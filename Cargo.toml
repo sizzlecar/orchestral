@@ -1,0 +1,31 @@
+[package]
+name = "orchestral"
+version = "0.1.0"
+edition = "2021"
+description = "A Rust-native, intent-first agent runtime that transforms user intent into executable plans and orchestrates them as dynamic DAGs"
+license = "MIT"
+repository = "https://github.com/example/orchestral"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+thiserror = "1"
+
+# Observability
+tracing = "0.1"
+
+# Utilities
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
