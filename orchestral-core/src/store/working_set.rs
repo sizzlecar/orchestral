@@ -75,7 +75,8 @@ impl WorkingSet {
 
     /// Clear all step scopes
     pub fn clear_all_step_scopes(&mut self) {
-        self.data.retain(|(s, _), _| !matches!(s, Scope::Step { .. }));
+        self.data
+            .retain(|(s, _), _| !matches!(s, Scope::Step { .. }));
     }
 
     // ============ Convenience methods for Task scope ============

@@ -1,0 +1,23 @@
+[package]
+name = "orchestral-runtime"
+description = "Thread Runtime with concurrency, interruption, and scheduling for Orchestral"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+orchestral-core = { workspace = true }
+orchestral-stores = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }

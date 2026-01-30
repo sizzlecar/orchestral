@@ -14,4 +14,4 @@ mod task;
 pub use intent::{Intent, IntentContext};
 pub use plan::Plan;
 pub use step::{Step, StepKind};
-pub use task::{Task, TaskState};
+pub use task::{Task, TaskId, TaskState};

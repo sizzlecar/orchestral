@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use super::{Intent, Plan};
 
+/// Type alias for Task ID
+pub type TaskId = String;
+
 /// Task state machine - production-ready states
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -41,7 +44,10 @@ pub enum TaskState {
 impl TaskState {
     /// Check if the task is in a terminal state
     pub fn is_terminal(&self) -> bool {
-        matches!(self, TaskState::Done | TaskState::Failed { recoverable: false, .. })
+        matches!(
+            self,
+            TaskState::Done | TaskState::Failed { recoverable: false, .. }
+        )
     }
 
     /// Check if the task can be resumed
@@ -65,7 +71,7 @@ impl TaskState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     /// Unique identifier for this task
-    pub id: String,
+    pub id: TaskId,
     /// The intent that initiated this task
     pub intent: Intent,
     /// The execution plan (if planning is complete)

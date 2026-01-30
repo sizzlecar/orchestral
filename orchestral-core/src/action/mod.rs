@@ -16,6 +16,9 @@ pub use context::ActionContext;
 pub use input::ActionInput;
 pub use result::ActionResult;
 
+// Re-export CancellationToken for convenience
+pub use tokio_util::sync::CancellationToken;
+
 /// Action trait - the core abstraction for atomic execution units
 ///
 /// Actions are black boxes to the Executor. They can:

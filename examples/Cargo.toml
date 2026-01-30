@@ -1,0 +1,18 @@
+[package]
+name = "orchestral-examples"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[example]]
+name = "basic_usage"
+path = "basic_usage.rs"
+
+[dependencies]
+orchestral-core = { path = "../orchestral-core" }
+orchestral-runtime = { path = "../orchestral-runtime" }
+orchestral-stores = { path = "../orchestral-stores" }
+orchestral-actions = { path = "../orchestral-actions" }
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+serde_json = "1"

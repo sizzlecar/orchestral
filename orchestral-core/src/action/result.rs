@@ -70,7 +70,11 @@ impl ActionResult {
     }
 
     /// Convenience: create a retryable error
-    pub fn retryable(message: impl Into<String>, retry_after: Option<Duration>, attempt: u32) -> Self {
+    pub fn retryable(
+        message: impl Into<String>,
+        retry_after: Option<Duration>,
+        attempt: u32,
+    ) -> Self {
         Self::RetryableError {
             message: message.into(),
             retry_after,
