@@ -13,6 +13,7 @@ use super::concurrency::{ConcurrencyDecision, ConcurrencyPolicy, DefaultConcurre
 use super::interaction::{Interaction, InteractionId, InteractionState};
 use super::thread::{Thread, ThreadId};
 use orchestral_stores::{Event, EventStore};
+use orchestral_core::types::TaskId;
 
 /// Configuration for ThreadRuntime
 #[derive(Debug, Clone)]
@@ -123,17 +124,13 @@ impl ThreadRuntime {
 
     /// Handle a new event
     pub async fn handle_event(&self, event: Event) -> Result<HandleEventResult, RuntimeError> {
+        self.validate_event(&event).await?;
+
         // Get current running state
         let running_state = self.running_state().await;
 
         // Ask policy for decision
         let decision = self.concurrency_policy.decide(&running_state, &event);
-
-        // Store the event
-        self.event_store
-            .append(event.clone())
-            .await
-            .map_err(|e| RuntimeError::StoreError(e.to_string()))?;
 
         // Handle based on decision
         match decision {
@@ -152,12 +149,28 @@ impl ThreadRuntime {
                 // Touch the thread
                 self.thread.write().await.touch();
 
+                // Store the event with the runtime-generated interaction_id
+                self.event_store
+                    .append(event.with_interaction_id(&interaction_id))
+                    .await
+                    .map_err(|e| RuntimeError::StoreError(e.to_string()))?;
+
                 Ok(HandleEventResult::Started { interaction_id })
             }
             ConcurrencyDecision::Reject { reason } => {
+                // Store the event as-is (no interaction created)
+                self.event_store
+                    .append(event)
+                    .await
+                    .map_err(|e| RuntimeError::StoreError(e.to_string()))?;
                 Ok(HandleEventResult::Rejected { reason })
             }
             ConcurrencyDecision::Queue => {
+                // Store the event as-is (queueing policy handled elsewhere)
+                self.event_store
+                    .append(event)
+                    .await
+                    .map_err(|e| RuntimeError::StoreError(e.to_string()))?;
                 Ok(HandleEventResult::Queued)
             }
             ConcurrencyDecision::Parallel => {
@@ -172,6 +185,12 @@ impl ThreadRuntime {
                 // Touch the thread
                 self.thread.write().await.touch();
 
+                // Store the event with the runtime-generated interaction_id
+                self.event_store
+                    .append(event.with_interaction_id(&interaction_id))
+                    .await
+                    .map_err(|e| RuntimeError::StoreError(e.to_string()))?;
+
                 Ok(HandleEventResult::Started { interaction_id })
             }
             ConcurrencyDecision::MergeIntoRunning => {
@@ -183,6 +202,11 @@ impl ThreadRuntime {
                     .map(|i| i.id.clone());
 
                 if let Some(interaction_id) = active_id {
+                    // Store the event with the active interaction_id
+                    self.event_store
+                        .append(event.with_interaction_id(&interaction_id))
+                        .await
+                        .map_err(|e| RuntimeError::StoreError(e.to_string()))?;
                     Ok(HandleEventResult::Merged { interaction_id })
                 } else {
                     // No active interaction, start new
@@ -196,10 +220,35 @@ impl ThreadRuntime {
 
                     self.thread.write().await.touch();
 
+                    // Store the event with the runtime-generated interaction_id
+                    self.event_store
+                        .append(event.with_interaction_id(&interaction_id))
+                        .await
+                        .map_err(|e| RuntimeError::StoreError(e.to_string()))?;
+
                     Ok(HandleEventResult::Started { interaction_id })
                 }
             }
         }
+    }
+
+    async fn validate_event(&self, event: &Event) -> Result<(), RuntimeError> {
+        let expected_thread_id = self.thread_id().await;
+        let got_thread_id = event.thread_id();
+        if expected_thread_id != got_thread_id {
+            return Err(RuntimeError::InvalidEvent(format!(
+                "thread_id mismatch (expected {}, got {})",
+                expected_thread_id, got_thread_id
+            )));
+        }
+
+        if !payload_is_valid(event) {
+            return Err(RuntimeError::InvalidEvent(
+                "payload must not be null for user/external events".to_string(),
+            ));
+        }
+
+        Ok(())
     }
 
     /// Cancel all active interactions
@@ -221,6 +270,21 @@ impl ThreadRuntime {
     pub async fn get_interaction(&self, id: &str) -> Option<Interaction> {
         let interactions = self.interactions.read().await;
         interactions.get(id).cloned()
+    }
+
+    /// Add a task to an interaction
+    pub async fn add_task_to_interaction(
+        &self,
+        id: &str,
+        task_id: TaskId,
+    ) -> Result<(), RuntimeError> {
+        let mut interactions = self.interactions.write().await;
+        if let Some(interaction) = interactions.get_mut(id) {
+            interaction.add_task(task_id);
+            Ok(())
+        } else {
+            Err(RuntimeError::InteractionNotFound(id.to_string()))
+        }
     }
 
     /// Update an interaction's state
@@ -260,10 +324,36 @@ impl ThreadRuntime {
             .collect()
     }
 
+    /// Query recent events for this thread
+    pub async fn query_history(&self, limit: usize) -> Result<Vec<Event>, RuntimeError> {
+        let thread_id = self.thread_id().await;
+        let events = if limit == 0 {
+            self.event_store
+                .query_by_thread(&thread_id)
+                .await
+                .map_err(|e| RuntimeError::StoreError(e.to_string()))?
+        } else {
+            self.event_store
+                .query_by_thread_with_limit(&thread_id, limit)
+                .await
+                .map_err(|e| RuntimeError::StoreError(e.to_string()))?
+        };
+        Ok(events)
+    }
+
     /// Cleanup completed interactions
     pub async fn cleanup_completed(&self) {
         let mut interactions = self.interactions.write().await;
         interactions.retain(|_, i| !i.state.is_terminal());
+    }
+}
+
+fn payload_is_valid(event: &Event) -> bool {
+    match event {
+        Event::UserInput { payload, .. } | Event::ExternalEvent { payload, .. } => {
+            !payload.is_null()
+        }
+        _ => true,
     }
 }
 
@@ -303,4 +393,7 @@ pub enum RuntimeError {
 
     #[error("Internal error: {0}")]
     Internal(String),
+
+    #[error("Invalid event: {0}")]
+    InvalidEvent(String),
 }

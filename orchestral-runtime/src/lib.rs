@@ -11,6 +11,7 @@
 
 mod concurrency;
 mod interaction;
+mod orchestrator;
 mod thread;
 mod thread_runtime;
 
@@ -20,6 +21,7 @@ pub use concurrency::{
     RunningState,
 };
 pub use interaction::{Interaction, InteractionId, InteractionState};
+pub use orchestrator::{Orchestrator, OrchestratorError, OrchestratorResult};
 pub use thread::{Thread, ThreadId};
 pub use thread_runtime::{HandleEventResult, RuntimeError, ThreadRuntime, ThreadRuntimeConfig};
 

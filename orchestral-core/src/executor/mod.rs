@@ -271,8 +271,8 @@ impl ActionRegistry {
     }
 
     /// Get all action names
-    pub fn names(&self) -> Vec<&str> {
-        self.actions.keys().map(|s| s.as_str()).collect()
+    pub fn names(&self) -> Vec<String> {
+        self.actions.keys().cloned().collect()
     }
 }
 
@@ -323,7 +323,7 @@ pub enum ExecutionResult {
 /// The executor - orchestrates DAG execution
 pub struct Executor {
     /// Action registry
-    pub action_registry: ActionRegistry,
+    pub action_registry: Arc<RwLock<ActionRegistry>>,
     /// Maximum parallel executions
     pub max_parallel: usize,
 }
@@ -331,6 +331,11 @@ pub struct Executor {
 impl Executor {
     /// Create a new executor
     pub fn new(action_registry: ActionRegistry) -> Self {
+        Self::with_registry(Arc::new(RwLock::new(action_registry)))
+    }
+
+    /// Create a new executor with a shared registry
+    pub fn with_registry(action_registry: Arc<RwLock<ActionRegistry>>) -> Self {
         Self {
             action_registry,
             max_parallel: 4,
@@ -462,11 +467,14 @@ impl Executor {
         execution_id: &str,
         ctx: &ExecutorContext,
     ) -> ActionResult {
-        let action = match self.action_registry.get(&step.action) {
+        let action = {
+            let registry = self.action_registry.read().await;
+            registry.get(&step.action)
+        };
+
+        let action = match action {
             Some(a) => a,
-            None => {
-                return ActionResult::error(format!("Action '{}' not found", step.action));
-            }
+            None => return ActionResult::error(format!("Action '{}' not found", step.action)),
         };
 
         // Build input from imports

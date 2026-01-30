@@ -14,9 +14,12 @@ use super::StoreError;
 pub enum ReferenceType {
     Image,
     Document,
+    File,
     Text,
     Code,
     Url,
+    Summary,
+    Embedding,
     Custom(String),
 }
 

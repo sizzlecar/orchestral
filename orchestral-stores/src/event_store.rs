@@ -175,6 +175,47 @@ impl Event {
             Event::SystemTrace { timestamp, .. } => *timestamp,
         }
     }
+
+    /// Return a copy of this event with a new interaction ID (if applicable)
+    pub fn with_interaction_id(&self, interaction_id: impl Into<String>) -> Self {
+        let interaction_id = interaction_id.into();
+        match self {
+            Event::UserInput {
+                thread_id,
+                payload,
+                timestamp,
+                ..
+            } => Event::UserInput {
+                thread_id: thread_id.clone(),
+                interaction_id,
+                payload: payload.clone(),
+                timestamp: *timestamp,
+            },
+            Event::AssistantOutput {
+                thread_id,
+                payload,
+                timestamp,
+                ..
+            } => Event::AssistantOutput {
+                thread_id: thread_id.clone(),
+                interaction_id,
+                payload: payload.clone(),
+                timestamp: *timestamp,
+            },
+            Event::Artifact {
+                thread_id,
+                reference_id,
+                timestamp,
+                ..
+            } => Event::Artifact {
+                thread_id: thread_id.clone(),
+                interaction_id,
+                reference_id: reference_id.clone(),
+                timestamp: *timestamp,
+            },
+            Event::ExternalEvent { .. } | Event::SystemTrace { .. } => self.clone(),
+        }
+    }
 }
 
 /// EventStore trait - async interface for event storage

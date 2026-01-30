@@ -21,9 +21,9 @@ pub struct Intent {
 /// Additional context for an intent
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IntentContext {
-    /// Associated conversation ID (for multi-turn interactions)
+    /// Associated thread ID (for multi-turn interactions)
     #[serde(default)]
-    pub conversation_id: Option<String>,
+    pub thread_id: Option<String>,
     /// Previous task ID (for continuation/follow-up)
     #[serde(default)]
     pub previous_task_id: Option<String>,
