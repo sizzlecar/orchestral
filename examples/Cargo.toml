@@ -8,8 +8,13 @@ publish = false
 name = "basic_usage"
 path = "basic_usage.rs"
 
+[[example]]
+name = "runtime_pipeline"
+path = "runtime_pipeline.rs"
+
 [dependencies]
 orchestral-core = { path = "../orchestral-core" }
+orchestral-context = { path = "../orchestral-context" }
 orchestral-runtime = { path = "../orchestral-runtime" }
 orchestral-stores = { path = "../orchestral-stores" }
 orchestral-actions = { path = "../orchestral-actions" }

@@ -2,16 +2,20 @@
 //!
 //! Official Action collection for Orchestral (optional).
 //!
-//! This crate provides built-in actions for common tasks:
-//! - Image processing
-//! - Document handling
-//! - Conversation management
-//! - And more...
+//! This crate provides:
+//! - Built-in action implementations
+//! - YAML config loading
+//! - Hot-reloadable action registry
+
+mod builtin;
+mod config;
+mod factory;
+mod loader;
 
 // Re-export core action traits
 pub use orchestral_core::action::{Action, ActionContext, ActionInput, ActionMeta, ActionResult};
 
-// Placeholder for future built-in actions
-// pub mod image;
-// pub mod document;
-// pub mod conversation;
+pub use builtin::*;
+pub use config::{ActionSpec, ActionsConfig};
+pub use factory::{ActionBuildError, ActionFactory, DefaultActionFactory};
+pub use loader::{ActionConfigError, ActionRegistryManager, ActionWatcher};
