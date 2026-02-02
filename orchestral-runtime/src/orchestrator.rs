@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use serde_json::Value;
 use tokio::sync::RwLock;
 
@@ -12,12 +13,14 @@ use orchestral_context::{
     ContextBuilder, ContextError, ContextRequest, ContextWindow, TokenBudget,
 };
 use orchestral_core::action::{extract_meta, ActionMeta};
-use orchestral_core::executor::{ExecutionResult, Executor, ExecutorContext};
+use orchestral_core::executor::{
+    ExecutionProgressEvent, ExecutionProgressReporter, ExecutionResult, Executor, ExecutorContext,
+};
 use orchestral_core::normalizer::{NormalizeError, PlanNormalizer};
 use orchestral_core::planner::{HistoryItem, PlanError, Planner, PlannerContext};
 use orchestral_core::store::{ReferenceStore, StoreError, TaskStore, WorkingSet};
 use orchestral_core::types::{Intent, IntentContext, StepKind, Task, TaskId, TaskState};
-use orchestral_stores::Event;
+use orchestral_stores::{Event, EventBus, EventStore};
 
 use crate::{HandleEventResult, InteractionState, RuntimeError, ThreadRuntime};
 
@@ -282,12 +285,19 @@ impl Orchestrator {
             apply_resume_event_to_working_set(&mut ws, event);
         }
         let working_set = Arc::new(RwLock::new(ws));
+        let progress_reporter = Arc::new(RuntimeProgressReporter::new(
+            self.thread_runtime.thread_id().await,
+            interaction_id.to_string(),
+            self.thread_runtime.event_store.clone(),
+            self.thread_runtime.event_bus.clone(),
+        ));
 
         let exec_ctx = ExecutorContext::new(
             task.id.clone(),
             working_set.clone(),
             self.reference_store.clone(),
-        );
+        )
+        .with_progress_reporter(progress_reporter);
         let result = self.executor.execute(&mut dag, &exec_ctx).await;
         let checkpoint = {
             let ws_guard = working_set.read().await;
@@ -348,6 +358,74 @@ impl Orchestrator {
             .await?;
         events.sort_by(|a, b| a.timestamp().cmp(&b.timestamp()));
         Ok(events.iter().filter_map(event_to_history_item).collect())
+    }
+}
+
+struct RuntimeProgressReporter {
+    thread_id: String,
+    interaction_id: String,
+    event_store: Arc<dyn EventStore>,
+    event_bus: Arc<dyn EventBus>,
+}
+
+impl RuntimeProgressReporter {
+    fn new(
+        thread_id: String,
+        interaction_id: String,
+        event_store: Arc<dyn EventStore>,
+        event_bus: Arc<dyn EventBus>,
+    ) -> Self {
+        Self {
+            thread_id,
+            interaction_id,
+            event_store,
+            event_bus,
+        }
+    }
+}
+
+#[async_trait]
+impl ExecutionProgressReporter for RuntimeProgressReporter {
+    async fn report(&self, event: ExecutionProgressEvent) -> Result<(), String> {
+        let mut payload = serde_json::Map::new();
+        payload.insert(
+            "category".to_string(),
+            Value::String("execution_progress".to_string()),
+        );
+        payload.insert(
+            "interaction_id".to_string(),
+            Value::String(self.interaction_id.clone()),
+        );
+        payload.insert("task_id".to_string(), Value::String(event.task_id));
+        payload.insert("phase".to_string(), Value::String(event.phase));
+        if let Some(step_id) = event.step_id {
+            payload.insert("step_id".to_string(), Value::String(step_id));
+        }
+        if let Some(action) = event.action {
+            payload.insert("action".to_string(), Value::String(action));
+        }
+        if let Some(message) = event.message {
+            payload.insert("message".to_string(), Value::String(message));
+        }
+        if !event.metadata.is_null() {
+            payload.insert("metadata".to_string(), event.metadata);
+        }
+
+        let trace = Event::trace(
+            self.thread_id.clone(),
+            "info",
+            Value::Object(payload.clone()),
+        );
+        self.event_store
+            .append(trace.clone())
+            .await
+            .map_err(|e| e.to_string())?;
+        self.event_bus
+            .publish(trace)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok(())
     }
 }
 
@@ -529,8 +607,9 @@ fn interaction_state_from_task(state: &TaskState) -> InteractionState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orchestral_core::executor::ExecutionDag;
+    use orchestral_core::executor::{ExecutionDag, ExecutionProgressEvent};
     use orchestral_core::types::{Plan, Step};
+    use orchestral_stores::{BroadcastEventBus, EventBus, EventStore, InMemoryEventStore};
     use serde_json::json;
 
     #[test]
@@ -566,5 +645,51 @@ mod tests {
             Some(&json!({"due":true}))
         );
         assert_eq!(ws.get_task("last_event_kind"), Some(&json!("timer")));
+    }
+
+    #[test]
+    fn test_runtime_progress_reporter_persists_and_publishes() {
+        tokio_test::block_on(async {
+            let event_store: Arc<dyn EventStore> = Arc::new(InMemoryEventStore::new());
+            let event_bus = Arc::new(BroadcastEventBus::new(16));
+            let mut sub = event_bus.subscribe();
+            let reporter = RuntimeProgressReporter::new(
+                "thread-1".to_string(),
+                "int-1".to_string(),
+                event_store.clone(),
+                event_bus.clone(),
+            );
+
+            reporter
+                .report(
+                    ExecutionProgressEvent::new(
+                        "task-1",
+                        Some("s1".to_string()),
+                        Some("echo".to_string()),
+                        "step_started",
+                    )
+                    .with_message("running"),
+                )
+                .await
+                .expect("report");
+
+            let events = event_store
+                .query_by_thread("thread-1")
+                .await
+                .expect("query");
+            assert_eq!(events.len(), 1);
+            match &events[0] {
+                Event::SystemTrace { payload, .. } => {
+                    assert_eq!(payload["category"], "execution_progress");
+                    assert_eq!(payload["interaction_id"], "int-1");
+                    assert_eq!(payload["task_id"], "task-1");
+                    assert_eq!(payload["phase"], "step_started");
+                }
+                _ => panic!("expected system trace"),
+            }
+
+            let bus_event = sub.recv().await.expect("bus event");
+            assert!(matches!(bus_event, Event::SystemTrace { .. }));
+        });
     }
 }

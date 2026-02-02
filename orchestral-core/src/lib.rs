@@ -26,8 +26,8 @@ pub mod prelude {
         Action, ActionContext, ActionInput, ActionMeta, ActionResult, CancellationToken,
     };
     pub use crate::executor::{
-        ActionRegistry, DagNode, ExecutionDag, ExecutionResult, Executor, ExecutorContext,
-        NodeState,
+        ActionRegistry, DagNode, ExecutionDag, ExecutionProgressEvent, ExecutionProgressReporter,
+        ExecutionResult, Executor, ExecutorContext, NodeState,
     };
     pub use crate::normalizer::{
         FixError, NormalizeError, NormalizedPlan, PlanFixer, PlanNormalizer, PlanValidator,
@@ -42,7 +42,9 @@ pub mod prelude {
 
 // Re-export key types at crate root
 pub use action::{Action, ActionContext, ActionInput, ActionResult};
-pub use executor::{ExecutionDag, ExecutionResult, Executor};
+pub use executor::{
+    ExecutionDag, ExecutionProgressEvent, ExecutionProgressReporter, ExecutionResult, Executor,
+};
 pub use normalizer::{NormalizedPlan, PlanNormalizer};
 pub use planner::Planner;
 pub use store::{ReferenceStore, StoreError, TaskStore, WorkingSet};

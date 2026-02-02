@@ -15,7 +15,7 @@ use super::concurrency::{
 use super::interaction::{Interaction, InteractionId, InteractionState};
 use super::thread::{Thread, ThreadId};
 use orchestral_core::types::TaskId;
-use orchestral_stores::{Event, EventStore};
+use orchestral_stores::{BroadcastEventBus, Event, EventBus, EventStore};
 
 /// Configuration for ThreadRuntime
 #[derive(Debug, Clone)]
@@ -45,6 +45,8 @@ pub struct ThreadRuntime {
     pub concurrency_policy: Arc<dyn ConcurrencyPolicy>,
     /// Event store
     pub event_store: Arc<dyn EventStore>,
+    /// Realtime event bus
+    pub event_bus: Arc<dyn EventBus>,
     /// Configuration
     pub config: ThreadRuntimeConfig,
 }
@@ -52,11 +54,21 @@ pub struct ThreadRuntime {
 impl ThreadRuntime {
     /// Create a new thread runtime
     pub fn new(thread: Thread, event_store: Arc<dyn EventStore>) -> Self {
+        Self::new_with_bus(thread, event_store, Arc::new(BroadcastEventBus::default()))
+    }
+
+    /// Create a new thread runtime with custom event bus
+    pub fn new_with_bus(
+        thread: Thread,
+        event_store: Arc<dyn EventStore>,
+        event_bus: Arc<dyn EventBus>,
+    ) -> Self {
         Self {
             thread: RwLock::new(thread),
             interactions: RwLock::new(HashMap::new()),
             concurrency_policy: Arc::new(DefaultConcurrencyPolicy),
             event_store,
+            event_bus,
             config: ThreadRuntimeConfig::default(),
         }
     }
@@ -67,11 +79,27 @@ impl ThreadRuntime {
         event_store: Arc<dyn EventStore>,
         policy: Arc<dyn ConcurrencyPolicy>,
     ) -> Self {
+        Self::with_policy_and_bus(
+            thread,
+            event_store,
+            policy,
+            Arc::new(BroadcastEventBus::default()),
+        )
+    }
+
+    /// Create a new thread runtime with custom policy and event bus
+    pub fn with_policy_and_bus(
+        thread: Thread,
+        event_store: Arc<dyn EventStore>,
+        policy: Arc<dyn ConcurrencyPolicy>,
+        event_bus: Arc<dyn EventBus>,
+    ) -> Self {
         Self {
             thread: RwLock::new(thread),
             interactions: RwLock::new(HashMap::new()),
             concurrency_policy: policy,
             event_store,
+            event_bus,
             config: ThreadRuntimeConfig::default(),
         }
     }
@@ -82,11 +110,27 @@ impl ThreadRuntime {
         event_store: Arc<dyn EventStore>,
         config: ThreadRuntimeConfig,
     ) -> Self {
+        Self::with_config_and_bus(
+            thread,
+            event_store,
+            config,
+            Arc::new(BroadcastEventBus::default()),
+        )
+    }
+
+    /// Create a new thread runtime with custom config and event bus
+    pub fn with_config_and_bus(
+        thread: Thread,
+        event_store: Arc<dyn EventStore>,
+        config: ThreadRuntimeConfig,
+        event_bus: Arc<dyn EventBus>,
+    ) -> Self {
         Self {
             thread: RwLock::new(thread),
             interactions: RwLock::new(HashMap::new()),
             concurrency_policy: Arc::new(DefaultConcurrencyPolicy),
             event_store,
+            event_bus,
             config,
         }
     }
@@ -98,11 +142,29 @@ impl ThreadRuntime {
         policy: Arc<dyn ConcurrencyPolicy>,
         config: ThreadRuntimeConfig,
     ) -> Self {
+        Self::with_policy_config_and_bus(
+            thread,
+            event_store,
+            policy,
+            config,
+            Arc::new(BroadcastEventBus::default()),
+        )
+    }
+
+    /// Create a new thread runtime with custom policy, config, and event bus
+    pub fn with_policy_config_and_bus(
+        thread: Thread,
+        event_store: Arc<dyn EventStore>,
+        policy: Arc<dyn ConcurrencyPolicy>,
+        config: ThreadRuntimeConfig,
+        event_bus: Arc<dyn EventBus>,
+    ) -> Self {
         Self {
             thread: RwLock::new(thread),
             interactions: RwLock::new(HashMap::new()),
             concurrency_policy: policy,
             event_store,
+            event_bus,
             config,
         }
     }
@@ -165,27 +227,19 @@ impl ThreadRuntime {
                 self.thread.write().await.touch();
 
                 // Store the event with the runtime-generated interaction_id
-                self.event_store
-                    .append(event.with_interaction_id(&interaction_id))
-                    .await
-                    .map_err(|e| RuntimeError::StoreError(e.to_string()))?;
+                self.persist_event(event.with_interaction_id(&interaction_id))
+                    .await?;
 
                 Ok(HandleEventResult::Started { interaction_id })
             }
             ConcurrencyDecision::Reject { reason } => {
                 // Store the event as-is (no interaction created)
-                self.event_store
-                    .append(event)
-                    .await
-                    .map_err(|e| RuntimeError::StoreError(e.to_string()))?;
+                self.persist_event(event).await?;
                 Ok(HandleEventResult::Rejected { reason })
             }
             ConcurrencyDecision::Queue => {
                 // Store the event as-is (queueing policy handled elsewhere)
-                self.event_store
-                    .append(event)
-                    .await
-                    .map_err(|e| RuntimeError::StoreError(e.to_string()))?;
+                self.persist_event(event).await?;
                 Ok(HandleEventResult::Queued)
             }
             ConcurrencyDecision::Parallel => {
@@ -201,10 +255,8 @@ impl ThreadRuntime {
                 self.thread.write().await.touch();
 
                 // Store the event with the runtime-generated interaction_id
-                self.event_store
-                    .append(event.with_interaction_id(&interaction_id))
-                    .await
-                    .map_err(|e| RuntimeError::StoreError(e.to_string()))?;
+                self.persist_event(event.with_interaction_id(&interaction_id))
+                    .await?;
 
                 Ok(HandleEventResult::Started { interaction_id })
             }
@@ -218,10 +270,8 @@ impl ThreadRuntime {
 
                 if let Some(interaction_id) = active_id {
                     // Store the event with the active interaction_id
-                    self.event_store
-                        .append(event.with_interaction_id(&interaction_id))
-                        .await
-                        .map_err(|e| RuntimeError::StoreError(e.to_string()))?;
+                    self.persist_event(event.with_interaction_id(&interaction_id))
+                        .await?;
                     Ok(HandleEventResult::Merged { interaction_id })
                 } else {
                     // No active interaction, start new
@@ -236,10 +286,8 @@ impl ThreadRuntime {
                     self.thread.write().await.touch();
 
                     // Store the event with the runtime-generated interaction_id
-                    self.event_store
-                        .append(event.with_interaction_id(&interaction_id))
-                        .await
-                        .map_err(|e| RuntimeError::StoreError(e.to_string()))?;
+                    self.persist_event(event.with_interaction_id(&interaction_id))
+                        .await?;
 
                     Ok(HandleEventResult::Started { interaction_id })
                 }
@@ -336,12 +384,15 @@ impl ThreadRuntime {
             ));
         }
 
-        self.event_store
-            .append(event.with_interaction_id(interaction_id))
-            .await
-            .map_err(|e| RuntimeError::StoreError(e.to_string()))?;
+        self.persist_event(event.with_interaction_id(interaction_id))
+            .await?;
         self.thread.write().await.touch();
         Ok(())
+    }
+
+    /// Subscribe to the realtime event stream.
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<Event> {
+        self.event_bus.subscribe()
     }
 
     /// Mark a waiting interaction active so execution can continue.
@@ -419,6 +470,18 @@ impl ThreadRuntime {
         let mut interactions = self.interactions.write().await;
         interactions.retain(|_, i| !i.state.is_terminal());
     }
+
+    async fn persist_event(&self, event: Event) -> Result<(), RuntimeError> {
+        self.event_store
+            .append(event.clone())
+            .await
+            .map_err(|e| RuntimeError::StoreError(e.to_string()))?;
+        self.event_bus
+            .publish(event)
+            .await
+            .map_err(|e| RuntimeError::Internal(format!("event bus publish failed: {}", e)))?;
+        Ok(())
+    }
 }
 
 fn payload_is_valid(event: &Event) -> bool {
@@ -475,7 +538,7 @@ pub enum RuntimeError {
 mod tests {
     use super::*;
     use chrono::{Duration, Utc};
-    use orchestral_stores::InMemoryEventStore;
+    use orchestral_stores::{BroadcastEventBus, InMemoryEventStore};
     use serde_json::json;
 
     #[test]
@@ -535,6 +598,36 @@ mod tests {
             match &events[0] {
                 Event::UserInput { interaction_id, .. } => {
                     assert_eq!(interaction_id, "target");
+                }
+                _ => panic!("expected user_input event"),
+            }
+        });
+    }
+
+    #[test]
+    fn test_handle_event_publishes_to_event_bus() {
+        tokio_test::block_on(async {
+            let thread_id = "thread-1";
+            let runtime = ThreadRuntime::new_with_bus(
+                Thread::with_id(thread_id),
+                Arc::new(InMemoryEventStore::new()),
+                Arc::new(BroadcastEventBus::new(16)),
+            );
+            let mut sub = runtime.subscribe_events();
+
+            let event = Event::user_input(thread_id, "cli", json!({"message":"hello"}));
+            let result = runtime.handle_event(event).await.unwrap();
+            assert!(matches!(result, HandleEventResult::Started { .. }));
+
+            let published = sub.recv().await.expect("published event");
+            match published {
+                Event::UserInput {
+                    interaction_id,
+                    payload,
+                    ..
+                } => {
+                    assert_ne!(interaction_id, "cli");
+                    assert_eq!(payload["message"], "hello");
                 }
                 _ => panic!("expected user_input event"),
             }

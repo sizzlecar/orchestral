@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use async_trait::async_trait;
+
 use crate::action::{Action, ActionContext, ActionInput, ActionResult};
 use crate::store::{ReferenceStore, WorkingSet};
 use crate::types::{Plan, Step, StepKind};
@@ -290,6 +292,8 @@ pub struct ExecutorContext {
     pub reference_store: Arc<dyn ReferenceStore>,
     /// Task ID
     pub task_id: String,
+    /// Optional execution progress reporter.
+    pub progress_reporter: Option<Arc<dyn ExecutionProgressReporter>>,
 }
 
 impl ExecutorContext {
@@ -303,7 +307,14 @@ impl ExecutorContext {
             task_id: task_id.into(),
             working_set,
             reference_store,
+            progress_reporter: None,
         }
+    }
+
+    /// Attach a realtime execution progress reporter.
+    pub fn with_progress_reporter(mut self, reporter: Arc<dyn ExecutionProgressReporter>) -> Self {
+        self.progress_reporter = Some(reporter);
+        self
     }
 }
 
@@ -318,6 +329,54 @@ pub enum ExecutionResult {
     WaitingUser { step_id: String, prompt: String },
     /// Waiting for external event
     WaitingEvent { step_id: String, event_type: String },
+}
+
+/// Realtime execution progress event.
+#[derive(Debug, Clone)]
+pub struct ExecutionProgressEvent {
+    pub task_id: String,
+    pub step_id: Option<String>,
+    pub action: Option<String>,
+    /// Phase label, e.g. step_started/step_completed/task_completed.
+    pub phase: String,
+    /// Optional human-readable message.
+    pub message: Option<String>,
+    /// Extra structured metadata.
+    pub metadata: serde_json::Value,
+}
+
+impl ExecutionProgressEvent {
+    pub fn new(
+        task_id: impl Into<String>,
+        step_id: Option<String>,
+        action: Option<String>,
+        phase: impl Into<String>,
+    ) -> Self {
+        Self {
+            task_id: task_id.into(),
+            step_id,
+            action,
+            phase: phase.into(),
+            message: None,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = Some(message.into());
+        self
+    }
+
+    pub fn with_metadata(mut self, metadata: serde_json::Value) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
+/// Sink interface for execution progress reporting.
+#[async_trait]
+pub trait ExecutionProgressReporter: Send + Sync {
+    async fn report(&self, event: ExecutionProgressEvent) -> Result<(), String>;
 }
 
 /// The executor - orchestrates DAG execution
@@ -370,15 +429,43 @@ impl Executor {
             if ready.is_empty() {
                 // No more ready nodes
                 if dag.is_completed() {
+                    report_progress(
+                        ctx,
+                        ExecutionProgressEvent::new(
+                            ctx.task_id.clone(),
+                            None,
+                            None,
+                            "task_completed",
+                        ),
+                    )
+                    .await;
                     return ExecutionResult::Completed;
                 } else if dag.has_failed() {
                     let failed = dag.failed_nodes();
+                    let failed_step_id = failed.first().map(|s| s.to_string()).unwrap_or_default();
+                    report_progress(
+                        ctx,
+                        ExecutionProgressEvent::new(
+                            ctx.task_id.clone(),
+                            Some(failed_step_id.clone()),
+                            None,
+                            "task_failed",
+                        )
+                        .with_message("execution failed"),
+                    )
+                    .await;
                     return ExecutionResult::Failed {
-                        step_id: failed.first().map(|s| s.to_string()).unwrap_or_default(),
+                        step_id: failed_step_id,
                         error: "Execution failed".to_string(),
                     };
                 } else {
                     // Deadlock or waiting
+                    report_progress(
+                        ctx,
+                        ExecutionProgressEvent::new(ctx.task_id.clone(), None, None, "task_failed")
+                            .with_message("no ready nodes but DAG not completed"),
+                    )
+                    .await;
                     return ExecutionResult::Failed {
                         step_id: String::new(),
                         error: "No ready nodes but DAG not completed".to_string(),
@@ -405,6 +492,16 @@ impl Executor {
                     match kind {
                         StepKind::WaitUser => {
                             dag.mark_running(&step_id);
+                            report_progress(
+                                ctx,
+                                ExecutionProgressEvent::new(
+                                    ctx.task_id.clone(),
+                                    Some(step_id.clone()),
+                                    Some(step.action.clone()),
+                                    "step_waiting_user",
+                                ),
+                            )
+                            .await;
                             return ExecutionResult::WaitingUser {
                                 step_id,
                                 prompt: params
@@ -416,6 +513,16 @@ impl Executor {
                         }
                         StepKind::WaitEvent => {
                             dag.mark_running(&step_id);
+                            report_progress(
+                                ctx,
+                                ExecutionProgressEvent::new(
+                                    ctx.task_id.clone(),
+                                    Some(step_id.clone()),
+                                    Some(step.action.clone()),
+                                    "step_waiting_event",
+                                ),
+                            )
+                            .await;
                             return ExecutionResult::WaitingEvent {
                                 step_id,
                                 event_type: params
@@ -430,6 +537,16 @@ impl Executor {
 
                     // Execute the action
                     dag.mark_running(&step_id);
+                    report_progress(
+                        ctx,
+                        ExecutionProgressEvent::new(
+                            ctx.task_id.clone(),
+                            Some(step_id.clone()),
+                            Some(step.action.clone()),
+                            "step_started",
+                        ),
+                    )
+                    .await;
 
                     let result = self.execute_step_data(&step, &execution_id, ctx).await;
 
@@ -439,6 +556,17 @@ impl Executor {
                                 validate_declared_exports(&step, &exports, self.strict_exports)
                             {
                                 dag.mark_failed(&step_id);
+                                report_progress(
+                                    ctx,
+                                    ExecutionProgressEvent::new(
+                                        ctx.task_id.clone(),
+                                        Some(step_id.clone()),
+                                        Some(step.action.clone()),
+                                        "step_failed",
+                                    )
+                                    .with_message(error.clone()),
+                                )
+                                .await;
                                 return ExecutionResult::Failed { step_id, error };
                             }
 
@@ -449,8 +577,29 @@ impl Executor {
                                 ws.set_task(format!("{}.{}", step.id, key), value);
                             }
                             dag.mark_completed(&step_id);
+                            report_progress(
+                                ctx,
+                                ExecutionProgressEvent::new(
+                                    ctx.task_id.clone(),
+                                    Some(step_id),
+                                    Some(step.action.clone()),
+                                    "step_completed",
+                                ),
+                            )
+                            .await;
                         }
                         ActionResult::NeedClarification { question } => {
+                            report_progress(
+                                ctx,
+                                ExecutionProgressEvent::new(
+                                    ctx.task_id.clone(),
+                                    Some(step_id.clone()),
+                                    Some(step.action.clone()),
+                                    "step_waiting_user",
+                                )
+                                .with_message(question.clone()),
+                            )
+                            .await;
                             return ExecutionResult::WaitingUser {
                                 step_id,
                                 prompt: question,
@@ -459,6 +608,17 @@ impl Executor {
                         ActionResult::RetryableError { message, .. } => {
                             // For now, mark as failed (retry logic can be added later)
                             dag.mark_failed(&step_id);
+                            report_progress(
+                                ctx,
+                                ExecutionProgressEvent::new(
+                                    ctx.task_id.clone(),
+                                    Some(step_id.clone()),
+                                    Some(step.action.clone()),
+                                    "step_failed",
+                                )
+                                .with_message(message.clone()),
+                            )
+                            .await;
                             return ExecutionResult::Failed {
                                 step_id,
                                 error: message,
@@ -466,6 +626,17 @@ impl Executor {
                         }
                         ActionResult::Error { message } => {
                             dag.mark_failed(&step_id);
+                            report_progress(
+                                ctx,
+                                ExecutionProgressEvent::new(
+                                    ctx.task_id.clone(),
+                                    Some(step_id.clone()),
+                                    Some(step.action.clone()),
+                                    "step_failed",
+                                )
+                                .with_message(message.clone()),
+                            )
+                            .await;
                             return ExecutionResult::Failed {
                                 step_id,
                                 error: message,
@@ -572,6 +743,14 @@ impl Executor {
                 ActionResult::Success { exports }
             }
             other => other,
+        }
+    }
+}
+
+async fn report_progress(ctx: &ExecutorContext, event: ExecutionProgressEvent) {
+    if let Some(reporter) = &ctx.progress_reporter {
+        if let Err(err) = reporter.report(event).await {
+            tracing::warn!("failed to report execution progress: {}", err);
         }
     }
 }
@@ -791,6 +970,26 @@ mod tests {
 
         async fn delete(&self, _id: &str) -> Result<bool, StoreError> {
             Ok(false)
+        }
+    }
+
+    struct CollectProgressReporter {
+        events: Arc<RwLock<Vec<ExecutionProgressEvent>>>,
+    }
+
+    impl CollectProgressReporter {
+        fn new() -> Self {
+            Self {
+                events: Arc::new(RwLock::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ExecutionProgressReporter for CollectProgressReporter {
+        async fn report(&self, event: ExecutionProgressEvent) -> Result<(), String> {
+            self.events.write().await.push(event);
+            Ok(())
         }
     }
 
@@ -1040,6 +1239,41 @@ mod tests {
                 }
                 _ => panic!("expected failed result"),
             }
+        });
+    }
+
+    #[test]
+    fn test_progress_reporter_receives_step_lifecycle_events() {
+        tokio_test::block_on(async {
+            let mut registry = ActionRegistry::new();
+            registry.register(Arc::new(StaticAction::new(
+                "produce",
+                ActionResult::success_with_one("result", json!("ok")),
+            )));
+            let executor = Executor::new(registry);
+
+            let plan = Plan::new(
+                "progress flow",
+                vec![Step::action("s1", "produce").with_exports(vec!["result".to_string()])],
+            );
+            let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
+            let reporter = Arc::new(CollectProgressReporter::new());
+            let events_ref = reporter.events.clone();
+            let ctx = ExecutorContext::new(
+                "task-1",
+                Arc::new(RwLock::new(WorkingSet::new())),
+                Arc::new(NoopReferenceStore),
+            )
+            .with_progress_reporter(reporter);
+
+            let result = executor.execute(&mut dag, &ctx).await;
+            assert!(matches!(result, ExecutionResult::Completed));
+
+            let events = events_ref.read().await.clone();
+            let phases: Vec<String> = events.into_iter().map(|e| e.phase).collect();
+            assert!(phases.iter().any(|p| p == "step_started"));
+            assert!(phases.iter().any(|p| p == "step_completed"));
+            assert!(phases.iter().any(|p| p == "task_completed"));
         });
     }
 }
