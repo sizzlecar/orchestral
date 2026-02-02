@@ -81,8 +81,8 @@ pub fn build_client_from_backend(
     backend: &BackendSpec,
     invocation: &LlmInvocationConfig,
 ) -> Result<Arc<dyn LlmClient>, LlmBuildError> {
-    let api_key = resolve_api_key(backend)?;
     let backend_kind = parse_backend(&backend.kind)?;
+    let api_key = resolve_api_key(backend)?;
     let client = GranietLlmClient {
         backend: backend_kind,
         api_key: Some(api_key),
