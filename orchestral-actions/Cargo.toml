@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 orchestral-core = { workspace = true }
+orchestral-config = { workspace = true }
 orchestral-stores = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }

@@ -4,18 +4,20 @@
 //!
 //! This crate provides:
 //! - Built-in action implementations
-//! - YAML config loading
 //! - Hot-reloadable action registry
+//!
+//! Configuration types are provided by `orchestral-config`.
 
 mod builtin;
-mod config;
 mod factory;
 mod loader;
 
 // Re-export core action traits
 pub use orchestral_core::action::{Action, ActionContext, ActionInput, ActionMeta, ActionResult};
 
+// Re-export config types from orchestral-config
+pub use orchestral_config::{ActionSpec, ActionsConfig};
+
 pub use builtin::*;
-pub use config::{ActionSpec, ActionsConfig};
 pub use factory::{ActionBuildError, ActionFactory, DefaultActionFactory};
 pub use loader::{ActionConfigError, ActionRegistryManager, ActionWatcher};

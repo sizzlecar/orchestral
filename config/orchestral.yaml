@@ -1,0 +1,102 @@
+version: 1
+
+app:
+  name: orchestral
+  environment: development
+
+runtime:
+  max_interactions_per_thread: 10
+  auto_cleanup: true
+  concurrency_policy: interrupt_and_start_new
+
+planner:
+  mode: deterministic
+  backend: openai
+  model_profile: fast
+  max_history: 20
+  dynamic_model_selection: true
+
+context:
+  history_limit: 50
+  max_tokens: 4096
+  include_history: true
+  include_references: true
+
+stores:
+  event:
+    backend: in_memory
+  task:
+    backend: in_memory
+  reference:
+    backend: in_memory
+
+observability:
+  log_level: info
+  traces_enabled: false
+
+providers:
+  default_backend: openai
+  default_model: fast
+  backends:
+    - name: openai
+      kind: openai
+      api_key_env: OPENAI_API_KEY
+      config:
+        timeout_secs: 30
+    - name: google
+      kind: google
+      api_key_env: GEMINI_API_KEY
+      config:
+        timeout_secs: 60
+  models:
+    - name: fast
+      backend: openai
+      model: gpt-4o-mini
+      temperature: 0.2
+      policy:
+        temperature_min: 0.0
+        temperature_max: 1.0
+    - name: deep
+      backend: openai
+      model: gpt-4.1
+      temperature: 0.1
+      policy:
+        temperature_min: 0.0
+        temperature_max: 0.7
+    - name: cheap
+      backend: google
+      model: gemini-1.5-flash
+      temperature: 0.2
+      policy:
+        temperature_min: 0.0
+        temperature_max: 1.0
+
+actions:
+  hot_reload: true
+  actions:
+    - name: echo
+      kind: echo
+      description: "Echoes input back as output"
+      config:
+        prefix: "Echo: "
+    - name: http
+      kind: http
+      description: "Performs an HTTP request"
+      config:
+        default_method: "GET"
+    - name: shell
+      kind: shell
+      description: "Runs a shell command"
+      config:
+        timeout_ms: 10000
+    - name: file_read
+      kind: file_read
+      description: "Reads a file from disk"
+      config:
+        root_dir: "."
+    - name: file_write
+      kind: file_write
+      description: "Writes a file to disk"
+      config:
+        root_dir: "."
+        create_dirs: true

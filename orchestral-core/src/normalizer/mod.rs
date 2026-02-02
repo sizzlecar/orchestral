@@ -185,9 +185,7 @@ impl PlanNormalizer {
         for step in &plan.steps {
             adj.entry(step.id.as_str()).or_default();
             for dep in &step.depends_on {
-                adj.entry(dep.as_str())
-                    .or_default()
-                    .push(step.id.as_str());
+                adj.entry(dep.as_str()).or_default().push(step.id.as_str());
             }
         }
 
@@ -222,7 +220,8 @@ impl PlanNormalizer {
 
         for step in &plan.steps {
             if !visited.contains(step.id.as_str()) {
-                if let Some(cycle_node) = dfs(step.id.as_str(), &adj, &mut visited, &mut rec_stack) {
+                if let Some(cycle_node) = dfs(step.id.as_str(), &adj, &mut visited, &mut rec_stack)
+                {
                     return Err(ValidationError::CycleDetected(cycle_node.to_string()));
                 }
             }

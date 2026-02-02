@@ -191,10 +191,7 @@ pub struct BasicContextBuilder {
 }
 
 impl BasicContextBuilder {
-    pub fn new(
-        event_store: Arc<dyn EventStore>,
-        reference_store: Arc<dyn ReferenceStore>,
-    ) -> Self {
+    pub fn new(event_store: Arc<dyn EventStore>, reference_store: Arc<dyn ReferenceStore>) -> Self {
         Self {
             event_store,
             reference_store,
@@ -228,9 +225,7 @@ impl ContextBuilder for BasicContextBuilder {
 
         if request.include_history {
             let mut events = if self.config.history_limit == 0 {
-                self.event_store
-                    .query_by_thread(&request.thread_id)
-                    .await?
+                self.event_store.query_by_thread(&request.thread_id).await?
             } else {
                 self.event_store
                     .query_by_thread_with_limit(&request.thread_id, self.config.history_limit)

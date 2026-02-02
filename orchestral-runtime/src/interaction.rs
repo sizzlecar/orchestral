@@ -41,9 +41,7 @@ impl InteractionState {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            InteractionState::Completed
-                | InteractionState::Failed
-                | InteractionState::Cancelled
+            InteractionState::Completed | InteractionState::Failed | InteractionState::Cancelled
         )
     }
 

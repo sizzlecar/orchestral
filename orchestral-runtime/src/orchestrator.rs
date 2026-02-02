@@ -8,7 +8,9 @@ use std::sync::Arc;
 use serde_json::Value;
 use tokio::sync::RwLock;
 
-use orchestral_context::{ContextBuilder, ContextError, ContextRequest, ContextWindow, TokenBudget};
+use orchestral_context::{
+    ContextBuilder, ContextError, ContextRequest, ContextWindow, TokenBudget,
+};
 use orchestral_core::action::{extract_meta, ActionMeta};
 use orchestral_core::executor::{ExecutionResult, Executor, ExecutorContext};
 use orchestral_core::normalizer::{NormalizeError, PlanNormalizer};
@@ -143,7 +145,10 @@ impl Orchestrator {
     }
 
     /// Handle an event end-to-end (intent → plan → normalize → execute)
-    pub async fn handle_event(&self, event: Event) -> Result<OrchestratorResult, OrchestratorError> {
+    pub async fn handle_event(
+        &self,
+        event: Event,
+    ) -> Result<OrchestratorResult, OrchestratorError> {
         let event_clone = event.clone();
         let decision = self.thread_runtime.handle_event(event).await?;
 
@@ -182,7 +187,8 @@ impl Orchestrator {
 
         // Execute
         let working_set = Arc::new(RwLock::new(WorkingSet::new()));
-        let exec_ctx = ExecutorContext::new(task.id.clone(), working_set, self.reference_store.clone());
+        let exec_ctx =
+            ExecutorContext::new(task.id.clone(), working_set, self.reference_store.clone());
         let mut dag = normalized.dag;
         let result = self.executor.execute(&mut dag, &exec_ctx).await;
 
@@ -247,10 +253,7 @@ impl Orchestrator {
             .query_history(self.config.history_limit)
             .await?;
         events.sort_by(|a, b| a.timestamp().cmp(&b.timestamp()));
-        Ok(events
-            .iter()
-            .filter_map(event_to_history_item)
-            .collect())
+        Ok(events.iter().filter_map(event_to_history_item).collect())
     }
 }
 
@@ -274,25 +277,21 @@ fn intent_from_event(
     };
 
     match event {
-        Event::UserInput { payload, .. } => Ok(Intent::with_context(
-            payload_to_string(payload),
-            context,
-        )),
+        Event::UserInput { payload, .. } => {
+            Ok(Intent::with_context(payload_to_string(payload), context))
+        }
         Event::ExternalEvent { kind, payload, .. } => {
             let content = format!("external:{} {}", kind, payload_to_string(payload));
             Ok(Intent::with_context(content, context))
         }
-        Event::AssistantOutput { payload, .. } => Ok(Intent::with_context(
-            payload_to_string(payload),
-            context,
-        )),
+        Event::AssistantOutput { payload, .. } => {
+            Ok(Intent::with_context(payload_to_string(payload), context))
+        }
         Event::SystemTrace { level, payload, .. } => Ok(Intent::with_context(
             format!("trace:{} {}", level, payload_to_string(payload)),
             context,
         )),
-        Event::Artifact {
-            reference_id, ..
-        } => Ok(Intent::with_context(
+        Event::Artifact { reference_id, .. } => Ok(Intent::with_context(
             format!("artifact:{}", reference_id),
             context,
         )),

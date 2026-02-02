@@ -141,11 +141,7 @@ impl Event {
     }
 
     /// Create a new system trace event
-    pub fn trace(
-        thread_id: impl Into<String>,
-        level: impl Into<String>,
-        payload: Value,
-    ) -> Self {
+    pub fn trace(thread_id: impl Into<String>, level: impl Into<String>, payload: Value) -> Self {
         Self::SystemTrace {
             thread_id: thread_id.into(),
             level: level.into(),

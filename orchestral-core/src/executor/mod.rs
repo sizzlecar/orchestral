@@ -349,11 +349,7 @@ impl Executor {
     }
 
     /// Execute a DAG
-    pub async fn execute(
-        &self,
-        dag: &mut ExecutionDag,
-        ctx: &ExecutorContext,
-    ) -> ExecutionResult {
+    pub async fn execute(&self, dag: &mut ExecutionDag, ctx: &ExecutorContext) -> ExecutionResult {
         loop {
             // Get ready nodes
             let ready: Vec<_> = dag.ready_nodes.clone();

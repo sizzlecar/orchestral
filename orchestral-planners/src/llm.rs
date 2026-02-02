@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
@@ -19,6 +21,13 @@ pub struct LlmRequest {
 #[async_trait]
 pub trait LlmClient: Send + Sync {
     async fn complete(&self, request: LlmRequest) -> Result<String, LlmError>;
+}
+
+#[async_trait]
+impl LlmClient for Arc<dyn LlmClient> {
+    async fn complete(&self, request: LlmRequest) -> Result<String, LlmError> {
+        (**self).complete(request).await
+    }
 }
 
 /// LLM errors
@@ -70,7 +79,13 @@ impl<C: LlmClient> LlmPlanner<C> {
 
         if !context.history.is_empty() {
             user.push_str("History:\n");
-            for item in context.history.iter().rev().take(self.config.max_history).rev() {
+            for item in context
+                .history
+                .iter()
+                .rev()
+                .take(self.config.max_history)
+                .rev()
+            {
                 user.push_str(&format!("- {}: {}\n", item.role, item.content));
             }
             user.push('\n');
@@ -110,9 +125,8 @@ impl<C: LlmClient> Planner for LlmPlanner<C> {
             .await
             .map_err(|e| PlanError::LlmError(e.to_string()))?;
 
-        let json_str = extract_json(&output).ok_or_else(|| {
-            PlanError::Generation("LLM output did not contain JSON".to_string())
-        })?;
+        let json_str = extract_json(&output)
+            .ok_or_else(|| PlanError::Generation("LLM output did not contain JSON".to_string()))?;
 
         serde_json::from_str::<Plan>(&json_str)
             .map_err(|e| PlanError::Generation(format!("Invalid plan JSON: {}", e)))
@@ -239,13 +253,13 @@ impl LlmClient for HttpLlmClient {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            return Err(LlmError::Response(format!(
-                "HTTP {}: {}",
-                status, text
-            )));
+            return Err(LlmError::Response(format!("HTTP {}: {}", status, text)));
         }
 
-        let text = response.text().await.map_err(|e| LlmError::Http(e.to_string()))?;
+        let text = response
+            .text()
+            .await
+            .map_err(|e| LlmError::Http(e.to_string()))?;
         let parsed: ChatResponse =
             serde_json::from_str(&text).map_err(|e| LlmError::Serialization(e.to_string()))?;
 

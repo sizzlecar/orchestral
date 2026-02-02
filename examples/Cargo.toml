@@ -16,8 +16,13 @@ path = "runtime_pipeline.rs"
 name = "llm_planner"
 path = "llm_planner.rs"
 
+[[example]]
+name = "config_loading"
+path = "config_loading.rs"
+
 [dependencies]
 orchestral-core = { path = "../orchestral-core" }
+orchestral-config = { path = "../orchestral-config" }
 orchestral-context = { path = "../orchestral-context" }
 orchestral-planners = { path = "../orchestral-planners" }
 orchestral-runtime = { path = "../orchestral-runtime" }

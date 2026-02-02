@@ -1,29 +1,24 @@
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use thiserror::Error;
 use tokio::sync::RwLock;
 
+use orchestral_config::{load_actions_config, ActionsConfig, ConfigError};
 use orchestral_core::executor::ActionRegistry;
 
-use crate::config::{ActionSpec, ActionsConfig};
 use crate::factory::{ActionBuildError, ActionFactory};
 
 /// Action config errors
 #[derive(Debug, Error)]
 pub enum ActionConfigError {
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("parse error: {0}")]
-    Parse(#[from] serde_yaml::Error),
+    #[error("config error: {0}")]
+    Config(#[from] ConfigError),
     #[error("build error: {0}")]
     Build(#[from] ActionBuildError),
     #[error("notify error: {0}")]
     Notify(#[from] notify::Error),
-    #[error("invalid config: {0}")]
-    InvalidConfig(String),
 }
 
 /// Loads action specs and maintains a live registry
@@ -48,9 +43,17 @@ impl ActionRegistryManager {
 
     pub async fn load(&self) -> Result<usize, ActionConfigError> {
         let config = load_actions_config(&self.path)?;
+        self.load_from_config(&config).await
+    }
+
+    /// Load from an already-parsed config.
+    pub async fn load_from_config(
+        &self,
+        config: &ActionsConfig,
+    ) -> Result<usize, ActionConfigError> {
         let mut registry = ActionRegistry::new();
-        for spec in config.actions {
-            let action = self.factory.build(&spec)?;
+        for spec in &config.actions {
+            let action = self.factory.build(spec)?;
             registry.register(action);
         }
 
@@ -63,21 +66,24 @@ impl ActionRegistryManager {
         let manager = Arc::clone(self);
         let handle = tokio::runtime::Handle::current();
 
-        let mut watcher: RecommendedWatcher = notify::recommended_watcher(
-            move |res: Result<notify::Event, notify::Error>| {
+        let mut watcher: RecommendedWatcher =
+            notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
                 if let Ok(event) = res {
-                if matches!(
-                    event.kind,
-                    EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
-                ) {
-                    let manager = Arc::clone(&manager);
-                    handle.spawn(async move {
-                        let _ = manager.load().await;
-                    });
+                    if matches!(
+                        event.kind,
+                        EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+                    ) {
+                        let manager = Arc::clone(&manager);
+                        handle.spawn(async move {
+                            if let Err(e) = manager.load().await {
+                                tracing::error!("Action reload failed: {}", e);
+                            } else {
+                                tracing::info!("Actions reloaded from config");
+                            }
+                        });
+                    }
                 }
-            }
-        },
-        )?;
+            })?;
 
         watcher.watch(&self.path, RecursiveMode::NonRecursive)?;
         Ok(ActionWatcher { _watcher: watcher })
@@ -87,32 +93,4 @@ impl ActionRegistryManager {
 /// Keeps file watcher alive
 pub struct ActionWatcher {
     _watcher: RecommendedWatcher,
-}
-
-fn load_actions_config(path: &Path) -> Result<ActionsConfig, ActionConfigError> {
-    let content = fs::read_to_string(path)?;
-    let config: ActionsConfig = serde_yaml::from_str(&content)?;
-    if config.actions.is_empty() {
-        return Err(ActionConfigError::InvalidConfig(
-            "actions list is empty".to_string(),
-        ));
-    }
-    validate_specs(&config.actions)?;
-    Ok(config)
-}
-
-fn validate_specs(specs: &[ActionSpec]) -> Result<(), ActionConfigError> {
-    for spec in specs {
-        if spec.name.trim().is_empty() {
-            return Err(ActionConfigError::InvalidConfig(
-                "action name must not be empty".to_string(),
-            ));
-        }
-        if spec.kind.trim().is_empty() {
-            return Err(ActionConfigError::InvalidConfig(
-                "action kind must not be empty".to_string(),
-            ));
-        }
-    }
-    Ok(())
 }

@@ -9,12 +9,14 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+use orchestral_config::ActionSpec;
 use orchestral_core::action::{Action, ActionContext, ActionInput, ActionResult};
 
-use crate::config::ActionSpec;
-
 fn config_string(config: &Value, key: &str) -> Option<String> {
-    config.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+    config
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 fn config_bool(config: &Value, key: &str) -> Option<bool> {
@@ -26,7 +28,10 @@ fn config_u64(config: &Value, key: &str) -> Option<u64> {
 }
 
 fn params_get_string(params: &Value, key: &str) -> Option<String> {
-    params.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+    params
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 fn params_get_bool(params: &Value, key: &str) -> Option<bool> {
@@ -43,7 +48,6 @@ fn params_get_array(params: &Value, key: &str) -> Option<Vec<String>> {
     })
 }
 
-
 fn headers_from_value(value: &Value) -> HashMap<String, String> {
     value
         .as_object()
@@ -55,10 +59,16 @@ fn headers_from_value(value: &Value) -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
-fn merge_headers(defaults: &HashMap<String, String>, overrides: &HashMap<String, String>) -> HeaderMap {
+fn merge_headers(
+    defaults: &HashMap<String, String>,
+    overrides: &HashMap<String, String>,
+) -> HeaderMap {
     let mut map = HeaderMap::new();
     for (k, v) in defaults.iter().chain(overrides.iter()) {
-        if let (Ok(name), Ok(value)) = (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v)) {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(k.as_bytes()),
+            HeaderValue::from_str(v),
+        ) {
             map.insert(name, value);
         }
     }
@@ -130,9 +140,11 @@ pub struct HttpAction {
 
 impl HttpAction {
     pub fn from_spec(spec: &ActionSpec) -> Self {
-        let default_method = config_string(&spec.config, "default_method").unwrap_or_else(|| "GET".to_string());
+        let default_method =
+            config_string(&spec.config, "default_method").unwrap_or_else(|| "GET".to_string());
         let default_url = config_string(&spec.config, "default_url");
-        let default_headers = headers_from_value(spec.config.get("headers").unwrap_or(&Value::Null));
+        let default_headers =
+            headers_from_value(spec.config.get("headers").unwrap_or(&Value::Null));
         let timeout_ms = config_u64(&spec.config, "timeout_ms");
 
         let client = {
@@ -168,7 +180,8 @@ impl Action for HttpAction {
 
     async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
         let params = &input.params;
-        let method = params_get_string(params, "method").unwrap_or_else(|| self.default_method.clone());
+        let method =
+            params_get_string(params, "method").unwrap_or_else(|| self.default_method.clone());
         let url = params_get_string(params, "url").or_else(|| self.default_url.clone());
 
         let url = match url {
@@ -208,7 +221,11 @@ impl Action for HttpAction {
         let headers_map = response
             .headers()
             .iter()
-            .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.to_string(), Value::String(s.to_string()))))
+            .filter_map(|(k, v)| {
+                v.to_str()
+                    .ok()
+                    .map(|s| (k.to_string(), Value::String(s.to_string())))
+            })
             .collect::<Map<String, Value>>();
         let body = match response.text().await {
             Ok(text) => text,

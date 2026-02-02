@@ -9,16 +9,17 @@
 //! - ThreadRuntime for lifecycle and concurrency management
 //! - ConcurrencyPolicy for deciding how to handle new inputs
 
+mod bootstrap;
 mod concurrency;
 mod interaction;
 mod orchestrator;
 mod thread;
 mod thread_runtime;
 
+pub use bootstrap::{BootstrapError, RuntimeApp};
 pub use concurrency::{
-    ConcurrencyDecision, ConcurrencyPolicy, DefaultConcurrencyPolicy,
-    ParallelConcurrencyPolicy, QueueConcurrencyPolicy, RejectWhenBusyConcurrencyPolicy,
-    RunningState,
+    ConcurrencyDecision, ConcurrencyPolicy, DefaultConcurrencyPolicy, ParallelConcurrencyPolicy,
+    QueueConcurrencyPolicy, RejectWhenBusyConcurrencyPolicy, RunningState,
 };
 pub use interaction::{Interaction, InteractionId, InteractionState};
 pub use orchestrator::{Orchestrator, OrchestratorError, OrchestratorResult};

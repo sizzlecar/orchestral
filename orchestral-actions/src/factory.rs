@@ -2,10 +2,10 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
+use orchestral_config::ActionSpec;
 use orchestral_core::action::Action;
 
 use crate::builtin::build_builtin_action;
-use crate::config::ActionSpec;
 
 /// Action factory errors
 #[derive(Debug, Error)]

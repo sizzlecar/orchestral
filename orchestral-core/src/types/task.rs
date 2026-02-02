@@ -46,7 +46,11 @@ impl TaskState {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            TaskState::Done | TaskState::Failed { recoverable: false, .. }
+            TaskState::Done
+                | TaskState::Failed {
+                    recoverable: false,
+                    ..
+                }
         )
     }
 
@@ -57,7 +61,10 @@ impl TaskState {
             TaskState::WaitingUser { .. }
                 | TaskState::WaitingEvent { .. }
                 | TaskState::Paused
-                | TaskState::Failed { recoverable: true, .. }
+                | TaskState::Failed {
+                    recoverable: true,
+                    ..
+                }
         )
     }
 

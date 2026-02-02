@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "orchestral-core",
+    "orchestral-config",
     "orchestral-context",
     "orchestral-planners",
     "orchestral-runtime",
@@ -43,6 +44,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # Internal crates
 orchestral-core = { path = "orchestral-core" }
+orchestral-config = { path = "orchestral-config" }
 orchestral-context = { path = "orchestral-context" }
 orchestral-planners = { path = "orchestral-planners" }
 orchestral-runtime = { path = "orchestral-runtime" }

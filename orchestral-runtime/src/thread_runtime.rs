@@ -9,11 +9,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use super::concurrency::{ConcurrencyDecision, ConcurrencyPolicy, DefaultConcurrencyPolicy, RunningState};
+use super::concurrency::{
+    ConcurrencyDecision, ConcurrencyPolicy, DefaultConcurrencyPolicy, RunningState,
+};
 use super::interaction::{Interaction, InteractionId, InteractionState};
 use super::thread::{Thread, ThreadId};
-use orchestral_stores::{Event, EventStore};
 use orchestral_core::types::TaskId;
+use orchestral_stores::{Event, EventStore};
 
 /// Configuration for ThreadRuntime
 #[derive(Debug, Clone)]
@@ -49,10 +51,7 @@ pub struct ThreadRuntime {
 
 impl ThreadRuntime {
     /// Create a new thread runtime
-    pub fn new(
-        thread: Thread,
-        event_store: Arc<dyn EventStore>,
-    ) -> Self {
+    pub fn new(thread: Thread, event_store: Arc<dyn EventStore>) -> Self {
         Self {
             thread: RwLock::new(thread),
             interactions: RwLock::new(HashMap::new()),
@@ -87,6 +86,22 @@ impl ThreadRuntime {
             thread: RwLock::new(thread),
             interactions: RwLock::new(HashMap::new()),
             concurrency_policy: Arc::new(DefaultConcurrencyPolicy),
+            event_store,
+            config,
+        }
+    }
+
+    /// Create a new thread runtime with custom policy and config
+    pub fn with_policy_and_config(
+        thread: Thread,
+        event_store: Arc<dyn EventStore>,
+        policy: Arc<dyn ConcurrencyPolicy>,
+        config: ThreadRuntimeConfig,
+    ) -> Self {
+        Self {
+            thread: RwLock::new(thread),
+            interactions: RwLock::new(HashMap::new()),
+            concurrency_policy: policy,
             event_store,
             config,
         }

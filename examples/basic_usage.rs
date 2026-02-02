@@ -15,8 +15,7 @@ use tokio::sync::RwLock;
 // Import from orchestral crates
 use orchestral_core::prelude::*;
 use orchestral_runtime::{
-    ConcurrencyDecision, ConcurrencyPolicy, HandleEventResult, RunningState, Thread,
-    ThreadRuntime,
+    ConcurrencyDecision, ConcurrencyPolicy, HandleEventResult, RunningState, Thread, ThreadRuntime,
 };
 use orchestral_stores::{Event, EventStore, InMemoryEventStore, InMemoryReferenceStore};
 
@@ -77,11 +76,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Created Thread: {}", thread.id);
 
     // Create ThreadRuntime with custom policy
-    let runtime = ThreadRuntime::with_policy(
-        thread,
-        event_store.clone(),
-        Arc::new(LimitedParallelPolicy),
-    );
+    let runtime =
+        ThreadRuntime::with_policy(thread, event_store.clone(), Arc::new(LimitedParallelPolicy));
 
     // Handle first event
     let event1 = Event::user_input(
