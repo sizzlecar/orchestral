@@ -8,6 +8,7 @@ members = [
     "orchestral-runtime",
     "orchestral-stores",
     "orchestral-actions",
+    "orchestral-cli",
     "examples",
 ]
 

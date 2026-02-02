@@ -119,6 +119,24 @@ async fn main() {
 cargo run --example basic_usage
 ```
 
+### CLI 运行（MVP）
+
+```bash
+# 单次执行（触发 user_input）
+cargo run -p orchestral-cli -- run "帮我生成一份日本旅行攻略"
+
+# 指定 thread_id 继续同一条链路（配合 redis store）
+cargo run -p orchestral-cli -- run --thread-id demo-thread "继续"
+
+# 交互模式
+cargo run -p orchestral-cli -- repl --thread-id demo-thread
+
+# 注入 external event（恢复 wait_event）
+cargo run -p orchestral-cli -- event emit --thread-id demo-thread --kind timer --payload '{"tick":1}'
+```
+
+`actions.actions[]` supports an optional `interface` section (`input_schema`, `output_schema`), and the planner will automatically receive these typed contracts in its prompt context.
+
 ---
 
 ## 并发策略（Concurrency Policy）

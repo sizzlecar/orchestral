@@ -877,6 +877,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "orchestral-cli"
+version = "0.1.0"
+dependencies = [
+ "orchestral-runtime",
+ "orchestral-stores",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "orchestral-config"
 version = "0.1.0"
 dependencies = [

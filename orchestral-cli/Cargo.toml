@@ -1,0 +1,13 @@
+[package]
+name = "orchestral-cli"
+description = "Command line interface for running Orchestral workflows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+orchestral-runtime = { workspace = true }
+orchestral-stores = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
