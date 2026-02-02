@@ -34,6 +34,11 @@ pub trait Action: Send + Sync {
     /// Get the action description (for LLM planning)
     fn description(&self) -> &str;
 
+    /// Get action metadata (imports/exports/schema hints for planning/runtime checks)
+    fn metadata(&self) -> ActionMeta {
+        ActionMeta::new(self.name(), self.description())
+    }
+
     /// Execute the action
     async fn run(&self, input: ActionInput, ctx: ActionContext) -> ActionResult;
 }
@@ -86,5 +91,5 @@ impl ActionMeta {
 
 /// Extract metadata from an Action implementation
 pub fn extract_meta<A: Action + ?Sized>(action: &A) -> ActionMeta {
-    ActionMeta::new(action.name(), action.description())
+    action.metadata()
 }

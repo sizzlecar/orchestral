@@ -101,7 +101,12 @@ impl<C: LlmClient> LlmPlanner<C> {
 
         user.push_str("\nReturn a JSON object with shape:\n");
         user.push_str(
-            r#"{"goal":"...","steps":[{"id":"s1","action":"action_name","kind":"action","depends_on":[],"imports":[],"exports":[],"params":{}}],"confidence":0.0}"#,
+            r#"{"goal":"...","steps":[{"id":"s1","action":"action_name","kind":"action","depends_on":[],"imports":[],"exports":[],"io_bindings":[{"from":"s1.output_key","to":"input_key","required":true}],"params":{}}],"confidence":0.0}"#,
+        );
+        user.push_str("\nRules:\n");
+        user.push_str("- Declare each step output keys in step.exports.\n");
+        user.push_str(
+            "- When a step consumes previous outputs, use io_bindings and explicit depends_on.\n",
         );
         user.push('\n');
 

@@ -326,6 +326,10 @@ pub struct Executor {
     pub action_registry: Arc<RwLock<ActionRegistry>>,
     /// Maximum parallel executions
     pub max_parallel: usize,
+    /// Whether declared imports are required at runtime.
+    pub strict_imports: bool,
+    /// Whether declared exports are required at runtime.
+    pub strict_exports: bool,
 }
 
 impl Executor {
@@ -339,12 +343,21 @@ impl Executor {
         Self {
             action_registry,
             max_parallel: 4,
+            strict_imports: true,
+            strict_exports: true,
         }
     }
 
     /// Set maximum parallel executions
     pub fn with_max_parallel(mut self, max: usize) -> Self {
         self.max_parallel = max;
+        self
+    }
+
+    /// Configure strict runtime checks for step imports/exports.
+    pub fn with_io_contract(mut self, strict_imports: bool, strict_exports: bool) -> Self {
+        self.strict_imports = strict_imports;
+        self.strict_exports = strict_exports;
         self
     }
 
@@ -422,10 +435,18 @@ impl Executor {
 
                     match result {
                         ActionResult::Success { exports } => {
+                            if let Err(error) =
+                                validate_declared_exports(&step, &exports, self.strict_exports)
+                            {
+                                dag.mark_failed(&step_id);
+                                return ExecutionResult::Failed { step_id, error };
+                            }
+
                             // Write exports to working set
                             let mut ws = ctx.working_set.write().await;
                             for (key, value) in exports {
-                                ws.set_task(key, value);
+                                ws.set_task(key.clone(), value.clone());
+                                ws.set_task(format!("{}.{}", step.id, key), value);
                             }
                             dag.mark_completed(&step_id);
                         }
@@ -475,17 +496,39 @@ impl Executor {
 
         // Build input from imports
         let mut imports = HashMap::new();
+        let mut resolved_params = step.params.clone();
         {
             let ws = ctx.working_set.read().await;
             for key in &step.imports {
                 if let Some(value) = ws.get_task(key) {
                     imports.insert(key.clone(), value.clone());
+                } else if self.strict_imports {
+                    return ActionResult::error(format!(
+                        "Missing declared import '{}' for step '{}'",
+                        key, step.id
+                    ));
+                }
+            }
+            for binding in &step.io_bindings {
+                if let Some(value) = ws.get_task(&binding.from) {
+                    imports.insert(binding.to.clone(), value.clone());
+                    if let Err(error) = bind_param_value(&mut resolved_params, &binding.to, value) {
+                        return ActionResult::error(format!(
+                            "Invalid io binding for step '{}': {}",
+                            step.id, error
+                        ));
+                    }
+                } else if binding.required {
+                    return ActionResult::error(format!(
+                        "Missing required io binding '{}' from '{}' for step '{}'",
+                        binding.to, binding.from, step.id
+                    ));
                 }
             }
         }
 
         let input = ActionInput {
-            params: step.params.clone(),
+            params: resolved_params,
             imports,
         };
 
@@ -498,5 +541,241 @@ impl Executor {
         );
 
         action.run(input, action_ctx).await
+    }
+}
+
+fn bind_param_value(
+    params: &mut serde_json::Value,
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    match params {
+        serde_json::Value::Object(map) => {
+            map.insert(key.to_string(), value.clone());
+            Ok(())
+        }
+        serde_json::Value::Null => {
+            let mut map = serde_json::Map::new();
+            map.insert(key.to_string(), value.clone());
+            *params = serde_json::Value::Object(map);
+            Ok(())
+        }
+        _ => Err("step.params must be an object (or null) when using io_bindings".to_string()),
+    }
+}
+
+fn validate_declared_exports(
+    step: &Step,
+    exports: &HashMap<String, serde_json::Value>,
+    strict_exports: bool,
+) -> Result<(), String> {
+    if !strict_exports || step.exports.is_empty() {
+        return Ok(());
+    }
+
+    for key in &step.exports {
+        match exports.get(key) {
+            Some(value) if !value.is_null() => {}
+            Some(_) => return Err(format!("Step '{}' export '{}' is null", step.id, key)),
+            None => {
+                return Err(format!(
+                    "Step '{}' missing declared export '{}'",
+                    step.id, key
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use serde_json::{json, Value};
+
+    use crate::store::{Reference, ReferenceStore, ReferenceType, StoreError};
+    use crate::types::{Plan, StepIoBinding};
+
+    struct NoopReferenceStore;
+
+    #[async_trait]
+    impl ReferenceStore for NoopReferenceStore {
+        async fn add(&self, _reference: Reference) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn get(&self, _id: &str) -> Result<Option<Reference>, StoreError> {
+            Ok(None)
+        }
+
+        async fn query_by_type(
+            &self,
+            _ref_type: &ReferenceType,
+        ) -> Result<Vec<Reference>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn query_recent(&self, _limit: usize) -> Result<Vec<Reference>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn delete(&self, _id: &str) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+    }
+
+    struct StaticAction {
+        name: String,
+        result: ActionResult,
+    }
+
+    impl StaticAction {
+        fn new(name: &str, result: ActionResult) -> Self {
+            Self {
+                name: name.to_string(),
+                result,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Action for StaticAction {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "test action"
+        }
+
+        async fn run(&self, _input: ActionInput, _ctx: ActionContext) -> ActionResult {
+            self.result.clone()
+        }
+    }
+
+    struct ConsumeContentAction;
+
+    #[async_trait]
+    impl Action for ConsumeContentAction {
+        fn name(&self) -> &str {
+            "consume_content"
+        }
+
+        fn description(&self) -> &str {
+            "consume imported content"
+        }
+
+        async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
+            let from_params = input.params.get("content").and_then(|v| v.as_str());
+            let from_imports = input.imports.get("content").and_then(|v| v.as_str());
+            match (from_params, from_imports) {
+                (Some(a), Some(b)) if a == b => {
+                    ActionResult::success_with_one("written", Value::String(a.to_string()))
+                }
+                _ => ActionResult::error("content binding not applied"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_io_binding_injects_input_for_downstream_step() {
+        tokio_test::block_on(async {
+            let mut registry = ActionRegistry::new();
+            registry.register(Arc::new(StaticAction::new(
+                "produce",
+                ActionResult::success_with_one("guide_markdown", json!("hello world")),
+            )));
+            registry.register(Arc::new(ConsumeContentAction));
+            let executor = Executor::new(registry);
+
+            let plan = Plan::new(
+                "binding flow",
+                vec![
+                    Step::action("s1", "produce").with_exports(vec!["guide_markdown".to_string()]),
+                    Step::action("s2", "consume_content")
+                        .with_depends_on(vec!["s1".to_string()])
+                        .with_io_bindings(vec![StepIoBinding::required(
+                            "s1.guide_markdown",
+                            "content",
+                        )])
+                        .with_exports(vec!["written".to_string()]),
+                ],
+            );
+            let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
+            let working_set = Arc::new(RwLock::new(WorkingSet::new()));
+            let ctx =
+                ExecutorContext::new("task-1", working_set.clone(), Arc::new(NoopReferenceStore));
+
+            let result = executor.execute(&mut dag, &ctx).await;
+            assert!(matches!(result, ExecutionResult::Completed));
+
+            let ws = working_set.read().await;
+            assert_eq!(ws.get_task("s2.written"), Some(&json!("hello world")));
+        });
+    }
+
+    #[test]
+    fn test_missing_required_binding_fails_step() {
+        tokio_test::block_on(async {
+            let mut registry = ActionRegistry::new();
+            registry.register(Arc::new(ConsumeContentAction));
+            let executor = Executor::new(registry);
+
+            let plan = Plan::new(
+                "missing binding",
+                vec![Step::action("s1", "consume_content")
+                    .with_io_bindings(vec![StepIoBinding::required(
+                        "missing.step_output",
+                        "content",
+                    )])
+                    .with_exports(vec!["written".to_string()])],
+            );
+            let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
+            let ctx = ExecutorContext::new(
+                "task-1",
+                Arc::new(RwLock::new(WorkingSet::new())),
+                Arc::new(NoopReferenceStore),
+            );
+
+            let result = executor.execute(&mut dag, &ctx).await;
+            match result {
+                ExecutionResult::Failed { error, .. } => {
+                    assert!(error.contains("Missing required io binding"));
+                }
+                _ => panic!("expected failed result"),
+            }
+        });
+    }
+
+    #[test]
+    fn test_missing_declared_export_fails_step_when_strict() {
+        tokio_test::block_on(async {
+            let mut registry = ActionRegistry::new();
+            registry.register(Arc::new(StaticAction::new(
+                "produce",
+                ActionResult::success(),
+            )));
+            let executor = Executor::new(registry).with_io_contract(true, true);
+
+            let plan = Plan::new(
+                "strict exports",
+                vec![Step::action("s1", "produce").with_exports(vec!["result".to_string()])],
+            );
+            let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
+            let ctx = ExecutorContext::new(
+                "task-1",
+                Arc::new(RwLock::new(WorkingSet::new())),
+                Arc::new(NoopReferenceStore),
+            );
+
+            let result = executor.execute(&mut dag, &ctx).await;
+            match result {
+                ExecutionResult::Failed { error, .. } => {
+                    assert!(error.contains("missing declared export"));
+                }
+                _ => panic!("expected failed result"),
+            }
+        });
     }
 }

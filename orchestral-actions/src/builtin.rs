@@ -10,7 +10,7 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 use orchestral_config::ActionSpec;
-use orchestral_core::action::{Action, ActionContext, ActionInput, ActionResult};
+use orchestral_core::action::{Action, ActionContext, ActionInput, ActionMeta, ActionResult};
 
 fn config_string(config: &Value, key: &str) -> Option<String> {
     config
@@ -117,6 +117,10 @@ impl Action for EchoAction {
         &self.description
     }
 
+    fn metadata(&self) -> ActionMeta {
+        ActionMeta::new(self.name(), self.description()).with_exports(vec!["result".to_string()])
+    }
+
     async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
         let message = input
             .params
@@ -176,6 +180,15 @@ impl Action for HttpAction {
 
     fn description(&self) -> &str {
         &self.description
+    }
+
+    fn metadata(&self) -> ActionMeta {
+        ActionMeta::new(self.name(), self.description()).with_exports(vec![
+            "status".to_string(),
+            "url".to_string(),
+            "headers".to_string(),
+            "body".to_string(),
+        ])
     }
 
     async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
@@ -273,6 +286,14 @@ impl Action for ShellAction {
         &self.description
     }
 
+    fn metadata(&self) -> ActionMeta {
+        ActionMeta::new(self.name(), self.description()).with_exports(vec![
+            "stdout".to_string(),
+            "stderr".to_string(),
+            "status".to_string(),
+        ])
+    }
+
     async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
         let params = &input.params;
         let command = match params_get_string(params, "command") {
@@ -346,6 +367,11 @@ impl Action for FileReadAction {
 
     fn description(&self) -> &str {
         &self.description
+    }
+
+    fn metadata(&self) -> ActionMeta {
+        ActionMeta::new(self.name(), self.description())
+            .with_exports(vec!["content".to_string(), "path".to_string()])
     }
 
     async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
@@ -423,6 +449,11 @@ impl Action for FileWriteAction {
 
     fn description(&self) -> &str {
         &self.description
+    }
+
+    fn metadata(&self) -> ActionMeta {
+        ActionMeta::new(self.name(), self.description())
+            .with_exports(vec!["path".to_string(), "bytes".to_string()])
     }
 
     async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {

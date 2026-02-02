@@ -197,7 +197,8 @@ impl RuntimeApp {
             None
         };
 
-        let executor = Executor::with_registry(action_registry_manager.registry());
+        let executor = Executor::with_registry(action_registry_manager.registry())
+            .with_io_contract(config.runtime.strict_imports, config.runtime.strict_exports);
         let planner = build_planner(&config)?;
 
         let mut normalizer = PlanNormalizer::new();

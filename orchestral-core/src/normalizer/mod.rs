@@ -31,6 +31,12 @@ pub enum ValidationError {
 
     #[error("Empty plan")]
     EmptyPlan,
+
+    #[error("Invalid io binding in step '{0}': {1}")]
+    InvalidIoBinding(String, String),
+
+    #[error("Step '{0}' binds from '{1}' but does not depend on that step")]
+    IoBindingMissingDependency(String, String),
 }
 
 /// Fix errors
@@ -159,6 +165,40 @@ impl PlanNormalizer {
                     ));
                 }
             }
+
+            for binding in &step.io_bindings {
+                let (source_step, source_key) = match parse_step_binding_source(&binding.from) {
+                    Some(parts) => parts,
+                    None => continue,
+                };
+
+                if !step_ids.contains(source_step.as_str()) {
+                    return Err(ValidationError::InvalidIoBinding(
+                        step.id.clone(),
+                        format!("unknown source step '{}'", source_step),
+                    ));
+                }
+                if source_step != step.id && !step.depends_on.iter().any(|dep| dep == &source_step)
+                {
+                    return Err(ValidationError::IoBindingMissingDependency(
+                        step.id.clone(),
+                        source_step,
+                    ));
+                }
+
+                if let Some(source) = plan.get_step(&source_step) {
+                    if !source.exports.is_empty() && !source.exports.iter().any(|k| k == source_key)
+                    {
+                        return Err(ValidationError::InvalidIoBinding(
+                            step.id.clone(),
+                            format!(
+                                "source key '{}' not declared in step '{}' exports",
+                                source_key, source.id
+                            ),
+                        ));
+                    }
+                }
+            }
         }
 
         // Check for unknown actions (if we have a registry)
@@ -234,6 +274,14 @@ impl PlanNormalizer {
     fn build_dag(&self, plan: &Plan) -> Result<ExecutionDag, NormalizeError> {
         ExecutionDag::from_plan(plan).map_err(NormalizeError::DagBuild)
     }
+}
+
+fn parse_step_binding_source(value: &str) -> Option<(String, &str)> {
+    let (source_step, source_key) = value.split_once('.')?;
+    if source_step.is_empty() || source_key.is_empty() {
+        return None;
+    }
+    Some((source_step.to_string(), source_key))
 }
 
 impl Default for PlanNormalizer {

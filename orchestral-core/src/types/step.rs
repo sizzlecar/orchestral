@@ -25,6 +25,42 @@ impl Default for StepKind {
     }
 }
 
+/// Data binding from an upstream task key to this step's input key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StepIoBinding {
+    /// Source task key, e.g. "s1.result" or "result"
+    pub from: String,
+    /// Target key for this step input
+    pub to: String,
+    /// Whether missing source value should fail this step
+    #[serde(default = "default_true")]
+    pub required: bool,
+}
+
+impl StepIoBinding {
+    /// Create a required binding from source key to target key
+    pub fn required(from: impl Into<String>, to: impl Into<String>) -> Self {
+        Self {
+            from: from.into(),
+            to: to.into(),
+            required: true,
+        }
+    }
+
+    /// Create an optional binding from source key to target key
+    pub fn optional(from: impl Into<String>, to: impl Into<String>) -> Self {
+        Self {
+            from: from.into(),
+            to: to.into(),
+            required: false,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
 /// A single step in the execution plan
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Step {
@@ -44,6 +80,9 @@ pub struct Step {
     /// Keys to export to WorkingSet (explicit data contract)
     #[serde(default)]
     pub exports: Vec<String>,
+    /// Explicit upstream -> current step input bindings
+    #[serde(default)]
+    pub io_bindings: Vec<StepIoBinding>,
     /// Parameters for the action
     #[serde(default)]
     pub params: Value,
@@ -59,6 +98,7 @@ impl Step {
             depends_on: Vec::new(),
             imports: Vec::new(),
             exports: Vec::new(),
+            io_bindings: Vec::new(),
             params: Value::Null,
         }
     }
@@ -72,6 +112,7 @@ impl Step {
             depends_on: Vec::new(),
             imports: Vec::new(),
             exports: Vec::new(),
+            io_bindings: Vec::new(),
             params: Value::Null,
         }
     }
@@ -85,6 +126,7 @@ impl Step {
             depends_on: Vec::new(),
             imports: Vec::new(),
             exports: Vec::new(),
+            io_bindings: Vec::new(),
             params: Value::Null,
         }
     }
@@ -104,6 +146,12 @@ impl Step {
     /// Add exports
     pub fn with_exports(mut self, exports: Vec<String>) -> Self {
         self.exports = exports;
+        self
+    }
+
+    /// Add explicit IO bindings
+    pub fn with_io_bindings(mut self, io_bindings: Vec<StepIoBinding>) -> Self {
+        self.io_bindings = io_bindings;
         self
     }
 
