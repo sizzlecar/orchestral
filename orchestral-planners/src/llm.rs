@@ -74,6 +74,7 @@ impl<C: LlmClient> LlmPlanner<C> {
     }
 
     fn build_prompt(&self, intent: &Intent, context: &PlannerContext) -> (String, String) {
+        let system = build_system_prompt(&self.config.system_prompt, context);
         let mut user = String::new();
         user.push_str(&format!("Intent:\n{}\n\n", intent.content));
 
@@ -91,27 +92,44 @@ impl<C: LlmClient> LlmPlanner<C> {
             user.push('\n');
         }
 
-        user.push_str("Available actions:\n");
-        for action in &context.available_actions {
-            user.push_str(&format!(
-                "- {}: {} (imports: {:?}, exports: {:?})\n",
-                action.name, action.description, action.imports, action.exports
-            ));
-        }
-
-        user.push_str("\nReturn a JSON object with shape:\n");
+        user.push_str("Return a JSON object with shape:\n");
         user.push_str(
-            r#"{"goal":"...","steps":[{"id":"s1","action":"action_name","kind":"action","depends_on":[],"imports":[],"exports":[],"io_bindings":[{"from":"s1.output_key","to":"input_key","required":true}],"params":{}}],"confidence":0.0}"#,
+            r#"{"goal":"...","steps":[{"id":"s1","action":"action_name","params":{},"io_bindings":[{"from":"s1.output_key","to":"input_key","required":true}]}],"confidence":0.0}"#,
         );
-        user.push_str("\nRules:\n");
-        user.push_str("- Declare each step output keys in step.exports.\n");
         user.push_str(
-            "- When a step consumes previous outputs, use io_bindings and explicit depends_on.\n",
+            "\nUse only action names listed in the system prompt Action Catalog. Return JSON only.\n",
         );
         user.push('\n');
 
-        (self.config.system_prompt.clone(), user)
+        (system, user)
     }
+}
+
+fn build_system_prompt(base: &str, context: &PlannerContext) -> String {
+    let mut system = String::new();
+    system.push_str(base.trim());
+    system.push_str("\n\nPlanning Rules:\n");
+    system.push_str("1) Return ONLY one valid JSON object matching the required Plan schema.\n");
+    system.push_str("2) step.id must be unique and stable.\n");
+    system.push_str("3) step.params must satisfy the selected action input_schema.\n");
+    system.push_str(
+        "4) Prefer minimal steps: output action + params + io_bindings; omit optional fields unless needed.\n",
+    );
+    system.push_str("5) If a step consumes upstream output, declare io_bindings.\n");
+    system.push_str("6) Do not invent action names not listed in Action Catalog.\n");
+    system
+        .push_str("7) If requirements are unclear, prefer wait_user step to ask clarification.\n");
+    system.push_str(
+        "8) For wait_user/wait_event/system steps, set kind explicitly; normal action steps can omit kind.\n",
+    );
+    system.push_str("\nAction Catalog:\n");
+    for action in &context.available_actions {
+        system.push_str(&format!(
+            "- name: {}\n  description: {}\n  input_schema: {}\n  output_schema: {}\n",
+            action.name, action.description, action.input_schema, action.output_schema
+        ));
+    }
+    system
 }
 
 #[async_trait]
@@ -285,4 +303,72 @@ fn extract_json(text: &str) -> Option<String> {
         return None;
     }
     Some(text[start..=end].to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use orchestral_core::action::ActionMeta;
+    use orchestral_core::planner::PlannerContext;
+    use orchestral_core::store::{Reference, ReferenceStore, ReferenceType, StoreError};
+    use orchestral_core::types::Intent;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    struct NoopReferenceStore;
+
+    #[async_trait]
+    impl ReferenceStore for NoopReferenceStore {
+        async fn add(&self, _reference: Reference) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn get(&self, _id: &str) -> Result<Option<Reference>, StoreError> {
+            Ok(None)
+        }
+
+        async fn query_by_type(
+            &self,
+            _ref_type: &ReferenceType,
+        ) -> Result<Vec<Reference>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn query_recent(&self, _limit: usize) -> Result<Vec<Reference>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn delete(&self, _id: &str) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+    }
+
+    #[test]
+    fn test_system_prompt_contains_action_catalog_with_schema() {
+        let planner = LlmPlanner::new(
+            MockLlmClient {
+                response: "{}".to_string(),
+            },
+            LlmPlannerConfig {
+                system_prompt: "Base prompt.".to_string(),
+                ..LlmPlannerConfig::default()
+            },
+        );
+
+        let actions = vec![ActionMeta::new("write_doc", "Write markdown to file")
+            .with_input_schema(json!({"type":"object","properties":{"path":{"type":"string"}}}))
+            .with_output_schema(
+                json!({"type":"object","properties":{"path":{"type":"string"},"bytes":{"type":"integer"}}}),
+            )];
+        let context = PlannerContext::new(actions, Arc::new(NoopReferenceStore));
+        let intent = Intent::new("generate a guide");
+        let (system, _user) = planner.build_prompt(&intent, &context);
+
+        assert!(system.contains("Action Catalog"));
+        assert!(system.contains("write_doc"));
+        assert!(system.contains("\"path\""));
+        assert!(system.contains("input_schema"));
+        assert!(system.contains("output_schema"));
+    }
 }

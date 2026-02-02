@@ -8,7 +8,7 @@ mod actions;
 mod loader;
 mod providers;
 
-pub use actions::{ActionSpec, ActionsConfig};
+pub use actions::{ActionInterfaceSpec, ActionSpec, ActionsConfig};
 pub use loader::{
     load_actions_config, load_config, load_providers_config, ConfigError, ConfigManager,
     ConfigWatcher,

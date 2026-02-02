@@ -12,6 +12,7 @@ use orchestral_actions::{
 };
 use orchestral_config::{ConfigError, ConfigManager, OrchestralConfig, StoreSpec};
 use orchestral_context::{BasicContextBuilder, TokenBudget};
+use orchestral_core::action::extract_meta;
 use orchestral_core::executor::Executor;
 use orchestral_core::normalizer::PlanNormalizer;
 use orchestral_core::planner::{PlanError, Planner, PlannerContext};
@@ -205,7 +206,11 @@ impl RuntimeApp {
         {
             let registry = executor.action_registry.read().await;
             for name in registry.names() {
-                normalizer.register_action(name);
+                if let Some(action) = registry.get(&name) {
+                    normalizer.register_action_meta(&extract_meta(action.as_ref()));
+                } else {
+                    normalizer.register_action(name);
+                }
             }
         }
 

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -118,7 +118,20 @@ impl Action for EchoAction {
     }
 
     fn metadata(&self) -> ActionMeta {
-        ActionMeta::new(self.name(), self.description()).with_exports(vec!["result".to_string()])
+        ActionMeta::new(self.name(), self.description())
+            .with_input_schema(json!({
+                "type": "object",
+                "properties": {
+                    "message": { "type": "string" }
+                }
+            }))
+            .with_output_schema(json!({
+                "type": "object",
+                "properties": {
+                    "result": { "type": "string" }
+                },
+                "required": ["result"]
+            }))
     }
 
     async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
@@ -183,12 +196,27 @@ impl Action for HttpAction {
     }
 
     fn metadata(&self) -> ActionMeta {
-        ActionMeta::new(self.name(), self.description()).with_exports(vec![
-            "status".to_string(),
-            "url".to_string(),
-            "headers".to_string(),
-            "body".to_string(),
-        ])
+        ActionMeta::new(self.name(), self.description())
+            .with_input_schema(json!({
+                "type": "object",
+                "properties": {
+                    "method": { "type": "string" },
+                    "url": { "type": "string" },
+                    "headers": { "type": "object" },
+                    "body": {},
+                    "json": {}
+                }
+            }))
+            .with_output_schema(json!({
+                "type": "object",
+                "properties": {
+                    "status": { "type": "integer" },
+                    "url": { "type": "string" },
+                    "headers": { "type": "object" },
+                    "body": { "type": "string" }
+                },
+                "required": ["status", "url", "headers", "body"]
+            }))
     }
 
     async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
@@ -287,11 +315,24 @@ impl Action for ShellAction {
     }
 
     fn metadata(&self) -> ActionMeta {
-        ActionMeta::new(self.name(), self.description()).with_exports(vec![
-            "stdout".to_string(),
-            "stderr".to_string(),
-            "status".to_string(),
-        ])
+        ActionMeta::new(self.name(), self.description())
+            .with_input_schema(json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" },
+                    "args": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["command"]
+            }))
+            .with_output_schema(json!({
+                "type": "object",
+                "properties": {
+                    "stdout": { "type": "string" },
+                    "stderr": { "type": "string" },
+                    "status": { "type": "integer" }
+                },
+                "required": ["stdout", "stderr", "status"]
+            }))
     }
 
     async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
@@ -371,7 +412,21 @@ impl Action for FileReadAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
-            .with_exports(vec!["content".to_string(), "path".to_string()])
+            .with_input_schema(json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" }
+                },
+                "required": ["path"]
+            }))
+            .with_output_schema(json!({
+                "type": "object",
+                "properties": {
+                    "content": { "type": "string" },
+                    "path": { "type": "string" }
+                },
+                "required": ["content", "path"]
+            }))
     }
 
     async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
@@ -453,7 +508,23 @@ impl Action for FileWriteAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
-            .with_exports(vec!["path".to_string(), "bytes".to_string()])
+            .with_input_schema(json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "content": { "type": "string" },
+                    "append": { "type": "boolean" }
+                },
+                "required": ["path", "content"]
+            }))
+            .with_output_schema(json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "bytes": { "type": "integer" }
+                },
+                "required": ["path", "bytes"]
+            }))
     }
 
     async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {

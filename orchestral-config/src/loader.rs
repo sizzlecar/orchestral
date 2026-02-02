@@ -173,6 +173,20 @@ fn validate_actions(config: &ActionsConfig) -> Result<(), ConfigError> {
                 "action kind must not be empty".to_string(),
             ));
         }
+        if let Some(interface) = &spec.interface {
+            if !interface.input_schema.is_null() && !interface.input_schema.is_object() {
+                return Err(ConfigError::Invalid(format!(
+                    "action '{}' interface.input_schema must be an object",
+                    spec.name
+                )));
+            }
+            if !interface.output_schema.is_null() && !interface.output_schema.is_object() {
+                return Err(ConfigError::Invalid(format!(
+                    "action '{}' interface.output_schema must be an object",
+                    spec.name
+                )));
+            }
+        }
     }
     Ok(())
 }

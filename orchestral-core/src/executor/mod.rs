@@ -493,6 +493,7 @@ impl Executor {
             Some(a) => a,
             None => return ActionResult::error(format!("Action '{}' not found", step.action)),
         };
+        let action_meta = action.metadata();
 
         // Build input from imports
         let mut imports = HashMap::new();
@@ -527,6 +528,16 @@ impl Executor {
             }
         }
 
+        if let Err(error) = validate_schema(
+            &resolved_params,
+            &action_meta.input_schema,
+            "input",
+            &step.id,
+            &step.action,
+        ) {
+            return ActionResult::error(error);
+        }
+
         let input = ActionInput {
             params: resolved_params,
             imports,
@@ -540,7 +551,164 @@ impl Executor {
             ctx.reference_store.clone(),
         );
 
-        action.run(input, action_ctx).await
+        let result = action.run(input, action_ctx).await;
+        match result {
+            ActionResult::Success { exports } => {
+                let export_value = serde_json::Value::Object(
+                    exports
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                );
+                if let Err(error) = validate_schema(
+                    &export_value,
+                    &action_meta.output_schema,
+                    "output",
+                    &step.id,
+                    &step.action,
+                ) {
+                    return ActionResult::error(error);
+                }
+                ActionResult::Success { exports }
+            }
+            other => other,
+        }
+    }
+}
+
+fn validate_schema(
+    value: &serde_json::Value,
+    schema: &serde_json::Value,
+    label: &str,
+    step_id: &str,
+    action: &str,
+) -> Result<(), String> {
+    if schema.is_null() {
+        return Ok(());
+    }
+
+    validate_value_against_schema(value, schema, "$").map_err(|reason| {
+        format!(
+            "Step '{}' action '{}' {} schema validation failed: {}",
+            step_id, action, label, reason
+        )
+    })
+}
+
+fn validate_value_against_schema(
+    value: &serde_json::Value,
+    schema: &serde_json::Value,
+    path: &str,
+) -> Result<(), String> {
+    let schema_obj = schema
+        .as_object()
+        .ok_or_else(|| format!("schema at '{}' must be an object", path))?;
+
+    if let Some(type_spec) = schema_obj.get("type") {
+        validate_json_type(value, type_spec, path)?;
+    }
+
+    if let Some(constant) = schema_obj.get("const") {
+        if value != constant {
+            return Err(format!("{} expected const {}", path, constant));
+        }
+    }
+
+    if let Some(variants) = schema_obj.get("enum").and_then(|v| v.as_array()) {
+        if !variants.iter().any(|candidate| candidate == value) {
+            return Err(format!("{} is not one of the allowed enum values", path));
+        }
+    }
+
+    if let Some(required) = schema_obj.get("required").and_then(|v| v.as_array()) {
+        let object = value
+            .as_object()
+            .ok_or_else(|| format!("{} must be an object for required fields", path))?;
+        for key in required.iter().filter_map(|v| v.as_str()) {
+            if !object.contains_key(key) {
+                return Err(format!("{} missing required field '{}'", path, key));
+            }
+        }
+    }
+
+    if let Some(properties) = schema_obj.get("properties").and_then(|v| v.as_object()) {
+        let object = value
+            .as_object()
+            .ok_or_else(|| format!("{} must be an object for properties validation", path))?;
+        for (key, property_schema) in properties {
+            if let Some(child_value) = object.get(key) {
+                let child_path = format!("{}.{}", path, key);
+                validate_value_against_schema(child_value, property_schema, &child_path)?;
+            }
+        }
+
+        if schema_obj
+            .get("additionalProperties")
+            .and_then(|v| v.as_bool())
+            == Some(false)
+        {
+            for key in object.keys() {
+                if !properties.contains_key(key) {
+                    return Err(format!("{} contains unknown field '{}'", path, key));
+                }
+            }
+        }
+    }
+
+    if let Some(item_schema) = schema_obj.get("items") {
+        let array = value
+            .as_array()
+            .ok_or_else(|| format!("{} must be an array for items validation", path))?;
+        for (idx, item) in array.iter().enumerate() {
+            let item_path = format!("{}[{}]", path, idx);
+            validate_value_against_schema(item, item_schema, &item_path)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_json_type(
+    value: &serde_json::Value,
+    type_spec: &serde_json::Value,
+    path: &str,
+) -> Result<(), String> {
+    let matches = |t: &str, v: &serde_json::Value| match t {
+        "object" => v.is_object(),
+        "array" => v.is_array(),
+        "string" => v.is_string(),
+        "number" => v.is_number(),
+        "integer" => v.as_i64().is_some() || v.as_u64().is_some(),
+        "boolean" => v.is_boolean(),
+        "null" => v.is_null(),
+        _ => false,
+    };
+
+    match type_spec {
+        serde_json::Value::String(type_name) => {
+            if matches(type_name, value) {
+                Ok(())
+            } else {
+                Err(format!("{} expected type '{}'", path, type_name))
+            }
+        }
+        serde_json::Value::Array(types) => {
+            let mut any_match = false;
+            for ty in types {
+                if let Some(type_name) = ty.as_str() {
+                    if matches(type_name, value) {
+                        any_match = true;
+                        break;
+                    }
+                }
+            }
+            if any_match {
+                Ok(())
+            } else {
+                Err(format!("{} did not match any allowed types", path))
+            }
+        }
+        _ => Err(format!("{} schema.type must be string or array", path)),
     }
 }
 
@@ -594,6 +762,7 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::{json, Value};
 
+    use crate::action::ActionMeta;
     use crate::store::{Reference, ReferenceStore, ReferenceType, StoreError};
     use crate::types::{Plan, StepIoBinding};
 
@@ -628,6 +797,7 @@ mod tests {
     struct StaticAction {
         name: String,
         result: ActionResult,
+        metadata: Option<ActionMeta>,
     }
 
     impl StaticAction {
@@ -635,7 +805,13 @@ mod tests {
             Self {
                 name: name.to_string(),
                 result,
+                metadata: None,
             }
+        }
+
+        fn with_metadata(mut self, metadata: ActionMeta) -> Self {
+            self.metadata = Some(metadata);
+            self
         }
     }
 
@@ -647,6 +823,12 @@ mod tests {
 
         fn description(&self) -> &str {
             "test action"
+        }
+
+        fn metadata(&self) -> ActionMeta {
+            self.metadata
+                .clone()
+                .unwrap_or_else(|| ActionMeta::new(self.name(), self.description()))
         }
 
         async fn run(&self, _input: ActionInput, _ctx: ActionContext) -> ActionResult {
@@ -773,6 +955,88 @@ mod tests {
             match result {
                 ExecutionResult::Failed { error, .. } => {
                     assert!(error.contains("missing declared export"));
+                }
+                _ => panic!("expected failed result"),
+            }
+        });
+    }
+
+    #[test]
+    fn test_input_schema_validation_fails_on_wrong_type() {
+        tokio_test::block_on(async {
+            let action = StaticAction::new("typed_input", ActionResult::success()).with_metadata(
+                ActionMeta::new("typed_input", "typed input").with_input_schema(json!({
+                    "type": "object",
+                    "properties": {
+                        "count": { "type": "integer" }
+                    },
+                    "required": ["count"]
+                })),
+            );
+
+            let mut registry = ActionRegistry::new();
+            registry.register(Arc::new(action));
+            let executor = Executor::new(registry);
+
+            let plan = Plan::new(
+                "typed input fail",
+                vec![Step::action("s1", "typed_input").with_params(json!({
+                    "count": "not-integer"
+                }))],
+            );
+            let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
+            let ctx = ExecutorContext::new(
+                "task-1",
+                Arc::new(RwLock::new(WorkingSet::new())),
+                Arc::new(NoopReferenceStore),
+            );
+
+            let result = executor.execute(&mut dag, &ctx).await;
+            match result {
+                ExecutionResult::Failed { error, .. } => {
+                    assert!(error.contains("input schema validation failed"));
+                }
+                _ => panic!("expected failed result"),
+            }
+        });
+    }
+
+    #[test]
+    fn test_output_schema_validation_fails_on_wrong_type() {
+        tokio_test::block_on(async {
+            let action = StaticAction::new(
+                "typed_output",
+                ActionResult::success_with_one("bytes", json!("wrong")),
+            )
+            .with_metadata(
+                ActionMeta::new("typed_output", "typed output").with_output_schema(json!({
+                    "type": "object",
+                    "properties": {
+                        "bytes": { "type": "integer" }
+                    },
+                    "required": ["bytes"]
+                })),
+            );
+
+            let mut registry = ActionRegistry::new();
+            registry.register(Arc::new(action));
+            let executor = Executor::new(registry);
+
+            let plan = Plan::new(
+                "typed output fail",
+                vec![Step::action("s1", "typed_output")],
+            );
+            let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
+            let ctx = ExecutorContext::new(
+                "task-1",
+                Arc::new(RwLock::new(WorkingSet::new())),
+                Arc::new(NoopReferenceStore),
+            );
+
+            let result = executor.execute(&mut dag, &ctx).await;
+            match result {
+                ExecutionResult::Failed { error, .. } => {
+                    assert!(error.contains("output schema validation failed"));
                 }
                 _ => panic!("expected failed result"),
             }

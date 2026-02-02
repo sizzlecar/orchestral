@@ -16,7 +16,7 @@ mod loader;
 pub use orchestral_core::action::{Action, ActionContext, ActionInput, ActionMeta, ActionResult};
 
 // Re-export config types from orchestral-config
-pub use orchestral_config::{ActionSpec, ActionsConfig};
+pub use orchestral_config::{ActionInterfaceSpec, ActionSpec, ActionsConfig};
 
 pub use builtin::*;
 pub use factory::{ActionBuildError, ActionFactory, DefaultActionFactory};

@@ -11,8 +11,9 @@
 
 use thiserror::Error;
 
+use crate::action::ActionMeta;
 use crate::executor::ExecutionDag;
-use crate::types::Plan;
+use crate::types::{Plan, StepKind};
 
 /// Validation errors
 #[derive(Debug, Error)]
@@ -88,8 +89,8 @@ pub struct NormalizedPlan {
 pub struct PlanNormalizer {
     validators: Vec<Box<dyn PlanValidator>>,
     fixers: Vec<Box<dyn PlanFixer>>,
-    /// Set of known action names
-    known_actions: std::collections::HashSet<String>,
+    /// Known action contracts keyed by action name.
+    known_actions: std::collections::HashMap<String, ActionContract>,
 }
 
 impl PlanNormalizer {
@@ -98,7 +99,7 @@ impl PlanNormalizer {
         Self {
             validators: Vec::new(),
             fixers: Vec::new(),
-            known_actions: std::collections::HashSet::new(),
+            known_actions: std::collections::HashMap::new(),
         }
     }
 
@@ -114,7 +115,16 @@ impl PlanNormalizer {
 
     /// Register a known action
     pub fn register_action(&mut self, name: impl Into<String>) {
-        self.known_actions.insert(name.into());
+        self.known_actions
+            .entry(name.into())
+            .or_insert_with(ActionContract::default);
+    }
+
+    /// Register a known action with metadata-derived contract.
+    pub fn register_action_meta(&mut self, meta: &ActionMeta) {
+        let output_keys = output_keys_from_schema(&meta.output_schema);
+        self.known_actions
+            .insert(meta.name.clone(), ActionContract { output_keys });
     }
 
     /// Normalize a plan
@@ -124,15 +134,18 @@ impl PlanNormalizer {
             fixer.fix(&mut plan)?;
         }
 
-        // Step 2: Run built-in validations
+        // Step 2: Apply built-in normalization derived from action contracts.
+        self.apply_implicit_contracts(&mut plan);
+
+        // Step 3: Run built-in validations
         self.validate_basic(&plan)?;
 
-        // Step 3: Run custom validators
+        // Step 4: Run custom validators
         for validator in &self.validators {
             validator.validate(&plan)?;
         }
 
-        // Step 4: Build the execution DAG
+        // Step 5: Build the execution DAG
         let dag = self.build_dag(&plan)?;
 
         Ok(NormalizedPlan { plan, dag })
@@ -204,7 +217,10 @@ impl PlanNormalizer {
         // Check for unknown actions (if we have a registry)
         if !self.known_actions.is_empty() {
             for step in &plan.steps {
-                if !self.known_actions.contains(&step.action) {
+                if step.kind != StepKind::Action {
+                    continue;
+                }
+                if !self.known_actions.contains_key(&step.action) {
                     return Err(ValidationError::UnknownAction(step.action.clone()));
                 }
             }
@@ -276,6 +292,48 @@ impl PlanNormalizer {
     }
 }
 
+#[derive(Debug, Default, Clone)]
+struct ActionContract {
+    output_keys: Vec<String>,
+}
+
+impl PlanNormalizer {
+    fn apply_implicit_contracts(&self, plan: &mut Plan) {
+        for step in &mut plan.steps {
+            infer_special_step_kind(step);
+            derive_depends_on_from_bindings(step);
+
+            if let Some(contract) = self.known_actions.get(&step.action) {
+                if !contract.output_keys.is_empty() {
+                    step.exports = contract.output_keys.clone();
+                }
+            }
+        }
+    }
+}
+
+fn infer_special_step_kind(step: &mut crate::types::Step) {
+    if step.kind != StepKind::Action {
+        return;
+    }
+
+    match step.action.as_str() {
+        "wait_user" => step.kind = StepKind::WaitUser,
+        "wait_event" => step.kind = StepKind::WaitEvent,
+        _ => {}
+    }
+}
+
+fn derive_depends_on_from_bindings(step: &mut crate::types::Step) {
+    for binding in &step.io_bindings {
+        if let Some((source_step, _)) = parse_step_binding_source(&binding.from) {
+            if source_step != step.id && !step.depends_on.iter().any(|dep| dep == &source_step) {
+                step.depends_on.push(source_step);
+            }
+        }
+    }
+}
+
 fn parse_step_binding_source(value: &str) -> Option<(String, &str)> {
     let (source_step, source_key) = value.split_once('.')?;
     if source_step.is_empty() || source_key.is_empty() {
@@ -284,8 +342,89 @@ fn parse_step_binding_source(value: &str) -> Option<(String, &str)> {
     Some((source_step.to_string(), source_key))
 }
 
+fn output_keys_from_schema(schema: &serde_json::Value) -> Vec<String> {
+    let Some(schema_obj) = schema.as_object() else {
+        return Vec::new();
+    };
+
+    let required: Vec<String> = schema_obj
+        .get("required")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !required.is_empty() {
+        return required;
+    }
+
+    schema_obj
+        .get("properties")
+        .and_then(|v| v.as_object())
+        .map(|props| props.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
 impl Default for PlanNormalizer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Step, StepIoBinding};
+    use serde_json::json;
+
+    #[test]
+    fn test_normalizer_derives_depends_on_from_io_bindings() {
+        let mut normalizer = PlanNormalizer::new();
+        normalizer.register_action("produce");
+        normalizer.register_action("consume");
+
+        let plan = Plan::new(
+            "derive deps",
+            vec![
+                Step::action("s1", "produce"),
+                Step::action("s2", "consume")
+                    .with_io_bindings(vec![StepIoBinding::required("s1.result", "content")]),
+            ],
+        );
+
+        let normalized = normalizer.normalize(plan).expect("normalize");
+        let step2 = normalized.plan.get_step("s2").expect("s2");
+        assert_eq!(step2.depends_on, vec!["s1".to_string()]);
+    }
+
+    #[test]
+    fn test_normalizer_populates_exports_from_action_output_schema() {
+        let mut normalizer = PlanNormalizer::new();
+        normalizer.register_action_meta(&ActionMeta::new("write_doc", "write").with_output_schema(
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "bytes": { "type": "integer" }
+                },
+                "required": ["path", "bytes"]
+            }),
+        ));
+
+        let plan = Plan::new("exports", vec![Step::action("s1", "write_doc")]);
+        let normalized = normalizer.normalize(plan).expect("normalize");
+        let step = normalized.plan.get_step("s1").expect("s1");
+        assert_eq!(step.exports, vec!["path".to_string(), "bytes".to_string()]);
+    }
+
+    #[test]
+    fn test_normalizer_infers_wait_user_kind_from_action_name() {
+        let normalizer = PlanNormalizer::new();
+        let plan = Plan::new("wait", vec![Step::action("s1", "wait_user")]);
+        let normalized = normalizer.normalize(plan).expect("normalize");
+        let step = normalized.plan.get_step("s1").expect("s1");
+        assert_eq!(step.kind, StepKind::WaitUser);
     }
 }

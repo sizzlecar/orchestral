@@ -44,6 +44,9 @@ pub struct ActionSpec {
     /// Action-specific configuration.
     #[serde(default)]
     pub config: Value,
+    /// Optional declared action interface (typed input/output contract).
+    #[serde(default)]
+    pub interface: Option<ActionInterfaceSpec>,
 }
 
 impl ActionSpec {
@@ -60,4 +63,16 @@ impl ActionSpec {
             .get(key)
             .and_then(|v| serde_json::from_value(v.clone()).ok())
     }
+}
+
+/// Action interface declaration used for planning and IO contracts.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ActionInterfaceSpec {
+    /// JSON Schema describing resolved action input.
+    /// Backward-compatible alias: params_schema.
+    #[serde(default, alias = "params_schema")]
+    pub input_schema: Value,
+    /// JSON Schema describing action output (exports map).
+    #[serde(default)]
+    pub output_schema: Value,
 }
