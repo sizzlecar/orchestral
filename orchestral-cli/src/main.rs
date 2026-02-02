@@ -3,6 +3,7 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 use serde_json::{json, Value};
+use tokio::sync::watch;
 
 use orchestral_runtime::{ExecutionResult, OrchestratorResult, RuntimeApp};
 use orchestral_stores::Event;
@@ -48,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let thread_id = app.orchestrator.thread_runtime.thread_id().await;
             println!("thread_id={}", thread_id);
             let event = Event::user_input(&thread_id, "cli", json!({ "message": input }));
-            let result = app.orchestrator.handle_event(event).await?;
+            let result = handle_event_with_live_progress(&app, event).await?;
             print_result(&result);
         }
         CliCommand::Repl { config, thread_id } => {
@@ -62,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let app = build_app(&config, Some(&thread_id)).await?;
             let event = Event::external(&thread_id, kind, payload);
-            let result = app.orchestrator.handle_event(event).await?;
+            let result = handle_event_with_live_progress(&app, event).await?;
             print_result(&result);
         }
         CliCommand::Help => print_usage(),
@@ -120,7 +121,7 @@ async fn run_repl(
             Event::user_input(&thread_id, "cli", json!({ "message": trimmed }))
         };
 
-        let result = app.orchestrator.handle_event(event).await?;
+        let result = handle_event_with_live_progress(&app, event).await?;
         print_result(&result);
         write!(stdout, "> ")?;
         stdout.flush()?;
@@ -294,6 +295,78 @@ fn parse_event_command(args: &[String]) -> Result<CliCommand, String> {
 
 fn parse_payload(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
+}
+
+async fn handle_event_with_live_progress(
+    app: &RuntimeApp,
+    event: Event,
+) -> Result<OrchestratorResult, Box<dyn std::error::Error>> {
+    let thread_id = app.orchestrator.thread_runtime.thread_id().await;
+    let mut rx = app.orchestrator.thread_runtime.subscribe_events();
+    let (stop_tx, mut stop_rx) = watch::channel(false);
+
+    let progress_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                changed = stop_rx.changed() => {
+                    if changed.is_err() || *stop_rx.borrow() {
+                        break;
+                    }
+                }
+                event = rx.recv() => {
+                    match event {
+                        Ok(event) => {
+                            if event.thread_id() != thread_id {
+                                continue;
+                            }
+                            if let Some(line) = format_progress_event(&event) {
+                                println!("{}", line);
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        }
+    });
+
+    let result = app.orchestrator.handle_event(event).await;
+    let _ = stop_tx.send(true);
+    let _ = progress_task.await;
+
+    result.map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
+}
+
+fn format_progress_event(event: &Event) -> Option<String> {
+    let Event::SystemTrace { payload, .. } = event else {
+        return None;
+    };
+
+    if payload.get("category").and_then(|v| v.as_str()) != Some("execution_progress") {
+        return None;
+    }
+
+    let phase = payload
+        .get("phase")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown_phase");
+    let task_id = payload
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown_task");
+    let step = payload.get("step_id").and_then(|v| v.as_str()).unwrap_or("-");
+    let action = payload.get("action").and_then(|v| v.as_str()).unwrap_or("-");
+    let message = payload.get("message").and_then(|v| v.as_str());
+
+    let mut line = format!(
+        "progress task_id={} step_id={} action={} phase={}",
+        task_id, step, action, phase
+    );
+    if let Some(message) = message {
+        line.push_str(&format!(" message={}", message));
+    }
+    Some(line)
 }
 
 fn print_result(result: &OrchestratorResult) {
