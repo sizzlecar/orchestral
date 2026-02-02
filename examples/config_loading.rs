@@ -54,9 +54,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let factory = DefaultLlmClientFactory::new();
 
     // Try to get default backend + model profile
-    if let (Some(backend), Some(profile)) =
-        (providers.get_default_backend(), providers.get_default_model())
-    {
+    if let (Some(backend), Some(profile)) = (
+        providers.get_default_backend(),
+        providers.get_default_model(),
+    ) {
         println!("Attempting to create client:");
         println!("  Backend: {} ({})", backend.name, backend.kind);
         println!("  Model Profile: {}", profile.name);

@@ -207,16 +207,14 @@ fn build_planner(config: &OrchestralConfig) -> Result<Arc<dyn Planner>, Bootstra
                     .ok_or(BootstrapError::MissingProviderConfig)?
             };
 
-            let profile = if let Some(profile_name) = &config.planner.model_profile {
-                Some(
-                    config
-                        .providers
-                        .get_model(profile_name)
-                        .ok_or_else(|| BootstrapError::ModelProfileNotFound(profile_name.clone()))?,
-                )
-            } else {
-                config.providers.get_default_model()
-            };
+            let profile =
+                if let Some(profile_name) = &config.planner.model_profile {
+                    Some(config.providers.get_model(profile_name).ok_or_else(|| {
+                        BootstrapError::ModelProfileNotFound(profile_name.clone())
+                    })?)
+                } else {
+                    config.providers.get_default_model()
+                };
 
             let model = config
                 .planner

@@ -80,7 +80,10 @@ impl ProvidersConfig {
 
     /// List all model profile names.
     pub fn model_names(&self) -> Vec<String> {
-        self.normalized_models().into_iter().map(|m| m.name).collect()
+        self.normalized_models()
+            .into_iter()
+            .map(|m| m.name)
+            .collect()
     }
 
     /// Compatibility alias: returns backend names.
@@ -169,7 +172,10 @@ pub struct BackendSpec {
 impl BackendSpec {
     /// Resolve the API key from environment variable.
     pub fn resolve_api_key(&self) -> Result<String, ApiKeyError> {
-        let env_name = self.api_key_env.as_ref().ok_or(ApiKeyError::NotConfigured)?;
+        let env_name = self
+            .api_key_env
+            .as_ref()
+            .ok_or(ApiKeyError::NotConfigured)?;
         std::env::var(env_name).map_err(|_| ApiKeyError::EnvNotFound(env_name.clone()))
     }
 
