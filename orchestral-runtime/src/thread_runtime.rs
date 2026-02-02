@@ -302,6 +302,64 @@ impl ThreadRuntime {
         }
     }
 
+    /// Find a waiting interaction that can be resumed by this event.
+    pub async fn find_resume_interaction(&self, event: &Event) -> Option<InteractionId> {
+        let target_state = match event {
+            Event::UserInput { .. } => InteractionState::WaitingUser,
+            Event::ExternalEvent { .. } => InteractionState::WaitingEvent,
+            _ => return None,
+        };
+
+        let interactions = self.interactions.read().await;
+        interactions
+            .values()
+            .filter(|i| i.state == target_state)
+            .max_by_key(|i| i.started_at)
+            .map(|i| i.id.clone())
+    }
+
+    /// Append an event to an existing interaction and keep event/interaction IDs consistent.
+    pub async fn append_event_to_interaction(
+        &self,
+        interaction_id: &str,
+        event: Event,
+    ) -> Result<(), RuntimeError> {
+        self.validate_event(&event).await?;
+
+        let exists = {
+            let interactions = self.interactions.read().await;
+            interactions.contains_key(interaction_id)
+        };
+        if !exists {
+            return Err(RuntimeError::InteractionNotFound(
+                interaction_id.to_string(),
+            ));
+        }
+
+        self.event_store
+            .append(event.with_interaction_id(interaction_id))
+            .await
+            .map_err(|e| RuntimeError::StoreError(e.to_string()))?;
+        self.thread.write().await.touch();
+        Ok(())
+    }
+
+    /// Mark a waiting interaction active so execution can continue.
+    pub async fn resume_interaction(&self, id: &str) -> Result<(), RuntimeError> {
+        let mut interactions = self.interactions.write().await;
+        let interaction = interactions
+            .get_mut(id)
+            .ok_or_else(|| RuntimeError::InteractionNotFound(id.to_string()))?;
+        if interaction.state.is_terminal() {
+            return Err(RuntimeError::InvalidEvent(format!(
+                "interaction '{}' is terminal and cannot be resumed",
+                id
+            )));
+        }
+        interaction.resume();
+        Ok(())
+    }
+
     /// Update an interaction's state
     pub async fn update_interaction_state(
         &self,
@@ -411,4 +469,75 @@ pub enum RuntimeError {
 
     #[error("Invalid event: {0}")]
     InvalidEvent(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+    use orchestral_stores::InMemoryEventStore;
+    use serde_json::json;
+
+    #[test]
+    fn test_find_resume_interaction_prefers_latest_waiting_user() {
+        tokio_test::block_on(async {
+            let thread_id = "thread-1";
+            let runtime = ThreadRuntime::new(
+                Thread::with_id(thread_id),
+                Arc::new(InMemoryEventStore::new()),
+            );
+
+            {
+                let mut interactions = runtime.interactions.write().await;
+
+                let mut older = Interaction::with_id("older", thread_id);
+                older.set_state(InteractionState::WaitingUser);
+                older.started_at = Utc::now() - Duration::seconds(10);
+                interactions.insert(older.id.clone(), older);
+
+                let mut newer = Interaction::with_id("newer", thread_id);
+                newer.set_state(InteractionState::WaitingUser);
+                newer.started_at = Utc::now();
+                interactions.insert(newer.id.clone(), newer);
+            }
+
+            let event = Event::user_input(thread_id, "ignored", json!({"message":"resume"}));
+            let found = runtime.find_resume_interaction(&event).await;
+            assert_eq!(found.as_deref(), Some("newer"));
+        });
+    }
+
+    #[test]
+    fn test_append_event_to_interaction_rewrites_user_interaction_id() {
+        tokio_test::block_on(async {
+            let thread_id = "thread-1";
+            let runtime = ThreadRuntime::new(
+                Thread::with_id(thread_id),
+                Arc::new(InMemoryEventStore::new()),
+            );
+
+            {
+                let mut interactions = runtime.interactions.write().await;
+                interactions.insert(
+                    "target".to_string(),
+                    Interaction::with_id("target", thread_id),
+                );
+            }
+
+            let event = Event::user_input(thread_id, "wrong", json!({"text":"hello"}));
+            runtime
+                .append_event_to_interaction("target", event)
+                .await
+                .unwrap();
+
+            let events = runtime.query_history(0).await.unwrap();
+            assert_eq!(events.len(), 1);
+            match &events[0] {
+                Event::UserInput { interaction_id, .. } => {
+                    assert_eq!(interaction_id, "target");
+                }
+                _ => panic!("expected user_input event"),
+            }
+        });
+    }
 }

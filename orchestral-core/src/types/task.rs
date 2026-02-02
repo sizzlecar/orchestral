@@ -4,6 +4,8 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
 
 use super::{Intent, Plan};
 
@@ -86,6 +88,12 @@ pub struct Task {
     pub plan: Option<Plan>,
     /// Current state of the task
     pub state: TaskState,
+    /// Completed step IDs for resume/replay
+    #[serde(default)]
+    pub completed_step_ids: Vec<String>,
+    /// Task-scope working set snapshot for resume
+    #[serde(default)]
+    pub working_set_snapshot: HashMap<String, Value>,
     /// Creation timestamp
     pub created_at: DateTime<Utc>,
     /// Last update timestamp
@@ -101,6 +109,8 @@ impl Task {
             intent,
             plan: None,
             state: TaskState::Planning,
+            completed_step_ids: Vec::new(),
+            working_set_snapshot: HashMap::new(),
             created_at: now,
             updated_at: now,
         }
@@ -146,5 +156,16 @@ impl Task {
     /// Pause the task
     pub fn pause(&mut self) {
         self.set_state(TaskState::Paused);
+    }
+
+    /// Update execution checkpoint data
+    pub fn set_checkpoint(
+        &mut self,
+        completed_step_ids: Vec<String>,
+        working_set_snapshot: HashMap<String, Value>,
+    ) {
+        self.completed_step_ids = completed_step_ids;
+        self.working_set_snapshot = working_set_snapshot;
+        self.updated_at = Utc::now();
     }
 }

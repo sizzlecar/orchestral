@@ -16,7 +16,7 @@ use orchestral_core::executor::{ExecutionResult, Executor, ExecutorContext};
 use orchestral_core::normalizer::{NormalizeError, PlanNormalizer};
 use orchestral_core::planner::{HistoryItem, PlanError, Planner, PlannerContext};
 use orchestral_core::store::{ReferenceStore, StoreError, TaskStore, WorkingSet};
-use orchestral_core::types::{Intent, IntentContext, Task, TaskId, TaskState};
+use orchestral_core::types::{Intent, IntentContext, StepKind, Task, TaskId, TaskState};
 use orchestral_stores::Event;
 
 use crate::{HandleEventResult, InteractionState, RuntimeError, ThreadRuntime};
@@ -55,6 +55,12 @@ pub enum OrchestratorError {
     Store(#[from] StoreError),
     #[error("context error: {0}")]
     Context(#[from] ContextError),
+    #[error("task not found: {0}")]
+    TaskNotFound(String),
+    #[error("task has no plan: {0}")]
+    MissingPlan(String),
+    #[error("resume error: {0}")]
+    ResumeError(String),
     #[error("unsupported event: {0}")]
     UnsupportedEvent(String),
 }
@@ -149,6 +155,17 @@ impl Orchestrator {
         &self,
         event: Event,
     ) -> Result<OrchestratorResult, OrchestratorError> {
+        if let Some(interaction_id) = self.thread_runtime.find_resume_interaction(&event).await {
+            return self.resume_interaction(interaction_id, event).await;
+        }
+
+        self.start_new_interaction(event).await
+    }
+
+    async fn start_new_interaction(
+        &self,
+        event: Event,
+    ) -> Result<OrchestratorResult, OrchestratorError> {
         let event_clone = event.clone();
         let decision = self.thread_runtime.handle_event(event).await?;
 
@@ -173,31 +190,16 @@ impl Orchestrator {
             .add_task_to_interaction(&interaction_id, task.id.clone())
             .await?;
 
-        // Plan
         let actions = self.available_actions().await;
         let history = self.history_for_planner(&interaction_id, &task.id).await?;
         let context = PlannerContext::with_history(actions, history, self.reference_store.clone());
         let plan = self.planner.plan(&task.intent, &context).await?;
-        task.set_plan(plan.clone());
+        task.set_plan(plan);
         task.start_executing();
         self.task_store.save(&task).await?;
 
-        // Normalize
-        let normalized = self.normalizer.normalize(plan)?;
-
-        // Execute
-        let working_set = Arc::new(RwLock::new(WorkingSet::new()));
-        let exec_ctx =
-            ExecutorContext::new(task.id.clone(), working_set, self.reference_store.clone());
-        let mut dag = normalized.dag;
-        let result = self.executor.execute(&mut dag, &exec_ctx).await;
-
-        // Update task + interaction state
-        let new_state = task_state_from_execution(&result);
-        task.set_state(new_state.clone());
-        self.task_store.save(&task).await?;
-        self.thread_runtime
-            .update_interaction_state(&interaction_id, interaction_state_from_task(&new_state))
+        let result = self
+            .execute_existing_task(&mut task, &interaction_id, None)
             .await?;
 
         let response = match started_kind {
@@ -214,6 +216,98 @@ impl Orchestrator {
         };
 
         Ok(response)
+    }
+
+    async fn resume_interaction(
+        &self,
+        interaction_id: String,
+        event: Event,
+    ) -> Result<OrchestratorResult, OrchestratorError> {
+        self.thread_runtime
+            .append_event_to_interaction(&interaction_id, event.clone())
+            .await?;
+        self.thread_runtime
+            .resume_interaction(&interaction_id)
+            .await?;
+
+        let interaction = self
+            .thread_runtime
+            .get_interaction(&interaction_id)
+            .await
+            .ok_or_else(|| OrchestratorError::ResumeError("interaction missing".to_string()))?;
+        let task_id =
+            interaction.task_ids.last().cloned().ok_or_else(|| {
+                OrchestratorError::ResumeError("interaction has no task".to_string())
+            })?;
+
+        let mut task = self
+            .task_store
+            .load(&task_id)
+            .await?
+            .ok_or_else(|| OrchestratorError::TaskNotFound(task_id.clone()))?;
+        task.start_executing();
+        self.task_store.save(&task).await?;
+
+        let result = self
+            .execute_existing_task(&mut task, &interaction_id, Some(&event))
+            .await?;
+
+        Ok(OrchestratorResult::Merged {
+            interaction_id,
+            task_id: task.id.clone(),
+            result,
+        })
+    }
+
+    async fn execute_existing_task(
+        &self,
+        task: &mut Task,
+        interaction_id: &str,
+        resume_event: Option<&Event>,
+    ) -> Result<ExecutionResult, OrchestratorError> {
+        let plan = task
+            .plan
+            .clone()
+            .ok_or_else(|| OrchestratorError::MissingPlan(task.id.clone()))?;
+        let normalized = self.normalizer.normalize(plan.clone())?;
+        let mut dag = normalized.dag;
+        restore_checkpoint(&mut dag, task);
+        if let Some(event) = resume_event {
+            complete_wait_step_for_resume(&mut dag, &plan, &task.completed_step_ids, event);
+        }
+
+        let mut ws = WorkingSet::new();
+        ws.import_task_data(task.working_set_snapshot.clone());
+        if let Some(event) = resume_event {
+            apply_resume_event_to_working_set(&mut ws, event);
+        }
+        let working_set = Arc::new(RwLock::new(ws));
+
+        let exec_ctx = ExecutorContext::new(
+            task.id.clone(),
+            working_set.clone(),
+            self.reference_store.clone(),
+        );
+        let result = self.executor.execute(&mut dag, &exec_ctx).await;
+        let checkpoint = {
+            let ws_guard = working_set.read().await;
+            ws_guard.export_task_data()
+        };
+        let completed = dag
+            .completed_nodes()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let new_state = task_state_from_execution(&result);
+        task.set_checkpoint(completed, checkpoint);
+        task.set_state(new_state.clone());
+        self.task_store.save(task).await?;
+        self.thread_runtime
+            .update_interaction_state(interaction_id, interaction_state_from_task(&new_state))
+            .await?;
+
+        Ok(result)
     }
 
     async fn available_actions(&self) -> Vec<ActionMeta> {
@@ -379,6 +473,48 @@ fn task_state_from_execution(result: &ExecutionResult) -> TaskState {
     }
 }
 
+fn restore_checkpoint(dag: &mut orchestral_core::executor::ExecutionDag, task: &Task) {
+    for step_id in &task.completed_step_ids {
+        dag.mark_completed(step_id);
+    }
+}
+
+fn complete_wait_step_for_resume(
+    dag: &mut orchestral_core::executor::ExecutionDag,
+    plan: &orchestral_core::types::Plan,
+    completed_steps: &[String],
+    event: &Event,
+) {
+    let target_kind = match event {
+        Event::UserInput { .. } => StepKind::WaitUser,
+        Event::ExternalEvent { .. } => StepKind::WaitEvent,
+        _ => return,
+    };
+
+    if let Some(step) = plan
+        .steps
+        .iter()
+        .find(|s| s.kind == target_kind && !completed_steps.iter().any(|id| id == &s.id))
+    {
+        dag.mark_completed(&step.id);
+    }
+}
+
+fn apply_resume_event_to_working_set(ws: &mut WorkingSet, event: &Event) {
+    match event {
+        Event::UserInput { payload, .. } => {
+            ws.set_task("resume_user_input", payload.clone());
+            ws.set_task("last_event_payload", payload.clone());
+        }
+        Event::ExternalEvent { payload, kind, .. } => {
+            ws.set_task("resume_external_event", payload.clone());
+            ws.set_task("last_event_payload", payload.clone());
+            ws.set_task("last_event_kind", Value::String(kind.clone()));
+        }
+        _ => {}
+    }
+}
+
 fn interaction_state_from_task(state: &TaskState) -> InteractionState {
     match state {
         TaskState::Done => InteractionState::Completed,
@@ -387,5 +523,48 @@ fn interaction_state_from_task(state: &TaskState) -> InteractionState {
         TaskState::WaitingEvent { .. } => InteractionState::WaitingEvent,
         TaskState::Paused => InteractionState::Paused,
         TaskState::Planning | TaskState::Executing => InteractionState::Active,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orchestral_core::executor::ExecutionDag;
+    use orchestral_core::types::{Plan, Step};
+    use serde_json::json;
+
+    #[test]
+    fn test_complete_wait_step_for_resume_marks_wait_user() {
+        let plan = Plan::new(
+            "goal",
+            vec![
+                Step::wait_user("wait"),
+                Step::action("next", "noop").with_depends_on(vec!["wait".to_string()]),
+            ],
+        );
+        let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
+        let event = Event::user_input("thread-1", "int-1", json!({"text":"ok"}));
+
+        complete_wait_step_for_resume(&mut dag, &plan, &[], &event);
+
+        assert!(dag.completed_nodes().contains(&"wait"));
+    }
+
+    #[test]
+    fn test_apply_resume_event_to_working_set_for_external_event() {
+        let mut ws = WorkingSet::new();
+        let event = Event::external("thread-1", "timer", json!({"due":true}));
+
+        apply_resume_event_to_working_set(&mut ws, &event);
+
+        assert_eq!(
+            ws.get_task("resume_external_event"),
+            Some(&json!({"due":true}))
+        );
+        assert_eq!(
+            ws.get_task("last_event_payload"),
+            Some(&json!({"due":true}))
+        );
+        assert_eq!(ws.get_task("last_event_kind"), Some(&json!("timer")));
     }
 }
