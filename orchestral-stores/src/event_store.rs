@@ -7,6 +7,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::RwLock;
@@ -304,5 +305,138 @@ impl EventStore for InMemoryEventStore {
         let mut sorted: Vec<_> = events.iter().cloned().collect();
         sorted.sort_by(|a, b| b.timestamp().cmp(&a.timestamp()));
         Ok(sorted.into_iter().take(limit).collect())
+    }
+}
+
+/// Redis implementation for append-only event persistence.
+pub struct RedisEventStore {
+    client: redis::Client,
+    key_prefix: String,
+}
+
+impl RedisEventStore {
+    /// Create a new Redis event store from a connection URL.
+    pub fn new(connection_url: &str, key_prefix: impl Into<String>) -> Result<Self, StoreError> {
+        let client = redis::Client::open(connection_url)
+            .map_err(|e| StoreError::Connection(e.to_string()))?;
+        Ok(Self {
+            client,
+            key_prefix: key_prefix.into(),
+        })
+    }
+
+    fn sequence_key(&self) -> String {
+        format!("{}:event:seq", self.key_prefix)
+    }
+
+    fn event_key(&self, sequence: i64) -> String {
+        format!("{}:event:{}", self.key_prefix, sequence)
+    }
+
+    fn thread_events_key(&self, thread_id: &str) -> String {
+        format!("{}:thread:{}:events", self.key_prefix, thread_id)
+    }
+
+    fn recent_events_key(&self) -> String {
+        format!("{}:events:recent", self.key_prefix)
+    }
+
+    async fn connection(&self) -> Result<redis::aio::MultiplexedConnection, StoreError> {
+        self.client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| StoreError::Connection(e.to_string()))
+    }
+
+    async fn load_events_by_sequences(
+        &self,
+        sequences: Vec<i64>,
+    ) -> Result<Vec<Event>, StoreError> {
+        let mut conn = self.connection().await?;
+        let mut out = Vec::new();
+
+        for seq in sequences {
+            let key = self.event_key(seq);
+            let payload: Option<String> = conn
+                .get(key)
+                .await
+                .map_err(|e| StoreError::Connection(e.to_string()))?;
+            if let Some(payload) = payload {
+                let event: Event = serde_json::from_str(&payload)
+                    .map_err(|e| StoreError::Serialization(e.to_string()))?;
+                out.push(event);
+            }
+        }
+
+        Ok(out)
+    }
+}
+
+#[async_trait]
+impl EventStore for RedisEventStore {
+    async fn append(&self, event: Event) -> Result<(), StoreError> {
+        let mut conn = self.connection().await?;
+        let payload =
+            serde_json::to_string(&event).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let sequence: i64 = conn
+            .incr(self.sequence_key(), 1_i64)
+            .await
+            .map_err(|e| StoreError::Connection(e.to_string()))?;
+        let event_key = self.event_key(sequence);
+        let thread_events_key = self.thread_events_key(event.thread_id());
+        let recent_events_key = self.recent_events_key();
+        let score = event.timestamp().timestamp_millis();
+
+        conn.set::<_, _, ()>(event_key, payload)
+            .await
+            .map_err(|e| StoreError::Connection(e.to_string()))?;
+        conn.zadd::<_, _, _, ()>(thread_events_key, sequence, score)
+            .await
+            .map_err(|e| StoreError::Connection(e.to_string()))?;
+        conn.zadd::<_, _, _, ()>(recent_events_key, sequence, score)
+            .await
+            .map_err(|e| StoreError::Connection(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn query_by_thread(&self, thread_id: &str) -> Result<Vec<Event>, StoreError> {
+        let mut conn = self.connection().await?;
+        let sequence_ids: Vec<i64> = conn
+            .zrange(self.thread_events_key(thread_id), 0, -1)
+            .await
+            .map_err(|e| StoreError::Connection(e.to_string()))?;
+        self.load_events_by_sequences(sequence_ids).await
+    }
+
+    async fn query_by_thread_with_limit(
+        &self,
+        thread_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Event>, StoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut conn = self.connection().await?;
+        let stop = (limit as isize) - 1;
+        let sequence_ids: Vec<i64> = conn
+            .zrevrange(self.thread_events_key(thread_id), 0, stop)
+            .await
+            .map_err(|e| StoreError::Connection(e.to_string()))?;
+        self.load_events_by_sequences(sequence_ids).await
+    }
+
+    async fn query_recent(&self, limit: usize) -> Result<Vec<Event>, StoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut conn = self.connection().await?;
+        let stop = (limit as isize) - 1;
+        let sequence_ids: Vec<i64> = conn
+            .zrevrange(self.recent_events_key(), 0, stop)
+            .await
+            .map_err(|e| StoreError::Connection(e.to_string()))?;
+        self.load_events_by_sequences(sequence_ids).await
     }
 }

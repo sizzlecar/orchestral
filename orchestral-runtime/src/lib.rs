@@ -16,7 +16,7 @@ mod orchestrator;
 mod thread;
 mod thread_runtime;
 
-pub use bootstrap::{BootstrapError, RuntimeApp};
+pub use bootstrap::{BootstrapError, DefaultStoreBackendFactory, RuntimeApp, StoreBackendFactory};
 pub use concurrency::{
     ConcurrencyDecision, ConcurrencyPolicy, DefaultConcurrencyPolicy, ParallelConcurrencyPolicy,
     QueueConcurrencyPolicy, RejectWhenBusyConcurrencyPolicy, RunningState,

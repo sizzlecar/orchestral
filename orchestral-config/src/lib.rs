@@ -109,6 +109,10 @@ pub struct RuntimeConfig {
     pub auto_cleanup: bool,
     #[serde(default = "default_concurrency_policy")]
     pub concurrency_policy: String,
+    #[serde(default = "default_true")]
+    pub strict_imports: bool,
+    #[serde(default = "default_true")]
+    pub strict_exports: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -117,6 +121,8 @@ impl Default for RuntimeConfig {
             max_interactions_per_thread: default_max_interactions(),
             auto_cleanup: true,
             concurrency_policy: default_concurrency_policy(),
+            strict_imports: true,
+            strict_exports: true,
         }
     }
 }
@@ -239,6 +245,9 @@ pub struct StoreSpec {
     pub backend: String,
     #[serde(default)]
     pub connection_url: Option<String>,
+    /// Optional key prefix/namespace used by backend implementations.
+    #[serde(default)]
+    pub key_prefix: Option<String>,
 }
 
 impl Default for StoreSpec {
@@ -246,6 +255,7 @@ impl Default for StoreSpec {
         Self {
             backend: default_backend(),
             connection_url: None,
+            key_prefix: None,
         }
     }
 }

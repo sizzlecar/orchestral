@@ -15,14 +15,15 @@ use orchestral_context::{BasicContextBuilder, TokenBudget};
 use orchestral_core::executor::Executor;
 use orchestral_core::normalizer::PlanNormalizer;
 use orchestral_core::planner::{PlanError, Planner, PlannerContext};
-use orchestral_core::store::{ReferenceStore, TaskStore};
+use orchestral_core::store::{ReferenceStore, StoreError, TaskStore};
 use orchestral_core::types::{Intent, Plan, Step};
 use orchestral_planners::{
     DefaultLlmClientFactory, LlmBuildError, LlmClient, LlmClientFactory, LlmInvocationConfig,
     LlmPlanner, LlmPlannerConfig,
 };
 use orchestral_stores::{
-    EventStore, InMemoryEventStore, InMemoryReferenceStore, InMemoryTaskStore,
+    EventStore, InMemoryEventStore, InMemoryReferenceStore, InMemoryTaskStore, RedisEventStore,
+    RedisReferenceStore, RedisTaskStore,
 };
 
 use crate::orchestrator::OrchestratorConfig;
@@ -41,6 +42,8 @@ pub enum BootstrapError {
     ActionConfig(#[from] ActionConfigError),
     #[error("planner build error: {0}")]
     PlannerBuild(#[from] LlmBuildError),
+    #[error("store error: {0}")]
+    Store(#[from] StoreError),
     #[error("unsupported planner mode: {0}")]
     UnsupportedPlannerMode(String),
     #[error("unsupported concurrency policy: {0}")]
@@ -53,6 +56,8 @@ pub enum BootstrapError {
     ModelProfileNotFound(String),
     #[error("unsupported store backend for {store}: {backend}")]
     UnsupportedStoreBackend { store: String, backend: String },
+    #[error("missing connection_url for {store} store backend")]
+    MissingStoreConnectionUrl { store: String },
 }
 
 /// Running app bundle created from unified config.
@@ -63,17 +68,112 @@ pub struct RuntimeApp {
     _action_watcher: Option<ActionWatcher>,
 }
 
+/// Factory abstraction for pluggable store backends.
+pub trait StoreBackendFactory: Send + Sync {
+    fn build_event_store(&self, spec: &StoreSpec) -> Result<Arc<dyn EventStore>, BootstrapError>;
+    fn build_task_store(&self, spec: &StoreSpec) -> Result<Arc<dyn TaskStore>, BootstrapError>;
+    fn build_reference_store(
+        &self,
+        spec: &StoreSpec,
+    ) -> Result<Arc<dyn ReferenceStore>, BootstrapError>;
+}
+
+/// Default store factory supporting in-memory and Redis backends.
+pub struct DefaultStoreBackendFactory;
+
+impl DefaultStoreBackendFactory {
+    fn backend_name(spec: &StoreSpec) -> String {
+        spec.backend.trim().to_ascii_lowercase()
+    }
+
+    fn redis_url(spec: &StoreSpec, store: &str) -> Result<String, BootstrapError> {
+        spec.connection_url
+            .clone()
+            .ok_or_else(|| BootstrapError::MissingStoreConnectionUrl {
+                store: store.to_string(),
+            })
+    }
+
+    fn key_prefix(spec: &StoreSpec, default_prefix: &str) -> String {
+        spec.key_prefix
+            .clone()
+            .unwrap_or_else(|| default_prefix.to_string())
+    }
+}
+
+impl StoreBackendFactory for DefaultStoreBackendFactory {
+    fn build_event_store(&self, spec: &StoreSpec) -> Result<Arc<dyn EventStore>, BootstrapError> {
+        match Self::backend_name(spec).as_str() {
+            "in_memory" | "memory" => Ok(Arc::new(InMemoryEventStore::new())),
+            "redis" => {
+                let url = Self::redis_url(spec, "event")?;
+                let prefix = Self::key_prefix(spec, "orchestral:event");
+                let store = RedisEventStore::new(&url, prefix).map_err(BootstrapError::Store)?;
+                Ok(Arc::new(store))
+            }
+            backend => Err(BootstrapError::UnsupportedStoreBackend {
+                store: "event".to_string(),
+                backend: backend.to_string(),
+            }),
+        }
+    }
+
+    fn build_task_store(&self, spec: &StoreSpec) -> Result<Arc<dyn TaskStore>, BootstrapError> {
+        match Self::backend_name(spec).as_str() {
+            "in_memory" | "memory" => Ok(Arc::new(InMemoryTaskStore::new())),
+            "redis" => {
+                let url = Self::redis_url(spec, "task")?;
+                let prefix = Self::key_prefix(spec, "orchestral:task");
+                let store = RedisTaskStore::new(&url, prefix).map_err(BootstrapError::Store)?;
+                Ok(Arc::new(store))
+            }
+            backend => Err(BootstrapError::UnsupportedStoreBackend {
+                store: "task".to_string(),
+                backend: backend.to_string(),
+            }),
+        }
+    }
+
+    fn build_reference_store(
+        &self,
+        spec: &StoreSpec,
+    ) -> Result<Arc<dyn ReferenceStore>, BootstrapError> {
+        match Self::backend_name(spec).as_str() {
+            "in_memory" | "memory" => Ok(Arc::new(InMemoryReferenceStore::new())),
+            "redis" => {
+                let url = Self::redis_url(spec, "reference")?;
+                let prefix = Self::key_prefix(spec, "orchestral:reference");
+                let store =
+                    RedisReferenceStore::new(&url, prefix).map_err(BootstrapError::Store)?;
+                Ok(Arc::new(store))
+            }
+            backend => Err(BootstrapError::UnsupportedStoreBackend {
+                store: "reference".to_string(),
+                backend: backend.to_string(),
+            }),
+        }
+    }
+}
+
 impl RuntimeApp {
     /// Create a runnable app from a single `orchestral.yaml`.
     pub async fn from_config_path(path: impl Into<PathBuf>) -> Result<Self, BootstrapError> {
+        Self::from_config_path_with_store_factory(path, Arc::new(DefaultStoreBackendFactory)).await
+    }
+
+    /// Create a runnable app and inject custom store backend factory.
+    pub async fn from_config_path_with_store_factory(
+        path: impl Into<PathBuf>,
+        store_factory: Arc<dyn StoreBackendFactory>,
+    ) -> Result<Self, BootstrapError> {
         let path = path.into();
         let config_manager = Arc::new(ConfigManager::new(path.clone()));
         config_manager.load().await?;
         let config = config_manager.config().read().await.clone();
 
-        let event_store = build_event_store(&config.stores.event)?;
-        let task_store = build_task_store(&config.stores.task)?;
-        let reference_store = build_reference_store(&config.stores.reference)?;
+        let event_store = store_factory.build_event_store(&config.stores.event)?;
+        let task_store = store_factory.build_task_store(&config.stores.task)?;
+        let reference_store = store_factory.build_reference_store(&config.stores.reference)?;
 
         let policy = concurrency_policy_from_name(&config.runtime.concurrency_policy)?;
         let runtime_cfg = ThreadRuntimeConfig {
@@ -138,31 +238,6 @@ impl RuntimeApp {
             _action_watcher: action_watcher,
         })
     }
-}
-
-fn build_event_store(spec: &StoreSpec) -> Result<Arc<dyn EventStore>, BootstrapError> {
-    ensure_in_memory(spec, "event")?;
-    Ok(Arc::new(InMemoryEventStore::new()))
-}
-
-fn build_task_store(spec: &StoreSpec) -> Result<Arc<dyn TaskStore>, BootstrapError> {
-    ensure_in_memory(spec, "task")?;
-    Ok(Arc::new(InMemoryTaskStore::new()))
-}
-
-fn build_reference_store(spec: &StoreSpec) -> Result<Arc<dyn ReferenceStore>, BootstrapError> {
-    ensure_in_memory(spec, "reference")?;
-    Ok(Arc::new(InMemoryReferenceStore::new()))
-}
-
-fn ensure_in_memory(spec: &StoreSpec, store_name: &str) -> Result<(), BootstrapError> {
-    if spec.backend.eq_ignore_ascii_case("in_memory") {
-        return Ok(());
-    }
-    Err(BootstrapError::UnsupportedStoreBackend {
-        store: store_name.to_string(),
-        backend: spec.backend.clone(),
-    })
 }
 
 fn concurrency_policy_from_name(
@@ -283,5 +358,40 @@ impl Planner for DeterministicPlanner {
                 "message": intent.content
             }))],
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_store_factory_rejects_redis_without_connection_url() {
+        let factory = DefaultStoreBackendFactory;
+        let spec = StoreSpec {
+            backend: "redis".to_string(),
+            connection_url: None,
+            key_prefix: None,
+        };
+
+        let result = factory.build_event_store(&spec);
+        assert!(matches!(
+            result,
+            Err(BootstrapError::MissingStoreConnectionUrl { store }) if store == "event"
+        ));
+    }
+
+    #[test]
+    fn test_default_store_factory_accepts_redis_spec() {
+        let factory = DefaultStoreBackendFactory;
+        let spec = StoreSpec {
+            backend: "redis".to_string(),
+            connection_url: Some("redis://127.0.0.1/".to_string()),
+            key_prefix: Some("orchestral:test".to_string()),
+        };
+
+        assert!(factory.build_event_store(&spec).is_ok());
+        assert!(factory.build_task_store(&spec).is_ok());
+        assert!(factory.build_reference_store(&spec).is_ok());
     }
 }
