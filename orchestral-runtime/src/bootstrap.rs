@@ -1,7 +1,7 @@
 //! Bootstrap helpers for starting Orchestral from a single YAML config.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -10,7 +10,9 @@ use thiserror::Error;
 use orchestral_actions::{
     ActionConfigError, ActionRegistryManager, ActionWatcher, DefaultActionFactory,
 };
-use orchestral_config::{ConfigError, ConfigManager, OrchestralConfig, StoreSpec};
+use orchestral_config::{
+    ConfigError, ConfigManager, ObservabilityConfig, OrchestralConfig, StoreSpec,
+};
 use orchestral_context::{BasicContextBuilder, TokenBudget};
 use orchestral_core::action::extract_meta;
 use orchestral_core::executor::Executor;
@@ -68,6 +70,9 @@ pub struct RuntimeApp {
     pub action_registry_manager: Arc<ActionRegistryManager>,
     _action_watcher: Option<ActionWatcher>,
 }
+
+static TRACING_INIT: OnceLock<()> = OnceLock::new();
+const MAX_PROMPT_LOG_CHARS: usize = 4_000;
 
 /// Factory abstraction for pluggable store backends.
 pub trait StoreBackendFactory: Send + Sync {
@@ -171,6 +176,7 @@ impl RuntimeApp {
         let config_manager = Arc::new(ConfigManager::new(path.clone()));
         config_manager.load().await?;
         let config = config_manager.config().read().await.clone();
+        init_tracing_if_needed(&config.observability);
 
         let event_store = store_factory.build_event_store(&config.stores.event)?;
         let task_store = store_factory.build_task_store(&config.stores.task)?;
@@ -246,6 +252,47 @@ impl RuntimeApp {
     }
 }
 
+fn init_tracing_if_needed(observability: &ObservabilityConfig) {
+    TRACING_INIT.get_or_init(|| {
+        let fallback_level = match observability.log_level.trim().to_ascii_lowercase().as_str() {
+            "trace" => "trace",
+            "debug" => "debug",
+            "info" => "info",
+            "warn" => "warn",
+            "error" => "error",
+            _ => "info",
+        };
+
+        let make_filter = || {
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .or_else(|_| tracing_subscriber::EnvFilter::try_new(fallback_level))
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+        };
+
+        if observability.traces_enabled {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(make_filter())
+                .with_target(true)
+                .with_span_events(
+                    tracing_subscriber::fmt::format::FmtSpan::NEW
+                        | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
+                )
+                .try_init();
+        } else {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(make_filter())
+                .with_target(true)
+                .try_init();
+        }
+
+        tracing::info!(
+            log_level = %observability.log_level,
+            traces_enabled = observability.traces_enabled,
+            "tracing initialized"
+        );
+    });
+}
+
 fn concurrency_policy_from_name(
     policy: &str,
 ) -> Result<Arc<dyn ConcurrencyPolicy>, BootstrapError> {
@@ -258,6 +305,16 @@ fn concurrency_policy_from_name(
             other.to_string(),
         )),
     }
+}
+
+fn truncate_for_log(input: &str, max_chars: usize) -> String {
+    let char_count = input.chars().count();
+    if char_count <= max_chars {
+        return input.to_string();
+    }
+    let mut preview: String = input.chars().take(max_chars).collect();
+    preview.push_str(&format!("... [truncated, total_chars={}]", char_count));
+    preview
 }
 
 fn build_planner(config: &OrchestralConfig) -> Result<Arc<dyn Planner>, BootstrapError> {
@@ -321,14 +378,36 @@ fn build_planner(config: &OrchestralConfig) -> Result<Arc<dyn Planner>, Bootstra
 
             let client = DefaultLlmClientFactory::new().build(&backend, &invocation)?;
             let default_cfg = LlmPlannerConfig::default();
-            let system_prompt = config
+            let prompt_from_profile = config
                 .planner
                 .model_profile
                 .as_ref()
                 .and_then(|name| config.providers.get_model(name))
-                .and_then(|p| p.system_prompt.clone())
-                .or_else(|| backend.get_config::<String>("system_prompt"))
-                .unwrap_or(default_cfg.system_prompt);
+                .and_then(|p| p.system_prompt.clone());
+            let prompt_from_backend = backend.get_config::<String>("system_prompt");
+            let (system_prompt, prompt_source) = if let Some(prompt) = prompt_from_profile {
+                (prompt, "model_profile")
+            } else if let Some(prompt) = prompt_from_backend {
+                (prompt, "backend")
+            } else {
+                (default_cfg.system_prompt, "default")
+            };
+
+            tracing::info!(
+                backend_name = %backend.name,
+                backend_kind = %backend.kind,
+                model = %model,
+                temperature = temperature,
+                prompt_source = %prompt_source,
+                planner_mode = "llm",
+                "planner llm config selected"
+            );
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                tracing::debug!(
+                    system_prompt = %truncate_for_log(&system_prompt, MAX_PROMPT_LOG_CHARS),
+                    "planner system prompt"
+                );
+            }
 
             let planner_cfg = LlmPlannerConfig {
                 model,

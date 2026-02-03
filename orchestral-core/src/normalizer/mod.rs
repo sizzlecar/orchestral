@@ -300,6 +300,9 @@ struct ActionContract {
 impl PlanNormalizer {
     fn apply_implicit_contracts(&self, plan: &mut Plan) {
         for step in &mut plan.steps {
+            let original_kind = step.kind.clone();
+            let original_depends_on = step.depends_on.clone();
+            let original_exports = step.exports.clone();
             infer_special_step_kind(step);
             derive_depends_on_from_bindings(step);
 
@@ -307,6 +310,32 @@ impl PlanNormalizer {
                 if !contract.output_keys.is_empty() {
                     step.exports = contract.output_keys.clone();
                 }
+            }
+
+            if step.kind != original_kind {
+                tracing::debug!(
+                    step_id = %step.id,
+                    action = %step.action,
+                    from_kind = ?original_kind,
+                    to_kind = ?step.kind,
+                    "normalizer inferred step kind"
+                );
+            }
+            if step.depends_on != original_depends_on {
+                tracing::debug!(
+                    step_id = %step.id,
+                    action = %step.action,
+                    depends_on = ?step.depends_on,
+                    "normalizer derived depends_on from io_bindings"
+                );
+            }
+            if step.exports != original_exports {
+                tracing::debug!(
+                    step_id = %step.id,
+                    action = %step.action,
+                    exports = ?step.exports,
+                    "normalizer populated exports from action output schema"
+                );
             }
         }
     }

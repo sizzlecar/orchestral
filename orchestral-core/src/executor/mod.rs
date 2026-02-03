@@ -10,10 +10,37 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use async_trait::async_trait;
+use serde_json::Value;
 
 use crate::action::{Action, ActionContext, ActionInput, ActionResult};
 use crate::store::{ReferenceStore, WorkingSet};
 use crate::types::{Plan, Step, StepKind};
+
+const MAX_LOG_TEXT_CHARS: usize = 2_000;
+const MAX_LOG_JSON_CHARS: usize = 8_000;
+
+fn truncate_for_log(input: &str, max_chars: usize) -> String {
+    let char_count = input.chars().count();
+    if char_count <= max_chars {
+        return input.to_string();
+    }
+    let mut preview: String = input.chars().take(max_chars).collect();
+    preview.push_str(&format!("... [truncated, total_chars={}]", char_count));
+    preview
+}
+
+fn truncate_json_for_log(value: &Value, max_chars: usize) -> String {
+    truncate_for_log(&value.to_string(), max_chars)
+}
+
+fn truncate_json_map_for_log(map: &HashMap<String, Value>, max_chars: usize) -> String {
+    let as_value = Value::Object(
+        map.iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<serde_json::Map<String, Value>>(),
+    );
+    truncate_json_for_log(&as_value, max_chars)
+}
 
 /// Node state in the execution DAG
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -537,6 +564,12 @@ impl Executor {
 
                     // Execute the action
                     dag.mark_running(&step_id);
+                    tracing::info!(
+                        task_id = %ctx.task_id,
+                        step_id = %step_id,
+                        action = %step.action,
+                        "step execution started"
+                    );
                     report_progress(
                         ctx,
                         ExecutionProgressEvent::new(
@@ -577,6 +610,12 @@ impl Executor {
                                 ws.set_task(format!("{}.{}", step.id, key), value);
                             }
                             dag.mark_completed(&step_id);
+                            tracing::info!(
+                                task_id = %ctx.task_id,
+                                step_id = %step_id,
+                                action = %step.action,
+                                "step execution completed"
+                            );
                             report_progress(
                                 ctx,
                                 ExecutionProgressEvent::new(
@@ -608,6 +647,13 @@ impl Executor {
                         ActionResult::RetryableError { message, .. } => {
                             // For now, mark as failed (retry logic can be added later)
                             dag.mark_failed(&step_id);
+                            tracing::warn!(
+                                task_id = %ctx.task_id,
+                                step_id = %step_id,
+                                action = %step.action,
+                                error = %truncate_for_log(&message, MAX_LOG_TEXT_CHARS),
+                                "step execution retryable error"
+                            );
                             report_progress(
                                 ctx,
                                 ExecutionProgressEvent::new(
@@ -626,6 +672,13 @@ impl Executor {
                         }
                         ActionResult::Error { message } => {
                             dag.mark_failed(&step_id);
+                            tracing::error!(
+                                task_id = %ctx.task_id,
+                                step_id = %step_id,
+                                action = %step.action,
+                                error = %truncate_for_log(&message, MAX_LOG_TEXT_CHARS),
+                                "step execution failed"
+                            );
                             report_progress(
                                 ctx,
                                 ExecutionProgressEvent::new(
@@ -665,6 +718,18 @@ impl Executor {
             None => return ActionResult::error(format!("Action '{}' not found", step.action)),
         };
         let action_meta = action.metadata();
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            tracing::debug!(
+                task_id = %ctx.task_id,
+                step_id = %step.id,
+                action = %step.action,
+                params = %truncate_json_for_log(&step.params, MAX_LOG_JSON_CHARS),
+                declared_imports = ?step.imports,
+                declared_exports = ?step.exports,
+                io_bindings = ?step.io_bindings,
+                "step execution context"
+            );
+        }
 
         // Build input from imports
         let mut imports = HashMap::new();
@@ -684,6 +749,15 @@ impl Executor {
             for binding in &step.io_bindings {
                 if let Some(value) = ws.get_task(&binding.from) {
                     imports.insert(binding.to.clone(), value.clone());
+                    tracing::debug!(
+                        task_id = %ctx.task_id,
+                        step_id = %step.id,
+                        from = %binding.from,
+                        to = %binding.to,
+                        required = binding.required,
+                        value = %truncate_json_for_log(value, MAX_LOG_JSON_CHARS),
+                        "io binding resolved"
+                    );
                     if let Err(error) = bind_param_value(&mut resolved_params, &binding.to, value) {
                         return ActionResult::error(format!(
                             "Invalid io binding for step '{}': {}",
@@ -691,10 +765,25 @@ impl Executor {
                         ));
                     }
                 } else if binding.required {
+                    tracing::warn!(
+                        task_id = %ctx.task_id,
+                        step_id = %step.id,
+                        from = %binding.from,
+                        to = %binding.to,
+                        "required io binding missing"
+                    );
                     return ActionResult::error(format!(
                         "Missing required io binding '{}' from '{}' for step '{}'",
                         binding.to, binding.from, step.id
                     ));
+                } else {
+                    tracing::debug!(
+                        task_id = %ctx.task_id,
+                        step_id = %step.id,
+                        from = %binding.from,
+                        to = %binding.to,
+                        "optional io binding missing"
+                    );
                 }
             }
         }
@@ -713,6 +802,16 @@ impl Executor {
             params: resolved_params,
             imports,
         };
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            tracing::debug!(
+                task_id = %ctx.task_id,
+                step_id = %step.id,
+                action = %step.action,
+                resolved_params = %truncate_json_for_log(&input.params, MAX_LOG_JSON_CHARS),
+                resolved_imports = %truncate_json_map_for_log(&input.imports, MAX_LOG_JSON_CHARS),
+                "action input resolved"
+            );
+        }
 
         let action_ctx = ActionContext::new(
             ctx.task_id.clone(),
@@ -725,6 +824,15 @@ impl Executor {
         let result = action.run(input, action_ctx).await;
         match result {
             ActionResult::Success { exports } => {
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    tracing::debug!(
+                        task_id = %ctx.task_id,
+                        step_id = %step.id,
+                        action = %step.action,
+                        exports = %truncate_json_map_for_log(&exports, MAX_LOG_JSON_CHARS),
+                        "action returned success"
+                    );
+                }
                 let export_value = serde_json::Value::Object(
                     exports
                         .iter()
@@ -742,7 +850,46 @@ impl Executor {
                 }
                 ActionResult::Success { exports }
             }
-            other => other,
+            ActionResult::NeedClarification { question } => {
+                tracing::info!(
+                    task_id = %ctx.task_id,
+                    step_id = %step.id,
+                    action = %step.action,
+                    question = %truncate_for_log(&question, MAX_LOG_TEXT_CHARS),
+                    "action requested clarification"
+                );
+                ActionResult::NeedClarification { question }
+            }
+            ActionResult::RetryableError {
+                message,
+                retry_after,
+                attempt,
+            } => {
+                tracing::warn!(
+                    task_id = %ctx.task_id,
+                    step_id = %step.id,
+                    action = %step.action,
+                    message = %truncate_for_log(&message, MAX_LOG_TEXT_CHARS),
+                    retry_after_ms = retry_after.map(|d| d.as_millis() as u64),
+                    attempt = attempt,
+                    "action returned retryable error"
+                );
+                ActionResult::RetryableError {
+                    message,
+                    retry_after,
+                    attempt,
+                }
+            }
+            ActionResult::Error { message } => {
+                tracing::error!(
+                    task_id = %ctx.task_id,
+                    step_id = %step.id,
+                    action = %step.action,
+                    error = %truncate_for_log(&message, MAX_LOG_TEXT_CHARS),
+                    "action returned terminal error"
+                );
+                ActionResult::Error { message }
+            }
         }
     }
 }

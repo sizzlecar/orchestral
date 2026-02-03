@@ -24,6 +24,22 @@ use orchestral_stores::{Event, EventBus, EventStore};
 
 use crate::{HandleEventResult, InteractionState, RuntimeError, ThreadRuntime};
 
+const MAX_LOG_CHARS: usize = 8_000;
+
+fn truncate_for_log(input: &str, max_chars: usize) -> String {
+    let char_count = input.chars().count();
+    if char_count <= max_chars {
+        return input.to_string();
+    }
+    let mut preview: String = input.chars().take(max_chars).collect();
+    preview.push_str(&format!("... [truncated, total_chars={}]", char_count));
+    preview
+}
+
+fn truncate_debug_for_log(value: &impl std::fmt::Debug, max_chars: usize) -> String {
+    truncate_for_log(&format!("{:?}", value), max_chars)
+}
+
 /// Orchestrator result for a handled event
 #[derive(Debug)]
 pub enum OrchestratorResult {
@@ -170,6 +186,11 @@ impl Orchestrator {
         event: Event,
     ) -> Result<OrchestratorResult, OrchestratorError> {
         let event_clone = event.clone();
+        tracing::info!(
+            thread_id = %event_clone.thread_id(),
+            event_type = %event_type_label(&event_clone),
+            "orchestrator received event"
+        );
         let decision = self.thread_runtime.handle_event(event).await?;
 
         let (interaction_id, started_kind) = match &decision {
@@ -195,8 +216,30 @@ impl Orchestrator {
 
         let actions = self.available_actions().await;
         let history = self.history_for_planner(&interaction_id, &task.id).await?;
+        tracing::info!(
+            interaction_id = %interaction_id,
+            task_id = %task.id,
+            available_actions = actions.len(),
+            history_items = history.len(),
+            "orchestrator planning started"
+        );
         let context = PlannerContext::with_history(actions, history, self.reference_store.clone());
         let plan = self.planner.plan(&task.intent, &context).await?;
+        tracing::info!(
+            interaction_id = %interaction_id,
+            task_id = %task.id,
+            goal = %plan.goal,
+            step_count = plan.steps.len(),
+            "orchestrator planning completed"
+        );
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            tracing::debug!(
+                interaction_id = %interaction_id,
+                task_id = %task.id,
+                plan = %truncate_debug_for_log(&plan.steps, MAX_LOG_CHARS),
+                "orchestrator plan detail"
+            );
+        }
         task.set_plan(plan);
         task.start_executing();
         self.task_store.save(&task).await?;
@@ -272,7 +315,21 @@ impl Orchestrator {
             .plan
             .clone()
             .ok_or_else(|| OrchestratorError::MissingPlan(task.id.clone()))?;
+        tracing::info!(
+            interaction_id = %interaction_id,
+            task_id = %task.id,
+            step_count = plan.steps.len(),
+            "orchestrator normalize/execute started"
+        );
         let normalized = self.normalizer.normalize(plan.clone())?;
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            tracing::debug!(
+                interaction_id = %interaction_id,
+                task_id = %task.id,
+                normalized_steps = %truncate_debug_for_log(&normalized.plan.steps, MAX_LOG_CHARS),
+                "orchestrator normalized plan detail"
+            );
+        }
         let mut dag = normalized.dag;
         restore_checkpoint(&mut dag, task);
         if let Some(event) = resume_event {
@@ -299,6 +356,12 @@ impl Orchestrator {
         )
         .with_progress_reporter(progress_reporter);
         let result = self.executor.execute(&mut dag, &exec_ctx).await;
+        tracing::info!(
+            interaction_id = %interaction_id,
+            task_id = %task.id,
+            result = %truncate_debug_for_log(&result, MAX_LOG_CHARS),
+            "orchestrator execution completed"
+        );
         let checkpoint = {
             let ws_guard = working_set.read().await;
             ws_guard.export_task_data()

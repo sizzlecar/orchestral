@@ -15,4 +15,5 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 llm_sdk = { package = "llm", version = "1.3.6", default-features = false, features = ["openai", "google"] }

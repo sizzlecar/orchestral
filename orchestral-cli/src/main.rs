@@ -355,8 +355,14 @@ fn format_progress_event(event: &Event) -> Option<String> {
         .get("task_id")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown_task");
-    let step = payload.get("step_id").and_then(|v| v.as_str()).unwrap_or("-");
-    let action = payload.get("action").and_then(|v| v.as_str()).unwrap_or("-");
+    let step = payload
+        .get("step_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("-");
+    let action = payload
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("-");
     let message = payload.get("message").and_then(|v| v.as_str());
 
     let mut line = format!(

@@ -1,12 +1,17 @@
 use std::sync::Arc;
+use std::{collections::HashSet, fmt::Write};
 
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::{debug, info};
 
 use orchestral_core::planner::{PlanError, Planner, PlannerContext};
 use orchestral_core::types::{Intent, Plan};
+
+const MAX_PROMPT_LOG_CHARS: usize = 4_000;
+const MAX_LLM_OUTPUT_LOG_CHARS: usize = 8_000;
 
 /// LLM request payload
 #[derive(Debug, Clone)]
@@ -122,20 +127,172 @@ fn build_system_prompt(base: &str, context: &PlannerContext) -> String {
     system.push_str(
         "8) For wait_user/wait_event/system steps, set kind explicitly; normal action steps can omit kind.\n",
     );
+    system
+        .push_str("9) When generating step.params, strictly follow Action Catalog input fields.\n");
     system.push_str("\nAction Catalog:\n");
     for action in &context.available_actions {
-        system.push_str(&format!(
-            "- name: {}\n  description: {}\n  input_schema: {}\n  output_schema: {}\n",
-            action.name, action.description, action.input_schema, action.output_schema
-        ));
+        append_action_catalog_entry(
+            &mut system,
+            &action.name,
+            &action.description,
+            &action.input_schema,
+            &action.output_schema,
+        );
     }
     system
+}
+
+fn append_action_catalog_entry(
+    buf: &mut String,
+    name: &str,
+    description: &str,
+    input_schema: &serde_json::Value,
+    output_schema: &serde_json::Value,
+) {
+    let _ = writeln!(buf, "- name: {}", name);
+    let _ = writeln!(buf, "  description: {}", description);
+    append_schema_fields(buf, "input_fields", input_schema);
+    append_schema_fields(buf, "output_fields", output_schema);
+    let _ = writeln!(buf, "  input_schema: {}", input_schema);
+    let _ = writeln!(buf, "  output_schema: {}", output_schema);
+}
+
+fn append_schema_fields(buf: &mut String, label: &str, schema: &serde_json::Value) {
+    if schema.is_null() {
+        let _ = writeln!(buf, "  {}: []", label);
+        return;
+    }
+
+    let Some(properties) = schema.get("properties").and_then(|v| v.as_object()) else {
+        let _ = writeln!(buf, "  {}: []", label);
+        return;
+    };
+
+    let required = schema_required_fields(schema);
+    let mut keys: Vec<&str> = properties.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+
+    let _ = writeln!(buf, "  {}:", label);
+    for key in keys {
+        let Some(field_schema) = properties.get(key) else {
+            continue;
+        };
+        let type_hint = schema_type_hint(field_schema);
+        let required_label = if required.contains(key) {
+            "required"
+        } else {
+            "optional"
+        };
+        let mut extras = Vec::new();
+        if let Some(desc) = field_schema.get("description").and_then(|v| v.as_str()) {
+            extras.push(format!("desc={}", desc));
+        }
+        if let Some(default) = field_schema.get("default") {
+            extras.push(format!(
+                "default={}",
+                truncate_for_log(&default.to_string(), 120)
+            ));
+        }
+        if let Some(example) = field_schema.get("example").or_else(|| {
+            field_schema
+                .get("examples")
+                .and_then(|v| v.as_array()?.first())
+        }) {
+            extras.push(format!(
+                "example={}",
+                truncate_for_log(&example.to_string(), 120)
+            ));
+        }
+
+        if extras.is_empty() {
+            let _ = writeln!(buf, "    - {} ({}, {})", key, type_hint, required_label);
+        } else {
+            let _ = writeln!(
+                buf,
+                "    - {} ({}, {}): {}",
+                key,
+                type_hint,
+                required_label,
+                extras.join("; ")
+            );
+        }
+    }
+}
+
+fn schema_required_fields(schema: &serde_json::Value) -> HashSet<String> {
+    schema
+        .get("required")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(ToString::to_string))
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn schema_type_hint(schema: &serde_json::Value) -> String {
+    if let Some(t) = schema.get("type") {
+        if let Some(text) = t.as_str() {
+            return text.to_string();
+        }
+        if let Some(list) = t.as_array() {
+            let mut items = list
+                .iter()
+                .filter_map(|v| v.as_str().map(ToString::to_string))
+                .collect::<Vec<_>>();
+            if !items.is_empty() {
+                items.sort_unstable();
+                return items.join("|");
+            }
+        }
+    }
+    if schema.get("enum").is_some() {
+        return "enum".to_string();
+    }
+    if schema.get("oneOf").is_some() {
+        return "oneOf".to_string();
+    }
+    if schema.get("anyOf").is_some() {
+        return "anyOf".to_string();
+    }
+    if schema.is_object() {
+        return "object".to_string();
+    }
+    "any".to_string()
+}
+
+fn truncate_for_log(input: &str, max_chars: usize) -> String {
+    let char_count = input.chars().count();
+    if char_count <= max_chars {
+        return input.to_string();
+    }
+    let mut preview: String = input.chars().take(max_chars).collect();
+    preview.push_str(&format!("... [truncated, total_chars={}]", char_count));
+    preview
 }
 
 #[async_trait]
 impl<C: LlmClient> Planner for LlmPlanner<C> {
     async fn plan(&self, intent: &Intent, context: &PlannerContext) -> Result<Plan, PlanError> {
         let (system, user) = self.build_prompt(intent, context);
+        info!(
+            model = %self.config.model,
+            temperature = self.config.temperature,
+            intent_len = intent.content.len(),
+            action_count = context.available_actions.len(),
+            history_count = context.history.len(),
+            "planner request prepared"
+        );
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let system_preview = truncate_for_log(&system, MAX_PROMPT_LOG_CHARS);
+            let user_preview = truncate_for_log(&user, MAX_PROMPT_LOG_CHARS);
+            debug!(
+                system_prompt = %system_preview,
+                user_prompt = %user_preview,
+                "planner prompts"
+            );
+        }
         let request = LlmRequest {
             system,
             user,
@@ -147,12 +304,37 @@ impl<C: LlmClient> Planner for LlmPlanner<C> {
             .complete(request)
             .await
             .map_err(|e| PlanError::LlmError(e.to_string()))?;
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(
+                llm_output = %truncate_for_log(&output, MAX_LLM_OUTPUT_LOG_CHARS),
+                "planner raw llm output"
+            );
+        }
 
         let json_str = extract_json(&output)
             .ok_or_else(|| PlanError::Generation("LLM output did not contain JSON".to_string()))?;
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(
+                plan_json = %truncate_for_log(&json_str, MAX_LLM_OUTPUT_LOG_CHARS),
+                "planner extracted json"
+            );
+        }
 
-        serde_json::from_str::<Plan>(&json_str)
-            .map_err(|e| PlanError::Generation(format!("Invalid plan JSON: {}", e)))
+        let plan = serde_json::from_str::<Plan>(&json_str)
+            .map_err(|e| PlanError::Generation(format!("Invalid plan JSON: {}", e)))?;
+        info!(
+            step_count = plan.steps.len(),
+            confidence = plan.confidence.unwrap_or_default(),
+            "planner parsed plan"
+        );
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(
+                goal = %truncate_for_log(&plan.goal, MAX_PROMPT_LOG_CHARS),
+                plan = %truncate_for_log(&format!("{:?}", plan.steps), MAX_LLM_OUTPUT_LOG_CHARS),
+                "planner plan detail"
+            );
+        }
+        Ok(plan)
     }
 }
 
@@ -345,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn test_system_prompt_contains_action_catalog_with_schema() {
+    fn test_system_prompt_contains_action_catalog_with_schema_and_field_hints() {
         let planner = LlmPlanner::new(
             MockLlmClient {
                 response: "{}".to_string(),
@@ -357,9 +539,22 @@ mod tests {
         );
 
         let actions = vec![ActionMeta::new("write_doc", "Write markdown to file")
-            .with_input_schema(json!({"type":"object","properties":{"path":{"type":"string"}}}))
+            .with_input_schema(json!({
+                "type":"object",
+                "properties":{
+                    "path":{"type":"string","description":"Target markdown path","example":"guide.md"},
+                    "content":{"type":"string","description":"Markdown content"}
+                },
+                "required":["path","content"]
+            }))
             .with_output_schema(
-                json!({"type":"object","properties":{"path":{"type":"string"},"bytes":{"type":"integer"}}}),
+                json!({
+                    "type":"object",
+                    "properties":{
+                        "path":{"type":"string","description":"Resolved path"},
+                        "bytes":{"type":"integer","description":"Written bytes"}
+                    }
+                }),
             )];
         let context = PlannerContext::new(actions, Arc::new(NoopReferenceStore));
         let intent = Intent::new("generate a guide");
@@ -367,7 +562,10 @@ mod tests {
 
         assert!(system.contains("Action Catalog"));
         assert!(system.contains("write_doc"));
-        assert!(system.contains("\"path\""));
+        assert!(system.contains("input_fields"));
+        assert!(system.contains("path (string, required)"));
+        assert!(system.contains("desc=Target markdown path"));
+        assert!(system.contains("example=\"guide.md\""));
         assert!(system.contains("input_schema"));
         assert!(system.contains("output_schema"));
     }
