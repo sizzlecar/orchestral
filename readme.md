@@ -137,6 +137,38 @@ cargo run -p orchestral-cli -- event emit --thread-id demo-thread --kind timer -
 
 `actions.actions[]` supports an optional `interface` section (`input_schema`, `output_schema`), and the planner will automatically receive these typed contracts in its prompt context.
 
+### 多语言 Action（external_process）
+
+可通过 `kind: external_process` 把 Action 委托给任意语言进程（Python/Node/Go 等），
+Orchestral 使用 stdin/stdout 传递 JSON：
+
+- 请求：`{ protocol, action, input, context }`
+- 响应：`ActionResult` JSON（推荐），或简写 `{ "exports": {...} }`
+
+示例插件：`examples/plugins/echo_plugin.py`（读取 stdin，返回 success exports）。
+配置示例见：`config/orchestral.cli.yaml` 中的 `external_process` 注释块。
+
+### 安全内置 Action（shell/file_read/file_write）
+
+- `shell` 默认禁用隐式 `sh -c`，如需表达式执行必须显式 `shell=true` 或配置 `allow_shell_expression=true`。
+- `shell` 支持 `blocked_commands` / `allowed_commands` 策略以及 `max_output_bytes` 输出截断，防止危险命令与日志爆量。
+- `file_read` 默认有 `max_read_bytes` 上限，并支持请求级 `max_bytes` + `truncate` 控制。
+- `file_write` 默认有 `max_write_bytes` 上限，校验 `root_dir` 越权路径，并拒绝符号链接写入。
+
+---
+
+## 日志与排障（Logging）
+
+- 进程日志基于 `tracing`，启动时会读取配置中的 `observability.log_level`（如 `info/debug/trace`）。
+- 可用环境变量 `RUST_LOG` 覆盖配置（例如 `RUST_LOG=orchestral_runtime=debug,orchestral_core=debug`）。
+- 运行 CLI 时建议：
+
+```bash
+RUST_LOG=debug cargo run -p orchestral-cli -- run "你好"
+```
+
+- 执行链路进度会作为 `system_trace` 事件写入 EventStore，`category=execution_progress` 可用于历史回放与实时展示。
+
 ---
 
 ## 并发策略（Concurrency Policy）

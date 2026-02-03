@@ -1,11 +1,11 @@
-use std::collections::HashMap;
-use std::path::{Component, PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{json, Map, Value};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -27,6 +27,18 @@ fn config_u64(config: &Value, key: &str) -> Option<u64> {
     config.get(key).and_then(|v| v.as_u64())
 }
 
+fn config_string_array(config: &Value, key: &str) -> Vec<String> {
+    config
+        .get(key)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(ToString::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
 fn params_get_string(params: &Value, key: &str) -> Option<String> {
     params
         .get(key)
@@ -46,6 +58,10 @@ fn params_get_array(params: &Value, key: &str) -> Option<Vec<String>> {
                 .collect::<Vec<_>>()
         })
     })
+}
+
+fn params_get_u64(params: &Value, key: &str) -> Option<u64> {
+    params.get(key).and_then(|v| v.as_u64())
 }
 
 fn headers_from_value(value: &Value) -> HashMap<String, String> {
@@ -89,6 +105,121 @@ fn has_parent_dir(path: &str) -> bool {
         .any(|c| matches!(c, Component::ParentDir))
 }
 
+fn contains_shell_metacharacters(s: &str) -> bool {
+    s.chars().any(|c| {
+        matches!(
+            c,
+            '|' | '&' | ';' | '<' | '>' | '$' | '`' | '(' | ')' | '{' | '}' | '*' | '?' | '\n'
+        )
+    })
+}
+
+fn normalize_command_name(command: &str) -> String {
+    Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command)
+        .to_ascii_lowercase()
+}
+
+fn first_token(input: &str) -> Option<&str> {
+    input.split_whitespace().next()
+}
+
+fn expression_command_tokens(input: &str) -> HashSet<String> {
+    input
+        .split_whitespace()
+        .map(|token| {
+            token
+                .trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '-' && c != '.')
+                .to_ascii_lowercase()
+        })
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn truncate_utf8_lossy(bytes: &[u8], max_bytes: usize) -> (String, bool, usize) {
+    let total = bytes.len();
+    if total <= max_bytes {
+        return (String::from_utf8_lossy(bytes).to_string(), false, total);
+    }
+    (
+        String::from_utf8_lossy(&bytes[..max_bytes]).to_string(),
+        true,
+        total,
+    )
+}
+
+fn bounded_u64(value: Option<u64>, default: usize, hard_max: usize) -> usize {
+    value
+        .and_then(|v| usize::try_from(v).ok())
+        .unwrap_or(default)
+        .clamp(1, hard_max)
+}
+
+async fn read_stream_limited<R: tokio::io::AsyncRead + Unpin>(
+    mut reader: R,
+    max_bytes: usize,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut buf = [0_u8; 8192];
+    let mut kept = Vec::new();
+    let mut truncated = false;
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        if kept.len() < max_bytes {
+            let remaining = max_bytes - kept.len();
+            let to_copy = remaining.min(n);
+            kept.extend_from_slice(&buf[..to_copy]);
+            if to_copy < n {
+                truncated = true;
+            }
+        } else {
+            truncated = true;
+        }
+    }
+    Ok((kept, truncated))
+}
+
+async fn resolve_safe_path(
+    root_dir: &Option<PathBuf>,
+    path: &str,
+    allow_nonexistent_target: bool,
+) -> Result<PathBuf, String> {
+    if root_dir.is_some() && has_parent_dir(path) {
+        return Err("Path escapes root_dir".to_string());
+    }
+    let full_path = resolve_path(root_dir, path);
+    let Some(root) = root_dir else {
+        return Ok(full_path);
+    };
+
+    let canonical_root = tokio::fs::canonicalize(root)
+        .await
+        .map_err(|e| format!("Invalid root_dir: {}", e))?;
+
+    let candidate = match tokio::fs::canonicalize(&full_path).await {
+        Ok(p) => p,
+        Err(_e) if allow_nonexistent_target => {
+            if full_path.is_absolute() {
+                full_path.clone()
+            } else {
+                std::env::current_dir()
+                    .map(|cwd| cwd.join(&full_path))
+                    .map_err(|err| format!("Resolve current dir failed: {}", err))?
+            }
+        }
+        Err(e) => return Err(format!("Invalid path: {}", e)),
+    };
+
+    if !candidate.starts_with(&canonical_root) {
+        return Err("Path escapes root_dir".to_string());
+    }
+    Ok(candidate)
+}
+
 /// Echo action
 pub struct EchoAction {
     name: String,
@@ -122,13 +253,20 @@ impl Action for EchoAction {
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
-                    "message": { "type": "string" }
-                }
+                    "message": {
+                        "type": "string",
+                        "description": "Text to echo back."
+                    }
+                },
+                "required": ["message"]
             }))
             .with_output_schema(json!({
                 "type": "object",
                 "properties": {
-                    "result": { "type": "string" }
+                    "result": {
+                        "type": "string",
+                        "description": "Echoed text result."
+                    }
                 },
                 "required": ["result"]
             }))
@@ -200,20 +338,47 @@ impl Action for HttpAction {
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
-                    "method": { "type": "string" },
-                    "url": { "type": "string" },
-                    "headers": { "type": "object" },
-                    "body": {},
-                    "json": {}
+                    "method": {
+                        "type": "string",
+                        "description": "HTTP method, such as GET/POST/PUT.",
+                        "default": self.default_method
+                    },
+                    "url": {
+                        "type": "string",
+                        "description": "Request URL. Required when no default_url is configured.",
+                        "default": self.default_url
+                    },
+                    "headers": {
+                        "type": "object",
+                        "description": "Extra request headers merged with action defaults."
+                    },
+                    "body": {
+                        "description": "Raw request body. If not a string, it is sent as JSON."
+                    },
+                    "json": {
+                        "description": "JSON payload. Takes precedence over body when both are provided."
+                    }
                 }
             }))
             .with_output_schema(json!({
                 "type": "object",
                 "properties": {
-                    "status": { "type": "integer" },
-                    "url": { "type": "string" },
-                    "headers": { "type": "object" },
-                    "body": { "type": "string" }
+                    "status": {
+                        "type": "integer",
+                        "description": "HTTP status code."
+                    },
+                    "url": {
+                        "type": "string",
+                        "description": "Resolved request URL."
+                    },
+                    "headers": {
+                        "type": "object",
+                        "description": "Response headers."
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Response body as text."
+                    }
                 },
                 "required": ["status", "url", "headers", "body"]
             }))
@@ -289,17 +454,48 @@ pub struct ShellAction {
     description: String,
     working_dir: Option<PathBuf>,
     timeout_ms: Option<u64>,
+    allow_shell_expression: bool,
+    allowed_commands: Option<HashSet<String>>,
+    blocked_commands: HashSet<String>,
+    max_output_bytes: usize,
 }
 
 impl ShellAction {
     pub fn from_spec(spec: &ActionSpec) -> Self {
         let working_dir = config_string(&spec.config, "working_dir").map(PathBuf::from);
         let timeout_ms = config_u64(&spec.config, "timeout_ms");
+        let allow_shell_expression =
+            config_bool(&spec.config, "allow_shell_expression").unwrap_or(false);
+        let allowed_commands_vec = config_string_array(&spec.config, "allowed_commands");
+        let allowed_commands = if allowed_commands_vec.is_empty() {
+            None
+        } else {
+            Some(
+                allowed_commands_vec
+                    .into_iter()
+                    .map(|v| normalize_command_name(&v))
+                    .collect(),
+            )
+        };
+        let blocked_commands: HashSet<String> =
+            config_string_array(&spec.config, "blocked_commands")
+                .into_iter()
+                .map(|v| normalize_command_name(&v))
+                .collect();
+        let max_output_bytes = bounded_u64(
+            config_u64(&spec.config, "max_output_bytes"),
+            64 * 1024,
+            1024 * 1024,
+        );
         Self {
             name: spec.name.clone(),
             description: spec.description_or("Runs a shell command"),
             working_dir,
             timeout_ms,
+            allow_shell_expression,
+            allowed_commands,
+            blocked_commands,
+            max_output_bytes,
         }
     }
 }
@@ -319,19 +515,53 @@ impl Action for ShellAction {
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string" },
-                    "args": { "type": "array", "items": { "type": "string" } }
+                    "command": {
+                        "type": "string",
+                        "description": "Executable name or shell expression."
+                    },
+                    "args": {
+                        "type": "array",
+                        "description": "Optional command arguments. Preferred mode for safe execution.",
+                        "items": {
+                            "type": "string"
+                        }
+                    },
+                    "shell": {
+                        "type": "boolean",
+                        "description": "Set true to force shell expression mode (`sh -c command`)."
+                    }
                 },
                 "required": ["command"]
             }))
             .with_output_schema(json!({
                 "type": "object",
                 "properties": {
-                    "stdout": { "type": "string" },
-                    "stderr": { "type": "string" },
-                    "status": { "type": "integer" }
+                    "stdout": {
+                        "type": "string",
+                        "description": "Captured standard output."
+                    },
+                    "stderr": {
+                        "type": "string",
+                        "description": "Captured standard error."
+                    },
+                    "status": {
+                        "type": "integer",
+                        "description": "Process exit code (-1 when unavailable)."
+                    },
+                    "timed_out": {
+                        "type": "boolean",
+                        "description": "Whether process execution timed out and was killed."
+                    },
+                    "stdout_truncated": {
+                        "type": "boolean",
+                        "description": "Whether stdout exceeded max_output_bytes."
+                    },
+                    "stderr_truncated": {
+                        "type": "boolean",
+                        "description": "Whether stderr exceeded max_output_bytes."
+                    }
                 },
-                "required": ["stdout", "stderr", "status"]
+                "required": ["stdout", "stderr", "status", "timed_out", "stdout_truncated", "stderr_truncated"]
             }))
     }
 
@@ -341,43 +571,140 @@ impl Action for ShellAction {
             Some(cmd) => cmd,
             None => return ActionResult::error("Missing command for shell action"),
         };
+        let args = params_get_array(params, "args");
+        let use_shell = params_get_bool(params, "shell").unwrap_or(self.allow_shell_expression);
+        let looks_like_expression =
+            contains_shell_metacharacters(&command) || command.contains(' ');
 
-        let mut cmd = if let Some(args) = params_get_array(params, "args") {
-            let mut c = Command::new(&command);
-            c.args(args);
-            c
+        if args.is_none() && !use_shell && looks_like_expression {
+            return ActionResult::error(
+                "Unsafe shell expression detected. Provide args[] or set shell=true explicitly.",
+            );
+        }
+
+        let command_name = if use_shell {
+            first_token(&command)
+                .map(normalize_command_name)
+                .unwrap_or_else(|| "sh".to_string())
         } else {
+            normalize_command_name(&command)
+        };
+
+        if self.blocked_commands.contains(&command_name) {
+            return ActionResult::error(format!("Command '{}' is blocked by policy", command_name));
+        }
+        if use_shell {
+            let tokens = expression_command_tokens(&command);
+            if let Some(blocked) = self
+                .blocked_commands
+                .iter()
+                .find(|cmd| tokens.contains(*cmd))
+            {
+                return ActionResult::error(format!(
+                    "Shell expression contains blocked command '{}'",
+                    blocked
+                ));
+            }
+        }
+        if let Some(allowed) = &self.allowed_commands {
+            if !allowed.contains(&command_name) {
+                return ActionResult::error(format!(
+                    "Command '{}' is not in allowed_commands policy",
+                    command_name
+                ));
+            }
+        }
+
+        let mut cmd = if use_shell {
             let mut c = Command::new("sh");
             c.arg("-c").arg(command);
+            c
+        } else {
+            let mut c = Command::new(&command);
+            if let Some(args) = args {
+                c.args(args);
+            }
             c
         };
 
         if let Some(dir) = &self.working_dir {
             cmd.current_dir(dir);
         }
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        cmd.kill_on_drop(true);
 
-        let output = if let Some(ms) = self.timeout_ms {
-            match timeout(Duration::from_millis(ms), cmd.output()).await {
-                Ok(result) => result,
-                Err(_) => return ActionResult::error("Shell command timed out"),
-            }
-        } else {
-            cmd.output().await
-        };
-
-        let output = match output {
-            Ok(o) => o,
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
             Err(e) => return ActionResult::error(format!("Shell execution failed: {}", e)),
         };
+        let stdout_pipe = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => return ActionResult::error("Shell stdout capture not available"),
+        };
+        let stderr_pipe = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => return ActionResult::error("Shell stderr capture not available"),
+        };
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let status = output.status.code().unwrap_or(-1);
+        let max_output_bytes = self.max_output_bytes;
+        let stdout_task =
+            tokio::spawn(async move { read_stream_limited(stdout_pipe, max_output_bytes).await });
+        let stderr_task =
+            tokio::spawn(async move { read_stream_limited(stderr_pipe, max_output_bytes).await });
+
+        let wait_result: (Option<std::process::ExitStatus>, bool) =
+            if let Some(ms) = self.timeout_ms {
+                match timeout(Duration::from_millis(ms), child.wait()).await {
+                    Ok(status) => match status {
+                        Ok(exit) => (Some(exit), false),
+                        Err(e) => return ActionResult::error(format!("Shell wait failed: {}", e)),
+                    },
+                    Err(_) => {
+                        let _ = child.kill().await;
+                        let status = child.wait().await.ok();
+                        (status, true)
+                    }
+                }
+            } else {
+                match child.wait().await {
+                    Ok(exit) => (Some(exit), false),
+                    Err(e) => return ActionResult::error(format!("Shell wait failed: {}", e)),
+                }
+            };
+
+        let (stdout_raw, stdout_stream_truncated) = match stdout_task.await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return ActionResult::error(format!("Read stdout failed: {}", e)),
+            Err(e) => return ActionResult::error(format!("Stdout join failed: {}", e)),
+        };
+        let (stderr_raw, stderr_stream_truncated) = match stderr_task.await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return ActionResult::error(format!("Read stderr failed: {}", e)),
+            Err(e) => return ActionResult::error(format!("Stderr join failed: {}", e)),
+        };
+
+        let (stdout, stdout_truncated, _) = truncate_utf8_lossy(&stdout_raw, self.max_output_bytes);
+        let (stderr, stderr_truncated, _) = truncate_utf8_lossy(&stderr_raw, self.max_output_bytes);
+        let stdout_truncated = stdout_truncated || stdout_stream_truncated;
+        let stderr_truncated = stderr_truncated || stderr_stream_truncated;
+        let status = wait_result.0.as_ref().and_then(|s| s.code()).unwrap_or(-1);
+        let timed_out = wait_result.1;
 
         let mut exports = Map::new();
         exports.insert("stdout".to_string(), Value::String(stdout));
         exports.insert("stderr".to_string(), Value::String(stderr));
         exports.insert("status".to_string(), Value::Number(status.into()));
+        exports.insert("timed_out".to_string(), Value::Bool(timed_out));
+        exports.insert(
+            "stdout_truncated".to_string(),
+            Value::Bool(stdout_truncated),
+        );
+        exports.insert(
+            "stderr_truncated".to_string(),
+            Value::Bool(stderr_truncated),
+        );
         ActionResult::success_with(exports.into_iter().collect())
     }
 }
@@ -387,15 +714,22 @@ pub struct FileReadAction {
     name: String,
     description: String,
     root_dir: Option<PathBuf>,
+    max_read_bytes: usize,
 }
 
 impl FileReadAction {
     pub fn from_spec(spec: &ActionSpec) -> Self {
         let root_dir = config_string(&spec.config, "root_dir").map(PathBuf::from);
+        let max_read_bytes = bounded_u64(
+            config_u64(&spec.config, "max_read_bytes"),
+            512 * 1024,
+            10 * 1024 * 1024,
+        );
         Self {
             name: spec.name.clone(),
             description: spec.description_or("Reads a file from disk"),
             root_dir,
+            max_read_bytes,
         }
     }
 }
@@ -415,17 +749,42 @@ impl Action for FileReadAction {
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string" }
+                    "path": {
+                        "type": "string",
+                        "description": "File path to read. Must stay under root_dir when configured."
+                    },
+                    "max_bytes": {
+                        "type": "integer",
+                        "description": "Read at most this many bytes (clamped by action config max_read_bytes)."
+                    },
+                    "truncate": {
+                        "type": "boolean",
+                        "description": "When true, oversize files are truncated instead of returning an error."
+                    }
                 },
                 "required": ["path"]
             }))
             .with_output_schema(json!({
                 "type": "object",
                 "properties": {
-                    "content": { "type": "string" },
-                    "path": { "type": "string" }
+                    "content": {
+                        "type": "string",
+                        "description": "File content as UTF-8 text."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Resolved absolute file path."
+                    },
+                    "bytes": {
+                        "type": "integer",
+                        "description": "Number of bytes returned in content."
+                    },
+                    "truncated": {
+                        "type": "boolean",
+                        "description": "Whether content was truncated by max_bytes."
+                    }
                 },
-                "required": ["content", "path"]
+                "required": ["content", "path", "bytes", "truncated"]
             }))
     }
 
@@ -436,30 +795,39 @@ impl Action for FileReadAction {
             None => return ActionResult::error("Missing path for file_read"),
         };
 
-        if self.root_dir.is_some() && has_parent_dir(&path) {
-            return ActionResult::error("Path escapes root_dir");
-        }
-        let full_path = resolve_path(&self.root_dir, &path);
-        let full_path = if let Some(root) = &self.root_dir {
-            let root = match tokio::fs::canonicalize(root).await {
-                Ok(r) => r,
-                Err(e) => return ActionResult::error(format!("Invalid root_dir: {}", e)),
-            };
-            let full = match tokio::fs::canonicalize(&full_path).await {
-                Ok(p) => p,
-                Err(e) => return ActionResult::error(format!("Invalid path: {}", e)),
-            };
-            if !full.starts_with(&root) {
-                return ActionResult::error("Path escapes root_dir");
-            }
-            full
-        } else {
-            full_path
+        let full_path = match resolve_safe_path(&self.root_dir, &path, false).await {
+            Ok(path) => path,
+            Err(e) => return ActionResult::error(e),
         };
 
-        let content = match tokio::fs::read_to_string(&full_path).await {
-            Ok(c) => c,
+        let max_bytes = bounded_u64(
+            params_get_u64(params, "max_bytes"),
+            self.max_read_bytes,
+            self.max_read_bytes,
+        );
+        let allow_truncate = params_get_bool(params, "truncate").unwrap_or(false);
+
+        let mut raw = match tokio::fs::read(&full_path).await {
+            Ok(v) => v,
             Err(e) => return ActionResult::error(format!("Read failed: {}", e)),
+        };
+        let mut truncated = false;
+        if raw.len() > max_bytes {
+            if !allow_truncate {
+                return ActionResult::error(format!(
+                    "File too large: {} bytes exceeds read limit {}",
+                    raw.len(),
+                    max_bytes
+                ));
+            }
+            raw.truncate(max_bytes);
+            truncated = true;
+        }
+
+        let bytes_len = raw.len() as u64;
+        let content = match String::from_utf8(raw) {
+            Ok(c) => c,
+            Err(e) => return ActionResult::error(format!("File is not valid UTF-8 text: {}", e)),
         };
 
         let mut exports = Map::new();
@@ -468,6 +836,8 @@ impl Action for FileReadAction {
             "path".to_string(),
             Value::String(full_path.to_string_lossy().to_string()),
         );
+        exports.insert("bytes".to_string(), Value::Number(bytes_len.into()));
+        exports.insert("truncated".to_string(), Value::Bool(truncated));
         ActionResult::success_with(exports.into_iter().collect())
     }
 }
@@ -479,6 +849,7 @@ pub struct FileWriteAction {
     root_dir: Option<PathBuf>,
     create_dirs: bool,
     default_append: bool,
+    max_write_bytes: usize,
 }
 
 impl FileWriteAction {
@@ -486,12 +857,18 @@ impl FileWriteAction {
         let root_dir = config_string(&spec.config, "root_dir").map(PathBuf::from);
         let create_dirs = config_bool(&spec.config, "create_dirs").unwrap_or(true);
         let default_append = config_bool(&spec.config, "append").unwrap_or(false);
+        let max_write_bytes = bounded_u64(
+            config_u64(&spec.config, "max_write_bytes"),
+            512 * 1024,
+            10 * 1024 * 1024,
+        );
         Self {
             name: spec.name.clone(),
             description: spec.description_or("Writes a file to disk"),
             root_dir,
             create_dirs,
             default_append,
+            max_write_bytes,
         }
     }
 }
@@ -511,17 +888,37 @@ impl Action for FileWriteAction {
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string" },
-                    "content": { "type": "string" },
-                    "append": { "type": "boolean" }
+                    "path": {
+                        "type": "string",
+                        "description": "Target file path to write. Must stay under root_dir when configured."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Text content to write."
+                    },
+                    "append": {
+                        "type": "boolean",
+                        "description": "Append content instead of overwrite when true.",
+                        "default": self.default_append
+                    },
+                    "max_bytes": {
+                        "type": "integer",
+                        "description": "Maximum allowed content bytes for this call (clamped by action config max_write_bytes)."
+                    }
                 },
                 "required": ["path", "content"]
             }))
             .with_output_schema(json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string" },
-                    "bytes": { "type": "integer" }
+                    "path": {
+                        "type": "string",
+                        "description": "Resolved absolute file path."
+                    },
+                    "bytes": {
+                        "type": "integer",
+                        "description": "Number of bytes written."
+                    }
                 },
                 "required": ["path", "bytes"]
             }))
@@ -537,26 +934,23 @@ impl Action for FileWriteAction {
             Some(c) => c,
             None => return ActionResult::error("Missing content for file_write"),
         };
-
-        if self.root_dir.is_some() && has_parent_dir(&path) {
-            return ActionResult::error("Path escapes root_dir");
+        let content_bytes = content.as_bytes();
+        let max_bytes = bounded_u64(
+            params_get_u64(params, "max_bytes"),
+            self.max_write_bytes,
+            self.max_write_bytes,
+        );
+        if content_bytes.len() > max_bytes {
+            return ActionResult::error(format!(
+                "Content too large: {} bytes exceeds write limit {}",
+                content_bytes.len(),
+                max_bytes
+            ));
         }
-        let full_path = resolve_path(&self.root_dir, &path);
-        let full_path = if let Some(root) = &self.root_dir {
-            let root = match tokio::fs::canonicalize(root).await {
-                Ok(r) => r,
-                Err(e) => return ActionResult::error(format!("Invalid root_dir: {}", e)),
-            };
-            let full = match tokio::fs::canonicalize(&full_path).await {
-                Ok(p) => p,
-                Err(_) => full_path.clone(),
-            };
-            if !full.starts_with(&root) {
-                return ActionResult::error("Path escapes root_dir");
-            }
-            full
-        } else {
-            full_path
+
+        let full_path = match resolve_safe_path(&self.root_dir, &path, true).await {
+            Ok(path) => path,
+            Err(e) => return ActionResult::error(e),
         };
 
         if self.create_dirs {
@@ -568,6 +962,11 @@ impl Action for FileWriteAction {
         }
 
         let append = params_get_bool(params, "append").unwrap_or(self.default_append);
+        if let Ok(meta) = tokio::fs::symlink_metadata(&full_path).await {
+            if meta.file_type().is_symlink() {
+                return ActionResult::error("Refusing to write through symlink path");
+            }
+        }
         if append {
             let mut file = match tokio::fs::OpenOptions::new()
                 .create(true)
@@ -581,8 +980,23 @@ impl Action for FileWriteAction {
             if let Err(e) = file.write_all(content.as_bytes()).await {
                 return ActionResult::error(format!("Write failed: {}", e));
             }
-        } else if let Err(e) = tokio::fs::write(&full_path, content.as_bytes()).await {
-            return ActionResult::error(format!("Write failed: {}", e));
+        } else {
+            let tmp_name = format!(
+                ".orchestral-tmp-{}-{}.tmp",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            );
+            let tmp_path = full_path.with_file_name(tmp_name);
+            if let Err(e) = tokio::fs::write(&tmp_path, content.as_bytes()).await {
+                return ActionResult::error(format!("Write temp file failed: {}", e));
+            }
+            if let Err(e) = tokio::fs::rename(&tmp_path, &full_path).await {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                return ActionResult::error(format!("Atomic rename failed: {}", e));
+            }
         }
 
         let mut exports = Map::new();
@@ -603,5 +1017,244 @@ pub fn build_builtin_action(spec: &ActionSpec) -> Option<Box<dyn Action>> {
         "file_read" => Some(Box::new(FileReadAction::from_spec(spec))),
         "file_write" => Some(Box::new(FileWriteAction::from_spec(spec))),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use async_trait::async_trait;
+    use orchestral_core::store::{
+        Reference, ReferenceStore, ReferenceType, StoreError, WorkingSet,
+    };
+    use serde_json::json;
+    use tokio::sync::RwLock;
+
+    struct NoopReferenceStore;
+
+    #[async_trait]
+    impl ReferenceStore for NoopReferenceStore {
+        async fn add(&self, _reference: Reference) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn get(&self, _id: &str) -> Result<Option<Reference>, StoreError> {
+            Ok(None)
+        }
+
+        async fn query_by_type(
+            &self,
+            _ref_type: &ReferenceType,
+        ) -> Result<Vec<Reference>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn query_recent(&self, _limit: usize) -> Result<Vec<Reference>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn delete(&self, _id: &str) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+    }
+
+    fn test_ctx() -> ActionContext {
+        ActionContext::new(
+            "task-1",
+            "s1",
+            "exec-1",
+            Arc::new(RwLock::new(WorkingSet::new())),
+            Arc::new(NoopReferenceStore),
+        )
+    }
+
+    #[test]
+    fn test_file_write_allows_new_file_under_relative_root_dir() {
+        tokio_test::block_on(async {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos();
+            let path = format!("target/orchestral_file_write_{}.txt", unique);
+            let spec = ActionSpec {
+                name: "file_write".to_string(),
+                kind: "file_write".to_string(),
+                description: None,
+                config: json!({
+                    "root_dir": ".",
+                    "create_dirs": true
+                }),
+                interface: None,
+            };
+            let action = FileWriteAction::from_spec(&spec);
+            let input = ActionInput::with_params(json!({
+                "path": path,
+                "content": "hello"
+            }));
+            let ctx = test_ctx();
+
+            let result = action.run(input, ctx).await;
+            match result {
+                ActionResult::Success { exports } => {
+                    assert_eq!(
+                        exports.get("bytes").and_then(|v| v.as_u64()),
+                        Some("hello".len() as u64)
+                    );
+                    let written_path = exports
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .expect("path export");
+                    let content = tokio::fs::read_to_string(written_path)
+                        .await
+                        .expect("read back");
+                    assert_eq!(content, "hello");
+                    let _ = tokio::fs::remove_file(written_path).await;
+                }
+                other => panic!("expected success, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn test_shell_rejects_expression_without_explicit_shell_mode() {
+        tokio_test::block_on(async {
+            let spec = ActionSpec {
+                name: "shell".to_string(),
+                kind: "shell".to_string(),
+                description: None,
+                config: json!({}),
+                interface: None,
+            };
+            let action = ShellAction::from_spec(&spec);
+            let input = ActionInput::with_params(json!({
+                "command": "echo hello"
+            }));
+            let result = action.run(input, test_ctx()).await;
+            match result {
+                ActionResult::Error { message } => {
+                    assert!(message.contains("Unsafe shell expression detected"));
+                }
+                other => panic!("expected error, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn test_shell_blocks_command_by_policy() {
+        tokio_test::block_on(async {
+            let spec = ActionSpec {
+                name: "shell".to_string(),
+                kind: "shell".to_string(),
+                description: None,
+                config: json!({
+                    "blocked_commands": ["echo"]
+                }),
+                interface: None,
+            };
+            let action = ShellAction::from_spec(&spec);
+            let input = ActionInput::with_params(json!({
+                "command": "echo",
+                "args": ["hello"]
+            }));
+            let result = action.run(input, test_ctx()).await;
+            match result {
+                ActionResult::Error { message } => {
+                    assert!(message.contains("blocked by policy"));
+                }
+                other => panic!("expected error, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn test_shell_blocks_expression_when_contains_blocked_command() {
+        tokio_test::block_on(async {
+            let spec = ActionSpec {
+                name: "shell".to_string(),
+                kind: "shell".to_string(),
+                description: None,
+                config: json!({
+                    "allow_shell_expression": true,
+                    "blocked_commands": ["rm"]
+                }),
+                interface: None,
+            };
+            let action = ShellAction::from_spec(&spec);
+            let input = ActionInput::with_params(json!({
+                "command": "echo ok && rm demo.txt",
+                "shell": true
+            }));
+            let result = action.run(input, test_ctx()).await;
+            match result {
+                ActionResult::Error { message } => {
+                    assert!(message.contains("contains blocked command"));
+                }
+                other => panic!("expected error, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn test_file_read_respects_size_limit_and_truncate() {
+        tokio_test::block_on(async {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos();
+            let path = format!("target/orchestral_file_read_{}.txt", unique);
+            tokio::fs::write(&path, "abcdefghij")
+                .await
+                .expect("seed file");
+
+            let spec = ActionSpec {
+                name: "file_read".to_string(),
+                kind: "file_read".to_string(),
+                description: None,
+                config: json!({
+                    "root_dir": ".",
+                    "max_read_bytes": 8
+                }),
+                interface: None,
+            };
+            let action = FileReadAction::from_spec(&spec);
+
+            let too_large = ActionInput::with_params(json!({
+                "path": path.clone(),
+                "max_bytes": 4
+            }));
+            let result = action.run(too_large, test_ctx()).await;
+            match result {
+                ActionResult::Error { message } => {
+                    assert!(message.contains("File too large"));
+                }
+                other => panic!("expected error, got {:?}", other),
+            }
+
+            let truncated = ActionInput::with_params(json!({
+                "path": path.clone(),
+                "max_bytes": 4,
+                "truncate": true
+            }));
+            let result = action.run(truncated, test_ctx()).await;
+            match result {
+                ActionResult::Success { exports } => {
+                    assert_eq!(
+                        exports.get("content").and_then(|v| v.as_str()),
+                        Some("abcd")
+                    );
+                    assert_eq!(exports.get("bytes").and_then(|v| v.as_u64()), Some(4));
+                    assert_eq!(
+                        exports.get("truncated").and_then(|v| v.as_bool()),
+                        Some(true)
+                    );
+                }
+                other => panic!("expected success, got {:?}", other),
+            }
+
+            let _ = tokio::fs::remove_file(&path).await;
+        });
     }
 }
