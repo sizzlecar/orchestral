@@ -12,6 +12,7 @@ mod builtin;
 mod external;
 mod factory;
 mod loader;
+mod shell_sandbox;
 
 // Re-export core action traits
 pub use orchestral_core::action::{Action, ActionContext, ActionInput, ActionMeta, ActionResult};

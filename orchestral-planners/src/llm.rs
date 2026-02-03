@@ -113,6 +113,16 @@ impl<C: LlmClient> LlmPlanner<C> {
 fn build_system_prompt(base: &str, context: &PlannerContext) -> String {
     let mut system = String::new();
     system.push_str(base.trim());
+    if !context.runtime_info.os.is_empty() {
+        system.push_str("\n\nExecution Environment:\n");
+        system.push_str(&format!(
+            "- os: {}\n- os_family: {}\n- arch: {}\n",
+            context.runtime_info.os, context.runtime_info.os_family, context.runtime_info.arch
+        ));
+        if let Some(shell) = &context.runtime_info.shell {
+            system.push_str(&format!("- shell: {}\n", shell));
+        }
+    }
     system.push_str("\n\nPlanning Rules:\n");
     system.push_str("1) Return ONLY one valid JSON object matching the required Plan schema.\n");
     system.push_str("2) step.id must be unique and stable.\n");
@@ -129,6 +139,9 @@ fn build_system_prompt(base: &str, context: &PlannerContext) -> String {
     );
     system
         .push_str("9) When generating step.params, strictly follow Action Catalog input fields.\n");
+    system.push_str(
+        "10) Any shell/file operation must be compatible with the current host platform and shell.\n",
+    );
     system.push_str("\nAction Catalog:\n");
     for action in &context.available_actions {
         append_action_catalog_entry(

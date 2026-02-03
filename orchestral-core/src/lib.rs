@@ -33,7 +33,7 @@ pub mod prelude {
         FixError, NormalizeError, NormalizedPlan, PlanFixer, PlanNormalizer, PlanValidator,
         ValidationError,
     };
-    pub use crate::planner::{HistoryItem, PlanError, Planner, PlannerContext};
+    pub use crate::planner::{HistoryItem, PlanError, Planner, PlannerContext, PlannerRuntimeInfo};
     pub use crate::store::{
         Reference, ReferenceStore, ReferenceType, Scope, StoreError, TaskStore, WorkingSet,
     };
@@ -46,6 +46,6 @@ pub use executor::{
     ExecutionDag, ExecutionProgressEvent, ExecutionProgressReporter, ExecutionResult, Executor,
 };
 pub use normalizer::{NormalizedPlan, PlanNormalizer};
-pub use planner::Planner;
+pub use planner::{Planner, PlannerRuntimeInfo};
 pub use store::{ReferenceStore, StoreError, TaskStore, WorkingSet};
 pub use types::{Intent, Plan, Step, Task, TaskId, TaskState};

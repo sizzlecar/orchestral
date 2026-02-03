@@ -218,6 +218,12 @@ actions:
             shell:
               type: boolean
               description: "Whether to execute command as a shell expression (`sh -c`)."
+            sandbox_mode:
+              type: string
+              description: "Optional override: none/read_only/workspace_write."
+            sandbox_backend:
+              type: string
+              description: "Optional override: auto/macos_seatbelt/linux_seccomp/windows_restricted."
           required: ["command"]
         output_schema:
           type: object
@@ -240,11 +246,26 @@ actions:
             stderr_truncated:
               type: boolean
               description: "Whether stderr exceeded max_output_bytes."
-          required: ["stdout", "stderr", "status", "timed_out", "stdout_truncated", "stderr_truncated"]
+            sandbox_mode:
+              type: string
+              description: "Applied sandbox mode."
+            sandboxed:
+              type: boolean
+              description: "Whether command ran with OS sandbox wrapper."
+            sandbox_backend:
+              type: string
+              description: "Resolved sandbox backend name."
+          required: ["stdout", "stderr", "status", "timed_out", "stdout_truncated", "stderr_truncated", "sandbox_mode", "sandboxed", "sandbox_backend"]
       config:
         timeout_ms: 10000
         allow_shell_expression: false
         max_output_bytes: 65536
+        sandbox_mode: workspace_write
+        sandbox_backend: auto
+        sandbox_allow_network: false
+        # Linux only (optional): explicit bubblewrap executable path.
+        # sandbox_linux_bwrap_path: "/usr/bin/bwrap"
+        sandbox_writable_roots: ["."]
         blocked_commands: ["rm", "mkfs", "shutdown", "reboot", "poweroff"]
     - name: file_read
       kind: file_read
@@ -255,7 +276,7 @@ actions:
           properties:
             path:
               type: string
-              description: "File path to read (must stay under root_dir)."
+              description: "File path to read (must stay under sandbox_writable_roots when sandbox is enabled)."
               example: "docs/readme.md"
             max_bytes:
               type: integer
@@ -281,7 +302,8 @@ actions:
               description: "Whether content was truncated."
           required: ["content", "path", "bytes", "truncated"]
       config:
-        root_dir: "."
+        sandbox_mode: workspace_write
+        sandbox_writable_roots: ["."]
         max_read_bytes: 524288
     - name: file_write
       kind: file_write
@@ -292,7 +314,7 @@ actions:
           properties:
             path:
               type: string
-              description: "Target file path to write (must stay under root_dir)."
+              description: "Target file path to write (must stay under sandbox_writable_roots when sandbox is enabled)."
               example: "output/google.html"
             content:
               type: string
@@ -316,6 +338,7 @@ actions:
               description: "Bytes written to file."
           required: ["path", "bytes"]
       config:
-        root_dir: "."
+        sandbox_mode: workspace_write
+        sandbox_writable_roots: ["."]
         create_dirs: true
         max_write_bytes: 524288

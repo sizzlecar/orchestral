@@ -56,6 +56,8 @@ pub struct PlannerContext {
     /// Reference store for querying historical artifacts and user preferences
     /// Read-only access
     pub reference_store: Arc<dyn ReferenceStore>,
+    /// Runtime host information for platform-aware planning.
+    pub runtime_info: PlannerRuntimeInfo,
 }
 
 impl PlannerContext {
@@ -68,6 +70,7 @@ impl PlannerContext {
             available_actions,
             history: Vec::new(),
             reference_store,
+            runtime_info: PlannerRuntimeInfo::default(),
         }
     }
 
@@ -81,7 +84,14 @@ impl PlannerContext {
             available_actions,
             history,
             reference_store,
+            runtime_info: PlannerRuntimeInfo::default(),
         }
+    }
+
+    /// Attach runtime host information.
+    pub fn with_runtime_info(mut self, runtime_info: PlannerRuntimeInfo) -> Self {
+        self.runtime_info = runtime_info;
+        self
     }
 
     /// Add a history item
@@ -92,6 +102,26 @@ impl PlannerContext {
     /// Get action by name
     pub fn get_action(&self, name: &str) -> Option<&ActionMeta> {
         self.available_actions.iter().find(|a| a.name == name)
+    }
+}
+
+/// Runtime host info visible to planner prompt.
+#[derive(Debug, Clone, Default)]
+pub struct PlannerRuntimeInfo {
+    pub os: String,
+    pub os_family: String,
+    pub arch: String,
+    pub shell: Option<String>,
+}
+
+impl PlannerRuntimeInfo {
+    pub fn detect() -> Self {
+        Self {
+            os: std::env::consts::OS.to_string(),
+            os_family: std::env::consts::FAMILY.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            shell: std::env::var("SHELL").ok(),
+        }
     }
 }
 

@@ -17,7 +17,9 @@ use orchestral_core::executor::{
     ExecutionProgressEvent, ExecutionProgressReporter, ExecutionResult, Executor, ExecutorContext,
 };
 use orchestral_core::normalizer::{NormalizeError, PlanNormalizer};
-use orchestral_core::planner::{HistoryItem, PlanError, Planner, PlannerContext};
+use orchestral_core::planner::{
+    HistoryItem, PlanError, Planner, PlannerContext, PlannerRuntimeInfo,
+};
 use orchestral_core::store::{ReferenceStore, StoreError, TaskStore, WorkingSet};
 use orchestral_core::types::{Intent, IntentContext, StepKind, Task, TaskId, TaskState};
 use orchestral_stores::{Event, EventBus, EventStore};
@@ -223,7 +225,9 @@ impl Orchestrator {
             history_items = history.len(),
             "orchestrator planning started"
         );
-        let context = PlannerContext::with_history(actions, history, self.reference_store.clone());
+        let runtime_info = PlannerRuntimeInfo::detect();
+        let context = PlannerContext::with_history(actions, history, self.reference_store.clone())
+            .with_runtime_info(runtime_info);
         let plan = self.planner.plan(&task.intent, &context).await?;
         tracing::info!(
             interaction_id = %interaction_id,

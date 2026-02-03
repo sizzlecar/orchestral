@@ -9,6 +9,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::time::timeout;
 
+use crate::shell_sandbox::{
+    resolve_root_path, sandbox_command, ShellSandboxBackendKind, ShellSandboxMode,
+    ShellSandboxPolicy,
+};
 use orchestral_config::ActionSpec;
 use orchestral_core::action::{Action, ActionContext, ActionInput, ActionMeta, ActionResult};
 
@@ -89,14 +93,6 @@ fn merge_headers(
         }
     }
     map
-}
-
-fn resolve_path(root: &Option<PathBuf>, path: &str) -> PathBuf {
-    let path = PathBuf::from(path);
-    match root {
-        Some(root_dir) => root_dir.join(path),
-        None => path,
-    }
 }
 
 fn has_parent_dir(path: &str) -> bool {
@@ -183,41 +179,60 @@ async fn read_stream_limited<R: tokio::io::AsyncRead + Unpin>(
     Ok((kept, truncated))
 }
 
-async fn resolve_safe_path(
-    root_dir: &Option<PathBuf>,
+async fn resolve_safe_path_with_policy(
+    policy: &ShellSandboxPolicy,
     path: &str,
     allow_nonexistent_target: bool,
 ) -> Result<PathBuf, String> {
-    if root_dir.is_some() && has_parent_dir(path) {
-        return Err("Path escapes root_dir".to_string());
+    if has_parent_dir(path) {
+        return Err("Path escapes sandbox roots".to_string());
     }
-    let full_path = resolve_path(root_dir, path);
-    let Some(root) = root_dir else {
-        return Ok(full_path);
-    };
 
-    let canonical_root = tokio::fs::canonicalize(root)
-        .await
-        .map_err(|e| format!("Invalid root_dir: {}", e))?;
+    let cwd = std::env::current_dir().map_err(|e| format!("Resolve current dir failed: {}", e))?;
+    let full_path = resolve_root_path(&cwd, Path::new(path));
 
     let candidate = match tokio::fs::canonicalize(&full_path).await {
         Ok(p) => p,
-        Err(_e) if allow_nonexistent_target => {
-            if full_path.is_absolute() {
-                full_path.clone()
-            } else {
-                std::env::current_dir()
-                    .map(|cwd| cwd.join(&full_path))
-                    .map_err(|err| format!("Resolve current dir failed: {}", err))?
-            }
-        }
+        Err(_e) if allow_nonexistent_target => full_path.clone(),
         Err(e) => return Err(format!("Invalid path: {}", e)),
     };
 
-    if !candidate.starts_with(&canonical_root) {
-        return Err("Path escapes root_dir".to_string());
+    if matches!(policy.mode, ShellSandboxMode::None) {
+        return Ok(candidate);
     }
-    Ok(candidate)
+
+    let mut roots = policy.writable_roots.clone();
+    if roots.is_empty() {
+        roots.push(PathBuf::from("."));
+    }
+    for root in roots {
+        let resolved_root = resolve_root_path(&cwd, &root);
+        let canonical_root = tokio::fs::canonicalize(&resolved_root)
+            .await
+            .map_err(|e| format!("Invalid sandbox root '{}': {}", resolved_root.display(), e))?;
+        if candidate.starts_with(&canonical_root) {
+            return Ok(candidate);
+        }
+    }
+    Err("Path escapes sandbox roots".to_string())
+}
+
+fn build_file_sandbox_policy(spec: &ActionSpec) -> ShellSandboxPolicy {
+    let mode = config_string(&spec.config, "sandbox_mode")
+        .as_deref()
+        .and_then(ShellSandboxMode::from_str)
+        .unwrap_or(ShellSandboxMode::WorkspaceWrite);
+    let writable_roots = config_string_array(&spec.config, "sandbox_writable_roots")
+        .into_iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    ShellSandboxPolicy {
+        mode,
+        backend: ShellSandboxBackendKind::Auto,
+        allow_network: false,
+        writable_roots,
+        linux_bwrap_path: None,
+    }
 }
 
 /// Echo action
@@ -458,6 +473,7 @@ pub struct ShellAction {
     allowed_commands: Option<HashSet<String>>,
     blocked_commands: HashSet<String>,
     max_output_bytes: usize,
+    sandbox_policy: ShellSandboxPolicy,
 }
 
 impl ShellAction {
@@ -487,6 +503,29 @@ impl ShellAction {
             64 * 1024,
             1024 * 1024,
         );
+        let sandbox_mode = config_string(&spec.config, "sandbox_mode")
+            .as_deref()
+            .and_then(ShellSandboxMode::from_str)
+            .unwrap_or(ShellSandboxMode::None);
+        let sandbox_backend = config_string(&spec.config, "sandbox_backend")
+            .as_deref()
+            .and_then(ShellSandboxBackendKind::from_str)
+            .unwrap_or(ShellSandboxBackendKind::Auto);
+        let sandbox_allow_network =
+            config_bool(&spec.config, "sandbox_allow_network").unwrap_or(false);
+        let sandbox_writable_roots = config_string_array(&spec.config, "sandbox_writable_roots")
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        let sandbox_linux_bwrap_path =
+            config_string(&spec.config, "sandbox_linux_bwrap_path").map(PathBuf::from);
+        let sandbox_policy = ShellSandboxPolicy {
+            mode: sandbox_mode,
+            backend: sandbox_backend,
+            allow_network: sandbox_allow_network,
+            writable_roots: sandbox_writable_roots,
+            linux_bwrap_path: sandbox_linux_bwrap_path,
+        };
         Self {
             name: spec.name.clone(),
             description: spec.description_or("Runs a shell command"),
@@ -496,6 +535,7 @@ impl ShellAction {
             allowed_commands,
             blocked_commands,
             max_output_bytes,
+            sandbox_policy,
         }
     }
 }
@@ -529,6 +569,14 @@ impl Action for ShellAction {
                     "shell": {
                         "type": "boolean",
                         "description": "Set true to force shell expression mode (`sh -c command`)."
+                    },
+                    "sandbox_mode": {
+                        "type": "string",
+                        "description": "Optional override for this step: none/read_only/workspace_write."
+                    },
+                    "sandbox_backend": {
+                        "type": "string",
+                        "description": "Optional override: auto/macos_seatbelt/linux_seccomp/windows_restricted."
                     }
                 },
                 "required": ["command"]
@@ -559,9 +607,21 @@ impl Action for ShellAction {
                     "stderr_truncated": {
                         "type": "boolean",
                         "description": "Whether stderr exceeded max_output_bytes."
+                    },
+                    "sandbox_mode": {
+                        "type": "string",
+                        "description": "Applied sandbox mode."
+                    },
+                    "sandboxed": {
+                        "type": "boolean",
+                        "description": "Whether command ran with OS sandbox wrapper."
+                    },
+                    "sandbox_backend": {
+                        "type": "string",
+                        "description": "Resolved sandbox backend name."
                     }
                 },
-                "required": ["stdout", "stderr", "status", "timed_out", "stdout_truncated", "stderr_truncated"]
+                "required": ["stdout", "stderr", "status", "timed_out", "stdout_truncated", "stderr_truncated", "sandbox_mode", "sandboxed", "sandbox_backend"]
             }))
     }
 
@@ -615,21 +675,44 @@ impl Action for ShellAction {
             }
         }
 
-        let mut cmd = if use_shell {
-            let mut c = Command::new("sh");
-            c.arg("-c").arg(command);
-            c
+        let cwd = if let Some(dir) = &self.working_dir {
+            dir.clone()
         } else {
-            let mut c = Command::new(&command);
-            if let Some(args) = args {
-                c.args(args);
+            match std::env::current_dir() {
+                Ok(dir) => dir,
+                Err(e) => return ActionResult::error(format!("Resolve current dir failed: {}", e)),
             }
-            c
         };
 
-        if let Some(dir) = &self.working_dir {
-            cmd.current_dir(dir);
+        let mut sandbox_policy = self.sandbox_policy.clone();
+        if let Some(mode_override) = params_get_string(params, "sandbox_mode")
+            .as_deref()
+            .and_then(ShellSandboxMode::from_str)
+        {
+            sandbox_policy.mode = mode_override;
         }
+        if let Some(backend_override) = params_get_string(params, "sandbox_backend")
+            .as_deref()
+            .and_then(ShellSandboxBackendKind::from_str)
+        {
+            sandbox_policy.backend = backend_override;
+        }
+
+        let (base_program, base_args) = if use_shell {
+            ("sh".to_string(), vec!["-c".to_string(), command])
+        } else {
+            (command, args.unwrap_or_default())
+        };
+
+        let sandboxed = match sandbox_command(base_program, base_args, &cwd, &sandbox_policy) {
+            Ok(cmd) => cmd,
+            Err(e) => return ActionResult::error(format!("Sandbox setup failed: {}", e)),
+        };
+
+        let mut cmd = Command::new(&sandboxed.program);
+        cmd.args(&sandboxed.args);
+        cmd.envs(sandboxed.env.clone());
+        cmd.current_dir(&cwd);
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
@@ -705,6 +788,18 @@ impl Action for ShellAction {
             "stderr_truncated".to_string(),
             Value::Bool(stderr_truncated),
         );
+        exports.insert(
+            "sandbox_mode".to_string(),
+            Value::String(sandbox_policy.mode.as_str().to_string()),
+        );
+        exports.insert(
+            "sandboxed".to_string(),
+            Value::Bool(!matches!(sandbox_policy.mode, ShellSandboxMode::None)),
+        );
+        exports.insert(
+            "sandbox_backend".to_string(),
+            Value::String(sandboxed.backend.to_string()),
+        );
         ActionResult::success_with(exports.into_iter().collect())
     }
 }
@@ -713,13 +808,13 @@ impl Action for ShellAction {
 pub struct FileReadAction {
     name: String,
     description: String,
-    root_dir: Option<PathBuf>,
+    sandbox_policy: ShellSandboxPolicy,
     max_read_bytes: usize,
 }
 
 impl FileReadAction {
     pub fn from_spec(spec: &ActionSpec) -> Self {
-        let root_dir = config_string(&spec.config, "root_dir").map(PathBuf::from);
+        let sandbox_policy = build_file_sandbox_policy(spec);
         let max_read_bytes = bounded_u64(
             config_u64(&spec.config, "max_read_bytes"),
             512 * 1024,
@@ -728,7 +823,7 @@ impl FileReadAction {
         Self {
             name: spec.name.clone(),
             description: spec.description_or("Reads a file from disk"),
-            root_dir,
+            sandbox_policy,
             max_read_bytes,
         }
     }
@@ -751,7 +846,7 @@ impl Action for FileReadAction {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "File path to read. Must stay under root_dir when configured."
+                        "description": "File path to read. Must stay under sandbox_writable_roots when sandbox is enabled."
                     },
                     "max_bytes": {
                         "type": "integer",
@@ -795,10 +890,11 @@ impl Action for FileReadAction {
             None => return ActionResult::error("Missing path for file_read"),
         };
 
-        let full_path = match resolve_safe_path(&self.root_dir, &path, false).await {
-            Ok(path) => path,
-            Err(e) => return ActionResult::error(e),
-        };
+        let full_path =
+            match resolve_safe_path_with_policy(&self.sandbox_policy, &path, false).await {
+                Ok(path) => path,
+                Err(e) => return ActionResult::error(e),
+            };
 
         let max_bytes = bounded_u64(
             params_get_u64(params, "max_bytes"),
@@ -846,7 +942,7 @@ impl Action for FileReadAction {
 pub struct FileWriteAction {
     name: String,
     description: String,
-    root_dir: Option<PathBuf>,
+    sandbox_policy: ShellSandboxPolicy,
     create_dirs: bool,
     default_append: bool,
     max_write_bytes: usize,
@@ -854,7 +950,7 @@ pub struct FileWriteAction {
 
 impl FileWriteAction {
     pub fn from_spec(spec: &ActionSpec) -> Self {
-        let root_dir = config_string(&spec.config, "root_dir").map(PathBuf::from);
+        let sandbox_policy = build_file_sandbox_policy(spec);
         let create_dirs = config_bool(&spec.config, "create_dirs").unwrap_or(true);
         let default_append = config_bool(&spec.config, "append").unwrap_or(false);
         let max_write_bytes = bounded_u64(
@@ -865,7 +961,7 @@ impl FileWriteAction {
         Self {
             name: spec.name.clone(),
             description: spec.description_or("Writes a file to disk"),
-            root_dir,
+            sandbox_policy,
             create_dirs,
             default_append,
             max_write_bytes,
@@ -890,7 +986,7 @@ impl Action for FileWriteAction {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Target file path to write. Must stay under root_dir when configured."
+                        "description": "Target file path to write. Must stay under sandbox_writable_roots when sandbox is enabled."
                     },
                     "content": {
                         "type": "string",
@@ -948,7 +1044,13 @@ impl Action for FileWriteAction {
             ));
         }
 
-        let full_path = match resolve_safe_path(&self.root_dir, &path, true).await {
+        if matches!(self.sandbox_policy.mode, ShellSandboxMode::ReadOnly) {
+            return ActionResult::error(
+                "file_write is not allowed when sandbox_mode=read_only".to_string(),
+            );
+        }
+        let full_path = match resolve_safe_path_with_policy(&self.sandbox_policy, &path, true).await
+        {
             Ok(path) => path,
             Err(e) => return ActionResult::error(e),
         };
@@ -1072,7 +1174,7 @@ mod tests {
     }
 
     #[test]
-    fn test_file_write_allows_new_file_under_relative_root_dir() {
+    fn test_file_write_allows_new_file_under_workspace_roots() {
         tokio_test::block_on(async {
             let unique = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1084,7 +1186,8 @@ mod tests {
                 kind: "file_write".to_string(),
                 description: None,
                 config: json!({
-                    "root_dir": ".",
+                    "sandbox_mode": "workspace_write",
+                    "sandbox_writable_roots": ["."],
                     "create_dirs": true
                 }),
                 interface: None,
@@ -1214,7 +1317,8 @@ mod tests {
                 kind: "file_read".to_string(),
                 description: None,
                 config: json!({
-                    "root_dir": ".",
+                    "sandbox_mode": "workspace_write",
+                    "sandbox_writable_roots": ["."],
                     "max_read_bytes": 8
                 }),
                 interface: None,
@@ -1255,6 +1359,61 @@ mod tests {
             }
 
             let _ = tokio::fs::remove_file(&path).await;
+        });
+    }
+
+    #[test]
+    fn test_file_write_rejects_in_read_only_mode() {
+        tokio_test::block_on(async {
+            let spec = ActionSpec {
+                name: "file_write".to_string(),
+                kind: "file_write".to_string(),
+                description: None,
+                config: json!({
+                    "sandbox_mode": "read_only",
+                    "sandbox_writable_roots": ["."]
+                }),
+                interface: None,
+            };
+            let action = FileWriteAction::from_spec(&spec);
+            let input = ActionInput::with_params(json!({
+                "path": "target/readonly.txt",
+                "content": "hello"
+            }));
+            let result = action.run(input, test_ctx()).await;
+            match result {
+                ActionResult::Error { message } => {
+                    assert!(message.contains("read_only"));
+                }
+                other => panic!("expected error, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn test_file_read_rejects_path_outside_workspace_roots() {
+        tokio_test::block_on(async {
+            let spec = ActionSpec {
+                name: "file_read".to_string(),
+                kind: "file_read".to_string(),
+                description: None,
+                config: json!({
+                    "sandbox_mode": "workspace_write",
+                    "sandbox_writable_roots": ["target"]
+                }),
+                interface: None,
+            };
+            let action = FileReadAction::from_spec(&spec);
+            let input = ActionInput::with_params(json!({
+                "path": "Cargo.toml"
+            }));
+            let result = action.run(input, test_ctx()).await;
+            match result {
+                ActionResult::Error { message } => {
+                    assert!(message.contains("sandbox roots"));
+                }
+                other => panic!("expected error, got {:?}", other),
+            }
         });
     }
 }
