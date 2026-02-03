@@ -9,6 +9,7 @@
 //! Configuration types are provided by `orchestral-config`.
 
 mod builtin;
+mod external;
 mod factory;
 mod loader;
 
@@ -19,5 +20,6 @@ pub use orchestral_core::action::{Action, ActionContext, ActionInput, ActionMeta
 pub use orchestral_config::{ActionInterfaceSpec, ActionSpec, ActionsConfig};
 
 pub use builtin::*;
+pub use external::*;
 pub use factory::{ActionBuildError, ActionFactory, DefaultActionFactory};
 pub use loader::{ActionConfigError, ActionRegistryManager, ActionWatcher};

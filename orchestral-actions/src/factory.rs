@@ -7,12 +7,15 @@ use orchestral_config::{ActionInterfaceSpec, ActionSpec};
 use orchestral_core::action::{Action, ActionContext, ActionInput, ActionMeta, ActionResult};
 
 use crate::builtin::build_builtin_action;
+use crate::external::build_external_action;
 
 /// Action factory errors
 #[derive(Debug, Error)]
 pub enum ActionBuildError {
     #[error("unknown action kind: {0}")]
     UnknownKind(String),
+    #[error("invalid action config: {0}")]
+    InvalidConfig(String),
 }
 
 /// Action factory trait
@@ -42,7 +45,13 @@ impl ActionFactory for DefaultActionFactory {
                 let action: Arc<dyn Action> = Arc::from(action);
                 Ok(Arc::new(ConfiguredAction::new(action, spec)))
             }
-            None => Err(ActionBuildError::UnknownKind(spec.kind.clone())),
+            None => match build_external_action(spec)? {
+                Some(action) => {
+                    let action: Arc<dyn Action> = Arc::from(action);
+                    Ok(Arc::new(ConfiguredAction::new(action, spec)))
+                }
+                None => Err(ActionBuildError::UnknownKind(spec.kind.clone())),
+            },
         }
     }
 }
