@@ -255,7 +255,10 @@ actions:
             sandbox_backend:
               type: string
               description: "Resolved sandbox backend name."
-          required: ["stdout", "stderr", "status", "timed_out", "stdout_truncated", "stderr_truncated", "sandbox_mode", "sandboxed", "sandbox_backend"]
+            env_policy:
+              type: string
+              description: "Applied environment policy."
+          required: ["stdout", "stderr", "status", "timed_out", "stdout_truncated", "stderr_truncated", "sandbox_mode", "sandboxed", "sandbox_backend", "env_policy"]
       config:
         timeout_ms: 10000
         allow_shell_expression: false
@@ -266,6 +269,8 @@ actions:
         # Linux only (optional): explicit bubblewrap executable path.
         # sandbox_linux_bwrap_path: "/usr/bin/bwrap"
         sandbox_writable_roots: ["."]
+        env_policy: minimal
+        env_denylist: ["OPENAI_API_KEY", "GEMINI_API_KEY", "HF_TOKEN"]
         blocked_commands: ["rm", "mkfs", "shutdown", "reboot", "poweroff"]
     - name: file_read
       kind: file_read

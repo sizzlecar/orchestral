@@ -153,6 +153,7 @@ Orchestral 使用 stdin/stdout 传递 JSON：
 - `shell` 默认禁用隐式 `sh -c`，如需表达式执行必须显式 `shell=true` 或配置 `allow_shell_expression=true`。
 - `shell` 支持 `blocked_commands` / `allowed_commands` 策略以及 `max_output_bytes` 输出截断，防止危险命令与日志爆量。
 - `shell` 支持 `sandbox_mode`（`none/read_only/workspace_write`）、`sandbox_backend`（`auto/macos_seatbelt/linux_seccomp/...`）与 `sandbox_writable_roots`；macOS 使用 seatbelt，Linux 使用 bubblewrap（可通过 `sandbox_linux_bwrap_path` 指定）。
+- `shell` 默认使用 `env_policy=minimal`，避免把宿主机全部环境变量暴露给命令；可通过 `env_allowlist/env_denylist` 细化。
 - `file_read` 默认有 `max_read_bytes` 上限，并支持请求级 `max_bytes` + `truncate` 控制。
 - `file_write` 默认有 `max_write_bytes` 上限，校验 `sandbox_writable_roots` 越权路径，并拒绝符号链接写入。
 

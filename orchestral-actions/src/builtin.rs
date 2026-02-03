@@ -118,6 +118,85 @@ fn normalize_command_name(command: &str) -> String {
         .to_ascii_lowercase()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellEnvPolicy {
+    Inherit,
+    Minimal,
+    Allowlist,
+}
+
+impl ShellEnvPolicy {
+    fn from_str(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "inherit" => Some(Self::Inherit),
+            "minimal" => Some(Self::Minimal),
+            "allowlist" | "whitelist" => Some(Self::Allowlist),
+            _ => None,
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Inherit => "inherit",
+            Self::Minimal => "minimal",
+            Self::Allowlist => "allowlist",
+        }
+    }
+}
+
+fn normalize_env_key(key: &str) -> String {
+    key.trim().to_ascii_uppercase()
+}
+
+fn build_shell_env(
+    policy: ShellEnvPolicy,
+    allowlist: &HashSet<String>,
+    denylist: &HashSet<String>,
+    extra: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let insert_if_allowed = |map: &mut HashMap<String, String>, key: &str, value: String| {
+        let normalized = normalize_env_key(key);
+        if !denylist.contains(&normalized) {
+            map.insert(key.to_string(), value);
+        }
+    };
+
+    match policy {
+        ShellEnvPolicy::Inherit => {
+            for (k, v) in std::env::vars() {
+                insert_if_allowed(&mut out, &k, v);
+            }
+        }
+        ShellEnvPolicy::Minimal => {
+            for key in [
+                "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "HOME", "USER", "TMPDIR", "SHELL",
+            ] {
+                if let Ok(value) = std::env::var(key) {
+                    insert_if_allowed(&mut out, key, value);
+                }
+            }
+        }
+        ShellEnvPolicy::Allowlist => {
+            for key in allowlist {
+                if let Ok(value) = std::env::var(key) {
+                    insert_if_allowed(&mut out, key, value);
+                }
+            }
+            if !out.contains_key("PATH") {
+                if let Ok(path) = std::env::var("PATH") {
+                    insert_if_allowed(&mut out, "PATH", path);
+                }
+            }
+        }
+    }
+
+    for (k, v) in extra {
+        out.insert(k.clone(), v.clone());
+    }
+    out
+}
+
 fn first_token(input: &str) -> Option<&str> {
     input.split_whitespace().next()
 }
@@ -474,6 +553,9 @@ pub struct ShellAction {
     blocked_commands: HashSet<String>,
     max_output_bytes: usize,
     sandbox_policy: ShellSandboxPolicy,
+    env_policy: ShellEnvPolicy,
+    env_allowlist: HashSet<String>,
+    env_denylist: HashSet<String>,
 }
 
 impl ShellAction {
@@ -526,6 +608,18 @@ impl ShellAction {
             writable_roots: sandbox_writable_roots,
             linux_bwrap_path: sandbox_linux_bwrap_path,
         };
+        let env_policy = config_string(&spec.config, "env_policy")
+            .as_deref()
+            .and_then(ShellEnvPolicy::from_str)
+            .unwrap_or(ShellEnvPolicy::Minimal);
+        let env_allowlist = config_string_array(&spec.config, "env_allowlist")
+            .into_iter()
+            .map(|s| normalize_env_key(&s))
+            .collect::<HashSet<_>>();
+        let env_denylist = config_string_array(&spec.config, "env_denylist")
+            .into_iter()
+            .map(|s| normalize_env_key(&s))
+            .collect::<HashSet<_>>();
         Self {
             name: spec.name.clone(),
             description: spec.description_or("Runs a shell command"),
@@ -536,6 +630,9 @@ impl ShellAction {
             blocked_commands,
             max_output_bytes,
             sandbox_policy,
+            env_policy,
+            env_allowlist,
+            env_denylist,
         }
     }
 }
@@ -619,9 +716,13 @@ impl Action for ShellAction {
                     "sandbox_backend": {
                         "type": "string",
                         "description": "Resolved sandbox backend name."
+                    },
+                    "env_policy": {
+                        "type": "string",
+                        "description": "Applied environment policy."
                     }
                 },
-                "required": ["stdout", "stderr", "status", "timed_out", "stdout_truncated", "stderr_truncated", "sandbox_mode", "sandboxed", "sandbox_backend"]
+                "required": ["stdout", "stderr", "status", "timed_out", "stdout_truncated", "stderr_truncated", "sandbox_mode", "sandboxed", "sandbox_backend", "env_policy"]
             }))
     }
 
@@ -711,7 +812,14 @@ impl Action for ShellAction {
 
         let mut cmd = Command::new(&sandboxed.program);
         cmd.args(&sandboxed.args);
-        cmd.envs(sandboxed.env.clone());
+        let exec_env = build_shell_env(
+            self.env_policy,
+            &self.env_allowlist,
+            &self.env_denylist,
+            &sandboxed.env,
+        );
+        cmd.env_clear();
+        cmd.envs(exec_env);
         cmd.current_dir(&cwd);
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::piped());
@@ -799,6 +907,10 @@ impl Action for ShellAction {
         exports.insert(
             "sandbox_backend".to_string(),
             Value::String(sandboxed.backend.to_string()),
+        );
+        exports.insert(
+            "env_policy".to_string(),
+            Value::String(self.env_policy.as_str().to_string()),
         );
         ActionResult::success_with(exports.into_iter().collect())
     }
@@ -1296,6 +1408,47 @@ mod tests {
                     assert!(message.contains("contains blocked command"));
                 }
                 other => panic!("expected error, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn test_shell_minimal_env_hides_secret_vars() {
+        tokio_test::block_on(async {
+            let secret_key = format!("ORCHESTRAL_TEST_SECRET_{}", std::process::id());
+            std::env::set_var(&secret_key, "top-secret-value");
+
+            let spec = ActionSpec {
+                name: "shell".to_string(),
+                kind: "shell".to_string(),
+                description: None,
+                config: json!({
+                    "sandbox_mode": "none",
+                    "env_policy": "minimal"
+                }),
+                interface: None,
+            };
+            let action = ShellAction::from_spec(&spec);
+            let input = ActionInput::with_params(json!({
+                "command": "env"
+            }));
+            let result = action.run(input, test_ctx()).await;
+            std::env::remove_var(&secret_key);
+
+            match result {
+                ActionResult::Success { exports } => {
+                    let stdout = exports
+                        .get("stdout")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    assert!(!stdout.contains(&secret_key));
+                    assert!(!stdout.contains("top-secret-value"));
+                    assert_eq!(
+                        exports.get("env_policy").and_then(|v| v.as_str()),
+                        Some("minimal")
+                    );
+                }
+                other => panic!("expected success, got {:?}", other),
             }
         });
     }

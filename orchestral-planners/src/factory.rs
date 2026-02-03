@@ -2,6 +2,7 @@
 
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use llm_sdk::builder::{LLMBackend, LLMBuilder};
@@ -89,6 +90,7 @@ pub fn build_client_from_backend(
         model: invocation.model.clone(),
         temperature: invocation.temperature,
         normalize_response: invocation.normalize_response,
+        timeout_secs: backend.get_config::<u64>("timeout_secs").unwrap_or(60),
     };
     Ok(Arc::new(client))
 }
@@ -132,6 +134,7 @@ struct GranietLlmClient {
     model: String,
     temperature: f32,
     normalize_response: bool,
+    timeout_secs: u64,
 }
 
 #[async_trait]
@@ -168,10 +171,13 @@ impl LlmClient for GranietLlmClient {
             .map_err(|e| LlmError::Http(format!("llm builder error: {}", e)))?;
 
         let messages = vec![ChatMessage::user().content(prompt).build()];
-        let response = llm
-            .chat(&messages)
-            .await
-            .map_err(|e| LlmError::Http(format!("llm chat error: {}", e)))?;
+        let response =
+            tokio::time::timeout(Duration::from_secs(self.timeout_secs), llm.chat(&messages))
+                .await
+                .map_err(|_| {
+                    LlmError::Http(format!("llm chat timeout after {}s", self.timeout_secs))
+                })?
+                .map_err(|e| LlmError::Http(format!("llm chat error: {}", e)))?;
 
         response
             .text()
