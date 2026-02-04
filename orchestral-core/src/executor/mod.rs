@@ -577,7 +577,8 @@ impl Executor {
                             Some(step_id.clone()),
                             Some(step.action.clone()),
                             "step_started",
-                        ),
+                        )
+                        .with_metadata(build_step_start_metadata(&step.action, &step.params)),
                     )
                     .await;
 
@@ -604,10 +605,12 @@ impl Executor {
                             }
 
                             // Write exports to working set
+                            let completion_metadata =
+                                build_step_completion_metadata(&step.action, &exports);
                             let mut ws = ctx.working_set.write().await;
-                            for (key, value) in exports {
+                            for (key, value) in &exports {
                                 ws.set_task(key.clone(), value.clone());
-                                ws.set_task(format!("{}.{}", step.id, key), value);
+                                ws.set_task(format!("{}.{}", step.id, key), value.clone());
                             }
                             dag.mark_completed(&step_id);
                             tracing::info!(
@@ -623,7 +626,8 @@ impl Executor {
                                     Some(step_id),
                                     Some(step.action.clone()),
                                     "step_completed",
-                                ),
+                                )
+                                .with_metadata(completion_metadata),
                             )
                             .await;
                         }
@@ -892,6 +896,139 @@ impl Executor {
             }
         }
     }
+}
+
+fn build_step_completion_metadata(
+    action: &str,
+    exports: &HashMap<String, serde_json::Value>,
+) -> serde_json::Value {
+    let mut export_keys: Vec<String> = exports.keys().cloned().collect();
+    export_keys.sort();
+
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        "action".to_string(),
+        serde_json::Value::String(action.to_string()),
+    );
+    metadata.insert(
+        "export_count".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(export_keys.len())),
+    );
+    metadata.insert(
+        "export_keys".to_string(),
+        serde_json::Value::Array(
+            export_keys
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    );
+
+    if let Some(path) = exports.get("path").and_then(|v| v.as_str()) {
+        metadata.insert(
+            "path".to_string(),
+            serde_json::Value::String(truncate_for_log(path, 240)),
+        );
+    }
+    if let Some(bytes) = exports.get("bytes").and_then(|v| v.as_u64()) {
+        metadata.insert(
+            "bytes".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(bytes)),
+        );
+    }
+    if let Some(status) = exports.get("status").and_then(|v| v.as_i64()) {
+        metadata.insert(
+            "status".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(status)),
+        );
+    }
+    if let Some(timed_out) = exports.get("timed_out").and_then(|v| v.as_bool()) {
+        metadata.insert("timed_out".to_string(), serde_json::Value::Bool(timed_out));
+    }
+
+    if let Some(preview) = output_preview(exports) {
+        metadata.insert(
+            "output_preview".to_string(),
+            serde_json::Value::String(preview),
+        );
+    }
+
+    serde_json::Value::Object(metadata)
+}
+
+fn build_step_start_metadata(action: &str, params: &serde_json::Value) -> serde_json::Value {
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        "action".to_string(),
+        serde_json::Value::String(action.to_string()),
+    );
+    if let Some(summary) = summarize_step_input(action, params) {
+        metadata.insert(
+            "input_summary".to_string(),
+            serde_json::Value::String(summary),
+        );
+    }
+    serde_json::Value::Object(metadata)
+}
+
+fn summarize_step_input(action: &str, params: &serde_json::Value) -> Option<String> {
+    let obj = params.as_object()?;
+    match action {
+        "shell" => {
+            let command = obj.get("command").and_then(|v| v.as_str())?;
+            let args = obj
+                .get("args")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default();
+            let line = if args.is_empty() {
+                command.to_string()
+            } else {
+                format!("{} {}", command, args)
+            };
+            Some(truncate_for_log(&line, 240))
+        }
+        "http" => {
+            let method = obj.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
+            let url = obj.get("url").and_then(|v| v.as_str())?;
+            Some(truncate_for_log(&format!("{} {}", method, url), 240))
+        }
+        "file_read" | "file_write" => obj
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|p| truncate_for_log(p, 240)),
+        _ => None,
+    }
+}
+
+fn output_preview(exports: &HashMap<String, serde_json::Value>) -> Option<String> {
+    for key in ["result", "content", "stdout", "stderr"] {
+        if let Some(value) = exports.get(key).and_then(|v| v.as_str()) {
+            return Some(truncate_for_log(value, 320));
+        }
+    }
+    if let Some(headers) = exports.get("headers").and_then(|v| v.as_object()) {
+        if !headers.is_empty() {
+            let mut pairs = headers
+                .iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| format!("{}: {}", k, s)))
+                .collect::<Vec<_>>();
+            pairs.sort();
+            let preview = pairs.into_iter().take(8).collect::<Vec<_>>().join("\n");
+            if !preview.is_empty() {
+                return Some(truncate_for_log(&preview, 320));
+            }
+        }
+    }
+    if let Some(value) = exports.get("body").and_then(|v| v.as_str()) {
+        return Some(truncate_for_log(value, 320));
+    }
+    None
 }
 
 async fn report_progress(ctx: &ExecutorContext, event: ExecutionProgressEvent) {

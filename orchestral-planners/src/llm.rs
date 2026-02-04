@@ -142,6 +142,12 @@ fn build_system_prompt(base: &str, context: &PlannerContext) -> String {
     system.push_str(
         "10) Any shell/file operation must be compatible with the current host platform and shell.\n",
     );
+    system.push_str(
+        "11) Only use `echo` when the user explicitly asks to echo/repeat text; otherwise avoid `echo` in plans.\n",
+    );
+    system.push_str(
+        "12) For requests about HTTP response headers, use `http` with method `HEAD` and return headers directly.\n",
+    );
     system.push_str("\nAction Catalog:\n");
     for action in &context.available_actions {
         append_action_catalog_entry(

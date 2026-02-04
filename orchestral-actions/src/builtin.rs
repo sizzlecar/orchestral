@@ -733,15 +733,10 @@ impl Action for ShellAction {
             None => return ActionResult::error("Missing command for shell action"),
         };
         let args = params_get_array(params, "args");
-        let use_shell = params_get_bool(params, "shell").unwrap_or(self.allow_shell_expression);
+        let mut use_shell =
+            params_get_bool(params, "shell").unwrap_or(self.allow_shell_expression);
         let looks_like_expression =
             contains_shell_metacharacters(&command) || command.contains(' ');
-
-        if args.is_none() && !use_shell && looks_like_expression {
-            return ActionResult::error(
-                "Unsafe shell expression detected. Provide args[] or set shell=true explicitly.",
-            );
-        }
 
         let command_name = if use_shell {
             first_token(&command)
@@ -797,6 +792,17 @@ impl Action for ShellAction {
             .and_then(ShellSandboxBackendKind::from_str)
         {
             sandbox_policy.backend = backend_override;
+        }
+
+        // In sandboxed mode, allow shell expressions by auto-promoting to `sh -c`.
+        // Keep strict validation only when sandbox is disabled.
+        if args.is_none() && !use_shell && looks_like_expression {
+            if matches!(sandbox_policy.mode, ShellSandboxMode::None) {
+                return ActionResult::error(
+                    "Unsafe shell expression detected. Provide args[] or set shell=true explicitly.",
+                );
+            }
+            use_shell = true;
         }
 
         let (base_program, base_args) = if use_shell {
