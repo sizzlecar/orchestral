@@ -5,6 +5,12 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Duration;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalRequest {
+    pub reason: String,
+    pub command: Option<String>,
+}
+
 /// Action execution result with retry semantics
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -21,6 +27,11 @@ pub enum ActionResult {
     NeedClarification {
         /// Question to ask the user
         question: String,
+    },
+
+    /// Need explicit user approval before continuing
+    NeedApproval {
+        request: ApprovalRequest,
     },
 
     /// Retryable error (rate limit / timeout / external service flakiness)
@@ -69,6 +80,16 @@ impl ActionResult {
         }
     }
 
+    /// Convenience: create an approval request
+    pub fn need_approval(reason: impl Into<String>, command: Option<String>) -> Self {
+        Self::NeedApproval {
+            request: ApprovalRequest {
+                reason: reason.into(),
+                command,
+            },
+        }
+    }
+
     /// Convenience: create a retryable error
     pub fn retryable(
         message: impl Into<String>,
@@ -106,7 +127,7 @@ impl ActionResult {
 
     /// Check if the result needs user input
     pub fn needs_user_input(&self) -> bool {
-        matches!(self, Self::NeedClarification { .. })
+        matches!(self, Self::NeedClarification { .. } | Self::NeedApproval { .. })
     }
 }
 

@@ -12,7 +12,7 @@ use tokio::sync::RwLock;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::action::{Action, ActionContext, ActionInput, ActionResult};
+use crate::action::{Action, ActionContext, ActionInput, ActionResult, ApprovalRequest};
 use crate::store::{ReferenceStore, WorkingSet};
 use crate::types::{Plan, Step, StepKind};
 
@@ -353,7 +353,11 @@ pub enum ExecutionResult {
     /// Execution failed
     Failed { step_id: String, error: String },
     /// Waiting for user input
-    WaitingUser { step_id: String, prompt: String },
+    WaitingUser {
+        step_id: String,
+        prompt: String,
+        approval: Option<ApprovalRequest>,
+    },
     /// Waiting for external event
     WaitingEvent { step_id: String, event_type: String },
 }
@@ -536,6 +540,7 @@ impl Executor {
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("Please provide input")
                                     .to_string(),
+                                approval: None,
                             };
                         }
                         StepKind::WaitEvent => {
@@ -646,6 +651,30 @@ impl Executor {
                             return ExecutionResult::WaitingUser {
                                 step_id,
                                 prompt: question,
+                                approval: None,
+                            };
+                        }
+                        ActionResult::NeedApproval { request } => {
+                            report_progress(
+                                ctx,
+                                ExecutionProgressEvent::new(
+                                    ctx.task_id.clone(),
+                                    Some(step_id.clone()),
+                                    Some(step.action.clone()),
+                                    "step_waiting_user",
+                                )
+                                .with_message(request.reason.clone())
+                                .with_metadata(serde_json::json!({
+                                    "waiting_kind": "approval",
+                                    "approval_reason": request.reason,
+                                    "approval_command": request.command,
+                                })),
+                            )
+                            .await;
+                            return ExecutionResult::WaitingUser {
+                                step_id,
+                                prompt: "Approval required".to_string(),
+                                approval: Some(request),
                             };
                         }
                         ActionResult::RetryableError { message, .. } => {
@@ -863,6 +892,17 @@ impl Executor {
                     "action requested clarification"
                 );
                 ActionResult::NeedClarification { question }
+            }
+            ActionResult::NeedApproval { request } => {
+                tracing::info!(
+                    task_id = %ctx.task_id,
+                    step_id = %step.id,
+                    action = %step.action,
+                    reason = %truncate_for_log(&request.reason, MAX_LOG_TEXT_CHARS),
+                    command = ?request.command,
+                    "action requested approval"
+                );
+                ActionResult::NeedApproval { request }
             }
             ActionResult::RetryableError {
                 message,

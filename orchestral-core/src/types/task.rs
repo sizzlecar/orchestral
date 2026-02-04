@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
+use crate::action::ApprovalRequest;
+
 use super::{Intent, Plan};
 
 /// Type alias for Task ID
@@ -24,6 +26,9 @@ pub enum TaskState {
     WaitingUser {
         /// Prompt/question for the user
         prompt: String,
+        /// Structured waiting reason
+        #[serde(default)]
+        reason: WaitUserReason,
     },
     /// Waiting for external event
     WaitingEvent {
@@ -41,6 +46,17 @@ pub enum TaskState {
     },
     /// Execution completed successfully
     Done,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WaitUserReason {
+    #[default]
+    Input,
+    Approval {
+        reason: String,
+        command: Option<String>,
+    },
 }
 
 impl TaskState {
@@ -137,6 +153,17 @@ impl Task {
     pub fn wait_for_user(&mut self, prompt: impl Into<String>) {
         self.set_state(TaskState::WaitingUser {
             prompt: prompt.into(),
+            reason: WaitUserReason::Input,
+        });
+    }
+
+    pub fn wait_for_approval(&mut self, request: &ApprovalRequest) {
+        self.set_state(TaskState::WaitingUser {
+            prompt: "Approval required".to_string(),
+            reason: WaitUserReason::Approval {
+                reason: request.reason.clone(),
+                command: request.command.clone(),
+            },
         });
     }
 

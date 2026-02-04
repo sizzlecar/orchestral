@@ -14,7 +14,7 @@ use async_trait::async_trait;
 
 pub use context::ActionContext;
 pub use input::ActionInput;
-pub use result::ActionResult;
+pub use result::{ActionResult, ApprovalRequest};
 
 // Re-export CancellationToken for convenience
 pub use tokio_util::sync::CancellationToken;

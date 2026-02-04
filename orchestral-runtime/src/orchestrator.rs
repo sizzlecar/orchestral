@@ -21,7 +21,7 @@ use orchestral_core::planner::{
     HistoryItem, PlanError, Planner, PlannerContext, PlannerRuntimeInfo,
 };
 use orchestral_core::store::{ReferenceStore, StoreError, TaskStore, WorkingSet};
-use orchestral_core::types::{Intent, IntentContext, StepKind, Task, TaskId, TaskState};
+use orchestral_core::types::{Intent, IntentContext, StepKind, Task, TaskId, TaskState, WaitUserReason};
 use orchestral_stores::{Event, EventBus, EventStore};
 
 use crate::{HandleEventResult, InteractionState, RuntimeError, ThreadRuntime};
@@ -796,11 +796,26 @@ fn execution_result_metadata(result: &ExecutionResult) -> Value {
             "step_id": step_id,
             "error": truncate_for_log(error, 400),
         }),
-        ExecutionResult::WaitingUser { step_id, prompt } => serde_json::json!({
-            "status": "waiting_user",
-            "step_id": step_id,
-            "prompt": truncate_for_log(prompt, 400),
-        }),
+        ExecutionResult::WaitingUser {
+            step_id,
+            prompt,
+            approval,
+        } => {
+            let mut meta = serde_json::json!({
+                "status": "waiting_user",
+                "step_id": step_id,
+                "prompt": truncate_for_log(prompt, 400),
+                "waiting_kind": "input",
+            });
+            if let Some(req) = approval {
+                meta["waiting_kind"] = Value::String("approval".to_string());
+                meta["approval_reason"] = Value::String(truncate_for_log(&req.reason, 400));
+                if let Some(command) = &req.command {
+                    meta["approval_command"] = Value::String(truncate_for_log(command, 400));
+                }
+            }
+            meta
+        }
         ExecutionResult::WaitingEvent {
             step_id,
             event_type,
@@ -819,8 +834,15 @@ fn task_state_from_execution(result: &ExecutionResult) -> TaskState {
             reason: error.clone(),
             recoverable: false,
         },
-        ExecutionResult::WaitingUser { prompt, .. } => TaskState::WaitingUser {
+        ExecutionResult::WaitingUser { prompt, approval, .. } => TaskState::WaitingUser {
             prompt: prompt.clone(),
+            reason: approval
+                .as_ref()
+                .map(|a| WaitUserReason::Approval {
+                    reason: a.reason.clone(),
+                    command: a.command.clone(),
+                })
+                .unwrap_or(WaitUserReason::Input),
         },
         ExecutionResult::WaitingEvent { event_type, .. } => TaskState::WaitingEvent {
             event_type: event_type.clone(),
