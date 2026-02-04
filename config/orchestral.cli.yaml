@@ -271,7 +271,7 @@ actions:
         sandbox_writable_roots: ["."]
         env_policy: minimal
         env_denylist: ["OPENAI_API_KEY", "GEMINI_API_KEY", "HF_TOKEN"]
-        blocked_commands: ["rm", "mkfs", "shutdown", "reboot", "poweroff"]
+        blocked_commands: ["mkfs", "shutdown", "reboot", "poweroff"]
     - name: file_read
       kind: file_read
       description: "Reads a file from disk"

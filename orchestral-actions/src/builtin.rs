@@ -213,6 +213,103 @@ fn expression_command_tokens(input: &str) -> HashSet<String> {
         .collect()
 }
 
+fn requires_destructive_approval(
+    use_shell: bool,
+    command_name: &str,
+    command: &str,
+    args: &[String],
+) -> bool {
+    let destructive = [
+        "rm",
+        "rmdir",
+        "mv",
+        "chmod",
+        "chown",
+        "truncate",
+        "dd",
+        "mkfs",
+        "fdisk",
+        "git",
+    ];
+
+    if use_shell {
+        let tokens = expression_command_tokens(command);
+        if tokens.contains("git") && tokens.contains("reset") {
+            return true;
+        }
+        return destructive.iter().any(|cmd| tokens.contains(*cmd));
+    }
+
+    if command_name == "git" {
+        return args
+            .first()
+            .map(|s| s.eq_ignore_ascii_case("reset"))
+            .unwrap_or(false);
+    }
+    destructive.contains(&command_name)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalDecision {
+    Approve,
+    Deny,
+}
+
+fn parse_approval_decision(message: &str) -> Option<ApprovalDecision> {
+    let normalized = message.trim().to_ascii_lowercase();
+    let approve_tokens = [
+        "/approve",
+        "approve",
+        "approved",
+        "yes",
+        "y",
+        "ok",
+        "同意",
+        "确认",
+        "批准",
+    ];
+    if approve_tokens.contains(&normalized.as_str()) {
+        return Some(ApprovalDecision::Approve);
+    }
+
+    let deny_tokens = ["/deny", "deny", "denied", "no", "n", "拒绝", "不同意", "取消"];
+    if deny_tokens.contains(&normalized.as_str()) {
+        return Some(ApprovalDecision::Deny);
+    }
+    None
+}
+
+async fn approval_decision_from_ctx(ctx: &ActionContext) -> Option<ApprovalDecision> {
+    let mut ws = ctx.working_set.write().await;
+    let payload = ws.get_task("resume_user_input")?.clone();
+    if let Some(decision) = payload
+        .get("approval")
+        .and_then(|v| v.get("decision"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_ascii_lowercase())
+    {
+        let mapped = match decision.as_str() {
+            "approve" => Some(ApprovalDecision::Approve),
+            "deny" => Some(ApprovalDecision::Deny),
+            _ => None,
+        };
+        if mapped.is_some() {
+            ws.remove_task("resume_user_input");
+        }
+        if let Some(mapped) = mapped {
+            return Some(mapped);
+        }
+    }
+    let message = payload
+        .get("message")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)?;
+    let decision = parse_approval_decision(&message)?;
+    // Consume the resume input once interpreted as an approval decision.
+    ws.remove_task("resume_user_input");
+    Some(decision)
+}
+
 fn truncate_utf8_lossy(bytes: &[u8], max_bytes: usize) -> (String, bool, usize) {
     let total = bytes.len();
     if total <= max_bytes {
@@ -674,6 +771,10 @@ impl Action for ShellAction {
                     "sandbox_backend": {
                         "type": "string",
                         "description": "Optional override: auto/macos_seatbelt/linux_seccomp/windows_restricted."
+                    },
+                    "approved": {
+                        "type": "boolean",
+                        "description": "Set true only after explicit user approval for destructive commands."
                     }
                 },
                 "required": ["command"]
@@ -726,7 +827,7 @@ impl Action for ShellAction {
             }))
     }
 
-    async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
+    async fn run(&self, input: ActionInput, ctx: ActionContext) -> ActionResult {
         let params = &input.params;
         let command = match params_get_string(params, "command") {
             Some(cmd) => cmd,
@@ -735,8 +836,43 @@ impl Action for ShellAction {
         let args = params_get_array(params, "args");
         let mut use_shell =
             params_get_bool(params, "shell").unwrap_or(self.allow_shell_expression);
+        let approved = params_get_bool(params, "approved").unwrap_or(false);
         let looks_like_expression =
             contains_shell_metacharacters(&command) || command.contains(' ');
+
+        let cwd = if let Some(dir) = &self.working_dir {
+            dir.clone()
+        } else {
+            match std::env::current_dir() {
+                Ok(dir) => dir,
+                Err(e) => return ActionResult::error(format!("Resolve current dir failed: {}", e)),
+            }
+        };
+
+        let mut sandbox_policy = self.sandbox_policy.clone();
+        if let Some(mode_override) = params_get_string(params, "sandbox_mode")
+            .as_deref()
+            .and_then(ShellSandboxMode::from_str)
+        {
+            sandbox_policy.mode = mode_override;
+        }
+        if let Some(backend_override) = params_get_string(params, "sandbox_backend")
+            .as_deref()
+            .and_then(ShellSandboxBackendKind::from_str)
+        {
+            sandbox_policy.backend = backend_override;
+        }
+
+        // In sandboxed mode, allow shell expressions by auto-promoting to `sh -c`.
+        // Keep strict validation only when sandbox is disabled.
+        if args.is_none() && !use_shell && looks_like_expression {
+            if matches!(sandbox_policy.mode, ShellSandboxMode::None) {
+                return ActionResult::error(
+                    "Unsafe shell expression detected. Provide args[] or set shell=true explicitly.",
+                );
+            }
+            use_shell = true;
+        }
 
         let command_name = if use_shell {
             first_token(&command)
@@ -771,38 +907,19 @@ impl Action for ShellAction {
             }
         }
 
-        let cwd = if let Some(dir) = &self.working_dir {
-            dir.clone()
-        } else {
-            match std::env::current_dir() {
-                Ok(dir) => dir,
-                Err(e) => return ActionResult::error(format!("Resolve current dir failed: {}", e)),
+        let args_for_check = args.clone().unwrap_or_default();
+        if requires_destructive_approval(use_shell, &command_name, &command, &args_for_check) {
+            if !approved {
+                if let Some(decision) = approval_decision_from_ctx(&ctx).await {
+                    if matches!(decision, ApprovalDecision::Deny) {
+                        return ActionResult::error("Destructive command denied by user");
+                    }
+                } else {
+                    return ActionResult::need_clarification(
+                        "This command is destructive and requires approval. Reply with /approve to continue or /deny to cancel.",
+                    );
+                }
             }
-        };
-
-        let mut sandbox_policy = self.sandbox_policy.clone();
-        if let Some(mode_override) = params_get_string(params, "sandbox_mode")
-            .as_deref()
-            .and_then(ShellSandboxMode::from_str)
-        {
-            sandbox_policy.mode = mode_override;
-        }
-        if let Some(backend_override) = params_get_string(params, "sandbox_backend")
-            .as_deref()
-            .and_then(ShellSandboxBackendKind::from_str)
-        {
-            sandbox_policy.backend = backend_override;
-        }
-
-        // In sandboxed mode, allow shell expressions by auto-promoting to `sh -c`.
-        // Keep strict validation only when sandbox is disabled.
-        if args.is_none() && !use_shell && looks_like_expression {
-            if matches!(sandbox_policy.mode, ShellSandboxMode::None) {
-                return ActionResult::error(
-                    "Unsafe shell expression detected. Provide args[] or set shell=true explicitly.",
-                );
-            }
-            use_shell = true;
         }
 
         let (base_program, base_args) = if use_shell {
