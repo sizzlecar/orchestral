@@ -32,7 +32,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 }
 
 fn render_history(frame: &mut Frame, area: Rect, app: &App, theme: &Theme, lines: Vec<Line<'static>>) {
-    let inner_height = area.height.saturating_sub(2) as usize;
+    let inner_height = area.height as usize;
     let scroll = lines.len().saturating_sub(inner_height) as u16;
     let widget = Paragraph::new(lines)
         .block(Block::default().borders(Borders::NONE))

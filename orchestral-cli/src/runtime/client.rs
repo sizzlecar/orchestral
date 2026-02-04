@@ -6,9 +6,10 @@ use serde_json::json;
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::{sleep, Duration};
 
-use orchestral_runtime::{project_event, RuntimeApp, UiEvent};
+use orchestral_runtime::RuntimeApp;
 use orchestral_stores::Event;
 
+use super::event_projection::{project_event, UiEvent};
 use crate::runtime::protocol::{ActivityKind, RuntimeMsg, TransientSlot};
 
 #[derive(Clone)]
@@ -76,7 +77,7 @@ impl RuntimeClient {
                         };
 
                         match ui_event {
-                            UiEvent::PlanningStarted { .. } => {
+                            UiEvent::PlanningStarted => {
                                 let _ = runtime_tx_events.send(RuntimeMsg::PlanningStart).await;
                                 let _ = runtime_tx_events
                                     .send(RuntimeMsg::OutputTransient {
@@ -85,7 +86,7 @@ impl RuntimeClient {
                                     })
                                     .await;
                             }
-                            UiEvent::PlanningCompleted { step_count, steps, .. } => {
+                            UiEvent::PlanningCompleted { step_count, steps } => {
                                 total_steps = step_count.unwrap_or(steps.len());
                                 let plan = if steps.is_empty() {
                                     "Plan: no actions".to_string()
@@ -107,7 +108,7 @@ impl RuntimeClient {
                                     .await;
                                 let _ = runtime_tx_events.send(RuntimeMsg::PlanningEnd).await;
                             }
-                            UiEvent::ExecutionStarted { .. } => {
+                            UiEvent::ExecutionStarted => {
                                 let _ = runtime_tx_events
                                     .send(RuntimeMsg::ExecutionStart { total: total_steps })
                                     .await;
@@ -144,7 +145,7 @@ impl RuntimeClient {
                                     })
                                     .await;
                             }
-                            UiEvent::StepCompleted { step_id, action, output, .. } => {
+                            UiEvent::StepCompleted { step_id, action, output } => {
                                 completed_steps = completed_steps.saturating_add(1);
                                 let action_name = action.unwrap_or_else(|| "-".to_string());
                                 if let Some(preview) = output.preview.clone() {
@@ -198,7 +199,7 @@ impl RuntimeClient {
                                     })
                                     .await;
                             }
-                            UiEvent::StepFailed { step_id, action, message, .. } => {
+                            UiEvent::StepFailed { step_id, action, message } => {
                                 let action_name = action.unwrap_or_else(|| "-".to_string());
                                 let _ = runtime_tx_events
                                     .send(RuntimeMsg::ActivityItem {
@@ -218,15 +219,37 @@ impl RuntimeClient {
                                     })
                                     .await;
                             }
-                            UiEvent::InputRequired { prompt, .. } => {
-                                let _ = runtime_tx_events
-                                    .send(RuntimeMsg::OutputPersist(format!(
+                            UiEvent::InputRequired {
+                                prompt,
+                                waiting_kind,
+                                approval_reason,
+                                approval_command,
+                            } => {
+                                let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
+                                let waiting_line = if matches!(waiting_kind.as_deref(), Some("approval")) {
+                                    let reason = approval_reason
+                                        .or(prompt)
+                                        .unwrap_or_else(|| "approval required".to_string());
+                                    let command = approval_command.unwrap_or_default();
+                                    if command.is_empty() {
+                                        format!("Waiting: Approval required. {} Reply /approve or /deny.", reason)
+                                    } else {
+                                        format!(
+                                            "Waiting: Approval required for `{}`. {} Reply /approve or /deny.",
+                                            command, reason
+                                        )
+                                    }
+                                } else {
+                                    format!(
                                         "Waiting: {}",
                                         prompt.unwrap_or_else(|| "input required".to_string())
-                                    )))
+                                    )
+                                };
+                                let _ = runtime_tx_events
+                                    .send(RuntimeMsg::OutputPersist(waiting_line))
                                     .await;
                             }
-                            UiEvent::ExecutionCompleted { status, .. } => {
+                            UiEvent::ExecutionCompleted { status } => {
                                 match status.as_deref() {
                                     Some("completed") => {
                                         let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
@@ -247,25 +270,33 @@ impl RuntimeClient {
                                     None => {}
                                 }
                             }
-                            UiEvent::TaskFailed { message, .. } => {
+                            UiEvent::TaskFailed { message } => {
                                 let _ = runtime_tx_events
                                     .send(RuntimeMsg::Error(
                                         message.unwrap_or_else(|| "task failed".to_string()),
                                     ))
                                     .await;
                             }
-                            UiEvent::TaskCompleted { .. }
-                            | UiEvent::TurnStarted { .. }
-                            | UiEvent::TurnResumed { .. }
-                            | UiEvent::TurnRejected { .. }
-                            | UiEvent::TurnQueued { .. } => {}
+                            UiEvent::TaskCompleted
+                            | UiEvent::TurnStarted
+                            | UiEvent::TurnQueued => {}
+                            | UiEvent::TurnResumed => {}
+                            UiEvent::TurnRejected { reason } => {
+                                let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
+                                let _ = runtime_tx_events
+                                    .send(RuntimeMsg::OutputPersist(format!(
+                                        "Waiting: {}",
+                                        reason.unwrap_or_else(|| "turn rejected".to_string())
+                                    )))
+                                    .await;
+                            }
                         }
                     }
                 }
             }
         });
 
-        let request = Event::user_input(&self.thread_id, "tui", json!({ "message": input }));
+        let request = Event::user_input(&self.thread_id, "tui", build_user_input_payload(&input));
         let result = self.app.orchestrator.handle_event(request).await;
         // Give projected runtime events a short drain window before stopping forwarder.
         sleep(Duration::from_millis(120)).await;
@@ -304,6 +335,22 @@ fn classify_activity_kind(action: &str) -> ActivityKind {
             ActivityKind::Explored
         }
         _ => ActivityKind::Ran,
+    }
+}
+
+fn build_user_input_payload(input: &str) -> serde_json::Value {
+    let message = input.trim().to_string();
+    let decision = match message.to_ascii_lowercase().as_str() {
+        "/approve" => Some("approve"),
+        "/deny" => Some("deny"),
+        _ => None,
+    };
+    match decision {
+        Some(decision) => json!({
+            "message": message,
+            "approval": { "decision": decision }
+        }),
+        None => json!({ "message": message }),
     }
 }
 

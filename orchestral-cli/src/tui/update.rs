@@ -143,6 +143,22 @@ fn handle_runtime(app: &mut App, msg: RuntimeMsg) {
                 app.set_dirty();
                 return;
             }
+            if line.trim_start().starts_with("Waiting:") {
+                enter_waiting_input(app);
+                app.history.push(line);
+                let wait = app.history.last().cloned().unwrap_or_default();
+                if wait.contains("requires approval")
+                    || wait.contains("/approve")
+                    || wait.contains("/deny")
+                {
+                    app.transient.insert(
+                        TransientSlot::Footer,
+                        "Approval required: type /approve or /deny".to_string(),
+                    );
+                }
+                app.set_dirty();
+                return;
+            }
             if is_noise_line(&line) {
                 app.set_dirty();
                 return;
@@ -151,9 +167,7 @@ fn handle_runtime(app: &mut App, msg: RuntimeMsg) {
                 app.set_dirty();
                 return;
             }
-            if !is_progress_echo(&line) {
-                app.history.push(line);
-            }
+            app.history.push(line);
             app.set_dirty();
         }
         RuntimeMsg::OutputTransient { slot, text } => {
@@ -305,9 +319,4 @@ fn upsert_activity_group(
     });
     app.activity_index.insert(key, idx);
     idx
-}
-
-fn is_progress_echo(line: &str) -> bool {
-    let trimmed = line.trim();
-    trimmed.starts_with("Waiting:")
 }
