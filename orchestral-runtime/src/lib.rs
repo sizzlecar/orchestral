@@ -11,6 +11,7 @@
 
 mod bootstrap;
 mod concurrency;
+mod event_projection;
 mod interaction;
 mod orchestrator;
 mod thread;
@@ -21,6 +22,7 @@ pub use concurrency::{
     ConcurrencyDecision, ConcurrencyPolicy, DefaultConcurrencyPolicy, ParallelConcurrencyPolicy,
     QueueConcurrencyPolicy, RejectWhenBusyConcurrencyPolicy, RunningState,
 };
+pub use event_projection::{project_event, StepOutput, StepSummary, UiEvent};
 pub use interaction::{Interaction, InteractionId, InteractionState};
 pub use orchestrator::{Orchestrator, OrchestratorError, OrchestratorResult};
 pub use thread::{Thread, ThreadId};

@@ -199,11 +199,29 @@ impl Orchestrator {
             HandleEventResult::Started { interaction_id } => (interaction_id.clone(), "started"),
             HandleEventResult::Merged { interaction_id } => (interaction_id.clone(), "merged"),
             HandleEventResult::Rejected { reason } => {
+                self.emit_lifecycle_event(
+                    "turn_rejected",
+                    None,
+                    None,
+                    Some(reason),
+                    serde_json::json!({ "reason": reason }),
+                )
+                .await;
                 return Ok(OrchestratorResult::Rejected {
                     reason: reason.clone(),
                 });
             }
-            HandleEventResult::Queued => return Ok(OrchestratorResult::Queued),
+            HandleEventResult::Queued => {
+                self.emit_lifecycle_event(
+                    "turn_queued",
+                    None,
+                    None,
+                    Some("event queued"),
+                    Value::Null,
+                )
+                .await;
+                return Ok(OrchestratorResult::Queued);
+            }
         };
 
         // Build intent from event
@@ -215,9 +233,31 @@ impl Orchestrator {
         self.thread_runtime
             .add_task_to_interaction(&interaction_id, task.id.clone())
             .await?;
+        self.emit_lifecycle_event(
+            "turn_started",
+            Some(&interaction_id),
+            Some(&task.id),
+            Some("turn started"),
+            serde_json::json!({
+                "started_kind": started_kind,
+                "event_type": event_type_label(&event_clone),
+            }),
+        )
+        .await;
 
         let actions = self.available_actions().await;
         let history = self.history_for_planner(&interaction_id, &task.id).await?;
+        self.emit_lifecycle_event(
+            "planning_started",
+            Some(&interaction_id),
+            Some(&task.id),
+            Some("planning started"),
+            serde_json::json!({
+                "available_actions": actions.len(),
+                "history_items": history.len(),
+            }),
+        )
+        .await;
         tracing::info!(
             interaction_id = %interaction_id,
             task_id = %task.id,
@@ -229,6 +269,18 @@ impl Orchestrator {
         let context = PlannerContext::with_history(actions, history, self.reference_store.clone())
             .with_runtime_info(runtime_info);
         let plan = self.planner.plan(&task.intent, &context).await?;
+        self.emit_lifecycle_event(
+            "planning_completed",
+            Some(&interaction_id),
+            Some(&task.id),
+            Some("planning completed"),
+            serde_json::json!({
+                "goal": plan.goal.clone(),
+                "step_count": plan.steps.len(),
+                "steps": summarize_plan_steps(&plan),
+            }),
+        )
+        .await;
         tracing::info!(
             interaction_id = %interaction_id,
             task_id = %task.id,
@@ -248,9 +300,30 @@ impl Orchestrator {
         task.start_executing();
         self.task_store.save(&task).await?;
 
+        let planned_step_count = task
+            .plan
+            .as_ref()
+            .map(|p| p.steps.len())
+            .unwrap_or_default();
+        self.emit_lifecycle_event(
+            "execution_started",
+            Some(&interaction_id),
+            Some(&task.id),
+            Some("execution started"),
+            serde_json::json!({ "step_count": planned_step_count }),
+        )
+        .await;
         let result = self
             .execute_existing_task(&mut task, &interaction_id, None)
             .await?;
+        self.emit_lifecycle_event(
+            "execution_completed",
+            Some(&interaction_id),
+            Some(&task.id),
+            Some("execution completed"),
+            execution_result_metadata(&result),
+        )
+        .await;
 
         let response = match started_kind {
             "started" => OrchestratorResult::Started {
@@ -295,12 +368,38 @@ impl Orchestrator {
             .load(&task_id)
             .await?
             .ok_or_else(|| OrchestratorError::TaskNotFound(task_id.clone()))?;
+        self.emit_lifecycle_event(
+            "turn_resumed",
+            Some(&interaction_id),
+            Some(&task.id),
+            Some("resuming waiting turn"),
+            serde_json::json!({
+                "event_type": event_type_label(&event),
+            }),
+        )
+        .await;
         task.start_executing();
         self.task_store.save(&task).await?;
 
+        self.emit_lifecycle_event(
+            "execution_started",
+            Some(&interaction_id),
+            Some(&task.id),
+            Some("execution resumed"),
+            serde_json::json!({ "resume": true }),
+        )
+        .await;
         let result = self
             .execute_existing_task(&mut task, &interaction_id, Some(&event))
             .await?;
+        self.emit_lifecycle_event(
+            "execution_completed",
+            Some(&interaction_id),
+            Some(&task.id),
+            Some("execution completed"),
+            execution_result_metadata(&result),
+        )
+        .await;
 
         Ok(OrchestratorResult::Merged {
             interaction_id,
@@ -425,6 +524,59 @@ impl Orchestrator {
             .await?;
         events.sort_by(|a, b| a.timestamp().cmp(&b.timestamp()));
         Ok(events.iter().filter_map(event_to_history_item).collect())
+    }
+
+    async fn emit_lifecycle_event(
+        &self,
+        event_type: &str,
+        interaction_id: Option<&str>,
+        task_id: Option<&str>,
+        message: Option<&str>,
+        metadata: Value,
+    ) {
+        let thread_id = self.thread_runtime.thread_id().await;
+        let mut payload = serde_json::Map::new();
+        payload.insert(
+            "category".to_string(),
+            Value::String("runtime_lifecycle".to_string()),
+        );
+        payload.insert(
+            "event_type".to_string(),
+            Value::String(event_type.to_string()),
+        );
+        if let Some(interaction_id) = interaction_id {
+            payload.insert(
+                "interaction_id".to_string(),
+                Value::String(interaction_id.to_string()),
+            );
+        }
+        if let Some(task_id) = task_id {
+            payload.insert("task_id".to_string(), Value::String(task_id.to_string()));
+        }
+        if let Some(message) = message {
+            payload.insert("message".to_string(), Value::String(message.to_string()));
+        }
+        if !metadata.is_null() {
+            payload.insert("metadata".to_string(), metadata);
+        }
+
+        let trace = Event::trace(thread_id, "info", Value::Object(payload));
+        if let Err(err) = self.thread_runtime.event_store.append(trace.clone()).await {
+            tracing::warn!(
+                event_type = %event_type,
+                error = %err,
+                "failed to persist lifecycle event"
+            );
+            return;
+        }
+
+        if let Err(err) = self.thread_runtime.event_bus.publish(trace).await {
+            tracing::warn!(
+                event_type = %event_type,
+                error = %err,
+                "failed to publish lifecycle event"
+            );
+        }
     }
 }
 
@@ -599,6 +751,64 @@ fn event_type_label(event: &Event) -> &'static str {
         Event::Artifact { .. } => "artifact",
         Event::ExternalEvent { .. } => "external_event",
         Event::SystemTrace { .. } => "system_trace",
+    }
+}
+
+fn summarize_plan_steps(plan: &orchestral_core::types::Plan) -> Value {
+    const STEP_PREVIEW_LIMIT: usize = 32;
+    let steps: Vec<Value> = plan
+        .steps
+        .iter()
+        .take(STEP_PREVIEW_LIMIT)
+        .map(|step| {
+            serde_json::json!({
+                "id": step.id.clone(),
+                "action": step.action.clone(),
+                "kind": format!("{:?}", step.kind),
+                "depends_on": step.depends_on.clone(),
+                "io_bindings": step.io_bindings.clone(),
+            })
+        })
+        .collect();
+
+    if plan.steps.len() > STEP_PREVIEW_LIMIT {
+        serde_json::json!({
+            "items": steps,
+            "truncated": true,
+            "total_steps": plan.steps.len(),
+        })
+    } else {
+        serde_json::json!({
+            "items": steps,
+            "truncated": false,
+            "total_steps": plan.steps.len(),
+        })
+    }
+}
+
+fn execution_result_metadata(result: &ExecutionResult) -> Value {
+    match result {
+        ExecutionResult::Completed => serde_json::json!({
+            "status": "completed"
+        }),
+        ExecutionResult::Failed { step_id, error } => serde_json::json!({
+            "status": "failed",
+            "step_id": step_id,
+            "error": truncate_for_log(error, 400),
+        }),
+        ExecutionResult::WaitingUser { step_id, prompt } => serde_json::json!({
+            "status": "waiting_user",
+            "step_id": step_id,
+            "prompt": truncate_for_log(prompt, 400),
+        }),
+        ExecutionResult::WaitingEvent {
+            step_id,
+            event_type,
+        } => serde_json::json!({
+            "status": "waiting_event",
+            "step_id": step_id,
+            "event_type": event_type,
+        }),
     }
 }
 
