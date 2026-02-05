@@ -254,6 +254,9 @@ impl RuntimeApp {
 
 fn init_tracing_if_needed(observability: &ObservabilityConfig) {
     TRACING_INIT.get_or_init(|| {
+        let silent_tui_logs = std::env::var("ORCHESTRAL_TUI_SILENT_LOGS")
+            .map(|v| v == "1")
+            .unwrap_or(false);
         let fallback_level = match observability.log_level.trim().to_ascii_lowercase().as_str() {
             "trace" => "trace",
             "debug" => "debug",
@@ -270,19 +273,39 @@ fn init_tracing_if_needed(observability: &ObservabilityConfig) {
         };
 
         if observability.traces_enabled {
-            let _ = tracing_subscriber::fmt()
-                .with_env_filter(make_filter())
-                .with_target(true)
-                .with_span_events(
-                    tracing_subscriber::fmt::format::FmtSpan::NEW
-                        | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
-                )
-                .try_init();
+            if silent_tui_logs {
+                let _ = tracing_subscriber::fmt()
+                    .with_env_filter(make_filter())
+                    .with_target(true)
+                    .with_writer(std::io::sink)
+                    .with_span_events(
+                        tracing_subscriber::fmt::format::FmtSpan::NEW
+                            | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
+                    )
+                    .try_init();
+            } else {
+                let _ = tracing_subscriber::fmt()
+                    .with_env_filter(make_filter())
+                    .with_target(true)
+                    .with_span_events(
+                        tracing_subscriber::fmt::format::FmtSpan::NEW
+                            | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
+                    )
+                    .try_init();
+            }
         } else {
-            let _ = tracing_subscriber::fmt()
-                .with_env_filter(make_filter())
-                .with_target(true)
-                .try_init();
+            if silent_tui_logs {
+                let _ = tracing_subscriber::fmt()
+                    .with_env_filter(make_filter())
+                    .with_target(true)
+                    .with_writer(std::io::sink)
+                    .try_init();
+            } else {
+                let _ = tracing_subscriber::fmt()
+                    .with_env_filter(make_filter())
+                    .with_target(true)
+                    .try_init();
+            }
         }
 
         tracing::info!(

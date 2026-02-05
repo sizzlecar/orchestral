@@ -31,7 +31,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
     render_modal(frame, app, &theme);
 }
 
-fn render_history(frame: &mut Frame, area: Rect, app: &App, theme: &Theme, lines: Vec<Line<'static>>) {
+fn render_history(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    theme: &Theme,
+    lines: Vec<Line<'static>>,
+) {
     let inner_height = area.height as usize;
     let scroll = lines.len().saturating_sub(inner_height) as u16;
     let widget = Paragraph::new(lines)
@@ -133,7 +139,11 @@ fn append_turn_lines(lines: &mut Vec<Line<'static>>, app: &App, theme: &Theme, t
             .iter()
             .filter(|g| g.turn_id == turn_id && g.kind == kind)
         {
-            let step_style = if group.failed { theme.error } else { theme.input };
+            let step_style = if group.failed {
+                theme.error
+            } else {
+                theme.input
+            };
             lines.push(Line::from(vec![
                 Span::styled("  └ ", theme.muted),
                 Span::styled(group.title.clone(), step_style),
@@ -221,14 +231,14 @@ fn render_modal(frame: &mut Frame, app: &App, theme: &Theme) {
     let Some(modal) = app.bottom.top_modal() else {
         return;
     };
-    let area = centered_rect(70, 45, frame.area());
-    frame.render_widget(Clear, area);
     let lines: Vec<Line> = modal
         .lines()
         .into_iter()
         .map(|line| Line::from(Span::styled(line, theme.input)))
         .collect();
-    let widget = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+    let area = top_anchored_rect(frame.area(), lines.len() as u16 + 2);
+    frame.render_widget(Clear, area);
+    let widget = Paragraph::new(lines).wrap(Wrap { trim: true }).block(
         Block::default()
             .title(Span::styled(modal.title(), theme.title))
             .borders(Borders::ALL)
@@ -237,18 +247,15 @@ fn render_modal(frame: &mut Frame, app: &App, theme: &Theme) {
     frame.render_widget(widget, area);
 }
 
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let popup_layout = Layout::vertical([
-        Constraint::Percentage((100 - percent_y) / 2),
-        Constraint::Percentage(percent_y),
-        Constraint::Percentage((100 - percent_y) / 2),
-    ])
-    .split(area);
-
-    Layout::horizontal([
-        Constraint::Percentage((100 - percent_x) / 2),
-        Constraint::Percentage(percent_x),
-        Constraint::Percentage((100 - percent_x) / 2),
-    ])
-    .split(popup_layout[1])[1]
+fn top_anchored_rect(area: Rect, desired_height: u16) -> Rect {
+    let max_width = area.width.saturating_sub(4).min(110);
+    let width = max_width.max(48);
+    let max_height = area.height.saturating_sub(6);
+    let height = desired_height.clamp(8, max_height.max(8));
+    Rect {
+        x: area.x.saturating_add(2),
+        y: area.y.saturating_add(2),
+        width,
+        height,
+    }
 }

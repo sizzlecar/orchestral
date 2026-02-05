@@ -220,16 +220,7 @@ fn requires_destructive_approval(
     args: &[String],
 ) -> bool {
     let destructive = [
-        "rm",
-        "rmdir",
-        "mv",
-        "chmod",
-        "chown",
-        "truncate",
-        "dd",
-        "mkfs",
-        "fdisk",
-        "git",
+        "rm", "rmdir", "mv", "chmod", "chown", "truncate", "dd", "mkfs", "fdisk", "git",
     ];
 
     if use_shell {
@@ -258,21 +249,22 @@ enum ApprovalDecision {
 fn parse_approval_decision(message: &str) -> Option<ApprovalDecision> {
     let normalized = message.trim().to_ascii_lowercase();
     let approve_tokens = [
-        "/approve",
-        "approve",
-        "approved",
-        "yes",
-        "y",
-        "ok",
-        "同意",
-        "确认",
-        "批准",
+        "/approve", "approve", "approved", "yes", "y", "ok", "同意", "确认", "批准",
     ];
     if approve_tokens.contains(&normalized.as_str()) {
         return Some(ApprovalDecision::Approve);
     }
 
-    let deny_tokens = ["/deny", "deny", "denied", "no", "n", "拒绝", "不同意", "取消"];
+    let deny_tokens = [
+        "/deny",
+        "deny",
+        "denied",
+        "no",
+        "n",
+        "拒绝",
+        "不同意",
+        "取消",
+    ];
     if deny_tokens.contains(&normalized.as_str()) {
         return Some(ApprovalDecision::Deny);
     }
@@ -834,8 +826,7 @@ impl Action for ShellAction {
             None => return ActionResult::error("Missing command for shell action"),
         };
         let args = params_get_array(params, "args");
-        let mut use_shell =
-            params_get_bool(params, "shell").unwrap_or(self.allow_shell_expression);
+        let mut use_shell = params_get_bool(params, "shell").unwrap_or(self.allow_shell_expression);
         let approved = params_get_bool(params, "approved").unwrap_or(false);
         let looks_like_expression =
             contains_shell_metacharacters(&command) || command.contains(' ');
@@ -915,8 +906,16 @@ impl Action for ShellAction {
                         return ActionResult::error("Destructive command denied by user");
                     }
                 } else {
-                    return ActionResult::need_clarification(
-                        "This command is destructive and requires approval. Reply with /approve to continue or /deny to cancel.",
+                    let approval_command = if use_shell {
+                        command.clone()
+                    } else if args_for_check.is_empty() {
+                        command.clone()
+                    } else {
+                        format!("{} {}", command, args_for_check.join(" "))
+                    };
+                    return ActionResult::need_approval(
+                        "This command is destructive and requires approval.",
+                        Some(approval_command),
                     );
                 }
             }

@@ -16,8 +16,12 @@ pub enum ActivityKind {
 pub enum RuntimeMsg {
     PlanningStart,
     PlanningEnd,
-    ExecutionStart { total: usize },
-    ExecutionProgress { step: usize },
+    ExecutionStart {
+        total: usize,
+    },
+    ExecutionProgress {
+        step: usize,
+    },
     ExecutionEnd,
     ActivityStart {
         kind: ActivityKind,
@@ -36,6 +40,13 @@ pub enum RuntimeMsg {
         failed: bool,
     },
     OutputPersist(String),
-    OutputTransient { slot: TransientSlot, text: String },
+    OutputTransient {
+        slot: TransientSlot,
+        text: String,
+    },
+    ApprovalRequested {
+        reason: String,
+        command: Option<String>,
+    },
     Error(String),
 }

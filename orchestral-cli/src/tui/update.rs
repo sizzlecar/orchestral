@@ -1,8 +1,10 @@
 use crossterm::event::{KeyCode, KeyModifiers};
+use std::time::Duration;
 
 use crate::runtime::{ActivityKind, RuntimeMsg, TransientSlot};
 
 use super::app::{ActivityGroup, App, AppMode};
+use super::bottom_pane::modal::ModalAction;
 use super::protocol::UiMsg;
 
 pub fn update(app: &mut App, msg: UiMsg) {
@@ -23,8 +25,7 @@ pub fn update(app: &mut App, msg: UiMsg) {
         UiMsg::UiTick => {}
         UiMsg::Key(key) => {
             if key.code == KeyCode::F(1)
-                || (key.code == KeyCode::Char('k')
-                    && key.modifiers.contains(KeyModifiers::CONTROL))
+                || (key.code == KeyCode::Char('k') && key.modifiers.contains(KeyModifiers::CONTROL))
             {
                 app.bottom.toggle_help_modal();
                 app.set_dirty();
@@ -35,10 +36,8 @@ pub fn update(app: &mut App, msg: UiMsg) {
                 app.queue_interrupt();
                 app.transient
                     .insert(TransientSlot::Status, "Interrupting...".to_string());
-                app.transient.insert(
-                    TransientSlot::Footer,
-                    "Interrupt requested...".to_string(),
-                );
+                app.transient
+                    .insert(TransientSlot::Footer, "Interrupt requested...".to_string());
                 app.set_dirty();
                 return;
             }
@@ -54,8 +53,28 @@ pub fn update(app: &mut App, msg: UiMsg) {
                 return;
             }
 
-            if app.bottom.handle_key_modal(key) {
-                app.set_dirty();
+            if let Some((action, modal_prefix)) = app.bottom.handle_key_modal(key) {
+                match action {
+                    ModalAction::SubmitApprove => {
+                        update(app, UiMsg::SubmitInput("/approve".to_string()));
+                    }
+                    ModalAction::SubmitDeny => {
+                        update(app, UiMsg::SubmitInput("/deny".to_string()));
+                    }
+                    ModalAction::ApproveAndRemember => {
+                        if let Some(prefix) = modal_prefix {
+                            app.remember_approved_prefix(prefix.clone());
+                            app.history.push(format!(
+                                "Approval rule added for this session: `{}`",
+                                prefix
+                            ));
+                        }
+                        update(app, UiMsg::SubmitInput("/approve".to_string()));
+                    }
+                    ModalAction::Close | ModalAction::None => {
+                        app.set_dirty();
+                    }
+                }
                 return;
             }
 
@@ -76,13 +95,17 @@ pub fn update(app: &mut App, msg: UiMsg) {
             app.queue_submit(input.clone());
             app.history.push(format!("> {}", input));
             app.active_activity = None;
+            app.turn_started_at = Some(std::time::Instant::now());
+            app.turn_elapsed_reported = false;
             app.mode = AppMode::Planning;
             app.spinner.enabled = true;
             app.shimmer.enabled = true;
             app.transient
                 .insert(TransientSlot::Status, "Planning...".to_string());
-            app.transient
-                .insert(TransientSlot::Footer, "Working... Ctrl+C to interrupt".to_string());
+            app.transient.insert(
+                TransientSlot::Footer,
+                "Working... Ctrl+C to interrupt".to_string(),
+            );
             app.set_dirty();
         }
         UiMsg::Runtime(msg) => handle_runtime(app, msg),
@@ -146,16 +169,6 @@ fn handle_runtime(app: &mut App, msg: RuntimeMsg) {
             if line.trim_start().starts_with("Waiting:") {
                 enter_waiting_input(app);
                 app.history.push(line);
-                let wait = app.history.last().cloned().unwrap_or_default();
-                if wait.contains("requires approval")
-                    || wait.contains("/approve")
-                    || wait.contains("/deny")
-                {
-                    app.transient.insert(
-                        TransientSlot::Footer,
-                        "Approval required: type /approve or /deny".to_string(),
-                    );
-                }
                 app.set_dirty();
                 return;
             }
@@ -178,6 +191,22 @@ fn handle_runtime(app: &mut App, msg: RuntimeMsg) {
             app.transient.insert(slot, text);
             app.set_dirty();
         }
+        RuntimeMsg::ApprovalRequested { reason, command } => {
+            if let Some(cmd) = command.clone() {
+                if app.is_command_auto_approved(&cmd) {
+                    app.history
+                        .push(format!("Auto-approved by rule: `{}`", cmd));
+                    update(app, UiMsg::SubmitInput("/approve".to_string()));
+                    return;
+                }
+            }
+            app.bottom.open_approval_modal(reason, command);
+            app.transient.insert(
+                TransientSlot::Footer,
+                "Approval required: use Up/Down then Enter".to_string(),
+            );
+            app.set_dirty();
+        }
         RuntimeMsg::ActivityStart {
             kind,
             step_id,
@@ -185,12 +214,7 @@ fn handle_runtime(app: &mut App, msg: RuntimeMsg) {
             input_summary,
         } => {
             let key = make_activity_key(app.current_turn_id, &step_id, &action);
-            let idx = upsert_activity_group(
-                app,
-                key,
-                kind,
-                action.clone(),
-            );
+            let idx = upsert_activity_group(app, key, kind, action.clone());
             if let Some(summary) = input_summary.filter(|s| !s.is_empty()) {
                 app.activities[idx]
                     .items
@@ -237,15 +261,48 @@ fn handle_runtime(app: &mut App, msg: RuntimeMsg) {
 }
 
 fn enter_waiting_input(app: &mut App) {
+    maybe_append_elapsed_line(app);
     app.mode = AppMode::WaitingInput;
     app.spinner.enabled = false;
     app.shimmer.enabled = false;
     app.active_activity = None;
-    app.transient.insert(TransientSlot::Status, "Idle".to_string());
+    app.transient
+        .insert(TransientSlot::Status, "Idle".to_string());
     app.transient.insert(
         TransientSlot::Footer,
         "Ready. Enter submit | Ctrl+K help | /exit quit".to_string(),
     );
+}
+
+fn maybe_append_elapsed_line(app: &mut App) {
+    if app.current_turn_id == 0 || app.turn_elapsed_reported {
+        return;
+    }
+    let Some(started_at) = app.turn_started_at else {
+        return;
+    };
+
+    let elapsed = started_at.elapsed();
+    app.history
+        .push(format!("Worked for {}", format_elapsed(elapsed)));
+    app.turn_elapsed_reported = true;
+}
+
+fn format_elapsed(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs == 0 {
+        return format!("{}ms", elapsed.as_millis().max(1));
+    }
+    if secs < 60 {
+        return format!("{}s", secs);
+    }
+    let mins = secs / 60;
+    let rem_secs = secs % 60;
+    if rem_secs == 0 {
+        format!("{}m", mins)
+    } else {
+        format!("{}m {}s", mins, rem_secs)
+    }
 }
 
 fn parse_execution_status(line: &str) -> Option<String> {
@@ -284,9 +341,9 @@ fn handle_activity_extra_line(app: &mut App, line: &str) -> bool {
     if let Some(body) = line.strip_prefix("Echo:") {
         let text = body.trim();
         let detail = if text.is_empty() {
-            "output: (empty)".to_string()
+            "(empty)".to_string()
         } else {
-            format!("output: {}", text)
+            text.to_string()
         };
         group.items.push(detail);
         return true;
@@ -296,16 +353,11 @@ fn handle_activity_extra_line(app: &mut App, line: &str) -> bool {
     if trimmed.is_empty() || trimmed.starts_with('<') || trimmed.starts_with('>') {
         return false;
     }
-    group.items.push(format!("output: {}", trimmed));
+    group.items.push(trimmed.to_string());
     true
 }
 
-fn upsert_activity_group(
-    app: &mut App,
-    key: String,
-    kind: ActivityKind,
-    title: String,
-) -> usize {
+fn upsert_activity_group(app: &mut App, key: String, kind: ActivityKind, title: String) -> usize {
     if let Some(idx) = app.activity_index.get(&key).copied() {
         return idx;
     }

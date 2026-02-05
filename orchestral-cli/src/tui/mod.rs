@@ -23,11 +23,15 @@ pub async fn run_session(
     once: bool,
     verbose: bool,
 ) -> anyhow::Result<()> {
+    let use_tui = std::io::stdout().is_terminal();
+    if use_tui {
+        std::env::set_var("ORCHESTRAL_TUI_SILENT_LOGS", "1");
+    }
     let runtime_client = RuntimeClient::from_config(config, thread_id)
         .await
         .context("initialize runtime client")?;
 
-    if !std::io::stdout().is_terminal() {
+    if !use_tui {
         return run_plain(runtime_client, initial_input).await;
     }
 
@@ -65,6 +69,16 @@ async fn run_plain(
             RuntimeMsg::OutputTransient { slot, text } => {
                 if matches!(slot, TransientSlot::Status) {
                     println!("{}", text);
+                }
+            }
+            RuntimeMsg::ApprovalRequested { reason, command } => {
+                if let Some(command) = command {
+                    println!(
+                        "Approval required for `{}`: {} (reply /approve or /deny)",
+                        command, reason
+                    );
+                } else {
+                    println!("Approval required: {} (reply /approve or /deny)", reason);
                 }
             }
             RuntimeMsg::Error(err) => eprintln!("Error: {}", err),

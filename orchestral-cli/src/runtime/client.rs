@@ -59,6 +59,7 @@ impl RuntimeClient {
             let mut completed_steps: usize = 0;
             let mut total_steps: usize = 0;
             let mut last_preview: Option<String> = None;
+            let mut last_approval_fingerprint: Option<String> = None;
 
             loop {
                 tokio::select! {
@@ -151,12 +152,10 @@ impl RuntimeClient {
                                 if let Some(preview) = output.preview.clone() {
                                     last_preview = Some(preview);
                                 }
+                                let output_path = output.path.clone();
                                 let mut parts = Vec::new();
                                 if let Some(status) = output.status {
                                     parts.push(format!("status={}", status));
-                                }
-                                if let Some(path) = output.path {
-                                    parts.push(format!("path={}", path));
                                 }
                                 if let Some(bytes) = output.bytes {
                                     parts.push(format!("bytes={}", bytes));
@@ -180,6 +179,15 @@ impl RuntimeClient {
                                         },
                                     })
                                     .await;
+                                if let Some(path) = output_path {
+                                    let _ = runtime_tx_events
+                                        .send(RuntimeMsg::ActivityItem {
+                                            step_id: step_id.clone(),
+                                            action: action_name.clone(),
+                                            line: format!("file: {}", path),
+                                        })
+                                        .await;
+                                }
                                 if let Some(preview) = output.preview {
                                     for line in preview_to_activity_lines(&preview) {
                                         let _ = runtime_tx_events
@@ -226,28 +234,42 @@ impl RuntimeClient {
                                 approval_command,
                             } => {
                                 let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
-                                let waiting_line = if matches!(waiting_kind.as_deref(), Some("approval")) {
+                                let is_approval = matches!(waiting_kind.as_deref(), Some("approval"))
+                                    || approval_reason.is_some()
+                                    || prompt
+                                        .as_deref()
+                                        .map(|p| p.to_ascii_lowercase().contains("requires approval"))
+                                        .unwrap_or(false);
+                                let waiting_line = if is_approval {
                                     let reason = approval_reason
                                         .or(prompt)
                                         .unwrap_or_else(|| "approval required".to_string());
-                                    let command = approval_command.unwrap_or_default();
-                                    if command.is_empty() {
-                                        format!("Waiting: Approval required. {} Reply /approve or /deny.", reason)
-                                    } else {
-                                        format!(
-                                            "Waiting: Approval required for `{}`. {} Reply /approve or /deny.",
-                                            command, reason
-                                        )
+                                    let fingerprint = format!(
+                                        "{}|{}",
+                                        reason,
+                                        approval_command.clone().unwrap_or_default()
+                                    );
+                                    if last_approval_fingerprint.as_deref() != Some(&fingerprint) {
+                                        last_approval_fingerprint = Some(fingerprint);
+                                        let _ = runtime_tx_events
+                                            .send(RuntimeMsg::ApprovalRequested {
+                                                reason,
+                                                command: approval_command,
+                                            })
+                                            .await;
                                     }
+                                    String::new()
                                 } else {
                                     format!(
                                         "Waiting: {}",
                                         prompt.unwrap_or_else(|| "input required".to_string())
                                     )
                                 };
-                                let _ = runtime_tx_events
-                                    .send(RuntimeMsg::OutputPersist(waiting_line))
-                                    .await;
+                                if !waiting_line.is_empty() {
+                                    let _ = runtime_tx_events
+                                        .send(RuntimeMsg::OutputPersist(waiting_line))
+                                        .await;
+                                }
                             }
                             UiEvent::ExecutionCompleted { status } => {
                                 match status.as_deref() {
@@ -331,9 +353,7 @@ impl RuntimeClient {
 fn classify_activity_kind(action: &str) -> ActivityKind {
     match action {
         "file_write" | "edit" | "patch" | "write" => ActivityKind::Edited,
-        "http" | "search" | "read_file" | "list_files" | "find" | "grep" => {
-            ActivityKind::Explored
-        }
+        "http" | "search" | "read_file" | "list_files" | "find" | "grep" => ActivityKind::Explored,
         _ => ActivityKind::Ran,
     }
 }
@@ -359,7 +379,7 @@ fn preview_to_activity_lines(preview: &str) -> Vec<String> {
     let lines: Vec<&str> = preview.lines().collect();
     let max_lines = 8usize;
     if lines.is_empty() {
-        out.push("output: (empty)".to_string());
+        out.push("(empty)".to_string());
         return out;
     }
 
@@ -372,13 +392,13 @@ fn preview_to_activity_lines(preview: &str) -> Vec<String> {
         if trimmed.chars().count() > 180 {
             snippet.push_str("...");
         }
-        out.push(format!("output: {}", snippet));
+        out.push(snippet);
     }
     if lines.len() > max_lines {
-        out.push(format!("output: ... +{} lines", lines.len() - max_lines));
+        out.push(format!("... +{} lines", lines.len() - max_lines));
     }
     if out.is_empty() {
-        out.push("output: (empty)".to_string());
+        out.push("(empty)".to_string());
     }
     out
 }
