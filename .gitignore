@@ -23,5 +23,6 @@
 # Environment
 .env
 .env.local
+.venv/
 
 /docs/
