@@ -21,7 +21,9 @@ use orchestral_core::planner::{
     HistoryItem, PlanError, Planner, PlannerContext, PlannerRuntimeInfo,
 };
 use orchestral_core::store::{ReferenceStore, StoreError, TaskStore, WorkingSet};
-use orchestral_core::types::{Intent, IntentContext, StepKind, Task, TaskId, TaskState, WaitUserReason};
+use orchestral_core::types::{
+    Intent, IntentContext, StepKind, Task, TaskId, TaskState, WaitUserReason,
+};
 use orchestral_stores::{Event, EventBus, EventStore};
 
 use crate::{HandleEventResult, InteractionState, RuntimeError, ThreadRuntime};
@@ -834,7 +836,9 @@ fn task_state_from_execution(result: &ExecutionResult) -> TaskState {
             reason: error.clone(),
             recoverable: false,
         },
-        ExecutionResult::WaitingUser { prompt, approval, .. } => TaskState::WaitingUser {
+        ExecutionResult::WaitingUser {
+            prompt, approval, ..
+        } => TaskState::WaitingUser {
             prompt: prompt.clone(),
             reason: approval
                 .as_ref()
