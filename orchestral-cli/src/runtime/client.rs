@@ -2,20 +2,20 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
-use serde_json::json;
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::{sleep, Duration};
 use tracing::debug;
 
-use orchestral_runtime::RuntimeApp;
-use orchestral_stores::Event;
+use orchestral_api::{ApiService, RuntimeApi};
+use orchestral_channels::{CliChannel, InMemoryChannelBindingStore};
 
 use super::event_projection::{project_event, UiEvent};
 use crate::runtime::protocol::{ActivityKind, RuntimeMsg, TransientSlot};
 
 #[derive(Clone)]
 pub struct RuntimeClient {
-    app: Arc<RuntimeApp>,
+    api: Arc<RuntimeApi>,
+    channel: Arc<CliChannel<RuntimeApi, InMemoryChannelBindingStore>>,
     thread_id: String,
     submit_lock: Arc<Mutex<()>>,
 }
@@ -25,17 +25,23 @@ impl RuntimeClient {
         config: PathBuf,
         thread_id_override: Option<String>,
     ) -> anyhow::Result<Self> {
-        let app = RuntimeApp::from_config_path(config)
+        let api = RuntimeApi::from_config_path(config)
             .await
-            .context("failed to build runtime app from config")?;
+            .context("failed to build runtime api from config")?;
         if let Some(thread_id) = thread_id_override {
-            let mut thread = app.orchestrator.thread_runtime.thread.write().await;
-            thread.id = thread_id;
+            api.set_thread_id(thread_id)
+                .await
+                .context("failed to override thread id")?;
         }
-        let thread_id = app.orchestrator.thread_runtime.thread_id().await;
+        let thread = api.thread().await.context("failed to read thread")?;
+        let channel = CliChannel::new(
+            Arc::new(api.clone()),
+            Arc::new(InMemoryChannelBindingStore::new()),
+        );
         Ok(Self {
-            app: Arc::new(app),
-            thread_id,
+            api: Arc::new(api),
+            channel: Arc::new(channel),
+            thread_id: thread.id,
             submit_lock: Arc::new(Mutex::new(())),
         })
     }
@@ -51,7 +57,7 @@ impl RuntimeClient {
     ) -> anyhow::Result<()> {
         let _guard = self.submit_lock.lock().await;
 
-        let mut rx = self.app.orchestrator.thread_runtime.subscribe_events();
+        let mut rx = self.api.subscribe_events();
         let (stop_tx, mut stop_rx) = watch::channel(false);
         let thread_id = self.thread_id.clone();
         let runtime_tx_events = runtime_tx.clone();
@@ -462,8 +468,15 @@ impl RuntimeClient {
             }
         });
 
-        let request = Event::user_input(&self.thread_id, "tui", build_user_input_payload(&input));
-        let result = self.app.orchestrator.handle_event(request).await;
+        let result = self
+            .channel
+            .submit_input(
+                &format!("cli:{}", self.thread_id),
+                Some("tui".to_string()),
+                input.clone(),
+            )
+            .await
+            .map(|_| ());
         // Give projected runtime events a short drain window before stopping forwarder.
         sleep(Duration::from_millis(120)).await;
         let _ = stop_tx.send(true);
@@ -480,7 +493,8 @@ impl RuntimeClient {
     }
 
     pub async fn interrupt(&self, runtime_tx: mpsc::Sender<RuntimeMsg>) {
-        self.app
+        self.api
+            .runtime_app()
             .orchestrator
             .thread_runtime
             .cancel_all_active()
@@ -499,22 +513,6 @@ fn classify_activity_kind(action: &str) -> ActivityKind {
         "file_write" | "edit" | "patch" | "write" => ActivityKind::Edited,
         "http" | "search" | "read_file" | "list_files" | "find" | "grep" => ActivityKind::Explored,
         _ => ActivityKind::Ran,
-    }
-}
-
-fn build_user_input_payload(input: &str) -> serde_json::Value {
-    let message = input.trim().to_string();
-    let decision = match message.to_ascii_lowercase().as_str() {
-        "/approve" => Some("approve"),
-        "/deny" => Some("deny"),
-        _ => None,
-    };
-    match decision {
-        Some(decision) => json!({
-            "message": message,
-            "approval": { "decision": decision }
-        }),
-        None => json!({ "message": message }),
     }
 }
 
