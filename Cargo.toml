@@ -8,6 +8,8 @@ members = [
     "orchestral-runtime",
     "orchestral-stores",
     "orchestral-actions",
+    "orchestral-api",
+    "orchestral-channels",
     "orchestral-cli",
     "examples",
 ]
@@ -53,6 +55,8 @@ orchestral-planners = { path = "orchestral-planners" }
 orchestral-runtime = { path = "orchestral-runtime" }
 orchestral-stores = { path = "orchestral-stores" }
 orchestral-actions = { path = "orchestral-actions" }
+orchestral-api = { path = "orchestral-api" }
+orchestral-channels = { path = "orchestral-channels" }
 
 [workspace.dependencies.tokio-test]
 version = "0.4"
