@@ -34,8 +34,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
 fn render_history(
     frame: &mut Frame,
     area: Rect,
-    app: &App,
-    theme: &Theme,
+    _app: &App,
+    _theme: &Theme,
     lines: Vec<Line<'static>>,
 ) {
     let inner_height = area.height as usize;
@@ -45,24 +45,6 @@ fn render_history(
         .scroll((scroll, 0))
         .wrap(Wrap { trim: true });
     frame.render_widget(widget, area);
-
-    // Keep subtle feedback visible even before first step arrives.
-    if app.spinner.enabled && app.activities.is_empty() && inner_height > 0 {
-        let hint = Paragraph::new(Line::from(vec![
-            Span::styled("  ", theme.muted),
-            Span::styled(app.spinner.current().to_string(), theme.input),
-            Span::styled(" preparing steps...", theme.muted),
-        ]));
-        frame.render_widget(
-            hint,
-            Rect {
-                x: area.x + 1,
-                y: area.y + 1,
-                width: area.width.saturating_sub(2),
-                height: 1,
-            },
-        );
-    }
 }
 
 fn build_activity_lines(app: &App, theme: &Theme) -> Vec<Line<'static>> {

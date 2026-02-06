@@ -326,16 +326,42 @@ fn format_elapsed(elapsed: Duration) -> String {
 fn push_history_multiline(app: &mut App, text: &str) {
     let mut pushed = false;
     for line in text.lines() {
+        if line_already_in_current_turn(app, line) {
+            continue;
+        }
         if app.history.last().map(String::as_str) != Some(line) {
             app.history.push(line.to_string());
         }
         pushed = true;
     }
     if !pushed {
+        if line_already_in_current_turn(app, text) {
+            return;
+        }
         if app.history.last().map(String::as_str) != Some(text) {
             app.history.push(text.to_string());
         }
     }
+}
+
+fn line_already_in_current_turn(app: &App, line: &str) -> bool {
+    if line.trim().is_empty() {
+        return false;
+    }
+    let mut seen_prompts = 0usize;
+    let mut start = 0usize;
+    for (idx, item) in app.history.iter().enumerate() {
+        if item.starts_with('>') {
+            seen_prompts = seen_prompts.saturating_add(1);
+            if seen_prompts == app.current_turn_id {
+                start = idx.saturating_add(1);
+            }
+        }
+    }
+    app.history
+        .iter()
+        .skip(start)
+        .any(|existing| existing.trim() == line.trim())
 }
 
 fn parse_execution_status(line: &str) -> Option<String> {

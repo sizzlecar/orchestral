@@ -5,6 +5,7 @@ use anyhow::Context;
 use serde_json::json;
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::{sleep, Duration};
+use tracing::debug;
 
 use orchestral_runtime::RuntimeApp;
 use orchestral_stores::Event;
@@ -60,6 +61,7 @@ impl RuntimeClient {
             let mut total_steps: usize = 0;
             let mut last_preview: Option<String> = None;
             let mut last_assistant_fingerprint: Option<String> = None;
+            let mut last_streamed_assistant: Option<String> = None;
             let mut streamed_assistant: String = String::new();
             let mut stream_active = false;
             let mut last_approval_fingerprint: Option<String> = None;
@@ -278,10 +280,20 @@ impl RuntimeClient {
                                 let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
                             }
                             UiEvent::ExecutionCompleted { status } => {
+                                debug!(
+                                    status = ?status,
+                                    pending_execution_end = pending_execution_end,
+                                    assistant_rendered = assistant_rendered,
+                                    "tui event: execution_completed"
+                                );
                                 match status.as_deref() {
                                     Some("completed") => {
                                         // For completed turns, assistant output is emitted after
                                         // execution_completed. Delay ExecutionEnd until reply arrives.
+                                        pending_execution_end = true;
+                                    }
+                                    Some("clarification") => {
+                                        // Clarification also emits assistant output after execution_completed.
                                         pending_execution_end = true;
                                     }
                                     Some(other) => {
@@ -307,14 +319,45 @@ impl RuntimeClient {
                             | UiEvent::TurnStarted
                             | UiEvent::TurnQueued
                             | UiEvent::TurnResumed => {}
+                            UiEvent::ReplanningStarted { message } => {
+                                let line = message.unwrap_or_else(|| {
+                                    "Execution failed, retrying with recovery plan...".to_string()
+                                });
+                                let _ = runtime_tx_events.send(RuntimeMsg::OutputPersist(line)).await;
+                            }
+                            UiEvent::ReplanningCompleted { message } => {
+                                let line = message
+                                    .unwrap_or_else(|| "Recovery plan ready, resuming execution.".to_string());
+                                let _ = runtime_tx_events.send(RuntimeMsg::OutputPersist(line)).await;
+                            }
+                            UiEvent::ReplanningFailed { message, error } => {
+                                let mut line = format!(
+                                    "Recovery planning failed: {}",
+                                    message.unwrap_or_else(|| "unknown error".to_string())
+                                );
+                                if let Some(error) = error {
+                                    if !error.trim().is_empty() {
+                                        line.push_str(" | ");
+                                        line.push_str(error.trim());
+                                    }
+                                }
+                                let _ = runtime_tx_events.send(RuntimeMsg::OutputPersist(line)).await;
+                            }
                             UiEvent::AssistantOutput { message } => {
                                 let normalized = message.trim().to_string();
                                 if normalized.is_empty() {
                                     continue;
                                 }
+                                debug!(
+                                    len = normalized.len(),
+                                    pending_execution_end = pending_execution_end,
+                                    stream_active = stream_active,
+                                    "tui event: assistant_output"
+                                );
                                 let streamed_trimmed = streamed_assistant.trim().to_string();
                                 if (!streamed_trimmed.is_empty()
                                     && streamed_trimmed == normalized)
+                                    || last_streamed_assistant.as_deref() == Some(normalized.as_str())
                                     || stream_active
                                 {
                                     // Stream already rendered this answer live.
@@ -332,16 +375,24 @@ impl RuntimeClient {
                                         .await;
                                 }
                                 if pending_execution_end {
+                                    debug!("tui action: execution_end after assistant_output");
                                     pending_execution_end = false;
                                     let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
                                     assistant_rendered = false;
                                     last_preview = None;
                                     last_assistant_fingerprint = None;
+                                    last_streamed_assistant = None;
                                     streamed_assistant.clear();
                                     stream_active = false;
                                 }
                             }
                             UiEvent::AssistantStreamDelta { delta, done } => {
+                                debug!(
+                                    delta_len = delta.len(),
+                                    done = done,
+                                    pending_execution_end = pending_execution_end,
+                                    "tui event: assistant_stream_delta"
+                                );
                                 if !delta.is_empty() {
                                     stream_active = true;
                                     streamed_assistant.push_str(&delta);
@@ -355,6 +406,13 @@ impl RuntimeClient {
                                 }
                                 if done {
                                     stream_active = false;
+                                    let streamed_final = streamed_assistant.trim().to_string();
+                                    if !streamed_final.is_empty() {
+                                        let _ = runtime_tx_events
+                                            .send(RuntimeMsg::OutputPersist(streamed_final.clone()))
+                                            .await;
+                                        last_streamed_assistant = Some(streamed_final);
+                                    }
                                     let _ = runtime_tx_events
                                         .send(RuntimeMsg::AssistantDelta {
                                             chunk: String::new(),
@@ -362,11 +420,13 @@ impl RuntimeClient {
                                         })
                                         .await;
                                     if pending_execution_end && !streamed_assistant.trim().is_empty() {
+                                        debug!("tui action: execution_end after assistant_stream done");
                                         pending_execution_end = false;
                                         let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
                                         assistant_rendered = false;
                                         last_preview = None;
                                         last_assistant_fingerprint = None;
+                                        last_streamed_assistant = None;
                                     }
                                     streamed_assistant.clear();
                                 }
@@ -387,6 +447,10 @@ impl RuntimeClient {
             }
 
             if pending_execution_end {
+                debug!(
+                    assistant_rendered = assistant_rendered,
+                    "tui action: execution_end at forwarder shutdown"
+                );
                 if !assistant_rendered {
                     if let Some(preview) = last_preview {
                         let _ = runtime_tx_events

@@ -10,7 +10,6 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use anyhow::Context;
-use std::io::Write;
 use tokio::sync::mpsc;
 
 use crate::runtime::{RuntimeClient, RuntimeMsg, TransientSlot};
@@ -55,6 +54,7 @@ async fn run_plain(
     let (tx, mut rx) = mpsc::channel::<RuntimeMsg>(256);
     let client = runtime_client.clone();
     let submit = tokio::spawn(async move { client.submit_input(input, tx).await });
+    let mut last_persist_line: Option<String> = None;
 
     while let Some(msg) = rx.recv().await {
         match msg {
@@ -66,16 +66,15 @@ async fn run_plain(
             RuntimeMsg::ActivityStart { .. }
             | RuntimeMsg::ActivityItem { .. }
             | RuntimeMsg::ActivityEnd { .. } => {}
-            RuntimeMsg::OutputPersist(line) => println!("{}", line),
-            RuntimeMsg::AssistantDelta { chunk, done } => {
-                if !chunk.is_empty() {
-                    print!("{}", chunk);
-                    let _ = std::io::stdout().flush();
+            RuntimeMsg::OutputPersist(line) => {
+                let trimmed = line.trim().to_string();
+                if last_persist_line.as_ref() == Some(&trimmed) {
+                    continue;
                 }
-                if done {
-                    println!();
-                }
+                println!("{}", line);
+                last_persist_line = Some(trimmed);
             }
+            RuntimeMsg::AssistantDelta { .. } => {}
             RuntimeMsg::OutputTransient { slot, text } => {
                 if matches!(slot, TransientSlot::Status) {
                     println!("{}", text);

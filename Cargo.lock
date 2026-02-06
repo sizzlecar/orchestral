@@ -1520,6 +1520,7 @@ dependencies = [
  "serde_json",
  "textwrap",
  "tokio",
+ "tracing",
  "unicode-width 0.1.14",
 ]
 

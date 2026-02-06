@@ -33,6 +33,16 @@ pub enum UiEvent {
         reason: Option<String>,
     },
     TurnQueued,
+    ReplanningStarted {
+        message: Option<String>,
+    },
+    ReplanningCompleted {
+        message: Option<String>,
+    },
+    ReplanningFailed {
+        message: Option<String>,
+        error: Option<String>,
+    },
     PlanningStarted,
     PlanningCompleted {
         step_count: Option<usize>,
@@ -119,6 +129,28 @@ fn project_lifecycle_event(payload: &Value) -> Option<UiEvent> {
                 .map(str::to_string),
         }),
         "turn_queued" => Some(UiEvent::TurnQueued),
+        "replanning_started" => Some(UiEvent::ReplanningStarted {
+            message: payload
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        }),
+        "replanning_completed" => Some(UiEvent::ReplanningCompleted {
+            message: payload
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        }),
+        "replanning_failed" => Some(UiEvent::ReplanningFailed {
+            message: payload
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            error: metadata
+                .and_then(|m| m.get("error"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        }),
         "planning_started" => Some(UiEvent::PlanningStarted),
         "planning_completed" => {
             let step_count = metadata
