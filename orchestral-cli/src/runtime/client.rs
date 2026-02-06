@@ -59,11 +59,11 @@ impl RuntimeClient {
             let mut completed_steps: usize = 0;
             let mut total_steps: usize = 0;
             let mut last_preview: Option<String> = None;
-            let mut last_assistant_message: Option<String> = None;
             let mut last_assistant_fingerprint: Option<String> = None;
             let mut streamed_assistant: String = String::new();
             let mut stream_active = false;
             let mut last_approval_fingerprint: Option<String> = None;
+            let mut assistant_rendered = false;
 
             loop {
                 tokio::select! {
@@ -237,7 +237,6 @@ impl RuntimeClient {
                                 approval_reason,
                                 approval_command,
                             } => {
-                                let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
                                 let is_approval = matches!(waiting_kind.as_deref(), Some("approval"))
                                     || approval_reason.is_some()
                                     || prompt
@@ -274,27 +273,41 @@ impl RuntimeClient {
                                         .send(RuntimeMsg::OutputPersist(waiting_line))
                                         .await;
                                 }
+                                let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
                             }
                             UiEvent::ExecutionCompleted { status } => {
                                 match status.as_deref() {
                                     Some("completed") => {
-                                        let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
-                                        if let Some(message) = last_assistant_message.clone() {
-                                            let _ = runtime_tx_events
-                                                .send(RuntimeMsg::OutputPersist(message))
-                                                .await;
-                                        } else if let Some(preview) = last_preview.clone() {
-                                            let _ = runtime_tx_events
-                                                .send(RuntimeMsg::OutputPersist(preview))
-                                                .await;
+                                        if !assistant_rendered {
+                                            if let Some(preview) = last_preview.clone() {
+                                                let _ = runtime_tx_events
+                                                    .send(RuntimeMsg::OutputPersist(preview))
+                                                    .await;
+                                            }
                                         }
+                                        let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
+                                        assistant_rendered = false;
+                                        last_preview = None;
+                                        last_assistant_fingerprint = None;
+                                        streamed_assistant.clear();
+                                        stream_active = false;
                                     }
                                     Some(other) => {
                                         let _ = runtime_tx_events
                                             .send(RuntimeMsg::OutputPersist(format!("Status: {}", other)))
                                             .await;
+                                        let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
                                     }
-                                    None => {}
+                                    None => {
+                                        if !assistant_rendered {
+                                            let _ = runtime_tx_events
+                                                .send(RuntimeMsg::OutputPersist(
+                                                    "Status: completed".to_string(),
+                                                ))
+                                                .await;
+                                        }
+                                        let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
+                                    }
                                 }
                             }
                             UiEvent::TaskFailed { message } => {
@@ -321,13 +334,13 @@ impl RuntimeClient {
                                     // Stream already rendered this answer live.
                                     stream_active = false;
                                     streamed_assistant.clear();
-                                    last_assistant_message = Some(normalized);
+                                    assistant_rendered = true;
                                     continue;
                                 }
-                                last_assistant_message = Some(normalized.clone());
                                 if last_assistant_fingerprint.as_deref() != Some(normalized.as_str())
                                 {
                                     last_assistant_fingerprint = Some(normalized.clone());
+                                    assistant_rendered = true;
                                     let _ = runtime_tx_events
                                         .send(RuntimeMsg::OutputPersist(normalized))
                                         .await;
@@ -337,6 +350,7 @@ impl RuntimeClient {
                                 if !delta.is_empty() {
                                     stream_active = true;
                                     streamed_assistant.push_str(&delta);
+                                    assistant_rendered = true;
                                     let _ = runtime_tx_events
                                         .send(RuntimeMsg::AssistantDelta {
                                             chunk: delta,
@@ -346,9 +360,6 @@ impl RuntimeClient {
                                 }
                                 if done {
                                     stream_active = false;
-                                    if !streamed_assistant.trim().is_empty() {
-                                        last_assistant_message = Some(streamed_assistant.trim().to_string());
-                                    }
                                     let _ = runtime_tx_events
                                         .send(RuntimeMsg::AssistantDelta {
                                             chunk: String::new(),
@@ -359,13 +370,13 @@ impl RuntimeClient {
                                 }
                             }
                             UiEvent::TurnRejected { reason } => {
-                                let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
                                 let _ = runtime_tx_events
                                     .send(RuntimeMsg::OutputPersist(format!(
                                         "Waiting: {}",
                                         reason.unwrap_or_else(|| "turn rejected".to_string())
                                     )))
                                     .await;
+                                let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
                             }
                         }
                     }

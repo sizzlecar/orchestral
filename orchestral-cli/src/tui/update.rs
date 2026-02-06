@@ -94,6 +94,8 @@ pub fn update(app: &mut App, msg: UiMsg) {
             app.current_turn_id = app.current_turn_id.saturating_add(1);
             app.queue_submit(input.clone());
             app.history.push(format!("> {}", input));
+            app.activities.clear();
+            app.activity_index.clear();
             app.active_activity = None;
             app.turn_started_at = Some(std::time::Instant::now());
             app.turn_elapsed_reported = false;
@@ -169,8 +171,8 @@ fn handle_runtime(app: &mut App, msg: RuntimeMsg) {
                 return;
             }
             if line.trim_start().starts_with("Waiting:") {
-                enter_waiting_input(app);
                 push_history_multiline(app, &line);
+                enter_waiting_input(app);
                 app.set_dirty();
                 return;
             }
@@ -269,8 +271,8 @@ fn handle_runtime(app: &mut App, msg: RuntimeMsg) {
             app.set_dirty();
         }
         RuntimeMsg::Error(err) => {
-            enter_waiting_input(app);
             app.history.push(format!("Error: {}", err));
+            enter_waiting_input(app);
             app.set_dirty();
         }
     }
@@ -324,11 +326,15 @@ fn format_elapsed(elapsed: Duration) -> String {
 fn push_history_multiline(app: &mut App, text: &str) {
     let mut pushed = false;
     for line in text.lines() {
-        app.history.push(line.to_string());
+        if app.history.last().map(String::as_str) != Some(line) {
+            app.history.push(line.to_string());
+        }
         pushed = true;
     }
     if !pushed {
-        app.history.push(text.to_string());
+        if app.history.last().map(String::as_str) != Some(text) {
+            app.history.push(text.to_string());
+        }
     }
 }
 

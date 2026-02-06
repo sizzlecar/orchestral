@@ -140,6 +140,13 @@ impl<C: LlmClient> LlmPlanner<C> {
 
 fn build_system_prompt(base: &str, context: &PlannerContext) -> String {
     let mut system = String::new();
+    system.push_str(
+        "You are Orchestral Planner, the planning component of the Orchestral runtime.\n",
+    );
+    system.push_str(
+        "Project context:\n- Workspace: Rust multi-crate project.\n- Core crates: orchestral-core, orchestral-runtime, orchestral-actions, orchestral-stores, orchestral-planners, orchestral-cli.\n- Execution model: Intent -> Plan -> Normalize -> Execute.\n",
+    );
+    system.push('\n');
     system.push_str(base.trim());
     if !context.runtime_info.os.is_empty() {
         system.push_str("\n\nExecution Environment:\n");
@@ -716,6 +723,8 @@ mod tests {
         let (system, _user) = planner.build_prompt(&intent, &context);
 
         assert!(system.contains("Action Catalog"));
+        assert!(system.contains("Orchestral Planner"));
+        assert!(system.contains("Intent -> Plan -> Normalize -> Execute"));
         assert!(system.contains("write_doc"));
         assert!(system.contains("input_fields"));
         assert!(system.contains("path (string, required)"));
