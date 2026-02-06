@@ -922,7 +922,7 @@ impl Orchestrator {
             .thread_runtime
             .query_history(self.config.history_limit)
             .await?;
-        events.sort_by(|a, b| a.timestamp().cmp(&b.timestamp()));
+        events.sort_by_key(|a| a.timestamp());
         Ok(events.iter().filter_map(event_to_history_item).collect())
     }
 

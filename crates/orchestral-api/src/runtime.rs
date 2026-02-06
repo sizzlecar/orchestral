@@ -180,7 +180,7 @@ impl ApiService for RuntimeApi {
             .query_history(limit)
             .await
             .map_err(|err| ApiError::Internal(format!("query history failed: {}", err)))?;
-        events.sort_by(|a, b| a.timestamp().cmp(&b.timestamp()));
+        events.sort_by_key(|a| a.timestamp());
         Ok(events.iter().map(event_to_view).collect())
     }
 

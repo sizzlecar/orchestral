@@ -232,7 +232,7 @@ impl ContextBuilder for BasicContextBuilder {
                     .await?
             };
 
-            events.sort_by(|a, b| a.timestamp().cmp(&b.timestamp()));
+            events.sort_by_key(|a| a.timestamp());
             for event in events {
                 if let Some(slice) = event_to_slice(&event) {
                     window.core.push(slice);

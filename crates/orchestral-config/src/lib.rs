@@ -260,7 +260,7 @@ fn default_max_tokens() -> usize {
     4096
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct StoresConfig {
     #[serde(default)]
     pub event: StoreSpec,
@@ -268,16 +268,6 @@ pub struct StoresConfig {
     pub task: StoreSpec,
     #[serde(default)]
     pub reference: StoreSpec,
-}
-
-impl Default for StoresConfig {
-    fn default() -> Self {
-        Self {
-            event: StoreSpec::default(),
-            task: StoreSpec::default(),
-            reference: StoreSpec::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

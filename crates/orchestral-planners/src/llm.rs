@@ -119,9 +119,9 @@ impl<C: LlmClient> LlmPlanner<C> {
         user.push_str(
             r#"{"type":"WORKFLOW","goal":"...","steps":[{"id":"s1","action":"action_name","params":{},"io_bindings":[{"from":"s1.output_key","to":"input_key","required":true}]}],"confidence":0.0}"#,
         );
-        user.push_str("\n");
+        user.push('\n');
         user.push_str(r#"{"type":"DIRECT_RESPONSE","message":"..."}"#);
-        user.push_str("\n");
+        user.push('\n');
         user.push_str(r#"{"type":"CLARIFICATION","question":"..."}"#);
         user.push_str(
             "\nUse only action names listed in Action Catalog when type is WORKFLOW. Return JSON only.\n",
@@ -132,10 +132,7 @@ impl<C: LlmClient> LlmPlanner<C> {
     }
 }
 
-fn select_history_for_prompt<'a>(
-    history: &'a [HistoryItem],
-    max_history: usize,
-) -> Vec<&'a HistoryItem> {
+fn select_history_for_prompt(history: &[HistoryItem], max_history: usize) -> Vec<&HistoryItem> {
     if max_history == 0 {
         return Vec::new();
     }

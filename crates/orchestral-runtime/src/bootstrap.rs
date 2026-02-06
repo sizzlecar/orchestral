@@ -268,9 +268,7 @@ fn init_tracing_if_needed(observability: &ObservabilityConfig) {
             .ok()
             .filter(|v| !v.trim().is_empty())
             .or_else(|| observability.log_file.clone());
-        let file_writer = log_file_path
-            .as_deref()
-            .and_then(|path| create_log_writer(path));
+        let file_writer = log_file_path.as_deref().and_then(create_log_writer);
         let fallback_level = match observability.log_level.trim().to_ascii_lowercase().as_str() {
             "trace" => "trace",
             "debug" => "debug",

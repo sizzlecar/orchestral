@@ -115,9 +115,7 @@ impl PlanNormalizer {
 
     /// Register a known action
     pub fn register_action(&mut self, name: impl Into<String>) {
-        self.known_actions
-            .entry(name.into())
-            .or_insert_with(ActionContract::default);
+        self.known_actions.entry(name.into()).or_default();
     }
 
     /// Register a known action with metadata-derived contract.

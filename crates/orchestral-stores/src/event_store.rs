@@ -293,7 +293,7 @@ impl EventStore for InMemoryEventStore {
             .cloned()
             .collect();
         // Sort by timestamp descending (most recent first)
-        filtered.sort_by(|a, b| b.timestamp().cmp(&a.timestamp()));
+        filtered.sort_by_key(|b| std::cmp::Reverse(b.timestamp()));
         Ok(filtered.into_iter().take(limit).collect())
     }
 
@@ -303,7 +303,7 @@ impl EventStore for InMemoryEventStore {
             .read()
             .map_err(|e| StoreError::Internal(e.to_string()))?;
         let mut sorted: Vec<_> = events.iter().cloned().collect();
-        sorted.sort_by(|a, b| b.timestamp().cmp(&a.timestamp()));
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.timestamp()));
         Ok(sorted.into_iter().take(limit).collect())
     }
 }

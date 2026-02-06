@@ -215,7 +215,7 @@ fn expression_command_tokens(input: &str) -> HashSet<String> {
 
 fn expression_command_names(input: &str) -> HashSet<String> {
     input
-        .split(|c: char| matches!(c, '|' | '&' | ';' | '\n'))
+        .split(['|', '&', ';', '\n'])
         .filter_map(first_command_name_from_segment)
         .collect()
 }
@@ -938,25 +938,23 @@ impl Action for ShellAction {
         }
 
         let args_for_check = args.clone().unwrap_or_default();
-        if requires_destructive_approval(use_shell, &command_name, &command, &args_for_check) {
-            if !approved {
-                if let Some(decision) = approval_decision_from_ctx(&ctx).await {
-                    if matches!(decision, ApprovalDecision::Deny) {
-                        return ActionResult::error("Destructive command denied by user");
-                    }
-                } else {
-                    let approval_command = if use_shell {
-                        command.clone()
-                    } else if args_for_check.is_empty() {
-                        command.clone()
-                    } else {
-                        format!("{} {}", command, args_for_check.join(" "))
-                    };
-                    return ActionResult::need_approval(
-                        "This command is destructive and requires approval.",
-                        Some(approval_command),
-                    );
+        if requires_destructive_approval(use_shell, &command_name, &command, &args_for_check)
+            && !approved
+        {
+            if let Some(decision) = approval_decision_from_ctx(&ctx).await {
+                if matches!(decision, ApprovalDecision::Deny) {
+                    return ActionResult::error("Destructive command denied by user");
                 }
+            } else {
+                let approval_command = if use_shell || args_for_check.is_empty() {
+                    command.clone()
+                } else {
+                    format!("{} {}", command, args_for_check.join(" "))
+                };
+                return ActionResult::need_approval(
+                    "This command is destructive and requires approval.",
+                    Some(approval_command),
+                );
             }
         }
 

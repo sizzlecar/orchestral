@@ -6,10 +6,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Step type - distinguishes control semantics
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StepKind {
     /// Normal Action execution
+    #[default]
     Action,
     /// Wait for user input
     WaitUser,
@@ -17,12 +18,6 @@ pub enum StepKind {
     WaitEvent,
     /// System built-in step (e.g., resolve_reference)
     System,
-}
-
-impl Default for StepKind {
-    fn default() -> Self {
-        Self::Action
-    }
 }
 
 /// Data binding from an upstream task key to this step's input key.
