@@ -34,12 +34,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
 fn render_history(
     frame: &mut Frame,
     area: Rect,
-    _app: &App,
+    app: &App,
     _theme: &Theme,
     lines: Vec<Line<'static>>,
 ) {
     let inner_height = area.height as usize;
-    let scroll = lines.len().saturating_sub(inner_height) as u16;
+    let max_scroll = lines.len().saturating_sub(inner_height) as u16;
+    let back = app.history_scroll_back.min(max_scroll);
+    let scroll = max_scroll.saturating_sub(back);
     let widget = Paragraph::new(lines)
         .block(Block::default().borders(Borders::NONE))
         .scroll((scroll, 0))

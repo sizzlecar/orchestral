@@ -9,6 +9,8 @@ pub enum UiMsg {
     AnimTick,
     Runtime(crate::runtime::RuntimeMsg),
     SubmitInput(String),
+    ScrollUp,
+    ScrollDown,
     Interrupt,
     Quit,
 }

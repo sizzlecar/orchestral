@@ -1,7 +1,9 @@
 use std::io;
 
 use anyhow::Context;
-use crossterm::event::{Event, EventStream};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -27,7 +29,7 @@ impl TerminalGuard {
     fn enter() -> anyhow::Result<Self> {
         enable_raw_mode().context("enable raw mode")?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen).context("enter alt screen")?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture).context("enter alt screen")?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend).context("create terminal")?;
         terminal.clear().context("clear terminal")?;
@@ -42,7 +44,11 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = self.terminal.show_cursor();
     }
 }
@@ -74,6 +80,19 @@ pub async fn run_tui(
                             break;
                         }
                     }
+                    Event::Mouse(mouse) => match mouse.kind {
+                        MouseEventKind::ScrollUp => {
+                            if ui_tx.send(UiMsg::ScrollUp).await.is_err() {
+                                break;
+                            }
+                        }
+                        MouseEventKind::ScrollDown => {
+                            if ui_tx.send(UiMsg::ScrollDown).await.is_err() {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    },
                     _ => {}
                 }
             }
@@ -142,6 +161,16 @@ pub async fn run_tui(
             tokio::spawn(async move {
                 client.interrupt(tx).await;
             });
+        }
+
+        if let Some(enabled) = app.take_pending_mouse_capture_toggle() {
+            if enabled {
+                execute!(term.terminal_mut().backend_mut(), EnableMouseCapture)
+                    .context("enable mouse capture")?;
+            } else {
+                execute!(term.terminal_mut().backend_mut(), DisableMouseCapture)
+                    .context("disable mouse capture")?;
+            }
         }
 
         if let Some(input) = app.take_pending_submit() {

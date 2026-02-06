@@ -8,6 +8,7 @@ use super::widgets::{Shimmer, Spinner};
 
 #[derive(Debug, Clone)]
 pub struct ActivityGroup {
+    pub key: String,
     pub turn_id: usize,
     pub kind: ActivityKind,
     pub title: String,
@@ -38,6 +39,9 @@ pub struct App {
     pub turn_elapsed_reported: bool,
     pub approved_command_prefixes: Vec<String>,
     pub assistant_stream_line: Option<usize>,
+    pub history_scroll_back: u16,
+    pub mouse_capture_enabled: bool,
+    pending_mouse_capture_toggle: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +80,9 @@ impl App {
             turn_elapsed_reported: false,
             approved_command_prefixes: Vec::new(),
             assistant_stream_line: None,
+            history_scroll_back: 0,
+            mouse_capture_enabled: true,
+            pending_mouse_capture_toggle: None,
         }
     }
 
@@ -118,5 +125,13 @@ impl App {
         self.approved_command_prefixes
             .iter()
             .any(|prefix| command.starts_with(prefix))
+    }
+
+    pub fn queue_set_mouse_capture(&mut self, enabled: bool) {
+        self.pending_mouse_capture_toggle = Some(enabled);
+    }
+
+    pub fn take_pending_mouse_capture_toggle(&mut self) -> Option<bool> {
+        self.pending_mouse_capture_toggle.take()
     }
 }

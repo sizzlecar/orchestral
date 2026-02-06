@@ -23,7 +23,53 @@ pub fn update(app: &mut App, msg: UiMsg) {
             }
         }
         UiMsg::UiTick => {}
+        UiMsg::ScrollUp => {
+            app.history_scroll_back = app.history_scroll_back.saturating_add(3);
+            app.set_dirty();
+        }
+        UiMsg::ScrollDown => {
+            app.history_scroll_back = app.history_scroll_back.saturating_sub(3);
+            app.set_dirty();
+        }
         UiMsg::Key(key) => {
+            if key.code == KeyCode::PageUp {
+                app.history_scroll_back = app.history_scroll_back.saturating_add(10);
+                app.set_dirty();
+                return;
+            }
+            if key.code == KeyCode::PageDown {
+                app.history_scroll_back = app.history_scroll_back.saturating_sub(10);
+                app.set_dirty();
+                return;
+            }
+            if key.code == KeyCode::Home {
+                app.history_scroll_back = u16::MAX;
+                app.set_dirty();
+                return;
+            }
+            if key.code == KeyCode::End {
+                app.history_scroll_back = 0;
+                app.set_dirty();
+                return;
+            }
+            if key.code == KeyCode::Char('m') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                let next = !app.mouse_capture_enabled;
+                app.mouse_capture_enabled = next;
+                app.queue_set_mouse_capture(next);
+                app.transient.insert(
+                    TransientSlot::Footer,
+                    if next {
+                        "Mouse capture ON (trackpad scroll). Ctrl+M to allow text selection/copy."
+                            .to_string()
+                    } else {
+                        "Mouse capture OFF (selection/copy enabled). Ctrl+M to re-enable trackpad scroll."
+                            .to_string()
+                    },
+                );
+                app.set_dirty();
+                return;
+            }
+
             if key.code == KeyCode::F(1)
                 || (key.code == KeyCode::Char('k') && key.modifiers.contains(KeyModifiers::CONTROL))
             {
@@ -64,10 +110,10 @@ pub fn update(app: &mut App, msg: UiMsg) {
                     ModalAction::ApproveAndRemember => {
                         if let Some(prefix) = modal_prefix {
                             app.remember_approved_prefix(prefix.clone());
-                            app.history.push(format!(
-                                "Approval rule added for this session: `{}`",
-                                prefix
-                            ));
+                            push_history_line(
+                                app,
+                                format!("Approval rule added for this session: `{}`", prefix),
+                            );
                         }
                         update(app, UiMsg::SubmitInput("/approve".to_string()));
                     }
@@ -93,13 +139,13 @@ pub fn update(app: &mut App, msg: UiMsg) {
         UiMsg::SubmitInput(input) => {
             app.current_turn_id = app.current_turn_id.saturating_add(1);
             app.queue_submit(input.clone());
-            app.history.push(format!("> {}", input));
-            app.activities.clear();
-            app.activity_index.clear();
+            push_history_line(app, format!("> {}", input));
+            prune_old_activities(app, 8);
             app.active_activity = None;
             app.turn_started_at = Some(std::time::Instant::now());
             app.turn_elapsed_reported = false;
             app.assistant_stream_line = None;
+            app.history_scroll_back = 0;
             app.mode = AppMode::Planning;
             app.spinner.enabled = true;
             app.shimmer.enabled = true;
@@ -154,6 +200,12 @@ fn handle_runtime(app: &mut App, msg: RuntimeMsg) {
             app.set_dirty();
         }
         RuntimeMsg::ExecutionEnd => {
+            // A stale end event from previous turn may arrive right after a new submit.
+            // Ignore it if the UI has already entered planning for the next turn.
+            if matches!(app.mode, AppMode::Planning) {
+                app.set_dirty();
+                return;
+            }
             enter_waiting_input(app);
             app.submitted_once = true;
             if app.once {
@@ -162,6 +214,9 @@ fn handle_runtime(app: &mut App, msg: RuntimeMsg) {
             app.set_dirty();
         }
         RuntimeMsg::OutputPersist(line) => {
+            if matches!(app.mode, AppMode::Planning | AppMode::Executing) {
+                app.history_scroll_back = 0;
+            }
             app.assistant_stream_line = None;
             if let Some(status) = parse_execution_status(&line) {
                 if status != "completed" {
@@ -184,12 +239,15 @@ fn handle_runtime(app: &mut App, msg: RuntimeMsg) {
             app.set_dirty();
         }
         RuntimeMsg::AssistantDelta { chunk, done } => {
+            if matches!(app.mode, AppMode::Planning | AppMode::Executing) {
+                app.history_scroll_back = 0;
+            }
             if let Some(idx) = app.assistant_stream_line {
                 if let Some(line) = app.history.get_mut(idx) {
                     line.push_str(&chunk);
                 }
             } else {
-                app.history.push(String::new());
+                push_history_line(app, String::new());
                 let idx = app.history.len().saturating_sub(1);
                 if let Some(line) = app.history.get_mut(idx) {
                     line.push_str(&chunk);
@@ -271,7 +329,7 @@ fn handle_runtime(app: &mut App, msg: RuntimeMsg) {
             app.set_dirty();
         }
         RuntimeMsg::Error(err) => {
-            app.history.push(format!("Error: {}", err));
+            push_history_line(app, format!("Error: {}", err));
             enter_waiting_input(app);
             app.set_dirty();
         }
@@ -301,8 +359,7 @@ fn maybe_append_elapsed_line(app: &mut App) {
     };
 
     let elapsed = started_at.elapsed();
-    app.history
-        .push(format!("Worked for {}", format_elapsed(elapsed)));
+    push_history_line(app, format!("Worked for {}", format_elapsed(elapsed)));
     app.turn_elapsed_reported = true;
 }
 
@@ -330,7 +387,7 @@ fn push_history_multiline(app: &mut App, text: &str) {
             continue;
         }
         if app.history.last().map(String::as_str) != Some(line) {
-            app.history.push(line.to_string());
+            push_history_line(app, line.to_string());
         }
         pushed = true;
     }
@@ -339,7 +396,7 @@ fn push_history_multiline(app: &mut App, text: &str) {
             return;
         }
         if app.history.last().map(String::as_str) != Some(text) {
-            app.history.push(text.to_string());
+            push_history_line(app, text.to_string());
         }
     }
 }
@@ -393,6 +450,7 @@ fn upsert_activity_group(app: &mut App, key: String, kind: ActivityKind, title: 
     }
     let idx = app.activities.len();
     app.activities.push(ActivityGroup {
+        key: key.clone(),
         turn_id: app.current_turn_id,
         kind,
         title,
@@ -401,4 +459,21 @@ fn upsert_activity_group(app: &mut App, key: String, kind: ActivityKind, title: 
     });
     app.activity_index.insert(key, idx);
     idx
+}
+
+fn push_history_line(app: &mut App, line: String) {
+    // Keep viewport stable while user is scrolled up.
+    if app.history_scroll_back > 0 {
+        app.history_scroll_back = app.history_scroll_back.saturating_add(1);
+    }
+    app.history.push(line);
+}
+
+fn prune_old_activities(app: &mut App, keep_turns: usize) {
+    let min_turn = app.current_turn_id.saturating_sub(keep_turns.saturating_sub(1));
+    app.activities.retain(|g| g.turn_id >= min_turn);
+    app.activity_index.clear();
+    for (idx, group) in app.activities.iter().enumerate() {
+        app.activity_index.insert(group.key.clone(), idx);
+    }
 }
