@@ -1,10 +1,11 @@
 use std::env;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "orchestral", about = "Orchestral CLI/TUI")]
+#[command(name = "orchestral", about = "Orchestral CLI")]
 pub struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -12,20 +13,10 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Start interactive TUI chat
-    Tui(TuiArgs),
     /// Run with optional initial input; enters chat by default
     Run(RunArgs),
-}
-
-#[derive(Debug, Args, Clone)]
-struct TuiArgs {
-    #[arg(long, default_value = "config/orchestral.cli.yaml")]
-    config: PathBuf,
-    #[arg(long)]
-    thread_id: Option<String>,
-    #[arg(long)]
-    verbose: bool,
+    /// Run HTTP/SSE server
+    Server(ServerArgs),
 }
 
 #[derive(Debug, Args, Clone)]
@@ -42,14 +33,17 @@ struct RunArgs {
     input: Vec<String>,
 }
 
+#[derive(Debug, Args, Clone)]
+struct ServerArgs {
+    #[arg(long, default_value = "config/orchestral.cli.yaml")]
+    config: PathBuf,
+    #[arg(long, default_value = "127.0.0.1:8080")]
+    listen: SocketAddr,
+}
+
 impl Cli {
     pub async fn run(self) -> anyhow::Result<()> {
         match self.command {
-            Some(Command::Tui(args)) => {
-                ensure_log_filter(args.verbose);
-                crate::tui::run_session(args.config, args.thread_id, None, false, args.verbose)
-                    .await
-            }
             Some(Command::Run(args)) => {
                 ensure_log_filter(args.verbose);
                 let initial_input = if args.input.is_empty() {
@@ -65,6 +59,10 @@ impl Cli {
                     args.verbose,
                 )
                 .await
+            }
+            Some(Command::Server(args)) => {
+                ensure_log_filter(false);
+                orchestral_server::run_server(args.config, args.listen).await
             }
             None => {
                 ensure_log_filter(false);
