@@ -1,0 +1,23 @@
+[package]
+name = "orchestral-server"
+description = "HTTP/SSE server for Orchestral"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+orchestral-api = { workspace = true }
+orchestral-channels = { workspace = true }
+orchestral-stores = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+axum = { version = "0.8", features = ["macros"] }
+clap = { version = "4.5", features = ["derive"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+anyhow = "1"
+async-stream = "0.3"
+futures-util = "0.3"

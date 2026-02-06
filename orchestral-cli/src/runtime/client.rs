@@ -7,7 +7,7 @@ use tokio::time::{sleep, Duration};
 use tracing::debug;
 
 use orchestral_api::{ApiService, RuntimeApi};
-use orchestral_channels::{CliChannel, InMemoryChannelBindingStore};
+use orchestral_channels::{ChannelBindingStore, CliChannel, InMemoryChannelBindingStore};
 
 use super::event_projection::{project_event, UiEvent};
 use crate::runtime::protocol::{ActivityKind, RuntimeMsg, TransientSlot};
@@ -17,6 +17,7 @@ pub struct RuntimeClient {
     api: Arc<RuntimeApi>,
     channel: Arc<CliChannel<RuntimeApi, InMemoryChannelBindingStore>>,
     thread_id: String,
+    session_key: String,
     submit_lock: Arc<Mutex<()>>,
 }
 
@@ -28,20 +29,27 @@ impl RuntimeClient {
         let api = RuntimeApi::from_config_path(config)
             .await
             .context("failed to build runtime api from config")?;
-        if let Some(thread_id) = thread_id_override {
-            api.set_thread_id(thread_id)
+        let binding_store = Arc::new(InMemoryChannelBindingStore::new());
+        let thread = match thread_id_override {
+            Some(thread_id) => api
+                .create_thread(Some(thread_id))
                 .await
-                .context("failed to override thread id")?;
-        }
-        let thread = api.thread().await.context("failed to read thread")?;
-        let channel = CliChannel::new(
-            Arc::new(api.clone()),
-            Arc::new(InMemoryChannelBindingStore::new()),
-        );
+                .context("failed to create thread with override id")?,
+            None => api
+                .create_thread(None)
+                .await
+                .context("failed to create default thread")?,
+        };
+        let session_key = format!("cli:{}", thread.id);
+        binding_store
+            .set_thread_id(&session_key, thread.id.clone())
+            .await;
+        let channel = CliChannel::new(Arc::new(api.clone()), binding_store);
         Ok(Self {
             api: Arc::new(api),
             channel: Arc::new(channel),
             thread_id: thread.id,
+            session_key,
             submit_lock: Arc::new(Mutex::new(())),
         })
     }
@@ -57,7 +65,11 @@ impl RuntimeClient {
     ) -> anyhow::Result<()> {
         let _guard = self.submit_lock.lock().await;
 
-        let mut rx = self.api.subscribe_events();
+        let mut rx = self
+            .api
+            .subscribe_events(&self.thread_id)
+            .await
+            .context("failed to subscribe events")?;
         let (stop_tx, mut stop_rx) = watch::channel(false);
         let thread_id = self.thread_id.clone();
         let runtime_tx_events = runtime_tx.clone();
@@ -470,11 +482,7 @@ impl RuntimeClient {
 
         let result = self
             .channel
-            .submit_input(
-                &format!("cli:{}", self.thread_id),
-                Some("tui".to_string()),
-                input.clone(),
-            )
+            .submit_input(&self.session_key, Some("tui".to_string()), input.clone())
             .await
             .map(|_| ());
         // Give projected runtime events a short drain window before stopping forwarder.
@@ -493,12 +501,19 @@ impl RuntimeClient {
     }
 
     pub async fn interrupt(&self, runtime_tx: mpsc::Sender<RuntimeMsg>) {
-        self.api
-            .runtime_app()
-            .orchestrator
-            .thread_runtime
-            .cancel_all_active()
-            .await;
+        let app = match self.api.runtime_app_for_thread(&self.thread_id).await {
+            Ok(app) => app,
+            Err(err) => {
+                let _ = runtime_tx
+                    .send(RuntimeMsg::Error(format!(
+                        "interrupt failed to resolve runtime app: {}",
+                        err
+                    )))
+                    .await;
+                return;
+            }
+        };
+        app.orchestrator.thread_runtime.cancel_all_active().await;
         let _ = runtime_tx
             .send(RuntimeMsg::OutputTransient {
                 slot: TransientSlot::Status,

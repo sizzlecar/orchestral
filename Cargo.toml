@@ -10,6 +10,7 @@ members = [
     "orchestral-actions",
     "orchestral-api",
     "orchestral-channels",
+    "orchestral-server",
     "orchestral-cli",
     "examples",
 ]
