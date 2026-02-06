@@ -2,20 +2,22 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
-use serde_json::json;
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::{sleep, Duration};
+use tracing::debug;
 
-use orchestral_runtime::RuntimeApp;
-use orchestral_stores::Event;
+use orchestral_api::{ApiService, RuntimeApi};
+use orchestral_channels::{ChannelBindingStore, CliChannel, InMemoryChannelBindingStore};
 
 use super::event_projection::{project_event, UiEvent};
 use crate::runtime::protocol::{ActivityKind, RuntimeMsg, TransientSlot};
 
 #[derive(Clone)]
 pub struct RuntimeClient {
-    app: Arc<RuntimeApp>,
+    api: Arc<RuntimeApi>,
+    channel: Arc<CliChannel<RuntimeApi, InMemoryChannelBindingStore>>,
     thread_id: String,
+    session_key: String,
     submit_lock: Arc<Mutex<()>>,
 }
 
@@ -24,17 +26,30 @@ impl RuntimeClient {
         config: PathBuf,
         thread_id_override: Option<String>,
     ) -> anyhow::Result<Self> {
-        let app = RuntimeApp::from_config_path(config)
+        let api = RuntimeApi::from_config_path(config)
             .await
-            .context("failed to build runtime app from config")?;
-        if let Some(thread_id) = thread_id_override {
-            let mut thread = app.orchestrator.thread_runtime.thread.write().await;
-            thread.id = thread_id;
-        }
-        let thread_id = app.orchestrator.thread_runtime.thread_id().await;
+            .context("failed to build runtime api from config")?;
+        let binding_store = Arc::new(InMemoryChannelBindingStore::new());
+        let thread = match thread_id_override {
+            Some(thread_id) => api
+                .create_thread(Some(thread_id))
+                .await
+                .context("failed to create thread with override id")?,
+            None => api
+                .create_thread(None)
+                .await
+                .context("failed to create default thread")?,
+        };
+        let session_key = format!("cli:{}", thread.id);
+        binding_store
+            .set_thread_id(&session_key, thread.id.clone())
+            .await;
+        let channel = CliChannel::new(Arc::new(api.clone()), binding_store);
         Ok(Self {
-            app: Arc::new(app),
-            thread_id,
+            api: Arc::new(api),
+            channel: Arc::new(channel),
+            thread_id: thread.id,
+            session_key,
             submit_lock: Arc::new(Mutex::new(())),
         })
     }
@@ -50,7 +65,11 @@ impl RuntimeClient {
     ) -> anyhow::Result<()> {
         let _guard = self.submit_lock.lock().await;
 
-        let mut rx = self.app.orchestrator.thread_runtime.subscribe_events();
+        let mut rx = self
+            .api
+            .subscribe_events(&self.thread_id)
+            .await
+            .context("failed to subscribe events")?;
         let (stop_tx, mut stop_rx) = watch::channel(false);
         let thread_id = self.thread_id.clone();
         let runtime_tx_events = runtime_tx.clone();
@@ -59,6 +78,13 @@ impl RuntimeClient {
             let mut completed_steps: usize = 0;
             let mut total_steps: usize = 0;
             let mut last_preview: Option<String> = None;
+            let mut last_assistant_fingerprint: Option<String> = None;
+            let mut last_streamed_assistant: Option<String> = None;
+            let mut streamed_assistant: String = String::new();
+            let mut stream_active = false;
+            let mut last_approval_fingerprint: Option<String> = None;
+            let mut assistant_rendered = false;
+            let mut pending_execution_end = false;
 
             loop {
                 tokio::select! {
@@ -151,12 +177,10 @@ impl RuntimeClient {
                                 if let Some(preview) = output.preview.clone() {
                                     last_preview = Some(preview);
                                 }
+                                let output_path = output.path.clone();
                                 let mut parts = Vec::new();
                                 if let Some(status) = output.status {
                                     parts.push(format!("status={}", status));
-                                }
-                                if let Some(path) = output.path {
-                                    parts.push(format!("path={}", path));
                                 }
                                 if let Some(bytes) = output.bytes {
                                     parts.push(format!("bytes={}", bytes));
@@ -180,6 +204,15 @@ impl RuntimeClient {
                                         },
                                     })
                                     .await;
+                                if let Some(path) = output_path {
+                                    let _ = runtime_tx_events
+                                        .send(RuntimeMsg::ActivityItem {
+                                            step_id: step_id.clone(),
+                                            action: action_name.clone(),
+                                            line: format!("file: {}", path),
+                                        })
+                                        .await;
+                                }
                                 if let Some(preview) = output.preview {
                                     for line in preview_to_activity_lines(&preview) {
                                         let _ = runtime_tx_events
@@ -225,49 +258,72 @@ impl RuntimeClient {
                                 approval_reason,
                                 approval_command,
                             } => {
-                                let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
-                                let waiting_line = if matches!(waiting_kind.as_deref(), Some("approval")) {
+                                let is_approval = matches!(waiting_kind.as_deref(), Some("approval"))
+                                    || approval_reason.is_some()
+                                    || prompt
+                                        .as_deref()
+                                        .map(|p| p.to_ascii_lowercase().contains("requires approval"))
+                                        .unwrap_or(false);
+                                let waiting_line = if is_approval {
                                     let reason = approval_reason
                                         .or(prompt)
                                         .unwrap_or_else(|| "approval required".to_string());
-                                    let command = approval_command.unwrap_or_default();
-                                    if command.is_empty() {
-                                        format!("Waiting: Approval required. {} Reply /approve or /deny.", reason)
-                                    } else {
-                                        format!(
-                                            "Waiting: Approval required for `{}`. {} Reply /approve or /deny.",
-                                            command, reason
-                                        )
+                                    let fingerprint = format!(
+                                        "{}|{}",
+                                        reason,
+                                        approval_command.clone().unwrap_or_default()
+                                    );
+                                    if last_approval_fingerprint.as_deref() != Some(&fingerprint) {
+                                        last_approval_fingerprint = Some(fingerprint);
+                                        let _ = runtime_tx_events
+                                            .send(RuntimeMsg::ApprovalRequested {
+                                                reason,
+                                                command: approval_command,
+                                            })
+                                            .await;
                                     }
+                                    String::new()
                                 } else {
                                     format!(
                                         "Waiting: {}",
                                         prompt.unwrap_or_else(|| "input required".to_string())
                                     )
                                 };
-                                let _ = runtime_tx_events
-                                    .send(RuntimeMsg::OutputPersist(waiting_line))
-                                    .await;
+                                if !waiting_line.is_empty() {
+                                    let _ = runtime_tx_events
+                                        .send(RuntimeMsg::OutputPersist(waiting_line))
+                                        .await;
+                                }
+                                pending_execution_end = false;
+                                let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
                             }
                             UiEvent::ExecutionCompleted { status } => {
+                                debug!(
+                                    status = ?status,
+                                    pending_execution_end = pending_execution_end,
+                                    assistant_rendered = assistant_rendered,
+                                    "tui event: execution_completed"
+                                );
                                 match status.as_deref() {
                                     Some("completed") => {
-                                        let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
-                                        if let Some(preview) = last_preview.clone() {
-                                            let _ = runtime_tx_events
-                                                .send(RuntimeMsg::OutputPersist("Final Answer".to_string()))
-                                                .await;
-                                            let _ = runtime_tx_events
-                                                .send(RuntimeMsg::OutputPersist(preview))
-                                                .await;
-                                        }
+                                        // For completed turns, assistant output is emitted after
+                                        // execution_completed. Delay ExecutionEnd until reply arrives.
+                                        pending_execution_end = true;
+                                    }
+                                    Some("clarification") => {
+                                        // Clarification also emits assistant output after execution_completed.
+                                        pending_execution_end = true;
                                     }
                                     Some(other) => {
                                         let _ = runtime_tx_events
                                             .send(RuntimeMsg::OutputPersist(format!("Status: {}", other)))
                                             .await;
+                                        pending_execution_end = false;
+                                        let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
                                     }
-                                    None => {}
+                                    None => {
+                                        pending_execution_end = true;
+                                    }
                                 }
                             }
                             UiEvent::TaskFailed { message } => {
@@ -279,25 +335,156 @@ impl RuntimeClient {
                             }
                             UiEvent::TaskCompleted
                             | UiEvent::TurnStarted
-                            | UiEvent::TurnQueued => {}
+                            | UiEvent::TurnQueued
                             | UiEvent::TurnResumed => {}
+                            UiEvent::ReplanningStarted { message } => {
+                                let line = message.unwrap_or_else(|| {
+                                    "Execution failed, retrying with recovery plan...".to_string()
+                                });
+                                let _ = runtime_tx_events.send(RuntimeMsg::OutputPersist(line)).await;
+                            }
+                            UiEvent::ReplanningCompleted { message } => {
+                                let line = message
+                                    .unwrap_or_else(|| "Recovery plan ready, resuming execution.".to_string());
+                                let _ = runtime_tx_events.send(RuntimeMsg::OutputPersist(line)).await;
+                            }
+                            UiEvent::ReplanningFailed { message, error } => {
+                                let mut line = format!(
+                                    "Recovery planning failed: {}",
+                                    message.unwrap_or_else(|| "unknown error".to_string())
+                                );
+                                if let Some(error) = error {
+                                    if !error.trim().is_empty() {
+                                        line.push_str(" | ");
+                                        line.push_str(error.trim());
+                                    }
+                                }
+                                let _ = runtime_tx_events.send(RuntimeMsg::OutputPersist(line)).await;
+                            }
+                            UiEvent::AssistantOutput { message } => {
+                                let normalized = message.trim().to_string();
+                                if normalized.is_empty() {
+                                    continue;
+                                }
+                                debug!(
+                                    len = normalized.len(),
+                                    pending_execution_end = pending_execution_end,
+                                    stream_active = stream_active,
+                                    "tui event: assistant_output"
+                                );
+                                let streamed_trimmed = streamed_assistant.trim().to_string();
+                                if (!streamed_trimmed.is_empty()
+                                    && streamed_trimmed == normalized)
+                                    || last_streamed_assistant.as_deref() == Some(normalized.as_str())
+                                    || stream_active
+                                {
+                                    // Stream already rendered this answer live.
+                                    stream_active = false;
+                                    streamed_assistant.clear();
+                                    assistant_rendered = true;
+                                    continue;
+                                }
+                                if last_assistant_fingerprint.as_deref() != Some(normalized.as_str())
+                                {
+                                    last_assistant_fingerprint = Some(normalized.clone());
+                                    assistant_rendered = true;
+                                    let _ = runtime_tx_events
+                                        .send(RuntimeMsg::OutputPersist(normalized))
+                                        .await;
+                                }
+                                if pending_execution_end {
+                                    debug!("tui action: execution_end after assistant_output");
+                                    pending_execution_end = false;
+                                    let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
+                                    assistant_rendered = false;
+                                    last_preview = None;
+                                    last_assistant_fingerprint = None;
+                                    last_streamed_assistant = None;
+                                    streamed_assistant.clear();
+                                    stream_active = false;
+                                }
+                            }
+                            UiEvent::AssistantStreamDelta { delta, done } => {
+                                debug!(
+                                    delta_len = delta.len(),
+                                    done = done,
+                                    pending_execution_end = pending_execution_end,
+                                    "tui event: assistant_stream_delta"
+                                );
+                                if !delta.is_empty() {
+                                    stream_active = true;
+                                    streamed_assistant.push_str(&delta);
+                                    assistant_rendered = true;
+                                    let _ = runtime_tx_events
+                                        .send(RuntimeMsg::AssistantDelta {
+                                            chunk: delta,
+                                            done: false,
+                                        })
+                                        .await;
+                                }
+                                if done {
+                                    stream_active = false;
+                                    let streamed_final = streamed_assistant.trim().to_string();
+                                    if !streamed_final.is_empty() {
+                                        let _ = runtime_tx_events
+                                            .send(RuntimeMsg::OutputPersist(streamed_final.clone()))
+                                            .await;
+                                        last_streamed_assistant = Some(streamed_final);
+                                    }
+                                    let _ = runtime_tx_events
+                                        .send(RuntimeMsg::AssistantDelta {
+                                            chunk: String::new(),
+                                            done: true,
+                                        })
+                                        .await;
+                                    if pending_execution_end && !streamed_assistant.trim().is_empty() {
+                                        debug!("tui action: execution_end after assistant_stream done");
+                                        pending_execution_end = false;
+                                        let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
+                                        assistant_rendered = false;
+                                        last_preview = None;
+                                        last_assistant_fingerprint = None;
+                                        last_streamed_assistant = None;
+                                    }
+                                    streamed_assistant.clear();
+                                }
+                            }
                             UiEvent::TurnRejected { reason } => {
-                                let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
                                 let _ = runtime_tx_events
                                     .send(RuntimeMsg::OutputPersist(format!(
                                         "Waiting: {}",
                                         reason.unwrap_or_else(|| "turn rejected".to_string())
                                     )))
                                     .await;
+                                pending_execution_end = false;
+                                let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
                             }
                         }
                     }
                 }
             }
+
+            if pending_execution_end {
+                debug!(
+                    assistant_rendered = assistant_rendered,
+                    "tui action: execution_end at forwarder shutdown"
+                );
+                if !assistant_rendered {
+                    if let Some(preview) = last_preview {
+                        let _ = runtime_tx_events
+                            .send(RuntimeMsg::OutputPersist(preview))
+                            .await;
+                    }
+                }
+                let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
+            }
         });
 
-        let request = Event::user_input(&self.thread_id, "tui", build_user_input_payload(&input));
-        let result = self.app.orchestrator.handle_event(request).await;
+        let result = self
+            .channel
+            .submit_input(&self.session_key, Some("tui".to_string()), input.clone())
+            .await
+            .map(|_| ());
         // Give projected runtime events a short drain window before stopping forwarder.
         sleep(Duration::from_millis(120)).await;
         let _ = stop_tx.send(true);
@@ -314,11 +501,19 @@ impl RuntimeClient {
     }
 
     pub async fn interrupt(&self, runtime_tx: mpsc::Sender<RuntimeMsg>) {
-        self.app
-            .orchestrator
-            .thread_runtime
-            .cancel_all_active()
-            .await;
+        let app = match self.api.runtime_app_for_thread(&self.thread_id).await {
+            Ok(app) => app,
+            Err(err) => {
+                let _ = runtime_tx
+                    .send(RuntimeMsg::Error(format!(
+                        "interrupt failed to resolve runtime app: {}",
+                        err
+                    )))
+                    .await;
+                return;
+            }
+        };
+        app.orchestrator.thread_runtime.cancel_all_active().await;
         let _ = runtime_tx
             .send(RuntimeMsg::OutputTransient {
                 slot: TransientSlot::Status,
@@ -331,26 +526,8 @@ impl RuntimeClient {
 fn classify_activity_kind(action: &str) -> ActivityKind {
     match action {
         "file_write" | "edit" | "patch" | "write" => ActivityKind::Edited,
-        "http" | "search" | "read_file" | "list_files" | "find" | "grep" => {
-            ActivityKind::Explored
-        }
+        "http" | "search" | "read_file" | "list_files" | "find" | "grep" => ActivityKind::Explored,
         _ => ActivityKind::Ran,
-    }
-}
-
-fn build_user_input_payload(input: &str) -> serde_json::Value {
-    let message = input.trim().to_string();
-    let decision = match message.to_ascii_lowercase().as_str() {
-        "/approve" => Some("approve"),
-        "/deny" => Some("deny"),
-        _ => None,
-    };
-    match decision {
-        Some(decision) => json!({
-            "message": message,
-            "approval": { "decision": decision }
-        }),
-        None => json!({ "message": message }),
     }
 }
 
@@ -359,7 +536,7 @@ fn preview_to_activity_lines(preview: &str) -> Vec<String> {
     let lines: Vec<&str> = preview.lines().collect();
     let max_lines = 8usize;
     if lines.is_empty() {
-        out.push("output: (empty)".to_string());
+        out.push("(empty)".to_string());
         return out;
     }
 
@@ -372,13 +549,13 @@ fn preview_to_activity_lines(preview: &str) -> Vec<String> {
         if trimmed.chars().count() > 180 {
             snippet.push_str("...");
         }
-        out.push(format!("output: {}", snippet));
+        out.push(snippet);
     }
     if lines.len() > max_lines {
-        out.push(format!("output: ... +{} lines", lines.len() - max_lines));
+        out.push(format!("... +{} lines", lines.len() - max_lines));
     }
     if out.is_empty() {
-        out.push("output: (empty)".to_string());
+        out.push("(empty)".to_string());
     }
     out
 }

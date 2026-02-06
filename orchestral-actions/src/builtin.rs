@@ -213,6 +213,34 @@ fn expression_command_tokens(input: &str) -> HashSet<String> {
         .collect()
 }
 
+fn expression_command_names(input: &str) -> HashSet<String> {
+    input
+        .split(|c: char| matches!(c, '|' | '&' | ';' | '\n'))
+        .filter_map(first_command_name_from_segment)
+        .collect()
+}
+
+fn first_command_name_from_segment(segment: &str) -> Option<String> {
+    for raw in segment.split_whitespace() {
+        let token =
+            raw.trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '-' && c != '.');
+        if token.is_empty() {
+            continue;
+        }
+        // Skip environment assignments like FOO=bar CMD ...
+        if token.contains('=')
+            && !token.starts_with('=')
+            && token
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '=')
+        {
+            continue;
+        }
+        return Some(normalize_command_name(token));
+    }
+    None
+}
+
 fn requires_destructive_approval(
     use_shell: bool,
     command_name: &str,
@@ -220,16 +248,7 @@ fn requires_destructive_approval(
     args: &[String],
 ) -> bool {
     let destructive = [
-        "rm",
-        "rmdir",
-        "mv",
-        "chmod",
-        "chown",
-        "truncate",
-        "dd",
-        "mkfs",
-        "fdisk",
-        "git",
+        "rm", "rmdir", "mv", "chmod", "chown", "truncate", "dd", "mkfs", "fdisk", "git",
     ];
 
     if use_shell {
@@ -258,21 +277,22 @@ enum ApprovalDecision {
 fn parse_approval_decision(message: &str) -> Option<ApprovalDecision> {
     let normalized = message.trim().to_ascii_lowercase();
     let approve_tokens = [
-        "/approve",
-        "approve",
-        "approved",
-        "yes",
-        "y",
-        "ok",
-        "同意",
-        "确认",
-        "批准",
+        "/approve", "approve", "approved", "yes", "y", "ok", "同意", "确认", "批准",
     ];
     if approve_tokens.contains(&normalized.as_str()) {
         return Some(ApprovalDecision::Approve);
     }
 
-    let deny_tokens = ["/deny", "deny", "denied", "no", "n", "拒绝", "不同意", "取消"];
+    let deny_tokens = [
+        "/deny",
+        "deny",
+        "denied",
+        "no",
+        "n",
+        "拒绝",
+        "不同意",
+        "取消",
+    ];
     if deny_tokens.contains(&normalized.as_str()) {
         return Some(ApprovalDecision::Deny);
     }
@@ -834,8 +854,7 @@ impl Action for ShellAction {
             None => return ActionResult::error("Missing command for shell action"),
         };
         let args = params_get_array(params, "args");
-        let mut use_shell =
-            params_get_bool(params, "shell").unwrap_or(self.allow_shell_expression);
+        let mut use_shell = params_get_bool(params, "shell").unwrap_or(self.allow_shell_expression);
         let approved = params_get_bool(params, "approved").unwrap_or(false);
         let looks_like_expression =
             contains_shell_metacharacters(&command) || command.contains(' ');
@@ -899,7 +918,18 @@ impl Action for ShellAction {
             }
         }
         if let Some(allowed) = &self.allowed_commands {
-            if !allowed.contains(&command_name) {
+            if use_shell {
+                let mut names = expression_command_names(&command);
+                if names.is_empty() {
+                    names.insert(command_name.clone());
+                }
+                if let Some(disallowed) = names.iter().find(|name| !allowed.contains(*name)) {
+                    return ActionResult::error(format!(
+                        "Shell expression command '{}' is not in allowed_commands policy",
+                        disallowed
+                    ));
+                }
+            } else if !allowed.contains(&command_name) {
                 return ActionResult::error(format!(
                     "Command '{}' is not in allowed_commands policy",
                     command_name
@@ -915,8 +945,16 @@ impl Action for ShellAction {
                         return ActionResult::error("Destructive command denied by user");
                     }
                 } else {
-                    return ActionResult::need_clarification(
-                        "This command is destructive and requires approval. Reply with /approve to continue or /deny to cancel.",
+                    let approval_command = if use_shell {
+                        command.clone()
+                    } else if args_for_check.is_empty() {
+                        command.clone()
+                    } else {
+                        format!("{} {}", command, args_for_check.join(" "))
+                    };
+                    return ActionResult::need_approval(
+                        "This command is destructive and requires approval.",
+                        Some(approval_command),
                     );
                 }
             }
@@ -1529,6 +1567,35 @@ mod tests {
             match result {
                 ActionResult::Error { message } => {
                     assert!(message.contains("contains blocked command"));
+                }
+                other => panic!("expected error, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn test_shell_blocks_expression_when_contains_disallowed_command() {
+        tokio_test::block_on(async {
+            let spec = ActionSpec {
+                name: "shell".to_string(),
+                kind: "shell".to_string(),
+                description: None,
+                config: json!({
+                    "allow_shell_expression": true,
+                    "allowed_commands": ["echo"]
+                }),
+                interface: None,
+            };
+            let action = ShellAction::from_spec(&spec);
+            let input = ActionInput::with_params(json!({
+                "command": "echo ok && rm demo.txt",
+                "shell": true
+            }));
+            let result = action.run(input, test_ctx()).await;
+            match result {
+                ActionResult::Error { message } => {
+                    assert!(message.contains("allowed_commands"));
+                    assert!(message.contains("rm"));
                 }
                 other => panic!("expected error, got {:?}", other),
             }

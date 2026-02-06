@@ -162,6 +162,7 @@ Orchestral 使用 stdin/stdout 传递 JSON：
 ## 日志与排障（Logging）
 
 - 进程日志基于 `tracing`，启动时会读取配置中的 `observability.log_level`（如 `info/debug/trace`）。
+- 可配置写入文件：`observability.log_file`，或通过环境变量 `ORCHESTRAL_LOG_FILE` 覆盖。
 - 可用环境变量 `RUST_LOG` 覆盖配置（例如 `RUST_LOG=orchestral_runtime=debug,orchestral_core=debug`）。
 - 运行 CLI 时建议：
 
@@ -169,7 +170,14 @@ Orchestral 使用 stdin/stdout 传递 JSON：
 RUST_LOG=debug cargo run -p orchestral-cli -- run "你好"
 ```
 
+```bash
+ORCHESTRAL_LOG_FILE=logs/orchestral-runtime.log cargo run -p orchestral-cli -- run "你好"
+```
+
 - 执行链路进度会作为 `system_trace` 事件写入 EventStore，`category=execution_progress` 可用于历史回放与实时展示。
+- 每轮执行结束会额外产出 `AssistantOutput` 事件（由 Result Interpreter 生成），用于给用户展示智能化结果摘要。
+- 当一次执行在某个 step 失败时，Runtime 会触发一次自动重规划（仅替换失败子图），默认不会从已完成步骤重跑。
+- `interpreter.mode` 支持 `auto/llm/noop`：`auto` 会在 `planner.mode=llm` 时启用 `LlmResultInterpreter`，否则回退规则解释。
 
 ---
 

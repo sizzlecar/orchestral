@@ -12,6 +12,7 @@
 mod bootstrap;
 mod concurrency;
 mod interaction;
+mod interpreter;
 mod orchestrator;
 mod thread;
 mod thread_runtime;

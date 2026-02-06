@@ -19,6 +19,17 @@ use crate::action::ActionMeta;
 use crate::store::ReferenceStore;
 use crate::types::{Intent, Plan};
 
+/// Planner output - decides whether runtime should execute workflow or respond directly.
+#[derive(Debug, Clone)]
+pub enum PlannerOutput {
+    /// Execute a workflow plan via normalizer + executor.
+    Workflow(Plan),
+    /// Reply directly without executing any workflow.
+    DirectResponse(String),
+    /// Ask user for clarification and wait for next input.
+    Clarification(String),
+}
+
 /// Planner errors
 #[derive(Debug, Error)]
 pub enum PlanError {
@@ -43,8 +54,12 @@ pub enum PlanError {
 /// Implementations can use different LLM backends or planning strategies.
 #[async_trait]
 pub trait Planner: Send + Sync {
-    /// Generate a plan from user intent
-    async fn plan(&self, intent: &Intent, context: &PlannerContext) -> Result<Plan, PlanError>;
+    /// Generate output from user intent
+    async fn plan(
+        &self,
+        intent: &Intent,
+        context: &PlannerContext,
+    ) -> Result<PlannerOutput, PlanError>;
 }
 
 /// Context provided to the planner

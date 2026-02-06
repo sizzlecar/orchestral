@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, info};
 
-use orchestral_core::planner::{PlanError, Planner, PlannerContext};
-use orchestral_core::types::{Intent, Plan};
+use orchestral_core::planner::{HistoryItem, PlanError, Planner, PlannerContext, PlannerOutput};
+use orchestral_core::types::{Intent, Plan, Step};
 
 const MAX_PROMPT_LOG_CHARS: usize = 4_000;
 const MAX_LLM_OUTPUT_LOG_CHARS: usize = 8_000;
@@ -22,16 +22,40 @@ pub struct LlmRequest {
     pub temperature: f32,
 }
 
+pub type StreamChunkCallback = Arc<dyn Fn(String) + Send + Sync>;
+
 /// LLM client trait
 #[async_trait]
 pub trait LlmClient: Send + Sync {
     async fn complete(&self, request: LlmRequest) -> Result<String, LlmError>;
+
+    async fn complete_stream(
+        &self,
+        request: LlmRequest,
+        on_chunk: StreamChunkCallback,
+    ) -> Result<String, LlmError> {
+        let full = self.complete(request).await?;
+        for token in full.split_inclusive(char::is_whitespace) {
+            if !token.is_empty() {
+                on_chunk(token.to_string());
+            }
+        }
+        Ok(full)
+    }
 }
 
 #[async_trait]
 impl LlmClient for Arc<dyn LlmClient> {
     async fn complete(&self, request: LlmRequest) -> Result<String, LlmError> {
         (**self).complete(request).await
+    }
+
+    async fn complete_stream(
+        &self,
+        request: LlmRequest,
+        on_chunk: StreamChunkCallback,
+    ) -> Result<String, LlmError> {
+        (**self).complete_stream(request, on_chunk).await
     }
 }
 
@@ -85,24 +109,22 @@ impl<C: LlmClient> LlmPlanner<C> {
 
         if !context.history.is_empty() {
             user.push_str("History:\n");
-            for item in context
-                .history
-                .iter()
-                .rev()
-                .take(self.config.max_history)
-                .rev()
-            {
+            for item in select_history_for_prompt(&context.history, self.config.max_history) {
                 user.push_str(&format!("- {}: {}\n", item.role, item.content));
             }
             user.push('\n');
         }
 
-        user.push_str("Return a JSON object with shape:\n");
+        user.push_str("Return ONE JSON object in one of these shapes:\n");
         user.push_str(
-            r#"{"goal":"...","steps":[{"id":"s1","action":"action_name","params":{},"io_bindings":[{"from":"s1.output_key","to":"input_key","required":true}]}],"confidence":0.0}"#,
+            r#"{"type":"WORKFLOW","goal":"...","steps":[{"id":"s1","action":"action_name","params":{},"io_bindings":[{"from":"s1.output_key","to":"input_key","required":true}]}],"confidence":0.0}"#,
         );
+        user.push_str("\n");
+        user.push_str(r#"{"type":"DIRECT_RESPONSE","message":"..."}"#);
+        user.push_str("\n");
+        user.push_str(r#"{"type":"CLARIFICATION","question":"..."}"#);
         user.push_str(
-            "\nUse only action names listed in the system prompt Action Catalog. Return JSON only.\n",
+            "\nUse only action names listed in Action Catalog when type is WORKFLOW. Return JSON only.\n",
         );
         user.push('\n');
 
@@ -110,8 +132,42 @@ impl<C: LlmClient> LlmPlanner<C> {
     }
 }
 
+fn select_history_for_prompt<'a>(
+    history: &'a [HistoryItem],
+    max_history: usize,
+) -> Vec<&'a HistoryItem> {
+    if max_history == 0 {
+        return Vec::new();
+    }
+
+    let dialog: Vec<&HistoryItem> = history
+        .iter()
+        .filter(|h| h.role == "user" || h.role == "assistant")
+        .collect();
+
+    if dialog.len() <= max_history {
+        return dialog;
+    }
+
+    let head_keep = if max_history >= 8 { 2 } else { 1 };
+    let tail_keep = max_history.saturating_sub(head_keep);
+    let split = dialog.len().saturating_sub(tail_keep);
+
+    let mut selected = Vec::with_capacity(max_history);
+    selected.extend(dialog.iter().take(head_keep).copied());
+    selected.extend(dialog.iter().skip(split).copied());
+    selected
+}
+
 fn build_system_prompt(base: &str, context: &PlannerContext) -> String {
     let mut system = String::new();
+    system.push_str(
+        "You are Orchestral Planner, the planning component of the Orchestral runtime.\n",
+    );
+    system.push_str(
+        "Project context:\n- Workspace: Rust multi-crate project.\n- Core crates: orchestral-core, orchestral-runtime, orchestral-actions, orchestral-stores, orchestral-planners, orchestral-cli.\n- Execution model: Intent -> Plan -> Normalize -> Execute.\n",
+    );
+    system.push('\n');
     system.push_str(base.trim());
     if !context.runtime_info.os.is_empty() {
         system.push_str("\n\nExecution Environment:\n");
@@ -124,29 +180,33 @@ fn build_system_prompt(base: &str, context: &PlannerContext) -> String {
         }
     }
     system.push_str("\n\nPlanning Rules:\n");
-    system.push_str("1) Return ONLY one valid JSON object matching the required Plan schema.\n");
-    system.push_str("2) step.id must be unique and stable.\n");
-    system.push_str("3) step.params must satisfy the selected action input_schema.\n");
-    system.push_str(
-        "4) Prefer minimal steps: output action + params + io_bindings; omit optional fields unless needed.\n",
-    );
-    system.push_str("5) If a step consumes upstream output, declare io_bindings.\n");
-    system.push_str("6) Do not invent action names not listed in Action Catalog.\n");
+    system.push_str("1) Return ONLY one valid JSON object matching one allowed output shape.\n");
+    system.push_str("2) If no tool/action execution is needed, return DIRECT_RESPONSE.\n");
     system
-        .push_str("7) If requirements are unclear, prefer wait_user step to ask clarification.\n");
+        .push_str("3) If information is missing, return CLARIFICATION with a concrete question.\n");
+    system.push_str("4) Only return WORKFLOW when execution is required.\n");
+    system.push_str("5) For WORKFLOW: step.id must be unique and stable.\n");
+    system.push_str("6) For WORKFLOW: step.params must satisfy selected action input_schema.\n");
+    system.push_str("7) For WORKFLOW: prefer minimal steps; omit optional fields unless needed.\n");
+    system.push_str("8) For WORKFLOW: if a step consumes upstream output, declare io_bindings.\n");
+    system.push_str("9) Do not invent action names not listed in Action Catalog.\n");
     system.push_str(
-        "8) For wait_user/wait_event/system steps, set kind explicitly; normal action steps can omit kind.\n",
-    );
-    system
-        .push_str("9) When generating step.params, strictly follow Action Catalog input fields.\n");
-    system.push_str(
-        "10) Any shell/file operation must be compatible with the current host platform and shell.\n",
-    );
-    system.push_str(
-        "11) Only use `echo` when the user explicitly asks to echo/repeat text; otherwise avoid `echo` in plans.\n",
+        "10) If clarifying via WORKFLOW, use wait_user; otherwise return CLARIFICATION.\n",
     );
     system.push_str(
-        "12) For requests about HTTP response headers, use `http` with method `HEAD` and return headers directly.\n",
+        "11) For wait_user/wait_event/system steps, set kind explicitly; normal action steps can omit kind.\n",
+    );
+    system.push_str(
+        "12) When generating step.params, strictly follow Action Catalog input fields.\n",
+    );
+    system.push_str(
+        "13) Any shell/file operation must be compatible with current host platform and shell.\n",
+    );
+    system.push_str(
+        "14) Only use `echo` when user explicitly asks to echo/repeat text; otherwise avoid `echo`.\n",
+    );
+    system.push_str(
+        "15) For HTTP headers requests, use `http` method `HEAD` and return headers directly.\n",
     );
     system.push_str("\nAction Catalog:\n");
     for action in &context.available_actions {
@@ -293,7 +353,11 @@ fn truncate_for_log(input: &str, max_chars: usize) -> String {
 
 #[async_trait]
 impl<C: LlmClient> Planner for LlmPlanner<C> {
-    async fn plan(&self, intent: &Intent, context: &PlannerContext) -> Result<Plan, PlanError> {
+    async fn plan(
+        &self,
+        intent: &Intent,
+        context: &PlannerContext,
+    ) -> Result<PlannerOutput, PlanError> {
         let (system, user) = self.build_prompt(intent, context);
         info!(
             model = %self.config.model,
@@ -339,21 +403,76 @@ impl<C: LlmClient> Planner for LlmPlanner<C> {
             );
         }
 
-        let plan = serde_json::from_str::<Plan>(&json_str)
-            .map_err(|e| PlanError::Generation(format!("Invalid plan JSON: {}", e)))?;
-        info!(
-            step_count = plan.steps.len(),
-            confidence = plan.confidence.unwrap_or_default(),
-            "planner parsed plan"
-        );
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            debug!(
-                goal = %truncate_for_log(&plan.goal, MAX_PROMPT_LOG_CHARS),
-                plan = %truncate_for_log(&format!("{:?}", plan.steps), MAX_LLM_OUTPUT_LOG_CHARS),
-                "planner plan detail"
-            );
+        let output = parse_planner_output(&json_str)?;
+        match &output {
+            PlannerOutput::Workflow(plan) => {
+                info!(
+                    output_type = "workflow",
+                    step_count = plan.steps.len(),
+                    confidence = plan.confidence.unwrap_or_default(),
+                    "planner parsed output"
+                );
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    debug!(
+                        goal = %truncate_for_log(&plan.goal, MAX_PROMPT_LOG_CHARS),
+                        plan = %truncate_for_log(&format!("{:?}", plan.steps), MAX_LLM_OUTPUT_LOG_CHARS),
+                        "planner workflow detail"
+                    );
+                }
+            }
+            PlannerOutput::DirectResponse(message) => {
+                info!(
+                    output_type = "direct_response",
+                    message = %truncate_for_log(message, MAX_PROMPT_LOG_CHARS),
+                    "planner parsed output"
+                );
+            }
+            PlannerOutput::Clarification(question) => {
+                info!(
+                    output_type = "clarification",
+                    question = %truncate_for_log(question, MAX_PROMPT_LOG_CHARS),
+                    "planner parsed output"
+                );
+            }
         }
-        Ok(plan)
+        Ok(output)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+enum PlannerJsonOutput {
+    Workflow {
+        goal: String,
+        #[serde(default)]
+        steps: Vec<Step>,
+        #[serde(default)]
+        confidence: Option<f32>,
+    },
+    DirectResponse {
+        message: String,
+    },
+    Clarification {
+        question: String,
+    },
+}
+
+fn parse_planner_output(json: &str) -> Result<PlannerOutput, PlanError> {
+    let parsed = serde_json::from_str::<PlannerJsonOutput>(json)
+        .map_err(|e| PlanError::Generation(format!("Invalid planner output JSON: {}", e)))?;
+
+    match parsed {
+        PlannerJsonOutput::Workflow {
+            goal,
+            steps,
+            confidence,
+        } => {
+            let mut plan = Plan::new(goal, steps);
+            plan.confidence = confidence.map(|c| c.clamp(0.0, 1.0));
+            Ok(PlannerOutput::Workflow(plan))
+        }
+        PlannerJsonOutput::DirectResponse { message } => Ok(PlannerOutput::DirectResponse(message)),
+        PlannerJsonOutput::Clarification { question } => Ok(PlannerOutput::Clarification(question)),
     }
 }
 
@@ -498,12 +617,57 @@ impl LlmClient for HttpLlmClient {
 }
 
 fn extract_json(text: &str) -> Option<String> {
-    let start = text.find('{')?;
-    let end = text.rfind('}')?;
-    if end <= start {
-        return None;
+    for (start, ch) in text.char_indices() {
+        if ch != '{' {
+            continue;
+        }
+        if let Some(end) = find_json_object_end(text, start) {
+            let candidate = &text[start..=end];
+            if serde_json::from_str::<serde_json::Value>(candidate)
+                .map(|v| v.is_object())
+                .unwrap_or(false)
+            {
+                return Some(candidate.to_string());
+            }
+        }
     }
-    Some(text[start..=end].to_string())
+    None
+}
+
+fn find_json_object_end(text: &str, start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (idx, ch) in text[start..].char_indices() {
+        let abs = start + idx;
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    return Some(abs);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -580,6 +744,8 @@ mod tests {
         let (system, _user) = planner.build_prompt(&intent, &context);
 
         assert!(system.contains("Action Catalog"));
+        assert!(system.contains("Orchestral Planner"));
+        assert!(system.contains("Intent -> Plan -> Normalize -> Execute"));
         assert!(system.contains("write_doc"));
         assert!(system.contains("input_fields"));
         assert!(system.contains("path (string, required)"));
@@ -587,5 +753,65 @@ mod tests {
         assert!(system.contains("example=\"guide.md\""));
         assert!(system.contains("input_schema"));
         assert!(system.contains("output_schema"));
+    }
+
+    #[test]
+    fn test_parse_workflow_output() {
+        let raw = r#"{
+            "type":"WORKFLOW",
+            "goal":"echo",
+            "steps":[{"id":"s1","action":"echo","params":{"message":"hi"}}],
+            "confidence": 1.2
+        }"#;
+        let parsed = parse_planner_output(raw).expect("parse workflow");
+        match parsed {
+            PlannerOutput::Workflow(plan) => {
+                assert_eq!(plan.goal, "echo");
+                assert_eq!(plan.steps.len(), 1);
+                assert_eq!(plan.confidence, Some(1.0));
+            }
+            _ => panic!("expected workflow output"),
+        }
+    }
+
+    #[test]
+    fn test_parse_direct_response_output() {
+        let raw = r#"{"type":"DIRECT_RESPONSE","message":"你好"}"#;
+        let parsed = parse_planner_output(raw).expect("parse direct response");
+        match parsed {
+            PlannerOutput::DirectResponse(message) => {
+                assert_eq!(message, "你好");
+            }
+            _ => panic!("expected direct_response output"),
+        }
+    }
+
+    #[test]
+    fn test_parse_clarification_output() {
+        let raw = r#"{"type":"CLARIFICATION","question":"请提供文件路径"}"#;
+        let parsed = parse_planner_output(raw).expect("parse clarification");
+        match parsed {
+            PlannerOutput::Clarification(question) => {
+                assert_eq!(question, "请提供文件路径");
+            }
+            _ => panic!("expected clarification output"),
+        }
+    }
+
+    #[test]
+    fn test_extract_json_ignores_non_json_braces() {
+        let raw = r#"Preface {not json} -> {"type":"DIRECT_RESPONSE","message":"ok"} trailing"#;
+        let json = extract_json(raw).expect("json");
+        assert_eq!(json, r#"{"type":"DIRECT_RESPONSE","message":"ok"}"#);
+    }
+
+    #[test]
+    fn test_extract_json_handles_braces_inside_strings() {
+        let raw = r#"noise {"type":"DIRECT_RESPONSE","message":"value with } brace"} end"#;
+        let json = extract_json(raw).expect("json");
+        assert_eq!(
+            json,
+            r#"{"type":"DIRECT_RESPONSE","message":"value with } brace"}"#
+        );
     }
 }

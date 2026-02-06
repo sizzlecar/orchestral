@@ -32,6 +32,8 @@ pub struct OrchestralConfig {
     #[serde(default)]
     pub planner: PlannerConfig,
     #[serde(default)]
+    pub interpreter: InterpreterConfig,
+    #[serde(default)]
     pub context: ContextConfig,
     #[serde(default)]
     pub stores: StoresConfig,
@@ -54,6 +56,7 @@ impl Default for OrchestralConfig {
             app: AppConfig::default(),
             runtime: RuntimeConfig::default(),
             planner: PlannerConfig::default(),
+            interpreter: InterpreterConfig::default(),
             context: ContextConfig::default(),
             stores: StoresConfig::default(),
             observability: ObservabilityConfig::default(),
@@ -189,6 +192,44 @@ fn default_dynamic_model_selection() -> bool {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct InterpreterConfig {
+    #[serde(default = "default_interpreter_mode")]
+    pub mode: String,
+    /// Backend name for interpreter LLM calls.
+    #[serde(default)]
+    pub backend: Option<String>,
+    /// Optional model profile name.
+    #[serde(default)]
+    pub model_profile: Option<String>,
+    /// Optional direct model override.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Optional direct temperature override.
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// Optional system prompt override.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+}
+
+impl Default for InterpreterConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_interpreter_mode(),
+            backend: None,
+            model_profile: None,
+            model: None,
+            temperature: None,
+            system_prompt: None,
+        }
+    }
+}
+
+fn default_interpreter_mode() -> String {
+    "auto".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct ContextConfig {
     #[serde(default = "default_history_limit")]
     pub history_limit: usize,
@@ -270,6 +311,8 @@ pub struct ObservabilityConfig {
     pub log_level: String,
     #[serde(default)]
     pub traces_enabled: bool,
+    #[serde(default)]
+    pub log_file: Option<String>,
 }
 
 impl Default for ObservabilityConfig {
@@ -277,6 +320,7 @@ impl Default for ObservabilityConfig {
         Self {
             log_level: default_log_level(),
             traces_enabled: false,
+            log_file: None,
         }
     }
 }

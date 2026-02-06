@@ -30,9 +30,7 @@ pub enum ActionResult {
     },
 
     /// Need explicit user approval before continuing
-    NeedApproval {
-        request: ApprovalRequest,
-    },
+    NeedApproval { request: ApprovalRequest },
 
     /// Retryable error (rate limit / timeout / external service flakiness)
     RetryableError {
@@ -127,7 +125,10 @@ impl ActionResult {
 
     /// Check if the result needs user input
     pub fn needs_user_input(&self) -> bool {
-        matches!(self, Self::NeedClarification { .. } | Self::NeedApproval { .. })
+        matches!(
+            self,
+            Self::NeedClarification { .. } | Self::NeedApproval { .. }
+        )
     }
 }
 

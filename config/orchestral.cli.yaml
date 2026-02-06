@@ -19,6 +19,12 @@ planner:
   max_history: 20
   dynamic_model_selection: true
 
+interpreter:
+  mode: llm
+  backend: google
+  model_profile: gemini-2.5-flash
+  temperature: 0.0
+
 context:
   history_limit: 50
   max_tokens: 4096
@@ -38,6 +44,9 @@ stores:
 observability:
   log_level: info
   traces_enabled: false
+  # Runtime logs are persisted by default for easier debugging.
+  # Can be overridden by ORCHESTRAL_LOG_FILE.
+  log_file: "logs/orchestral-runtime.log"
 
 providers:
   default_backend: openai
@@ -53,6 +62,7 @@ providers:
       api_key_env: GEMINI_API_KEY
       config:
         timeout_secs: 60
+        interpreter_timeout_secs: 8
   models:
     - name: fast
       backend: openai
@@ -105,11 +115,13 @@ providers:
           ],
           "confidence": 0.0
         }
-
       policy:
         temperature_min: 0.0
         temperature_max: 1.0
-
+    - name: gemini-2.5-flash
+      backend: google
+      model: gemini-2.5-flash
+      temperature: 0.2
 actions:
   hot_reload: true
   # Optional: external process action (multi-language plugin) example:
@@ -156,6 +168,123 @@ actions:
           required: ["result"]
       config:
         prefix: "Echo: "
+    - name: doc_parse
+      kind: external_process
+      description: "Parse document with markitdown and return structure"
+      interface:
+        input_schema:
+          type: object
+          properties:
+            source_path:
+              type: string
+              description: "Local document path to parse."
+              example: "docs/spec.pdf"
+          required: ["source_path"]
+        output_schema:
+          type: object
+          properties:
+            source_path:
+              type: string
+            markdown:
+              type: string
+            headings:
+              type: array
+              items:
+                type: object
+                properties:
+                  line:
+                    type: integer
+                  level:
+                    type: integer
+                  title:
+                    type: string
+            word_count:
+              type: integer
+            char_count:
+              type: integer
+          required: ["source_path", "markdown", "headings", "word_count", "char_count"]
+      config:
+        command: "/Users/chejinxuan/rust_ws/orchestral/.venv/bin/python"
+        args: ["examples/plugins/markitdown_plugin.py"]
+        entrypoint: "doc_parse"
+        timeout_ms: 180000
+    - name: doc_convert
+      kind: external_process
+      description: "Pandoc document conversion/generation tool. It can: (1) convert source files between formats (docx/pdf/html/md/txt, etc.) using mode=convert + to_format; (2) generate markdown summary/outline/overview from source files using mode=summary|outline|overview; (3) optionally write result to target_path or return inline text when target_path is omitted. Note: markdown/md/gfm outputs are normalized to gfm-raw_html by default to avoid raw HTML blocks and pandoc-specific markdown syntax."
+      interface:
+        input_schema:
+          type: object
+          properties:
+            source_path:
+              type: string
+              description: "Required local source file path. Use existing workspace file paths."
+              example: "docs/spec.docx"
+            mode:
+              type: string
+              description: "Operation mode. convert = direct pandoc conversion; summary/outline/overview = generate markdown artifacts from parsed source content."
+              default: "convert"
+            from_format:
+              type: string
+              description: "Optional pandoc --from format (for ambiguous inputs). Example: docx, markdown, html."
+              example: "docx"
+            to_format:
+              type: string
+              description: "Target format for mode=convert (pandoc --to). Common values: markdown, html, plain, gfm. markdown/md/gfm are normalized to gfm-raw_html unless explicitly overridden."
+              default: "gfm-raw_html"
+              example: "gfm-raw_html"
+            target_path:
+              type: string
+              description: "Optional output file path. If provided, writes file and returns metadata; if omitted in convert mode, returns converted content inline."
+              example: "output/spec.md"
+            summary_sentences:
+              type: integer
+              description: "Used by summary/overview mode to control summary length."
+              default: 5
+            extra_args:
+              type: array
+              description: "Optional extra pandoc CLI args for advanced conversion behavior, e.g. ['--standalone']."
+              items:
+                type: string
+          required: ["source_path"]
+        output_schema:
+          type: object
+          properties:
+            source_path:
+              type: string
+              description: "Original source file path."
+            mode:
+              type: string
+              description: "Executed mode: convert/summary/outline/overview."
+            from_format:
+              type: ["string", "null"]
+              description: "Resolved input format hint."
+            to_format:
+              type: string
+              description: "Output format used by conversion."
+            target_path:
+              type: ["string", "null"]
+              description: "Output file path when writing to disk."
+            wrote_file:
+              type: boolean
+              description: "True if target_path was written."
+            bytes:
+              type: ["integer", "null"]
+              description: "Written file size in bytes when wrote_file=true."
+            content:
+              type: string
+              description: "Inline converted content for mode=convert when not writing to file."
+            generated_markdown:
+              type: string
+              description: "Generated markdown text for mode=summary|outline|overview."
+            pandoc_command:
+              type: string
+              description: "Pandoc command used for execution (for debugging/traceability)."
+          required: ["source_path", "mode", "to_format", "target_path", "wrote_file", "pandoc_command"]
+      config:
+        command: "/Users/chejinxuan/rust_ws/orchestral/.venv/bin/python"
+        args: ["examples/plugins/pandoc_plugin.py"]
+        entrypoint: "doc_convert"
+        timeout_ms: 180000
     - name: http
       kind: http
       description: "Performs an HTTP request"

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Instant;
 
 use crate::runtime::{ActivityKind, TransientSlot};
 
@@ -33,6 +34,10 @@ pub struct App {
     pending_interrupt: bool,
     pub once: bool,
     pub submitted_once: bool,
+    pub turn_started_at: Option<Instant>,
+    pub turn_elapsed_reported: bool,
+    pub approved_command_prefixes: Vec<String>,
+    pub assistant_stream_line: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +72,10 @@ impl App {
             pending_interrupt: false,
             once,
             submitted_once: false,
+            turn_started_at: None,
+            turn_elapsed_reported: false,
+            approved_command_prefixes: Vec::new(),
+            assistant_stream_line: None,
         }
     }
 
@@ -93,5 +102,21 @@ impl App {
         } else {
             false
         }
+    }
+
+    pub fn remember_approved_prefix(&mut self, prefix: String) {
+        if !self
+            .approved_command_prefixes
+            .iter()
+            .any(|saved| saved == &prefix)
+        {
+            self.approved_command_prefixes.push(prefix);
+        }
+    }
+
+    pub fn is_command_auto_approved(&self, command: &str) -> bool {
+        self.approved_command_prefixes
+            .iter()
+            .any(|prefix| command.starts_with(prefix))
     }
 }

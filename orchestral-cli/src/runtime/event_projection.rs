@@ -20,12 +20,29 @@ pub struct StepOutput {
 
 #[derive(Debug, Clone)]
 pub enum UiEvent {
+    AssistantOutput {
+        message: String,
+    },
+    AssistantStreamDelta {
+        delta: String,
+        done: bool,
+    },
     TurnStarted,
     TurnResumed,
     TurnRejected {
         reason: Option<String>,
     },
     TurnQueued,
+    ReplanningStarted {
+        message: Option<String>,
+    },
+    ReplanningCompleted {
+        message: Option<String>,
+    },
+    ReplanningFailed {
+        message: Option<String>,
+        error: Option<String>,
+    },
     PlanningStarted,
     PlanningCompleted {
         step_count: Option<usize>,
@@ -63,15 +80,40 @@ pub enum UiEvent {
 }
 
 pub fn project_event(event: &Event) -> Option<UiEvent> {
-    let Event::SystemTrace { payload, .. } = event else {
-        return None;
-    };
-    let category = payload.get("category")?.as_str()?;
-    match category {
-        "runtime_lifecycle" => project_lifecycle_event(payload),
-        "execution_progress" => project_execution_progress(payload),
+    match event {
+        Event::AssistantOutput { payload, .. } => payload
+            .get("message")
+            .and_then(|v| v.as_str())
+            .map(|message| UiEvent::AssistantOutput {
+                message: message.to_string(),
+            }),
+        Event::SystemTrace { payload, .. } => {
+            let category = payload.get("category")?.as_str()?;
+            match category {
+                "runtime_lifecycle" => project_lifecycle_event(payload),
+                "execution_progress" => project_execution_progress(payload),
+                "assistant_stream" => project_assistant_stream(payload),
+                _ => None,
+            }
+        }
         _ => None,
     }
+}
+
+fn project_assistant_stream(payload: &Value) -> Option<UiEvent> {
+    let done = payload
+        .get("done")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let delta = payload
+        .get("delta")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if delta.is_empty() && !done {
+        return None;
+    }
+    Some(UiEvent::AssistantStreamDelta { delta, done })
 }
 
 fn project_lifecycle_event(payload: &Value) -> Option<UiEvent> {
@@ -87,6 +129,28 @@ fn project_lifecycle_event(payload: &Value) -> Option<UiEvent> {
                 .map(str::to_string),
         }),
         "turn_queued" => Some(UiEvent::TurnQueued),
+        "replanning_started" => Some(UiEvent::ReplanningStarted {
+            message: payload
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        }),
+        "replanning_completed" => Some(UiEvent::ReplanningCompleted {
+            message: payload
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        }),
+        "replanning_failed" => Some(UiEvent::ReplanningFailed {
+            message: payload
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            error: metadata
+                .and_then(|m| m.get("error"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        }),
         "planning_started" => Some(UiEvent::PlanningStarted),
         "planning_completed" => {
             let step_count = metadata

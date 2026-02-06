@@ -166,7 +166,8 @@ impl ExecutionDag {
             .nodes
             .iter()
             .filter(|(_, node)| {
-                node.state == NodeState::Pending && node.dependencies_satisfied(&self.nodes)
+                matches!(node.state, NodeState::Pending | NodeState::Ready)
+                    && node.dependencies_satisfied(&self.nodes)
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -174,7 +175,9 @@ impl ExecutionDag {
         // Mark ready nodes
         for id in &self.ready_nodes {
             if let Some(node) = self.nodes.get_mut(id) {
-                node.state = NodeState::Ready;
+                if node.state == NodeState::Pending {
+                    node.state = NodeState::Ready;
+                }
             }
         }
     }
@@ -346,7 +349,7 @@ impl ExecutorContext {
 }
 
 /// Execution result
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ExecutionResult {
     /// All steps completed successfully
     Completed,
@@ -964,7 +967,7 @@ fn build_step_completion_metadata(
         ),
     );
 
-    if let Some(path) = exports.get("path").and_then(|v| v.as_str()) {
+    if let Some(path) = completion_path_from_exports(exports) {
         metadata.insert(
             "path".to_string(),
             serde_json::Value::String(truncate_for_log(path, 240)),
@@ -994,6 +997,27 @@ fn build_step_completion_metadata(
     }
 
     serde_json::Value::Object(metadata)
+}
+
+fn completion_path_from_exports(exports: &HashMap<String, serde_json::Value>) -> Option<&str> {
+    const CANDIDATE_KEYS: [&str; 7] = [
+        "path",
+        "target_path",
+        "output_path",
+        "file_path",
+        "destination_path",
+        "dest_path",
+        "target",
+    ];
+    for key in CANDIDATE_KEYS {
+        if let Some(path) = exports.get(key).and_then(|v| v.as_str()) {
+            let trimmed = path.trim();
+            if !trimmed.is_empty() {
+                return Some(path);
+            }
+        }
+    }
+    None
 }
 
 fn build_step_start_metadata(action: &str, params: &serde_json::Value) -> serde_json::Value {
@@ -1598,6 +1622,45 @@ mod tests {
             assert!(phases.iter().any(|p| p == "step_started"));
             assert!(phases.iter().any(|p| p == "step_completed"));
             assert!(phases.iter().any(|p| p == "task_completed"));
+        });
+    }
+
+    #[test]
+    fn test_step_completion_metadata_uses_target_path_when_present() {
+        let mut exports = HashMap::new();
+        exports.insert("target_path".to_string(), json!("output/统计人数.md"));
+        let metadata = build_step_completion_metadata("doc_transform", &exports);
+        assert_eq!(
+            metadata.get("path").and_then(|v| v.as_str()),
+            Some("output/统计人数.md")
+        );
+    }
+
+    #[test]
+    fn test_execute_with_max_parallel_one_keeps_remaining_ready_nodes() {
+        tokio_test::block_on(async {
+            let mut registry = ActionRegistry::new();
+            registry.register(Arc::new(StaticAction::new("noop", ActionResult::success())));
+            let executor = Executor::new(registry).with_max_parallel(1);
+
+            let plan = Plan::new(
+                "fan-out",
+                vec![
+                    Step::action("s1", "noop"),
+                    Step::action("s2", "noop"),
+                    Step::action("s3", "noop"),
+                ],
+            );
+            let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
+            let ctx = ExecutorContext::new(
+                "task-1",
+                Arc::new(RwLock::new(WorkingSet::new())),
+                Arc::new(NoopReferenceStore),
+            );
+
+            let result = executor.execute(&mut dag, &ctx).await;
+            assert!(matches!(result, ExecutionResult::Completed));
+            assert_eq!(dag.completed_nodes().len(), 3);
         });
     }
 }

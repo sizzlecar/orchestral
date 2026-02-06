@@ -23,11 +23,15 @@ pub async fn run_session(
     once: bool,
     verbose: bool,
 ) -> anyhow::Result<()> {
+    let use_tui = std::io::stdout().is_terminal();
+    if use_tui {
+        std::env::set_var("ORCHESTRAL_TUI_SILENT_LOGS", "1");
+    }
     let runtime_client = RuntimeClient::from_config(config, thread_id)
         .await
         .context("initialize runtime client")?;
 
-    if !std::io::stdout().is_terminal() {
+    if !use_tui {
         return run_plain(runtime_client, initial_input).await;
     }
 
@@ -50,6 +54,7 @@ async fn run_plain(
     let (tx, mut rx) = mpsc::channel::<RuntimeMsg>(256);
     let client = runtime_client.clone();
     let submit = tokio::spawn(async move { client.submit_input(input, tx).await });
+    let mut last_persist_line: Option<String> = None;
 
     while let Some(msg) = rx.recv().await {
         match msg {
@@ -61,10 +66,28 @@ async fn run_plain(
             RuntimeMsg::ActivityStart { .. }
             | RuntimeMsg::ActivityItem { .. }
             | RuntimeMsg::ActivityEnd { .. } => {}
-            RuntimeMsg::OutputPersist(line) => println!("{}", line),
+            RuntimeMsg::OutputPersist(line) => {
+                let trimmed = line.trim().to_string();
+                if last_persist_line.as_ref() == Some(&trimmed) {
+                    continue;
+                }
+                println!("{}", line);
+                last_persist_line = Some(trimmed);
+            }
+            RuntimeMsg::AssistantDelta { .. } => {}
             RuntimeMsg::OutputTransient { slot, text } => {
                 if matches!(slot, TransientSlot::Status) {
                     println!("{}", text);
+                }
+            }
+            RuntimeMsg::ApprovalRequested { reason, command } => {
+                if let Some(command) = command {
+                    println!(
+                        "Approval required for `{}`: {} (reply /approve or /deny)",
+                        command, reason
+                    );
+                } else {
+                    println!("Approval required: {} (reply /approve or /deny)", reason);
                 }
             }
             RuntimeMsg::Error(err) => eprintln!("Error: {}", err),
