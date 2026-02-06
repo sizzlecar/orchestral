@@ -3,7 +3,7 @@
 //! This module provides a client for Google's Gemini API.
 
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 
 use crate::llm::{LlmClient, LlmError, LlmRequest};
@@ -52,10 +52,7 @@ impl GeminiClient {
     }
 
     fn build_url(&self, model: &str) -> String {
-        format!(
-            "{}/models/{}:generateContent?key={}",
-            self.config.endpoint, model, self.config.api_key
-        )
+        format!("{}/models/{}:generateContent", self.config.endpoint, model)
     }
 }
 
@@ -126,6 +123,10 @@ impl LlmClient for GeminiClient {
 
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let api_key_header = HeaderName::from_static("x-goog-api-key");
+        let api_key_value = HeaderValue::from_str(&self.config.api_key)
+            .map_err(|e| LlmError::Http(format!("invalid Gemini API key header value: {}", e)))?;
+        headers.insert(api_key_header, api_key_value);
 
         // Build Gemini request
         let body = GeminiRequest {
@@ -214,7 +215,7 @@ mod tests {
         let client = GeminiClient::new(config).unwrap();
         let url = client.build_url("gemini-1.5-pro");
         assert!(url.contains("gemini-1.5-pro:generateContent"));
-        assert!(url.contains("key=test-key"));
+        assert!(!url.contains("test-key"));
     }
 
     #[tokio::test]
