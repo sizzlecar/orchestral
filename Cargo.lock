@@ -1579,6 +1579,8 @@ dependencies = [
  "orchestral-stores",
  "serde_json",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1586,6 +1588,7 @@ name = "orchestral-planners"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures-util",
  "llm",
  "orchestral-config",
  "orchestral-core",

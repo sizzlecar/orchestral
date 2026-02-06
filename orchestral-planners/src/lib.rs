@@ -17,5 +17,5 @@ pub use factory::{
 pub use gemini::{GeminiClient, GeminiClientConfig};
 pub use llm::{
     HttpLlmClient, HttpLlmClientConfig, LlmClient, LlmError, LlmPlanner, LlmPlannerConfig,
-    LlmRequest, MockLlmClient,
+    LlmRequest, MockLlmClient, StreamChunkCallback,
 };

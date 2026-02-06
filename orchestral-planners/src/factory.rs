@@ -5,13 +5,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use llm_sdk::builder::{LLMBackend, LLMBuilder};
 use llm_sdk::chat::ChatMessage;
 use thiserror::Error;
 
 use orchestral_config::BackendSpec;
 
-use crate::llm::{LlmClient, LlmError, LlmRequest};
+use crate::llm::{LlmClient, LlmError, LlmRequest, StreamChunkCallback};
 
 /// Runtime invocation config for an LLM call chain.
 #[derive(Debug, Clone)]
@@ -183,6 +184,80 @@ impl LlmClient for GranietLlmClient {
             .text()
             .map(|s| s.to_string())
             .ok_or_else(|| LlmError::Response("llm response had no text".to_string()))
+    }
+
+    async fn complete_stream(
+        &self,
+        request: LlmRequest,
+        on_chunk: StreamChunkCallback,
+    ) -> Result<String, LlmError> {
+        let prompt = if request.system.trim().is_empty() {
+            request.user
+        } else {
+            format!("System:\n{}\n\nUser:\n{}", request.system, request.user)
+        };
+        let model = if request.model.trim().is_empty() {
+            self.model.clone()
+        } else {
+            request.model
+        };
+        let temperature = if request.temperature <= 0.0 {
+            self.temperature
+        } else {
+            request.temperature
+        };
+
+        let mut builder = LLMBuilder::new()
+            .backend(self.backend.clone())
+            .model(model)
+            .temperature(temperature)
+            .normalize_response(self.normalize_response);
+        if let Some(api_key) = &self.api_key {
+            builder = builder.api_key(api_key.clone());
+        }
+        let llm = builder
+            .build()
+            .map_err(|e| LlmError::Http(format!("llm builder error: {}", e)))?;
+        let messages = vec![ChatMessage::user().content(prompt).build()];
+
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(self.timeout_secs),
+            llm.chat_stream(&messages),
+        )
+        .await
+        .map_err(|_| {
+            LlmError::Http(format!(
+                "llm stream setup timeout after {}s",
+                self.timeout_secs
+            ))
+        })?
+        .map_err(|e| LlmError::Http(format!("llm chat_stream error: {}", e)))?;
+
+        let mut full = String::new();
+        while let Some(item) =
+            tokio::time::timeout(Duration::from_secs(self.timeout_secs), stream.next())
+                .await
+                .map_err(|_| {
+                    LlmError::Http(format!(
+                        "llm stream timeout after {}s while reading chunk",
+                        self.timeout_secs
+                    ))
+                })?
+        {
+            let chunk =
+                item.map_err(|e| LlmError::Http(format!("llm stream chunk error: {}", e)))?;
+            if chunk.is_empty() {
+                continue;
+            }
+            full.push_str(&chunk);
+            on_chunk(chunk);
+        }
+        if full.is_empty() {
+            return Err(LlmError::Response(
+                "llm stream produced no text chunks".to_string(),
+            ));
+        }
+        Ok(full)
     }
 }
 

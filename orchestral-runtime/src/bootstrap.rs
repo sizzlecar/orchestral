@@ -16,8 +16,9 @@ use orchestral_config::{
 use orchestral_context::{BasicContextBuilder, TokenBudget};
 use orchestral_core::action::extract_meta;
 use orchestral_core::executor::Executor;
+use orchestral_core::interpreter::{NoopResultInterpreter, ResultInterpreter};
 use orchestral_core::normalizer::PlanNormalizer;
-use orchestral_core::planner::{PlanError, Planner, PlannerContext};
+use orchestral_core::planner::{PlanError, Planner, PlannerContext, PlannerOutput};
 use orchestral_core::store::{ReferenceStore, StoreError, TaskStore};
 use orchestral_core::types::{Intent, Plan, Step};
 use orchestral_planners::{
@@ -29,6 +30,7 @@ use orchestral_stores::{
     RedisReferenceStore, RedisTaskStore,
 };
 
+use crate::interpreter::{LlmResultInterpreter, LlmResultInterpreterConfig};
 use crate::orchestrator::OrchestratorConfig;
 use crate::{
     ConcurrencyPolicy, DefaultConcurrencyPolicy, Orchestrator, ParallelConcurrencyPolicy,
@@ -49,6 +51,8 @@ pub enum BootstrapError {
     Store(#[from] StoreError),
     #[error("unsupported planner mode: {0}")]
     UnsupportedPlannerMode(String),
+    #[error("unsupported interpreter mode: {0}")]
+    UnsupportedInterpreterMode(String),
     #[error("unsupported concurrency policy: {0}")]
     UnsupportedConcurrencyPolicy(String),
     #[error("missing provider config for planner mode llm")]
@@ -207,6 +211,7 @@ impl RuntimeApp {
         let executor = Executor::with_registry(action_registry_manager.registry())
             .with_io_contract(config.runtime.strict_imports, config.runtime.strict_exports);
         let planner = build_planner(&config)?;
+        let result_interpreter = build_result_interpreter(&config)?;
 
         let mut normalizer = PlanNormalizer::new();
         {
@@ -230,6 +235,7 @@ impl RuntimeApp {
             context_budget: TokenBudget::new(config.context.max_tokens),
             include_history: config.context.include_history,
             include_references: config.context.include_references,
+            auto_replan_once: true,
         };
 
         let orchestrator = Orchestrator::with_config(
@@ -241,7 +247,8 @@ impl RuntimeApp {
             reference_store,
             orchestrator_cfg,
         )
-        .with_context_builder(context_builder);
+        .with_context_builder(context_builder)
+        .with_result_interpreter(result_interpreter);
 
         Ok(Self {
             orchestrator,
@@ -257,6 +264,13 @@ fn init_tracing_if_needed(observability: &ObservabilityConfig) {
         let silent_tui_logs = std::env::var("ORCHESTRAL_TUI_SILENT_LOGS")
             .map(|v| v == "1")
             .unwrap_or(false);
+        let log_file_path = std::env::var("ORCHESTRAL_LOG_FILE")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| observability.log_file.clone());
+        let file_writer = log_file_path
+            .as_deref()
+            .and_then(|path| create_log_writer(path));
         let fallback_level = match observability.log_level.trim().to_ascii_lowercase().as_str() {
             "trace" => "trace",
             "debug" => "debug",
@@ -272,8 +286,20 @@ fn init_tracing_if_needed(observability: &ObservabilityConfig) {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
         };
 
-        if observability.traces_enabled {
-            if silent_tui_logs {
+        match (observability.traces_enabled, silent_tui_logs, file_writer) {
+            (true, _, Some(writer)) => {
+                let _ = tracing_subscriber::fmt()
+                    .with_env_filter(make_filter())
+                    .with_target(true)
+                    .with_ansi(false)
+                    .with_writer(writer)
+                    .with_span_events(
+                        tracing_subscriber::fmt::format::FmtSpan::NEW
+                            | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
+                    )
+                    .try_init();
+            }
+            (true, true, None) => {
                 let _ = tracing_subscriber::fmt()
                     .with_env_filter(make_filter())
                     .with_target(true)
@@ -283,7 +309,8 @@ fn init_tracing_if_needed(observability: &ObservabilityConfig) {
                             | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
                     )
                     .try_init();
-            } else {
+            }
+            (true, false, None) => {
                 let _ = tracing_subscriber::fmt()
                     .with_env_filter(make_filter())
                     .with_target(true)
@@ -293,14 +320,22 @@ fn init_tracing_if_needed(observability: &ObservabilityConfig) {
                     )
                     .try_init();
             }
-        } else {
-            if silent_tui_logs {
+            (false, _, Some(writer)) => {
+                let _ = tracing_subscriber::fmt()
+                    .with_env_filter(make_filter())
+                    .with_target(true)
+                    .with_ansi(false)
+                    .with_writer(writer)
+                    .try_init();
+            }
+            (false, true, None) => {
                 let _ = tracing_subscriber::fmt()
                     .with_env_filter(make_filter())
                     .with_target(true)
                     .with_writer(std::io::sink)
                     .try_init();
-            } else {
+            }
+            (false, false, None) => {
                 let _ = tracing_subscriber::fmt()
                     .with_env_filter(make_filter())
                     .with_target(true)
@@ -311,9 +346,82 @@ fn init_tracing_if_needed(observability: &ObservabilityConfig) {
         tracing::info!(
             log_level = %observability.log_level,
             traces_enabled = observability.traces_enabled,
+            log_file = log_file_path.as_deref().unwrap_or("(stdout)"),
             "tracing initialized"
         );
     });
+}
+
+fn create_log_writer(path: &str) -> Option<SharedFileMakeWriter> {
+    use std::fs::{create_dir_all, OpenOptions};
+    use std::path::Path;
+
+    let file_path = Path::new(path);
+    if let Some(parent) = file_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(err) = create_dir_all(parent) {
+                eprintln!(
+                    "failed to create log directory '{}': {}",
+                    parent.display(),
+                    err
+                );
+                return None;
+            }
+        }
+    }
+    let file = match OpenOptions::new().create(true).append(true).open(file_path) {
+        Ok(f) => f,
+        Err(err) => {
+            eprintln!("failed to open log file '{}': {}", file_path.display(), err);
+            return None;
+        }
+    };
+    Some(SharedFileMakeWriter::new(file))
+}
+
+#[derive(Clone)]
+struct SharedFileMakeWriter {
+    file: Arc<std::sync::Mutex<std::fs::File>>,
+}
+
+impl SharedFileMakeWriter {
+    fn new(file: std::fs::File) -> Self {
+        Self {
+            file: Arc::new(std::sync::Mutex::new(file)),
+        }
+    }
+}
+
+struct SharedFileWriter {
+    file: Arc<std::sync::Mutex<std::fs::File>>,
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedFileMakeWriter {
+    type Writer = SharedFileWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        SharedFileWriter {
+            file: self.file.clone(),
+        }
+    }
+}
+
+impl std::io::Write for SharedFileWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| std::io::Error::other("log file mutex poisoned"))?;
+        std::io::Write::write(&mut *file, buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| std::io::Error::other("log file mutex poisoned"))?;
+        std::io::Write::flush(&mut *file)
+    }
 }
 
 fn concurrency_policy_from_name(
@@ -447,11 +555,148 @@ fn build_planner(config: &OrchestralConfig) -> Result<Arc<dyn Planner>, Bootstra
     }
 }
 
+fn build_result_interpreter(
+    config: &OrchestralConfig,
+) -> Result<Arc<dyn ResultInterpreter>, BootstrapError> {
+    let mode = config.interpreter.mode.trim().to_ascii_lowercase();
+    let use_llm = match mode.as_str() {
+        "auto" | "" => config.planner.mode.trim().eq_ignore_ascii_case("llm"),
+        "llm" => true,
+        "noop" | "rule" | "rules" => false,
+        other => {
+            return Err(BootstrapError::UnsupportedInterpreterMode(
+                other.to_string(),
+            ))
+        }
+    };
+    if !use_llm {
+        return Ok(Arc::new(NoopResultInterpreter));
+    }
+
+    let backend = resolve_interpreter_backend(config)?;
+    let profile = resolve_interpreter_model_profile(config);
+    let default_cfg = LlmResultInterpreterConfig::default();
+    let model = config
+        .interpreter
+        .model
+        .clone()
+        .or_else(|| profile.as_ref().map(|p| p.model.clone()))
+        .or_else(|| config.planner.model.clone())
+        .unwrap_or(default_cfg.model.clone());
+    let temperature_candidate = config
+        .interpreter
+        .temperature
+        .or_else(|| profile.as_ref().and_then(|p| p.temperature))
+        .or(config.planner.temperature)
+        .unwrap_or(default_cfg.temperature);
+    let temperature = profile
+        .as_ref()
+        .map(|p| p.clamp_temperature(temperature_candidate))
+        .unwrap_or(temperature_candidate);
+    let system_prompt = config
+        .interpreter
+        .system_prompt
+        .clone()
+        .or_else(|| profile.as_ref().and_then(|p| p.system_prompt.clone()))
+        .or_else(|| backend.get_config::<String>("interpreter_system_prompt"))
+        .unwrap_or(default_cfg.system_prompt);
+
+    let invocation = LlmInvocationConfig {
+        model: model.clone(),
+        temperature,
+        normalize_response: true,
+    };
+    let client = DefaultLlmClientFactory::new().build(&backend, &invocation)?;
+    let cfg = LlmResultInterpreterConfig {
+        model,
+        temperature,
+        system_prompt,
+        timeout_secs: backend
+            .get_config::<u64>("interpreter_timeout_secs")
+            .unwrap_or(12),
+    };
+    tracing::info!(
+        mode = %mode,
+        backend_name = %backend.name,
+        backend_kind = %backend.kind,
+        model = %cfg.model,
+        temperature = cfg.temperature,
+        timeout_secs = cfg.timeout_secs,
+        "result interpreter configured"
+    );
+    Ok(Arc::new(LlmResultInterpreter::new(client, cfg)))
+}
+
+fn resolve_interpreter_backend(
+    config: &OrchestralConfig,
+) -> Result<orchestral_config::BackendSpec, BootstrapError> {
+    if let Some(name) = &config.interpreter.backend {
+        return config
+            .providers
+            .get_backend(name)
+            .ok_or_else(|| BootstrapError::BackendNotFound(name.clone()));
+    }
+    if let Some(profile_name) = &config.interpreter.model_profile {
+        let profile = config
+            .providers
+            .get_model(profile_name)
+            .ok_or_else(|| BootstrapError::ModelProfileNotFound(profile_name.clone()))?;
+        let backend_name = profile
+            .backend
+            .clone()
+            .ok_or(BootstrapError::MissingProviderConfig)?;
+        return config
+            .providers
+            .get_backend(&backend_name)
+            .ok_or(BootstrapError::BackendNotFound(backend_name));
+    }
+    if let Some(name) = &config.planner.backend {
+        return config
+            .providers
+            .get_backend(name)
+            .ok_or_else(|| BootstrapError::BackendNotFound(name.clone()));
+    }
+    if let Some(profile_name) = &config.planner.model_profile {
+        let profile = config
+            .providers
+            .get_model(profile_name)
+            .ok_or_else(|| BootstrapError::ModelProfileNotFound(profile_name.clone()))?;
+        let backend_name = profile
+            .backend
+            .clone()
+            .ok_or(BootstrapError::MissingProviderConfig)?;
+        return config
+            .providers
+            .get_backend(&backend_name)
+            .ok_or(BootstrapError::BackendNotFound(backend_name));
+    }
+    config
+        .providers
+        .get_default_backend()
+        .ok_or(BootstrapError::MissingProviderConfig)
+}
+
+fn resolve_interpreter_model_profile(
+    config: &OrchestralConfig,
+) -> Option<orchestral_config::ModelProfile> {
+    if let Some(name) = &config.interpreter.model_profile {
+        return config.providers.get_model(name);
+    }
+    if let Some(name) = &config.planner.model_profile {
+        return config.providers.get_model(name);
+    }
+    config.providers.get_default_model()
+}
+
 struct DeterministicPlanner;
 
 #[async_trait]
 impl Planner for DeterministicPlanner {
-    async fn plan(&self, intent: &Intent, context: &PlannerContext) -> Result<Plan, PlanError> {
+    async fn plan(
+        &self,
+        intent: &Intent,
+        context: &PlannerContext,
+    ) -> Result<PlannerOutput, PlanError> {
         let action_name = context
             .available_actions
             .iter()
@@ -460,12 +705,12 @@ impl Planner for DeterministicPlanner {
             .or_else(|| context.available_actions.first().map(|a| a.name.clone()))
             .ok_or(PlanError::NoSuitableActions)?;
 
-        Ok(Plan::new(
+        Ok(PlannerOutput::Workflow(Plan::new(
             format!("Deterministic plan for intent: {}", intent.content),
             vec![Step::action("s1", action_name).with_params(json!({
                 "message": intent.content
             }))],
-        ))
+        )))
     }
 }
 
