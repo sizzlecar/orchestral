@@ -1626,6 +1626,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "orchestral-api",
+ "orchestral-stores",
  "thiserror 1.0.69",
  "tokio",
 ]
@@ -1638,11 +1639,8 @@ dependencies = [
  "clap",
  "crossterm 0.28.1",
  "futures-util",
- "orchestral-api",
  "orchestral-channels",
- "orchestral-runtime",
  "orchestral-server",
- "orchestral-stores",
  "ratatui",
  "serde_json",
  "textwrap",

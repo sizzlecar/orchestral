@@ -4,20 +4,17 @@ use std::sync::Arc;
 use anyhow::Context;
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::{sleep, Duration};
-use tracing::debug;
+use tracing::{debug, warn};
 
-use orchestral_api::{ApiService, RuntimeApi};
-use orchestral_channels::{ChannelBindingStore, CliChannel, InMemoryChannelBindingStore};
+use orchestral_channels::CliRuntime;
 
 use super::event_projection::{project_event, UiEvent};
 use crate::runtime::protocol::{ActivityKind, RuntimeMsg, TransientSlot};
 
 #[derive(Clone)]
 pub struct RuntimeClient {
-    api: Arc<RuntimeApi>,
-    channel: Arc<CliChannel<RuntimeApi, InMemoryChannelBindingStore>>,
+    runtime: Arc<CliRuntime>,
     thread_id: String,
-    session_key: String,
     submit_lock: Arc<Mutex<()>>,
 }
 
@@ -26,30 +23,12 @@ impl RuntimeClient {
         config: PathBuf,
         thread_id_override: Option<String>,
     ) -> anyhow::Result<Self> {
-        let api = RuntimeApi::from_config_path(config)
+        let runtime = CliRuntime::from_config(config, thread_id_override)
             .await
-            .context("failed to build runtime api from config")?;
-        let binding_store = Arc::new(InMemoryChannelBindingStore::new());
-        let thread = match thread_id_override {
-            Some(thread_id) => api
-                .create_thread(Some(thread_id))
-                .await
-                .context("failed to create thread with override id")?,
-            None => api
-                .create_thread(None)
-                .await
-                .context("failed to create default thread")?,
-        };
-        let session_key = format!("cli:{}", thread.id);
-        binding_store
-            .set_thread_id(&session_key, thread.id.clone())
-            .await;
-        let channel = CliChannel::new(Arc::new(api.clone()), binding_store);
+            .context("failed to build cli runtime from config")?;
         Ok(Self {
-            api: Arc::new(api),
-            channel: Arc::new(channel),
-            thread_id: thread.id,
-            session_key,
+            thread_id: runtime.thread_id().to_string(),
+            runtime: Arc::new(runtime),
             submit_lock: Arc::new(Mutex::new(())),
         })
     }
@@ -65,11 +44,7 @@ impl RuntimeClient {
     ) -> anyhow::Result<()> {
         let _guard = self.submit_lock.lock().await;
 
-        let mut rx = self
-            .api
-            .subscribe_events(&self.thread_id)
-            .await
-            .context("failed to subscribe events")?;
+        let mut rx = self.runtime.subscribe_events().await.context("failed to subscribe events")?;
         let (stop_tx, mut stop_rx) = watch::channel(false);
         let thread_id = self.thread_id.clone();
         let runtime_tx_events = runtime_tx.clone();
@@ -94,7 +69,20 @@ impl RuntimeClient {
                         }
                     }
                     msg = rx.recv() => {
-                        let Ok(event) = msg else { break; };
+                        let event = match msg {
+                            Ok(event) => event,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                warn!(skipped, "cli runtime event stream lagged; ui may miss intermediate events");
+                                let _ = runtime_tx_events
+                                    .send(RuntimeMsg::OutputTransient {
+                                        slot: TransientSlot::Status,
+                                        text: format!("Syncing UI stream... skipped {} events", skipped),
+                                    })
+                                    .await;
+                                continue;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        };
                         if event.thread_id() != thread_id {
                             continue;
                         }
@@ -373,16 +361,30 @@ impl RuntimeClient {
                                     "tui event: assistant_output"
                                 );
                                 let streamed_trimmed = streamed_assistant.trim().to_string();
-                                if (!streamed_trimmed.is_empty()
-                                    && streamed_trimmed == normalized)
+                                if (!streamed_trimmed.is_empty() && streamed_trimmed == normalized)
                                     || last_streamed_assistant.as_deref() == Some(normalized.as_str())
-                                    || stream_active
                                 {
                                     // Stream already rendered this answer live.
                                     stream_active = false;
                                     streamed_assistant.clear();
                                     assistant_rendered = true;
+                                    debug!("tui action: assistant_output deduped against streamed text");
+                                    if pending_execution_end {
+                                        debug!("tui action: execution_end after assistant_output (dedup)");
+                                        pending_execution_end = false;
+                                        let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
+                                        assistant_rendered = false;
+                                        last_preview = None;
+                                        last_assistant_fingerprint = None;
+                                        last_streamed_assistant = None;
+                                    }
                                     continue;
+                                }
+                                // If a stream was open but no deduplicated final arrived, prefer the
+                                // explicit assistant_output payload to avoid losing visible replies.
+                                if stream_active {
+                                    stream_active = false;
+                                    streamed_assistant.clear();
                                 }
                                 if last_assistant_fingerprint.as_deref() != Some(normalized.as_str())
                                 {
@@ -480,11 +482,7 @@ impl RuntimeClient {
             }
         });
 
-        let result = self
-            .channel
-            .submit_input(&self.session_key, Some("tui".to_string()), input.clone())
-            .await
-            .map(|_| ());
+        let result = self.runtime.submit_input(input.clone()).await.map(|_| ());
         // Give projected runtime events a short drain window before stopping forwarder.
         sleep(Duration::from_millis(120)).await;
         let _ = stop_tx.send(true);
@@ -501,19 +499,15 @@ impl RuntimeClient {
     }
 
     pub async fn interrupt(&self, runtime_tx: mpsc::Sender<RuntimeMsg>) {
-        let app = match self.api.runtime_app_for_thread(&self.thread_id).await {
-            Ok(app) => app,
+        match self.runtime.interrupt().await {
+            Ok(()) => {}
             Err(err) => {
                 let _ = runtime_tx
-                    .send(RuntimeMsg::Error(format!(
-                        "interrupt failed to resolve runtime app: {}",
-                        err
-                    )))
+                    .send(RuntimeMsg::Error(format!("interrupt failed: {}", err)))
                     .await;
                 return;
             }
-        };
-        app.orchestrator.thread_runtime.cancel_all_active().await;
+        }
         let _ = runtime_tx
             .send(RuntimeMsg::OutputTransient {
                 slot: TransientSlot::Status,

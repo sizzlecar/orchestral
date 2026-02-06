@@ -7,9 +7,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-orchestral-runtime = { workspace = true }
-orchestral-stores = { workspace = true }
-orchestral-api = { workspace = true }
 orchestral-channels = { workspace = true }
 orchestral-server = { workspace = true }
 tokio = { workspace = true }
