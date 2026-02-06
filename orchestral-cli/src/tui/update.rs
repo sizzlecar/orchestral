@@ -470,7 +470,9 @@ fn push_history_line(app: &mut App, line: String) {
 }
 
 fn prune_old_activities(app: &mut App, keep_turns: usize) {
-    let min_turn = app.current_turn_id.saturating_sub(keep_turns.saturating_sub(1));
+    let min_turn = app
+        .current_turn_id
+        .saturating_sub(keep_turns.saturating_sub(1));
     app.activities.retain(|g| g.turn_id >= min_turn);
     app.activity_index.clear();
     for (idx, group) in app.activities.iter().enumerate() {

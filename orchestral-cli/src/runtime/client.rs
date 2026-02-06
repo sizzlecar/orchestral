@@ -44,7 +44,11 @@ impl RuntimeClient {
     ) -> anyhow::Result<()> {
         let _guard = self.submit_lock.lock().await;
 
-        let mut rx = self.runtime.subscribe_events().await.context("failed to subscribe events")?;
+        let mut rx = self
+            .runtime
+            .subscribe_events()
+            .await
+            .context("failed to subscribe events")?;
         let (stop_tx, mut stop_rx) = watch::channel(false);
         let thread_id = self.thread_id.clone();
         let runtime_tx_events = runtime_tx.clone();
