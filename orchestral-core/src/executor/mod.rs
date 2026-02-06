@@ -346,7 +346,7 @@ impl ExecutorContext {
 }
 
 /// Execution result
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ExecutionResult {
     /// All steps completed successfully
     Completed,

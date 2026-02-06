@@ -15,6 +15,7 @@
 
 pub mod action;
 pub mod executor;
+pub mod interpreter;
 pub mod normalizer;
 pub mod planner;
 pub mod store;
@@ -29,11 +30,17 @@ pub mod prelude {
         ActionRegistry, DagNode, ExecutionDag, ExecutionProgressEvent, ExecutionProgressReporter,
         ExecutionResult, Executor, ExecutorContext, NodeState,
     };
+    pub use crate::interpreter::{
+        InterpretDeltaSink, InterpretError, InterpretRequest, InterpretResult,
+        NoopResultInterpreter, ResultInterpreter,
+    };
     pub use crate::normalizer::{
         FixError, NormalizeError, NormalizedPlan, PlanFixer, PlanNormalizer, PlanValidator,
         ValidationError,
     };
-    pub use crate::planner::{HistoryItem, PlanError, Planner, PlannerContext, PlannerRuntimeInfo};
+    pub use crate::planner::{
+        HistoryItem, PlanError, Planner, PlannerContext, PlannerOutput, PlannerRuntimeInfo,
+    };
     pub use crate::store::{
         Reference, ReferenceStore, ReferenceType, Scope, StoreError, TaskStore, WorkingSet,
     };
@@ -45,7 +52,10 @@ pub use action::{Action, ActionContext, ActionInput, ActionResult};
 pub use executor::{
     ExecutionDag, ExecutionProgressEvent, ExecutionProgressReporter, ExecutionResult, Executor,
 };
+pub use interpreter::{
+    InterpretDeltaSink, InterpretRequest, InterpretResult, NoopResultInterpreter, ResultInterpreter,
+};
 pub use normalizer::{NormalizedPlan, PlanNormalizer};
-pub use planner::{Planner, PlannerRuntimeInfo};
+pub use planner::{Planner, PlannerOutput, PlannerRuntimeInfo};
 pub use store::{ReferenceStore, StoreError, TaskStore, WorkingSet};
 pub use types::{Intent, Plan, Step, Task, TaskId, TaskState};
