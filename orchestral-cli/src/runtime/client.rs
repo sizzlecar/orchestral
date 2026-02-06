@@ -64,6 +64,7 @@ impl RuntimeClient {
             let mut stream_active = false;
             let mut last_approval_fingerprint: Option<String> = None;
             let mut assistant_rendered = false;
+            let mut pending_execution_end = false;
 
             loop {
                 tokio::select! {
@@ -273,40 +274,25 @@ impl RuntimeClient {
                                         .send(RuntimeMsg::OutputPersist(waiting_line))
                                         .await;
                                 }
+                                pending_execution_end = false;
                                 let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
                             }
                             UiEvent::ExecutionCompleted { status } => {
                                 match status.as_deref() {
                                     Some("completed") => {
-                                        if !assistant_rendered {
-                                            if let Some(preview) = last_preview.clone() {
-                                                let _ = runtime_tx_events
-                                                    .send(RuntimeMsg::OutputPersist(preview))
-                                                    .await;
-                                            }
-                                        }
-                                        let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
-                                        assistant_rendered = false;
-                                        last_preview = None;
-                                        last_assistant_fingerprint = None;
-                                        streamed_assistant.clear();
-                                        stream_active = false;
+                                        // For completed turns, assistant output is emitted after
+                                        // execution_completed. Delay ExecutionEnd until reply arrives.
+                                        pending_execution_end = true;
                                     }
                                     Some(other) => {
                                         let _ = runtime_tx_events
                                             .send(RuntimeMsg::OutputPersist(format!("Status: {}", other)))
                                             .await;
+                                        pending_execution_end = false;
                                         let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
                                     }
                                     None => {
-                                        if !assistant_rendered {
-                                            let _ = runtime_tx_events
-                                                .send(RuntimeMsg::OutputPersist(
-                                                    "Status: completed".to_string(),
-                                                ))
-                                                .await;
-                                        }
-                                        let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
+                                        pending_execution_end = true;
                                     }
                                 }
                             }
@@ -345,6 +331,15 @@ impl RuntimeClient {
                                         .send(RuntimeMsg::OutputPersist(normalized))
                                         .await;
                                 }
+                                if pending_execution_end {
+                                    pending_execution_end = false;
+                                    let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
+                                    assistant_rendered = false;
+                                    last_preview = None;
+                                    last_assistant_fingerprint = None;
+                                    streamed_assistant.clear();
+                                    stream_active = false;
+                                }
                             }
                             UiEvent::AssistantStreamDelta { delta, done } => {
                                 if !delta.is_empty() {
@@ -366,6 +361,13 @@ impl RuntimeClient {
                                             done: true,
                                         })
                                         .await;
+                                    if pending_execution_end && !streamed_assistant.trim().is_empty() {
+                                        pending_execution_end = false;
+                                        let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
+                                        assistant_rendered = false;
+                                        last_preview = None;
+                                        last_assistant_fingerprint = None;
+                                    }
                                     streamed_assistant.clear();
                                 }
                             }
@@ -376,11 +378,23 @@ impl RuntimeClient {
                                         reason.unwrap_or_else(|| "turn rejected".to_string())
                                     )))
                                     .await;
+                                pending_execution_end = false;
                                 let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
                             }
                         }
                     }
                 }
+            }
+
+            if pending_execution_end {
+                if !assistant_rendered {
+                    if let Some(preview) = last_preview {
+                        let _ = runtime_tx_events
+                            .send(RuntimeMsg::OutputPersist(preview))
+                            .await;
+                    }
+                }
+                let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
             }
         });
 
