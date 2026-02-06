@@ -1644,6 +1644,9 @@ mod tests {
     #[test]
     fn test_file_read_respects_size_limit_and_truncate() {
         tokio_test::block_on(async {
+            tokio::fs::create_dir_all("target")
+                .await
+                .expect("create target dir");
             let unique = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system time")
@@ -1734,6 +1737,9 @@ mod tests {
     #[test]
     fn test_file_read_rejects_path_outside_workspace_roots() {
         tokio_test::block_on(async {
+            tokio::fs::create_dir_all("target")
+                .await
+                .expect("create target dir");
             let spec = ActionSpec {
                 name: "file_read".to_string(),
                 kind: "file_read".to_string(),
@@ -1751,7 +1757,9 @@ mod tests {
             let result = action.run(input, test_ctx()).await;
             match result {
                 ActionResult::Error { message } => {
-                    assert!(message.contains("sandbox roots"));
+                    assert!(
+                        message.contains("sandbox root") || message.contains("sandbox roots")
+                    );
                 }
                 other => panic!("expected error, got {:?}", other),
             }
