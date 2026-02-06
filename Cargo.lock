@@ -1641,6 +1641,7 @@ dependencies = [
  "orchestral-api",
  "orchestral-channels",
  "orchestral-runtime",
+ "orchestral-server",
  "orchestral-stores",
  "ratatui",
  "serde_json",
