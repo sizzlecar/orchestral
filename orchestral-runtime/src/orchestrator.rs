@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -363,8 +364,10 @@ impl Orchestrator {
         started_kind: &str,
         mut task: Task,
     ) -> Result<OrchestratorResult, OrchestratorError> {
+        let turn_started_at = Instant::now();
         let actions = self.available_actions().await;
-        let history = self.history_for_planner(&interaction_id, &task.id).await?;
+        let mut history = self.history_for_planner(&interaction_id, &task.id).await?;
+        drop_current_turn_user_input(&mut history, &task.intent.content);
         self.emit_lifecycle_event(
             "planning_started",
             Some(&interaction_id),
@@ -386,7 +389,15 @@ impl Orchestrator {
         let runtime_info = PlannerRuntimeInfo::detect();
         let context = PlannerContext::with_history(actions, history, self.reference_store.clone())
             .with_runtime_info(runtime_info);
+        let planner_started_at = Instant::now();
         let planner_output = self.planner.plan(&task.intent, &context).await?;
+        let planner_elapsed_ms = planner_started_at.elapsed().as_millis() as u64;
+        tracing::info!(
+            interaction_id = %interaction_id,
+            task_id = %task.id,
+            planner_elapsed_ms = planner_elapsed_ms,
+            "orchestrator planner latency"
+        );
         match planner_output {
             PlannerOutput::Workflow(plan) => {
                 self.emit_lifecycle_event(
@@ -437,6 +448,7 @@ impl Orchestrator {
                 let result = self
                     .execute_existing_task(&mut task, &interaction_id, None)
                     .await?;
+                let execute_elapsed_ms = turn_started_at.elapsed().as_millis() as u64;
                 self.emit_lifecycle_event(
                     "execution_completed",
                     Some(&interaction_id),
@@ -445,8 +457,22 @@ impl Orchestrator {
                     execution_result_metadata(&result),
                 )
                 .await;
+                tracing::info!(
+                    interaction_id = %interaction_id,
+                    task_id = %task.id,
+                    execute_elapsed_ms = execute_elapsed_ms,
+                    "orchestrator execution pipeline latency"
+                );
+                let interpret_started_at = Instant::now();
                 self.emit_interpreted_output(&interaction_id, &task, &result)
                     .await;
+                tracing::info!(
+                    interaction_id = %interaction_id,
+                    task_id = %task.id,
+                    interpret_elapsed_ms = interpret_started_at.elapsed().as_millis() as u64,
+                    total_turn_elapsed_ms = turn_started_at.elapsed().as_millis() as u64,
+                    "orchestrator interpretation latency"
+                );
 
                 let response = match started_kind {
                     "started" => OrchestratorResult::Started {
@@ -514,6 +540,12 @@ impl Orchestrator {
                     })),
                 )
                 .await;
+                tracing::info!(
+                    interaction_id = %interaction_id,
+                    task_id = %task.id,
+                    total_turn_elapsed_ms = turn_started_at.elapsed().as_millis() as u64,
+                    "orchestrator direct_response latency"
+                );
 
                 let response = match started_kind {
                     "started" => OrchestratorResult::Started {
@@ -588,6 +620,12 @@ impl Orchestrator {
                     })),
                 )
                 .await;
+                tracing::info!(
+                    interaction_id = %interaction_id,
+                    task_id = %task.id,
+                    total_turn_elapsed_ms = turn_started_at.elapsed().as_millis() as u64,
+                    "orchestrator clarification latency"
+                );
 
                 let response = match started_kind {
                     "started" => OrchestratorResult::Started {
@@ -625,10 +663,19 @@ impl Orchestrator {
         let mut current_plan = initial_plan.clone();
         let mut remaining_replans = if self.config.auto_replan_once { 1 } else { 0 };
         let mut resume = resume_event;
+        let execute_started_at = Instant::now();
         let final_result = loop {
+            let one_run_started_at = Instant::now();
             let run = self
                 .execute_plan_once(task, interaction_id, &current_plan, resume)
                 .await?;
+            tracing::info!(
+                interaction_id = %interaction_id,
+                task_id = %task.id,
+                run_elapsed_ms = one_run_started_at.elapsed().as_millis() as u64,
+                result = %truncate_debug_for_log(&run.result, MAX_LOG_CHARS),
+                "orchestrator execute_plan_once latency"
+            );
             task.set_checkpoint(run.completed_step_ids, run.working_set_snapshot);
             self.task_store.save(task).await?;
 
@@ -666,6 +713,12 @@ impl Orchestrator {
                                 }),
                             )
                             .await;
+                            tracing::info!(
+                                interaction_id = %interaction_id,
+                                task_id = %task.id,
+                                recovery_replan_elapsed_ms = one_run_started_at.elapsed().as_millis() as u64,
+                                "orchestrator recovery replan latency"
+                            );
                             continue;
                         }
                         Ok(None) => {}
@@ -693,6 +746,12 @@ impl Orchestrator {
         self.thread_runtime
             .update_interaction_state(interaction_id, interaction_state_from_task(&new_state))
             .await?;
+        tracing::info!(
+            interaction_id = %interaction_id,
+            task_id = %task.id,
+            execute_existing_task_elapsed_ms = execute_started_at.elapsed().as_millis() as u64,
+            "orchestrator execute_existing_task finished"
+        );
 
         Ok(final_result)
     }
@@ -926,6 +985,7 @@ impl Orchestrator {
         task: &Task,
         result: &ExecutionResult,
     ) {
+        let started_at = Instant::now();
         let Some(plan) = task.plan.clone() else {
             return;
         };
@@ -978,6 +1038,12 @@ impl Orchestrator {
             Some(execution_result_metadata(result)),
         )
         .await;
+        tracing::info!(
+            task_id = %task.id,
+            interaction_id = %interaction_id,
+            emit_interpreted_output_elapsed_ms = started_at.elapsed().as_millis() as u64,
+            "orchestrator emit_interpreted_output finished"
+        );
     }
 
     async fn emit_assistant_output_message(
@@ -1482,21 +1548,9 @@ fn event_to_history_item(event: &Event) -> Option<HistoryItem> {
             content: payload_to_string(payload),
             timestamp,
         }),
-        Event::ExternalEvent { kind, payload, .. } => Some(HistoryItem {
-            role: "system".to_string(),
-            content: format!("external:{} {}", kind, payload_to_string(payload)),
-            timestamp,
-        }),
-        Event::SystemTrace { level, payload, .. } => Some(HistoryItem {
-            role: "system".to_string(),
-            content: format!("trace:{} {}", level, payload_to_string(payload)),
-            timestamp,
-        }),
-        Event::Artifact { reference_id, .. } => Some(HistoryItem {
-            role: "system".to_string(),
-            content: format!("artifact:{}", reference_id),
-            timestamp,
-        }),
+        // Planner dialog history should stay focused on user/assistant exchanges.
+        // Lifecycle traces/artifacts create high-volume noise and can evict useful turns.
+        Event::ExternalEvent { .. } | Event::SystemTrace { .. } | Event::Artifact { .. } => None,
     }
 }
 
@@ -1510,6 +1564,15 @@ fn context_window_to_history(window: &ContextWindow) -> Vec<HistoryItem> {
         });
     }
     items
+}
+
+fn drop_current_turn_user_input(history: &mut Vec<HistoryItem>, current_intent: &str) {
+    let Some(last) = history.last() else {
+        return;
+    };
+    if last.role == "user" && last.content.trim() == current_intent.trim() {
+        history.pop();
+    }
 }
 
 fn event_type_label(event: &Event) -> &'static str {

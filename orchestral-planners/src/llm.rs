@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, info};
 
-use orchestral_core::planner::{PlanError, Planner, PlannerContext, PlannerOutput};
+use orchestral_core::planner::{HistoryItem, PlanError, Planner, PlannerContext, PlannerOutput};
 use orchestral_core::types::{Intent, Plan, Step};
 
 const MAX_PROMPT_LOG_CHARS: usize = 4_000;
@@ -109,13 +109,7 @@ impl<C: LlmClient> LlmPlanner<C> {
 
         if !context.history.is_empty() {
             user.push_str("History:\n");
-            for item in context
-                .history
-                .iter()
-                .rev()
-                .take(self.config.max_history)
-                .rev()
-            {
+            for item in select_history_for_prompt(&context.history, self.config.max_history) {
                 user.push_str(&format!("- {}: {}\n", item.role, item.content));
             }
             user.push('\n');
@@ -136,6 +130,33 @@ impl<C: LlmClient> LlmPlanner<C> {
 
         (system, user)
     }
+}
+
+fn select_history_for_prompt<'a>(
+    history: &'a [HistoryItem],
+    max_history: usize,
+) -> Vec<&'a HistoryItem> {
+    if max_history == 0 {
+        return Vec::new();
+    }
+
+    let dialog: Vec<&HistoryItem> = history
+        .iter()
+        .filter(|h| h.role == "user" || h.role == "assistant")
+        .collect();
+
+    if dialog.len() <= max_history {
+        return dialog;
+    }
+
+    let head_keep = if max_history >= 8 { 2 } else { 1 };
+    let tail_keep = max_history.saturating_sub(head_keep);
+    let split = dialog.len().saturating_sub(tail_keep);
+
+    let mut selected = Vec::with_capacity(max_history);
+    selected.extend(dialog.iter().take(head_keep).copied());
+    selected.extend(dialog.iter().skip(split).copied());
+    selected
 }
 
 fn build_system_prompt(base: &str, context: &PlannerContext) -> String {
