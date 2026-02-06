@@ -15,3 +15,4 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+uuid = { workspace = true }

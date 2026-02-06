@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::json;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, RwLock};
+use uuid::Uuid;
 
 use orchestral_runtime::{OrchestratorResult, RuntimeApp};
 use orchestral_stores::Event;
@@ -15,37 +17,93 @@ use crate::{ApiError, ApiService};
 
 #[derive(Clone)]
 pub struct RuntimeApi {
-    app: Arc<RuntimeApp>,
+    config_path: PathBuf,
+    apps: Arc<RwLock<HashMap<String, Arc<RuntimeApp>>>>,
 }
 
 impl RuntimeApi {
     pub async fn from_config_path(config: PathBuf) -> Result<Self, ApiError> {
-        let app = RuntimeApp::from_config_path(config)
+        Ok(Self {
+            config_path: config,
+            apps: Arc::new(RwLock::new(HashMap::new())),
+        })
+    }
+
+    pub async fn runtime_app_for_thread(
+        &self,
+        thread_id: &str,
+    ) -> Result<Arc<RuntimeApp>, ApiError> {
+        self.get_app(thread_id).await
+    }
+
+    async fn create_app_for_thread(&self, thread_id: &str) -> Result<Arc<RuntimeApp>, ApiError> {
+        let app = RuntimeApp::from_config_path(self.config_path.clone())
             .await
             .map_err(|err| ApiError::Internal(format!("build runtime app failed: {}", err)))?;
-        Ok(Self { app: Arc::new(app) })
+        {
+            let mut thread = app.orchestrator.thread_runtime.thread.write().await;
+            thread.id = thread_id.to_string();
+        }
+        Ok(Arc::new(app))
     }
 
-    pub fn runtime_app(&self) -> Arc<RuntimeApp> {
-        self.app.clone()
-    }
-}
-
-#[async_trait]
-impl ApiService for RuntimeApi {
-    async fn set_thread_id(&self, thread_id: String) -> Result<(), ApiError> {
+    async fn get_app(&self, thread_id: &str) -> Result<Arc<RuntimeApp>, ApiError> {
         if thread_id.trim().is_empty() {
             return Err(ApiError::InvalidArgument(
                 "thread_id must not be empty".to_string(),
             ));
         }
-        let mut thread = self.app.orchestrator.thread_runtime.thread.write().await;
-        thread.id = thread_id;
-        Ok(())
+
+        if let Some(existing) = self.apps.read().await.get(thread_id).cloned() {
+            return Ok(existing);
+        }
+
+        Err(ApiError::NotFound(format!(
+            "thread '{}' not found",
+            thread_id
+        )))
     }
 
-    async fn thread(&self) -> Result<ThreadView, ApiError> {
-        let thread = self.app.orchestrator.thread_runtime.thread.read().await;
+    async fn get_or_create_app(&self, thread_id: &str) -> Result<Arc<RuntimeApp>, ApiError> {
+        if thread_id.trim().is_empty() {
+            return Err(ApiError::InvalidArgument(
+                "thread_id must not be empty".to_string(),
+            ));
+        }
+
+        if let Some(existing) = self.apps.read().await.get(thread_id).cloned() {
+            return Ok(existing);
+        }
+
+        let created = self.create_app_for_thread(thread_id).await?;
+        let mut apps = self.apps.write().await;
+        if let Some(existing) = apps.get(thread_id).cloned() {
+            return Ok(existing);
+        }
+        apps.insert(thread_id.to_string(), created.clone());
+        Ok(created)
+    }
+}
+
+#[async_trait]
+impl ApiService for RuntimeApi {
+    async fn create_thread(&self, preferred_id: Option<String>) -> Result<ThreadView, ApiError> {
+        let thread_id = preferred_id
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+        let app = self.get_or_create_app(&thread_id).await?;
+        let thread = app.orchestrator.thread_runtime.thread.read().await;
+        Ok(ThreadView {
+            id: thread.id.clone(),
+            created_at: thread.created_at,
+            updated_at: thread.updated_at,
+        })
+    }
+
+    async fn get_thread(&self, thread_id: &str) -> Result<ThreadView, ApiError> {
+        let app = self.get_app(thread_id).await?;
+        let thread = app.orchestrator.thread_runtime.thread.read().await;
         Ok(ThreadView {
             id: thread.id.clone(),
             created_at: thread.created_at,
@@ -55,6 +113,7 @@ impl ApiService for RuntimeApi {
 
     async fn submit_interaction(
         &self,
+        thread_id: &str,
         request: InteractionSubmitRequest,
     ) -> Result<InteractionSubmitResponse, ApiError> {
         if request.input.trim().is_empty() {
@@ -63,18 +122,13 @@ impl ApiService for RuntimeApi {
             ));
         }
 
-        let thread_id = self.app.orchestrator.thread_runtime.thread_id().await;
+        let app = self.get_app(thread_id).await?;
         let interaction_id = request.request_id.unwrap_or_else(|| "api".to_string());
-        let event = Event::user_input(thread_id, interaction_id, json!(request.input));
+        let event = Event::user_input(thread_id.to_string(), interaction_id, json!(request.input));
 
-        let result = self
-            .app
-            .orchestrator
-            .handle_event(event)
-            .await
-            .map_err(|err| {
-                ApiError::Internal(format!("orchestrator handle_event failed: {}", err))
-            })?;
+        let result = app.orchestrator.handle_event(event).await.map_err(|err| {
+            ApiError::Internal(format!("orchestrator handle_event failed: {}", err))
+        })?;
 
         let response = match result {
             OrchestratorResult::Started {
@@ -114,9 +168,13 @@ impl ApiService for RuntimeApi {
         Ok(response)
     }
 
-    async fn query_history(&self, limit: usize) -> Result<Vec<HistoryEventView>, ApiError> {
-        let mut events = self
-            .app
+    async fn query_history(
+        &self,
+        thread_id: &str,
+        limit: usize,
+    ) -> Result<Vec<HistoryEventView>, ApiError> {
+        let app = self.get_app(thread_id).await?;
+        let mut events = app
             .orchestrator
             .thread_runtime
             .query_history(limit)
@@ -126,8 +184,12 @@ impl ApiService for RuntimeApi {
         Ok(events.iter().map(event_to_view).collect())
     }
 
-    fn subscribe_events(&self) -> broadcast::Receiver<Event> {
-        self.app.orchestrator.thread_runtime.subscribe_events()
+    async fn subscribe_events(
+        &self,
+        thread_id: &str,
+    ) -> Result<broadcast::Receiver<Event>, ApiError> {
+        let app = self.get_app(thread_id).await?;
+        Ok(app.orchestrator.thread_runtime.subscribe_events())
     }
 }
 

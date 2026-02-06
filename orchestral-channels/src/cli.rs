@@ -30,10 +30,10 @@ impl<A: ApiService, B: ChannelBindingStore> CliChannel<A, B> {
         request_id: Option<String>,
         input: String,
     ) -> Result<InteractionSubmitResponse, ChannelError> {
-        self.bind_session(session_key).await?;
+        let thread_id = self.bind_session(session_key).await?;
         let request = InteractionSubmitRequest { request_id, input };
         self.api
-            .submit_interaction(request)
+            .submit_interaction(&thread_id, request)
             .await
             .map_err(Into::into)
     }
@@ -43,21 +43,26 @@ impl<A: ApiService, B: ChannelBindingStore> CliChannel<A, B> {
         session_key: &str,
         limit: usize,
     ) -> Result<Vec<HistoryEventView>, ChannelError> {
-        self.bind_session(session_key).await?;
-        self.api.query_history(limit).await.map_err(Into::into)
+        let thread_id = self.bind_session(session_key).await?;
+        self.api
+            .query_history(&thread_id, limit)
+            .await
+            .map_err(Into::into)
     }
 
-    async fn bind_session(&self, session_key: &str) -> Result<(), ChannelError> {
+    pub async fn resolve_thread_id(&self, session_key: &str) -> Result<String, ChannelError> {
+        self.bind_session(session_key).await
+    }
+
+    async fn bind_session(&self, session_key: &str) -> Result<String, ChannelError> {
         if let Some(thread_id) = self.binding_store.get_thread_id(session_key).await {
-            self.api.set_thread_id(thread_id).await?;
-            return Ok(());
+            return Ok(thread_id);
         }
 
-        let thread = self.api.thread().await?;
+        let thread = self.api.create_thread(None).await?;
         self.binding_store
             .set_thread_id(session_key, thread.id.clone())
             .await;
-        self.api.set_thread_id(thread.id).await?;
-        Ok(())
+        Ok(thread.id)
     }
 }
