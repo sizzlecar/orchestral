@@ -40,6 +40,10 @@ pub enum RuntimeMsg {
         failed: bool,
     },
     OutputPersist(String),
+    AssistantDelta {
+        chunk: String,
+        done: bool,
+    },
     OutputTransient {
         slot: TransientSlot,
         text: String,

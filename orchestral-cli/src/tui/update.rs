@@ -97,6 +97,7 @@ pub fn update(app: &mut App, msg: UiMsg) {
             app.active_activity = None;
             app.turn_started_at = Some(std::time::Instant::now());
             app.turn_elapsed_reported = false;
+            app.assistant_stream_line = None;
             app.mode = AppMode::Planning;
             app.spinner.enabled = true;
             app.shimmer.enabled = true;
@@ -159,6 +160,7 @@ fn handle_runtime(app: &mut App, msg: RuntimeMsg) {
             app.set_dirty();
         }
         RuntimeMsg::OutputPersist(line) => {
+            app.assistant_stream_line = None;
             if let Some(status) = parse_execution_status(&line) {
                 if status != "completed" {
                     enter_waiting_input(app);
@@ -168,7 +170,7 @@ fn handle_runtime(app: &mut App, msg: RuntimeMsg) {
             }
             if line.trim_start().starts_with("Waiting:") {
                 enter_waiting_input(app);
-                app.history.push(line);
+                push_history_multiline(app, &line);
                 app.set_dirty();
                 return;
             }
@@ -176,11 +178,25 @@ fn handle_runtime(app: &mut App, msg: RuntimeMsg) {
                 app.set_dirty();
                 return;
             }
-            if handle_activity_extra_line(app, &line) {
-                app.set_dirty();
-                return;
+            push_history_multiline(app, &line);
+            app.set_dirty();
+        }
+        RuntimeMsg::AssistantDelta { chunk, done } => {
+            if let Some(idx) = app.assistant_stream_line {
+                if let Some(line) = app.history.get_mut(idx) {
+                    line.push_str(&chunk);
+                }
+            } else {
+                app.history.push(String::new());
+                let idx = app.history.len().saturating_sub(1);
+                if let Some(line) = app.history.get_mut(idx) {
+                    line.push_str(&chunk);
+                }
+                app.assistant_stream_line = Some(idx);
             }
-            app.history.push(line);
+            if done {
+                app.assistant_stream_line = None;
+            }
             app.set_dirty();
         }
         RuntimeMsg::OutputTransient { slot, text } => {
@@ -305,6 +321,17 @@ fn format_elapsed(elapsed: Duration) -> String {
     }
 }
 
+fn push_history_multiline(app: &mut App, text: &str) {
+    let mut pushed = false;
+    for line in text.lines() {
+        app.history.push(line.to_string());
+        pushed = true;
+    }
+    if !pushed {
+        app.history.push(text.to_string());
+    }
+}
+
 fn parse_execution_status(line: &str) -> Option<String> {
     let status = line.strip_prefix("Status:")?.trim().to_ascii_lowercase();
     if status.is_empty() {
@@ -326,35 +353,6 @@ fn is_noise_line(line: &str) -> bool {
 
 fn make_activity_key(turn_id: usize, step: &str, action: &str) -> String {
     format!("{}::{}::{}", turn_id, step, action)
-}
-
-fn handle_activity_extra_line(app: &mut App, line: &str) -> bool {
-    let Some(group) = app
-        .activities
-        .iter_mut()
-        .rev()
-        .find(|g| g.turn_id == app.current_turn_id)
-    else {
-        return false;
-    };
-
-    if let Some(body) = line.strip_prefix("Echo:") {
-        let text = body.trim();
-        let detail = if text.is_empty() {
-            "(empty)".to_string()
-        } else {
-            text.to_string()
-        };
-        group.items.push(detail);
-        return true;
-    }
-
-    let trimmed = line.trim();
-    if trimmed.is_empty() || trimmed.starts_with('<') || trimmed.starts_with('>') {
-        return false;
-    }
-    group.items.push(trimmed.to_string());
-    true
 }
 
 fn upsert_activity_group(app: &mut App, key: String, kind: ActivityKind, title: String) -> usize {

@@ -88,5 +88,5 @@ fn ensure_log_filter(verbose: bool) {
     if env::var("RUST_LOG").is_ok() {
         return;
     }
-    env::set_var("RUST_LOG", "warn");
+    env::set_var("RUST_LOG", "info");
 }

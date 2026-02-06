@@ -20,6 +20,13 @@ pub struct StepOutput {
 
 #[derive(Debug, Clone)]
 pub enum UiEvent {
+    AssistantOutput {
+        message: String,
+    },
+    AssistantStreamDelta {
+        delta: String,
+        done: bool,
+    },
     TurnStarted,
     TurnResumed,
     TurnRejected {
@@ -63,15 +70,40 @@ pub enum UiEvent {
 }
 
 pub fn project_event(event: &Event) -> Option<UiEvent> {
-    let Event::SystemTrace { payload, .. } = event else {
-        return None;
-    };
-    let category = payload.get("category")?.as_str()?;
-    match category {
-        "runtime_lifecycle" => project_lifecycle_event(payload),
-        "execution_progress" => project_execution_progress(payload),
+    match event {
+        Event::AssistantOutput { payload, .. } => payload
+            .get("message")
+            .and_then(|v| v.as_str())
+            .map(|message| UiEvent::AssistantOutput {
+                message: message.to_string(),
+            }),
+        Event::SystemTrace { payload, .. } => {
+            let category = payload.get("category")?.as_str()?;
+            match category {
+                "runtime_lifecycle" => project_lifecycle_event(payload),
+                "execution_progress" => project_execution_progress(payload),
+                "assistant_stream" => project_assistant_stream(payload),
+                _ => None,
+            }
+        }
         _ => None,
     }
+}
+
+fn project_assistant_stream(payload: &Value) -> Option<UiEvent> {
+    let done = payload
+        .get("done")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let delta = payload
+        .get("delta")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if delta.is_empty() && !done {
+        return None;
+    }
+    Some(UiEvent::AssistantStreamDelta { delta, done })
 }
 
 fn project_lifecycle_event(payload: &Value) -> Option<UiEvent> {

@@ -59,6 +59,10 @@ impl RuntimeClient {
             let mut completed_steps: usize = 0;
             let mut total_steps: usize = 0;
             let mut last_preview: Option<String> = None;
+            let mut last_assistant_message: Option<String> = None;
+            let mut last_assistant_fingerprint: Option<String> = None;
+            let mut streamed_assistant: String = String::new();
+            let mut stream_active = false;
             let mut last_approval_fingerprint: Option<String> = None;
 
             loop {
@@ -275,10 +279,11 @@ impl RuntimeClient {
                                 match status.as_deref() {
                                     Some("completed") => {
                                         let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
-                                        if let Some(preview) = last_preview.clone() {
+                                        if let Some(message) = last_assistant_message.clone() {
                                             let _ = runtime_tx_events
-                                                .send(RuntimeMsg::OutputPersist("Final Answer".to_string()))
+                                                .send(RuntimeMsg::OutputPersist(message))
                                                 .await;
+                                        } else if let Some(preview) = last_preview.clone() {
                                             let _ = runtime_tx_events
                                                 .send(RuntimeMsg::OutputPersist(preview))
                                                 .await;
@@ -301,8 +306,58 @@ impl RuntimeClient {
                             }
                             UiEvent::TaskCompleted
                             | UiEvent::TurnStarted
-                            | UiEvent::TurnQueued => {}
+                            | UiEvent::TurnQueued
                             | UiEvent::TurnResumed => {}
+                            UiEvent::AssistantOutput { message } => {
+                                let normalized = message.trim().to_string();
+                                if normalized.is_empty() {
+                                    continue;
+                                }
+                                let streamed_trimmed = streamed_assistant.trim().to_string();
+                                if (!streamed_trimmed.is_empty()
+                                    && streamed_trimmed == normalized)
+                                    || stream_active
+                                {
+                                    // Stream already rendered this answer live.
+                                    stream_active = false;
+                                    streamed_assistant.clear();
+                                    last_assistant_message = Some(normalized);
+                                    continue;
+                                }
+                                last_assistant_message = Some(normalized.clone());
+                                if last_assistant_fingerprint.as_deref() != Some(normalized.as_str())
+                                {
+                                    last_assistant_fingerprint = Some(normalized.clone());
+                                    let _ = runtime_tx_events
+                                        .send(RuntimeMsg::OutputPersist(normalized))
+                                        .await;
+                                }
+                            }
+                            UiEvent::AssistantStreamDelta { delta, done } => {
+                                if !delta.is_empty() {
+                                    stream_active = true;
+                                    streamed_assistant.push_str(&delta);
+                                    let _ = runtime_tx_events
+                                        .send(RuntimeMsg::AssistantDelta {
+                                            chunk: delta,
+                                            done: false,
+                                        })
+                                        .await;
+                                }
+                                if done {
+                                    stream_active = false;
+                                    if !streamed_assistant.trim().is_empty() {
+                                        last_assistant_message = Some(streamed_assistant.trim().to_string());
+                                    }
+                                    let _ = runtime_tx_events
+                                        .send(RuntimeMsg::AssistantDelta {
+                                            chunk: String::new(),
+                                            done: true,
+                                        })
+                                        .await;
+                                    streamed_assistant.clear();
+                                }
+                            }
                             UiEvent::TurnRejected { reason } => {
                                 let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
                                 let _ = runtime_tx_events

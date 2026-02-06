@@ -10,6 +10,7 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use anyhow::Context;
+use std::io::Write;
 use tokio::sync::mpsc;
 
 use crate::runtime::{RuntimeClient, RuntimeMsg, TransientSlot};
@@ -66,6 +67,15 @@ async fn run_plain(
             | RuntimeMsg::ActivityItem { .. }
             | RuntimeMsg::ActivityEnd { .. } => {}
             RuntimeMsg::OutputPersist(line) => println!("{}", line),
+            RuntimeMsg::AssistantDelta { chunk, done } => {
+                if !chunk.is_empty() {
+                    print!("{}", chunk);
+                    let _ = std::io::stdout().flush();
+                }
+                if done {
+                    println!();
+                }
+            }
             RuntimeMsg::OutputTransient { slot, text } => {
                 if matches!(slot, TransientSlot::Status) {
                     println!("{}", text);

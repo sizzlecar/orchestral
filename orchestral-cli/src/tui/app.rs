@@ -37,6 +37,7 @@ pub struct App {
     pub turn_started_at: Option<Instant>,
     pub turn_elapsed_reported: bool,
     pub approved_command_prefixes: Vec<String>,
+    pub assistant_stream_line: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +75,7 @@ impl App {
             turn_started_at: None,
             turn_elapsed_reported: false,
             approved_command_prefixes: Vec::new(),
+            assistant_stream_line: None,
         }
     }
 
