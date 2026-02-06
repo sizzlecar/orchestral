@@ -1757,9 +1757,7 @@ mod tests {
             let result = action.run(input, test_ctx()).await;
             match result {
                 ActionResult::Error { message } => {
-                    assert!(
-                        message.contains("sandbox root") || message.contains("sandbox roots")
-                    );
+                    assert!(message.contains("sandbox root") || message.contains("sandbox roots"));
                 }
                 other => panic!("expected error, got {:?}", other),
             }
