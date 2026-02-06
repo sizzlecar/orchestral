@@ -1,0 +1,17 @@
+[package]
+name = "orchestral-api"
+description = "Application-layer API boundary for Orchestral"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+orchestral-runtime = { workspace = true }
+orchestral-stores = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }

@@ -1,0 +1,13 @@
+[package]
+name = "orchestral-channels"
+description = "Protocol adapter layer for Orchestral"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+orchestral-api = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
