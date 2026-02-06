@@ -19,6 +19,12 @@ planner:
   max_history: 20
   dynamic_model_selection: true
 
+interpreter:
+  mode: llm
+  backend: google
+  model_profile: gemini-2.5-flash
+  temperature: 0.0
+
 context:
   history_limit: 50
   max_tokens: 4096
@@ -38,6 +44,9 @@ stores:
 observability:
   log_level: info
   traces_enabled: false
+  # Runtime logs are persisted by default for easier debugging.
+  # Can be overridden by ORCHESTRAL_LOG_FILE.
+  log_file: "logs/orchestral-runtime.log"
 
 providers:
   default_backend: openai
@@ -53,6 +62,7 @@ providers:
       api_key_env: GEMINI_API_KEY
       config:
         timeout_secs: 60
+        interpreter_timeout_secs: 8
   models:
     - name: fast
       backend: openai
@@ -105,11 +115,13 @@ providers:
           ],
           "confidence": 0.0
         }
-
       policy:
         temperature_min: 0.0
         temperature_max: 1.0
-
+    - name: gemini-2.5-flash
+      backend: google
+      model: gemini-2.5-flash
+      temperature: 0.2
 actions:
   hot_reload: true
   # Optional: external process action (multi-language plugin) example:

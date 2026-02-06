@@ -18,6 +18,9 @@ planner:
   max_history: 20
   dynamic_model_selection: true
 
+interpreter:
+  mode: auto
+
 context:
   history_limit: 50
   max_tokens: 4096
@@ -35,6 +38,7 @@ stores:
 observability:
   log_level: info
   traces_enabled: false
+  # log_file: "logs/orchestral-runtime.log"
 
 providers:
   default_backend: openai
