@@ -1,0 +1,203 @@
+version: 1
+
+app:
+  name: orchestral
+  environment: development
+
+runtime:
+  max_interactions_per_thread: 10
+  auto_cleanup: true
+  concurrency_policy: interrupt_and_start_new
+  strict_imports: true
+  strict_exports: true
+
+planner:
+  mode: deterministic
+  backend: openai
+  model_profile: fast
+  max_history: 20
+  dynamic_model_selection: true
+
+interpreter:
+  mode: auto
+
+context:
+  history_limit: 50
+  max_tokens: 4096
+  include_history: true
+  include_references: true
+
+stores:
+  event:
+    backend: in_memory
+  task:
+    backend: in_memory
+  reference:
+    backend: in_memory
+
+observability:
+  log_level: info
+  traces_enabled: false
+  # log_file: "logs/orchestral-runtime.log"
+
+providers:
+  default_backend: openai
+  default_model: fast
+  backends:
+    - name: openai
+      kind: openai
+      api_key_env: OPENAI_API_KEY
+      config:
+        timeout_secs: 30
+    - name: google
+      kind: google
+      api_key_env: GEMINI_API_KEY
+      config:
+        timeout_secs: 60
+  models:
+    - name: fast
+      backend: openai
+      model: gpt-4o-mini
+      temperature: 0.2
+      system_prompt: |
+        You are the planning engine for Orchestral.
+        Generate executable plans only.
+      policy:
+        temperature_min: 0.0
+        temperature_max: 1.0
+    - name: deep
+      backend: openai
+      model: gpt-4.1
+      temperature: 0.1
+      policy:
+        temperature_min: 0.0
+        temperature_max: 0.7
+    - name: cheap
+      backend: google
+      model: gemini-1.5-flash
+      temperature: 0.2
+      policy:
+        temperature_min: 0.0
+        temperature_max: 1.0
+
+actions:
+  hot_reload: true
+  actions:
+    - name: echo
+      kind: echo
+      description: "Echoes input back as output"
+      interface:
+        input_schema:
+          type: object
+          properties:
+            message:
+              type: string
+          required: ["message"]
+        output_schema:
+          type: object
+          properties:
+            result:
+              type: string
+          required: ["result"]
+      config:
+        prefix: "Echo: "
+    - name: http
+      kind: http
+      description: "Performs an HTTP request"
+      interface:
+        input_schema:
+          type: object
+          properties:
+            method:
+              type: string
+            url:
+              type: string
+            headers:
+              type: object
+            body: {}
+            json: {}
+        output_schema:
+          type: object
+          properties:
+            status:
+              type: integer
+            url:
+              type: string
+            headers:
+              type: object
+            body:
+              type: string
+          required: ["status", "url", "headers", "body"]
+      config:
+        default_method: "GET"
+    - name: shell
+      kind: shell
+      description: "Runs a shell command"
+      interface:
+        input_schema:
+          type: object
+          properties:
+            command:
+              type: string
+            args:
+              type: array
+              items:
+                type: string
+          required: ["command"]
+        output_schema:
+          type: object
+          properties:
+            stdout:
+              type: string
+            stderr:
+              type: string
+            status:
+              type: integer
+          required: ["stdout", "stderr", "status"]
+      config:
+        timeout_ms: 10000
+    - name: file_read
+      kind: file_read
+      description: "Reads a file from disk"
+      interface:
+        input_schema:
+          type: object
+          properties:
+            path:
+              type: string
+          required: ["path"]
+        output_schema:
+          type: object
+          properties:
+            content:
+              type: string
+            path:
+              type: string
+          required: ["content", "path"]
+      config:
+        root_dir: "."
+    - name: file_write
+      kind: file_write
+      description: "Writes a file to disk"
+      interface:
+        input_schema:
+          type: object
+          properties:
+            path:
+              type: string
+            content:
+              type: string
+            append:
+              type: boolean
+          required: ["path", "content"]
+        output_schema:
+          type: object
+          properties:
+            path:
+              type: string
+            bytes:
+              type: integer
+          required: ["path", "bytes"]
+      config:
+        root_dir: "."
+        create_dirs: true

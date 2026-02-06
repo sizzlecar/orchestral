@@ -2,11 +2,16 @@
 
 ## Project Structure & Module Organization
 - Workspace root: `Cargo.toml`, `Cargo.lock`, `readme.md`.
-- Core crates:
-  - `orchestral-core/` — deterministic abstractions (Intent/Plan/Step/Task), planner/normalizer/executor.
-  - `orchestral-runtime/` — Thread/Interaction model, concurrency policies, runtime orchestration.
-  - `orchestral-stores/` — Event/Task/Reference store traits + in-memory implementations.
-  - `orchestral-actions/` — placeholder for built-in Actions.
+- Core crates are under `crates/`:
+  - `crates/orchestral-core/` — deterministic abstractions (Intent/Plan/Step/Task), planner/normalizer/executor.
+  - `crates/orchestral-runtime/` — Thread/Interaction model, concurrency policies, runtime orchestration.
+  - `crates/orchestral-stores/` — Event/Task/Reference store traits + in-memory implementations.
+  - `crates/orchestral-actions/` — built-in Actions.
+- Applications are under `apps/`:
+  - `apps/orchestral-cli/`
+  - `apps/orchestral-server/`
+- Runtime configs are under `configs/`.
+- Frontend project is under `web/orchestral-web/`.
 - `examples/` — runnable demos (e.g., `examples/basic_usage.rs`).
 - `docs/` — developer notes (`docs/dev.md`).
 - `target/` — build artifacts (generated).
