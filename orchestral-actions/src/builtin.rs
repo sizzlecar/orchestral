@@ -213,6 +213,34 @@ fn expression_command_tokens(input: &str) -> HashSet<String> {
         .collect()
 }
 
+fn expression_command_names(input: &str) -> HashSet<String> {
+    input
+        .split(|c: char| matches!(c, '|' | '&' | ';' | '\n'))
+        .filter_map(first_command_name_from_segment)
+        .collect()
+}
+
+fn first_command_name_from_segment(segment: &str) -> Option<String> {
+    for raw in segment.split_whitespace() {
+        let token =
+            raw.trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '-' && c != '.');
+        if token.is_empty() {
+            continue;
+        }
+        // Skip environment assignments like FOO=bar CMD ...
+        if token.contains('=')
+            && !token.starts_with('=')
+            && token
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '=')
+        {
+            continue;
+        }
+        return Some(normalize_command_name(token));
+    }
+    None
+}
+
 fn requires_destructive_approval(
     use_shell: bool,
     command_name: &str,
@@ -890,7 +918,18 @@ impl Action for ShellAction {
             }
         }
         if let Some(allowed) = &self.allowed_commands {
-            if !allowed.contains(&command_name) {
+            if use_shell {
+                let mut names = expression_command_names(&command);
+                if names.is_empty() {
+                    names.insert(command_name.clone());
+                }
+                if let Some(disallowed) = names.iter().find(|name| !allowed.contains(*name)) {
+                    return ActionResult::error(format!(
+                        "Shell expression command '{}' is not in allowed_commands policy",
+                        disallowed
+                    ));
+                }
+            } else if !allowed.contains(&command_name) {
                 return ActionResult::error(format!(
                     "Command '{}' is not in allowed_commands policy",
                     command_name
@@ -1528,6 +1567,35 @@ mod tests {
             match result {
                 ActionResult::Error { message } => {
                     assert!(message.contains("contains blocked command"));
+                }
+                other => panic!("expected error, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn test_shell_blocks_expression_when_contains_disallowed_command() {
+        tokio_test::block_on(async {
+            let spec = ActionSpec {
+                name: "shell".to_string(),
+                kind: "shell".to_string(),
+                description: None,
+                config: json!({
+                    "allow_shell_expression": true,
+                    "allowed_commands": ["echo"]
+                }),
+                interface: None,
+            };
+            let action = ShellAction::from_spec(&spec);
+            let input = ActionInput::with_params(json!({
+                "command": "echo ok && rm demo.txt",
+                "shell": true
+            }));
+            let result = action.run(input, test_ctx()).await;
+            match result {
+                ActionResult::Error { message } => {
+                    assert!(message.contains("allowed_commands"));
+                    assert!(message.contains("rm"));
                 }
                 other => panic!("expected error, got {:?}", other),
             }

@@ -589,12 +589,57 @@ impl LlmClient for HttpLlmClient {
 }
 
 fn extract_json(text: &str) -> Option<String> {
-    let start = text.find('{')?;
-    let end = text.rfind('}')?;
-    if end <= start {
-        return None;
+    for (start, ch) in text.char_indices() {
+        if ch != '{' {
+            continue;
+        }
+        if let Some(end) = find_json_object_end(text, start) {
+            let candidate = &text[start..=end];
+            if serde_json::from_str::<serde_json::Value>(candidate)
+                .map(|v| v.is_object())
+                .unwrap_or(false)
+            {
+                return Some(candidate.to_string());
+            }
+        }
     }
-    Some(text[start..=end].to_string())
+    None
+}
+
+fn find_json_object_end(text: &str, start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (idx, ch) in text[start..].char_indices() {
+        let abs = start + idx;
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    return Some(abs);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -721,5 +766,22 @@ mod tests {
             }
             _ => panic!("expected clarification output"),
         }
+    }
+
+    #[test]
+    fn test_extract_json_ignores_non_json_braces() {
+        let raw = r#"Preface {not json} -> {"type":"DIRECT_RESPONSE","message":"ok"} trailing"#;
+        let json = extract_json(raw).expect("json");
+        assert_eq!(json, r#"{"type":"DIRECT_RESPONSE","message":"ok"}"#);
+    }
+
+    #[test]
+    fn test_extract_json_handles_braces_inside_strings() {
+        let raw = r#"noise {"type":"DIRECT_RESPONSE","message":"value with } brace"} end"#;
+        let json = extract_json(raw).expect("json");
+        assert_eq!(
+            json,
+            r#"{"type":"DIRECT_RESPONSE","message":"value with } brace"}"#
+        );
     }
 }

@@ -1638,12 +1638,35 @@ fn complete_wait_step_for_resume(
         _ => return,
     };
 
-    if let Some(step) = plan
+    let completed: std::collections::HashSet<&str> =
+        completed_steps.iter().map(String::as_str).collect();
+    let candidates = plan
         .steps
         .iter()
-        .find(|s| s.kind == target_kind && !completed_steps.iter().any(|id| id == &s.id))
-    {
-        dag.mark_completed(&step.id);
+        .filter(|s| {
+            s.kind == target_kind
+                && !completed.contains(s.id.as_str())
+                && wait_step_matches_resume_event(s, event)
+                && s.depends_on
+                    .iter()
+                    .all(|dep| completed.contains(dep.as_str()))
+        })
+        .collect::<Vec<_>>();
+    if candidates.len() == 1 {
+        dag.mark_completed(&candidates[0].id);
+    }
+}
+
+fn wait_step_matches_resume_event(step: &orchestral_core::types::Step, event: &Event) -> bool {
+    match event {
+        Event::ExternalEvent { kind, .. } if step.kind == StepKind::WaitEvent => step
+            .params
+            .get("event_type")
+            .and_then(|v| v.as_str())
+            .map(|expected| expected == "*" || expected.eq_ignore_ascii_case(kind))
+            .unwrap_or(true),
+        Event::UserInput { .. } if step.kind == StepKind::WaitUser => true,
+        _ => false,
     }
 }
 
@@ -1677,7 +1700,7 @@ fn interaction_state_from_task(state: &TaskState) -> InteractionState {
 mod tests {
     use super::*;
     use orchestral_core::executor::{ExecutionDag, ExecutionProgressEvent};
-    use orchestral_core::types::{Plan, Step, StepIoBinding};
+    use orchestral_core::types::{Plan, Step, StepIoBinding, StepKind};
     use orchestral_stores::{BroadcastEventBus, EventBus, EventStore, InMemoryEventStore};
     use serde_json::json;
 
@@ -1696,6 +1719,34 @@ mod tests {
         complete_wait_step_for_resume(&mut dag, &plan, &[], &event);
 
         assert!(dag.completed_nodes().contains(&"wait"));
+    }
+
+    #[test]
+    fn test_complete_wait_step_for_resume_matches_wait_event_kind() {
+        let mut wait_timer = Step::action("wait_timer", "wait_event");
+        wait_timer.kind = StepKind::WaitEvent;
+        wait_timer.params = json!({"event_type":"timer"});
+
+        let mut wait_webhook = Step::action("wait_webhook", "wait_event");
+        wait_webhook.kind = StepKind::WaitEvent;
+        wait_webhook.params = json!({"event_type":"webhook"});
+
+        let plan = Plan::new(
+            "goal",
+            vec![
+                wait_timer,
+                Step::action("prep", "noop"),
+                wait_webhook.with_depends_on(vec!["prep".to_string()]),
+            ],
+        );
+        let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
+        dag.mark_completed("prep");
+        let event = Event::external("thread-1", "webhook", json!({"ok":true}));
+
+        complete_wait_step_for_resume(&mut dag, &plan, &["prep".to_string()], &event);
+
+        assert!(dag.completed_nodes().contains(&"wait_webhook"));
+        assert!(!dag.completed_nodes().contains(&"wait_timer"));
     }
 
     #[test]

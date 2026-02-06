@@ -166,7 +166,8 @@ impl ExecutionDag {
             .nodes
             .iter()
             .filter(|(_, node)| {
-                node.state == NodeState::Pending && node.dependencies_satisfied(&self.nodes)
+                matches!(node.state, NodeState::Pending | NodeState::Ready)
+                    && node.dependencies_satisfied(&self.nodes)
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -174,7 +175,9 @@ impl ExecutionDag {
         // Mark ready nodes
         for id in &self.ready_nodes {
             if let Some(node) = self.nodes.get_mut(id) {
-                node.state = NodeState::Ready;
+                if node.state == NodeState::Pending {
+                    node.state = NodeState::Ready;
+                }
             }
         }
     }
@@ -1631,5 +1634,33 @@ mod tests {
             metadata.get("path").and_then(|v| v.as_str()),
             Some("output/统计人数.md")
         );
+    }
+
+    #[test]
+    fn test_execute_with_max_parallel_one_keeps_remaining_ready_nodes() {
+        tokio_test::block_on(async {
+            let mut registry = ActionRegistry::new();
+            registry.register(Arc::new(StaticAction::new("noop", ActionResult::success())));
+            let executor = Executor::new(registry).with_max_parallel(1);
+
+            let plan = Plan::new(
+                "fan-out",
+                vec![
+                    Step::action("s1", "noop"),
+                    Step::action("s2", "noop"),
+                    Step::action("s3", "noop"),
+                ],
+            );
+            let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
+            let ctx = ExecutorContext::new(
+                "task-1",
+                Arc::new(RwLock::new(WorkingSet::new())),
+                Arc::new(NoopReferenceStore),
+            );
+
+            let result = executor.execute(&mut dag, &ctx).await;
+            assert!(matches!(result, ExecutionResult::Completed));
+            assert_eq!(dag.completed_nodes().len(), 3);
+        });
     }
 }
