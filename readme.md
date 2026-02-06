@@ -30,10 +30,17 @@
 orchestral/                  # Cargo workspace root
 ├── Cargo.toml
 ├── README.md
-├── orchestral-core/         # 核心抽象与确定性逻辑
-├── orchestral-runtime/      # Thread Runtime + 并发/中断/调度
-├── orchestral-stores/       # 各类存储实现（InMemory / Redis / DB）
-├── orchestral-actions/      # 官方 Action 集（可选）
+├── crates/
+│   ├── orchestral-core/     # 核心抽象与确定性逻辑
+│   ├── orchestral-runtime/  # Thread Runtime + 并发/中断/调度
+│   ├── orchestral-stores/   # 各类存储实现（InMemory / Redis / DB）
+│   └── orchestral-actions/  # 官方 Action 集（可选）
+├── apps/
+│   ├── orchestral-cli/
+│   └── orchestral-server/
+├── configs/
+├── web/
+│   └── orchestral-web/
 └── examples/                # 完整示例
 ```
 
@@ -84,9 +91,9 @@ append-only 的事实，Message 只是 Event 的一种。
 
 ```toml
 [dependencies]
-orchestral-core = { path = "orchestral-core" }
-orchestral-runtime = { path = "orchestral-runtime" }
-orchestral-stores = { path = "orchestral-stores" }
+orchestral-core = { path = "crates/orchestral-core" }
+orchestral-runtime = { path = "crates/orchestral-runtime" }
+orchestral-stores = { path = "crates/orchestral-stores" }
 ```
 
 ### 基本用法
@@ -146,7 +153,7 @@ Orchestral 使用 stdin/stdout 传递 JSON：
 - 响应：`ActionResult` JSON（推荐），或简写 `{ "exports": {...} }`
 
 示例插件：`examples/plugins/echo_plugin.py`（读取 stdin，返回 success exports）。
-配置示例见：`config/orchestral.cli.yaml` 中的 `external_process` 注释块。
+配置示例见：`configs/orchestral.cli.yaml` 中的 `external_process` 注释块。
 
 ### 安全内置 Action（shell/file_read/file_write）
 

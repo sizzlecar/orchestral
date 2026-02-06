@@ -21,7 +21,7 @@ enum Command {
 
 #[derive(Debug, Args, Clone)]
 struct RunArgs {
-    #[arg(long, default_value = "config/orchestral.cli.yaml")]
+    #[arg(long, default_value = "configs/orchestral.cli.yaml")]
     config: PathBuf,
     #[arg(long)]
     thread_id: Option<String>,
@@ -35,7 +35,7 @@ struct RunArgs {
 
 #[derive(Debug, Args, Clone)]
 struct ServerArgs {
-    #[arg(long, default_value = "config/orchestral.cli.yaml")]
+    #[arg(long, default_value = "configs/orchestral.cli.yaml")]
     config: PathBuf,
     #[arg(long, default_value = "127.0.0.1:8080")]
     listen: SocketAddr,
@@ -67,7 +67,7 @@ impl Cli {
             None => {
                 ensure_log_filter(false);
                 crate::tui::run_session(
-                    PathBuf::from("config/orchestral.cli.yaml"),
+                    PathBuf::from("configs/orchestral.cli.yaml"),
                     None,
                     None,
                     false,

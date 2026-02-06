@@ -21,7 +21,7 @@ use orchestral_planners::{DefaultLlmClientFactory, LlmClientFactory, LlmInvocati
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load the unified configuration
-    let config_path = Path::new("config/orchestral.yaml");
+    let config_path = Path::new("configs/orchestral.yaml");
     let config: OrchestralConfig = load_config(config_path)?;
 
     println!("=== Configuration Loaded ===\n");
@@ -91,7 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Action Registry Demo ===\n");
 
     let action_factory = Arc::new(DefaultActionFactory::new());
-    let registry_manager = ActionRegistryManager::new("config/orchestral.yaml", action_factory);
+    let registry_manager = ActionRegistryManager::new("configs/orchestral.yaml", action_factory);
 
     // Load from the unified config instead
     let registry = registry_manager.registry();

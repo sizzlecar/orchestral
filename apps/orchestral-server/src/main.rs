@@ -6,7 +6,7 @@ use clap::Parser;
 #[derive(Debug, Parser)]
 #[command(name = "orchestral-server")]
 struct Args {
-    #[arg(long, default_value = "config/orchestral.cli.yaml")]
+    #[arg(long, default_value = "configs/orchestral.cli.yaml")]
     config: PathBuf,
     #[arg(long, default_value = "127.0.0.1:8080")]
     listen: SocketAddr,

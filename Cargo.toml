@@ -1,17 +1,17 @@
 [workspace]
 resolver = "2"
 members = [
-    "orchestral-core",
-    "orchestral-config",
-    "orchestral-context",
-    "orchestral-planners",
-    "orchestral-runtime",
-    "orchestral-stores",
-    "orchestral-actions",
-    "orchestral-api",
-    "orchestral-channels",
-    "orchestral-server",
-    "orchestral-cli",
+    "crates/orchestral-core",
+    "crates/orchestral-config",
+    "crates/orchestral-context",
+    "crates/orchestral-planners",
+    "crates/orchestral-runtime",
+    "crates/orchestral-stores",
+    "crates/orchestral-actions",
+    "crates/orchestral-api",
+    "crates/orchestral-channels",
+    "apps/orchestral-server",
+    "apps/orchestral-cli",
     "examples",
 ]
 
@@ -49,16 +49,16 @@ uuid = { version = "1", features = ["v4", "serde"] }
 redis = { version = "0.27", features = ["aio", "tokio-comp"] }
 
 # Internal crates
-orchestral-core = { path = "orchestral-core" }
-orchestral-config = { path = "orchestral-config" }
-orchestral-context = { path = "orchestral-context" }
-orchestral-planners = { path = "orchestral-planners" }
-orchestral-runtime = { path = "orchestral-runtime" }
-orchestral-stores = { path = "orchestral-stores" }
-orchestral-actions = { path = "orchestral-actions" }
-orchestral-api = { path = "orchestral-api" }
-orchestral-channels = { path = "orchestral-channels" }
-orchestral-server = { path = "orchestral-server" }
+orchestral-core = { path = "crates/orchestral-core" }
+orchestral-config = { path = "crates/orchestral-config" }
+orchestral-context = { path = "crates/orchestral-context" }
+orchestral-planners = { path = "crates/orchestral-planners" }
+orchestral-runtime = { path = "crates/orchestral-runtime" }
+orchestral-stores = { path = "crates/orchestral-stores" }
+orchestral-actions = { path = "crates/orchestral-actions" }
+orchestral-api = { path = "crates/orchestral-api" }
+orchestral-channels = { path = "crates/orchestral-channels" }
+orchestral-server = { path = "apps/orchestral-server" }
 
 [workspace.dependencies.tokio-test]
 version = "0.4"

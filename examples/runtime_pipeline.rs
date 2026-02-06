@@ -1,6 +1,6 @@
 //! Runtime pipeline example for Orchestral
 //!
-//! Demonstrates startup from a single `config/orchestral.yaml`.
+//! Demonstrates startup from a single `configs/orchestral.yaml`.
 
 use serde_json::json;
 
@@ -11,7 +11,7 @@ use orchestral_stores::Event;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Orchestral Runtime Pipeline Example ===\n");
 
-    let app = RuntimeApp::from_config_path("config/orchestral.yaml").await?;
+    let app = RuntimeApp::from_config_path("configs/orchestral.yaml").await?;
     let thread_id = app.orchestrator.thread_runtime.thread_id().await;
 
     let event = Event::user_input(
