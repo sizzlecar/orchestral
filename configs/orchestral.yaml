@@ -8,7 +8,6 @@ runtime:
   max_interactions_per_thread: 10
   auto_cleanup: true
   concurrency_policy: interrupt_and_start_new
-  strict_imports: true
   strict_exports: true
 
 planner:

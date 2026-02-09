@@ -113,8 +113,6 @@ pub struct RuntimeConfig {
     #[serde(default = "default_concurrency_policy")]
     pub concurrency_policy: String,
     #[serde(default = "default_true")]
-    pub strict_imports: bool,
-    #[serde(default = "default_true")]
     pub strict_exports: bool,
 }
 
@@ -124,7 +122,6 @@ impl Default for RuntimeConfig {
             max_interactions_per_thread: default_max_interactions(),
             auto_cleanup: true,
             concurrency_policy: default_concurrency_policy(),
-            strict_imports: true,
             strict_exports: true,
         }
     }

@@ -14,6 +14,8 @@ use std::sync::RwLock;
 
 use orchestral_core::store::StoreError;
 
+const DEFAULT_IN_MEMORY_EVENT_LIMIT: usize = 20_000;
+
 /// Type alias for Thread ID
 pub type ThreadId = String;
 
@@ -238,13 +240,20 @@ pub trait EventStore: Send + Sync {
 /// In-memory implementation for development and testing
 pub struct InMemoryEventStore {
     events: RwLock<Vec<Event>>,
+    max_events: usize,
 }
 
 impl InMemoryEventStore {
     /// Create a new in-memory event store
     pub fn new() -> Self {
+        Self::with_max_events(DEFAULT_IN_MEMORY_EVENT_LIMIT)
+    }
+
+    /// Create an in-memory event store with a hard capacity limit.
+    pub fn with_max_events(max_events: usize) -> Self {
         Self {
             events: RwLock::new(Vec::new()),
+            max_events: max_events.max(1),
         }
     }
 }
@@ -262,6 +271,15 @@ impl EventStore for InMemoryEventStore {
             .events
             .write()
             .map_err(|e| StoreError::Internal(e.to_string()))?;
+        if events.len() >= self.max_events {
+            let overflow = events
+                .len()
+                .saturating_add(1)
+                .saturating_sub(self.max_events);
+            if overflow > 0 {
+                events.drain(0..overflow);
+            }
+        }
         events.push(event);
         Ok(())
     }
@@ -438,5 +456,45 @@ impl EventStore for RedisEventStore {
             .await
             .map_err(|e| StoreError::Connection(e.to_string()))?;
         self.load_events_by_sequences(sequence_ids).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_in_memory_event_store_evicts_oldest_events() {
+        tokio_test::block_on(async {
+            let store = InMemoryEventStore::with_max_events(2);
+            store
+                .append(Event::user_input("thread-1", "i1", json!({"n": 1})))
+                .await
+                .expect("append e1");
+            store
+                .append(Event::user_input("thread-1", "i2", json!({"n": 2})))
+                .await
+                .expect("append e2");
+            store
+                .append(Event::user_input("thread-1", "i3", json!({"n": 3})))
+                .await
+                .expect("append e3");
+
+            let events = store
+                .query_by_thread("thread-1")
+                .await
+                .expect("query events");
+            assert_eq!(events.len(), 2);
+
+            match &events[0] {
+                Event::UserInput { interaction_id, .. } => assert_eq!(interaction_id, "i2"),
+                other => panic!("unexpected event: {:?}", other),
+            }
+            match &events[1] {
+                Event::UserInput { interaction_id, .. } => assert_eq!(interaction_id, "i3"),
+                other => panic!("unexpected event: {:?}", other),
+            }
+        });
     }
 }

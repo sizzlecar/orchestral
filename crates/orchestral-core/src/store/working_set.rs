@@ -2,7 +2,13 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+
+const DEFAULT_WORKING_SET_MAX_ENTRIES: usize = 10_000;
+
+fn default_max_entries() -> usize {
+    DEFAULT_WORKING_SET_MAX_ENTRIES
+}
 
 /// Data scope for WorkingSet
 /// Avoids naming conflicts and data pollution
@@ -37,15 +43,46 @@ impl Scope {
 }
 
 /// Working set - weakly-typed KV data container for inter-step communication
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkingSet {
     data: HashMap<(Scope, String), Value>,
+    order: VecDeque<(Scope, String)>,
+    #[serde(default = "default_max_entries")]
+    max_entries: usize,
+}
+
+impl Default for WorkingSet {
+    fn default() -> Self {
+        Self {
+            data: HashMap::new(),
+            order: VecDeque::new(),
+            max_entries: default_max_entries(),
+        }
+    }
 }
 
 impl WorkingSet {
     /// Create a new empty working set
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create a working set with a hard entry limit.
+    pub fn with_max_entries(max_entries: usize) -> Self {
+        Self {
+            max_entries: max_entries.max(1),
+            ..Self::default()
+        }
+    }
+
+    /// Number of key-value entries currently stored.
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Returns true when there are no entries in the working set.
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
     }
 
     /// Get a value by scope and key
@@ -55,12 +92,20 @@ impl WorkingSet {
 
     /// Set a value by scope and key
     pub fn set(&mut self, scope: Scope, key: impl Into<String>, value: Value) {
-        self.data.insert((scope, key.into()), value);
+        let entry_key = (scope, key.into());
+        self.data.insert(entry_key.clone(), value);
+        self.touch_entry(entry_key);
+        self.evict_if_needed();
     }
 
     /// Remove a value by scope and key
     pub fn remove(&mut self, scope: &Scope, key: &str) -> Option<Value> {
-        self.data.remove(&(scope.clone(), key.to_string()))
+        let entry_key = (scope.clone(), key.to_string());
+        let removed = self.data.remove(&entry_key);
+        if removed.is_some() {
+            self.remove_from_order(&entry_key);
+        }
+        removed
     }
 
     /// Check if a key exists in scope
@@ -71,12 +116,14 @@ impl WorkingSet {
     /// Clear all data in a specific scope
     pub fn clear_scope(&mut self, scope: &Scope) {
         self.data.retain(|(s, _), _| s != scope);
+        self.order.retain(|(s, _)| s != scope);
     }
 
     /// Clear all step scopes
     pub fn clear_all_step_scopes(&mut self) {
         self.data
             .retain(|(s, _), _| !matches!(s, Scope::Step { .. }));
+        self.order.retain(|(s, _)| !matches!(s, Scope::Step { .. }));
     }
 
     // ============ Convenience methods for Task scope ============
@@ -155,5 +202,56 @@ impl WorkingSet {
         for (k, v) in data {
             self.set_task(k, v);
         }
+    }
+
+    fn touch_entry(&mut self, key: (Scope, String)) {
+        self.remove_from_order(&key);
+        self.order.push_back(key);
+    }
+
+    fn remove_from_order(&mut self, key: &(Scope, String)) {
+        self.order.retain(|item| item != key);
+    }
+
+    fn evict_if_needed(&mut self) {
+        while self.data.len() > self.max_entries {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.data.remove(&oldest);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_working_set_evicts_oldest_entry_when_limit_exceeded() {
+        let mut ws = WorkingSet::with_max_entries(2);
+        ws.set_task("a", json!(1));
+        ws.set_task("b", json!(2));
+        ws.set_task("c", json!(3));
+
+        assert_eq!(ws.len(), 2);
+        assert_eq!(ws.get_task("a"), None);
+        assert_eq!(ws.get_task("b"), Some(&json!(2)));
+        assert_eq!(ws.get_task("c"), Some(&json!(3)));
+    }
+
+    #[test]
+    fn test_working_set_update_marks_entry_as_recent() {
+        let mut ws = WorkingSet::with_max_entries(2);
+        ws.set_task("a", json!(1));
+        ws.set_task("b", json!(2));
+        ws.set_task("a", json!(11));
+        ws.set_task("c", json!(3));
+
+        assert_eq!(ws.len(), 2);
+        assert_eq!(ws.get_task("a"), Some(&json!(11)));
+        assert_eq!(ws.get_task("b"), None);
+        assert_eq!(ws.get_task("c"), Some(&json!(3)));
     }
 }

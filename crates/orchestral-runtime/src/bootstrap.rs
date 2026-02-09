@@ -209,7 +209,7 @@ impl RuntimeApp {
         };
 
         let executor = Executor::with_registry(action_registry_manager.registry())
-            .with_io_contract(config.runtime.strict_imports, config.runtime.strict_exports);
+            .with_export_contract(config.runtime.strict_exports);
         let planner = build_planner(&config)?;
         let result_interpreter = build_result_interpreter(&config)?;
 

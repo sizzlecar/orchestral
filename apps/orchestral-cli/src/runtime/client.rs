@@ -2,14 +2,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
-use tokio::sync::{mpsc, watch, Mutex};
-use tokio::time::{sleep, Duration};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use tokio::time::{timeout, Duration};
 use tracing::{debug, warn};
 
-use orchestral_channels::CliRuntime;
+use orchestral_channels::{ChannelEvent, CliRuntime};
 
 use super::event_projection::{project_event, UiEvent};
 use crate::runtime::protocol::{ActivityKind, RuntimeMsg, TransientSlot};
+
+const TURN_SETTLE_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Clone)]
 pub struct RuntimeClient {
@@ -50,10 +52,14 @@ impl RuntimeClient {
             .await
             .context("failed to subscribe events")?;
         let (stop_tx, mut stop_rx) = watch::channel(false);
+        let (expected_interaction_tx, expected_interaction_rx) =
+            watch::channel::<Option<String>>(None);
+        let (turn_settled_tx, turn_settled_rx) = oneshot::channel::<()>();
         let thread_id = self.thread_id.clone();
         let runtime_tx_events = runtime_tx.clone();
 
         let forward = tokio::spawn(async move {
+            let mut turn_settled_tx = Some(turn_settled_tx);
             let mut completed_steps: usize = 0;
             let mut total_steps: usize = 0;
             let mut last_preview: Option<String> = None;
@@ -89,6 +95,13 @@ impl RuntimeClient {
                         };
                         if event.thread_id() != thread_id {
                             continue;
+                        }
+                        if let Some(expected_interaction_id) = expected_interaction_rx.borrow().as_deref() {
+                            if let Some(event_interaction_id) = event_interaction_id(&event) {
+                                if event_interaction_id != expected_interaction_id {
+                                    continue;
+                                }
+                            }
                         }
                         let Some(ui_event) = project_event(&event) else {
                             continue;
@@ -288,6 +301,7 @@ impl RuntimeClient {
                                 }
                                 pending_execution_end = false;
                                 let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
+                                mark_turn_settled(&mut turn_settled_tx);
                             }
                             UiEvent::ExecutionCompleted { status } => {
                                 debug!(
@@ -312,6 +326,7 @@ impl RuntimeClient {
                                             .await;
                                         pending_execution_end = false;
                                         let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
+                                        mark_turn_settled(&mut turn_settled_tx);
                                     }
                                     None => {
                                         pending_execution_end = true;
@@ -377,11 +392,13 @@ impl RuntimeClient {
                                         debug!("tui action: execution_end after assistant_output (dedup)");
                                         pending_execution_end = false;
                                         let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
+                                        mark_turn_settled(&mut turn_settled_tx);
                                         assistant_rendered = false;
                                         last_preview = None;
                                         last_assistant_fingerprint = None;
                                         last_streamed_assistant = None;
                                     }
+                                    mark_turn_settled(&mut turn_settled_tx);
                                     continue;
                                 }
                                 // If a stream was open but no deduplicated final arrived, prefer the
@@ -398,10 +415,12 @@ impl RuntimeClient {
                                         .send(RuntimeMsg::OutputPersist(normalized))
                                         .await;
                                 }
+                                mark_turn_settled(&mut turn_settled_tx);
                                 if pending_execution_end {
                                     debug!("tui action: execution_end after assistant_output");
                                     pending_execution_end = false;
                                     let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
+                                    mark_turn_settled(&mut turn_settled_tx);
                                     assistant_rendered = false;
                                     last_preview = None;
                                     last_assistant_fingerprint = None;
@@ -443,10 +462,12 @@ impl RuntimeClient {
                                             done: true,
                                         })
                                         .await;
+                                    mark_turn_settled(&mut turn_settled_tx);
                                     if pending_execution_end && !streamed_assistant.trim().is_empty() {
                                         debug!("tui action: execution_end after assistant_stream done");
                                         pending_execution_end = false;
                                         let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
+                                        mark_turn_settled(&mut turn_settled_tx);
                                         assistant_rendered = false;
                                         last_preview = None;
                                         last_assistant_fingerprint = None;
@@ -464,6 +485,7 @@ impl RuntimeClient {
                                     .await;
                                 pending_execution_end = false;
                                 let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
+                                mark_turn_settled(&mut turn_settled_tx);
                             }
                         }
                     }
@@ -483,21 +505,46 @@ impl RuntimeClient {
                     }
                 }
                 let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
+                mark_turn_settled(&mut turn_settled_tx);
             }
         });
 
-        let result = self.runtime.submit_input(input.clone()).await.map(|_| ());
-        // Give projected runtime events a short drain window before stopping forwarder.
-        sleep(Duration::from_millis(120)).await;
+        let submit_result = self.runtime.submit_input(input).await;
+
+        match submit_result {
+            Ok(response) => {
+                if response.interaction_id.is_none() {
+                    if let Some(message) = response.message {
+                        let _ = runtime_tx
+                            .send(RuntimeMsg::OutputPersist(format!("Waiting: {}", message)))
+                            .await;
+                    }
+                    let _ = runtime_tx.send(RuntimeMsg::ExecutionEnd).await;
+                } else {
+                    let _ = expected_interaction_tx.send(response.interaction_id.clone());
+                    match timeout(TURN_SETTLE_TIMEOUT, turn_settled_rx).await {
+                        Ok(Ok(())) | Ok(Err(_)) => {
+                            // Forwarder observed terminal turn event.
+                        }
+                        Err(_) => {
+                            warn!("timeout waiting for terminal turn event; forcing execution end");
+                            let _ = runtime_tx.send(RuntimeMsg::ExecutionEnd).await;
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                let _ = stop_tx.send(true);
+                let _ = forward.await;
+                let _ = runtime_tx
+                    .send(RuntimeMsg::Error(format!("runtime error: {}", err)))
+                    .await;
+                return Err(anyhow::anyhow!(err));
+            }
+        }
+
         let _ = stop_tx.send(true);
         let _ = forward.await;
-
-        if let Err(err) = result {
-            let _ = runtime_tx
-                .send(RuntimeMsg::Error(format!("runtime error: {}", err)))
-                .await;
-            return Err(anyhow::anyhow!(err));
-        }
 
         Ok(())
     }
@@ -518,6 +565,24 @@ impl RuntimeClient {
                 text: "Interrupt requested".to_string(),
             })
             .await;
+    }
+}
+
+fn mark_turn_settled(turn_settled_tx: &mut Option<oneshot::Sender<()>>) {
+    if let Some(tx) = turn_settled_tx.take() {
+        let _ = tx.send(());
+    }
+}
+
+fn event_interaction_id(event: &ChannelEvent) -> Option<&str> {
+    match event {
+        ChannelEvent::UserInput { interaction_id, .. }
+        | ChannelEvent::AssistantOutput { interaction_id, .. }
+        | ChannelEvent::Artifact { interaction_id, .. } => Some(interaction_id.as_str()),
+        ChannelEvent::SystemTrace { payload, .. } => {
+            payload.get("interaction_id").and_then(|v| v.as_str())
+        }
+        ChannelEvent::ExternalEvent { .. } => None,
     }
 }
 
@@ -556,4 +621,22 @@ fn preview_to_activity_lines(preview: &str) -> Vec<String> {
         out.push("(empty)".to_string());
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_event_interaction_id_from_assistant_output() {
+        let event = ChannelEvent::assistant_output("thread-1", "int-1", json!({"message":"ok"}));
+        assert_eq!(event_interaction_id(&event), Some("int-1"));
+    }
+
+    #[test]
+    fn test_event_interaction_id_from_system_trace_payload() {
+        let event = ChannelEvent::trace("thread-1", "info", json!({"interaction_id":"int-2"}));
+        assert_eq!(event_interaction_id(&event), Some("int-2"));
+    }
 }

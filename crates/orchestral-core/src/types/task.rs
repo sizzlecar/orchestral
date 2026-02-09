@@ -196,3 +196,111 @@ impl Task {
         self.updated_at = Utc::now();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Intent;
+
+    fn sample_intent() -> Intent {
+        Intent::new("hello".to_string())
+    }
+
+    #[test]
+    fn test_task_state_classification_flags() {
+        assert!(TaskState::Planning.is_active());
+        assert!(TaskState::Executing.is_active());
+        assert!(!TaskState::Done.is_active());
+
+        assert!(TaskState::Done.is_terminal());
+        assert!(TaskState::Failed {
+            reason: "fatal".to_string(),
+            recoverable: false,
+        }
+        .is_terminal());
+        assert!(!TaskState::Failed {
+            reason: "recover".to_string(),
+            recoverable: true,
+        }
+        .is_terminal());
+
+        assert!(TaskState::Paused.is_resumable());
+        assert!(TaskState::WaitingUser {
+            prompt: "input".to_string(),
+            reason: WaitUserReason::Input,
+        }
+        .is_resumable());
+        assert!(TaskState::WaitingEvent {
+            event_type: "timer".to_string(),
+        }
+        .is_resumable());
+        assert!(TaskState::Failed {
+            reason: "recover".to_string(),
+            recoverable: true,
+        }
+        .is_resumable());
+        assert!(!TaskState::Done.is_resumable());
+    }
+
+    #[test]
+    fn test_task_transition_methods_update_state() {
+        let mut task = Task::new(sample_intent());
+        assert!(matches!(task.state, TaskState::Planning));
+
+        task.start_executing();
+        assert!(matches!(task.state, TaskState::Executing));
+
+        task.wait_for_user("need input");
+        assert!(matches!(
+            task.state,
+            TaskState::WaitingUser {
+                reason: WaitUserReason::Input,
+                ..
+            }
+        ));
+
+        let approval = ApprovalRequest {
+            reason: "dangerous command".to_string(),
+            command: Some("rm -rf /".to_string()),
+        };
+        task.wait_for_approval(&approval);
+        assert!(matches!(
+            task.state,
+            TaskState::WaitingUser {
+                reason: WaitUserReason::Approval { .. },
+                ..
+            }
+        ));
+
+        task.fail("temporary", true);
+        assert!(matches!(
+            task.state,
+            TaskState::Failed {
+                recoverable: true,
+                ..
+            }
+        ));
+
+        task.pause();
+        assert!(matches!(task.state, TaskState::Paused));
+
+        task.complete();
+        assert!(matches!(task.state, TaskState::Done));
+    }
+
+    #[test]
+    fn test_task_checkpoint_updates_payload() {
+        let mut task = Task::new(sample_intent());
+        let checkpoint = HashMap::from([
+            ("x".to_string(), Value::String("1".to_string())),
+            ("y".to_string(), Value::Number(2.into())),
+        ]);
+        task.set_checkpoint(vec!["s1".to_string(), "s2".to_string()], checkpoint.clone());
+
+        assert_eq!(
+            task.completed_step_ids,
+            vec!["s1".to_string(), "s2".to_string()]
+        );
+        assert_eq!(task.working_set_snapshot, checkpoint);
+    }
+}

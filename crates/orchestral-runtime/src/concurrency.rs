@@ -97,7 +97,10 @@ impl ConcurrencyPolicy for DefaultConcurrencyPolicy {
     }
 }
 
-/// Queue policy: Queue new inputs for later processing
+/// Queue policy placeholder.
+///
+/// Runtime-side queue execution is not implemented yet, so this policy currently
+/// rejects when busy with an explicit reason.
 pub struct QueueConcurrencyPolicy;
 
 impl ConcurrencyPolicy for QueueConcurrencyPolicy {
@@ -105,7 +108,9 @@ impl ConcurrencyPolicy for QueueConcurrencyPolicy {
         if running.is_idle() {
             ConcurrencyDecision::InterruptAndStartNew
         } else {
-            ConcurrencyDecision::Queue
+            ConcurrencyDecision::reject(
+                "Queue policy is not implemented; use interrupt/parallel/reject policy",
+            )
         }
     }
 }

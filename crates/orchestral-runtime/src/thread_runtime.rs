@@ -215,13 +215,13 @@ impl ThreadRuntime {
                 // Cancel all active interactions
                 self.cancel_all_active().await;
 
-                // Create new interaction
-                let thread_id = self.thread_id().await;
-                let interaction = Interaction::new(&thread_id);
-                let interaction_id = interaction.id.clone();
-
-                let mut interactions = self.interactions.write().await;
-                interactions.insert(interaction_id.clone(), interaction);
+                let interaction_id = match self.create_interaction_if_allowed().await {
+                    Ok(id) => id,
+                    Err(reason) => {
+                        self.persist_event(event).await?;
+                        return Ok(HandleEventResult::Rejected { reason });
+                    }
+                };
 
                 // Touch the thread
                 self.thread.write().await.touch();
@@ -238,18 +238,21 @@ impl ThreadRuntime {
                 Ok(HandleEventResult::Rejected { reason })
             }
             ConcurrencyDecision::Queue => {
-                // Store the event as-is (queueing policy handled elsewhere)
+                // Queueing is not implemented yet. Reject explicitly to avoid silent drops.
                 self.persist_event(event).await?;
-                Ok(HandleEventResult::Queued)
+                Ok(HandleEventResult::Rejected {
+                    reason: "Queue policy is configured but queue execution is not implemented"
+                        .to_string(),
+                })
             }
             ConcurrencyDecision::Parallel => {
-                // Create new interaction without interrupting existing ones
-                let thread_id = self.thread_id().await;
-                let interaction = Interaction::new(&thread_id);
-                let interaction_id = interaction.id.clone();
-
-                let mut interactions = self.interactions.write().await;
-                interactions.insert(interaction_id.clone(), interaction);
+                let interaction_id = match self.create_interaction_if_allowed().await {
+                    Ok(id) => id,
+                    Err(reason) => {
+                        self.persist_event(event).await?;
+                        return Ok(HandleEventResult::Rejected { reason });
+                    }
+                };
 
                 // Touch the thread
                 self.thread.write().await.touch();
@@ -276,12 +279,13 @@ impl ThreadRuntime {
                 } else {
                     // No active interaction, start new
                     drop(interactions);
-                    let thread_id = self.thread_id().await;
-                    let interaction = Interaction::new(&thread_id);
-                    let interaction_id = interaction.id.clone();
-
-                    let mut interactions = self.interactions.write().await;
-                    interactions.insert(interaction_id.clone(), interaction);
+                    let interaction_id = match self.create_interaction_if_allowed().await {
+                        Ok(id) => id,
+                        Err(reason) => {
+                            self.persist_event(event).await?;
+                            return Ok(HandleEventResult::Rejected { reason });
+                        }
+                    };
 
                     self.thread.write().await.touch();
 
@@ -293,6 +297,27 @@ impl ThreadRuntime {
                 }
             }
         }
+    }
+
+    async fn create_interaction_if_allowed(&self) -> Result<InteractionId, String> {
+        let thread_id = self.thread_id().await;
+        let interaction = Interaction::new(&thread_id);
+        let interaction_id = interaction.id.clone();
+
+        let mut interactions = self.interactions.write().await;
+        let active_count = interactions
+            .values()
+            .filter(|i| !i.state.is_terminal())
+            .count();
+        if active_count >= self.config.max_interactions_per_thread {
+            return Err(format!(
+                "Maximum active interactions ({}) reached",
+                self.config.max_interactions_per_thread
+            ));
+        }
+
+        interactions.insert(interaction_id.clone(), interaction);
+        Ok(interaction_id)
     }
 
     async fn validate_event(&self, event: &Event) -> Result<(), RuntimeError> {
@@ -537,6 +562,7 @@ pub enum RuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::concurrency::{ParallelConcurrencyPolicy, QueueConcurrencyPolicy};
     use chrono::{Duration, Utc};
     use orchestral_stores::{BroadcastEventBus, InMemoryEventStore};
     use serde_json::json;
@@ -630,6 +656,60 @@ mod tests {
                     assert_eq!(payload["message"], "hello");
                 }
                 _ => panic!("expected user_input event"),
+            }
+        });
+    }
+
+    #[test]
+    fn test_rejects_when_max_active_interactions_reached() {
+        tokio_test::block_on(async {
+            let thread_id = "thread-max";
+            let runtime = ThreadRuntime::with_policy_and_config(
+                Thread::with_id(thread_id),
+                Arc::new(InMemoryEventStore::new()),
+                Arc::new(ParallelConcurrencyPolicy::new(10)),
+                ThreadRuntimeConfig {
+                    max_interactions_per_thread: 1,
+                    auto_cleanup: false,
+                },
+            );
+
+            let first = Event::user_input(thread_id, "a", json!({"message":"first"}));
+            let first_result = runtime.handle_event(first).await.unwrap();
+            assert!(matches!(first_result, HandleEventResult::Started { .. }));
+
+            let second = Event::user_input(thread_id, "b", json!({"message":"second"}));
+            let second_result = runtime.handle_event(second).await.unwrap();
+            match second_result {
+                HandleEventResult::Rejected { reason } => {
+                    assert!(reason.contains("Maximum active interactions (1) reached"));
+                }
+                other => panic!("expected rejected result, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn test_queue_policy_returns_rejected_not_queued() {
+        tokio_test::block_on(async {
+            let thread_id = "thread-queue";
+            let runtime = ThreadRuntime::with_policy(
+                Thread::with_id(thread_id),
+                Arc::new(InMemoryEventStore::new()),
+                Arc::new(QueueConcurrencyPolicy),
+            );
+
+            let first = Event::user_input(thread_id, "a", json!({"message":"first"}));
+            let first_result = runtime.handle_event(first).await.unwrap();
+            assert!(matches!(first_result, HandleEventResult::Started { .. }));
+
+            let second = Event::user_input(thread_id, "b", json!({"message":"second"}));
+            let second_result = runtime.handle_event(second).await.unwrap();
+            match second_result {
+                HandleEventResult::Rejected { reason } => {
+                    assert!(reason.contains("Queue policy"));
+                }
+                other => panic!("expected rejected result, got {:?}", other),
             }
         });
     }
