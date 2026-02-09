@@ -2,23 +2,39 @@
 
 use async_trait::async_trait;
 use redis::AsyncCommands;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::RwLock;
 
 use orchestral_core::store::{StoreError, TaskStore};
 use orchestral_core::types::{Task, TaskState};
 
+const DEFAULT_IN_MEMORY_TASK_LIMIT: usize = 5_000;
+
 /// In-memory implementation for development and testing
 pub struct InMemoryTaskStore {
     tasks: RwLock<HashMap<String, Task>>,
+    order: RwLock<VecDeque<String>>,
+    max_tasks: usize,
 }
 
 impl InMemoryTaskStore {
     /// Create a new in-memory store
     pub fn new() -> Self {
+        Self::with_max_tasks(DEFAULT_IN_MEMORY_TASK_LIMIT)
+    }
+
+    /// Create a new in-memory store with a hard capacity limit.
+    pub fn with_max_tasks(max_tasks: usize) -> Self {
         Self {
             tasks: RwLock::new(HashMap::new()),
+            order: RwLock::new(VecDeque::new()),
+            max_tasks: max_tasks.max(1),
         }
+    }
+
+    fn touch_order(order: &mut VecDeque<String>, task_id: &str) {
+        order.retain(|id| id != task_id);
+        order.push_back(task_id.to_string());
     }
 }
 
@@ -35,7 +51,18 @@ impl TaskStore for InMemoryTaskStore {
             .tasks
             .write()
             .map_err(|e| StoreError::Internal(e.to_string()))?;
+        let mut order = self
+            .order
+            .write()
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+
+        if !tasks.contains_key(&task.id) && tasks.len() >= self.max_tasks {
+            if let Some(oldest_id) = order.pop_front() {
+                tasks.remove(&oldest_id);
+            }
+        }
         tasks.insert(task.id.clone(), task.clone());
+        Self::touch_order(&mut order, &task.id);
         Ok(())
     }
 
@@ -54,6 +81,11 @@ impl TaskStore for InMemoryTaskStore {
             .map_err(|e| StoreError::Internal(e.to_string()))?;
         if let Some(task) = tasks.get_mut(task_id) {
             task.set_state(state);
+            let mut order = self
+                .order
+                .write()
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+            Self::touch_order(&mut order, task_id);
             Ok(())
         } else {
             Err(StoreError::NotFound(task_id.to_string()))
@@ -79,7 +111,15 @@ impl TaskStore for InMemoryTaskStore {
             .tasks
             .write()
             .map_err(|e| StoreError::Internal(e.to_string()))?;
-        Ok(tasks.remove(task_id).is_some())
+        let removed = tasks.remove(task_id).is_some();
+        if removed {
+            let mut order = self
+                .order
+                .write()
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+            order.retain(|id| id != task_id);
+        }
+        Ok(removed)
     }
 }
 
@@ -184,5 +224,32 @@ impl TaskStore for RedisTaskStore {
             .await
             .map_err(|e| StoreError::Connection(e.to_string()))?;
         Ok(deleted > 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orchestral_core::types::Intent;
+
+    fn task_with_id(id: &str) -> Task {
+        let mut task = Task::new(Intent::new(format!("intent-{}", id)));
+        task.id = id.to_string();
+        task
+    }
+
+    #[test]
+    fn test_in_memory_task_store_evicts_oldest_when_limit_exceeded() {
+        tokio_test::block_on(async {
+            let store = InMemoryTaskStore::with_max_tasks(2);
+
+            store.save(&task_with_id("t1")).await.expect("save t1");
+            store.save(&task_with_id("t2")).await.expect("save t2");
+            store.save(&task_with_id("t3")).await.expect("save t3");
+
+            assert!(store.load("t1").await.expect("load t1").is_none());
+            assert!(store.load("t2").await.expect("load t2").is_some());
+            assert!(store.load("t3").await.expect("load t3").is_some());
+        });
     }
 }

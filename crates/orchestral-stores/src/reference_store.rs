@@ -6,16 +6,25 @@ use std::sync::RwLock;
 
 use orchestral_core::store::{Reference, ReferenceStore, ReferenceType, StoreError};
 
+const DEFAULT_IN_MEMORY_REFERENCE_LIMIT: usize = 10_000;
+
 /// In-memory implementation for development and testing
 pub struct InMemoryReferenceStore {
     references: RwLock<Vec<Reference>>,
+    max_references: usize,
 }
 
 impl InMemoryReferenceStore {
     /// Create a new in-memory store
     pub fn new() -> Self {
+        Self::with_max_references(DEFAULT_IN_MEMORY_REFERENCE_LIMIT)
+    }
+
+    /// Create a new in-memory store with a hard capacity limit.
+    pub fn with_max_references(max_references: usize) -> Self {
         Self {
             references: RwLock::new(Vec::new()),
+            max_references: max_references.max(1),
         }
     }
 }
@@ -33,6 +42,15 @@ impl ReferenceStore for InMemoryReferenceStore {
             .references
             .write()
             .map_err(|e| StoreError::Internal(e.to_string()))?;
+        if refs.len() >= self.max_references {
+            let overflow = refs
+                .len()
+                .saturating_add(1)
+                .saturating_sub(self.max_references);
+            if overflow > 0 {
+                refs.drain(0..overflow);
+            }
+        }
         refs.push(reference);
         Ok(())
     }
@@ -242,5 +260,33 @@ fn ref_type_label(ref_type: &ReferenceType) -> String {
         ReferenceType::Summary => "summary".to_string(),
         ReferenceType::Embedding => "embedding".to_string(),
         ReferenceType::Custom(label) => format!("custom:{}", label),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_in_memory_reference_store_evicts_oldest_when_limit_exceeded() {
+        tokio_test::block_on(async {
+            let store = InMemoryReferenceStore::with_max_references(2);
+
+            let mut r1 = Reference::new(ReferenceType::Text, json!("r1"));
+            r1.id = "r1".to_string();
+            let mut r2 = Reference::new(ReferenceType::Text, json!("r2"));
+            r2.id = "r2".to_string();
+            let mut r3 = Reference::new(ReferenceType::Text, json!("r3"));
+            r3.id = "r3".to_string();
+
+            store.add(r1).await.expect("add r1");
+            store.add(r2).await.expect("add r2");
+            store.add(r3).await.expect("add r3");
+
+            assert!(store.get("r1").await.expect("get r1").is_none());
+            assert!(store.get("r2").await.expect("get r2").is_some());
+            assert!(store.get("r3").await.expect("get r3").is_some());
+        });
     }
 }
