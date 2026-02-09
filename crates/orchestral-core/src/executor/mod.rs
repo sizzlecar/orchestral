@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use async_trait::async_trait;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde_json::Value;
 
 use crate::action::{Action, ActionContext, ActionInput, ActionResult, ApprovalRequest};
@@ -510,34 +511,37 @@ impl Executor {
             // Execute ready nodes (up to max_parallel)
             let batch: Vec<_> = ready.into_iter().take(self.max_parallel).collect();
 
-            for step_id in batch {
-                // Extract node data before mutating dag
-                let node_data = dag.get_node(&step_id).map(|node| {
-                    (
-                        node.step.kind.clone(),
+            // Wait-style nodes should short-circuit before launching action futures.
+            for step_id in &batch {
+                let wait_data = dag.get_node(step_id).and_then(|node| match node.step.kind {
+                    StepKind::WaitUser => Some((
+                        StepKind::WaitUser,
+                        node.step.action.clone(),
                         node.step.params.clone(),
-                        node.step.clone(),
-                        node.execution_id.clone(),
-                    )
+                    )),
+                    StepKind::WaitEvent => Some((
+                        StepKind::WaitEvent,
+                        node.step.action.clone(),
+                        node.step.params.clone(),
+                    )),
+                    _ => None,
                 });
-
-                if let Some((kind, params, step, execution_id)) = node_data {
-                    // Check for special step kinds
+                if let Some((kind, action, params)) = wait_data {
+                    dag.mark_running(step_id);
                     match kind {
                         StepKind::WaitUser => {
-                            dag.mark_running(&step_id);
                             report_progress(
                                 ctx,
                                 ExecutionProgressEvent::new(
                                     ctx.task_id.clone(),
                                     Some(step_id.clone()),
-                                    Some(step.action.clone()),
+                                    Some(action),
                                     "step_waiting_user",
                                 ),
                             )
                             .await;
                             return ExecutionResult::WaitingUser {
-                                step_id,
+                                step_id: step_id.clone(),
                                 prompt: params
                                     .get("prompt")
                                     .and_then(|v| v.as_str())
@@ -547,19 +551,18 @@ impl Executor {
                             };
                         }
                         StepKind::WaitEvent => {
-                            dag.mark_running(&step_id);
                             report_progress(
                                 ctx,
                                 ExecutionProgressEvent::new(
                                     ctx.task_id.clone(),
                                     Some(step_id.clone()),
-                                    Some(step.action.clone()),
+                                    Some(action),
                                     "step_waiting_event",
                                 ),
                             )
                             .await;
                             return ExecutionResult::WaitingEvent {
-                                step_id,
+                                step_id: step_id.clone(),
                                 event_type: params
                                     .get("event_type")
                                     .and_then(|v| v.as_str())
@@ -569,8 +572,16 @@ impl Executor {
                         }
                         _ => {}
                     }
+                }
+            }
 
-                    // Execute the action
+            let mut in_flight = FuturesUnordered::new();
+            for step_id in batch {
+                // Extract node data before mutating dag
+                let node_data = dag
+                    .get_node(&step_id)
+                    .map(|node| (node.step.clone(), node.execution_id.clone()));
+                if let Some((step, execution_id)) = node_data {
                     dag.mark_running(&step_id);
                     tracing::info!(
                         task_id = %ctx.task_id,
@@ -590,149 +601,176 @@ impl Executor {
                     )
                     .await;
 
-                    let result = self.execute_step_data(&step, &execution_id, ctx).await;
+                    in_flight.push(async move {
+                        let result = self.execute_step_data(&step, &execution_id, ctx).await;
+                        (step_id, step, result)
+                    });
+                }
+            }
 
-                    match result {
-                        ActionResult::Success { exports } => {
-                            if let Err(error) =
-                                validate_declared_exports(&step, &exports, self.strict_exports)
-                            {
-                                dag.mark_failed(&step_id);
-                                report_progress(
-                                    ctx,
-                                    ExecutionProgressEvent::new(
-                                        ctx.task_id.clone(),
-                                        Some(step_id.clone()),
-                                        Some(step.action.clone()),
-                                        "step_failed",
-                                    )
-                                    .with_message(error.clone()),
-                                )
-                                .await;
-                                return ExecutionResult::Failed { step_id, error };
-                            }
-
-                            // Write exports to working set
-                            let completion_metadata =
-                                build_step_completion_metadata(&step.action, &exports);
-                            let mut ws = ctx.working_set.write().await;
-                            for (key, value) in &exports {
-                                ws.set_task(key.clone(), value.clone());
-                                ws.set_task(format!("{}.{}", step.id, key), value.clone());
-                            }
-                            dag.mark_completed(&step_id);
-                            tracing::info!(
-                                task_id = %ctx.task_id,
-                                step_id = %step_id,
-                                action = %step.action,
-                                "step execution completed"
-                            );
-                            report_progress(
-                                ctx,
-                                ExecutionProgressEvent::new(
-                                    ctx.task_id.clone(),
-                                    Some(step_id),
-                                    Some(step.action.clone()),
-                                    "step_completed",
-                                )
-                                .with_metadata(completion_metadata),
-                            )
-                            .await;
-                        }
-                        ActionResult::NeedClarification { question } => {
+            let mut terminal_result: Option<ExecutionResult> = None;
+            while let Some((step_id, step, result)) = in_flight.next().await {
+                match result {
+                    ActionResult::Success { exports } => {
+                        if let Err(error) =
+                            validate_declared_exports(&step, &exports, self.strict_exports)
+                        {
+                            dag.mark_failed(&step_id);
                             report_progress(
                                 ctx,
                                 ExecutionProgressEvent::new(
                                     ctx.task_id.clone(),
                                     Some(step_id.clone()),
                                     Some(step.action.clone()),
-                                    "step_waiting_user",
+                                    "step_failed",
                                 )
-                                .with_message(question.clone()),
+                                .with_message(error.clone()),
                             )
                             .await;
-                            return ExecutionResult::WaitingUser {
+                            choose_terminal_result(
+                                &mut terminal_result,
+                                ExecutionResult::Failed { step_id, error },
+                            );
+                            continue;
+                        }
+
+                        let completion_metadata =
+                            build_step_completion_metadata(&step.action, &exports);
+                        let mut ws = ctx.working_set.write().await;
+                        for (key, value) in &exports {
+                            ws.set_task(key.clone(), value.clone());
+                            ws.set_task(format!("{}.{}", step.id, key), value.clone());
+                        }
+                        dag.mark_completed(&step_id);
+                        tracing::info!(
+                            task_id = %ctx.task_id,
+                            step_id = %step_id,
+                            action = %step.action,
+                            "step execution completed"
+                        );
+                        report_progress(
+                            ctx,
+                            ExecutionProgressEvent::new(
+                                ctx.task_id.clone(),
+                                Some(step_id),
+                                Some(step.action.clone()),
+                                "step_completed",
+                            )
+                            .with_metadata(completion_metadata),
+                        )
+                        .await;
+                    }
+                    ActionResult::NeedClarification { question } => {
+                        report_progress(
+                            ctx,
+                            ExecutionProgressEvent::new(
+                                ctx.task_id.clone(),
+                                Some(step_id.clone()),
+                                Some(step.action.clone()),
+                                "step_waiting_user",
+                            )
+                            .with_message(question.clone()),
+                        )
+                        .await;
+                        choose_terminal_result(
+                            &mut terminal_result,
+                            ExecutionResult::WaitingUser {
                                 step_id,
                                 prompt: question,
                                 approval: None,
-                            };
-                        }
-                        ActionResult::NeedApproval { request } => {
-                            report_progress(
-                                ctx,
-                                ExecutionProgressEvent::new(
-                                    ctx.task_id.clone(),
-                                    Some(step_id.clone()),
-                                    Some(step.action.clone()),
-                                    "step_waiting_user",
-                                )
-                                .with_message(request.reason.clone())
-                                .with_metadata(serde_json::json!({
-                                    "waiting_kind": "approval",
-                                    "approval_reason": request.reason,
-                                    "approval_command": request.command,
-                                })),
+                            },
+                        );
+                    }
+                    ActionResult::NeedApproval { request } => {
+                        let approval_reason = request.reason.clone();
+                        let approval_command = request.command.clone();
+                        report_progress(
+                            ctx,
+                            ExecutionProgressEvent::new(
+                                ctx.task_id.clone(),
+                                Some(step_id.clone()),
+                                Some(step.action.clone()),
+                                "step_waiting_user",
                             )
-                            .await;
-                            return ExecutionResult::WaitingUser {
+                            .with_message(approval_reason.clone())
+                            .with_metadata(serde_json::json!({
+                                "waiting_kind": "approval",
+                                "approval_reason": approval_reason,
+                                "approval_command": approval_command,
+                            })),
+                        )
+                        .await;
+                        choose_terminal_result(
+                            &mut terminal_result,
+                            ExecutionResult::WaitingUser {
                                 step_id,
                                 prompt: "Approval required".to_string(),
                                 approval: Some(request),
-                            };
-                        }
-                        ActionResult::RetryableError { message, .. } => {
-                            // For now, mark as failed (retry logic can be added later)
-                            dag.mark_failed(&step_id);
-                            tracing::warn!(
-                                task_id = %ctx.task_id,
-                                step_id = %step_id,
-                                action = %step.action,
-                                error = %truncate_for_log(&message, MAX_LOG_TEXT_CHARS),
-                                "step execution retryable error"
-                            );
-                            report_progress(
-                                ctx,
-                                ExecutionProgressEvent::new(
-                                    ctx.task_id.clone(),
-                                    Some(step_id.clone()),
-                                    Some(step.action.clone()),
-                                    "step_failed",
-                                )
-                                .with_message(message.clone()),
+                            },
+                        );
+                    }
+                    ActionResult::RetryableError { message, .. } => {
+                        // For now, mark as failed (retry logic can be added later)
+                        dag.mark_failed(&step_id);
+                        tracing::warn!(
+                            task_id = %ctx.task_id,
+                            step_id = %step_id,
+                            action = %step.action,
+                            error = %truncate_for_log(&message, MAX_LOG_TEXT_CHARS),
+                            "step execution retryable error"
+                        );
+                        report_progress(
+                            ctx,
+                            ExecutionProgressEvent::new(
+                                ctx.task_id.clone(),
+                                Some(step_id.clone()),
+                                Some(step.action.clone()),
+                                "step_failed",
                             )
-                            .await;
-                            return ExecutionResult::Failed {
+                            .with_message(message.clone()),
+                        )
+                        .await;
+                        choose_terminal_result(
+                            &mut terminal_result,
+                            ExecutionResult::Failed {
                                 step_id,
                                 error: message,
-                            };
-                        }
-                        ActionResult::Error { message } => {
-                            dag.mark_failed(&step_id);
-                            tracing::error!(
-                                task_id = %ctx.task_id,
-                                step_id = %step_id,
-                                action = %step.action,
-                                error = %truncate_for_log(&message, MAX_LOG_TEXT_CHARS),
-                                "step execution failed"
-                            );
-                            report_progress(
-                                ctx,
-                                ExecutionProgressEvent::new(
-                                    ctx.task_id.clone(),
-                                    Some(step_id.clone()),
-                                    Some(step.action.clone()),
-                                    "step_failed",
-                                )
-                                .with_message(message.clone()),
+                            },
+                        );
+                    }
+                    ActionResult::Error { message } => {
+                        dag.mark_failed(&step_id);
+                        tracing::error!(
+                            task_id = %ctx.task_id,
+                            step_id = %step_id,
+                            action = %step.action,
+                            error = %truncate_for_log(&message, MAX_LOG_TEXT_CHARS),
+                            "step execution failed"
+                        );
+                        report_progress(
+                            ctx,
+                            ExecutionProgressEvent::new(
+                                ctx.task_id.clone(),
+                                Some(step_id.clone()),
+                                Some(step.action.clone()),
+                                "step_failed",
                             )
-                            .await;
-                            return ExecutionResult::Failed {
+                            .with_message(message.clone()),
+                        )
+                        .await;
+                        choose_terminal_result(
+                            &mut terminal_result,
+                            ExecutionResult::Failed {
                                 step_id,
                                 error: message,
-                            };
-                        }
+                            },
+                        );
                     }
                 }
+            }
+
+            if let Some(result) = terminal_result {
+                return result;
             }
         }
     }
@@ -1103,6 +1141,20 @@ async fn report_progress(ctx: &ExecutorContext, event: ExecutionProgressEvent) {
     }
 }
 
+fn choose_terminal_result(slot: &mut Option<ExecutionResult>, candidate: ExecutionResult) {
+    let rank = |result: &ExecutionResult| match result {
+        ExecutionResult::Failed { .. } => 3,
+        ExecutionResult::WaitingUser { .. } => 2,
+        ExecutionResult::WaitingEvent { .. } => 1,
+        ExecutionResult::Completed => 0,
+    };
+
+    match slot {
+        Some(current) if rank(current) >= rank(&candidate) => {}
+        _ => *slot = Some(candidate),
+    }
+}
+
 fn validate_schema(
     value: &serde_json::Value,
     schema: &serde_json::Value,
@@ -1288,6 +1340,8 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use serde_json::{json, Value};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::time::{sleep, Duration};
 
     use crate::action::ActionMeta;
     use crate::store::{Reference, ReferenceStore, ReferenceType, StoreError};
@@ -1404,6 +1458,52 @@ mod tests {
                 }
                 _ => ActionResult::error("content binding not applied"),
             }
+        }
+    }
+
+    struct SlowAction {
+        active: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        delay_ms: u64,
+    }
+
+    impl SlowAction {
+        fn new(active: Arc<AtomicUsize>, peak: Arc<AtomicUsize>, delay_ms: u64) -> Self {
+            Self {
+                active,
+                peak,
+                delay_ms,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Action for SlowAction {
+        fn name(&self) -> &str {
+            "slow"
+        }
+
+        fn description(&self) -> &str {
+            "slow action for parallelism tests"
+        }
+
+        async fn run(&self, _input: ActionInput, _ctx: ActionContext) -> ActionResult {
+            let in_flight = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut peak = self.peak.load(Ordering::SeqCst);
+            while in_flight > peak {
+                match self.peak.compare_exchange(
+                    peak,
+                    in_flight,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => peak = actual,
+                }
+            }
+            sleep(Duration::from_millis(self.delay_ms)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            ActionResult::success()
         }
     }
 
@@ -1661,6 +1761,37 @@ mod tests {
             let result = executor.execute(&mut dag, &ctx).await;
             assert!(matches!(result, ExecutionResult::Completed));
             assert_eq!(dag.completed_nodes().len(), 3);
+        });
+    }
+
+    #[test]
+    fn test_execute_runs_ready_steps_in_parallel_batches() {
+        tokio_test::block_on(async {
+            let active = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+
+            let mut registry = ActionRegistry::new();
+            registry.register(Arc::new(SlowAction::new(active.clone(), peak.clone(), 40)));
+            let executor = Executor::new(registry).with_max_parallel(2);
+
+            let plan = Plan::new(
+                "parallel fan-out",
+                vec![
+                    Step::action("s1", "slow"),
+                    Step::action("s2", "slow"),
+                    Step::action("s3", "slow"),
+                ],
+            );
+            let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
+            let ctx = ExecutorContext::new(
+                "task-1",
+                Arc::new(RwLock::new(WorkingSet::new())),
+                Arc::new(NoopReferenceStore),
+            );
+
+            let result = executor.execute(&mut dag, &ctx).await;
+            assert!(matches!(result, ExecutionResult::Completed));
+            assert!(peak.load(Ordering::SeqCst) >= 2);
         });
     }
 }
