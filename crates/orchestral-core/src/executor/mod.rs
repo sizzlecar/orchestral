@@ -7,7 +7,9 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
+use tokio::time::sleep;
 
 use async_trait::async_trait;
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -19,6 +21,9 @@ use crate::types::{Plan, Step, StepKind};
 
 const MAX_LOG_TEXT_CHARS: usize = 2_000;
 const MAX_LOG_JSON_CHARS: usize = 8_000;
+const DEFAULT_MAX_RETRY_ATTEMPTS: u32 = 3;
+const DEFAULT_RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
+const DEFAULT_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 
 fn truncate_for_log(input: &str, max_chars: usize) -> String {
     let char_count = input.chars().count();
@@ -420,8 +425,12 @@ pub struct Executor {
     pub action_registry: Arc<RwLock<ActionRegistry>>,
     /// Maximum parallel executions
     pub max_parallel: usize,
-    /// Whether declared imports are required at runtime.
-    pub strict_imports: bool,
+    /// Max retries for ActionResult::RetryableError (excluding initial attempt).
+    pub max_retry_attempts: u32,
+    /// Base delay for exponential backoff when action does not provide retry_after.
+    pub retry_base_delay: Duration,
+    /// Cap for exponential backoff delay.
+    pub retry_max_delay: Duration,
     /// Whether declared exports are required at runtime.
     pub strict_exports: bool,
 }
@@ -437,7 +446,9 @@ impl Executor {
         Self {
             action_registry,
             max_parallel: 4,
-            strict_imports: true,
+            max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
+            retry_base_delay: DEFAULT_RETRY_BASE_DELAY,
+            retry_max_delay: DEFAULT_RETRY_MAX_DELAY,
             strict_exports: true,
         }
     }
@@ -448,9 +459,21 @@ impl Executor {
         self
     }
 
-    /// Configure strict runtime checks for step imports/exports.
-    pub fn with_io_contract(mut self, strict_imports: bool, strict_exports: bool) -> Self {
-        self.strict_imports = strict_imports;
+    /// Configure retry policy for retryable action errors.
+    pub fn with_retry_policy(
+        mut self,
+        max_retry_attempts: u32,
+        retry_base_delay: Duration,
+        retry_max_delay: Duration,
+    ) -> Self {
+        self.max_retry_attempts = max_retry_attempts;
+        self.retry_base_delay = retry_base_delay;
+        self.retry_max_delay = retry_max_delay.max(retry_base_delay);
+        self
+    }
+
+    /// Configure strict runtime checks for step exports.
+    pub fn with_export_contract(mut self, strict_exports: bool) -> Self {
         self.strict_exports = strict_exports;
         self
     }
@@ -602,7 +625,9 @@ impl Executor {
                     .await;
 
                     in_flight.push(async move {
-                        let result = self.execute_step_data(&step, &execution_id, ctx).await;
+                        let result = self
+                            .execute_step_with_retry(&step, &execution_id, ctx)
+                            .await;
                         (step_id, step, result)
                     });
                 }
@@ -710,7 +735,8 @@ impl Executor {
                         );
                     }
                     ActionResult::RetryableError { message, .. } => {
-                        // For now, mark as failed (retry logic can be added later)
+                        // Defensive fallback: retryable errors should usually be consumed by
+                        // execute_step_with_retry and converted to success or terminal error.
                         dag.mark_failed(&step_id);
                         tracing::warn!(
                             task_id = %ctx.task_id,
@@ -775,6 +801,87 @@ impl Executor {
         }
     }
 
+    async fn execute_step_with_retry(
+        &self,
+        step: &Step,
+        execution_id: &str,
+        ctx: &ExecutorContext,
+    ) -> ActionResult {
+        let mut retries_used: u32 = 0;
+        let mut current_execution_id = execution_id.to_string();
+
+        loop {
+            let result = self
+                .execute_step_data(step, &current_execution_id, ctx)
+                .await;
+            let ActionResult::RetryableError {
+                message,
+                retry_after,
+                attempt: reported_attempt,
+            } = result
+            else {
+                return result;
+            };
+
+            if retries_used >= self.max_retry_attempts {
+                let total_attempts = retries_used.saturating_add(1);
+                return ActionResult::error(format!(
+                    "{} (retry exhausted after {} attempt(s))",
+                    message, total_attempts
+                ));
+            }
+
+            let delay = retry_after.unwrap_or_else(|| self.compute_retry_backoff(retries_used));
+            let next_attempt = retries_used.saturating_add(1);
+            tracing::warn!(
+                task_id = %ctx.task_id,
+                step_id = %step.id,
+                action = %step.action,
+                message = %truncate_for_log(&message, MAX_LOG_TEXT_CHARS),
+                retry_attempt = next_attempt,
+                reported_attempt = reported_attempt,
+                retry_in_ms = delay.as_millis() as u64,
+                "retrying step after retryable error"
+            );
+            report_progress(
+                ctx,
+                ExecutionProgressEvent::new(
+                    ctx.task_id.clone(),
+                    Some(step.id.clone()),
+                    Some(step.action.clone()),
+                    "step_retrying",
+                )
+                .with_message(message.clone())
+                .with_metadata(serde_json::json!({
+                    "retry_attempt": next_attempt,
+                    "reported_attempt": reported_attempt,
+                    "retry_in_ms": delay.as_millis() as u64,
+                    "max_retry_attempts": self.max_retry_attempts,
+                })),
+            )
+            .await;
+
+            if !delay.is_zero() {
+                sleep(delay).await;
+            }
+            retries_used = next_attempt;
+            current_execution_id = uuid::Uuid::new_v4().to_string();
+        }
+    }
+
+    fn compute_retry_backoff(&self, retries_used: u32) -> Duration {
+        let base_ms = self.retry_base_delay.as_millis();
+        if base_ms == 0 {
+            return Duration::from_millis(0);
+        }
+        let max_ms = self.retry_max_delay.as_millis().max(base_ms);
+        let shift = retries_used.min(20);
+        let multiplier = 1u128 << shift;
+        let backoff_ms = base_ms.saturating_mul(multiplier).min(max_ms);
+        let millis = u64::try_from(backoff_ms).unwrap_or(u64::MAX);
+        Duration::from_millis(millis)
+    }
+
     /// Execute a single step using extracted data (avoids borrow conflicts)
     async fn execute_step_data(
         &self,
@@ -798,31 +905,18 @@ impl Executor {
                 step_id = %step.id,
                 action = %step.action,
                 params = %truncate_json_for_log(&step.params, MAX_LOG_JSON_CHARS),
-                declared_imports = ?step.imports,
                 declared_exports = ?step.exports,
                 io_bindings = ?step.io_bindings,
                 "step execution context"
             );
         }
 
-        // Build input from imports
-        let mut imports = HashMap::new();
+        // Build input from io_bindings only.
         let mut resolved_params = step.params.clone();
         {
             let ws = ctx.working_set.read().await;
-            for key in &step.imports {
-                if let Some(value) = ws.get_task(key) {
-                    imports.insert(key.clone(), value.clone());
-                } else if self.strict_imports {
-                    return ActionResult::error(format!(
-                        "Missing declared import '{}' for step '{}'",
-                        key, step.id
-                    ));
-                }
-            }
             for binding in &step.io_bindings {
                 if let Some(value) = ws.get_task(&binding.from) {
-                    imports.insert(binding.to.clone(), value.clone());
                     tracing::debug!(
                         task_id = %ctx.task_id,
                         step_id = %step.id,
@@ -872,17 +966,13 @@ impl Executor {
             return ActionResult::error(error);
         }
 
-        let input = ActionInput {
-            params: resolved_params,
-            imports,
-        };
+        let input = ActionInput::with_params(resolved_params);
         if tracing::enabled!(tracing::Level::DEBUG) {
             tracing::debug!(
                 task_id = %ctx.task_id,
                 step_id = %step.id,
                 action = %step.action,
                 resolved_params = %truncate_json_for_log(&input.params, MAX_LOG_JSON_CHARS),
-                resolved_imports = %truncate_json_map_for_log(&input.imports, MAX_LOG_JSON_CHARS),
                 "action input resolved"
             );
         }
@@ -1446,17 +1536,15 @@ mod tests {
         }
 
         fn description(&self) -> &str {
-            "consume imported content"
+            "consume bound content"
         }
 
         async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
-            let from_params = input.params.get("content").and_then(|v| v.as_str());
-            let from_imports = input.imports.get("content").and_then(|v| v.as_str());
-            match (from_params, from_imports) {
-                (Some(a), Some(b)) if a == b => {
-                    ActionResult::success_with_one("written", Value::String(a.to_string()))
+            match input.params.get("content").and_then(|v| v.as_str()) {
+                Some(content) => {
+                    ActionResult::success_with_one("written", Value::String(content.to_string()))
                 }
-                _ => ActionResult::error("content binding not applied"),
+                None => ActionResult::error("content binding not applied"),
             }
         }
     }
@@ -1474,6 +1562,41 @@ mod tests {
                 peak,
                 delay_ms,
             }
+        }
+    }
+
+    struct FlakyRetryAction {
+        failures_left: Arc<AtomicUsize>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl FlakyRetryAction {
+        fn new(failures_left: Arc<AtomicUsize>, calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                failures_left,
+                calls,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Action for FlakyRetryAction {
+        fn name(&self) -> &str {
+            "flaky_retry"
+        }
+
+        fn description(&self) -> &str {
+            "returns retryable errors before succeeding"
+        }
+
+        async fn run(&self, _input: ActionInput, _ctx: ActionContext) -> ActionResult {
+            let current_call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let left = self.failures_left.load(Ordering::SeqCst);
+            if left > 0 {
+                self.failures_left.fetch_sub(1, Ordering::SeqCst);
+                return ActionResult::retryable("temporary failure", None, current_call as u32);
+            }
+            ActionResult::success_with_one("ok", json!(current_call))
         }
     }
 
@@ -1585,7 +1708,7 @@ mod tests {
                 "produce",
                 ActionResult::success(),
             )));
-            let executor = Executor::new(registry).with_io_contract(true, true);
+            let executor = Executor::new(registry).with_export_contract(true);
 
             let plan = Plan::new(
                 "strict exports",
@@ -1792,6 +1915,81 @@ mod tests {
             let result = executor.execute(&mut dag, &ctx).await;
             assert!(matches!(result, ExecutionResult::Completed));
             assert!(peak.load(Ordering::SeqCst) >= 2);
+        });
+    }
+
+    #[test]
+    fn test_retryable_error_retries_and_then_succeeds() {
+        tokio_test::block_on(async {
+            let failures_left = Arc::new(AtomicUsize::new(2));
+            let calls = Arc::new(AtomicUsize::new(0));
+
+            let mut registry = ActionRegistry::new();
+            registry.register(Arc::new(FlakyRetryAction::new(
+                failures_left.clone(),
+                calls.clone(),
+            )));
+            let executor = Executor::new(registry).with_retry_policy(
+                3,
+                Duration::from_millis(0),
+                Duration::from_millis(0),
+            );
+
+            let plan = Plan::new(
+                "retry success",
+                vec![Step::action("s1", "flaky_retry").with_exports(vec!["ok".to_string()])],
+            );
+            let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
+            let working_set = Arc::new(RwLock::new(WorkingSet::new()));
+            let ctx =
+                ExecutorContext::new("task-1", working_set.clone(), Arc::new(NoopReferenceStore));
+
+            let result = executor.execute(&mut dag, &ctx).await;
+            assert!(matches!(result, ExecutionResult::Completed));
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+            let ws = working_set.read().await;
+            assert_eq!(ws.get_task("s1.ok"), Some(&json!(3)));
+        });
+    }
+
+    #[test]
+    fn test_retryable_error_exhausts_and_fails() {
+        tokio_test::block_on(async {
+            let failures_left = Arc::new(AtomicUsize::new(10));
+            let calls = Arc::new(AtomicUsize::new(0));
+
+            let mut registry = ActionRegistry::new();
+            registry.register(Arc::new(FlakyRetryAction::new(
+                failures_left.clone(),
+                calls.clone(),
+            )));
+            let executor = Executor::new(registry).with_retry_policy(
+                2,
+                Duration::from_millis(0),
+                Duration::from_millis(0),
+            );
+
+            let plan = Plan::new(
+                "retry failure",
+                vec![Step::action("s1", "flaky_retry").with_exports(vec!["ok".to_string()])],
+            );
+            let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
+            let ctx = ExecutorContext::new(
+                "task-1",
+                Arc::new(RwLock::new(WorkingSet::new())),
+                Arc::new(NoopReferenceStore),
+            );
+
+            let result = executor.execute(&mut dag, &ctx).await;
+            match result {
+                ExecutionResult::Failed { error, .. } => {
+                    assert!(error.contains("retry exhausted"));
+                }
+                other => panic!("expected failed result, got {:?}", other),
+            }
+            // initial attempt + 2 retries
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
         });
     }
 }
