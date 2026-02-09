@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use orchestral_api::{ApiService, RuntimeApi};
+use orchestral_api::{ApiService, InteractionSubmitResponse, RuntimeApi};
 use orchestral_stores::Event;
 use tokio::sync::broadcast;
 
@@ -48,11 +48,13 @@ impl CliRuntime {
         Ok(self.api.subscribe_events(&self.thread_id).await?)
     }
 
-    pub async fn submit_input(&self, input: String) -> Result<(), ChannelError> {
+    pub async fn submit_input(
+        &self,
+        input: String,
+    ) -> Result<InteractionSubmitResponse, ChannelError> {
         self.channel
             .submit_input(&self.session_key, Some("tui".to_string()), input)
-            .await?;
-        Ok(())
+            .await
     }
 
     pub async fn interrupt(&self) -> Result<(), ChannelError> {
