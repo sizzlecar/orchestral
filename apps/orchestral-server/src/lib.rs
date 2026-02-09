@@ -15,6 +15,7 @@ use orchestral_api::{ApiService, RuntimeApi};
 use orchestral_channels::{InMemoryChannelBindingStore, WebChannel};
 use orchestral_stores::Event;
 use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast::error::RecvError;
 
 #[derive(Clone)]
 struct AppState {
@@ -95,13 +96,26 @@ async fn stream_events(
         .map_err(map_api_error)?;
 
     let event_stream = stream! {
-        while let Ok(event) = rx.recv().await {
-            if event.thread_id() != thread_id {
-                continue;
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    if event.thread_id() != thread_id {
+                        continue;
+                    }
+                    let payload = serde_json::to_string(&event_to_json(&event))
+                        .unwrap_or_else(|_| "{}".to_string());
+                    yield Ok(SseEvent::default().event("runtime_event").data(payload));
+                }
+                Err(RecvError::Lagged(skipped)) => {
+                    tracing::warn!(
+                        thread_id = %thread_id,
+                        skipped,
+                        "sse subscriber lagged behind; dropping old events"
+                    );
+                    continue;
+                }
+                Err(RecvError::Closed) => break,
             }
-            let payload = serde_json::to_string(&event_to_json(&event))
-                .unwrap_or_else(|_| "{}".to_string());
-            yield Ok(SseEvent::default().event("runtime_event").data(payload));
         }
     };
 
