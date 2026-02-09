@@ -25,6 +25,9 @@ struct RunArgs {
     config: PathBuf,
     #[arg(long)]
     thread_id: Option<String>,
+    /// Read multi-turn inputs from file (one turn per line; '#' comments supported)
+    #[arg(long)]
+    script: Option<PathBuf>,
     #[arg(long)]
     verbose: bool,
     #[arg(long)]
@@ -55,6 +58,7 @@ impl Cli {
                     args.config,
                     args.thread_id,
                     initial_input,
+                    args.script,
                     args.once,
                     args.verbose,
                 )
@@ -68,6 +72,7 @@ impl Cli {
                 ensure_log_filter(false);
                 crate::tui::run_session(
                     PathBuf::from("configs/orchestral.cli.yaml"),
+                    None,
                     None,
                     None,
                     false,
