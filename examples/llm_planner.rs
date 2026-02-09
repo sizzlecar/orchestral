@@ -19,7 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reference_store = std::sync::Arc::new(InMemoryReferenceStore::new());
     let context = PlannerContext::new(available_actions, reference_store);
 
-    let response = r#"{"type":"WORKFLOW","goal":"Echo message","steps":[{"id":"s1","action":"echo","kind":"action","depends_on":[],"imports":[],"exports":[],"params":{"message":"Hello"}}],"confidence":0.9}"#;
+    let response = r#"{"type":"WORKFLOW","goal":"Echo message","steps":[{"id":"s1","action":"echo","kind":"action","depends_on":[],"exports":[],"params":{"message":"Hello"}}],"confidence":0.9}"#;
 
     let planner = LlmPlanner::new(
         MockLlmClient {

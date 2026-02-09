@@ -69,9 +69,6 @@ pub struct Step {
     /// IDs of steps this step depends on
     #[serde(default)]
     pub depends_on: Vec<String>,
-    /// Keys to import from WorkingSet (explicit data contract)
-    #[serde(default)]
-    pub imports: Vec<String>,
     /// Keys to export to WorkingSet (explicit data contract)
     #[serde(default)]
     pub exports: Vec<String>,
@@ -91,7 +88,6 @@ impl Step {
             action: action.into(),
             kind: StepKind::Action,
             depends_on: Vec::new(),
-            imports: Vec::new(),
             exports: Vec::new(),
             io_bindings: Vec::new(),
             params: Value::Null,
@@ -105,7 +101,6 @@ impl Step {
             action: action.into(),
             kind: StepKind::System,
             depends_on: Vec::new(),
-            imports: Vec::new(),
             exports: Vec::new(),
             io_bindings: Vec::new(),
             params: Value::Null,
@@ -119,7 +114,6 @@ impl Step {
             action: "wait_user".to_string(),
             kind: StepKind::WaitUser,
             depends_on: Vec::new(),
-            imports: Vec::new(),
             exports: Vec::new(),
             io_bindings: Vec::new(),
             params: Value::Null,
@@ -129,12 +123,6 @@ impl Step {
     /// Add dependencies
     pub fn with_depends_on(mut self, deps: Vec<String>) -> Self {
         self.depends_on = deps;
-        self
-    }
-
-    /// Add imports
-    pub fn with_imports(mut self, imports: Vec<String>) -> Self {
-        self.imports = imports;
         self
     }
 
