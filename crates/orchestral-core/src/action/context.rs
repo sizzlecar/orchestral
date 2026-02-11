@@ -5,6 +5,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::store::{ReferenceStore, WorkingSet};
+use crate::types::{StepId, TaskId};
 
 /// Execution context for actions
 ///
@@ -16,9 +17,9 @@ use crate::store::{ReferenceStore, WorkingSet};
 #[derive(Clone)]
 pub struct ActionContext {
     /// Task ID
-    pub task_id: String,
+    pub task_id: TaskId,
     /// Step ID (logical ID)
-    pub step_id: String,
+    pub step_id: StepId,
     /// Execution ID (runtime ID for this specific execution)
     /// Distinguishes retry/resume runs of the same step
     pub execution_id: String,
@@ -34,8 +35,8 @@ pub struct ActionContext {
 impl ActionContext {
     /// Create a new action context
     pub fn new(
-        task_id: impl Into<String>,
-        step_id: impl Into<String>,
+        task_id: impl Into<TaskId>,
+        step_id: impl Into<StepId>,
         execution_id: impl Into<String>,
         working_set: Arc<RwLock<WorkingSet>>,
         reference_store: Arc<dyn ReferenceStore>,
@@ -52,8 +53,8 @@ impl ActionContext {
 
     /// Create a new action context with a specific cancellation token
     pub fn with_cancellation_token(
-        task_id: impl Into<String>,
-        step_id: impl Into<String>,
+        task_id: impl Into<TaskId>,
+        step_id: impl Into<StepId>,
         execution_id: impl Into<String>,
         working_set: Arc<RwLock<WorkingSet>>,
         reference_store: Arc<dyn ReferenceStore>,

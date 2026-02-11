@@ -6,13 +6,68 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fmt;
 
 use crate::action::ApprovalRequest;
 
-use super::{Intent, Plan};
+use super::{Intent, Plan, StepId};
 
-/// Type alias for Task ID
-pub type TaskId = String;
+/// Strongly-typed Task ID.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(transparent)]
+pub struct TaskId(pub String);
+
+impl TaskId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for TaskId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for TaskId {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl From<&TaskId> for TaskId {
+    fn from(value: &TaskId) -> Self {
+        value.clone()
+    }
+}
+
+impl From<TaskId> for String {
+    fn from(value: TaskId) -> Self {
+        value.0
+    }
+}
+
+impl fmt::Display for TaskId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl AsRef<str> for TaskId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialEq<&str> for TaskId {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
 
 /// Task state machine - production-ready states
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,7 +161,7 @@ pub struct Task {
     pub state: TaskState,
     /// Completed step IDs for resume/replay
     #[serde(default)]
-    pub completed_step_ids: Vec<String>,
+    pub completed_step_ids: Vec<StepId>,
     /// Task-scope working set snapshot for resume
     #[serde(default)]
     pub working_set_snapshot: HashMap<String, Value>,
@@ -121,7 +176,7 @@ impl Task {
     pub fn new(intent: Intent) -> Self {
         let now = Utc::now();
         Self {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: TaskId::from(uuid::Uuid::new_v4().to_string()),
             intent,
             plan: None,
             state: TaskState::Planning,
@@ -188,7 +243,7 @@ impl Task {
     /// Update execution checkpoint data
     pub fn set_checkpoint(
         &mut self,
-        completed_step_ids: Vec<String>,
+        completed_step_ids: Vec<StepId>,
         working_set_snapshot: HashMap<String, Value>,
     ) {
         self.completed_step_ids = completed_step_ids;
@@ -295,11 +350,20 @@ mod tests {
             ("x".to_string(), Value::String("1".to_string())),
             ("y".to_string(), Value::Number(2.into())),
         ]);
-        task.set_checkpoint(vec!["s1".to_string(), "s2".to_string()], checkpoint.clone());
+        task.set_checkpoint(
+            vec![
+                crate::types::StepId::from("s1"),
+                crate::types::StepId::from("s2"),
+            ],
+            checkpoint.clone(),
+        );
 
         assert_eq!(
             task.completed_step_ids,
-            vec!["s1".to_string(), "s2".to_string()]
+            vec![
+                crate::types::StepId::from("s1"),
+                crate::types::StepId::from("s2")
+            ]
         );
         assert_eq!(task.working_set_snapshot, checkpoint);
     }

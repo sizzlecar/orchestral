@@ -160,7 +160,7 @@ impl PlanNormalizer {
         let mut seen_ids = std::collections::HashSet::new();
         for step in &plan.steps {
             if !seen_ids.insert(&step.id) {
-                return Err(ValidationError::DuplicateStepId(step.id.clone()));
+                return Err(ValidationError::DuplicateStepId(step.id.to_string()));
             }
         }
 
@@ -171,8 +171,8 @@ impl PlanNormalizer {
             for dep in &step.depends_on {
                 if !step_ids.contains(dep.as_str()) {
                     return Err(ValidationError::MissingDependency(
-                        step.id.clone(),
-                        dep.clone(),
+                        step.id.to_string(),
+                        dep.to_string(),
                     ));
                 }
             }
@@ -185,14 +185,18 @@ impl PlanNormalizer {
 
                 if !step_ids.contains(source_step.as_str()) {
                     return Err(ValidationError::InvalidIoBinding(
-                        step.id.clone(),
+                        step.id.to_string(),
                         format!("unknown source step '{}'", source_step),
                     ));
                 }
-                if source_step != step.id && !step.depends_on.iter().any(|dep| dep == &source_step)
+                if source_step.as_str() != step.id.as_str()
+                    && !step
+                        .depends_on
+                        .iter()
+                        .any(|dep| dep.as_str() == source_step.as_str())
                 {
                     return Err(ValidationError::IoBindingMissingDependency(
-                        step.id.clone(),
+                        step.id.to_string(),
                         source_step,
                     ));
                 }
@@ -201,7 +205,7 @@ impl PlanNormalizer {
                     if !source.exports.is_empty() && !source.exports.iter().any(|k| k == source_key)
                     {
                         return Err(ValidationError::InvalidIoBinding(
-                            step.id.clone(),
+                            step.id.to_string(),
                             format!(
                                 "source key '{}' not declared in step '{}' exports",
                                 source_key, source.id
@@ -354,8 +358,13 @@ fn infer_special_step_kind(step: &mut crate::types::Step) {
 fn derive_depends_on_from_bindings(step: &mut crate::types::Step) {
     for binding in &step.io_bindings {
         if let Some((source_step, _)) = parse_step_binding_source(&binding.from) {
-            if source_step != step.id && !step.depends_on.iter().any(|dep| dep == &source_step) {
-                step.depends_on.push(source_step);
+            if source_step.as_str() != step.id.as_str()
+                && !step
+                    .depends_on
+                    .iter()
+                    .any(|dep| dep.as_str() == source_step.as_str())
+            {
+                step.depends_on.push(source_step.into());
             }
         }
     }
@@ -423,7 +432,7 @@ mod tests {
 
         let normalized = normalizer.normalize(plan).expect("normalize");
         let step2 = normalized.plan.get_step("s2").expect("s2");
-        assert_eq!(step2.depends_on, vec!["s1".to_string()]);
+        assert_eq!(step2.depends_on, vec![crate::types::StepId::from("s1")]);
     }
 
     #[test]

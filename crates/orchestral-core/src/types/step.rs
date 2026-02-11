@@ -4,6 +4,64 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::fmt;
+
+/// Strongly-typed Step ID.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(transparent)]
+pub struct StepId(pub String);
+
+impl StepId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for StepId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for StepId {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl From<&StepId> for StepId {
+    fn from(value: &StepId) -> Self {
+        value.clone()
+    }
+}
+
+impl From<StepId> for String {
+    fn from(value: StepId) -> Self {
+        value.0
+    }
+}
+
+impl fmt::Display for StepId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl AsRef<str> for StepId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialEq<&str> for StepId {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
 
 /// Step type - distinguishes control semantics
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -60,7 +118,7 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Step {
     /// Unique identifier for this step (logical ID)
-    pub id: String,
+    pub id: StepId,
     /// Name of the action to execute
     pub action: String,
     /// Step type for control flow semantics
@@ -68,7 +126,7 @@ pub struct Step {
     pub kind: StepKind,
     /// IDs of steps this step depends on
     #[serde(default)]
-    pub depends_on: Vec<String>,
+    pub depends_on: Vec<StepId>,
     /// Keys to export to WorkingSet (explicit data contract)
     #[serde(default)]
     pub exports: Vec<String>,
@@ -82,7 +140,7 @@ pub struct Step {
 
 impl Step {
     /// Create a new action step
-    pub fn action(id: impl Into<String>, action: impl Into<String>) -> Self {
+    pub fn action(id: impl Into<StepId>, action: impl Into<String>) -> Self {
         Self {
             id: id.into(),
             action: action.into(),
@@ -95,7 +153,7 @@ impl Step {
     }
 
     /// Create a new system step
-    pub fn system(id: impl Into<String>, action: impl Into<String>) -> Self {
+    pub fn system(id: impl Into<StepId>, action: impl Into<String>) -> Self {
         Self {
             id: id.into(),
             action: action.into(),
@@ -108,7 +166,7 @@ impl Step {
     }
 
     /// Create a wait-user step
-    pub fn wait_user(id: impl Into<String>) -> Self {
+    pub fn wait_user(id: impl Into<StepId>) -> Self {
         Self {
             id: id.into(),
             action: "wait_user".to_string(),
@@ -121,7 +179,7 @@ impl Step {
     }
 
     /// Add dependencies
-    pub fn with_depends_on(mut self, deps: Vec<String>) -> Self {
+    pub fn with_depends_on(mut self, deps: Vec<StepId>) -> Self {
         self.depends_on = deps;
         self
     }

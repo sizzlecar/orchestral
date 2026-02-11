@@ -10,7 +10,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::executor::ExecutionResult;
-use crate::types::Plan;
+use crate::types::{Plan, StepId};
 
 /// Input payload for result interpretation.
 #[derive(Debug, Clone)]
@@ -22,7 +22,7 @@ pub struct InterpretRequest {
     /// Current execution result.
     pub execution_result: ExecutionResult,
     /// Completed step ids in this task checkpoint.
-    pub completed_step_ids: Vec<String>,
+    pub completed_step_ids: Vec<StepId>,
     /// Task working set snapshot at the end of execution.
     pub working_set_snapshot: HashMap<String, Value>,
 }

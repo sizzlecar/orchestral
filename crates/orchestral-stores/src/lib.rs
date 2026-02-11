@@ -13,9 +13,12 @@ mod reference_store;
 mod task_store;
 
 pub use event_bus::{BroadcastEventBus, EventBus};
-pub use event_store::{Event, EventStore, InMemoryEventStore, RedisEventStore};
-pub use reference_store::{InMemoryReferenceStore, RedisReferenceStore};
-pub use task_store::{InMemoryTaskStore, RedisTaskStore};
+pub use event_store::{InMemoryEventStore, PostgresEventStore, RedisEventStore};
+pub use reference_store::{InMemoryReferenceStore, PostgresReferenceStore, RedisReferenceStore};
+pub use task_store::{InMemoryTaskStore, PostgresTaskStore, RedisTaskStore};
 
 // Re-export core traits for convenience
-pub use orchestral_core::store::{Reference, ReferenceStore, ReferenceType, StoreError, TaskStore};
+pub use orchestral_core::store::{
+    EmbeddingStatus, Event, EventStore, Reference, ReferenceMatch, ReferenceStore, ReferenceType,
+    StoreError, TaskStore,
+};

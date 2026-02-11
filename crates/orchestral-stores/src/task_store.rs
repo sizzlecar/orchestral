@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use redis::AsyncCommands;
+use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use std::collections::{HashMap, VecDeque};
 use std::sync::RwLock;
 
@@ -56,13 +57,13 @@ impl TaskStore for InMemoryTaskStore {
             .write()
             .map_err(|e| StoreError::Internal(e.to_string()))?;
 
-        if !tasks.contains_key(&task.id) && tasks.len() >= self.max_tasks {
+        if !tasks.contains_key(task.id.as_str()) && tasks.len() >= self.max_tasks {
             if let Some(oldest_id) = order.pop_front() {
                 tasks.remove(&oldest_id);
             }
         }
-        tasks.insert(task.id.clone(), task.clone());
-        Self::touch_order(&mut order, &task.id);
+        tasks.insert(task.id.to_string(), task.clone());
+        Self::touch_order(&mut order, task.id.as_str());
         Ok(())
     }
 
@@ -162,12 +163,12 @@ impl TaskStore for RedisTaskStore {
         let mut conn = self.connection().await?;
         let payload =
             serde_json::to_string(task).map_err(|e| StoreError::Serialization(e.to_string()))?;
-        let task_key = self.task_key(&task.id);
+        let task_key = self.task_key(task.id.as_str());
         let ids_key = self.task_ids_key();
         conn.set::<_, _, ()>(task_key, payload)
             .await
             .map_err(|e| StoreError::Connection(e.to_string()))?;
-        conn.sadd::<_, _, ()>(ids_key, &task.id)
+        conn.sadd::<_, _, ()>(ids_key, task.id.as_str())
             .await
             .map_err(|e| StoreError::Connection(e.to_string()))?;
         Ok(())
@@ -227,6 +228,176 @@ impl TaskStore for RedisTaskStore {
     }
 }
 
+/// PostgreSQL implementation for durable task persistence.
+pub struct PostgresTaskStore {
+    pool: PgPool,
+    table_name: String,
+}
+
+impl PostgresTaskStore {
+    /// Create a new PostgreSQL task store from a connection URL.
+    pub async fn new(
+        connection_url: &str,
+        table_prefix: impl Into<String>,
+    ) -> Result<Self, StoreError> {
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect(connection_url)
+            .await
+            .map_err(|e| StoreError::Connection(e.to_string()))?;
+        let prefix = normalize_table_prefix(&table_prefix.into());
+        let table_name = format!("{}_tasks", prefix);
+        let this = Self { pool, table_name };
+        this.init_schema().await?;
+        Ok(this)
+    }
+
+    async fn init_schema(&self) -> Result<(), StoreError> {
+        let create_table = format!(
+            "CREATE TABLE IF NOT EXISTS {} (
+                task_id TEXT PRIMARY KEY,
+                state_label TEXT NOT NULL,
+                task_json JSONB NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL
+            )",
+            self.table_name
+        );
+        sqlx::query(&create_table)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Connection(e.to_string()))?;
+        let idx_state = format!(
+            "CREATE INDEX IF NOT EXISTS {0}_state_idx ON {1} (state_label, updated_at DESC)",
+            self.table_name, self.table_name
+        );
+        sqlx::query(&idx_state)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Connection(e.to_string()))?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl TaskStore for PostgresTaskStore {
+    async fn save(&self, task: &Task) -> Result<(), StoreError> {
+        let sql = format!(
+            "INSERT INTO {} (task_id, state_label, task_json, updated_at)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (task_id) DO UPDATE SET
+               state_label = EXCLUDED.state_label,
+               task_json = EXCLUDED.task_json,
+               updated_at = EXCLUDED.updated_at",
+            self.table_name
+        );
+        let task_json =
+            serde_json::to_value(task).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        sqlx::query(&sql)
+            .bind(task.id.as_str())
+            .bind(task_state_label(&task.state))
+            .bind(task_json)
+            .bind(task.updated_at)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Connection(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn load(&self, task_id: &str) -> Result<Option<Task>, StoreError> {
+        let sql = format!(
+            "SELECT task_json FROM {} WHERE task_id = $1",
+            self.table_name
+        );
+        let row = sqlx::query(&sql)
+            .bind(task_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Connection(e.to_string()))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let value: serde_json::Value = row
+            .try_get("task_json")
+            .map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let task: Task =
+            serde_json::from_value(value).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        Ok(Some(task))
+    }
+
+    async fn update_state(&self, task_id: &str, state: TaskState) -> Result<(), StoreError> {
+        let mut task = self
+            .load(task_id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(task_id.to_string()))?;
+        task.set_state(state);
+        self.save(&task).await
+    }
+
+    async fn list_by_state(&self, state: &TaskState) -> Result<Vec<Task>, StoreError> {
+        let sql = format!(
+            "SELECT task_json FROM {} WHERE state_label = $1 ORDER BY updated_at DESC",
+            self.table_name
+        );
+        let rows = sqlx::query(&sql)
+            .bind(task_state_label(state))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Connection(e.to_string()))?;
+        let mut tasks = Vec::with_capacity(rows.len());
+        for row in rows {
+            let value: serde_json::Value = row
+                .try_get("task_json")
+                .map_err(|e| StoreError::Serialization(e.to_string()))?;
+            let task: Task = serde_json::from_value(value)
+                .map_err(|e| StoreError::Serialization(e.to_string()))?;
+            tasks.push(task);
+        }
+        Ok(tasks)
+    }
+
+    async fn delete(&self, task_id: &str) -> Result<bool, StoreError> {
+        let sql = format!("DELETE FROM {} WHERE task_id = $1", self.table_name);
+        let result = sqlx::query(&sql)
+            .bind(task_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Connection(e.to_string()))?;
+        Ok(result.rows_affected() > 0)
+    }
+}
+
+fn task_state_label(state: &TaskState) -> &'static str {
+    match state {
+        TaskState::Planning => "planning",
+        TaskState::Executing => "executing",
+        TaskState::WaitingUser { .. } => "waiting_user",
+        TaskState::WaitingEvent { .. } => "waiting_event",
+        TaskState::Paused => "paused",
+        TaskState::Failed { .. } => "failed",
+        TaskState::Done => "done",
+    }
+}
+
+fn normalize_table_prefix(raw: &str) -> String {
+    let candidate = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+    if candidate.is_empty() {
+        "orchestral".to_string()
+    } else {
+        candidate
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,7 +405,7 @@ mod tests {
 
     fn task_with_id(id: &str) -> Task {
         let mut task = Task::new(Intent::new(format!("intent-{}", id)));
-        task.id = id.to_string();
+        task.id = id.into();
         task
     }
 

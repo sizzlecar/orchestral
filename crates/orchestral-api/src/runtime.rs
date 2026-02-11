@@ -42,7 +42,7 @@ impl RuntimeApi {
             .map_err(|err| ApiError::Internal(format!("build runtime app failed: {}", err)))?;
         {
             let mut thread = app.orchestrator.thread_runtime.thread.write().await;
-            thread.id = thread_id.to_string();
+            thread.id = thread_id.into();
         }
         Ok(Arc::new(app))
     }
@@ -95,7 +95,7 @@ impl ApiService for RuntimeApi {
         let app = self.get_or_create_app(&thread_id).await?;
         let thread = app.orchestrator.thread_runtime.thread.read().await;
         Ok(ThreadView {
-            id: thread.id.clone(),
+            id: thread.id.to_string(),
             created_at: thread.created_at,
             updated_at: thread.updated_at,
         })
@@ -105,7 +105,7 @@ impl ApiService for RuntimeApi {
         let app = self.get_app(thread_id).await?;
         let thread = app.orchestrator.thread_runtime.thread.read().await;
         Ok(ThreadView {
-            id: thread.id.clone(),
+            id: thread.id.to_string(),
             created_at: thread.created_at,
             updated_at: thread.updated_at,
         })
@@ -137,8 +137,8 @@ impl ApiService for RuntimeApi {
                 ..
             } => InteractionSubmitResponse {
                 status: SubmitStatus::Started,
-                interaction_id: Some(interaction_id),
-                task_id: Some(task_id),
+                interaction_id: Some(interaction_id.to_string()),
+                task_id: Some(task_id.to_string()),
                 message: None,
             },
             OrchestratorResult::Merged {
@@ -147,8 +147,8 @@ impl ApiService for RuntimeApi {
                 ..
             } => InteractionSubmitResponse {
                 status: SubmitStatus::Merged,
-                interaction_id: Some(interaction_id),
-                task_id: Some(task_id),
+                interaction_id: Some(interaction_id.to_string()),
+                task_id: Some(task_id.to_string()),
                 message: None,
             },
             OrchestratorResult::Rejected { reason } => InteractionSubmitResponse {

@@ -52,7 +52,7 @@ impl Plan {
 
     /// Get step by ID
     pub fn get_step(&self, id: &str) -> Option<&Step> {
-        self.steps.iter().find(|s| s.id == id)
+        self.steps.iter().find(|s| s.id.as_str() == id)
     }
 
     /// Get step IDs in order

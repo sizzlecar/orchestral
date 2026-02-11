@@ -6,236 +6,13 @@
 //! - Debug / Audit
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use redis::AsyncCommands;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use std::sync::RwLock;
 
-use orchestral_core::store::StoreError;
+use orchestral_core::store::{Event, EventStore, StoreError};
 
 const DEFAULT_IN_MEMORY_EVENT_LIMIT: usize = 20_000;
-
-/// Type alias for Thread ID
-pub type ThreadId = String;
-
-/// Type alias for Interaction ID
-pub type InteractionId = String;
-
-/// Event - append-only fact record
-///
-/// Events represent facts that happened in the system.
-/// Message is just one type of Event.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum Event {
-    /// User input event
-    UserInput {
-        /// Thread this event belongs to
-        thread_id: ThreadId,
-        /// Interaction this event belongs to
-        interaction_id: InteractionId,
-        /// Event payload
-        payload: Value,
-        /// Event timestamp
-        timestamp: DateTime<Utc>,
-    },
-
-    /// Assistant output event
-    AssistantOutput {
-        /// Thread this event belongs to
-        thread_id: ThreadId,
-        /// Interaction this event belongs to
-        interaction_id: InteractionId,
-        /// Event payload
-        payload: Value,
-        /// Event timestamp
-        timestamp: DateTime<Utc>,
-    },
-
-    /// Artifact event (reference to stored artifact)
-    Artifact {
-        /// Thread this event belongs to
-        thread_id: ThreadId,
-        /// Interaction this event belongs to
-        interaction_id: InteractionId,
-        /// Reference ID to the artifact
-        reference_id: String,
-        /// Event timestamp
-        timestamp: DateTime<Utc>,
-    },
-
-    /// External event (webhook, timer, etc.)
-    ExternalEvent {
-        /// Thread this event belongs to
-        thread_id: ThreadId,
-        /// Kind of external event
-        kind: String,
-        /// Event payload
-        payload: Value,
-        /// Event timestamp
-        timestamp: DateTime<Utc>,
-    },
-
-    /// System trace event (for debugging and auditing)
-    SystemTrace {
-        /// Thread this event belongs to
-        thread_id: ThreadId,
-        /// Trace level (debug, info, warn, error)
-        level: String,
-        /// Trace payload
-        payload: Value,
-        /// Event timestamp
-        timestamp: DateTime<Utc>,
-    },
-}
-
-impl Event {
-    /// Create a new user input event
-    pub fn user_input(
-        thread_id: impl Into<String>,
-        interaction_id: impl Into<String>,
-        payload: Value,
-    ) -> Self {
-        Self::UserInput {
-            thread_id: thread_id.into(),
-            interaction_id: interaction_id.into(),
-            payload,
-            timestamp: Utc::now(),
-        }
-    }
-
-    /// Create a new assistant output event
-    pub fn assistant_output(
-        thread_id: impl Into<String>,
-        interaction_id: impl Into<String>,
-        payload: Value,
-    ) -> Self {
-        Self::AssistantOutput {
-            thread_id: thread_id.into(),
-            interaction_id: interaction_id.into(),
-            payload,
-            timestamp: Utc::now(),
-        }
-    }
-
-    /// Create a new artifact event
-    pub fn artifact(
-        thread_id: impl Into<String>,
-        interaction_id: impl Into<String>,
-        reference_id: impl Into<String>,
-    ) -> Self {
-        Self::Artifact {
-            thread_id: thread_id.into(),
-            interaction_id: interaction_id.into(),
-            reference_id: reference_id.into(),
-            timestamp: Utc::now(),
-        }
-    }
-
-    /// Create a new external event
-    pub fn external(thread_id: impl Into<String>, kind: impl Into<String>, payload: Value) -> Self {
-        Self::ExternalEvent {
-            thread_id: thread_id.into(),
-            kind: kind.into(),
-            payload,
-            timestamp: Utc::now(),
-        }
-    }
-
-    /// Create a new system trace event
-    pub fn trace(thread_id: impl Into<String>, level: impl Into<String>, payload: Value) -> Self {
-        Self::SystemTrace {
-            thread_id: thread_id.into(),
-            level: level.into(),
-            payload,
-            timestamp: Utc::now(),
-        }
-    }
-
-    /// Get the thread ID of this event
-    pub fn thread_id(&self) -> &str {
-        match self {
-            Event::UserInput { thread_id, .. } => thread_id,
-            Event::AssistantOutput { thread_id, .. } => thread_id,
-            Event::Artifact { thread_id, .. } => thread_id,
-            Event::ExternalEvent { thread_id, .. } => thread_id,
-            Event::SystemTrace { thread_id, .. } => thread_id,
-        }
-    }
-
-    /// Get the timestamp of this event
-    pub fn timestamp(&self) -> DateTime<Utc> {
-        match self {
-            Event::UserInput { timestamp, .. } => *timestamp,
-            Event::AssistantOutput { timestamp, .. } => *timestamp,
-            Event::Artifact { timestamp, .. } => *timestamp,
-            Event::ExternalEvent { timestamp, .. } => *timestamp,
-            Event::SystemTrace { timestamp, .. } => *timestamp,
-        }
-    }
-
-    /// Return a copy of this event with a new interaction ID (if applicable)
-    pub fn with_interaction_id(&self, interaction_id: impl Into<String>) -> Self {
-        let interaction_id = interaction_id.into();
-        match self {
-            Event::UserInput {
-                thread_id,
-                payload,
-                timestamp,
-                ..
-            } => Event::UserInput {
-                thread_id: thread_id.clone(),
-                interaction_id,
-                payload: payload.clone(),
-                timestamp: *timestamp,
-            },
-            Event::AssistantOutput {
-                thread_id,
-                payload,
-                timestamp,
-                ..
-            } => Event::AssistantOutput {
-                thread_id: thread_id.clone(),
-                interaction_id,
-                payload: payload.clone(),
-                timestamp: *timestamp,
-            },
-            Event::Artifact {
-                thread_id,
-                reference_id,
-                timestamp,
-                ..
-            } => Event::Artifact {
-                thread_id: thread_id.clone(),
-                interaction_id,
-                reference_id: reference_id.clone(),
-                timestamp: *timestamp,
-            },
-            Event::ExternalEvent { .. } | Event::SystemTrace { .. } => self.clone(),
-        }
-    }
-}
-
-/// EventStore trait - async interface for event storage
-#[async_trait]
-pub trait EventStore: Send + Sync {
-    /// Append an event
-    async fn append(&self, event: Event) -> Result<(), StoreError>;
-
-    /// Query events by thread ID
-    async fn query_by_thread(&self, thread_id: &str) -> Result<Vec<Event>, StoreError>;
-
-    /// Query events by thread ID with limit
-    async fn query_by_thread_with_limit(
-        &self,
-        thread_id: &str,
-        limit: usize,
-    ) -> Result<Vec<Event>, StoreError>;
-
-    /// Query recent events across all threads
-    async fn query_recent(&self, limit: usize) -> Result<Vec<Event>, StoreError>;
-}
 
 /// In-memory implementation for development and testing
 pub struct InMemoryEventStore {
@@ -459,6 +236,238 @@ impl EventStore for RedisEventStore {
     }
 }
 
+/// PostgreSQL implementation for append-only event persistence.
+pub struct PostgresEventStore {
+    pool: PgPool,
+    table_name: String,
+}
+
+impl PostgresEventStore {
+    /// Create a new PostgreSQL event store from a connection URL.
+    pub async fn new(
+        connection_url: &str,
+        table_prefix: impl Into<String>,
+    ) -> Result<Self, StoreError> {
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect(connection_url)
+            .await
+            .map_err(|e| StoreError::Connection(e.to_string()))?;
+        let prefix = normalize_table_prefix(&table_prefix.into());
+        let table_name = format!("{}_events", prefix);
+        let this = Self { pool, table_name };
+        this.init_schema().await?;
+        Ok(this)
+    }
+
+    async fn init_schema(&self) -> Result<(), StoreError> {
+        let create_table = format!(
+            "CREATE TABLE IF NOT EXISTS {} (
+                id BIGSERIAL PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                interaction_id TEXT NULL,
+                event_type TEXT NOT NULL,
+                payload JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                reference_id TEXT NULL,
+                task_id TEXT NULL,
+                step_id TEXT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                event_json JSONB NOT NULL
+            )",
+            self.table_name
+        );
+        sqlx::query(&create_table)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Connection(e.to_string()))?;
+        let idx_thread_time = format!(
+            "CREATE INDEX IF NOT EXISTS {0}_thread_time_idx ON {1} (thread_id, created_at DESC, id DESC)",
+            self.table_name, self.table_name
+        );
+        let idx_thread_type_time = format!(
+            "CREATE INDEX IF NOT EXISTS {0}_thread_type_time_idx ON {1} (thread_id, event_type, created_at DESC, id DESC)",
+            self.table_name, self.table_name
+        );
+        let idx_interaction = format!(
+            "CREATE INDEX IF NOT EXISTS {0}_interaction_idx ON {1} (thread_id, interaction_id, created_at DESC, id DESC)",
+            self.table_name, self.table_name
+        );
+        let idx_time = format!(
+            "CREATE INDEX IF NOT EXISTS {0}_time_idx ON {1} (created_at DESC, id DESC)",
+            self.table_name, self.table_name
+        );
+        let idx_reference = format!(
+            "CREATE INDEX IF NOT EXISTS {0}_reference_idx ON {1} (reference_id)",
+            self.table_name, self.table_name
+        );
+        sqlx::query(&idx_thread_time)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Connection(e.to_string()))?;
+        sqlx::query(&idx_thread_type_time)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Connection(e.to_string()))?;
+        sqlx::query(&idx_interaction)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Connection(e.to_string()))?;
+        sqlx::query(&idx_time)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Connection(e.to_string()))?;
+        sqlx::query(&idx_reference)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Connection(e.to_string()))?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl EventStore for PostgresEventStore {
+    async fn append(&self, event: Event) -> Result<(), StoreError> {
+        let sql = format!(
+            "INSERT INTO {} (thread_id, interaction_id, event_type, payload, reference_id, task_id, step_id, created_at, event_json)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            self.table_name
+        );
+        let event_json =
+            serde_json::to_value(&event).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let payload = event_payload(&event);
+        sqlx::query(&sql)
+            .bind(event.thread_id().to_string())
+            .bind(event.interaction_id().map(ToString::to_string))
+            .bind(event_type_label(&event))
+            .bind(payload)
+            .bind(event_reference_id(&event))
+            .bind(event.task_id().map(ToString::to_string))
+            .bind(event.step_id().map(ToString::to_string))
+            .bind(event.timestamp())
+            .bind(event_json)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Connection(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn query_by_thread(&self, thread_id: &str) -> Result<Vec<Event>, StoreError> {
+        let sql = format!(
+            "SELECT event_json FROM {} WHERE thread_id = $1 ORDER BY created_at ASC, id ASC",
+            self.table_name
+        );
+        let rows = sqlx::query(&sql)
+            .bind(thread_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Connection(e.to_string()))?;
+        decode_event_rows(rows)
+    }
+
+    async fn query_by_thread_with_limit(
+        &self,
+        thread_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Event>, StoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit_i64 = usize_to_i64(limit)?;
+        let sql = format!(
+            "SELECT event_json FROM {} WHERE thread_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2",
+            self.table_name
+        );
+        let rows = sqlx::query(&sql)
+            .bind(thread_id)
+            .bind(limit_i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Connection(e.to_string()))?;
+        decode_event_rows(rows)
+    }
+
+    async fn query_recent(&self, limit: usize) -> Result<Vec<Event>, StoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit_i64 = usize_to_i64(limit)?;
+        let sql = format!(
+            "SELECT event_json FROM {} ORDER BY created_at DESC, id DESC LIMIT $1",
+            self.table_name
+        );
+        let rows = sqlx::query(&sql)
+            .bind(limit_i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Connection(e.to_string()))?;
+        decode_event_rows(rows)
+    }
+}
+
+fn decode_event_rows(rows: Vec<sqlx::postgres::PgRow>) -> Result<Vec<Event>, StoreError> {
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let value: serde_json::Value = row
+            .try_get("event_json")
+            .map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let event: Event =
+            serde_json::from_value(value).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        out.push(event);
+    }
+    Ok(out)
+}
+
+fn event_type_label(event: &Event) -> &'static str {
+    match event {
+        Event::UserInput { .. } => "user_input",
+        Event::AssistantOutput { .. } => "assistant_output",
+        Event::Artifact { .. } => "artifact",
+        Event::ExternalEvent { .. } => "external_event",
+        Event::SystemTrace { .. } => "system_trace",
+    }
+}
+
+fn event_payload(event: &Event) -> serde_json::Value {
+    match event {
+        Event::UserInput { payload, .. } => payload.clone(),
+        Event::AssistantOutput { payload, .. } => payload.clone(),
+        Event::ExternalEvent { payload, .. } => payload.clone(),
+        Event::SystemTrace { payload, .. } => payload.clone(),
+        Event::Artifact { reference_id, .. } => serde_json::json!({ "reference_id": reference_id }),
+    }
+}
+
+fn event_reference_id(event: &Event) -> Option<String> {
+    match event {
+        Event::Artifact { reference_id, .. } => Some(reference_id.clone()),
+        _ => None,
+    }
+}
+
+fn usize_to_i64(value: usize) -> Result<i64, StoreError> {
+    i64::try_from(value).map_err(|_| StoreError::Internal("limit exceeds i64 range".to_string()))
+}
+
+fn normalize_table_prefix(raw: &str) -> String {
+    let candidate = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+    if candidate.is_empty() {
+        "orchestral".to_string()
+    } else {
+        candidate
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,11 +497,15 @@ mod tests {
             assert_eq!(events.len(), 2);
 
             match &events[0] {
-                Event::UserInput { interaction_id, .. } => assert_eq!(interaction_id, "i2"),
+                Event::UserInput { interaction_id, .. } => {
+                    assert_eq!(interaction_id.as_str(), "i2")
+                }
                 other => panic!("unexpected event: {:?}", other),
             }
             match &events[1] {
-                Event::UserInput { interaction_id, .. } => assert_eq!(interaction_id, "i3"),
+                Event::UserInput { interaction_id, .. } => {
+                    assert_eq!(interaction_id.as_str(), "i3")
+                }
                 other => panic!("unexpected event: {:?}", other),
             }
         });

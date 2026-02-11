@@ -17,7 +17,7 @@ use serde_json::Value;
 
 use crate::action::{Action, ActionContext, ActionInput, ActionResult, ApprovalRequest};
 use crate::store::{ReferenceStore, WorkingSet};
-use crate::types::{Plan, Step, StepKind};
+use crate::types::{Plan, Step, StepId, StepKind, TaskId};
 
 const MAX_LOG_TEXT_CHARS: usize = 2_000;
 const MAX_LOG_JSON_CHARS: usize = 8_000;
@@ -73,9 +73,9 @@ pub struct DagNode {
     /// Current state
     pub state: NodeState,
     /// Steps this node depends on
-    pub depends_on: Vec<String>,
+    pub depends_on: Vec<StepId>,
     /// Steps that depend on this node (reverse dependencies)
-    pub dependents: Vec<String>,
+    pub dependents: Vec<StepId>,
     /// Execution ID for this run (distinguishes retry/resume)
     pub execution_id: String,
 }
@@ -97,7 +97,7 @@ impl DagNode {
     pub fn dependencies_satisfied(&self, nodes: &HashMap<String, DagNode>) -> bool {
         self.depends_on.iter().all(|dep_id| {
             nodes
-                .get(dep_id)
+                .get(dep_id.as_str())
                 .map(|n| n.state == NodeState::Completed)
                 .unwrap_or(false)
         })
@@ -146,13 +146,13 @@ impl ExecutionDag {
         // Create all nodes
         for step in &plan.steps {
             let node = DagNode::new(step.clone());
-            dag.nodes.insert(step.id.clone(), node);
+            dag.nodes.insert(step.id.to_string(), node);
         }
 
         // Build reverse dependencies
         for step in &plan.steps {
             for dep_id in &step.depends_on {
-                if let Some(dep_node) = dag.nodes.get_mut(dep_id) {
+                if let Some(dep_node) = dag.nodes.get_mut(dep_id.as_str()) {
                     dep_node.dependents.push(step.id.clone());
                 } else {
                     return Err(format!("Dependency '{}' not found", dep_id));
@@ -257,7 +257,7 @@ impl ExecutionDag {
 
         // Validate dependencies exist
         for dep_id in &step.depends_on {
-            if !self.nodes.contains_key(dep_id) {
+            if !self.nodes.contains_key(dep_id.as_str()) {
                 return Err(format!("Dependency '{}' not found", dep_id));
             }
         }
@@ -267,12 +267,12 @@ impl ExecutionDag {
 
         // Update reverse dependencies
         for dep_id in &node.depends_on {
-            if let Some(dep_node) = self.nodes.get_mut(dep_id) {
-                dep_node.dependents.push(id.clone());
+            if let Some(dep_node) = self.nodes.get_mut(dep_id.as_str()) {
+                dep_node.dependents.push(id.clone().into());
             }
         }
 
-        self.nodes.insert(id, node);
+        self.nodes.insert(id.to_string(), node);
         self.update_ready_nodes();
 
         Ok(())
@@ -327,7 +327,7 @@ pub struct ExecutorContext {
     /// Reference store for historical artifacts
     pub reference_store: Arc<dyn ReferenceStore>,
     /// Task ID
-    pub task_id: String,
+    pub task_id: TaskId,
     /// Optional execution progress reporter.
     pub progress_reporter: Option<Arc<dyn ExecutionProgressReporter>>,
 }
@@ -335,7 +335,7 @@ pub struct ExecutorContext {
 impl ExecutorContext {
     /// Create a new executor context
     pub fn new(
-        task_id: impl Into<String>,
+        task_id: impl Into<TaskId>,
         working_set: Arc<RwLock<WorkingSet>>,
         reference_store: Arc<dyn ReferenceStore>,
     ) -> Self {
@@ -360,22 +360,22 @@ pub enum ExecutionResult {
     /// All steps completed successfully
     Completed,
     /// Execution failed
-    Failed { step_id: String, error: String },
+    Failed { step_id: StepId, error: String },
     /// Waiting for user input
     WaitingUser {
-        step_id: String,
+        step_id: StepId,
         prompt: String,
         approval: Option<ApprovalRequest>,
     },
     /// Waiting for external event
-    WaitingEvent { step_id: String, event_type: String },
+    WaitingEvent { step_id: StepId, event_type: String },
 }
 
 /// Realtime execution progress event.
 #[derive(Debug, Clone)]
 pub struct ExecutionProgressEvent {
-    pub task_id: String,
-    pub step_id: Option<String>,
+    pub task_id: TaskId,
+    pub step_id: Option<StepId>,
     pub action: Option<String>,
     /// Phase label, e.g. step_started/step_completed/task_completed.
     pub phase: String,
@@ -387,8 +387,8 @@ pub struct ExecutionProgressEvent {
 
 impl ExecutionProgressEvent {
     pub fn new(
-        task_id: impl Into<String>,
-        step_id: Option<String>,
+        task_id: impl Into<TaskId>,
+        step_id: Option<StepId>,
         action: Option<String>,
         phase: impl Into<String>,
     ) -> Self {
@@ -513,7 +513,7 @@ impl Executor {
 
         if dag.has_failed() {
             let failed = dag.failed_nodes();
-            let failed_step_id = failed.first().map(|s| s.to_string()).unwrap_or_default();
+            let failed_step_id = failed.first().map(|s| StepId::from(*s)).unwrap_or_default();
             report_progress(
                 ctx,
                 ExecutionProgressEvent::new(
@@ -538,7 +538,7 @@ impl Executor {
         )
         .await;
         ExecutionResult::Failed {
-            step_id: String::new(),
+            step_id: StepId::default(),
             error: "No ready nodes but DAG not completed".to_string(),
         }
     }
@@ -571,14 +571,14 @@ impl Executor {
                             ctx,
                             ExecutionProgressEvent::new(
                                 ctx.task_id.clone(),
-                                Some(step_id.clone()),
+                                Some(step_id.clone().into()),
                                 Some(action),
                                 "step_waiting_user",
                             ),
                         )
                         .await;
                         Some(ExecutionResult::WaitingUser {
-                            step_id: step_id.clone(),
+                            step_id: step_id.clone().into(),
                             prompt: params
                                 .get("prompt")
                                 .and_then(|v| v.as_str())
@@ -592,14 +592,14 @@ impl Executor {
                             ctx,
                             ExecutionProgressEvent::new(
                                 ctx.task_id.clone(),
-                                Some(step_id.clone()),
+                                Some(step_id.clone().into()),
                                 Some(action),
                                 "step_waiting_event",
                             ),
                         )
                         .await;
                         Some(ExecutionResult::WaitingEvent {
-                            step_id: step_id.clone(),
+                            step_id: step_id.clone().into(),
                             event_type: params
                                 .get("event_type")
                                 .and_then(|v| v.as_str())
@@ -637,7 +637,7 @@ impl Executor {
                     ctx,
                     ExecutionProgressEvent::new(
                         ctx.task_id.clone(),
-                        Some(step_id.clone()),
+                        Some(step_id.clone().into()),
                         Some(step.action.clone()),
                         "step_started",
                     )
@@ -680,7 +680,7 @@ impl Executor {
                         ctx,
                         ExecutionProgressEvent::new(
                             ctx.task_id.clone(),
-                            Some(step_id.clone()),
+                            Some(step_id.clone().into()),
                             Some(step.action.clone()),
                             "step_failed",
                         )
@@ -689,7 +689,10 @@ impl Executor {
                     .await;
                     choose_terminal_result(
                         terminal_result,
-                        ExecutionResult::Failed { step_id, error },
+                        ExecutionResult::Failed {
+                            step_id: step_id.into(),
+                            error,
+                        },
                     );
                     return;
                 }
@@ -711,7 +714,7 @@ impl Executor {
                     ctx,
                     ExecutionProgressEvent::new(
                         ctx.task_id.clone(),
-                        Some(step_id),
+                        Some(step_id.clone().into()),
                         Some(step.action.clone()),
                         "step_completed",
                     )
@@ -724,7 +727,7 @@ impl Executor {
                     ctx,
                     ExecutionProgressEvent::new(
                         ctx.task_id.clone(),
-                        Some(step_id.clone()),
+                        Some(step_id.clone().into()),
                         Some(step.action.clone()),
                         "step_waiting_user",
                     )
@@ -734,7 +737,7 @@ impl Executor {
                 choose_terminal_result(
                     terminal_result,
                     ExecutionResult::WaitingUser {
-                        step_id,
+                        step_id: step_id.into(),
                         prompt: question,
                         approval: None,
                     },
@@ -747,7 +750,7 @@ impl Executor {
                     ctx,
                     ExecutionProgressEvent::new(
                         ctx.task_id.clone(),
-                        Some(step_id.clone()),
+                        Some(step_id.clone().into()),
                         Some(step.action.clone()),
                         "step_waiting_user",
                     )
@@ -762,7 +765,7 @@ impl Executor {
                 choose_terminal_result(
                     terminal_result,
                     ExecutionResult::WaitingUser {
-                        step_id,
+                        step_id: step_id.into(),
                         prompt: "Approval required".to_string(),
                         approval: Some(request),
                     },
@@ -781,7 +784,7 @@ impl Executor {
                     ctx,
                     ExecutionProgressEvent::new(
                         ctx.task_id.clone(),
-                        Some(step_id.clone()),
+                        Some(step_id.clone().into()),
                         Some(step.action.clone()),
                         "step_failed",
                     )
@@ -791,7 +794,7 @@ impl Executor {
                 choose_terminal_result(
                     terminal_result,
                     ExecutionResult::Failed {
-                        step_id,
+                        step_id: step_id.into(),
                         error: message,
                     },
                 );
@@ -809,7 +812,7 @@ impl Executor {
                     ctx,
                     ExecutionProgressEvent::new(
                         ctx.task_id.clone(),
-                        Some(step_id.clone()),
+                        Some(step_id.clone().into()),
                         Some(step.action.clone()),
                         "step_failed",
                     )
@@ -819,7 +822,7 @@ impl Executor {
                 choose_terminal_result(
                     terminal_result,
                     ExecutionResult::Failed {
-                        step_id,
+                        step_id: step_id.into(),
                         error: message,
                     },
                 );
@@ -1275,7 +1278,7 @@ fn validate_schema(
     value: &serde_json::Value,
     schema: &serde_json::Value,
     label: &str,
-    step_id: &str,
+    step_id: &StepId,
     action: &str,
 ) -> Result<(), String> {
     if schema.is_null() {
@@ -1672,7 +1675,7 @@ mod tests {
                 vec![
                     Step::action("s1", "produce").with_exports(vec!["guide_markdown".to_string()]),
                     Step::action("s2", "consume_content")
-                        .with_depends_on(vec!["s1".to_string()])
+                        .with_depends_on(vec![StepId::from("s1")])
                         .with_io_bindings(vec![StepIoBinding::required(
                             "s1.guide_markdown",
                             "content",

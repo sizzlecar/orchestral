@@ -42,9 +42,12 @@ pub mod prelude {
         HistoryItem, PlanError, Planner, PlannerContext, PlannerOutput, PlannerRuntimeInfo,
     };
     pub use crate::store::{
-        Reference, ReferenceStore, ReferenceType, Scope, StoreError, TaskStore, WorkingSet,
+        EmbeddingStatus, Event, EventStore, Reference, ReferenceStore, ReferenceType, Scope,
+        StoreError, TaskStore, WorkingSet,
     };
-    pub use crate::types::{Intent, IntentContext, Plan, Step, StepKind, Task, TaskId, TaskState};
+    pub use crate::types::{
+        Intent, IntentContext, Plan, Step, StepId, StepKind, Task, TaskId, TaskState,
+    };
 }
 
 // Re-export key types at crate root
@@ -57,5 +60,7 @@ pub use interpreter::{
 };
 pub use normalizer::{NormalizedPlan, PlanNormalizer};
 pub use planner::{Planner, PlannerOutput, PlannerRuntimeInfo};
-pub use store::{ReferenceStore, StoreError, TaskStore, WorkingSet};
-pub use types::{Intent, Plan, Step, Task, TaskId, TaskState};
+pub use store::{
+    EmbeddingStatus, Event, EventStore, ReferenceStore, StoreError, TaskStore, WorkingSet,
+};
+pub use types::{Intent, Plan, Step, StepId, Task, TaskId, TaskState};

@@ -202,8 +202,8 @@ impl<'a> ExternalInvokeRequest<'a> {
             },
             input,
             context: ExternalContext {
-                task_id: &ctx.task_id,
-                step_id: &ctx.step_id,
+                task_id: ctx.task_id.as_str(),
+                step_id: ctx.step_id.as_str(),
                 execution_id: &ctx.execution_id,
             },
         }

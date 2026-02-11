@@ -579,10 +579,17 @@ fn event_interaction_id(event: &ChannelEvent) -> Option<&str> {
         ChannelEvent::UserInput { interaction_id, .. }
         | ChannelEvent::AssistantOutput { interaction_id, .. }
         | ChannelEvent::Artifact { interaction_id, .. } => Some(interaction_id.as_str()),
-        ChannelEvent::SystemTrace { payload, .. } => {
-            payload.get("interaction_id").and_then(|v| v.as_str())
+        ChannelEvent::SystemTrace {
+            interaction_id,
+            payload,
+            ..
+        } => interaction_id
+            .as_ref()
+            .map(|id| id.as_str())
+            .or_else(|| payload.get("interaction_id").and_then(|v| v.as_str())),
+        ChannelEvent::ExternalEvent { interaction_id, .. } => {
+            interaction_id.as_ref().map(|id| id.as_str())
         }
-        ChannelEvent::ExternalEvent { .. } => None,
     }
 }
 

@@ -357,7 +357,8 @@ impl ThreadRuntime {
     /// Get an interaction by ID
     pub async fn get_interaction(&self, id: &str) -> Option<Interaction> {
         let interactions = self.interactions.read().await;
-        interactions.get(id).cloned()
+        let key: InteractionId = id.into();
+        interactions.get(&key).cloned()
     }
 
     /// Add a task to an interaction
@@ -367,7 +368,8 @@ impl ThreadRuntime {
         task_id: TaskId,
     ) -> Result<(), RuntimeError> {
         let mut interactions = self.interactions.write().await;
-        if let Some(interaction) = interactions.get_mut(id) {
+        let key: InteractionId = id.into();
+        if let Some(interaction) = interactions.get_mut(&key) {
             interaction.add_task(task_id);
             Ok(())
         } else {
@@ -401,7 +403,8 @@ impl ThreadRuntime {
 
         let exists = {
             let interactions = self.interactions.read().await;
-            interactions.contains_key(interaction_id)
+            let key: InteractionId = interaction_id.into();
+            interactions.contains_key(&key)
         };
         if !exists {
             return Err(RuntimeError::InteractionNotFound(
@@ -423,8 +426,9 @@ impl ThreadRuntime {
     /// Mark a waiting interaction active so execution can continue.
     pub async fn resume_interaction(&self, id: &str) -> Result<(), RuntimeError> {
         let mut interactions = self.interactions.write().await;
+        let key: InteractionId = id.into();
         let interaction = interactions
-            .get_mut(id)
+            .get_mut(&key)
             .ok_or_else(|| RuntimeError::InteractionNotFound(id.to_string()))?;
         if interaction.state.is_terminal() {
             return Err(RuntimeError::InvalidEvent(format!(
@@ -443,7 +447,8 @@ impl ThreadRuntime {
         state: InteractionState,
     ) -> Result<(), RuntimeError> {
         let mut interactions = self.interactions.write().await;
-        if let Some(interaction) = interactions.get_mut(id) {
+        let key: InteractionId = id.into();
+        if let Some(interaction) = interactions.get_mut(&key) {
             interaction.set_state(state);
             Ok(())
         } else {
@@ -478,12 +483,12 @@ impl ThreadRuntime {
         let thread_id = self.thread_id().await;
         let events = if limit == 0 {
             self.event_store
-                .query_by_thread(&thread_id)
+                .query_by_thread(thread_id.as_str())
                 .await
                 .map_err(|e| RuntimeError::StoreError(e.to_string()))?
         } else {
             self.event_store
-                .query_by_thread_with_limit(&thread_id, limit)
+                .query_by_thread_with_limit(thread_id.as_str(), limit)
                 .await
                 .map_err(|e| RuntimeError::StoreError(e.to_string()))?
         };
@@ -592,7 +597,7 @@ mod tests {
 
             let event = Event::user_input(thread_id, "ignored", json!({"message":"resume"}));
             let found = runtime.find_resume_interaction(&event).await;
-            assert_eq!(found.as_deref(), Some("newer"));
+            assert_eq!(found.as_ref().map(|id| id.as_str()), Some("newer"));
         });
     }
 
@@ -607,10 +612,7 @@ mod tests {
 
             {
                 let mut interactions = runtime.interactions.write().await;
-                interactions.insert(
-                    "target".to_string(),
-                    Interaction::with_id("target", thread_id),
-                );
+                interactions.insert("target".into(), Interaction::with_id("target", thread_id));
             }
 
             let event = Event::user_input(thread_id, "wrong", json!({"text":"hello"}));
@@ -623,7 +625,7 @@ mod tests {
             assert_eq!(events.len(), 1);
             match &events[0] {
                 Event::UserInput { interaction_id, .. } => {
-                    assert_eq!(interaction_id, "target");
+                    assert_eq!(interaction_id.as_str(), "target");
                 }
                 _ => panic!("expected user_input event"),
             }
@@ -652,7 +654,7 @@ mod tests {
                     payload,
                     ..
                 } => {
-                    assert_ne!(interaction_id, "cli");
+                    assert_ne!(interaction_id.as_str(), "cli");
                     assert_eq!(payload["message"], "hello");
                 }
                 _ => panic!("expected user_input event"),

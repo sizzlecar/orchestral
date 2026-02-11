@@ -13,8 +13,7 @@ use serde::{Deserialize, Serialize};
 use super::thread::ThreadId;
 use orchestral_core::types::TaskId;
 
-/// Type alias for Interaction ID
-pub type InteractionId = String;
+pub use orchestral_core::store::InteractionId;
 
 /// Interaction state
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,9 +77,9 @@ pub struct Interaction {
 
 impl Interaction {
     /// Create a new interaction
-    pub fn new(thread_id: impl Into<String>) -> Self {
+    pub fn new(thread_id: impl Into<ThreadId>) -> Self {
         Self {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: InteractionId::from(uuid::Uuid::new_v4().to_string()),
             thread_id: thread_id.into(),
             state: InteractionState::Active,
             task_ids: Vec::new(),
@@ -90,7 +89,7 @@ impl Interaction {
     }
 
     /// Create a new interaction with specific ID
-    pub fn with_id(id: impl Into<String>, thread_id: impl Into<String>) -> Self {
+    pub fn with_id(id: impl Into<InteractionId>, thread_id: impl Into<ThreadId>) -> Self {
         Self {
             id: id.into(),
             thread_id: thread_id.into(),
