@@ -4,10 +4,11 @@ members = [
     "crates/orchestral-core",
     "crates/orchestral-config",
     "crates/orchestral-context",
-    "crates/orchestral-files",
+    "plugins/orchestral-files",
     "crates/orchestral-planners",
     "crates/orchestral-runtime",
     "crates/orchestral-stores",
+    "plugins/orchestral-stores-backends",
     "crates/orchestral-actions",
     "crates/orchestral-api",
     "crates/orchestral-channels",
@@ -55,10 +56,11 @@ futures-util = "0.3"
 orchestral-core = { path = "crates/orchestral-core" }
 orchestral-config = { path = "crates/orchestral-config" }
 orchestral-context = { path = "crates/orchestral-context" }
-orchestral-files = { path = "crates/orchestral-files" }
+orchestral-files = { path = "plugins/orchestral-files" }
 orchestral-planners = { path = "crates/orchestral-planners" }
 orchestral-runtime = { path = "crates/orchestral-runtime" }
 orchestral-stores = { path = "crates/orchestral-stores" }
+orchestral-stores-backends = { path = "plugins/orchestral-stores-backends" }
 orchestral-actions = { path = "crates/orchestral-actions" }
 orchestral-api = { path = "crates/orchestral-api" }
 orchestral-channels = { path = "crates/orchestral-channels" }

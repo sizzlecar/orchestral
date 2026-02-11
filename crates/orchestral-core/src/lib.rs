@@ -36,8 +36,8 @@ pub mod prelude {
         NoopResultInterpreter, ResultInterpreter,
     };
     pub use crate::io::{
-        FileBackend, FileCatalog, FileHead, FileId, FileIoError, FilePayload, FileRecord,
-        FileService, FileStatus, StorageBackend, StoredAt, UploadRequest,
+        BlobBinding, BlobStore, FileCatalog, FileHead, FileId, FileIoError, FilePayload,
+        FileRecord, FileService, FileStatus, UploadRequest,
     };
     pub use crate::normalizer::{
         FixError, NormalizeError, NormalizedPlan, PlanFixer, PlanNormalizer, PlanValidator,
@@ -64,8 +64,8 @@ pub use interpreter::{
     InterpretDeltaSink, InterpretRequest, InterpretResult, NoopResultInterpreter, ResultInterpreter,
 };
 pub use io::{
-    FileBackend, FileCatalog, FileHead, FileId, FileIoError, FilePayload, FileRecord, FileService,
-    FileStatus, StorageBackend, StoredAt, UploadRequest,
+    BlobBinding, BlobStore, FileCatalog, FileHead, FileId, FileIoError, FilePayload, FileRecord,
+    FileService, FileStatus, UploadRequest,
 };
 pub use normalizer::{NormalizedPlan, PlanNormalizer};
 pub use planner::{Planner, PlannerOutput, PlannerRuntimeInfo};

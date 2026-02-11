@@ -8,11 +8,11 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use orchestral_core::io::{
-    FileBackend, FileCatalog, FileHead, FileId, FileIoError, FilePayload, FileRecord, FileService,
-    FileStatus, StorageBackend, StoredAt, UploadRequest,
+    BlobBinding, BlobStore, FileCatalog, FileHead, FileId, FileIoError, FilePayload, FileRecord,
+    FileService, FileStatus, UploadRequest,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -33,8 +33,11 @@ pub enum FileMode {
 pub struct FileServiceConfig {
     pub mode: FileMode,
     #[serde(default)]
-    pub hybrid_write_to: Option<StorageBackend>,
+    pub hybrid_write_to: Option<String>,
 }
+
+const LOCAL_STORE_KEY: &str = "local";
+const S3_STORE_KEY: &str = "s3";
 
 impl Default for FileServiceConfig {
     fn default() -> Self {
@@ -232,10 +235,10 @@ impl FileCatalog for PostgresFileCatalog {
         );
         sqlx::query(&sql)
             .bind(record.id.as_str())
-            .bind(storage_backend_label(&record.backend))
-            .bind(&record.local_path)
-            .bind(&record.bucket)
-            .bind(&record.object_key)
+            .bind(binding_store_label(&record.binding))
+            .bind(binding_attr_text(&record.binding, "local_path"))
+            .bind(binding_attr_text(&record.binding, "bucket"))
+            .bind(binding_attr_text(&record.binding, "object_key"))
             .bind(&record.file_name)
             .bind(&record.mime_type)
             .bind(byte_size)
@@ -358,19 +361,35 @@ impl LocalFileBackend {
             .collect::<String>();
         format!("{}/{}", file_id.as_str(), safe)
     }
+
+    fn local_path_from_binding(binding: &BlobBinding) -> Result<String, FileIoError> {
+        let store = normalize_store_key(binding.store.as_str());
+        if store != LOCAL_STORE_KEY {
+            return Err(FileIoError::Invalid(format!(
+                "binding store '{}' is not supported by local backend",
+                binding.store
+            )));
+        }
+        binding
+            .attributes
+            .get("local_path")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .ok_or_else(|| FileIoError::Invalid("local_path missing in blob binding".to_string()))
+    }
 }
 
 #[async_trait]
-impl FileBackend for LocalFileBackend {
-    fn backend_kind(&self) -> StorageBackend {
-        StorageBackend::Local
+impl BlobStore for LocalFileBackend {
+    fn store_key(&self) -> &str {
+        LOCAL_STORE_KEY
     }
 
     async fn upload(
         &self,
         file_id: &FileId,
         request: &UploadRequest,
-    ) -> Result<StoredAt, FileIoError> {
+    ) -> Result<BlobBinding, FileIoError> {
         if request.bytes.is_empty() {
             return Err(FileIoError::Invalid("empty file payload".to_string()));
         }
@@ -380,20 +399,17 @@ impl FileBackend for LocalFileBackend {
             tokio::fs::create_dir_all(parent).await?;
         }
         tokio::fs::write(&full_path, &request.bytes).await?;
-        Ok(StoredAt {
-            local_path: Some(relative),
-            bucket: None,
-            object_key: None,
-        })
+        Ok(BlobBinding::new(
+            self.store_key(),
+            json!({
+                "local_path": relative,
+            }),
+        ))
     }
 
-    async fn download(&self, record: &FileRecord) -> Result<FilePayload, FileIoError> {
-        let Some(path) = &record.local_path else {
-            return Err(FileIoError::Invalid(
-                "local_path missing for local backend file".to_string(),
-            ));
-        };
-        let relative = Self::ensure_safe_relative(path)?;
+    async fn download(&self, binding: &BlobBinding) -> Result<FilePayload, FileIoError> {
+        let path = Self::local_path_from_binding(binding)?;
+        let relative = Self::ensure_safe_relative(path.as_str())?;
         let full_path = self.root_dir.join(relative);
         let bytes = tokio::fs::read(&full_path).await?;
         let file_name = full_path
@@ -407,13 +423,9 @@ impl FileBackend for LocalFileBackend {
         })
     }
 
-    async fn delete(&self, record: &FileRecord) -> Result<(), FileIoError> {
-        let Some(path) = &record.local_path else {
-            return Err(FileIoError::Invalid(
-                "local_path missing for local backend file".to_string(),
-            ));
-        };
-        let relative = Self::ensure_safe_relative(path)?;
+    async fn delete(&self, binding: &BlobBinding) -> Result<(), FileIoError> {
+        let path = Self::local_path_from_binding(binding)?;
+        let relative = Self::ensure_safe_relative(path.as_str())?;
         let full_path = self.root_dir.join(relative);
         match tokio::fs::remove_file(full_path).await {
             Ok(_) => Ok(()),
@@ -422,13 +434,9 @@ impl FileBackend for LocalFileBackend {
         }
     }
 
-    async fn head(&self, record: &FileRecord) -> Result<FileHead, FileIoError> {
-        let Some(path) = &record.local_path else {
-            return Err(FileIoError::Invalid(
-                "local_path missing for local backend file".to_string(),
-            ));
-        };
-        let relative = Self::ensure_safe_relative(path)?;
+    async fn head(&self, binding: &BlobBinding) -> Result<FileHead, FileIoError> {
+        let path = Self::local_path_from_binding(binding)?;
+        let relative = Self::ensure_safe_relative(path.as_str())?;
         let full_path = self.root_dir.join(relative);
         let metadata = tokio::fs::metadata(full_path).await?;
         let last_modified = metadata.modified().ok().map(DateTime::<Utc>::from);
@@ -488,19 +496,44 @@ impl S3FileBackend {
         key.push_str(file_name);
         key
     }
+
+    fn bucket_and_key(binding: &BlobBinding) -> Result<(String, String), FileIoError> {
+        let store = normalize_store_key(binding.store.as_str());
+        if store != S3_STORE_KEY {
+            return Err(FileIoError::Invalid(format!(
+                "binding store '{}' is not supported by s3 backend",
+                binding.store
+            )));
+        }
+        let bucket = binding
+            .attributes
+            .get("bucket")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .ok_or_else(|| FileIoError::Invalid("bucket missing in blob binding".to_string()))?;
+        let key = binding
+            .attributes
+            .get("object_key")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .ok_or_else(|| {
+                FileIoError::Invalid("object_key missing in blob binding".to_string())
+            })?;
+        Ok((bucket, key))
+    }
 }
 
 #[async_trait]
-impl FileBackend for S3FileBackend {
-    fn backend_kind(&self) -> StorageBackend {
-        StorageBackend::S3
+impl BlobStore for S3FileBackend {
+    fn store_key(&self) -> &str {
+        S3_STORE_KEY
     }
 
     async fn upload(
         &self,
         file_id: &FileId,
         request: &UploadRequest,
-    ) -> Result<StoredAt, FileIoError> {
+    ) -> Result<BlobBinding, FileIoError> {
         if request.bytes.is_empty() {
             return Err(FileIoError::Invalid("empty file payload".to_string()));
         }
@@ -513,53 +546,30 @@ impl FileBackend for S3FileBackend {
                 request.mime_type.as_deref(),
             )
             .await?;
-        Ok(StoredAt {
-            local_path: None,
-            bucket: Some(self.bucket.clone()),
-            object_key: Some(key),
-        })
+        Ok(BlobBinding::new(
+            self.store_key(),
+            json!({
+                "bucket": self.bucket,
+                "object_key": key,
+            }),
+        ))
     }
 
-    async fn download(&self, record: &FileRecord) -> Result<FilePayload, FileIoError> {
-        let Some(bucket) = &record.bucket else {
-            return Err(FileIoError::Invalid(
-                "bucket missing for s3 backend file".to_string(),
-            ));
-        };
-        let Some(key) = &record.object_key else {
-            return Err(FileIoError::Invalid(
-                "object_key missing for s3 backend file".to_string(),
-            ));
-        };
-        self.client.get_object(bucket, key).await
+    async fn download(&self, binding: &BlobBinding) -> Result<FilePayload, FileIoError> {
+        let (bucket, key) = Self::bucket_and_key(binding)?;
+        self.client.get_object(bucket.as_str(), key.as_str()).await
     }
 
-    async fn delete(&self, record: &FileRecord) -> Result<(), FileIoError> {
-        let Some(bucket) = &record.bucket else {
-            return Err(FileIoError::Invalid(
-                "bucket missing for s3 backend file".to_string(),
-            ));
-        };
-        let Some(key) = &record.object_key else {
-            return Err(FileIoError::Invalid(
-                "object_key missing for s3 backend file".to_string(),
-            ));
-        };
-        self.client.delete_object(bucket, key).await
+    async fn delete(&self, binding: &BlobBinding) -> Result<(), FileIoError> {
+        let (bucket, key) = Self::bucket_and_key(binding)?;
+        self.client
+            .delete_object(bucket.as_str(), key.as_str())
+            .await
     }
 
-    async fn head(&self, record: &FileRecord) -> Result<FileHead, FileIoError> {
-        let Some(bucket) = &record.bucket else {
-            return Err(FileIoError::Invalid(
-                "bucket missing for s3 backend file".to_string(),
-            ));
-        };
-        let Some(key) = &record.object_key else {
-            return Err(FileIoError::Invalid(
-                "object_key missing for s3 backend file".to_string(),
-            ));
-        };
-        self.client.head_object(bucket, key).await
+    async fn head(&self, binding: &BlobBinding) -> Result<FileHead, FileIoError> {
+        let (bucket, key) = Self::bucket_and_key(binding)?;
+        self.client.head_object(bucket.as_str(), key.as_str()).await
     }
 }
 
@@ -567,8 +577,8 @@ impl FileBackend for S3FileBackend {
 pub struct ManagedFileService {
     config: FileServiceConfig,
     catalog: Arc<dyn FileCatalog>,
-    local_backend: Option<Arc<dyn FileBackend>>,
-    s3_backend: Option<Arc<dyn FileBackend>>,
+    local_backend: Option<Arc<dyn BlobStore>>,
+    s3_backend: Option<Arc<dyn BlobStore>>,
 }
 
 impl ManagedFileService {
@@ -581,28 +591,28 @@ impl ManagedFileService {
         }
     }
 
-    pub fn with_local_backend(mut self, backend: Arc<dyn FileBackend>) -> Self {
+    pub fn with_local_backend(mut self, backend: Arc<dyn BlobStore>) -> Self {
         self.local_backend = Some(backend);
         self
     }
 
-    pub fn with_s3_backend(mut self, backend: Arc<dyn FileBackend>) -> Self {
+    pub fn with_s3_backend(mut self, backend: Arc<dyn BlobStore>) -> Self {
         self.s3_backend = Some(backend);
         self
     }
 
-    fn upload_target(&self) -> Result<StorageBackend, FileIoError> {
+    fn upload_target(&self) -> Result<String, FileIoError> {
         match self.config.mode {
-            FileMode::Local => Ok(StorageBackend::Local),
-            FileMode::S3 => Ok(StorageBackend::S3),
+            FileMode::Local => Ok(LOCAL_STORE_KEY.to_string()),
+            FileMode::S3 => Ok(S3_STORE_KEY.to_string()),
             FileMode::Hybrid => {
                 if let Some(target) = &self.config.hybrid_write_to {
-                    return Ok(target.clone());
+                    return Ok(normalize_store_key(target));
                 }
                 if self.s3_backend.is_some() {
-                    Ok(StorageBackend::S3)
+                    Ok(S3_STORE_KEY.to_string())
                 } else if self.local_backend.is_some() {
-                    Ok(StorageBackend::Local)
+                    Ok(LOCAL_STORE_KEY.to_string())
                 } else {
                     Err(FileIoError::Invalid(
                         "hybrid mode requires at least one backend".to_string(),
@@ -612,19 +622,19 @@ impl ManagedFileService {
         }
     }
 
-    fn backend_for_kind(&self, kind: &StorageBackend) -> Result<Arc<dyn FileBackend>, FileIoError> {
-        match kind {
-            StorageBackend::Local => self
+    fn backend_for_store(&self, store: &str) -> Result<Arc<dyn BlobStore>, FileIoError> {
+        match normalize_store_key(store).as_str() {
+            LOCAL_STORE_KEY => self
                 .local_backend
                 .clone()
                 .ok_or_else(|| FileIoError::Invalid("local backend is not configured".to_string())),
-            StorageBackend::S3 => self
+            S3_STORE_KEY => self
                 .s3_backend
                 .clone()
                 .ok_or_else(|| FileIoError::Invalid("s3 backend is not configured".to_string())),
-            StorageBackend::Custom(label) => Err(FileIoError::Unsupported(format!(
-                "custom backend '{}' is not configured",
-                label
+            other => Err(FileIoError::Unsupported(format!(
+                "blob store '{}' is not configured",
+                other
             ))),
         }
     }
@@ -634,16 +644,13 @@ impl ManagedFileService {
 impl FileService for ManagedFileService {
     async fn upload(&self, request: UploadRequest) -> Result<FileRecord, FileIoError> {
         let id = FileId::from(uuid::Uuid::new_v4().to_string());
-        let backend_kind = self.upload_target()?;
-        let backend = self.backend_for_kind(&backend_kind)?;
-        let stored_at = backend.upload(&id, &request).await?;
+        let store = self.upload_target()?;
+        let backend = self.backend_for_store(&store)?;
+        let binding = backend.upload(&id, &request).await?;
         let now = Utc::now();
         let record = FileRecord {
             id: id.clone(),
-            backend: backend_kind,
-            local_path: stored_at.local_path,
-            bucket: stored_at.bucket,
-            object_key: stored_at.object_key,
+            binding,
             file_name: request.file_name,
             mime_type: request.mime_type,
             byte_size: request.bytes.len() as u64,
@@ -669,16 +676,16 @@ impl FileService for ManagedFileService {
         if record.status == FileStatus::Deleted {
             return Err(FileIoError::NotFound(file_id.to_string()));
         }
-        let backend = self.backend_for_kind(&record.backend)?;
-        backend.download(&record).await
+        let backend = self.backend_for_store(record.binding.store.as_str())?;
+        backend.download(&record.binding).await
     }
 
     async fn delete(&self, file_id: &FileId) -> Result<bool, FileIoError> {
         let Some(record) = self.catalog.get(file_id).await? else {
             return Ok(false);
         };
-        let backend = self.backend_for_kind(&record.backend)?;
-        backend.delete(&record).await?;
+        let backend = self.backend_for_store(record.binding.store.as_str())?;
+        backend.delete(&record.binding).await?;
         self.catalog.mark_deleted(file_id, Utc::now()).await
     }
 
@@ -689,8 +696,8 @@ impl FileService for ManagedFileService {
         if record.status == FileStatus::Deleted {
             return Err(FileIoError::NotFound(file_id.to_string()));
         }
-        let backend = self.backend_for_kind(&record.backend)?;
-        backend.head(&record).await
+        let backend = self.backend_for_store(record.binding.store.as_str())?;
+        backend.head(&record.binding).await
     }
 
     async fn resolve(&self, file_id: &FileId) -> Result<Option<FileRecord>, FileIoError> {
@@ -718,12 +725,20 @@ fn normalize_table_prefix(raw: &str) -> String {
     }
 }
 
-fn storage_backend_label(backend: &StorageBackend) -> String {
-    match backend {
-        StorageBackend::Local => "local".to_string(),
-        StorageBackend::S3 => "s3".to_string(),
-        StorageBackend::Custom(label) => format!("custom:{}", label),
-    }
+fn normalize_store_key(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase()
+}
+
+fn binding_store_label(binding: &BlobBinding) -> String {
+    normalize_store_key(binding.store.as_str())
+}
+
+fn binding_attr_text(binding: &BlobBinding, key: &str) -> Option<String> {
+    binding
+        .attributes
+        .get(key)
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
 }
 
 fn file_status_label(status: &FileStatus) -> &'static str {
@@ -812,23 +827,13 @@ mod tests {
             let backend = LocalFileBackend::new(LocalFileBackendConfig {
                 root_dir: root.display().to_string(),
             });
-            let record = FileRecord {
-                id: "f-unsafe".into(),
-                backend: StorageBackend::Local,
-                local_path: Some("../etc/passwd".to_string()),
-                bucket: None,
-                object_key: None,
-                file_name: None,
-                mime_type: None,
-                byte_size: 0,
-                checksum_sha256: None,
-                metadata: Value::Null,
-                status: FileStatus::Active,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-                deleted_at: None,
-            };
-            let result = backend.download(&record).await;
+            let binding = BlobBinding::new(
+                LOCAL_STORE_KEY,
+                json!({
+                    "local_path": "../etc/passwd",
+                }),
+            );
+            let result = backend.download(&binding).await;
             assert!(matches!(result, Err(FileIoError::PathOutsideRoot(_))));
             let _ = tokio::fs::remove_dir_all(root).await;
         });

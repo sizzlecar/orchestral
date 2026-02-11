@@ -19,14 +19,15 @@ use orchestral_core::executor::Executor;
 use orchestral_core::interpreter::{NoopResultInterpreter, ResultInterpreter};
 use orchestral_core::normalizer::PlanNormalizer;
 use orchestral_core::planner::{PlanError, Planner, PlannerContext, PlannerOutput};
-use orchestral_core::store::{ReferenceStore, StoreError, TaskStore};
+use orchestral_core::store::{EventStore, ReferenceStore, StoreError, TaskStore};
 use orchestral_core::types::{Intent, Plan, Step};
 use orchestral_planners::{
     DefaultLlmClientFactory, LlmBuildError, LlmClient, LlmClientFactory, LlmInvocationConfig,
     LlmPlanner, LlmPlannerConfig,
 };
-use orchestral_stores::{
-    EventStore, InMemoryEventStore, InMemoryReferenceStore, InMemoryTaskStore, RedisEventStore,
+use orchestral_stores::{InMemoryEventStore, InMemoryReferenceStore, InMemoryTaskStore};
+use orchestral_stores_backends::{
+    PostgresEventStore, PostgresReferenceStore, PostgresTaskStore, RedisEventStore,
     RedisReferenceStore, RedisTaskStore,
 };
 
@@ -79,10 +80,17 @@ static TRACING_INIT: OnceLock<()> = OnceLock::new();
 const MAX_PROMPT_LOG_CHARS: usize = 4_000;
 
 /// Factory abstraction for pluggable store backends.
+#[async_trait]
 pub trait StoreBackendFactory: Send + Sync {
-    fn build_event_store(&self, spec: &StoreSpec) -> Result<Arc<dyn EventStore>, BootstrapError>;
-    fn build_task_store(&self, spec: &StoreSpec) -> Result<Arc<dyn TaskStore>, BootstrapError>;
-    fn build_reference_store(
+    async fn build_event_store(
+        &self,
+        spec: &StoreSpec,
+    ) -> Result<Arc<dyn EventStore>, BootstrapError>;
+    async fn build_task_store(
+        &self,
+        spec: &StoreSpec,
+    ) -> Result<Arc<dyn TaskStore>, BootstrapError>;
+    async fn build_reference_store(
         &self,
         spec: &StoreSpec,
     ) -> Result<Arc<dyn ReferenceStore>, BootstrapError>;
@@ -96,7 +104,7 @@ impl DefaultStoreBackendFactory {
         spec.backend.trim().to_ascii_lowercase()
     }
 
-    fn redis_url(spec: &StoreSpec, store: &str) -> Result<String, BootstrapError> {
+    fn connection_url(spec: &StoreSpec, store: &str) -> Result<String, BootstrapError> {
         spec.connection_url
             .clone()
             .ok_or_else(|| BootstrapError::MissingStoreConnectionUrl {
@@ -111,14 +119,26 @@ impl DefaultStoreBackendFactory {
     }
 }
 
+#[async_trait]
 impl StoreBackendFactory for DefaultStoreBackendFactory {
-    fn build_event_store(&self, spec: &StoreSpec) -> Result<Arc<dyn EventStore>, BootstrapError> {
+    async fn build_event_store(
+        &self,
+        spec: &StoreSpec,
+    ) -> Result<Arc<dyn EventStore>, BootstrapError> {
         match Self::backend_name(spec).as_str() {
             "in_memory" | "memory" => Ok(Arc::new(InMemoryEventStore::new())),
             "redis" => {
-                let url = Self::redis_url(spec, "event")?;
+                let url = Self::connection_url(spec, "event")?;
                 let prefix = Self::key_prefix(spec, "orchestral:event");
                 let store = RedisEventStore::new(&url, prefix).map_err(BootstrapError::Store)?;
+                Ok(Arc::new(store))
+            }
+            "postgres" | "postgresql" | "pgsql" => {
+                let url = Self::connection_url(spec, "event")?;
+                let prefix = Self::key_prefix(spec, "orchestral");
+                let store = PostgresEventStore::new(&url, prefix)
+                    .await
+                    .map_err(BootstrapError::Store)?;
                 Ok(Arc::new(store))
             }
             backend => Err(BootstrapError::UnsupportedStoreBackend {
@@ -128,13 +148,24 @@ impl StoreBackendFactory for DefaultStoreBackendFactory {
         }
     }
 
-    fn build_task_store(&self, spec: &StoreSpec) -> Result<Arc<dyn TaskStore>, BootstrapError> {
+    async fn build_task_store(
+        &self,
+        spec: &StoreSpec,
+    ) -> Result<Arc<dyn TaskStore>, BootstrapError> {
         match Self::backend_name(spec).as_str() {
             "in_memory" | "memory" => Ok(Arc::new(InMemoryTaskStore::new())),
             "redis" => {
-                let url = Self::redis_url(spec, "task")?;
+                let url = Self::connection_url(spec, "task")?;
                 let prefix = Self::key_prefix(spec, "orchestral:task");
                 let store = RedisTaskStore::new(&url, prefix).map_err(BootstrapError::Store)?;
+                Ok(Arc::new(store))
+            }
+            "postgres" | "postgresql" | "pgsql" => {
+                let url = Self::connection_url(spec, "task")?;
+                let prefix = Self::key_prefix(spec, "orchestral");
+                let store = PostgresTaskStore::new(&url, prefix)
+                    .await
+                    .map_err(BootstrapError::Store)?;
                 Ok(Arc::new(store))
             }
             backend => Err(BootstrapError::UnsupportedStoreBackend {
@@ -144,17 +175,25 @@ impl StoreBackendFactory for DefaultStoreBackendFactory {
         }
     }
 
-    fn build_reference_store(
+    async fn build_reference_store(
         &self,
         spec: &StoreSpec,
     ) -> Result<Arc<dyn ReferenceStore>, BootstrapError> {
         match Self::backend_name(spec).as_str() {
             "in_memory" | "memory" => Ok(Arc::new(InMemoryReferenceStore::new())),
             "redis" => {
-                let url = Self::redis_url(spec, "reference")?;
+                let url = Self::connection_url(spec, "reference")?;
                 let prefix = Self::key_prefix(spec, "orchestral:reference");
                 let store =
                     RedisReferenceStore::new(&url, prefix).map_err(BootstrapError::Store)?;
+                Ok(Arc::new(store))
+            }
+            "postgres" | "postgresql" | "pgsql" => {
+                let url = Self::connection_url(spec, "reference")?;
+                let prefix = Self::key_prefix(spec, "orchestral");
+                let store = PostgresReferenceStore::new(&url, prefix)
+                    .await
+                    .map_err(BootstrapError::Store)?;
                 Ok(Arc::new(store))
             }
             backend => Err(BootstrapError::UnsupportedStoreBackend {
@@ -182,9 +221,13 @@ impl RuntimeApp {
         let config = config_manager.config().read().await.clone();
         init_tracing_if_needed(&config.observability);
 
-        let event_store = store_factory.build_event_store(&config.stores.event)?;
-        let task_store = store_factory.build_task_store(&config.stores.task)?;
-        let reference_store = store_factory.build_reference_store(&config.stores.reference)?;
+        let event_store = store_factory
+            .build_event_store(&config.stores.event)
+            .await?;
+        let task_store = store_factory.build_task_store(&config.stores.task).await?;
+        let reference_store = store_factory
+            .build_reference_store(&config.stores.reference)
+            .await?;
 
         let policy = concurrency_policy_from_name(&config.runtime.concurrency_policy)?;
         let runtime_cfg = ThreadRuntimeConfig {
@@ -716,8 +759,8 @@ impl Planner for DeterministicPlanner {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_default_store_factory_rejects_redis_without_connection_url() {
+    #[tokio::test]
+    async fn test_default_store_factory_rejects_redis_without_connection_url() {
         let factory = DefaultStoreBackendFactory;
         let spec = StoreSpec {
             backend: "redis".to_string(),
@@ -725,15 +768,15 @@ mod tests {
             key_prefix: None,
         };
 
-        let result = factory.build_event_store(&spec);
+        let result = factory.build_event_store(&spec).await;
         assert!(matches!(
             result,
             Err(BootstrapError::MissingStoreConnectionUrl { store }) if store == "event"
         ));
     }
 
-    #[test]
-    fn test_default_store_factory_accepts_redis_spec() {
+    #[tokio::test]
+    async fn test_default_store_factory_accepts_redis_spec() {
         let factory = DefaultStoreBackendFactory;
         let spec = StoreSpec {
             backend: "redis".to_string(),
@@ -741,8 +784,8 @@ mod tests {
             key_prefix: Some("orchestral:test".to_string()),
         };
 
-        assert!(factory.build_event_store(&spec).is_ok());
-        assert!(factory.build_task_store(&spec).is_ok());
-        assert!(factory.build_reference_store(&spec).is_ok());
+        assert!(factory.build_event_store(&spec).await.is_ok());
+        assert!(factory.build_task_store(&spec).await.is_ok());
+        assert!(factory.build_reference_store(&spec).await.is_ok());
     }
 }

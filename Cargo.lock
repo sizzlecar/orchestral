@@ -1990,6 +1990,7 @@ dependencies = [
  "orchestral-core",
  "orchestral-planners",
  "orchestral-stores",
+ "orchestral-stores-backends",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -2026,6 +2027,18 @@ name = "orchestral-stores"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "orchestral-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-test",
+]
+
+[[package]]
+name = "orchestral-stores-backends"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
  "chrono",
  "orchestral-core",
  "redis",
@@ -2033,7 +2046,6 @@ dependencies = [
  "serde_json",
  "sqlx",
  "thiserror 1.0.69",
- "tokio",
  "tokio-test",
  "tracing",
  "uuid",

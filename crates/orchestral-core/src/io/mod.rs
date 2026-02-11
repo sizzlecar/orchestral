@@ -55,24 +55,25 @@ impl AsRef<str> for FileId {
     }
 }
 
-/// Physical backend kind.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StorageBackend {
-    Local,
-    S3,
-    Custom(String),
+/// Opaque blob binding for a concrete storage implementation.
+///
+/// `store` is implementation-defined (for example: "local", "s3", "oss", ...).
+/// `attributes` is implementation-defined key/value metadata required for
+/// download/delete/head operations.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct BlobBinding {
+    pub store: String,
+    #[serde(default)]
+    pub attributes: Value,
 }
 
-/// Physical object address returned by backend upload.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct StoredAt {
-    #[serde(default)]
-    pub local_path: Option<String>,
-    #[serde(default)]
-    pub bucket: Option<String>,
-    #[serde(default)]
-    pub object_key: Option<String>,
+impl BlobBinding {
+    pub fn new(store: impl Into<String>, attributes: Value) -> Self {
+        Self {
+            store: store.into(),
+            attributes,
+        }
+    }
 }
 
 /// File lifecycle state.
@@ -87,13 +88,7 @@ pub enum FileStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileRecord {
     pub id: FileId,
-    pub backend: StorageBackend,
-    #[serde(default)]
-    pub local_path: Option<String>,
-    #[serde(default)]
-    pub bucket: Option<String>,
-    #[serde(default)]
-    pub object_key: Option<String>,
+    pub binding: BlobBinding,
     #[serde(default)]
     pub file_name: Option<String>,
     #[serde(default)]
@@ -177,20 +172,20 @@ impl From<serde_json::Error> for FileIoError {
 
 /// Physical backend adapter.
 #[async_trait]
-pub trait FileBackend: Send + Sync {
-    fn backend_kind(&self) -> StorageBackend;
+pub trait BlobStore: Send + Sync {
+    fn store_key(&self) -> &str;
 
     async fn upload(
         &self,
         file_id: &FileId,
         request: &UploadRequest,
-    ) -> Result<StoredAt, FileIoError>;
+    ) -> Result<BlobBinding, FileIoError>;
 
-    async fn download(&self, record: &FileRecord) -> Result<FilePayload, FileIoError>;
+    async fn download(&self, binding: &BlobBinding) -> Result<FilePayload, FileIoError>;
 
-    async fn delete(&self, record: &FileRecord) -> Result<(), FileIoError>;
+    async fn delete(&self, binding: &BlobBinding) -> Result<(), FileIoError>;
 
-    async fn head(&self, record: &FileRecord) -> Result<FileHead, FileIoError>;
+    async fn head(&self, binding: &BlobBinding) -> Result<FileHead, FileIoError>;
 }
 
 /// Metadata catalog.

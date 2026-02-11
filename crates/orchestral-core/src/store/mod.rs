@@ -6,7 +6,8 @@
 //! - ReferenceStore: Historical artifact storage (async trait)
 //! - TaskStore: Task persistence (async trait)
 //!
-//! Note: Implementations are in orchestral-stores crate
+//! Note: In-memory implementations are in `orchestral-stores`; external
+//! backends (Redis/Postgres/...) can live in plugin crates.
 
 mod event_store;
 mod reference_store;

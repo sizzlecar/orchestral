@@ -1,6 +1,6 @@
 [package]
-name = "orchestral-stores"
-description = "Minimal in-memory storage implementations for Orchestral"
+name = "orchestral-stores-backends"
+description = "Redis/Postgres store backend implementations for Orchestral"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,10 +8,15 @@ repository.workspace = true
 
 [dependencies]
 orchestral-core = { workspace = true }
-tokio = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+redis = { workspace = true }
+sqlx = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }
