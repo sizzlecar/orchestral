@@ -38,7 +38,7 @@ pub enum EmbeddingStatus {
 
 /// A reference to a historical artifact.
 ///
-/// Reference is an index row (metadata + location), not the artifact body itself.
+/// Reference is an index row (metadata + linkage), not the artifact body itself.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Reference {
     /// Unique identifier
@@ -54,11 +54,11 @@ pub struct Reference {
     /// Optional owning step id.
     #[serde(default)]
     pub step_id: Option<StepId>,
+    /// Optional managed file identifier. When set, file IO must go through file service.
+    #[serde(default)]
+    pub file_id: Option<String>,
     /// Type of reference
     pub ref_type: ReferenceType,
-    /// Locator payload describing where the content lives.
-    #[serde(default)]
-    pub locator: Value,
     /// Inline content payload (small previews, snippets, extracted text).
     #[serde(default)]
     pub content: Value,
@@ -111,8 +111,8 @@ impl Reference {
             interaction_id: None,
             task_id: None,
             step_id: None,
+            file_id: None,
             ref_type,
-            locator: Value::Object(Default::default()),
             content,
             mime_type: None,
             file_name: None,
@@ -156,9 +156,9 @@ impl Reference {
         self
     }
 
-    /// Attach location payload.
-    pub fn with_locator(mut self, locator: Value) -> Self {
-        self.locator = locator;
+    /// Attach managed file id.
+    pub fn with_file_id(mut self, file_id: Option<String>) -> Self {
+        self.file_id = file_id;
         self
     }
 

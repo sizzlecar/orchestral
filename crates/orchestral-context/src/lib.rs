@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use orchestral_core::store::{Reference, ReferenceStore, ReferenceType, StoreError};
-use orchestral_stores::{Event, EventStore};
+use orchestral_core::store::{
+    Event, EventStore, Reference, ReferenceStore, ReferenceType, StoreError,
+};
 
 /// Metadata key for summary reference ID
 pub const META_SUMMARY_REF: &str = "orchestral.summary_ref";
@@ -22,10 +23,10 @@ pub const META_SOURCE_IDS: &str = "orchestral.source_ids";
 /// Metadata key for tags
 pub const META_TAGS: &str = "orchestral.tags";
 
-/// Where the artifact content lives
+/// How to reference artifact content
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ContentLocator {
+pub enum ContentSource {
     /// Inline text content
     InlineText { text: String },
     /// Reference by ID (stored in ReferenceStore)
@@ -39,7 +40,7 @@ pub enum ContentLocator {
 pub struct ContextArtifact {
     pub id: String,
     pub ref_type: ReferenceType,
-    pub locator: ContentLocator,
+    pub source: ContentSource,
     #[serde(default)]
     pub summary_id: Option<String>,
     #[serde(default)]
@@ -177,6 +178,47 @@ pub enum ContextError {
     InvalidRequest(String),
 }
 
+/// Thread-level summary artifact.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadSummary {
+    pub thread_id: String,
+    pub summary_text: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    pub last_event_id: i64,
+    #[serde(default)]
+    pub metadata: HashMap<String, Value>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Pluggable thread summary strategy.
+#[async_trait]
+pub trait ThreadSummarizer: Send + Sync {
+    async fn summarize_thread(
+        &self,
+        request: &ContextRequest,
+    ) -> Result<ThreadSummary, ContextError>;
+}
+
+/// Result of embedding a reference artifact.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddedReference {
+    pub reference_id: String,
+    pub model: String,
+    pub vector: Vec<f32>,
+}
+
+/// Pluggable artifact embedding strategy.
+#[async_trait]
+pub trait ArtifactEmbedder: Send + Sync {
+    async fn embed_reference(
+        &self,
+        reference: &Reference,
+    ) -> Result<EmbeddedReference, ContextError>;
+}
+
 /// Context builder trait
 #[async_trait]
 pub trait ContextBuilder: Send + Sync {
@@ -242,10 +284,12 @@ impl ContextBuilder for BasicContextBuilder {
 
         if request.include_references {
             let references = if self.config.reference_limit == 0 {
-                self.reference_store.query_recent(usize::MAX).await?
+                self.reference_store
+                    .query_recent_by_thread(&request.thread_id, usize::MAX)
+                    .await?
             } else {
                 self.reference_store
-                    .query_recent(self.config.reference_limit)
+                    .query_recent_by_thread(&request.thread_id, self.config.reference_limit)
                     .await?
             };
 
@@ -331,11 +375,11 @@ fn reference_to_slice(reference: &Reference, include_summary: bool) -> Option<Co
     match reference.ref_type {
         ReferenceType::Image
         | ReferenceType::Document
-        | ReferenceType::File
+        | ReferenceType::Binary
         | ReferenceType::Code
-        | ReferenceType::Url
-        | ReferenceType::Summary
-        | ReferenceType::Embedding
+        | ReferenceType::Table
+        | ReferenceType::Audio
+        | ReferenceType::Video
         | ReferenceType::Custom(_)
         | ReferenceType::Text => {
             attachments.push(reference.id.clone());
@@ -381,6 +425,9 @@ fn matches_ref_type(reference: &Reference, filter: Option<&Vec<ReferenceType>>) 
 fn matches_tags(reference: &Reference, tags: &[String]) -> bool {
     if tags.is_empty() {
         return true;
+    }
+    if !reference.tags.is_empty() {
+        return tags.iter().all(|t| reference.tags.contains(t));
     }
     let ref_tags = reference
         .metadata

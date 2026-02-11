@@ -30,15 +30,43 @@ context:
   include_history: true
   include_references: true
 
+ingestion:
+  enabled: true
+  asynchronous: true
+  max_file_size_mb: 30
+  mime_allowlist: []
+  auto_for_assistant_outputs: true
+
 stores:
   # For quick local testing in a single process.
-  # If you need cross-process persistence, switch backend to redis and add connection_url.
+  # If you need durable persistence, switch backend to postgres and add connection_url.
+  # Example:
+  # event:
+  #   backend: postgres
+  #   connection_url: "postgres://postgres:postgres@127.0.0.1:5432/orchestral"
+  #   key_prefix: "orchestral"   # table prefix
   event:
     backend: in_memory
   task:
     backend: in_memory
   reference:
     backend: in_memory
+
+files:
+  mode: local
+  local:
+    root_dir: ".orchestral/files"
+  s3:
+    endpoint:
+    region:
+    bucket:
+    key_prefix: "orchestral/files"
+  hybrid:
+    write_to: s3
+  catalog:
+    backend: in_memory
+    connection_url:
+    table_prefix: "orchestral"
 
 observability:
   log_level: info

@@ -418,8 +418,8 @@ impl PostgresReferenceStore {
                 interaction_id TEXT NULL,
                 task_id TEXT NULL,
                 step_id TEXT NULL,
+                file_id TEXT NULL,
                 ref_type TEXT NOT NULL,
-                locator JSONB NOT NULL DEFAULT '{{}}'::jsonb,
                 content JSONB NOT NULL DEFAULT '{{}}'::jsonb,
                 mime_type TEXT NULL,
                 file_name TEXT NULL,
@@ -442,6 +442,14 @@ impl PostgresReferenceStore {
             .execute(&self.pool)
             .await
             .map_err(|e| StoreError::Connection(e.to_string()))?;
+        let alter_file_id = format!(
+            "ALTER TABLE {} ADD COLUMN IF NOT EXISTS file_id TEXT NULL",
+            self.table_name
+        );
+        sqlx::query(&alter_file_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Connection(e.to_string()))?;
 
         let idx_thread_created = format!(
             "CREATE INDEX IF NOT EXISTS {0}_thread_created_idx ON {1} (thread_id, created_at DESC)",
@@ -455,16 +463,16 @@ impl PostgresReferenceStore {
             "CREATE INDEX IF NOT EXISTS {0}_task_step_idx ON {1} (task_id, step_id)",
             self.table_name, self.table_name
         );
+        let idx_file_id = format!(
+            "CREATE INDEX IF NOT EXISTS {0}_file_id_idx ON {1} (file_id)",
+            self.table_name, self.table_name
+        );
         let idx_tags = format!(
             "CREATE INDEX IF NOT EXISTS {0}_tags_idx ON {1} USING GIN (tags)",
             self.table_name, self.table_name
         );
         let idx_metadata = format!(
             "CREATE INDEX IF NOT EXISTS {0}_metadata_idx ON {1} USING GIN (metadata)",
-            self.table_name, self.table_name
-        );
-        let idx_locator = format!(
-            "CREATE INDEX IF NOT EXISTS {0}_locator_idx ON {1} USING GIN (locator)",
             self.table_name, self.table_name
         );
         sqlx::query(&idx_thread_created)
@@ -479,15 +487,15 @@ impl PostgresReferenceStore {
             .execute(&self.pool)
             .await
             .map_err(|e| StoreError::Connection(e.to_string()))?;
+        sqlx::query(&idx_file_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Connection(e.to_string()))?;
         sqlx::query(&idx_tags)
             .execute(&self.pool)
             .await
             .map_err(|e| StoreError::Connection(e.to_string()))?;
         sqlx::query(&idx_metadata)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| StoreError::Connection(e.to_string()))?;
-        sqlx::query(&idx_locator)
             .execute(&self.pool)
             .await
             .map_err(|e| StoreError::Connection(e.to_string()))?;
@@ -520,15 +528,15 @@ impl ReferenceStore for PostgresReferenceStore {
 
         let sql = format!(
             "INSERT INTO {} (
-                id, thread_id, interaction_id, task_id, step_id,
-                ref_type, locator, content,
+                id, thread_id, interaction_id, task_id, step_id, file_id,
+                ref_type, content,
                 mime_type, file_name, byte_size,
                 derived_from, tags, metadata,
                 embedding_backend, embedding_collection, embedding_key, embedding_model, embedding_status, embedding_version,
                 created_at, reference_json
             ) VALUES (
-                $1, $2, $3, $4, $5,
-                $6, $7, $8,
+                $1, $2, $3, $4, $5, $6,
+                $7, $8,
                 $9, $10, $11,
                 $12, $13, $14,
                 $15, $16, $17, $18, $19, $20,
@@ -539,8 +547,8 @@ impl ReferenceStore for PostgresReferenceStore {
                 interaction_id = EXCLUDED.interaction_id,
                 task_id = EXCLUDED.task_id,
                 step_id = EXCLUDED.step_id,
+                file_id = EXCLUDED.file_id,
                 ref_type = EXCLUDED.ref_type,
-                locator = EXCLUDED.locator,
                 content = EXCLUDED.content,
                 mime_type = EXCLUDED.mime_type,
                 file_name = EXCLUDED.file_name,
@@ -564,8 +572,8 @@ impl ReferenceStore for PostgresReferenceStore {
             .bind(&reference.interaction_id)
             .bind(reference.task_id.as_ref().map(|id| id.to_string()))
             .bind(reference.step_id.as_ref().map(|id| id.to_string()))
+            .bind(&reference.file_id)
             .bind(ref_type)
-            .bind(&reference.locator)
             .bind(&reference.content)
             .bind(&reference.mime_type)
             .bind(&reference.file_name)

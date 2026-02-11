@@ -36,7 +36,11 @@ pub struct OrchestralConfig {
     #[serde(default)]
     pub context: ContextConfig,
     #[serde(default)]
+    pub ingestion: IngestionConfig,
+    #[serde(default)]
     pub stores: StoresConfig,
+    #[serde(default)]
+    pub files: FilesConfig,
     #[serde(default)]
     pub observability: ObservabilityConfig,
     #[serde(default)]
@@ -58,7 +62,9 @@ impl Default for OrchestralConfig {
             planner: PlannerConfig::default(),
             interpreter: InterpreterConfig::default(),
             context: ContextConfig::default(),
+            ingestion: IngestionConfig::default(),
             stores: StoresConfig::default(),
+            files: FilesConfig::default(),
             observability: ObservabilityConfig::default(),
             providers: ProvidersConfig::default(),
             actions: ActionsConfig::default(),
@@ -257,6 +263,41 @@ fn default_max_tokens() -> usize {
     4096
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct IngestionConfig {
+    /// Whether automatic parse+embedding pipeline is enabled.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Whether ingestion should run asynchronously.
+    #[serde(default = "default_true")]
+    pub asynchronous: bool,
+    /// Maximum file size in MB accepted by ingestion.
+    #[serde(default = "default_ingestion_max_file_size_mb")]
+    pub max_file_size_mb: usize,
+    /// Allowed MIME list. Empty means allow all.
+    #[serde(default)]
+    pub mime_allowlist: Vec<String>,
+    /// Whether assistant-generated artifacts are auto-ingested.
+    #[serde(default = "default_true")]
+    pub auto_for_assistant_outputs: bool,
+}
+
+impl Default for IngestionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            asynchronous: true,
+            max_file_size_mb: default_ingestion_max_file_size_mb(),
+            mime_allowlist: Vec::new(),
+            auto_for_assistant_outputs: true,
+        }
+    }
+}
+
+fn default_ingestion_max_file_size_mb() -> usize {
+    30
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct StoresConfig {
     #[serde(default)]
@@ -286,6 +327,114 @@ impl Default for StoreSpec {
             key_prefix: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FilesConfig {
+    #[serde(default = "default_file_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub local: LocalFilesConfig,
+    #[serde(default)]
+    pub s3: S3FilesConfig,
+    #[serde(default)]
+    pub hybrid: HybridFilesConfig,
+    #[serde(default)]
+    pub catalog: FileCatalogConfig,
+}
+
+impl Default for FilesConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_file_mode(),
+            local: LocalFilesConfig::default(),
+            s3: S3FilesConfig::default(),
+            hybrid: HybridFilesConfig::default(),
+            catalog: FileCatalogConfig::default(),
+        }
+    }
+}
+
+fn default_file_mode() -> String {
+    "local".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LocalFilesConfig {
+    #[serde(default = "default_files_root_dir")]
+    pub root_dir: String,
+}
+
+impl Default for LocalFilesConfig {
+    fn default() -> Self {
+        Self {
+            root_dir: default_files_root_dir(),
+        }
+    }
+}
+
+fn default_files_root_dir() -> String {
+    ".orchestral/files".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct S3FilesConfig {
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub bucket: Option<String>,
+    #[serde(default)]
+    pub key_prefix: Option<String>,
+    #[serde(default)]
+    pub access_key_env: Option<String>,
+    #[serde(default)]
+    pub secret_key_env: Option<String>,
+    #[serde(default)]
+    pub force_path_style: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HybridFilesConfig {
+    #[serde(default = "default_hybrid_write_to")]
+    pub write_to: String,
+}
+
+impl Default for HybridFilesConfig {
+    fn default() -> Self {
+        Self {
+            write_to: default_hybrid_write_to(),
+        }
+    }
+}
+
+fn default_hybrid_write_to() -> String {
+    "s3".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FileCatalogConfig {
+    #[serde(default = "default_backend")]
+    pub backend: String,
+    #[serde(default)]
+    pub connection_url: Option<String>,
+    #[serde(default = "default_file_catalog_table_prefix")]
+    pub table_prefix: String,
+}
+
+impl Default for FileCatalogConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_backend(),
+            connection_url: None,
+            table_prefix: default_file_catalog_table_prefix(),
+        }
+    }
+}
+
+fn default_file_catalog_table_prefix() -> String {
+    "orchestral".to_string()
 }
 
 fn default_backend() -> String {

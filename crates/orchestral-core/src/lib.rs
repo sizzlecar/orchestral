@@ -16,6 +16,7 @@
 pub mod action;
 pub mod executor;
 pub mod interpreter;
+pub mod io;
 pub mod normalizer;
 pub mod planner;
 pub mod store;
@@ -33,6 +34,10 @@ pub mod prelude {
     pub use crate::interpreter::{
         InterpretDeltaSink, InterpretError, InterpretRequest, InterpretResult,
         NoopResultInterpreter, ResultInterpreter,
+    };
+    pub use crate::io::{
+        FileBackend, FileCatalog, FileHead, FileId, FileIoError, FilePayload, FileRecord,
+        FileService, FileStatus, StorageBackend, StoredAt, UploadRequest,
     };
     pub use crate::normalizer::{
         FixError, NormalizeError, NormalizedPlan, PlanFixer, PlanNormalizer, PlanValidator,
@@ -57,6 +62,10 @@ pub use executor::{
 };
 pub use interpreter::{
     InterpretDeltaSink, InterpretRequest, InterpretResult, NoopResultInterpreter, ResultInterpreter,
+};
+pub use io::{
+    FileBackend, FileCatalog, FileHead, FileId, FileIoError, FilePayload, FileRecord, FileService,
+    FileStatus, StorageBackend, StoredAt, UploadRequest,
 };
 pub use normalizer::{NormalizedPlan, PlanNormalizer};
 pub use planner::{Planner, PlannerOutput, PlannerRuntimeInfo};
