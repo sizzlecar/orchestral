@@ -268,7 +268,7 @@ impl ExecutionDag {
         // Update reverse dependencies
         for dep_id in &node.depends_on {
             if let Some(dep_node) = self.nodes.get_mut(dep_id.as_str()) {
-                dep_node.dependents.push(id.clone().into());
+                dep_node.dependents.push(id.clone());
             }
         }
 
