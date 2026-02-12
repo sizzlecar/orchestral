@@ -1875,7 +1875,9 @@ dependencies = [
  "clap",
  "crossterm 0.28.1",
  "futures-util",
+ "orchestral-api",
  "orchestral-channels",
+ "orchestral-plugin-host",
  "orchestral-server",
  "ratatui",
  "serde_json",
@@ -1982,6 +1984,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "orchestral-plugin-host"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "orchestral-api",
+ "orchestral-config",
+ "orchestral-core",
+ "orchestral-files",
+ "orchestral-runtime",
+ "orchestral-spi",
+ "orchestral-stores",
+ "orchestral-stores-backends",
+ "serde_json",
+ "serde_yaml",
+]
+
+[[package]]
 name = "orchestral-runtime"
 version = "0.1.0"
 dependencies = [
@@ -2013,19 +2032,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-stream",
- "async-trait",
  "axum",
  "chrono",
  "clap",
  "futures-util",
  "orchestral-api",
  "orchestral-channels",
- "orchestral-core",
- "orchestral-files",
- "orchestral-runtime",
- "orchestral-spi",
+ "orchestral-plugin-host",
  "orchestral-stores",
- "orchestral-stores-backends",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

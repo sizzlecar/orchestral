@@ -107,6 +107,10 @@ impl ComponentRegistry {
     pub fn get_named_component(&self, key: &str) -> Option<SharedComponent> {
         self.named_components.get(key).cloned()
     }
+
+    pub fn into_named_components(self) -> HashMap<String, SharedComponent> {
+        self.named_components
+    }
 }
 
 #[derive(Debug, Error)]

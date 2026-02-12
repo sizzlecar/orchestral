@@ -1,0 +1,22 @@
+[package]
+name = "orchestral-plugin-host"
+description = "Plugin host that auto-wires runtime SPI extensions for CLI and server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+orchestral-api = { workspace = true }
+orchestral-config = { workspace = true }
+orchestral-core = { workspace = true }
+orchestral-files = { workspace = true }
+orchestral-runtime = { workspace = true }
+orchestral-spi = { workspace = true }
+orchestral-stores = { workspace = true }
+orchestral-stores-backends = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+serde_yaml = { workspace = true }

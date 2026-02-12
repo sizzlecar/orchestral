@@ -21,6 +21,13 @@ impl CliRuntime {
         thread_id_override: Option<String>,
     ) -> Result<Self, ChannelError> {
         let api = Arc::new(RuntimeApi::from_config_path(config).await?);
+        Self::from_api(api, thread_id_override).await
+    }
+
+    pub async fn from_api(
+        api: Arc<RuntimeApi>,
+        thread_id_override: Option<String>,
+    ) -> Result<Self, ChannelError> {
         let binding_store = Arc::new(InMemoryChannelBindingStore::new());
         let thread = match thread_id_override {
             Some(thread_id) => api.create_thread(Some(thread_id)).await?,

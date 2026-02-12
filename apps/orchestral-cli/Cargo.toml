@@ -7,7 +7,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+orchestral-api = { workspace = true }
 orchestral-channels = { workspace = true }
+orchestral-plugin-host = { workspace = true }
 orchestral-server = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }

@@ -70,6 +70,7 @@ fn validate_config(config: &OrchestralConfig) -> Result<(), ConfigError> {
 
     validate_providers(&config.providers)?;
     validate_actions(&config.actions)?;
+    validate_plugins(config)?;
 
     Ok(())
 }
@@ -191,6 +192,17 @@ fn validate_actions(config: &ActionsConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn validate_plugins(config: &OrchestralConfig) -> Result<(), ConfigError> {
+    for spec in &config.plugins.runtime {
+        if spec.name.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "plugins.runtime[].name must not be empty".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Manages unified configuration with hot-reload support.
 pub struct ConfigManager {
     path: PathBuf,
@@ -251,4 +263,32 @@ impl ConfigManager {
 /// Keeps the file watcher alive.
 pub struct ConfigWatcher {
     _watcher: RecommendedWatcher,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::RuntimePluginSpec;
+
+    #[test]
+    fn test_validate_config_accepts_default_plugins() {
+        let config = OrchestralConfig::default();
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_config_rejects_empty_runtime_plugin_name() {
+        let mut config = OrchestralConfig::default();
+        config.plugins.runtime = vec![RuntimePluginSpec {
+            name: "".to_string(),
+            enabled: true,
+            targets: Vec::new(),
+            options: serde_json::Value::Null,
+        }];
+
+        assert!(matches!(
+            validate_config(&config),
+            Err(ConfigError::Invalid(_))
+        ));
+    }
 }

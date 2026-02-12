@@ -6,7 +6,9 @@ use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::time::{timeout, Duration};
 use tracing::{debug, warn};
 
+use orchestral_api::RuntimeApi;
 use orchestral_channels::{ChannelEvent, CliRuntime};
+use orchestral_plugin_host::{PluginRuntimeAppBuilder, RuntimeTarget};
 
 use super::event_projection::{project_event, UiEvent};
 use crate::runtime::protocol::{ActivityKind, RuntimeMsg, TransientSlot};
@@ -25,7 +27,13 @@ impl RuntimeClient {
         config: PathBuf,
         thread_id_override: Option<String>,
     ) -> anyhow::Result<Self> {
-        let runtime = CliRuntime::from_config(config, thread_id_override)
+        let runtime_builder = Arc::new(PluginRuntimeAppBuilder::new(RuntimeTarget::Cli));
+        let api = Arc::new(
+            RuntimeApi::from_config_path_with_builder(config, runtime_builder)
+                .await
+                .context("failed to build runtime api with plugin host")?,
+        );
+        let runtime = CliRuntime::from_api(api, thread_id_override)
             .await
             .context("failed to build cli runtime from config")?;
         Ok(Self {

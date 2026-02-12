@@ -5,6 +5,7 @@ members = [
     "crates/orchestral-core",
     "crates/orchestral-config",
     "crates/orchestral-context",
+    "plugins/orchestral-plugin-host",
     "plugins/orchestral-files",
     "crates/orchestral-planners",
     "crates/orchestral-runtime",
@@ -58,6 +59,7 @@ bytes = "1"
 orchestral-core = { path = "crates/orchestral-core" }
 orchestral-config = { path = "crates/orchestral-config" }
 orchestral-context = { path = "crates/orchestral-context" }
+orchestral-plugin-host = { path = "plugins/orchestral-plugin-host" }
 orchestral-spi = { path = "crates/orchestral-spi" }
 orchestral-files = { path = "plugins/orchestral-files" }
 orchestral-planners = { path = "crates/orchestral-planners" }

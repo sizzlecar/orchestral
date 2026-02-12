@@ -18,6 +18,7 @@ pub use providers::{
 };
 
 use serde::Deserialize;
+use serde_json::Value;
 
 /// Top-level configuration schema for Orchestral.
 #[derive(Debug, Clone, Deserialize)]
@@ -47,6 +48,8 @@ pub struct OrchestralConfig {
     pub providers: ProvidersConfig,
     #[serde(default)]
     pub actions: ActionsConfig,
+    #[serde(default)]
+    pub plugins: PluginsConfig,
 }
 
 fn default_version() -> u32 {
@@ -68,6 +71,7 @@ impl Default for OrchestralConfig {
             observability: ObservabilityConfig::default(),
             providers: ProvidersConfig::default(),
             actions: ActionsConfig::default(),
+            plugins: PluginsConfig::default(),
         }
     }
 }
@@ -447,6 +451,36 @@ pub type LocalFilesConfig = LocalBlobsConfig;
 pub type S3FilesConfig = S3BlobsConfig;
 pub type HybridFilesConfig = HybridBlobsConfig;
 pub type FileCatalogConfig = BlobCatalogConfig;
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PluginsConfig {
+    #[serde(default)]
+    pub runtime: Vec<RuntimePluginSpec>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RuntimePluginSpec {
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Empty means enabled for both cli and server.
+    #[serde(default)]
+    pub targets: Vec<String>,
+    /// Reserved for plugin-specific options.
+    #[serde(default)]
+    pub options: Value,
+}
+
+impl Default for RuntimePluginSpec {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            enabled: true,
+            targets: Vec::new(),
+            options: Value::Null,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ObservabilityConfig {
