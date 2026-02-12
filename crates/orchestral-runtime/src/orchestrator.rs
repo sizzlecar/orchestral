@@ -32,7 +32,7 @@ use orchestral_core::types::{
 };
 use orchestral_stores::{Event, EventBus};
 
-use crate::{HandleEventResult, InteractionState, RuntimeError, ThreadRuntime};
+use crate::{HandleEventResult, HookRegistry, InteractionState, RuntimeError, ThreadRuntime};
 
 const MAX_LOG_CHARS: usize = 8_000;
 
@@ -105,6 +105,7 @@ pub struct Orchestrator {
     pub context_builder: Option<Arc<dyn ContextBuilder>>,
     pub result_interpreter: Arc<dyn ResultInterpreter>,
     pub config: OrchestratorConfig,
+    pub hook_registry: Arc<HookRegistry>,
 }
 
 /// Orchestrator configuration
@@ -175,6 +176,7 @@ impl Orchestrator {
             context_builder: None,
             result_interpreter: Arc::new(NoopResultInterpreter),
             config,
+            hook_registry: Arc::new(HookRegistry::new()),
         }
     }
 
@@ -187,6 +189,12 @@ impl Orchestrator {
     /// Attach a result interpreter (optional override).
     pub fn with_result_interpreter(mut self, interpreter: Arc<dyn ResultInterpreter>) -> Self {
         self.result_interpreter = interpreter;
+        self
+    }
+
+    /// Attach runtime hook registry.
+    pub fn with_hook_registry(mut self, hook_registry: Arc<HookRegistry>) -> Self {
+        self.hook_registry = hook_registry;
         self
     }
 
@@ -802,6 +810,7 @@ impl Orchestrator {
             InteractionId::from(interaction_id),
             self.thread_runtime.event_store.clone(),
             self.thread_runtime.event_bus.clone(),
+            self.hook_registry.clone(),
         ));
         let exec_ctx = ExecutorContext::new(
             task.id.clone(),
@@ -1122,6 +1131,7 @@ struct RuntimeProgressReporter {
     interaction_id: InteractionId,
     event_store: Arc<dyn EventStore>,
     event_bus: Arc<dyn EventBus>,
+    hook_registry: Arc<HookRegistry>,
 }
 
 impl RuntimeProgressReporter {
@@ -1130,12 +1140,14 @@ impl RuntimeProgressReporter {
         interaction_id: InteractionId,
         event_store: Arc<dyn EventStore>,
         event_bus: Arc<dyn EventBus>,
+        hook_registry: Arc<HookRegistry>,
     ) -> Self {
         Self {
             thread_id,
             interaction_id,
             event_store,
             event_bus,
+            hook_registry,
         }
     }
 }
@@ -1143,6 +1155,25 @@ impl RuntimeProgressReporter {
 #[async_trait]
 impl ExecutionProgressReporter for RuntimeProgressReporter {
     async fn report(&self, event: ExecutionProgressEvent) -> Result<(), String> {
+        let hook_ctx = crate::StepHookContext {
+            thread_id: self.thread_id.clone(),
+            interaction_id: self.interaction_id.clone(),
+            task_id: event.task_id.clone(),
+            step_id: event.step_id.clone(),
+            action: event.action.clone(),
+            phase: event.phase.clone(),
+            message: event.message.clone(),
+            metadata: event.metadata.clone(),
+        };
+
+        self.hook_registry.on_execution_progress(&hook_ctx).await;
+        match hook_ctx.phase.as_str() {
+            "step_started" => self.hook_registry.on_before_step(&hook_ctx).await,
+            "step_completed" => self.hook_registry.on_after_step(&hook_ctx).await,
+            "step_failed" => self.hook_registry.on_step_error(&hook_ctx).await,
+            _ => {}
+        }
+
         let mut payload = serde_json::Map::new();
         payload.insert(
             "category".to_string(),
@@ -1865,6 +1896,7 @@ mod tests {
                 "int-1".into(),
                 event_store.clone(),
                 event_bus.clone(),
+                Arc::new(HookRegistry::new()),
             );
 
             reporter

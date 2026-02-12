@@ -43,3 +43,12 @@
 - Flow: Intent → Plan → Normalize → Execute (core).
 - Runtime manages Thread/Interaction lifecycle and concurrency decisions.
 - Stores persist events and task/reference state; Actions encapsulate side effects.
+
+## Extension & Dependency Rules
+- Keep dependency direction strict: `crates/orchestral-runtime` depends on contracts only, and must not depend on concrete implementations under `plugins/`.
+- Keep `crates/` clean: core/runtime crates define domain models, traits, lifecycle contracts, and minimal in-memory defaults only.
+- Put concrete infra implementations (S3/PG/Redis/external services) in `plugins/`.
+- Use app-level composition root (`apps/*`) to wire concrete implementations into runtime (builder/factory/DI), instead of hardcoding implementations in runtime.
+- Expose stable extension SPI for external developers (component factory + runtime hooks), so plugins can be added without modifying runtime internals.
+- Define runtime hook points at least for: `before_step`, `after_step`, `on_step_error`, and artifact/blob-related lifecycle events.
+- For heavy workflows (upload/parse/chunk/embedding), hooks should enqueue async jobs and avoid blocking the main step execution path.

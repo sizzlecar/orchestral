@@ -13,8 +13,6 @@ orchestral-context = { workspace = true }
 orchestral-planners = { workspace = true }
 orchestral-actions = { workspace = true }
 orchestral-stores = { workspace = true }
-orchestral-stores-backends = { workspace = true }
-orchestral-files = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }
@@ -25,6 +23,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

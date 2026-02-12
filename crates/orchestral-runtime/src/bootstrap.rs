@@ -1,11 +1,15 @@
 //! Bootstrap helpers for starting Orchestral from a single YAML config.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures_util::StreamExt;
 use serde_json::json;
 use thiserror::Error;
+use tokio::sync::RwLock;
 
 use orchestral_actions::{
     ActionConfigError, ActionRegistryManager, ActionWatcher, DefaultActionFactory,
@@ -17,28 +21,25 @@ use orchestral_context::{BasicContextBuilder, TokenBudget};
 use orchestral_core::action::extract_meta;
 use orchestral_core::executor::Executor;
 use orchestral_core::interpreter::{NoopResultInterpreter, ResultInterpreter};
-use orchestral_core::io::{BlobIoError, BlobStore};
+use orchestral_core::io::{
+    BlobHead, BlobId, BlobIoError, BlobMeta, BlobRead, BlobStore, BlobWriteRequest,
+};
 use orchestral_core::normalizer::PlanNormalizer;
 use orchestral_core::planner::{PlanError, Planner, PlannerContext, PlannerOutput};
 use orchestral_core::store::{EventStore, ReferenceStore, StoreError, TaskStore};
 use orchestral_core::types::{Intent, Plan, Step};
-use orchestral_files::{BlobMode, BlobServiceConfig, FileService, LocalBlobStoreConfig};
 use orchestral_planners::{
     DefaultLlmClientFactory, LlmBuildError, LlmClient, LlmClientFactory, LlmInvocationConfig,
     LlmPlanner, LlmPlannerConfig,
 };
 use orchestral_stores::{InMemoryEventStore, InMemoryReferenceStore, InMemoryTaskStore};
-use orchestral_stores_backends::{
-    PostgresEventStore, PostgresReferenceStore, PostgresTaskStore, RedisEventStore,
-    RedisReferenceStore, RedisTaskStore,
-};
 
 use crate::interpreter::{LlmResultInterpreter, LlmResultInterpreterConfig};
 use crate::orchestrator::OrchestratorConfig;
 use crate::{
-    ConcurrencyPolicy, DefaultConcurrencyPolicy, Orchestrator, ParallelConcurrencyPolicy,
-    QueueConcurrencyPolicy, RejectWhenBusyConcurrencyPolicy, Thread, ThreadRuntime,
-    ThreadRuntimeConfig,
+    ConcurrencyPolicy, DefaultConcurrencyPolicy, HookRegistry, Orchestrator,
+    ParallelConcurrencyPolicy, QueueConcurrencyPolicy, RejectWhenBusyConcurrencyPolicy, Thread,
+    ThreadRuntime, ThreadRuntimeConfig,
 };
 
 /// Runtime bootstrap errors.
@@ -70,18 +71,13 @@ pub enum BootstrapError {
     MissingStoreConnectionUrl { store: String },
     #[error("blob io error: {0}")]
     Blob(#[from] BlobIoError),
-    #[error("missing connection_url for blob catalog backend")]
-    MissingBlobCatalogConnectionUrl,
-    #[error("unsupported blob mode: {0}")]
-    UnsupportedBlobMode(String),
-    #[error("unsupported blob catalog backend: {0}")]
-    UnsupportedBlobCatalogBackend(String),
 }
 
 /// Running app bundle created from unified config.
 pub struct RuntimeApp {
     pub orchestrator: Orchestrator,
     pub blob_store: Arc<dyn BlobStore>,
+    pub hook_registry: Arc<HookRegistry>,
     pub config_manager: Arc<ConfigManager>,
     pub action_registry_manager: Arc<ActionRegistryManager>,
     _action_watcher: Option<ActionWatcher>,
@@ -107,26 +103,21 @@ pub trait StoreBackendFactory: Send + Sync {
     ) -> Result<Arc<dyn ReferenceStore>, BootstrapError>;
 }
 
-/// Default store factory supporting in-memory and Redis backends.
+/// Factory abstraction for pluggable blob store implementations.
+#[async_trait]
+pub trait BlobStoreFactory: Send + Sync {
+    async fn build_blob_store(
+        &self,
+        config: &OrchestralConfig,
+    ) -> Result<Arc<dyn BlobStore>, BootstrapError>;
+}
+
+/// Default store factory supporting in-memory backends only.
 pub struct DefaultStoreBackendFactory;
 
 impl DefaultStoreBackendFactory {
     fn backend_name(spec: &StoreSpec) -> String {
         spec.backend.trim().to_ascii_lowercase()
-    }
-
-    fn connection_url(spec: &StoreSpec, store: &str) -> Result<String, BootstrapError> {
-        spec.connection_url
-            .clone()
-            .ok_or_else(|| BootstrapError::MissingStoreConnectionUrl {
-                store: store.to_string(),
-            })
-    }
-
-    fn key_prefix(spec: &StoreSpec, default_prefix: &str) -> String {
-        spec.key_prefix
-            .clone()
-            .unwrap_or_else(|| default_prefix.to_string())
     }
 }
 
@@ -138,20 +129,6 @@ impl StoreBackendFactory for DefaultStoreBackendFactory {
     ) -> Result<Arc<dyn EventStore>, BootstrapError> {
         match Self::backend_name(spec).as_str() {
             "in_memory" | "memory" => Ok(Arc::new(InMemoryEventStore::new())),
-            "redis" => {
-                let url = Self::connection_url(spec, "event")?;
-                let prefix = Self::key_prefix(spec, "orchestral:event");
-                let store = RedisEventStore::new(&url, prefix).map_err(BootstrapError::Store)?;
-                Ok(Arc::new(store))
-            }
-            "postgres" | "postgresql" | "pgsql" => {
-                let url = Self::connection_url(spec, "event")?;
-                let prefix = Self::key_prefix(spec, "orchestral");
-                let store = PostgresEventStore::new(&url, prefix)
-                    .await
-                    .map_err(BootstrapError::Store)?;
-                Ok(Arc::new(store))
-            }
             backend => Err(BootstrapError::UnsupportedStoreBackend {
                 store: "event".to_string(),
                 backend: backend.to_string(),
@@ -165,20 +142,6 @@ impl StoreBackendFactory for DefaultStoreBackendFactory {
     ) -> Result<Arc<dyn TaskStore>, BootstrapError> {
         match Self::backend_name(spec).as_str() {
             "in_memory" | "memory" => Ok(Arc::new(InMemoryTaskStore::new())),
-            "redis" => {
-                let url = Self::connection_url(spec, "task")?;
-                let prefix = Self::key_prefix(spec, "orchestral:task");
-                let store = RedisTaskStore::new(&url, prefix).map_err(BootstrapError::Store)?;
-                Ok(Arc::new(store))
-            }
-            "postgres" | "postgresql" | "pgsql" => {
-                let url = Self::connection_url(spec, "task")?;
-                let prefix = Self::key_prefix(spec, "orchestral");
-                let store = PostgresTaskStore::new(&url, prefix)
-                    .await
-                    .map_err(BootstrapError::Store)?;
-                Ok(Arc::new(store))
-            }
             backend => Err(BootstrapError::UnsupportedStoreBackend {
                 store: "task".to_string(),
                 backend: backend.to_string(),
@@ -192,21 +155,6 @@ impl StoreBackendFactory for DefaultStoreBackendFactory {
     ) -> Result<Arc<dyn ReferenceStore>, BootstrapError> {
         match Self::backend_name(spec).as_str() {
             "in_memory" | "memory" => Ok(Arc::new(InMemoryReferenceStore::new())),
-            "redis" => {
-                let url = Self::connection_url(spec, "reference")?;
-                let prefix = Self::key_prefix(spec, "orchestral:reference");
-                let store =
-                    RedisReferenceStore::new(&url, prefix).map_err(BootstrapError::Store)?;
-                Ok(Arc::new(store))
-            }
-            "postgres" | "postgresql" | "pgsql" => {
-                let url = Self::connection_url(spec, "reference")?;
-                let prefix = Self::key_prefix(spec, "orchestral");
-                let store = PostgresReferenceStore::new(&url, prefix)
-                    .await
-                    .map_err(BootstrapError::Store)?;
-                Ok(Arc::new(store))
-            }
             backend => Err(BootstrapError::UnsupportedStoreBackend {
                 store: "reference".to_string(),
                 backend: backend.to_string(),
@@ -215,10 +163,29 @@ impl StoreBackendFactory for DefaultStoreBackendFactory {
     }
 }
 
+/// Default blob factory that uses an in-memory blob store.
+pub struct DefaultBlobStoreFactory;
+
+#[async_trait]
+impl BlobStoreFactory for DefaultBlobStoreFactory {
+    async fn build_blob_store(
+        &self,
+        _config: &OrchestralConfig,
+    ) -> Result<Arc<dyn BlobStore>, BootstrapError> {
+        Ok(Arc::new(InMemoryBlobStore::default()))
+    }
+}
+
 impl RuntimeApp {
     /// Create a runnable app from a single `orchestral.yaml`.
     pub async fn from_config_path(path: impl Into<PathBuf>) -> Result<Self, BootstrapError> {
-        Self::from_config_path_with_store_factory(path, Arc::new(DefaultStoreBackendFactory)).await
+        Self::from_config_path_with_factories_and_hooks(
+            path,
+            Arc::new(DefaultStoreBackendFactory),
+            Arc::new(DefaultBlobStoreFactory),
+            Arc::new(HookRegistry::new()),
+        )
+        .await
     }
 
     /// Create a runnable app and inject custom store backend factory.
@@ -226,12 +193,43 @@ impl RuntimeApp {
         path: impl Into<PathBuf>,
         store_factory: Arc<dyn StoreBackendFactory>,
     ) -> Result<Self, BootstrapError> {
+        Self::from_config_path_with_factories_and_hooks(
+            path,
+            store_factory,
+            Arc::new(DefaultBlobStoreFactory),
+            Arc::new(HookRegistry::new()),
+        )
+        .await
+    }
+
+    /// Create a runnable app and inject custom store/blob factories.
+    pub async fn from_config_path_with_factories(
+        path: impl Into<PathBuf>,
+        store_factory: Arc<dyn StoreBackendFactory>,
+        blob_store_factory: Arc<dyn BlobStoreFactory>,
+    ) -> Result<Self, BootstrapError> {
+        Self::from_config_path_with_factories_and_hooks(
+            path,
+            store_factory,
+            blob_store_factory,
+            Arc::new(HookRegistry::new()),
+        )
+        .await
+    }
+
+    /// Create a runnable app and inject custom store/blob factories + hook registry.
+    pub async fn from_config_path_with_factories_and_hooks(
+        path: impl Into<PathBuf>,
+        store_factory: Arc<dyn StoreBackendFactory>,
+        blob_store_factory: Arc<dyn BlobStoreFactory>,
+        hook_registry: Arc<HookRegistry>,
+    ) -> Result<Self, BootstrapError> {
         let path = path.into();
         let config_manager = Arc::new(ConfigManager::new(path.clone()));
         config_manager.load().await?;
         let config = config_manager.config().read().await.clone();
         init_tracing_if_needed(&config.observability);
-        let blob_store = build_blob_store(&config).await?;
+        let blob_store = blob_store_factory.build_blob_store(&config).await?;
 
         let event_store = store_factory
             .build_event_store(&config.stores.event)
@@ -303,11 +301,13 @@ impl RuntimeApp {
             orchestrator_cfg,
         )
         .with_context_builder(context_builder)
-        .with_result_interpreter(result_interpreter);
+        .with_result_interpreter(result_interpreter)
+        .with_hook_registry(hook_registry.clone());
 
         Ok(Self {
             orchestrator,
             blob_store,
+            hook_registry,
             config_manager,
             action_registry_manager,
             _action_watcher: action_watcher,
@@ -315,67 +315,94 @@ impl RuntimeApp {
     }
 }
 
-async fn build_blob_store(config: &OrchestralConfig) -> Result<Arc<dyn BlobStore>, BootstrapError> {
-    let mode = match config.blobs.mode.trim().to_ascii_lowercase().as_str() {
-        "local" => BlobMode::Local,
-        "s3" => BlobMode::S3,
-        "hybrid" => BlobMode::Hybrid,
-        other => return Err(BootstrapError::UnsupportedBlobMode(other.to_string())),
-    };
+#[derive(Clone)]
+struct InMemoryBlobObject {
+    meta: BlobMeta,
+    bytes: Vec<u8>,
+}
 
-    let hybrid_write_to = if config.blobs.hybrid.write_to.trim().is_empty() {
-        None
-    } else {
-        Some(config.blobs.hybrid.write_to.clone())
-    };
-    let service_config = BlobServiceConfig {
-        mode: mode.clone(),
-        hybrid_write_to,
-    };
+#[derive(Default)]
+pub struct InMemoryBlobStore {
+    objects: RwLock<HashMap<String, InMemoryBlobObject>>,
+}
 
-    let catalog_backend = config.blobs.catalog.backend.trim().to_ascii_lowercase();
-    let mut service = match catalog_backend.as_str() {
-        "in_memory" | "memory" => FileService::with_in_memory_catalog(service_config),
-        "postgres" | "postgresql" | "pgsql" => {
-            let url = config
-                .blobs
-                .catalog
-                .connection_url
-                .as_ref()
-                .ok_or(BootstrapError::MissingBlobCatalogConnectionUrl)?;
-            FileService::with_postgres_catalog(
-                service_config,
-                url,
-                config.blobs.catalog.table_prefix.clone(),
-            )
-            .await?
+#[async_trait]
+impl BlobStore for InMemoryBlobStore {
+    async fn write(&self, mut request: BlobWriteRequest) -> Result<BlobMeta, BlobIoError> {
+        let blob_id = BlobId::from(uuid::Uuid::new_v4().to_string());
+        let mut data: Vec<u8> = Vec::new();
+        while let Some(chunk) = request.body.next().await {
+            let chunk = chunk?;
+            data.extend_from_slice(&chunk);
         }
-        other => {
-            return Err(BootstrapError::UnsupportedBlobCatalogBackend(
-                other.to_string(),
-            ))
+        if data.is_empty() {
+            return Err(BlobIoError::Invalid("empty blob payload".to_string()));
         }
-    };
-
-    service = service.with_local_defaults(LocalBlobStoreConfig {
-        root_dir: config.blobs.local.root_dir.clone(),
-    });
-
-    let requires_s3 = matches!(mode, BlobMode::S3)
-        || (matches!(mode, BlobMode::Hybrid)
-            && config
-                .blobs
-                .hybrid
-                .write_to
-                .trim()
-                .eq_ignore_ascii_case("s3"));
-    if requires_s3 {
-        return Err(BootstrapError::UnsupportedBlobMode(
-            "s3 mode requires injecting an S3 client into orchestral-files FileService".to_string(),
-        ));
+        let now = chrono::Utc::now();
+        let meta = BlobMeta {
+            id: blob_id,
+            file_name: request.file_name.take(),
+            mime_type: request.mime_type.take(),
+            byte_size: data.len() as u64,
+            checksum_sha256: None,
+            metadata: if request.metadata.is_null() {
+                serde_json::json!({})
+            } else {
+                request.metadata
+            },
+            created_at: now,
+            updated_at: now,
+        };
+        self.objects.write().await.insert(
+            meta.id.to_string(),
+            InMemoryBlobObject {
+                meta: meta.clone(),
+                bytes: data,
+            },
+        );
+        Ok(meta)
     }
 
-    Ok(Arc::new(service))
+    async fn read(&self, blob_id: &BlobId) -> Result<BlobRead, BlobIoError> {
+        let obj = self
+            .objects
+            .read()
+            .await
+            .get(blob_id.as_str())
+            .cloned()
+            .ok_or_else(|| BlobIoError::NotFound(blob_id.to_string()))?;
+        let body = Box::pin(futures_util::stream::once(async move {
+            Ok(Bytes::from(obj.bytes))
+        }));
+        Ok(BlobRead {
+            meta: obj.meta,
+            body,
+        })
+    }
+
+    async fn head(&self, blob_id: &BlobId) -> Result<BlobHead, BlobIoError> {
+        let obj = self
+            .objects
+            .read()
+            .await
+            .get(blob_id.as_str())
+            .cloned()
+            .ok_or_else(|| BlobIoError::NotFound(blob_id.to_string()))?;
+        Ok(BlobHead {
+            byte_size: obj.meta.byte_size,
+            etag: None,
+            last_modified: Some(obj.meta.updated_at),
+        })
+    }
+
+    async fn delete(&self, blob_id: &BlobId) -> Result<bool, BlobIoError> {
+        Ok(self
+            .objects
+            .write()
+            .await
+            .remove(blob_id.as_str())
+            .is_some())
+    }
 }
 
 fn init_tracing_if_needed(observability: &ObservabilityConfig) {
@@ -836,23 +863,21 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_default_store_factory_rejects_redis_without_connection_url() {
+    async fn test_default_store_factory_accepts_in_memory_spec() {
         let factory = DefaultStoreBackendFactory;
         let spec = StoreSpec {
-            backend: "redis".to_string(),
+            backend: "in_memory".to_string(),
             connection_url: None,
             key_prefix: None,
         };
 
-        let result = factory.build_event_store(&spec).await;
-        assert!(matches!(
-            result,
-            Err(BootstrapError::MissingStoreConnectionUrl { store }) if store == "event"
-        ));
+        assert!(factory.build_event_store(&spec).await.is_ok());
+        assert!(factory.build_task_store(&spec).await.is_ok());
+        assert!(factory.build_reference_store(&spec).await.is_ok());
     }
 
     #[tokio::test]
-    async fn test_default_store_factory_accepts_redis_spec() {
+    async fn test_default_store_factory_rejects_redis_spec() {
         let factory = DefaultStoreBackendFactory;
         let spec = StoreSpec {
             backend: "redis".to_string(),
@@ -860,8 +885,32 @@ mod tests {
             key_prefix: Some("orchestral:test".to_string()),
         };
 
-        assert!(factory.build_event_store(&spec).await.is_ok());
-        assert!(factory.build_task_store(&spec).await.is_ok());
-        assert!(factory.build_reference_store(&spec).await.is_ok());
+        assert!(matches!(
+            factory.build_event_store(&spec).await,
+            Err(BootstrapError::UnsupportedStoreBackend { .. })
+        ));
+        assert!(matches!(
+            factory.build_task_store(&spec).await,
+            Err(BootstrapError::UnsupportedStoreBackend { .. })
+        ));
+        assert!(matches!(
+            factory.build_reference_store(&spec).await,
+            Err(BootstrapError::UnsupportedStoreBackend { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_default_blob_store_factory_writes_and_reads() {
+        let factory = DefaultBlobStoreFactory;
+        let config = OrchestralConfig::default();
+        let store = factory.build_blob_store(&config).await.expect("blob store");
+        let payload = vec![1_u8, 2, 3];
+        let request = BlobWriteRequest::new(Box::pin(futures_util::stream::once(async move {
+            Ok(Bytes::from(payload))
+        })));
+        let written = store.write(request).await.expect("write");
+        assert_eq!(written.byte_size, 3);
+        let read = store.read(&written.id).await.expect("read");
+        assert_eq!(read.meta.id, written.id);
     }
 }
