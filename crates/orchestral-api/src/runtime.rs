@@ -280,3 +280,50 @@ fn payload_to_string(payload: &serde_json::Value) -> String {
     }
     payload.to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingBuilder {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl RuntimeAppBuilder for CountingBuilder {
+        async fn build(&self, config_path: PathBuf) -> Result<RuntimeApp, ApiError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            RuntimeApp::from_config_path(config_path)
+                .await
+                .map_err(|err| ApiError::Internal(format!("build runtime app failed: {}", err)))
+        }
+    }
+
+    fn sample_config_path() -> PathBuf {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        manifest_dir
+            .join("../../configs/orchestral.yaml")
+            .canonicalize()
+            .expect("config path")
+    }
+
+    #[tokio::test]
+    async fn test_runtime_api_uses_injected_builder() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let builder = Arc::new(CountingBuilder {
+            calls: calls.clone(),
+        });
+        let api = RuntimeApi::from_config_path_with_builder(sample_config_path(), builder)
+            .await
+            .expect("api");
+
+        let thread = api
+            .create_thread(Some("thread-with-builder".to_string()))
+            .await
+            .expect("create thread");
+        assert_eq!(thread.id, "thread-with-builder");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+}
