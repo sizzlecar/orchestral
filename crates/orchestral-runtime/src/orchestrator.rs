@@ -30,9 +30,10 @@ use orchestral_core::store::{
 use orchestral_core::types::{
     Intent, IntentContext, Step, StepId, StepKind, Task, TaskId, TaskState, WaitUserReason,
 };
+use orchestral_spi::{HookRegistry, RuntimeHookContext, RuntimeHookEventEnvelope, SpiMeta};
 use orchestral_stores::{Event, EventBus};
 
-use crate::{HandleEventResult, HookRegistry, InteractionState, RuntimeError, ThreadRuntime};
+use crate::{HandleEventResult, InteractionState, RuntimeError, ThreadRuntime};
 
 const MAX_LOG_CHARS: usize = 8_000;
 
@@ -48,6 +49,15 @@ fn truncate_for_log(input: &str, max_chars: usize) -> String {
 
 fn truncate_debug_for_log(value: &impl std::fmt::Debug, max_chars: usize) -> String {
     truncate_for_log(&format!("{:?}", value), max_chars)
+}
+
+fn map_progress_phase_to_event_type(phase: &str) -> &'static str {
+    match phase {
+        "step_started" => "step.started",
+        "step_completed" => "step.completed",
+        "step_failed" => "step.failed",
+        _ => "execution.progress",
+    }
 }
 
 /// Orchestrator result for a handled event
@@ -1155,24 +1165,40 @@ impl RuntimeProgressReporter {
 #[async_trait]
 impl ExecutionProgressReporter for RuntimeProgressReporter {
     async fn report(&self, event: ExecutionProgressEvent) -> Result<(), String> {
-        let hook_ctx = crate::StepHookContext {
+        let phase = event.phase.clone();
+        let step_id = event.step_id.clone();
+        let action = event.action.clone();
+        let message = event.message.clone();
+        let metadata = event.metadata.clone();
+        let hook_ctx = RuntimeHookContext {
             thread_id: self.thread_id.clone(),
             interaction_id: self.interaction_id.clone(),
-            task_id: event.task_id.clone(),
-            step_id: event.step_id.clone(),
-            action: event.action.clone(),
-            phase: event.phase.clone(),
-            message: event.message.clone(),
-            metadata: event.metadata.clone(),
+            task_id: Some(event.task_id.clone()),
+            step_id: step_id.clone(),
+            action: action.clone(),
+            message: message.clone(),
+            metadata: metadata.clone(),
+            extensions: serde_json::Map::new(),
         };
 
-        self.hook_registry.on_execution_progress(&hook_ctx).await;
-        match hook_ctx.phase.as_str() {
-            "step_started" => self.hook_registry.on_before_step(&hook_ctx).await,
-            "step_completed" => self.hook_registry.on_after_step(&hook_ctx).await,
-            "step_failed" => self.hook_registry.on_step_error(&hook_ctx).await,
-            _ => {}
-        }
+        let hook_event = RuntimeHookEventEnvelope {
+            meta: SpiMeta::runtime_defaults(env!("CARGO_PKG_VERSION")),
+            event_type: map_progress_phase_to_event_type(&phase).to_string(),
+            event_version: "1.0.0".to_string(),
+            occurred_at_unix_ms: chrono::Utc::now().timestamp_millis(),
+            payload: serde_json::json!({
+                "thread_id": self.thread_id.to_string(),
+                "interaction_id": self.interaction_id.to_string(),
+                "task_id": event.task_id.to_string(),
+                "step_id": step_id.as_ref().map(ToString::to_string),
+                "action": action,
+                "phase": phase,
+                "message": message,
+                "metadata": metadata,
+            }),
+            extensions: serde_json::Map::new(),
+        };
+        self.hook_registry.dispatch(&hook_event, &hook_ctx).await;
 
         let mut payload = serde_json::Map::new();
         payload.insert(

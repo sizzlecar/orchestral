@@ -1994,6 +1994,7 @@ dependencies = [
  "orchestral-context",
  "orchestral-core",
  "orchestral-planners",
+ "orchestral-spi",
  "orchestral-stores",
  "serde",
  "serde_json",
@@ -2019,16 +2020,31 @@ dependencies = [
  "futures-util",
  "orchestral-api",
  "orchestral-channels",
- "orchestral-config",
  "orchestral-core",
  "orchestral-files",
  "orchestral-runtime",
+ "orchestral-spi",
  "orchestral-stores",
  "orchestral-stores-backends",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "orchestral-spi"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "orchestral-core",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-test",
  "tracing",
 ]
 

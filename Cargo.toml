@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/orchestral-spi",
     "crates/orchestral-core",
     "crates/orchestral-config",
     "crates/orchestral-context",
@@ -57,6 +58,7 @@ bytes = "1"
 orchestral-core = { path = "crates/orchestral-core" }
 orchestral-config = { path = "crates/orchestral-config" }
 orchestral-context = { path = "crates/orchestral-context" }
+orchestral-spi = { path = "crates/orchestral-spi" }
 orchestral-files = { path = "plugins/orchestral-files" }
 orchestral-planners = { path = "crates/orchestral-planners" }
 orchestral-runtime = { path = "crates/orchestral-runtime" }

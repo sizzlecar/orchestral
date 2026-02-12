@@ -14,10 +14,12 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use orchestral_api::{ApiService, RuntimeApi, RuntimeAppBuilder};
 use orchestral_channels::{InMemoryChannelBindingStore, WebChannel};
+use orchestral_core::io::BlobStore;
 use orchestral_files::{BlobMode, BlobServiceConfig, FileService, LocalBlobStoreConfig};
-use orchestral_runtime::{
-    BlobStoreFactory, BootstrapError, DefaultStoreBackendFactory, HookRegistry, RuntimeApp,
-    StoreBackendFactory,
+use orchestral_runtime::RuntimeApp;
+use orchestral_spi::{
+    ComponentRegistry, HookRegistry, RuntimeBuildRequest, RuntimeComponentFactory, SpiError,
+    StoreBundle,
 };
 use orchestral_stores::Event;
 use orchestral_stores_backends::{
@@ -45,218 +47,248 @@ struct ErrorBody {
     message: String,
 }
 
-struct ServerStoreBackendFactory;
+#[derive(Debug, Deserialize)]
+struct RuntimeComponentOptions {
+    stores: RuntimeStoreOptions,
+    blobs: RuntimeBlobOptions,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeStoreOptions {
+    event: StoreSpecView,
+    task: StoreSpecView,
+    reference: StoreSpecView,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoreSpecView {
+    backend: String,
+    connection_url: Option<String>,
+    key_prefix: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeBlobOptions {
+    mode: String,
+    catalog: RuntimeBlobCatalogOptions,
+    local: RuntimeBlobLocalOptions,
+    hybrid: RuntimeBlobHybridOptions,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeBlobCatalogOptions {
+    backend: String,
+    connection_url: Option<String>,
+    table_prefix: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeBlobLocalOptions {
+    root_dir: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeBlobHybridOptions {
+    write_to: String,
+}
+
+struct ServerRuntimeComponentFactory;
 
 #[async_trait]
-impl StoreBackendFactory for ServerStoreBackendFactory {
-    async fn build_event_store(
-        &self,
-        spec: &orchestral_config::StoreSpec,
-    ) -> Result<Arc<dyn orchestral_core::store::EventStore>, BootstrapError> {
-        match spec.backend.trim().to_ascii_lowercase().as_str() {
-            "in_memory" | "memory" => DefaultStoreBackendFactory.build_event_store(spec).await,
-            "redis" => {
-                let url = spec.connection_url.clone().ok_or_else(|| {
-                    BootstrapError::MissingStoreConnectionUrl {
-                        store: "event".to_string(),
-                    }
-                })?;
-                let prefix = spec
-                    .key_prefix
-                    .clone()
-                    .unwrap_or_else(|| "orchestral:event".to_string());
-                let store = RedisEventStore::new(&url, prefix).map_err(BootstrapError::Store)?;
-                Ok(Arc::new(store))
-            }
-            "postgres" | "postgresql" | "pgsql" => {
-                let url = spec.connection_url.clone().ok_or_else(|| {
-                    BootstrapError::MissingStoreConnectionUrl {
-                        store: "event".to_string(),
-                    }
-                })?;
-                let prefix = spec
-                    .key_prefix
-                    .clone()
-                    .unwrap_or_else(|| "orchestral".to_string());
-                let store = PostgresEventStore::new(&url, prefix)
-                    .await
-                    .map_err(BootstrapError::Store)?;
-                Ok(Arc::new(store))
-            }
-            backend => Err(BootstrapError::UnsupportedStoreBackend {
-                store: "event".to_string(),
-                backend: backend.to_string(),
-            }),
-        }
-    }
+impl RuntimeComponentFactory for ServerRuntimeComponentFactory {
+    async fn build(&self, request: &RuntimeBuildRequest) -> Result<ComponentRegistry, SpiError> {
+        let options: RuntimeComponentOptions =
+            serde_json::from_value(serde_json::Value::Object(request.options.clone()))
+                .map_err(|err| SpiError::InvalidBuildRequest(err.to_string()))?;
 
-    async fn build_task_store(
-        &self,
-        spec: &orchestral_config::StoreSpec,
-    ) -> Result<Arc<dyn orchestral_core::store::TaskStore>, BootstrapError> {
-        match spec.backend.trim().to_ascii_lowercase().as_str() {
-            "in_memory" | "memory" => DefaultStoreBackendFactory.build_task_store(spec).await,
-            "redis" => {
-                let url = spec.connection_url.clone().ok_or_else(|| {
-                    BootstrapError::MissingStoreConnectionUrl {
-                        store: "task".to_string(),
-                    }
-                })?;
-                let prefix = spec
-                    .key_prefix
-                    .clone()
-                    .unwrap_or_else(|| "orchestral:task".to_string());
-                let store = RedisTaskStore::new(&url, prefix).map_err(BootstrapError::Store)?;
-                Ok(Arc::new(store))
-            }
-            "postgres" | "postgresql" | "pgsql" => {
-                let url = spec.connection_url.clone().ok_or_else(|| {
-                    BootstrapError::MissingStoreConnectionUrl {
-                        store: "task".to_string(),
-                    }
-                })?;
-                let prefix = spec
-                    .key_prefix
-                    .clone()
-                    .unwrap_or_else(|| "orchestral".to_string());
-                let store = PostgresTaskStore::new(&url, prefix)
-                    .await
-                    .map_err(BootstrapError::Store)?;
-                Ok(Arc::new(store))
-            }
-            backend => Err(BootstrapError::UnsupportedStoreBackend {
-                store: "task".to_string(),
-                backend: backend.to_string(),
-            }),
-        }
-    }
+        let event_store = build_event_store(&options.stores.event).await?;
+        let task_store = build_task_store(&options.stores.task).await?;
+        let reference_store = build_reference_store(&options.stores.reference).await?;
+        let blob_store = build_blob_store(&options.blobs).await?;
 
-    async fn build_reference_store(
-        &self,
-        spec: &orchestral_config::StoreSpec,
-    ) -> Result<Arc<dyn orchestral_core::store::ReferenceStore>, BootstrapError> {
-        match spec.backend.trim().to_ascii_lowercase().as_str() {
-            "in_memory" | "memory" => DefaultStoreBackendFactory.build_reference_store(spec).await,
-            "redis" => {
-                let url = spec.connection_url.clone().ok_or_else(|| {
-                    BootstrapError::MissingStoreConnectionUrl {
-                        store: "reference".to_string(),
-                    }
-                })?;
-                let prefix = spec
-                    .key_prefix
-                    .clone()
-                    .unwrap_or_else(|| "orchestral:reference".to_string());
-                let store =
-                    RedisReferenceStore::new(&url, prefix).map_err(BootstrapError::Store)?;
-                Ok(Arc::new(store))
-            }
-            "postgres" | "postgresql" | "pgsql" => {
-                let url = spec.connection_url.clone().ok_or_else(|| {
-                    BootstrapError::MissingStoreConnectionUrl {
-                        store: "reference".to_string(),
-                    }
-                })?;
-                let prefix = spec
-                    .key_prefix
-                    .clone()
-                    .unwrap_or_else(|| "orchestral".to_string());
-                let store = PostgresReferenceStore::new(&url, prefix)
-                    .await
-                    .map_err(BootstrapError::Store)?;
-                Ok(Arc::new(store))
-            }
-            backend => Err(BootstrapError::UnsupportedStoreBackend {
-                store: "reference".to_string(),
-                backend: backend.to_string(),
-            }),
-        }
+        Ok(ComponentRegistry::new()
+            .with_stores(StoreBundle {
+                event_store,
+                task_store,
+                reference_store,
+            })
+            .with_blob_store(blob_store))
     }
 }
 
-struct ServerBlobStoreFactory;
-
-#[async_trait]
-impl BlobStoreFactory for ServerBlobStoreFactory {
-    async fn build_blob_store(
-        &self,
-        config: &orchestral_config::OrchestralConfig,
-    ) -> Result<Arc<dyn orchestral_core::io::BlobStore>, BootstrapError> {
-        let mode = match config.blobs.mode.trim().to_ascii_lowercase().as_str() {
-            "local" => BlobMode::Local,
-            "s3" => BlobMode::S3,
-            "hybrid" => BlobMode::Hybrid,
-            other => {
-                return Err(BootstrapError::UnsupportedStoreBackend {
-                    store: "blob".to_string(),
-                    backend: other.to_string(),
-                });
-            }
-        };
-        let service_config = BlobServiceConfig {
-            mode: mode.clone(),
-            hybrid_write_to: if config.blobs.hybrid.write_to.trim().is_empty() {
-                None
-            } else {
-                Some(config.blobs.hybrid.write_to.clone())
-            },
-        };
-
-        let mut service = match config
-            .blobs
-            .catalog
-            .backend
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "in_memory" | "memory" => FileService::with_in_memory_catalog(service_config),
-            "postgres" | "postgresql" | "pgsql" => {
-                let url = config
-                    .blobs
-                    .catalog
-                    .connection_url
-                    .as_ref()
-                    .ok_or_else(|| BootstrapError::MissingStoreConnectionUrl {
-                        store: "blob_catalog".to_string(),
-                    })?;
-                FileService::with_postgres_catalog(
-                    service_config,
-                    url,
-                    config.blobs.catalog.table_prefix.clone(),
-                )
+async fn build_event_store(
+    spec: &StoreSpecView,
+) -> Result<Arc<dyn orchestral_core::store::EventStore>, SpiError> {
+    match spec.backend.trim().to_ascii_lowercase().as_str() {
+        "in_memory" | "memory" => Ok(Arc::new(orchestral_stores::InMemoryEventStore::new())),
+        "redis" => {
+            let url = require_setting("event", "connection_url", spec.connection_url.as_ref())?;
+            let prefix = spec
+                .key_prefix
+                .clone()
+                .unwrap_or_else(|| "orchestral:event".to_string());
+            let store = RedisEventStore::new(url, prefix)
+                .map_err(|err| SpiError::Internal(err.to_string()))?;
+            Ok(Arc::new(store))
+        }
+        "postgres" | "postgresql" | "pgsql" => {
+            let url = require_setting("event", "connection_url", spec.connection_url.as_ref())?;
+            let prefix = spec
+                .key_prefix
+                .clone()
+                .unwrap_or_else(|| "orchestral".to_string());
+            let store = PostgresEventStore::new(url, prefix)
                 .await
-                .map_err(BootstrapError::Blob)?
-            }
-            backend => {
-                return Err(BootstrapError::UnsupportedStoreBackend {
-                    store: "blob_catalog".to_string(),
-                    backend: backend.to_string(),
-                });
-            }
-        };
+                .map_err(|err| SpiError::Internal(err.to_string()))?;
+            Ok(Arc::new(store))
+        }
+        backend => Err(SpiError::UnsupportedBackend {
+            component: "event_store".to_string(),
+            backend: backend.to_string(),
+        }),
+    }
+}
 
-        service = service.with_local_defaults(LocalBlobStoreConfig {
-            root_dir: config.blobs.local.root_dir.clone(),
-        });
+async fn build_task_store(
+    spec: &StoreSpecView,
+) -> Result<Arc<dyn orchestral_core::store::TaskStore>, SpiError> {
+    match spec.backend.trim().to_ascii_lowercase().as_str() {
+        "in_memory" | "memory" => Ok(Arc::new(orchestral_stores::InMemoryTaskStore::new())),
+        "redis" => {
+            let url = require_setting("task", "connection_url", spec.connection_url.as_ref())?;
+            let prefix = spec
+                .key_prefix
+                .clone()
+                .unwrap_or_else(|| "orchestral:task".to_string());
+            let store = RedisTaskStore::new(url, prefix)
+                .map_err(|err| SpiError::Internal(err.to_string()))?;
+            Ok(Arc::new(store))
+        }
+        "postgres" | "postgresql" | "pgsql" => {
+            let url = require_setting("task", "connection_url", spec.connection_url.as_ref())?;
+            let prefix = spec
+                .key_prefix
+                .clone()
+                .unwrap_or_else(|| "orchestral".to_string());
+            let store = PostgresTaskStore::new(url, prefix)
+                .await
+                .map_err(|err| SpiError::Internal(err.to_string()))?;
+            Ok(Arc::new(store))
+        }
+        backend => Err(SpiError::UnsupportedBackend {
+            component: "task_store".to_string(),
+            backend: backend.to_string(),
+        }),
+    }
+}
 
-        if matches!(mode, BlobMode::S3)
-            || (matches!(mode, BlobMode::Hybrid)
-                && config
-                    .blobs
-                    .hybrid
-                    .write_to
-                    .trim()
-                    .eq_ignore_ascii_case("s3"))
-        {
-            return Err(BootstrapError::UnsupportedStoreBackend {
-                store: "blob".to_string(),
-                backend: "s3_requires_custom_client".to_string(),
+async fn build_reference_store(
+    spec: &StoreSpecView,
+) -> Result<Arc<dyn orchestral_core::store::ReferenceStore>, SpiError> {
+    match spec.backend.trim().to_ascii_lowercase().as_str() {
+        "in_memory" | "memory" => Ok(Arc::new(orchestral_stores::InMemoryReferenceStore::new())),
+        "redis" => {
+            let url = require_setting("reference", "connection_url", spec.connection_url.as_ref())?;
+            let prefix = spec
+                .key_prefix
+                .clone()
+                .unwrap_or_else(|| "orchestral:reference".to_string());
+            let store = RedisReferenceStore::new(url, prefix)
+                .map_err(|err| SpiError::Internal(err.to_string()))?;
+            Ok(Arc::new(store))
+        }
+        "postgres" | "postgresql" | "pgsql" => {
+            let url = require_setting("reference", "connection_url", spec.connection_url.as_ref())?;
+            let prefix = spec
+                .key_prefix
+                .clone()
+                .unwrap_or_else(|| "orchestral".to_string());
+            let store = PostgresReferenceStore::new(url, prefix)
+                .await
+                .map_err(|err| SpiError::Internal(err.to_string()))?;
+            Ok(Arc::new(store))
+        }
+        backend => Err(SpiError::UnsupportedBackend {
+            component: "reference_store".to_string(),
+            backend: backend.to_string(),
+        }),
+    }
+}
+
+async fn build_blob_store(options: &RuntimeBlobOptions) -> Result<Arc<dyn BlobStore>, SpiError> {
+    let mode = match options.mode.trim().to_ascii_lowercase().as_str() {
+        "local" => BlobMode::Local,
+        "s3" => BlobMode::S3,
+        "hybrid" => BlobMode::Hybrid,
+        other => {
+            return Err(SpiError::UnsupportedBackend {
+                component: "blob_store".to_string(),
+                backend: other.to_string(),
             });
         }
+    };
+    let service_config = BlobServiceConfig {
+        mode: mode.clone(),
+        hybrid_write_to: if options.hybrid.write_to.trim().is_empty() {
+            None
+        } else {
+            Some(options.hybrid.write_to.clone())
+        },
+    };
 
-        Ok(Arc::new(service))
+    let mut service = match options.catalog.backend.trim().to_ascii_lowercase().as_str() {
+        "in_memory" | "memory" => FileService::with_in_memory_catalog(service_config),
+        "postgres" | "postgresql" | "pgsql" => {
+            let url = require_setting(
+                "blob_catalog",
+                "connection_url",
+                options.catalog.connection_url.as_ref(),
+            )?;
+            FileService::with_postgres_catalog(
+                service_config,
+                url,
+                options.catalog.table_prefix.clone(),
+            )
+            .await
+            .map_err(|err| SpiError::Io(err.to_string()))?
+        }
+        backend => {
+            return Err(SpiError::UnsupportedBackend {
+                component: "blob_catalog".to_string(),
+                backend: backend.to_string(),
+            });
+        }
+    };
+
+    service = service.with_local_defaults(LocalBlobStoreConfig {
+        root_dir: options.local.root_dir.clone(),
+    });
+
+    if matches!(mode, BlobMode::S3)
+        || (matches!(mode, BlobMode::Hybrid)
+            && options.hybrid.write_to.trim().eq_ignore_ascii_case("s3"))
+    {
+        return Err(SpiError::UnsupportedBackend {
+            component: "blob_store".to_string(),
+            backend: "s3_requires_custom_client".to_string(),
+        });
     }
+
+    Ok(Arc::new(service))
+}
+
+fn require_setting<'a>(
+    component: &str,
+    setting: &str,
+    value: Option<&'a String>,
+) -> Result<&'a str, SpiError> {
+    value
+        .map(|s| s.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| SpiError::MissingSetting {
+            component: component.to_string(),
+            setting: setting.to_string(),
+        })
 }
 
 struct ServerRuntimeAppBuilder;
@@ -264,10 +296,9 @@ struct ServerRuntimeAppBuilder;
 #[async_trait]
 impl RuntimeAppBuilder for ServerRuntimeAppBuilder {
     async fn build(&self, config_path: PathBuf) -> Result<RuntimeApp, orchestral_api::ApiError> {
-        RuntimeApp::from_config_path_with_factories_and_hooks(
+        RuntimeApp::from_config_path_with_spi(
             config_path,
-            Arc::new(ServerStoreBackendFactory),
-            Arc::new(ServerBlobStoreFactory),
+            Arc::new(ServerRuntimeComponentFactory),
             Arc::new(HookRegistry::new()),
         )
         .await

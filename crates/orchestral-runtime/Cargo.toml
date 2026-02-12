@@ -10,6 +10,7 @@ repository.workspace = true
 orchestral-core = { workspace = true }
 orchestral-config = { workspace = true }
 orchestral-context = { workspace = true }
+orchestral-spi = { workspace = true }
 orchestral-planners = { workspace = true }
 orchestral-actions = { workspace = true }
 orchestral-stores = { workspace = true }

@@ -11,7 +11,6 @@
 
 mod bootstrap;
 mod concurrency;
-mod hooks;
 mod interaction;
 mod interpreter;
 mod orchestrator;
@@ -19,15 +18,18 @@ mod thread;
 mod thread_runtime;
 
 pub use bootstrap::{
-    BlobStoreFactory, BootstrapError, DefaultBlobStoreFactory, DefaultStoreBackendFactory,
-    InMemoryBlobStore, RuntimeApp, StoreBackendFactory,
+    BootstrapError, DefaultRuntimeComponentFactory, InMemoryBlobStore, RuntimeApp,
 };
 pub use concurrency::{
     ConcurrencyDecision, ConcurrencyPolicy, DefaultConcurrencyPolicy, ParallelConcurrencyPolicy,
     QueueConcurrencyPolicy, RejectWhenBusyConcurrencyPolicy, RunningState,
 };
-pub use hooks::{HookRegistry, RuntimeHook, StepHookContext};
 pub use interaction::{Interaction, InteractionId, InteractionState};
+pub use orchestral_spi::{
+    ComponentRegistry, HookDispatchMode, HookExecutionPolicy, HookFailurePolicy, HookRegistry,
+    RuntimeBuildRequest, RuntimeComponentFactory, RuntimeHook, RuntimeHookContext,
+    RuntimeHookEventEnvelope, SpiError, SpiMeta, StoreBundle,
+};
 pub use orchestrator::{Orchestrator, OrchestratorError, OrchestratorResult};
 pub use thread::{Thread, ThreadId};
 pub use thread_runtime::{HandleEventResult, RuntimeError, ThreadRuntime, ThreadRuntimeConfig};

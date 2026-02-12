@@ -26,20 +26,24 @@ use orchestral_core::io::{
 };
 use orchestral_core::normalizer::PlanNormalizer;
 use orchestral_core::planner::{PlanError, Planner, PlannerContext, PlannerOutput};
-use orchestral_core::store::{EventStore, ReferenceStore, StoreError, TaskStore};
+use orchestral_core::store::StoreError;
 use orchestral_core::types::{Intent, Plan, Step};
 use orchestral_planners::{
     DefaultLlmClientFactory, LlmBuildError, LlmClient, LlmClientFactory, LlmInvocationConfig,
     LlmPlanner, LlmPlannerConfig,
+};
+use orchestral_spi::{
+    ComponentRegistry, HookRegistry, RuntimeBuildRequest, RuntimeComponentFactory, SpiError,
+    SpiMeta, StoreBundle,
 };
 use orchestral_stores::{InMemoryEventStore, InMemoryReferenceStore, InMemoryTaskStore};
 
 use crate::interpreter::{LlmResultInterpreter, LlmResultInterpreterConfig};
 use crate::orchestrator::OrchestratorConfig;
 use crate::{
-    ConcurrencyPolicy, DefaultConcurrencyPolicy, HookRegistry, Orchestrator,
-    ParallelConcurrencyPolicy, QueueConcurrencyPolicy, RejectWhenBusyConcurrencyPolicy, Thread,
-    ThreadRuntime, ThreadRuntimeConfig,
+    ConcurrencyPolicy, DefaultConcurrencyPolicy, Orchestrator, ParallelConcurrencyPolicy,
+    QueueConcurrencyPolicy, RejectWhenBusyConcurrencyPolicy, Thread, ThreadRuntime,
+    ThreadRuntimeConfig,
 };
 
 /// Runtime bootstrap errors.
@@ -65,12 +69,10 @@ pub enum BootstrapError {
     BackendNotFound(String),
     #[error("model profile '{0}' not found")]
     ModelProfileNotFound(String),
-    #[error("unsupported store backend for {store}: {backend}")]
-    UnsupportedStoreBackend { store: String, backend: String },
-    #[error("missing connection_url for {store} store backend")]
-    MissingStoreConnectionUrl { store: String },
     #[error("blob io error: {0}")]
     Blob(#[from] BlobIoError),
+    #[error("spi error: {0}")]
+    Spi(#[from] SpiError),
 }
 
 /// Running app bundle created from unified config.
@@ -86,142 +88,46 @@ pub struct RuntimeApp {
 static TRACING_INIT: OnceLock<()> = OnceLock::new();
 const MAX_PROMPT_LOG_CHARS: usize = 4_000;
 
-/// Factory abstraction for pluggable store backends.
-#[async_trait]
-pub trait StoreBackendFactory: Send + Sync {
-    async fn build_event_store(
-        &self,
-        spec: &StoreSpec,
-    ) -> Result<Arc<dyn EventStore>, BootstrapError>;
-    async fn build_task_store(
-        &self,
-        spec: &StoreSpec,
-    ) -> Result<Arc<dyn TaskStore>, BootstrapError>;
-    async fn build_reference_store(
-        &self,
-        spec: &StoreSpec,
-    ) -> Result<Arc<dyn ReferenceStore>, BootstrapError>;
-}
-
-/// Factory abstraction for pluggable blob store implementations.
-#[async_trait]
-pub trait BlobStoreFactory: Send + Sync {
-    async fn build_blob_store(
-        &self,
-        config: &OrchestralConfig,
-    ) -> Result<Arc<dyn BlobStore>, BootstrapError>;
-}
-
-/// Default store factory supporting in-memory backends only.
-pub struct DefaultStoreBackendFactory;
-
-impl DefaultStoreBackendFactory {
-    fn backend_name(spec: &StoreSpec) -> String {
-        spec.backend.trim().to_ascii_lowercase()
-    }
-}
+/// Default component factory providing in-memory stores and blob storage.
+pub struct DefaultRuntimeComponentFactory;
 
 #[async_trait]
-impl StoreBackendFactory for DefaultStoreBackendFactory {
-    async fn build_event_store(
-        &self,
-        spec: &StoreSpec,
-    ) -> Result<Arc<dyn EventStore>, BootstrapError> {
-        match Self::backend_name(spec).as_str() {
-            "in_memory" | "memory" => Ok(Arc::new(InMemoryEventStore::new())),
-            backend => Err(BootstrapError::UnsupportedStoreBackend {
-                store: "event".to_string(),
-                backend: backend.to_string(),
-            }),
-        }
-    }
-
-    async fn build_task_store(
-        &self,
-        spec: &StoreSpec,
-    ) -> Result<Arc<dyn TaskStore>, BootstrapError> {
-        match Self::backend_name(spec).as_str() {
-            "in_memory" | "memory" => Ok(Arc::new(InMemoryTaskStore::new())),
-            backend => Err(BootstrapError::UnsupportedStoreBackend {
-                store: "task".to_string(),
-                backend: backend.to_string(),
-            }),
-        }
-    }
-
-    async fn build_reference_store(
-        &self,
-        spec: &StoreSpec,
-    ) -> Result<Arc<dyn ReferenceStore>, BootstrapError> {
-        match Self::backend_name(spec).as_str() {
-            "in_memory" | "memory" => Ok(Arc::new(InMemoryReferenceStore::new())),
-            backend => Err(BootstrapError::UnsupportedStoreBackend {
-                store: "reference".to_string(),
-                backend: backend.to_string(),
-            }),
-        }
-    }
-}
-
-/// Default blob factory that uses an in-memory blob store.
-pub struct DefaultBlobStoreFactory;
-
-#[async_trait]
-impl BlobStoreFactory for DefaultBlobStoreFactory {
-    async fn build_blob_store(
-        &self,
-        _config: &OrchestralConfig,
-    ) -> Result<Arc<dyn BlobStore>, BootstrapError> {
-        Ok(Arc::new(InMemoryBlobStore::default()))
+impl RuntimeComponentFactory for DefaultRuntimeComponentFactory {
+    async fn build(&self, _request: &RuntimeBuildRequest) -> Result<ComponentRegistry, SpiError> {
+        Ok(ComponentRegistry::new()
+            .with_stores(StoreBundle {
+                event_store: Arc::new(InMemoryEventStore::new()),
+                task_store: Arc::new(InMemoryTaskStore::new()),
+                reference_store: Arc::new(InMemoryReferenceStore::new()),
+            })
+            .with_blob_store(Arc::new(InMemoryBlobStore::default())))
     }
 }
 
 impl RuntimeApp {
     /// Create a runnable app from a single `orchestral.yaml`.
     pub async fn from_config_path(path: impl Into<PathBuf>) -> Result<Self, BootstrapError> {
-        Self::from_config_path_with_factories_and_hooks(
+        Self::from_config_path_with_spi(
             path,
-            Arc::new(DefaultStoreBackendFactory),
-            Arc::new(DefaultBlobStoreFactory),
+            Arc::new(DefaultRuntimeComponentFactory),
             Arc::new(HookRegistry::new()),
         )
         .await
     }
 
-    /// Create a runnable app and inject custom store backend factory.
-    pub async fn from_config_path_with_store_factory(
+    /// Create a runnable app and inject custom runtime component factory.
+    pub async fn from_config_path_with_component_factory(
         path: impl Into<PathBuf>,
-        store_factory: Arc<dyn StoreBackendFactory>,
+        component_factory: Arc<dyn RuntimeComponentFactory>,
     ) -> Result<Self, BootstrapError> {
-        Self::from_config_path_with_factories_and_hooks(
-            path,
-            store_factory,
-            Arc::new(DefaultBlobStoreFactory),
-            Arc::new(HookRegistry::new()),
-        )
-        .await
+        Self::from_config_path_with_spi(path, component_factory, Arc::new(HookRegistry::new()))
+            .await
     }
 
-    /// Create a runnable app and inject custom store/blob factories.
-    pub async fn from_config_path_with_factories(
+    /// Create a runnable app and inject component factory + hook registry.
+    pub async fn from_config_path_with_spi(
         path: impl Into<PathBuf>,
-        store_factory: Arc<dyn StoreBackendFactory>,
-        blob_store_factory: Arc<dyn BlobStoreFactory>,
-    ) -> Result<Self, BootstrapError> {
-        Self::from_config_path_with_factories_and_hooks(
-            path,
-            store_factory,
-            blob_store_factory,
-            Arc::new(HookRegistry::new()),
-        )
-        .await
-    }
-
-    /// Create a runnable app and inject custom store/blob factories + hook registry.
-    pub async fn from_config_path_with_factories_and_hooks(
-        path: impl Into<PathBuf>,
-        store_factory: Arc<dyn StoreBackendFactory>,
-        blob_store_factory: Arc<dyn BlobStoreFactory>,
+        component_factory: Arc<dyn RuntimeComponentFactory>,
         hook_registry: Arc<HookRegistry>,
     ) -> Result<Self, BootstrapError> {
         let path = path.into();
@@ -229,15 +135,27 @@ impl RuntimeApp {
         config_manager.load().await?;
         let config = config_manager.config().read().await.clone();
         init_tracing_if_needed(&config.observability);
-        let blob_store = blob_store_factory.build_blob_store(&config).await?;
-
-        let event_store = store_factory
-            .build_event_store(&config.stores.event)
-            .await?;
-        let task_store = store_factory.build_task_store(&config.stores.task).await?;
-        let reference_store = store_factory
-            .build_reference_store(&config.stores.reference)
-            .await?;
+        let build_request = RuntimeBuildRequest {
+            meta: SpiMeta::runtime_defaults(env!("CARGO_PKG_VERSION")),
+            config_path: path.to_string_lossy().to_string(),
+            profile: None,
+            options: build_runtime_component_options(&config),
+        };
+        let components = component_factory.build(&build_request).await?;
+        let stores = components.stores.unwrap_or_else(|| {
+            tracing::warn!("component factory missing stores; fallback to in-memory stores");
+            StoreBundle {
+                event_store: Arc::new(InMemoryEventStore::new()),
+                task_store: Arc::new(InMemoryTaskStore::new()),
+                reference_store: Arc::new(InMemoryReferenceStore::new()),
+            }
+        });
+        let blob_store: Arc<dyn BlobStore> = components.blob_store.unwrap_or_else(|| {
+            tracing::warn!(
+                "component factory missing blob_store; fallback to in-memory blob store"
+            );
+            Arc::new(InMemoryBlobStore::default())
+        });
 
         let policy = concurrency_policy_from_name(&config.runtime.concurrency_policy)?;
         let runtime_cfg = ThreadRuntimeConfig {
@@ -247,7 +165,7 @@ impl RuntimeApp {
 
         let thread_runtime = ThreadRuntime::with_policy_and_config(
             Thread::new(),
-            event_store.clone(),
+            stores.event_store.clone(),
             policy,
             runtime_cfg,
         );
@@ -279,8 +197,8 @@ impl RuntimeApp {
         }
 
         let context_builder = Arc::new(BasicContextBuilder::new(
-            event_store.clone(),
-            reference_store.clone(),
+            stores.event_store.clone(),
+            stores.reference_store.clone(),
         ));
 
         let orchestrator_cfg = OrchestratorConfig {
@@ -296,8 +214,8 @@ impl RuntimeApp {
             planner,
             normalizer,
             executor,
-            task_store,
-            reference_store,
+            stores.task_store,
+            stores.reference_store,
             orchestrator_cfg,
         )
         .with_context_builder(context_builder)
@@ -832,6 +750,46 @@ fn resolve_interpreter_model_profile(
     config.providers.get_default_model()
 }
 
+fn build_runtime_component_options(
+    config: &OrchestralConfig,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut options = serde_json::Map::new();
+    options.insert(
+        "stores".to_string(),
+        json!({
+            "event": store_spec_to_json(&config.stores.event),
+            "task": store_spec_to_json(&config.stores.task),
+            "reference": store_spec_to_json(&config.stores.reference),
+        }),
+    );
+    options.insert(
+        "blobs".to_string(),
+        json!({
+            "mode": config.blobs.mode.clone(),
+            "catalog": {
+                "backend": config.blobs.catalog.backend.clone(),
+                "connection_url": config.blobs.catalog.connection_url.clone(),
+                "table_prefix": config.blobs.catalog.table_prefix.clone(),
+            },
+            "local": {
+                "root_dir": config.blobs.local.root_dir.clone(),
+            },
+            "hybrid": {
+                "write_to": config.blobs.hybrid.write_to.clone(),
+            }
+        }),
+    );
+    options
+}
+
+fn store_spec_to_json(spec: &StoreSpec) -> serde_json::Value {
+    json!({
+        "backend": spec.backend.clone(),
+        "connection_url": spec.connection_url.clone(),
+        "key_prefix": spec.key_prefix.clone(),
+    })
+}
+
 struct DeterministicPlanner;
 
 #[async_trait]
@@ -863,47 +821,23 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_default_store_factory_accepts_in_memory_spec() {
-        let factory = DefaultStoreBackendFactory;
-        let spec = StoreSpec {
-            backend: "in_memory".to_string(),
-            connection_url: None,
-            key_prefix: None,
+    async fn test_default_component_factory_builds_min_runtime_components() {
+        let factory = DefaultRuntimeComponentFactory;
+        let request = RuntimeBuildRequest {
+            meta: SpiMeta::runtime_defaults("0.1.0"),
+            config_path: "/tmp/orchestral.yaml".to_string(),
+            profile: None,
+            options: serde_json::Map::new(),
         };
+        let components = factory.build(&request).await.expect("components");
 
-        assert!(factory.build_event_store(&spec).await.is_ok());
-        assert!(factory.build_task_store(&spec).await.is_ok());
-        assert!(factory.build_reference_store(&spec).await.is_ok());
+        assert!(components.stores.is_some());
+        assert!(components.blob_store.is_some());
     }
 
     #[tokio::test]
-    async fn test_default_store_factory_rejects_redis_spec() {
-        let factory = DefaultStoreBackendFactory;
-        let spec = StoreSpec {
-            backend: "redis".to_string(),
-            connection_url: Some("redis://127.0.0.1/".to_string()),
-            key_prefix: Some("orchestral:test".to_string()),
-        };
-
-        assert!(matches!(
-            factory.build_event_store(&spec).await,
-            Err(BootstrapError::UnsupportedStoreBackend { .. })
-        ));
-        assert!(matches!(
-            factory.build_task_store(&spec).await,
-            Err(BootstrapError::UnsupportedStoreBackend { .. })
-        ));
-        assert!(matches!(
-            factory.build_reference_store(&spec).await,
-            Err(BootstrapError::UnsupportedStoreBackend { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_default_blob_store_factory_writes_and_reads() {
-        let factory = DefaultBlobStoreFactory;
-        let config = OrchestralConfig::default();
-        let store = factory.build_blob_store(&config).await.expect("blob store");
+    async fn test_default_blob_store_writes_and_reads() {
+        let store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::default());
         let payload = vec![1_u8, 2, 3];
         let request = BlobWriteRequest::new(Box::pin(futures_util::stream::once(async move {
             Ok(Bytes::from(payload))
@@ -912,5 +846,14 @@ mod tests {
         assert_eq!(written.byte_size, 3);
         let read = store.read(&written.id).await.expect("read");
         assert_eq!(read.meta.id, written.id);
+    }
+
+    #[test]
+    fn test_runtime_component_options_include_store_and_blob_hints() {
+        let config = OrchestralConfig::default();
+        let options = build_runtime_component_options(&config);
+
+        assert!(options.get("stores").is_some());
+        assert!(options.get("blobs").is_some());
     }
 }
