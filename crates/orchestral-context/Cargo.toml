@@ -8,7 +8,6 @@ repository.workspace = true
 
 [dependencies]
 orchestral-core = { workspace = true }
-orchestral-stores = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
