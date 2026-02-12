@@ -67,11 +67,11 @@ CREATE INDEX IF NOT EXISTS idx_orchestral_task_state_updated
   ON orchestral_task(state, updated_at DESC);
 
 -- ---------------------------------------------------------
--- 4) File (managed file metadata catalog)
+-- 4) Blob (managed blob metadata catalog)
 -- ---------------------------------------------------------
-CREATE TABLE IF NOT EXISTS orchestral_file (
+CREATE TABLE IF NOT EXISTS orchestral_blob (
   id               TEXT PRIMARY KEY,
-  backend          TEXT NOT NULL,    -- local / s3 / custom:*
+  store            TEXT NOT NULL,    -- local / s3 / custom:*
   local_path       TEXT,
   bucket           TEXT,
   object_key       TEXT,
@@ -79,21 +79,19 @@ CREATE TABLE IF NOT EXISTS orchestral_file (
   mime_type        TEXT,
   byte_size        BIGINT NOT NULL,
   checksum_sha256  TEXT,
-  status           TEXT NOT NULL,    -- active / deleted
   metadata         JSONB NOT NULL DEFAULT '{}'::jsonb,
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-  deleted_at       TIMESTAMPTZ
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS idx_orchestral_file_status_updated
-  ON orchestral_file(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_orchestral_blob_store_updated
+  ON orchestral_blob(store, updated_at DESC);
 
-CREATE INDEX IF NOT EXISTS idx_orchestral_file_created
-  ON orchestral_file(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_orchestral_blob_created
+  ON orchestral_blob(created_at DESC);
 
 -- ---------------------------------------------------------
--- 5) Reference (metadata index only; file assets point to file_id)
+-- 5) Reference (metadata index only; blob assets point to blob_id)
 -- ---------------------------------------------------------
 CREATE TABLE IF NOT EXISTS orchestral_reference (
   id                   TEXT PRIMARY KEY,
@@ -101,7 +99,7 @@ CREATE TABLE IF NOT EXISTS orchestral_reference (
   interaction_id       TEXT,
   task_id              UUID,
   step_id              TEXT,
-  file_id              TEXT,
+  blob_id              TEXT,
   ref_type             TEXT NOT NULL,
   content              JSONB NOT NULL DEFAULT '{}'::jsonb,
   mime_type            TEXT,
@@ -128,8 +126,8 @@ CREATE INDEX IF NOT EXISTS idx_orchestral_reference_thread_type_created
 CREATE INDEX IF NOT EXISTS idx_orchestral_reference_task_step
   ON orchestral_reference(task_id, step_id);
 
-CREATE INDEX IF NOT EXISTS idx_orchestral_reference_file_id
-  ON orchestral_reference(file_id);
+CREATE INDEX IF NOT EXISTS idx_orchestral_reference_blob_id
+  ON orchestral_reference(blob_id);
 
 CREATE INDEX IF NOT EXISTS gin_orchestral_reference_tags
   ON orchestral_reference USING GIN (tags);

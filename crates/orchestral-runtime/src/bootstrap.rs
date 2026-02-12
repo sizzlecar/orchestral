@@ -17,10 +17,12 @@ use orchestral_context::{BasicContextBuilder, TokenBudget};
 use orchestral_core::action::extract_meta;
 use orchestral_core::executor::Executor;
 use orchestral_core::interpreter::{NoopResultInterpreter, ResultInterpreter};
+use orchestral_core::io::{BlobIoError, BlobStore};
 use orchestral_core::normalizer::PlanNormalizer;
 use orchestral_core::planner::{PlanError, Planner, PlannerContext, PlannerOutput};
 use orchestral_core::store::{EventStore, ReferenceStore, StoreError, TaskStore};
 use orchestral_core::types::{Intent, Plan, Step};
+use orchestral_files::{BlobMode, BlobServiceConfig, FileService, LocalBlobStoreConfig};
 use orchestral_planners::{
     DefaultLlmClientFactory, LlmBuildError, LlmClient, LlmClientFactory, LlmInvocationConfig,
     LlmPlanner, LlmPlannerConfig,
@@ -66,11 +68,20 @@ pub enum BootstrapError {
     UnsupportedStoreBackend { store: String, backend: String },
     #[error("missing connection_url for {store} store backend")]
     MissingStoreConnectionUrl { store: String },
+    #[error("blob io error: {0}")]
+    Blob(#[from] BlobIoError),
+    #[error("missing connection_url for blob catalog backend")]
+    MissingBlobCatalogConnectionUrl,
+    #[error("unsupported blob mode: {0}")]
+    UnsupportedBlobMode(String),
+    #[error("unsupported blob catalog backend: {0}")]
+    UnsupportedBlobCatalogBackend(String),
 }
 
 /// Running app bundle created from unified config.
 pub struct RuntimeApp {
     pub orchestrator: Orchestrator,
+    pub blob_store: Arc<dyn BlobStore>,
     pub config_manager: Arc<ConfigManager>,
     pub action_registry_manager: Arc<ActionRegistryManager>,
     _action_watcher: Option<ActionWatcher>,
@@ -220,6 +231,7 @@ impl RuntimeApp {
         config_manager.load().await?;
         let config = config_manager.config().read().await.clone();
         init_tracing_if_needed(&config.observability);
+        let blob_store = build_blob_store(&config).await?;
 
         let event_store = store_factory
             .build_event_store(&config.stores.event)
@@ -295,11 +307,75 @@ impl RuntimeApp {
 
         Ok(Self {
             orchestrator,
+            blob_store,
             config_manager,
             action_registry_manager,
             _action_watcher: action_watcher,
         })
     }
+}
+
+async fn build_blob_store(config: &OrchestralConfig) -> Result<Arc<dyn BlobStore>, BootstrapError> {
+    let mode = match config.blobs.mode.trim().to_ascii_lowercase().as_str() {
+        "local" => BlobMode::Local,
+        "s3" => BlobMode::S3,
+        "hybrid" => BlobMode::Hybrid,
+        other => return Err(BootstrapError::UnsupportedBlobMode(other.to_string())),
+    };
+
+    let hybrid_write_to = if config.blobs.hybrid.write_to.trim().is_empty() {
+        None
+    } else {
+        Some(config.blobs.hybrid.write_to.clone())
+    };
+    let service_config = BlobServiceConfig {
+        mode: mode.clone(),
+        hybrid_write_to,
+    };
+
+    let catalog_backend = config.blobs.catalog.backend.trim().to_ascii_lowercase();
+    let mut service = match catalog_backend.as_str() {
+        "in_memory" | "memory" => FileService::with_in_memory_catalog(service_config),
+        "postgres" | "postgresql" | "pgsql" => {
+            let url = config
+                .blobs
+                .catalog
+                .connection_url
+                .as_ref()
+                .ok_or(BootstrapError::MissingBlobCatalogConnectionUrl)?;
+            FileService::with_postgres_catalog(
+                service_config,
+                url,
+                config.blobs.catalog.table_prefix.clone(),
+            )
+            .await?
+        }
+        other => {
+            return Err(BootstrapError::UnsupportedBlobCatalogBackend(
+                other.to_string(),
+            ))
+        }
+    };
+
+    service = service.with_local_defaults(LocalBlobStoreConfig {
+        root_dir: config.blobs.local.root_dir.clone(),
+    });
+
+    let requires_s3 = matches!(mode, BlobMode::S3)
+        || (matches!(mode, BlobMode::Hybrid)
+            && config
+                .blobs
+                .hybrid
+                .write_to
+                .trim()
+                .eq_ignore_ascii_case("s3"));
+    if requires_s3 {
+        return Err(BootstrapError::UnsupportedBlobMode(
+            "s3 mode requires injecting an S3 client into orchestral-files FileService".to_string(),
+        ));
+    }
+
+    Ok(Arc::new(service))
 }
 
 fn init_tracing_if_needed(observability: &ObservabilityConfig) {

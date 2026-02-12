@@ -52,15 +52,15 @@ stores:
   reference:
     backend: in_memory
 
-files:
+blobs:
   mode: local
   local:
-    root_dir: ".orchestral/files"
+    root_dir: ".orchestral/blobs"
   s3:
     endpoint:
     region:
     bucket:
-    key_prefix: "orchestral/files"
+    key_prefix: "orchestral/blobs"
   hybrid:
     write_to: s3
   catalog:

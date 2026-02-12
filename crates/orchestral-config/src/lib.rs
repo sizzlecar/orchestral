@@ -39,8 +39,8 @@ pub struct OrchestralConfig {
     pub ingestion: IngestionConfig,
     #[serde(default)]
     pub stores: StoresConfig,
-    #[serde(default)]
-    pub files: FilesConfig,
+    #[serde(default, alias = "files")]
+    pub blobs: BlobsConfig,
     #[serde(default)]
     pub observability: ObservabilityConfig,
     #[serde(default)]
@@ -64,7 +64,7 @@ impl Default for OrchestralConfig {
             context: ContextConfig::default(),
             ingestion: IngestionConfig::default(),
             stores: StoresConfig::default(),
-            files: FilesConfig::default(),
+            blobs: BlobsConfig::default(),
             observability: ObservabilityConfig::default(),
             providers: ProvidersConfig::default(),
             actions: ActionsConfig::default(),
@@ -330,55 +330,55 @@ impl Default for StoreSpec {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct FilesConfig {
-    #[serde(default = "default_file_mode")]
+pub struct BlobsConfig {
+    #[serde(default = "default_blob_mode")]
     pub mode: String,
     #[serde(default)]
-    pub local: LocalFilesConfig,
+    pub local: LocalBlobsConfig,
     #[serde(default)]
-    pub s3: S3FilesConfig,
+    pub s3: S3BlobsConfig,
     #[serde(default)]
-    pub hybrid: HybridFilesConfig,
+    pub hybrid: HybridBlobsConfig,
     #[serde(default)]
-    pub catalog: FileCatalogConfig,
+    pub catalog: BlobCatalogConfig,
 }
 
-impl Default for FilesConfig {
+impl Default for BlobsConfig {
     fn default() -> Self {
         Self {
-            mode: default_file_mode(),
-            local: LocalFilesConfig::default(),
-            s3: S3FilesConfig::default(),
-            hybrid: HybridFilesConfig::default(),
-            catalog: FileCatalogConfig::default(),
+            mode: default_blob_mode(),
+            local: LocalBlobsConfig::default(),
+            s3: S3BlobsConfig::default(),
+            hybrid: HybridBlobsConfig::default(),
+            catalog: BlobCatalogConfig::default(),
         }
     }
 }
 
-fn default_file_mode() -> String {
+fn default_blob_mode() -> String {
     "local".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct LocalFilesConfig {
-    #[serde(default = "default_files_root_dir")]
+pub struct LocalBlobsConfig {
+    #[serde(default = "default_blobs_root_dir")]
     pub root_dir: String,
 }
 
-impl Default for LocalFilesConfig {
+impl Default for LocalBlobsConfig {
     fn default() -> Self {
         Self {
-            root_dir: default_files_root_dir(),
+            root_dir: default_blobs_root_dir(),
         }
     }
 }
 
-fn default_files_root_dir() -> String {
-    ".orchestral/files".to_string()
+fn default_blobs_root_dir() -> String {
+    ".orchestral/blobs".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
-pub struct S3FilesConfig {
+pub struct S3BlobsConfig {
     #[serde(default)]
     pub endpoint: Option<String>,
     #[serde(default)]
@@ -396,12 +396,12 @@ pub struct S3FilesConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct HybridFilesConfig {
+pub struct HybridBlobsConfig {
     #[serde(default = "default_hybrid_write_to")]
     pub write_to: String,
 }
 
-impl Default for HybridFilesConfig {
+impl Default for HybridBlobsConfig {
     fn default() -> Self {
         Self {
             write_to: default_hybrid_write_to(),
@@ -414,7 +414,7 @@ fn default_hybrid_write_to() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct FileCatalogConfig {
+pub struct BlobCatalogConfig {
     #[serde(default = "default_backend")]
     pub backend: String,
     #[serde(default)]
@@ -423,7 +423,7 @@ pub struct FileCatalogConfig {
     pub table_prefix: String,
 }
 
-impl Default for FileCatalogConfig {
+impl Default for BlobCatalogConfig {
     fn default() -> Self {
         Self {
             backend: default_backend(),
@@ -440,6 +440,13 @@ fn default_file_catalog_table_prefix() -> String {
 fn default_backend() -> String {
     "in_memory".to_string()
 }
+
+// Backward-compatible aliases.
+pub type FilesConfig = BlobsConfig;
+pub type LocalFilesConfig = LocalBlobsConfig;
+pub type S3FilesConfig = S3BlobsConfig;
+pub type HybridFilesConfig = HybridBlobsConfig;
+pub type FileCatalogConfig = BlobCatalogConfig;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ObservabilityConfig {

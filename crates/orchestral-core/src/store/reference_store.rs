@@ -54,9 +54,9 @@ pub struct Reference {
     /// Optional owning step id.
     #[serde(default)]
     pub step_id: Option<StepId>,
-    /// Optional managed file identifier. When set, file IO must go through file service.
+    /// Optional managed blob identifier. When set, blob IO must go through blob store.
     #[serde(default)]
-    pub file_id: Option<String>,
+    pub blob_id: Option<String>,
     /// Type of reference
     pub ref_type: ReferenceType,
     /// Inline content payload (small previews, snippets, extracted text).
@@ -65,10 +65,10 @@ pub struct Reference {
     /// Optional media type (RFC 6838), e.g. application/pdf, image/png.
     #[serde(default)]
     pub mime_type: Option<String>,
-    /// Optional user-facing file name.
+    /// Optional user-facing blob name.
     #[serde(default)]
     pub file_name: Option<String>,
-    /// Optional byte size for file-like references.
+    /// Optional byte size for blob-like references.
     #[serde(default)]
     pub byte_size: Option<u64>,
     /// Source reference ids this artifact derives from.
@@ -111,7 +111,7 @@ impl Reference {
             interaction_id: None,
             task_id: None,
             step_id: None,
-            file_id: None,
+            blob_id: None,
             ref_type,
             content,
             mime_type: None,
@@ -156,13 +156,13 @@ impl Reference {
         self
     }
 
-    /// Attach managed file id.
-    pub fn with_file_id(mut self, file_id: Option<String>) -> Self {
-        self.file_id = file_id;
+    /// Attach managed blob id.
+    pub fn with_blob_id(mut self, blob_id: Option<String>) -> Self {
+        self.blob_id = blob_id;
         self
     }
 
-    /// Attach file/media metadata.
+    /// Attach blob/media metadata.
     pub fn with_media(
         mut self,
         mime_type: Option<String>,

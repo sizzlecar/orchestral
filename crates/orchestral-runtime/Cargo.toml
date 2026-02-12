@@ -14,6 +14,7 @@ orchestral-planners = { workspace = true }
 orchestral-actions = { workspace = true }
 orchestral-stores = { workspace = true }
 orchestral-stores-backends = { workspace = true }
+orchestral-files = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }

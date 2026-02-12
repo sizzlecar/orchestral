@@ -1915,6 +1915,7 @@ name = "orchestral-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "chrono",
  "futures-util",
  "serde",
@@ -1950,7 +1951,9 @@ name = "orchestral-files"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "chrono",
+ "futures-util",
  "orchestral-core",
  "serde",
  "serde_json",
@@ -1988,6 +1991,7 @@ dependencies = [
  "orchestral-config",
  "orchestral-context",
  "orchestral-core",
+ "orchestral-files",
  "orchestral-planners",
  "orchestral-stores",
  "orchestral-stores-backends",

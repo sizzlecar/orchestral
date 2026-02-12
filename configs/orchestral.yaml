@@ -46,17 +46,17 @@ stores:
   reference:
     backend: in_memory
 
-files:
+blobs:
   # mode: local | s3 | hybrid
   mode: local
   local:
-    root_dir: ".orchestral/files"
+    root_dir: ".orchestral/blobs"
   s3:
     # Optional placeholders for s3 mode.
     endpoint:
     region:
     bucket:
-    key_prefix: "orchestral/files"
+    key_prefix: "orchestral/blobs"
   hybrid:
     # local | s3
     write_to: s3

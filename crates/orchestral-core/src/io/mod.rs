@@ -1,21 +1,23 @@
-//! File IO abstractions.
+//! Blob IO abstractions.
 //!
-//! This module defines storage-neutral contracts. Implementations should live in
-//! dedicated crates (e.g. `orchestral-files`), while callers interact through
-//! file ids and metadata only.
+//! This module defines storage-neutral, streaming blob contracts.
+//! Implementations should live in dedicated crates (for example
+//! `orchestral-files`) while callers depend on `BlobId` and `BlobStore`.
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
 
-/// Strongly-typed file id.
+/// Strongly-typed blob id.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(transparent)]
-pub struct FileId(pub String);
+pub struct BlobId(pub String);
 
-impl FileId {
+impl BlobId {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
@@ -25,70 +27,46 @@ impl FileId {
     }
 }
 
-impl From<String> for FileId {
+impl From<String> for BlobId {
     fn from(value: String) -> Self {
         Self(value)
     }
 }
 
-impl From<&str> for FileId {
+impl From<&str> for BlobId {
     fn from(value: &str) -> Self {
         Self(value.to_string())
     }
 }
 
-impl From<&FileId> for FileId {
-    fn from(value: &FileId) -> Self {
+impl From<&BlobId> for BlobId {
+    fn from(value: &BlobId) -> Self {
         value.clone()
     }
 }
 
-impl fmt::Display for FileId {
+impl fmt::Display for BlobId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
 }
 
-impl AsRef<str> for FileId {
+impl AsRef<str> for BlobId {
     fn as_ref(&self) -> &str {
         self.as_str()
     }
 }
 
-/// Opaque blob binding for a concrete storage implementation.
-///
-/// `store` is implementation-defined (for example: "local", "s3", "oss", ...).
-/// `attributes` is implementation-defined key/value metadata required for
-/// download/delete/head operations.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-pub struct BlobBinding {
-    pub store: String,
-    #[serde(default)]
-    pub attributes: Value,
-}
+/// Streamed blob chunk type.
+pub type BlobChunk = Bytes;
 
-impl BlobBinding {
-    pub fn new(store: impl Into<String>, attributes: Value) -> Self {
-        Self {
-            store: store.into(),
-            attributes,
-        }
-    }
-}
+/// Streaming blob body.
+pub type BlobStream = BoxStream<'static, Result<BlobChunk, BlobIoError>>;
 
-/// File lifecycle state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FileStatus {
-    Active,
-    Deleted,
-}
-
-/// Stored file metadata row.
+/// Blob metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileRecord {
-    pub id: FileId,
-    pub binding: BlobBinding,
+pub struct BlobMeta {
+    pub id: BlobId,
     #[serde(default)]
     pub file_name: Option<String>,
     #[serde(default)]
@@ -98,38 +76,13 @@ pub struct FileRecord {
     pub checksum_sha256: Option<String>,
     #[serde(default)]
     pub metadata: Value,
-    pub status: FileStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    #[serde(default)]
-    pub deleted_at: Option<DateTime<Utc>>,
 }
 
-/// Upload payload.
+/// Blob metadata fetched from physical backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UploadRequest {
-    pub bytes: Vec<u8>,
-    #[serde(default)]
-    pub file_name: Option<String>,
-    #[serde(default)]
-    pub mime_type: Option<String>,
-    #[serde(default)]
-    pub metadata: Value,
-}
-
-/// Download payload.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FilePayload {
-    pub bytes: Vec<u8>,
-    #[serde(default)]
-    pub file_name: Option<String>,
-    #[serde(default)]
-    pub mime_type: Option<String>,
-}
-
-/// File metadata fetched from physical backend.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileHead {
+pub struct BlobHead {
     pub byte_size: u64,
     #[serde(default)]
     pub etag: Option<String>,
@@ -137,9 +90,49 @@ pub struct FileHead {
     pub last_modified: Option<DateTime<Utc>>,
 }
 
-/// Storage-neutral file errors.
+/// Write request.
+pub struct BlobWriteRequest {
+    pub body: BlobStream,
+    pub file_name: Option<String>,
+    pub mime_type: Option<String>,
+    pub metadata: Value,
+}
+
+impl BlobWriteRequest {
+    pub fn new(body: BlobStream) -> Self {
+        Self {
+            body,
+            file_name: None,
+            mime_type: None,
+            metadata: Value::Null,
+        }
+    }
+
+    pub fn with_file_name(mut self, file_name: Option<String>) -> Self {
+        self.file_name = file_name;
+        self
+    }
+
+    pub fn with_mime_type(mut self, mime_type: Option<String>) -> Self {
+        self.mime_type = mime_type;
+        self
+    }
+
+    pub fn with_metadata(mut self, metadata: Value) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
+/// Read result.
+pub struct BlobRead {
+    pub meta: BlobMeta,
+    pub body: BlobStream,
+}
+
+/// Storage-neutral blob errors.
 #[derive(Debug, thiserror::Error)]
-pub enum FileIoError {
+pub enum BlobIoError {
     #[error("invalid request: {0}")]
     Invalid(String),
     #[error("not found: {0}")]
@@ -158,66 +151,30 @@ pub enum FileIoError {
     Internal(String),
 }
 
-impl From<std::io::Error> for FileIoError {
+impl From<std::io::Error> for BlobIoError {
     fn from(value: std::io::Error) -> Self {
         Self::Io(value.to_string())
     }
 }
 
-impl From<serde_json::Error> for FileIoError {
+impl From<serde_json::Error> for BlobIoError {
     fn from(value: serde_json::Error) -> Self {
         Self::Serialization(value.to_string())
     }
 }
 
-/// Physical backend adapter.
+/// Blob store abstraction.
 #[async_trait]
 pub trait BlobStore: Send + Sync {
-    fn store_key(&self) -> &str;
+    /// Stream-write a blob and return metadata.
+    async fn write(&self, request: BlobWriteRequest) -> Result<BlobMeta, BlobIoError>;
 
-    async fn upload(
-        &self,
-        file_id: &FileId,
-        request: &UploadRequest,
-    ) -> Result<BlobBinding, FileIoError>;
+    /// Stream-read a blob by id.
+    async fn read(&self, blob_id: &BlobId) -> Result<BlobRead, BlobIoError>;
 
-    async fn download(&self, binding: &BlobBinding) -> Result<FilePayload, FileIoError>;
+    /// Read blob metadata only.
+    async fn head(&self, blob_id: &BlobId) -> Result<BlobHead, BlobIoError>;
 
-    async fn delete(&self, binding: &BlobBinding) -> Result<(), FileIoError>;
-
-    async fn head(&self, binding: &BlobBinding) -> Result<FileHead, FileIoError>;
-}
-
-/// Metadata catalog.
-#[async_trait]
-pub trait FileCatalog: Send + Sync {
-    async fn upsert(&self, record: &FileRecord) -> Result<(), FileIoError>;
-
-    async fn get(&self, file_id: &FileId) -> Result<Option<FileRecord>, FileIoError>;
-
-    async fn mark_deleted(
-        &self,
-        file_id: &FileId,
-        deleted_at: DateTime<Utc>,
-    ) -> Result<bool, FileIoError>;
-
-    async fn list_recent(
-        &self,
-        limit: usize,
-        include_deleted: bool,
-    ) -> Result<Vec<FileRecord>, FileIoError>;
-}
-
-/// High-level file service used by other modules.
-#[async_trait]
-pub trait FileService: Send + Sync {
-    async fn upload(&self, request: UploadRequest) -> Result<FileRecord, FileIoError>;
-
-    async fn download(&self, file_id: &FileId) -> Result<FilePayload, FileIoError>;
-
-    async fn delete(&self, file_id: &FileId) -> Result<bool, FileIoError>;
-
-    async fn head(&self, file_id: &FileId) -> Result<FileHead, FileIoError>;
-
-    async fn resolve(&self, file_id: &FileId) -> Result<Option<FileRecord>, FileIoError>;
+    /// Delete a blob by id.
+    async fn delete(&self, blob_id: &BlobId) -> Result<bool, BlobIoError>;
 }

@@ -418,7 +418,7 @@ impl PostgresReferenceStore {
                 interaction_id TEXT NULL,
                 task_id TEXT NULL,
                 step_id TEXT NULL,
-                file_id TEXT NULL,
+                blob_id TEXT NULL,
                 ref_type TEXT NOT NULL,
                 content JSONB NOT NULL DEFAULT '{{}}'::jsonb,
                 mime_type TEXT NULL,
@@ -442,11 +442,11 @@ impl PostgresReferenceStore {
             .execute(&self.pool)
             .await
             .map_err(|e| StoreError::Connection(e.to_string()))?;
-        let alter_file_id = format!(
-            "ALTER TABLE {} ADD COLUMN IF NOT EXISTS file_id TEXT NULL",
+        let alter_blob_id = format!(
+            "ALTER TABLE {} ADD COLUMN IF NOT EXISTS blob_id TEXT NULL",
             self.table_name
         );
-        sqlx::query(&alter_file_id)
+        sqlx::query(&alter_blob_id)
             .execute(&self.pool)
             .await
             .map_err(|e| StoreError::Connection(e.to_string()))?;
@@ -463,8 +463,8 @@ impl PostgresReferenceStore {
             "CREATE INDEX IF NOT EXISTS {0}_task_step_idx ON {1} (task_id, step_id)",
             self.table_name, self.table_name
         );
-        let idx_file_id = format!(
-            "CREATE INDEX IF NOT EXISTS {0}_file_id_idx ON {1} (file_id)",
+        let idx_blob_id = format!(
+            "CREATE INDEX IF NOT EXISTS {0}_blob_id_idx ON {1} (blob_id)",
             self.table_name, self.table_name
         );
         let idx_tags = format!(
@@ -487,7 +487,7 @@ impl PostgresReferenceStore {
             .execute(&self.pool)
             .await
             .map_err(|e| StoreError::Connection(e.to_string()))?;
-        sqlx::query(&idx_file_id)
+        sqlx::query(&idx_blob_id)
             .execute(&self.pool)
             .await
             .map_err(|e| StoreError::Connection(e.to_string()))?;
@@ -528,7 +528,7 @@ impl ReferenceStore for PostgresReferenceStore {
 
         let sql = format!(
             "INSERT INTO {} (
-                id, thread_id, interaction_id, task_id, step_id, file_id,
+                id, thread_id, interaction_id, task_id, step_id, blob_id,
                 ref_type, content,
                 mime_type, file_name, byte_size,
                 derived_from, tags, metadata,
@@ -547,7 +547,7 @@ impl ReferenceStore for PostgresReferenceStore {
                 interaction_id = EXCLUDED.interaction_id,
                 task_id = EXCLUDED.task_id,
                 step_id = EXCLUDED.step_id,
-                file_id = EXCLUDED.file_id,
+                blob_id = EXCLUDED.blob_id,
                 ref_type = EXCLUDED.ref_type,
                 content = EXCLUDED.content,
                 mime_type = EXCLUDED.mime_type,
@@ -572,7 +572,7 @@ impl ReferenceStore for PostgresReferenceStore {
             .bind(&reference.interaction_id)
             .bind(reference.task_id.as_ref().map(|id| id.to_string()))
             .bind(reference.step_id.as_ref().map(|id| id.to_string()))
-            .bind(&reference.file_id)
+            .bind(&reference.blob_id)
             .bind(ref_type)
             .bind(&reference.content)
             .bind(&reference.mime_type)
