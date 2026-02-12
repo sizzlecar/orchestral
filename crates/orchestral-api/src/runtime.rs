@@ -15,16 +15,41 @@ use crate::dto::{
 };
 use crate::{ApiError, ApiService};
 
+#[async_trait]
+pub trait RuntimeAppBuilder: Send + Sync {
+    async fn build(&self, config_path: PathBuf) -> Result<RuntimeApp, ApiError>;
+}
+
+struct DefaultRuntimeAppBuilder;
+
+#[async_trait]
+impl RuntimeAppBuilder for DefaultRuntimeAppBuilder {
+    async fn build(&self, config_path: PathBuf) -> Result<RuntimeApp, ApiError> {
+        RuntimeApp::from_config_path(config_path)
+            .await
+            .map_err(|err| ApiError::Internal(format!("build runtime app failed: {}", err)))
+    }
+}
+
 #[derive(Clone)]
 pub struct RuntimeApi {
     config_path: PathBuf,
+    app_builder: Arc<dyn RuntimeAppBuilder>,
     apps: Arc<RwLock<HashMap<String, Arc<RuntimeApp>>>>,
 }
 
 impl RuntimeApi {
     pub async fn from_config_path(config: PathBuf) -> Result<Self, ApiError> {
+        Self::from_config_path_with_builder(config, Arc::new(DefaultRuntimeAppBuilder)).await
+    }
+
+    pub async fn from_config_path_with_builder(
+        config: PathBuf,
+        app_builder: Arc<dyn RuntimeAppBuilder>,
+    ) -> Result<Self, ApiError> {
         Ok(Self {
             config_path: config,
+            app_builder,
             apps: Arc::new(RwLock::new(HashMap::new())),
         })
     }
@@ -37,9 +62,7 @@ impl RuntimeApi {
     }
 
     async fn create_app_for_thread(&self, thread_id: &str) -> Result<Arc<RuntimeApp>, ApiError> {
-        let app = RuntimeApp::from_config_path(self.config_path.clone())
-            .await
-            .map_err(|err| ApiError::Internal(format!("build runtime app failed: {}", err)))?;
+        let app = self.app_builder.build(self.config_path.clone()).await?;
         {
             let mut thread = app.orchestrator.thread_runtime.thread.write().await;
             thread.id = thread_id.into();

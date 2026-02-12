@@ -5,15 +5,25 @@ use std::time::Duration;
 
 use anyhow::Context;
 use async_stream::stream;
+use async_trait::async_trait;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use orchestral_api::{ApiService, RuntimeApi};
+use orchestral_api::{ApiService, RuntimeApi, RuntimeAppBuilder};
 use orchestral_channels::{InMemoryChannelBindingStore, WebChannel};
+use orchestral_files::{BlobMode, BlobServiceConfig, FileService, LocalBlobStoreConfig};
+use orchestral_runtime::{
+    BlobStoreFactory, BootstrapError, DefaultStoreBackendFactory, HookRegistry, RuntimeApp,
+    StoreBackendFactory,
+};
 use orchestral_stores::Event;
+use orchestral_stores_backends::{
+    PostgresEventStore, PostgresReferenceStore, PostgresTaskStore, RedisEventStore,
+    RedisReferenceStore, RedisTaskStore,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 
@@ -35,8 +45,243 @@ struct ErrorBody {
     message: String,
 }
 
+struct ServerStoreBackendFactory;
+
+#[async_trait]
+impl StoreBackendFactory for ServerStoreBackendFactory {
+    async fn build_event_store(
+        &self,
+        spec: &orchestral_config::StoreSpec,
+    ) -> Result<Arc<dyn orchestral_core::store::EventStore>, BootstrapError> {
+        match spec.backend.trim().to_ascii_lowercase().as_str() {
+            "in_memory" | "memory" => DefaultStoreBackendFactory.build_event_store(spec).await,
+            "redis" => {
+                let url = spec.connection_url.clone().ok_or_else(|| {
+                    BootstrapError::MissingStoreConnectionUrl {
+                        store: "event".to_string(),
+                    }
+                })?;
+                let prefix = spec
+                    .key_prefix
+                    .clone()
+                    .unwrap_or_else(|| "orchestral:event".to_string());
+                let store = RedisEventStore::new(&url, prefix).map_err(BootstrapError::Store)?;
+                Ok(Arc::new(store))
+            }
+            "postgres" | "postgresql" | "pgsql" => {
+                let url = spec.connection_url.clone().ok_or_else(|| {
+                    BootstrapError::MissingStoreConnectionUrl {
+                        store: "event".to_string(),
+                    }
+                })?;
+                let prefix = spec
+                    .key_prefix
+                    .clone()
+                    .unwrap_or_else(|| "orchestral".to_string());
+                let store = PostgresEventStore::new(&url, prefix)
+                    .await
+                    .map_err(BootstrapError::Store)?;
+                Ok(Arc::new(store))
+            }
+            backend => Err(BootstrapError::UnsupportedStoreBackend {
+                store: "event".to_string(),
+                backend: backend.to_string(),
+            }),
+        }
+    }
+
+    async fn build_task_store(
+        &self,
+        spec: &orchestral_config::StoreSpec,
+    ) -> Result<Arc<dyn orchestral_core::store::TaskStore>, BootstrapError> {
+        match spec.backend.trim().to_ascii_lowercase().as_str() {
+            "in_memory" | "memory" => DefaultStoreBackendFactory.build_task_store(spec).await,
+            "redis" => {
+                let url = spec.connection_url.clone().ok_or_else(|| {
+                    BootstrapError::MissingStoreConnectionUrl {
+                        store: "task".to_string(),
+                    }
+                })?;
+                let prefix = spec
+                    .key_prefix
+                    .clone()
+                    .unwrap_or_else(|| "orchestral:task".to_string());
+                let store = RedisTaskStore::new(&url, prefix).map_err(BootstrapError::Store)?;
+                Ok(Arc::new(store))
+            }
+            "postgres" | "postgresql" | "pgsql" => {
+                let url = spec.connection_url.clone().ok_or_else(|| {
+                    BootstrapError::MissingStoreConnectionUrl {
+                        store: "task".to_string(),
+                    }
+                })?;
+                let prefix = spec
+                    .key_prefix
+                    .clone()
+                    .unwrap_or_else(|| "orchestral".to_string());
+                let store = PostgresTaskStore::new(&url, prefix)
+                    .await
+                    .map_err(BootstrapError::Store)?;
+                Ok(Arc::new(store))
+            }
+            backend => Err(BootstrapError::UnsupportedStoreBackend {
+                store: "task".to_string(),
+                backend: backend.to_string(),
+            }),
+        }
+    }
+
+    async fn build_reference_store(
+        &self,
+        spec: &orchestral_config::StoreSpec,
+    ) -> Result<Arc<dyn orchestral_core::store::ReferenceStore>, BootstrapError> {
+        match spec.backend.trim().to_ascii_lowercase().as_str() {
+            "in_memory" | "memory" => DefaultStoreBackendFactory.build_reference_store(spec).await,
+            "redis" => {
+                let url = spec.connection_url.clone().ok_or_else(|| {
+                    BootstrapError::MissingStoreConnectionUrl {
+                        store: "reference".to_string(),
+                    }
+                })?;
+                let prefix = spec
+                    .key_prefix
+                    .clone()
+                    .unwrap_or_else(|| "orchestral:reference".to_string());
+                let store =
+                    RedisReferenceStore::new(&url, prefix).map_err(BootstrapError::Store)?;
+                Ok(Arc::new(store))
+            }
+            "postgres" | "postgresql" | "pgsql" => {
+                let url = spec.connection_url.clone().ok_or_else(|| {
+                    BootstrapError::MissingStoreConnectionUrl {
+                        store: "reference".to_string(),
+                    }
+                })?;
+                let prefix = spec
+                    .key_prefix
+                    .clone()
+                    .unwrap_or_else(|| "orchestral".to_string());
+                let store = PostgresReferenceStore::new(&url, prefix)
+                    .await
+                    .map_err(BootstrapError::Store)?;
+                Ok(Arc::new(store))
+            }
+            backend => Err(BootstrapError::UnsupportedStoreBackend {
+                store: "reference".to_string(),
+                backend: backend.to_string(),
+            }),
+        }
+    }
+}
+
+struct ServerBlobStoreFactory;
+
+#[async_trait]
+impl BlobStoreFactory for ServerBlobStoreFactory {
+    async fn build_blob_store(
+        &self,
+        config: &orchestral_config::OrchestralConfig,
+    ) -> Result<Arc<dyn orchestral_core::io::BlobStore>, BootstrapError> {
+        let mode = match config.blobs.mode.trim().to_ascii_lowercase().as_str() {
+            "local" => BlobMode::Local,
+            "s3" => BlobMode::S3,
+            "hybrid" => BlobMode::Hybrid,
+            other => {
+                return Err(BootstrapError::UnsupportedStoreBackend {
+                    store: "blob".to_string(),
+                    backend: other.to_string(),
+                });
+            }
+        };
+        let service_config = BlobServiceConfig {
+            mode: mode.clone(),
+            hybrid_write_to: if config.blobs.hybrid.write_to.trim().is_empty() {
+                None
+            } else {
+                Some(config.blobs.hybrid.write_to.clone())
+            },
+        };
+
+        let mut service = match config
+            .blobs
+            .catalog
+            .backend
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "in_memory" | "memory" => FileService::with_in_memory_catalog(service_config),
+            "postgres" | "postgresql" | "pgsql" => {
+                let url = config
+                    .blobs
+                    .catalog
+                    .connection_url
+                    .as_ref()
+                    .ok_or_else(|| BootstrapError::MissingStoreConnectionUrl {
+                        store: "blob_catalog".to_string(),
+                    })?;
+                FileService::with_postgres_catalog(
+                    service_config,
+                    url,
+                    config.blobs.catalog.table_prefix.clone(),
+                )
+                .await
+                .map_err(BootstrapError::Blob)?
+            }
+            backend => {
+                return Err(BootstrapError::UnsupportedStoreBackend {
+                    store: "blob_catalog".to_string(),
+                    backend: backend.to_string(),
+                });
+            }
+        };
+
+        service = service.with_local_defaults(LocalBlobStoreConfig {
+            root_dir: config.blobs.local.root_dir.clone(),
+        });
+
+        if matches!(mode, BlobMode::S3)
+            || (matches!(mode, BlobMode::Hybrid)
+                && config
+                    .blobs
+                    .hybrid
+                    .write_to
+                    .trim()
+                    .eq_ignore_ascii_case("s3"))
+        {
+            return Err(BootstrapError::UnsupportedStoreBackend {
+                store: "blob".to_string(),
+                backend: "s3_requires_custom_client".to_string(),
+            });
+        }
+
+        Ok(Arc::new(service))
+    }
+}
+
+struct ServerRuntimeAppBuilder;
+
+#[async_trait]
+impl RuntimeAppBuilder for ServerRuntimeAppBuilder {
+    async fn build(&self, config_path: PathBuf) -> Result<RuntimeApp, orchestral_api::ApiError> {
+        RuntimeApp::from_config_path_with_factories_and_hooks(
+            config_path,
+            Arc::new(ServerStoreBackendFactory),
+            Arc::new(ServerBlobStoreFactory),
+            Arc::new(HookRegistry::new()),
+        )
+        .await
+        .map_err(|err| {
+            orchestral_api::ApiError::Internal(format!("build runtime app failed: {}", err))
+        })
+    }
+}
+
 pub async fn run_server(config: PathBuf, listen: SocketAddr) -> anyhow::Result<()> {
-    let api = Arc::new(RuntimeApi::from_config_path(config).await?);
+    let api = Arc::new(
+        RuntimeApi::from_config_path_with_builder(config, Arc::new(ServerRuntimeAppBuilder))
+            .await?,
+    );
     let web = Arc::new(WebChannel::new(
         api.clone(),
         Arc::new(InMemoryChannelBindingStore::new()),
@@ -149,60 +394,84 @@ fn event_to_json(event: &Event) -> serde_json::Value {
             thread_id,
             interaction_id,
             payload,
+            task_id,
+            step_id,
             timestamp,
         } => serde_json::json!({
             "type": "user_input",
             "thread_id": thread_id,
             "interaction_id": interaction_id,
             "payload": payload,
+            "task_id": task_id,
+            "step_id": step_id,
             "timestamp": timestamp,
         }),
         Event::AssistantOutput {
             thread_id,
             interaction_id,
             payload,
+            task_id,
+            step_id,
             timestamp,
         } => serde_json::json!({
             "type": "assistant_output",
             "thread_id": thread_id,
             "interaction_id": interaction_id,
             "payload": payload,
+            "task_id": task_id,
+            "step_id": step_id,
             "timestamp": timestamp,
         }),
         Event::Artifact {
             thread_id,
             interaction_id,
             reference_id,
+            task_id,
+            step_id,
             timestamp,
         } => serde_json::json!({
             "type": "artifact",
             "thread_id": thread_id,
             "interaction_id": interaction_id,
             "reference_id": reference_id,
+            "task_id": task_id,
+            "step_id": step_id,
             "timestamp": timestamp,
         }),
         Event::ExternalEvent {
             thread_id,
+            interaction_id,
             kind,
             payload,
+            task_id,
+            step_id,
             timestamp,
         } => serde_json::json!({
             "type": "external_event",
             "thread_id": thread_id,
+            "interaction_id": interaction_id,
             "kind": kind,
             "payload": payload,
+            "task_id": task_id,
+            "step_id": step_id,
             "timestamp": timestamp,
         }),
         Event::SystemTrace {
             thread_id,
+            interaction_id,
             level,
             payload,
+            task_id,
+            step_id,
             timestamp,
         } => serde_json::json!({
             "type": "system_trace",
             "thread_id": thread_id,
+            "interaction_id": interaction_id,
             "level": level,
             "payload": payload,
+            "task_id": task_id,
+            "step_id": step_id,
             "timestamp": timestamp,
         }),
     }

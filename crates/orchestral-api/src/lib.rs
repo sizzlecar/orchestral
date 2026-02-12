@@ -7,5 +7,5 @@ pub use dto::{
     HistoryEventView, InteractionSubmitRequest, InteractionSubmitResponse, SubmitStatus, ThreadView,
 };
 pub use error::{ApiError, ErrorCode};
-pub use runtime::RuntimeApi;
+pub use runtime::{RuntimeApi, RuntimeAppBuilder};
 pub use service::ApiService;

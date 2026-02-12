@@ -97,3 +97,86 @@ impl HookRegistry {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct RecordingHook {
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    #[async_trait]
+    impl RuntimeHook for RecordingHook {
+        async fn on_before_step(&self, _ctx: &StepHookContext) -> Result<(), String> {
+            self.calls.lock().expect("lock").push("before");
+            Ok(())
+        }
+
+        async fn on_after_step(&self, _ctx: &StepHookContext) -> Result<(), String> {
+            self.calls.lock().expect("lock").push("after");
+            Ok(())
+        }
+
+        async fn on_step_error(&self, _ctx: &StepHookContext) -> Result<(), String> {
+            self.calls.lock().expect("lock").push("error");
+            Ok(())
+        }
+
+        async fn on_execution_progress(&self, _ctx: &StepHookContext) -> Result<(), String> {
+            self.calls.lock().expect("lock").push("progress");
+            Ok(())
+        }
+    }
+
+    fn sample_ctx(phase: &str) -> StepHookContext {
+        StepHookContext {
+            thread_id: "thread-1".into(),
+            interaction_id: "int-1".into(),
+            task_id: "task-1".into(),
+            step_id: Some("step-1".into()),
+            action: Some("echo".to_string()),
+            phase: phase.to_string(),
+            message: Some("ok".to_string()),
+            metadata: serde_json::json!({"n":1}),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hook_registry_dispatches_callbacks() {
+        let registry = HookRegistry::new();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        registry
+            .register(Arc::new(RecordingHook {
+                calls: calls.clone(),
+            }))
+            .await;
+
+        registry.on_before_step(&sample_ctx("step_started")).await;
+        registry.on_after_step(&sample_ctx("step_completed")).await;
+        registry.on_step_error(&sample_ctx("step_failed")).await;
+        registry
+            .on_execution_progress(&sample_ctx("step_started"))
+            .await;
+
+        let got = calls.lock().expect("lock").clone();
+        assert_eq!(got, vec!["before", "after", "error", "progress"]);
+    }
+
+    struct FailingHook;
+
+    #[async_trait]
+    impl RuntimeHook for FailingHook {
+        async fn on_before_step(&self, _ctx: &StepHookContext) -> Result<(), String> {
+            Err("boom".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hook_registry_tolerates_hook_failures() {
+        let registry = HookRegistry::new();
+        registry.register(Arc::new(FailingHook)).await;
+        registry.on_before_step(&sample_ctx("step_started")).await;
+    }
+}

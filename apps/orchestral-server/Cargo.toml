@@ -9,8 +9,14 @@ repository.workspace = true
 [dependencies]
 orchestral-api = { workspace = true }
 orchestral-channels = { workspace = true }
+orchestral-config = { workspace = true }
+orchestral-core = { workspace = true }
+orchestral-files = { workspace = true }
+orchestral-runtime = { workspace = true }
 orchestral-stores = { workspace = true }
+orchestral-stores-backends = { workspace = true }
 tokio = { workspace = true }
+async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
