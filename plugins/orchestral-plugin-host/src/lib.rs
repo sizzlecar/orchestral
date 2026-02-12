@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -213,7 +213,7 @@ fn merge_component_registry(
 }
 
 async fn build_hook_registry(
-    config_path: &PathBuf,
+    config_path: &Path,
     target: RuntimeTarget,
     config: &OrchestralConfig,
     plugins: &[LoadedPlugin],
