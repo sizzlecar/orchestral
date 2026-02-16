@@ -151,11 +151,32 @@ let builder = ComposedRuntimeAppBuilder::with_extension_catalog(RuntimeTarget::S
   - supported backends include `in_memory | redis | postgres` for stores and
     `local | s3 | hybrid` for blobs.
 
+## Document Assistant Actions (Rust SDK)
+
+- Parser pipeline is standardized as `source -> kreuzberg markdown -> downstream`.
+- Conversion still uses `pandoc`, but conversion input is always the markdown emitted by `kreuzberg`.
+- Document capabilities are split into dedicated built-in action kinds:
+  - `doc_parse`: parse document to normalized markdown + metadata
+  - `doc_convert`: convert with pandoc from markdown intermediate
+  - `doc_summarize`: summary/outline/overview generation
+  - `doc_generate`: markdown generation with optional format conversion
+  - `doc_qa`: document QA with evidence snippets
+  - `doc_merge`: merge multi-source docs with optional format conversion
+- Runtime config reference: `configs/orchestral.cli.yaml`.
+
+### Document Runtime Dependencies
+
+- `pandoc` must be installed and available in `PATH`.
+- When `kreuzberg` is built with `pdf` support, PDFium is required at build time:
+  - either allow network download of prebuilt PDFium binaries, or
+  - set `KREUZBERG_PDFIUM_PREBUILT` to a local PDFium directory.
+
 ## Troubleshooting
 
 - Missing model key: verify `GEMINI_API_KEY` (or provider-specific key) is exported.
 - No web updates: ensure server is running and SSE endpoint is reachable.
 - Empty/failed runs: check runtime logs at `logs/orchestral-runtime.log`.
+- PDF-related build failures: verify PDFium availability (`KREUZBERG_PDFIUM_PREBUILT`) or network access for `kreuzberg` prebuilt download.
 
 ## License
 
