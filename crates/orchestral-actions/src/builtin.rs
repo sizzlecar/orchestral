@@ -9,6 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::time::timeout;
 
+use crate::document::build_document_action;
 use crate::shell_sandbox::{
     resolve_root_path, sandbox_command, ShellSandboxBackendKind, ShellSandboxMode,
     ShellSandboxPolicy,
@@ -1389,7 +1390,7 @@ pub fn build_builtin_action(spec: &ActionSpec) -> Option<Box<dyn Action>> {
         "shell" => Some(Box::new(ShellAction::from_spec(spec))),
         "file_read" => Some(Box::new(FileReadAction::from_spec(spec))),
         "file_write" => Some(Box::new(FileWriteAction::from_spec(spec))),
-        _ => None,
+        _ => build_document_action(spec),
     }
 }
 

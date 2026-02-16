@@ -57,6 +57,16 @@ redis = { version = "0.27", features = ["aio", "tokio-comp"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "mysql", "chrono", "json", "uuid"] }
 futures-util = "0.3"
 bytes = "1"
+kreuzberg = { version = "4.2.0", default-features = false, features = [
+    "tokio-runtime",
+    "pdf",
+    "office",
+    "excel",
+    "email",
+    "html",
+    "xml",
+    "archives",
+] }
 
 # Internal crates
 orchestral-core = { path = "crates/orchestral-core" }

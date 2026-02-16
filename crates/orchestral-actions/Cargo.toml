@@ -19,6 +19,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 notify = { workspace = true }
 reqwest = { workspace = true }
+kreuzberg = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }
