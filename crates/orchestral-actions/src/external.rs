@@ -67,11 +67,11 @@ impl Action for ExternalProcessAction {
         ActionMeta::new(self.name(), self.description())
             .with_input_schema(json!({
                 "type": "object",
-                "description": "Plugin-defined input. Declare interface.input_schema in YAML for planner/runtime validation."
+                "description": "Extension-defined input. Declare interface.input_schema in YAML for planner/runtime validation."
             }))
             .with_output_schema(json!({
                 "type": "object",
-                "description": "Plugin-defined exports. Declare interface.output_schema in YAML for planner/runtime validation."
+                "description": "Extension-defined exports. Declare interface.output_schema in YAML for planner/runtime validation."
             }))
     }
 

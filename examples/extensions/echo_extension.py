@@ -17,7 +17,7 @@ def main() -> int:
     except Exception as exc:
         resp = {
             "type": "error",
-            "message": f"plugin failed: {exc}",
+            "message": f"extension failed: {exc}",
         }
     json.dump(resp, sys.stdout)
     sys.stdout.write("\n")

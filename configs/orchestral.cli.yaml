@@ -37,6 +37,18 @@ ingestion:
   mime_allowlist: []
   auto_for_assistant_outputs: true
 
+extensions:
+  # Backward-compatible alias: you may use `plugins:` with the same structure.
+  runtime:
+    # Optional docs ingestion extension (async parse/chunk/embed pipeline).
+    # - name: builtin.docs_assistant
+    #   enabled: true
+    #   targets: ["cli", "server"]
+    #   options:
+    #     max_chunk_chars: 900
+    #     chunk_overlap: 120
+    #     embedding_dim: 24
+
 stores:
   # For quick local testing in a single process.
   # If you need durable persistence, switch backend to postgres and add connection_url.
@@ -45,6 +57,11 @@ stores:
   #   backend: postgres
   #   connection_url: "postgres://postgres:postgres@127.0.0.1:5432/orchestral"
   #   key_prefix: "orchestral"   # table prefix
+  # Redis example:
+  # event:
+  #   backend: redis
+  #   connection_url: "redis://127.0.0.1:6379"
+  #   key_prefix: "orchestral:event"
   event:
     backend: in_memory
   task:
@@ -57,10 +74,19 @@ blobs:
   local:
     root_dir: ".orchestral/blobs"
   s3:
+    # Enable when mode is s3 or hybrid(write_to=s3).
+    # endpoint: "http://127.0.0.1:9000" # Optional (MinIO/S3-compatible)
+    # region: "us-east-1"
+    # bucket: "orchestral-blobs"
+    # access_key_env: "S3_ACCESS_KEY_ID"   # Optional, paired with secret_key_env
+    # secret_key_env: "S3_SECRET_ACCESS_KEY"
     endpoint:
     region:
     bucket:
     key_prefix: "orchestral/blobs"
+    access_key_env:
+    secret_key_env:
+    force_path_style: true
   hybrid:
     write_to: s3
   catalog:
@@ -151,10 +177,10 @@ providers:
       temperature: 0.2
 actions:
   hot_reload: true
-  # Optional: external process action (multi-language plugin) example:
+  # Optional: external process action (multi-language extension) example:
   # - name: echo_external
   #   kind: external_process
-  #   description: "Echo via Python plugin"
+  #   description: "Echo via Python extension"
   #   interface:
   #     input_schema:
   #       type: object
@@ -170,7 +196,7 @@ actions:
   #       required: ["result"]
   #   config:
   #     command: "python3"
-  #     args: ["examples/plugins/echo_plugin.py"]
+  #     args: ["examples/extensions/echo_extension.py"]
   #     timeout_ms: 10000
   actions:
     - name: echo
@@ -232,7 +258,7 @@ actions:
           required: ["source_path", "markdown", "headings", "word_count", "char_count"]
       config:
         command: "/Users/chejinxuan/rust_ws/orchestral/.venv/bin/python"
-        args: ["examples/plugins/markitdown_plugin.py"]
+        args: ["examples/extensions/markitdown_extension.py"]
         entrypoint: "doc_parse"
         timeout_ms: 180000
     - name: doc_convert
@@ -309,7 +335,7 @@ actions:
           required: ["source_path", "mode", "to_format", "target_path", "wrote_file", "pandoc_command"]
       config:
         command: "/Users/chejinxuan/rust_ws/orchestral/.venv/bin/python"
-        args: ["examples/plugins/pandoc_plugin.py"]
+        args: ["examples/extensions/pandoc_extension.py"]
         entrypoint: "doc_convert"
         timeout_ms: 180000
     - name: http

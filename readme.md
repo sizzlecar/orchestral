@@ -102,7 +102,15 @@ orchestral/
 │   ├── orchestral-core/
 │   ├── orchestral-runtime/
 │   ├── orchestral-stores/
-│   └── orchestral-actions/
+│   ├── orchestral-actions/
+│   └── orchestral-composition/
+├── adapters/
+│   ├── orchestral-infra/
+│   ├── orchestral-files/
+│   └── orchestral-stores-backends/
+├── extensions/
+│   ├── orchestral-extension-host/
+│   └── orchestral-docs-assistant/
 ├── apps/
 │   ├── orchestral-cli/
 │   └── orchestral-server/
@@ -111,6 +119,37 @@ orchestral/
 │   └── orchestral-web/
 └── examples/
 ```
+
+## Extension Model
+
+- `Extension Point`: trait-level abstraction in core/runtime (`Action`, hooks, SPI components).
+- `Adapter`: infra implementation for storage/blob backends (Redis/Postgres/S3, etc.).
+- `Extension Package`: business/runtime extension that contributes actions/hooks/components.
+- Layering rule:
+  - `crates/*` keep abstractions and orchestration only.
+  - `adapters/*` hold concrete infra backends.
+  - `extensions/*` hold runtime extension packages.
+  - `apps/*` are composition roots; they wire `infra + extensions`.
+- Config naming:
+  - `extensions.runtime` is preferred.
+  - `plugins.runtime` remains a backward-compatible alias.
+- Runtime extension registration (custom package):
+
+```rust
+use std::sync::Arc;
+use orchestral_composition::{ComposedRuntimeAppBuilder, RuntimeTarget};
+use orchestral_extension_host::{RuntimeExtensionCatalog, RuntimeExtension};
+
+let catalog = RuntimeExtensionCatalog::with_builtin_extensions()
+    .with_extension(Arc::new(MyRuntimeExtension), &["my_extension_alias"]);
+let builder = ComposedRuntimeAppBuilder::with_extension_catalog(RuntimeTarget::Server, catalog);
+```
+
+- Infra selection is **not** done via runtime extensions:
+  - stores are configured by `stores.*.backend`
+  - blob storage is configured by `blobs.*`
+  - supported backends include `in_memory | redis | postgres` for stores and
+    `local | s3 | hybrid` for blobs.
 
 ## Troubleshooting
 

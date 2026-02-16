@@ -239,7 +239,7 @@ def main() -> int:
         request = json.load(sys.stdin)
         response = dispatch(request)
     except Exception as exc:
-        response = error(f"plugin failed: {exc}")
+        response = error(f"extension failed: {exc}")
 
     json.dump(response, sys.stdout, ensure_ascii=False)
     sys.stdout.write("\n")

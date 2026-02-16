@@ -33,12 +33,28 @@ ingestion:
   mime_allowlist: []
   auto_for_assistant_outputs: true
 
+extensions:
+  # Backward-compatible alias: you may use `plugins:` with the same structure.
+  runtime:
+    # Optional docs ingestion extension (async parse/chunk/embed pipeline).
+    # - name: builtin.docs_assistant
+    #   enabled: true
+    #   targets: ["cli", "server"]
+    #   options:
+    #     max_chunk_chars: 900
+    #     chunk_overlap: 120
+    #     embedding_dim: 24
+
 stores:
   # Production recommendation:
   # event/task/reference all use postgres with same connection_url.
   # backend: postgres | postgresql | pgsql
   # connection_url: "postgres://postgres:postgres@127.0.0.1:5432/orchestral"
   # key_prefix: "orchestral"   # table prefix
+  # Redis example:
+  # backend: redis
+  # connection_url: "redis://127.0.0.1:6379"
+  # key_prefix: "orchestral:event"
   event:
     backend: in_memory
   task:
@@ -52,11 +68,19 @@ blobs:
   local:
     root_dir: ".orchestral/blobs"
   s3:
-    # Optional placeholders for s3 mode.
+    # Enable when mode is s3 or hybrid(write_to=s3).
+    # endpoint: "http://127.0.0.1:9000" # Optional (MinIO/S3-compatible)
+    # region: "us-east-1"
+    # bucket: "orchestral-blobs"
+    # access_key_env: "S3_ACCESS_KEY_ID"   # Optional, paired with secret_key_env
+    # secret_key_env: "S3_SECRET_ACCESS_KEY"
     endpoint:
     region:
     bucket:
     key_prefix: "orchestral/blobs"
+    access_key_env:
+    secret_key_env:
+    force_path_style: true
   hybrid:
     # local | s3
     write_to: s3

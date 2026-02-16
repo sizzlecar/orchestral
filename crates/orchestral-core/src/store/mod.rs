@@ -7,7 +7,7 @@
 //! - TaskStore: Task persistence (async trait)
 //!
 //! Note: In-memory implementations are in `orchestral-stores`; external
-//! backends (Redis/Postgres/...) can live in plugin crates.
+//! backends (Redis/Postgres/...) can live in adapter crates.
 
 mod event_store;
 mod reference_store;
