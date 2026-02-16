@@ -49,7 +49,8 @@ pub struct OrchestralConfig {
     #[serde(default)]
     pub actions: ActionsConfig,
     #[serde(default)]
-    pub plugins: PluginsConfig,
+    #[serde(alias = "plugins")]
+    pub extensions: ExtensionsConfig,
 }
 
 fn default_version() -> u32 {
@@ -71,7 +72,7 @@ impl Default for OrchestralConfig {
             observability: ObservabilityConfig::default(),
             providers: ProvidersConfig::default(),
             actions: ActionsConfig::default(),
-            plugins: PluginsConfig::default(),
+            extensions: ExtensionsConfig::default(),
         }
     }
 }
@@ -83,6 +84,10 @@ impl OrchestralConfig {
 
     pub fn actions(&self) -> &ActionsConfig {
         &self.actions
+    }
+
+    pub fn extensions(&self) -> &ExtensionsConfig {
+        &self.extensions
     }
 }
 
@@ -453,25 +458,25 @@ pub type HybridFilesConfig = HybridBlobsConfig;
 pub type FileCatalogConfig = BlobCatalogConfig;
 
 #[derive(Debug, Clone, Deserialize, Default)]
-pub struct PluginsConfig {
+pub struct ExtensionsConfig {
     #[serde(default)]
-    pub runtime: Vec<RuntimePluginSpec>,
+    pub runtime: Vec<RuntimeExtensionSpec>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct RuntimePluginSpec {
+pub struct RuntimeExtensionSpec {
     pub name: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Empty means enabled for both cli and server.
     #[serde(default)]
     pub targets: Vec<String>,
-    /// Reserved for plugin-specific options.
+    /// Reserved for extension-specific options.
     #[serde(default)]
     pub options: Value,
 }
 
-impl Default for RuntimePluginSpec {
+impl Default for RuntimeExtensionSpec {
     fn default() -> Self {
         Self {
             name: String::new(),

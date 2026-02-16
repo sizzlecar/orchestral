@@ -13,7 +13,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use orchestral_api::{ApiService, RuntimeApi};
 use orchestral_channels::{InMemoryChannelBindingStore, WebChannel};
-use orchestral_plugin_host::{PluginRuntimeAppBuilder, RuntimeTarget};
+use orchestral_composition::{ComposedRuntimeAppBuilder, RuntimeTarget};
 use orchestral_stores::Event;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
@@ -37,7 +37,7 @@ struct ErrorBody {
 }
 
 pub async fn run_server(config: PathBuf, listen: SocketAddr) -> anyhow::Result<()> {
-    let runtime_builder = Arc::new(PluginRuntimeAppBuilder::new(RuntimeTarget::Server));
+    let runtime_builder = Arc::new(ComposedRuntimeAppBuilder::new(RuntimeTarget::Server));
     let api = Arc::new(RuntimeApi::from_config_path_with_builder(config, runtime_builder).await?);
     let web = Arc::new(WebChannel::new(
         api.clone(),

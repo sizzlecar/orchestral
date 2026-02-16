@@ -70,7 +70,8 @@ fn validate_config(config: &OrchestralConfig) -> Result<(), ConfigError> {
 
     validate_providers(&config.providers)?;
     validate_actions(&config.actions)?;
-    validate_plugins(config)?;
+    validate_extensions(config)?;
+    validate_blobs(config)?;
 
     Ok(())
 }
@@ -192,14 +193,63 @@ fn validate_actions(config: &ActionsConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn validate_plugins(config: &OrchestralConfig) -> Result<(), ConfigError> {
-    for spec in &config.plugins.runtime {
+fn validate_extensions(config: &OrchestralConfig) -> Result<(), ConfigError> {
+    for spec in &config.extensions.runtime {
         if spec.name.trim().is_empty() {
             return Err(ConfigError::Invalid(
-                "plugins.runtime[].name must not be empty".to_string(),
+                "extensions.runtime[].name must not be empty".to_string(),
             ));
         }
     }
+    Ok(())
+}
+
+fn validate_blobs(config: &OrchestralConfig) -> Result<(), ConfigError> {
+    let mode = config.blobs.mode.trim().to_ascii_lowercase();
+    let write_to_s3 = config
+        .blobs
+        .hybrid
+        .write_to
+        .trim()
+        .eq_ignore_ascii_case("s3");
+    let needs_s3 = mode == "s3" || (mode == "hybrid" && write_to_s3);
+
+    if needs_s3 {
+        if config
+            .blobs
+            .s3
+            .bucket
+            .as_ref()
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true)
+        {
+            return Err(ConfigError::Invalid(
+                "blobs.s3.bucket must be set when blobs.mode is s3 or hybrid(write_to=s3)"
+                    .to_string(),
+            ));
+        }
+    }
+
+    let has_access_env = config
+        .blobs
+        .s3
+        .access_key_env
+        .as_ref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let has_secret_env = config
+        .blobs
+        .s3
+        .secret_key_env
+        .as_ref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    if has_access_env != has_secret_env {
+        return Err(ConfigError::Invalid(
+            "blobs.s3.access_key_env and blobs.s3.secret_key_env must be set together".to_string(),
+        ));
+    }
+
     Ok(())
 }
 
@@ -268,24 +318,52 @@ pub struct ConfigWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::RuntimePluginSpec;
+    use crate::RuntimeExtensionSpec;
+    use serde_yaml::from_str;
 
     #[test]
-    fn test_validate_config_accepts_default_plugins() {
+    fn test_validate_config_accepts_default_extensions() {
         let config = OrchestralConfig::default();
         assert!(validate_config(&config).is_ok());
     }
 
     #[test]
-    fn test_validate_config_rejects_empty_runtime_plugin_name() {
+    fn test_validate_config_rejects_empty_runtime_extension_name() {
         let mut config = OrchestralConfig::default();
-        config.plugins.runtime = vec![RuntimePluginSpec {
+        config.extensions.runtime = vec![RuntimeExtensionSpec {
             name: "".to_string(),
             enabled: true,
             targets: Vec::new(),
             options: serde_json::Value::Null,
         }];
 
+        assert!(matches!(
+            validate_config(&config),
+            Err(ConfigError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn test_extensions_alias_plugins_maps_to_runtime() {
+        let yaml = r#"
+version: 1
+app:
+  name: orchestral
+plugins:
+  runtime:
+    - name: custom_dummy
+      enabled: true
+"#;
+        let config: OrchestralConfig = from_str(yaml).expect("parse yaml");
+        assert_eq!(config.extensions.runtime.len(), 1);
+        assert_eq!(config.extensions.runtime[0].name, "custom_dummy");
+    }
+
+    #[test]
+    fn test_validate_config_rejects_s3_mode_without_bucket() {
+        let mut config = OrchestralConfig::default();
+        config.blobs.mode = "s3".to_string();
+        config.blobs.s3.bucket = None;
         assert!(matches!(
             validate_config(&config),
             Err(ConfigError::Invalid(_))

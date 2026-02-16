@@ -1,0 +1,16 @@
+[package]
+name = "orchestral-composition"
+description = "Application composition root for infra + runtime extensions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+orchestral-api = { workspace = true }
+orchestral-config = { workspace = true }
+orchestral-infra = { workspace = true }
+orchestral-extension-host = { workspace = true }
+orchestral-runtime = { workspace = true }
+orchestral-spi = { workspace = true }
+async-trait = { workspace = true }

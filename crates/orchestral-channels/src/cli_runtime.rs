@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use orchestral_api::{ApiService, InteractionSubmitResponse, RuntimeApi};
+use orchestral_composition::{ComposedRuntimeAppBuilder, RuntimeTarget};
 use orchestral_stores::Event;
 use tokio::sync::broadcast;
 
@@ -20,7 +21,9 @@ impl CliRuntime {
         config: PathBuf,
         thread_id_override: Option<String>,
     ) -> Result<Self, ChannelError> {
-        let api = Arc::new(RuntimeApi::from_config_path(config).await?);
+        let runtime_builder = Arc::new(ComposedRuntimeAppBuilder::new(RuntimeTarget::Cli));
+        let api =
+            Arc::new(RuntimeApi::from_config_path_with_builder(config, runtime_builder).await?);
         Self::from_api(api, thread_id_override).await
     }
 

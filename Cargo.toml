@@ -5,12 +5,15 @@ members = [
     "crates/orchestral-core",
     "crates/orchestral-config",
     "crates/orchestral-context",
-    "plugins/orchestral-plugin-host",
-    "plugins/orchestral-files",
+    "crates/orchestral-composition",
+    "extensions/orchestral-docs-assistant",
+    "extensions/orchestral-extension-host",
+    "adapters/orchestral-files",
+    "adapters/orchestral-infra",
     "crates/orchestral-planners",
     "crates/orchestral-runtime",
     "crates/orchestral-stores",
-    "plugins/orchestral-stores-backends",
+    "adapters/orchestral-stores-backends",
     "crates/orchestral-actions",
     "crates/orchestral-api",
     "crates/orchestral-channels",
@@ -59,13 +62,16 @@ bytes = "1"
 orchestral-core = { path = "crates/orchestral-core" }
 orchestral-config = { path = "crates/orchestral-config" }
 orchestral-context = { path = "crates/orchestral-context" }
-orchestral-plugin-host = { path = "plugins/orchestral-plugin-host" }
+orchestral-composition = { path = "crates/orchestral-composition" }
+orchestral-docs-assistant = { path = "extensions/orchestral-docs-assistant" }
+orchestral-extension-host = { path = "extensions/orchestral-extension-host" }
 orchestral-spi = { path = "crates/orchestral-spi" }
-orchestral-files = { path = "plugins/orchestral-files" }
+orchestral-files = { path = "adapters/orchestral-files" }
+orchestral-infra = { path = "adapters/orchestral-infra" }
 orchestral-planners = { path = "crates/orchestral-planners" }
 orchestral-runtime = { path = "crates/orchestral-runtime" }
 orchestral-stores = { path = "crates/orchestral-stores" }
-orchestral-stores-backends = { path = "plugins/orchestral-stores-backends" }
+orchestral-stores-backends = { path = "adapters/orchestral-stores-backends" }
 orchestral-actions = { path = "crates/orchestral-actions" }
 orchestral-api = { path = "crates/orchestral-api" }
 orchestral-channels = { path = "crates/orchestral-channels" }

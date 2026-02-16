@@ -1,22 +1,26 @@
 [package]
-name = "orchestral-plugin-host"
-description = "Plugin host that auto-wires runtime SPI extensions for CLI and server"
+name = "orchestral-infra"
+description = "Infrastructure component factory for stores/blob backends"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
-orchestral-api = { workspace = true }
 orchestral-config = { workspace = true }
 orchestral-core = { workspace = true }
-orchestral-files = { workspace = true }
-orchestral-runtime = { workspace = true }
 orchestral-spi = { workspace = true }
+orchestral-files = { workspace = true }
 orchestral-stores = { workspace = true }
 orchestral-stores-backends = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+aws-config = "1"
+aws-credential-types = "1"
+aws-sdk-s3 = "1"
+aws-types = "1"
 
 [dev-dependencies]
-serde_yaml = { workspace = true }
+tokio = { workspace = true }
