@@ -1,9 +1,9 @@
 use std::any::Any;
-use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use orchestral_actions::ActionFactory;
 use orchestral_config::{OrchestralConfig, RuntimeExtensionSpec};
 use orchestral_spi::{
     ComponentRegistry, HookError, RuntimeBuildRequest, RuntimeHook, RuntimeHookContext,
@@ -12,6 +12,10 @@ use orchestral_spi::{
 use serde::Deserialize;
 use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
+
+mod document_actions;
+
+pub use document_actions::DocsAssistantActionFactory;
 
 pub const EXTENSION_NAME: &str = "builtin.docs_assistant";
 pub const CATALOG_COMPONENT_KEY: &str = "docs_assistant.catalog";
@@ -271,6 +275,15 @@ impl DocsAssistantExtension {
         Ok(vec![Arc::new(DocsAssistantHook { sender, options })])
     }
 
+    pub async fn build_action_factories(
+        &self,
+        _request: &RuntimeBuildRequest,
+        _config: &OrchestralConfig,
+        _spec: &RuntimeExtensionSpec,
+    ) -> Result<Vec<Arc<dyn ActionFactory>>, SpiError> {
+        Ok(vec![Arc::new(DocsAssistantActionFactory::new())])
+    }
+
     #[cfg(test)]
     async fn stats(&self) -> IngestionStats {
         self.catalog().stats().await
@@ -460,14 +473,11 @@ struct ParsedDocument {
 }
 
 async fn parse_document(path: &str) -> Result<ParsedDocument, String> {
-    let bytes = tokio::fs::read(path)
+    let file_meta = tokio::fs::metadata(path)
         .await
-        .map_err(|err| format!("read source '{}' failed: {}", path, err))?;
-    let byte_size = bytes.len() as u64;
-    let content = match String::from_utf8(bytes.clone()) {
-        Ok(s) => s,
-        Err(_) => String::from_utf8_lossy(&bytes).to_string(),
-    };
+        .map_err(|err| format!("read source metadata '{}' failed: {}", path, err))?;
+    let byte_size = file_meta.len();
+    let (content, mime_type) = document_actions::parse_document_markdown(path, false).await?;
     let content = if content.trim().is_empty() {
         format!("(empty-or-binary) source={}", path)
     } else {
@@ -475,28 +485,9 @@ async fn parse_document(path: &str) -> Result<ParsedDocument, String> {
     };
     Ok(ParsedDocument {
         content,
-        mime_type: guess_mime_type(path),
+        mime_type,
         byte_size,
     })
-}
-
-fn guess_mime_type(path: &str) -> String {
-    match Path::new(path)
-        .extension()
-        .and_then(|v| v.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "md" | "markdown" => "text/markdown".to_string(),
-        "txt" => "text/plain".to_string(),
-        "html" | "htm" => "text/html".to_string(),
-        "pdf" => "application/pdf".to_string(),
-        "docx" => {
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document".to_string()
-        }
-        _ => "application/octet-stream".to_string(),
-    }
 }
 
 fn chunk_document(content: &str, max_chars: usize, overlap: usize) -> Vec<String> {

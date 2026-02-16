@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use orchestral_actions::{ActionBuildError, ActionFactory, ActionSpec, DefaultActionFactory};
 use orchestral_config::{ConfigError, OrchestralConfig, RuntimeExtensionSpec};
 use orchestral_docs_assistant::{DocsAssistantExtension, EXTENSION_NAME as DOCS_EXTENSION_NAME};
 use orchestral_spi::{
@@ -55,6 +56,15 @@ pub trait RuntimeExtension: Send + Sync {
         _config: &OrchestralConfig,
         _spec: &RuntimeExtensionSpec,
     ) -> Result<Vec<Arc<dyn RuntimeHook>>, SpiError> {
+        Ok(Vec::new())
+    }
+
+    async fn build_action_factories(
+        &self,
+        _request: &RuntimeBuildRequest,
+        _config: &OrchestralConfig,
+        _spec: &RuntimeExtensionSpec,
+    ) -> Result<Vec<Arc<dyn ActionFactory>>, SpiError> {
         Ok(Vec::new())
     }
 }
@@ -223,9 +233,36 @@ async fn build_hook_registry(
     Ok(registry)
 }
 
+async fn build_action_factory(
+    config_path: &Path,
+    target: RuntimeTarget,
+    config: &OrchestralConfig,
+    extensions: &[LoadedExtension],
+) -> Result<Arc<dyn ActionFactory>, ExtensionHostError> {
+    let request = RuntimeBuildRequest {
+        meta: SpiMeta::runtime_defaults(env!("CARGO_PKG_VERSION")),
+        config_path: config_path.to_string_lossy().to_string(),
+        profile: Some(target.as_config_value().to_string()),
+        options: serde_json::Map::new(),
+    };
+
+    let mut factories: Vec<Arc<dyn ActionFactory>> = Vec::new();
+    for loaded in extensions {
+        let mut extension_factories = loaded
+            .extension
+            .build_action_factories(&request, config, &loaded.spec)
+            .await?;
+        factories.append(&mut extension_factories);
+    }
+    factories.push(Arc::new(DefaultActionFactory::new()));
+
+    Ok(Arc::new(CompositeActionFactory { factories }))
+}
+
 pub struct ExtensionRuntimeBundle {
     pub component_factory: Arc<dyn RuntimeComponentFactory>,
     pub hook_registry: Arc<HookRegistry>,
+    pub action_factory: Arc<dyn ActionFactory>,
     pub loaded_extensions: Vec<String>,
 }
 
@@ -237,6 +274,7 @@ pub async fn build_extension_runtime_bundle(
 ) -> Result<ExtensionRuntimeBundle, ExtensionHostError> {
     let extensions = resolve_loaded_extensions(&config, target, catalog)?;
     let hook_registry = build_hook_registry(config_path, target, &config, &extensions).await?;
+    let action_factory = build_action_factory(config_path, target, &config, &extensions).await?;
     let loaded_extensions = extensions
         .iter()
         .map(|loaded| loaded.spec.name.clone())
@@ -244,8 +282,29 @@ pub async fn build_extension_runtime_bundle(
     Ok(ExtensionRuntimeBundle {
         component_factory: Arc::new(ExtensionComponentFactory { config, extensions }),
         hook_registry,
+        action_factory,
         loaded_extensions,
     })
+}
+
+struct CompositeActionFactory {
+    factories: Vec<Arc<dyn ActionFactory>>,
+}
+
+impl ActionFactory for CompositeActionFactory {
+    fn build(
+        &self,
+        spec: &ActionSpec,
+    ) -> Result<Arc<dyn orchestral_actions::Action>, ActionBuildError> {
+        for factory in &self.factories {
+            match factory.build(spec) {
+                Ok(action) => return Ok(action),
+                Err(ActionBuildError::UnknownKind(_)) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Err(ActionBuildError::UnknownKind(spec.kind.clone()))
+    }
 }
 
 struct DocsAssistantRuntimeExtension {
@@ -283,11 +342,23 @@ impl RuntimeExtension for DocsAssistantRuntimeExtension {
     ) -> Result<Vec<Arc<dyn RuntimeHook>>, SpiError> {
         self.inner.build_hooks(request, config, spec).await
     }
+
+    async fn build_action_factories(
+        &self,
+        request: &RuntimeBuildRequest,
+        config: &OrchestralConfig,
+        spec: &RuntimeExtensionSpec,
+    ) -> Result<Vec<Arc<dyn ActionFactory>>, SpiError> {
+        self.inner
+            .build_action_factories(request, config, spec)
+            .await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     struct DummyExtension;
 
@@ -349,6 +420,56 @@ mod tests {
             }
             Err(other) => panic!("unexpected error: {}", other),
             Ok(_) => panic!("expected ExtensionNotRegistered error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bundle_action_factory_combines_extension_and_default() {
+        let mut config = OrchestralConfig::default();
+        config.extensions.runtime = vec![RuntimeExtensionSpec {
+            name: "builtin.docs_assistant".to_string(),
+            enabled: true,
+            targets: vec!["cli".to_string()],
+            options: serde_json::Value::Null,
+        }];
+
+        let bundle = build_extension_runtime_bundle(
+            Arc::new(config),
+            Path::new("configs/orchestral.cli.yaml"),
+            RuntimeTarget::Cli,
+            &RuntimeExtensionCatalog::with_builtin_extensions(),
+        )
+        .await
+        .expect("build extension runtime bundle");
+
+        let doc_spec = ActionSpec {
+            name: "doc_parse".to_string(),
+            kind: "doc_parse".to_string(),
+            description: None,
+            config: serde_json::Value::Null,
+            interface: None,
+        };
+        assert!(bundle.action_factory.build(&doc_spec).is_ok());
+
+        let echo_spec = ActionSpec {
+            name: "echo".to_string(),
+            kind: "echo".to_string(),
+            description: None,
+            config: serde_json::Value::Null,
+            interface: None,
+        };
+        assert!(bundle.action_factory.build(&echo_spec).is_ok());
+
+        let unknown_spec = ActionSpec {
+            name: "unknown".to_string(),
+            kind: "unknown_kind".to_string(),
+            description: None,
+            config: serde_json::Value::Null,
+            interface: None,
+        };
+        match bundle.action_factory.build(&unknown_spec) {
+            Err(ActionBuildError::UnknownKind(kind)) => assert_eq!(kind, "unknown_kind"),
+            _ => panic!("expected unknown kind error"),
         }
     }
 }

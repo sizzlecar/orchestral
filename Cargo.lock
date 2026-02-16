@@ -4077,7 +4077,6 @@ name = "orchestral-actions"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "kreuzberg",
  "notify",
  "orchestral-config",
  "orchestral-core",
@@ -4201,7 +4200,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "kreuzberg",
+ "orchestral-actions",
  "orchestral-config",
+ "orchestral-core",
  "orchestral-spi",
  "serde",
  "serde_json",
@@ -4235,6 +4237,7 @@ name = "orchestral-extension-host"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "orchestral-actions",
  "orchestral-config",
  "orchestral-docs-assistant",
  "orchestral-spi",

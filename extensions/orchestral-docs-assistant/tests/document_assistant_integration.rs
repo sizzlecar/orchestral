@@ -5,9 +5,10 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use orchestral_actions::{ActionFactory, ActionInput, ActionSpec, DefaultActionFactory};
+use orchestral_actions::{ActionFactory, ActionInput, ActionSpec};
 use orchestral_core::action::ActionContext;
 use orchestral_core::store::{Reference, ReferenceStore, ReferenceType, StoreError, WorkingSet};
+use orchestral_docs_assistant::DocsAssistantActionFactory;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
@@ -57,7 +58,7 @@ fn action_spec(name: &str, kind: &str, config: Value) -> ActionSpec {
 }
 
 async fn run_action(spec: &ActionSpec, params: Value) -> Value {
-    let factory = DefaultActionFactory::new();
+    let factory = DocsAssistantActionFactory::new();
     let action = factory.build(spec).expect("build action");
     let result = action
         .run(ActionInput::with_params(params), test_ctx())

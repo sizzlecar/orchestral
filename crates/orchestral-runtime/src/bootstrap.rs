@@ -12,7 +12,7 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 
 use orchestral_actions::{
-    ActionConfigError, ActionRegistryManager, ActionWatcher, DefaultActionFactory,
+    ActionConfigError, ActionFactory, ActionRegistryManager, ActionWatcher, DefaultActionFactory,
 };
 use orchestral_config::{
     ConfigError, ConfigManager, ObservabilityConfig, OrchestralConfig, StoreSpec,
@@ -107,10 +107,12 @@ impl RuntimeComponentFactory for DefaultRuntimeComponentFactory {
 impl RuntimeApp {
     /// Create a runnable app from a single `orchestral.yaml`.
     pub async fn from_config_path(path: impl Into<PathBuf>) -> Result<Self, BootstrapError> {
+        let action_factory: Arc<dyn ActionFactory> = Arc::new(DefaultActionFactory::new());
         Self::from_config_path_with_spi(
             path,
             Arc::new(DefaultRuntimeComponentFactory),
             Arc::new(HookRegistry::new()),
+            action_factory,
         )
         .await
     }
@@ -120,8 +122,14 @@ impl RuntimeApp {
         path: impl Into<PathBuf>,
         component_factory: Arc<dyn RuntimeComponentFactory>,
     ) -> Result<Self, BootstrapError> {
-        Self::from_config_path_with_spi(path, component_factory, Arc::new(HookRegistry::new()))
-            .await
+        let action_factory: Arc<dyn ActionFactory> = Arc::new(DefaultActionFactory::new());
+        Self::from_config_path_with_spi(
+            path,
+            component_factory,
+            Arc::new(HookRegistry::new()),
+            action_factory,
+        )
+        .await
     }
 
     /// Create a runnable app and inject component factory + hook registry.
@@ -129,6 +137,7 @@ impl RuntimeApp {
         path: impl Into<PathBuf>,
         component_factory: Arc<dyn RuntimeComponentFactory>,
         hook_registry: Arc<HookRegistry>,
+        action_factory: Arc<dyn ActionFactory>,
     ) -> Result<Self, BootstrapError> {
         let path = path.into();
         let config_manager = Arc::new(ConfigManager::new(path.clone()));
@@ -170,7 +179,6 @@ impl RuntimeApp {
             runtime_cfg,
         );
 
-        let action_factory = Arc::new(DefaultActionFactory::new());
         let action_registry_manager = Arc::new(ActionRegistryManager::new(path, action_factory));
         action_registry_manager.load().await?;
         let action_watcher = if config.actions.hot_reload {

@@ -73,6 +73,7 @@ impl RuntimeAppBuilder for ComposedRuntimeAppBuilder {
             config_path,
             component_factory,
             extension_bundle.hook_registry,
+            extension_bundle.action_factory,
         )
         .await
         .map_err(|err| ApiError::Internal(format!("build runtime app failed: {}", err)))

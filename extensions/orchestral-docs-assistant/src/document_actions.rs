@@ -1,17 +1,19 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use kreuzberg::{extract_file, ExtractionConfig, OutputFormat, PageConfig};
+use orchestral_actions::{
+    Action, ActionBuildError, ActionContext, ActionFactory, ActionInput, ActionInterfaceSpec,
+    ActionMeta, ActionResult, ActionSpec,
+};
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
-
-use orchestral_config::ActionSpec;
-use orchestral_core::action::{Action, ActionContext, ActionInput, ActionMeta, ActionResult};
 
 /// Build built-in document actions.
 pub fn build_document_action(spec: &ActionSpec) -> Option<Box<dyn Action>> {
@@ -24,6 +26,76 @@ pub fn build_document_action(spec: &ActionSpec) -> Option<Box<dyn Action>> {
         "doc_merge" => Some(Box::new(DocMergeAction::from_spec(spec))),
         _ => None,
     }
+}
+
+/// Extension factory for document assistant actions.
+pub struct DocsAssistantActionFactory;
+
+impl DocsAssistantActionFactory {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for DocsAssistantActionFactory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ActionFactory for DocsAssistantActionFactory {
+    fn build(&self, spec: &ActionSpec) -> Result<Arc<dyn Action>, ActionBuildError> {
+        let action = build_document_action(spec)
+            .ok_or_else(|| ActionBuildError::UnknownKind(spec.kind.clone()))?;
+        let action: Arc<dyn Action> = Arc::from(action);
+        Ok(Arc::new(ConfiguredAction::new(action, spec)))
+    }
+}
+
+struct ConfiguredAction {
+    inner: Arc<dyn Action>,
+    metadata: ActionMeta,
+}
+
+impl ConfiguredAction {
+    fn new(inner: Arc<dyn Action>, spec: &ActionSpec) -> Self {
+        let metadata = merge_action_metadata(inner.metadata(), spec.interface.as_ref());
+        Self { inner, metadata }
+    }
+}
+
+#[async_trait]
+impl Action for ConfiguredAction {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+
+    fn metadata(&self) -> ActionMeta {
+        self.metadata.clone()
+    }
+
+    async fn run(&self, input: ActionInput, ctx: ActionContext) -> ActionResult {
+        self.inner.run(input, ctx).await
+    }
+}
+
+fn merge_action_metadata(base: ActionMeta, interface: Option<&ActionInterfaceSpec>) -> ActionMeta {
+    let Some(interface) = interface else {
+        return base;
+    };
+
+    let mut merged = base;
+    if !interface.input_schema.is_null() {
+        merged.input_schema = interface.input_schema.clone();
+    }
+    if !interface.output_schema.is_null() {
+        merged.output_schema = interface.output_schema.clone();
+    }
+    merged
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +217,14 @@ async fn parse_document_with_kreuzberg(
         tables_markdown,
         page_count: result.pages.as_ref().map(Vec::len),
     })
+}
+
+pub(crate) async fn parse_document_markdown(
+    source_path: &str,
+    extract_pages: bool,
+) -> Result<(String, String), String> {
+    let parsed = parse_document_with_kreuzberg(source_path, extract_pages).await?;
+    Ok((parsed.markdown, parsed.mime_type))
 }
 
 fn parse_headings(markdown: &str) -> Vec<Value> {
