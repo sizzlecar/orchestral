@@ -4,7 +4,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use kreuzberg::{extract_file_sync, ExtractionConfig, OutputFormat, PageConfig};
+use kreuzberg::{extract_file, ExtractionConfig, OutputFormat, PageConfig};
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -107,7 +107,7 @@ fn is_markdown_format(format: &str) -> bool {
         || normalized == "gfm-raw_html"
 }
 
-fn parse_document_with_kreuzberg(
+async fn parse_document_with_kreuzberg(
     source_path: &str,
     extract_pages: bool,
 ) -> Result<ParsedDocument, String> {
@@ -126,7 +126,8 @@ fn parse_document_with_kreuzberg(
         });
     }
 
-    let result = extract_file_sync(path, None, &config)
+    let result = extract_file(path, None, &config)
+        .await
         .map_err(|err| format!("kreuzberg extraction failed for '{}': {}", source_path, err))?;
 
     let metadata = serde_json::to_value(&result.metadata).unwrap_or(Value::Null);
@@ -416,7 +417,7 @@ async fn run_pandoc_from_markdown(
     })
 }
 
-fn doc_input_markdown_or_parse(
+async fn doc_input_markdown_or_parse(
     params: &Value,
     extract_pages: bool,
 ) -> Result<(Option<String>, String), String> {
@@ -429,7 +430,7 @@ fn doc_input_markdown_or_parse(
     let source_path = params_get_string(params, "source_path")
         .filter(|v| !v.is_empty())
         .ok_or_else(|| "requires params.source_path or params.markdown".to_string())?;
-    let parsed = parse_document_with_kreuzberg(&source_path, extract_pages)?;
+    let parsed = parse_document_with_kreuzberg(&source_path, extract_pages).await?;
     Ok((Some(parsed.source_path), parsed.markdown))
 }
 
@@ -497,7 +498,7 @@ impl Action for DocParseAction {
 
         let extract_pages =
             params_get_bool(params, "extract_pages").unwrap_or(self.default_extract_pages);
-        let parsed = match parse_document_with_kreuzberg(&source_path, extract_pages) {
+        let parsed = match parse_document_with_kreuzberg(&source_path, extract_pages).await {
             Ok(parsed) => parsed,
             Err(err) => return ActionResult::error(err),
         };
@@ -599,7 +600,7 @@ impl Action for DocConvertAction {
         let markdown = if let Some(markdown) = markdown_input {
             markdown
         } else if let Some(path) = source_path.as_ref() {
-            match parse_document_with_kreuzberg(path, false) {
+            match parse_document_with_kreuzberg(path, false).await {
                 Ok(parsed) => parsed.markdown,
                 Err(err) => return ActionResult::error(err),
             }
@@ -686,7 +687,7 @@ impl Action for DocSummarizeAction {
 
     async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
         let params = &input.params;
-        let (source_path, markdown) = match doc_input_markdown_or_parse(params, false) {
+        let (source_path, markdown) = match doc_input_markdown_or_parse(params, false).await {
             Ok(v) => v,
             Err(err) => return ActionResult::error(format!("doc_summarize {}", err)),
         };
@@ -931,7 +932,7 @@ impl Action for DocQaAction {
             .unwrap_or(self.default_top_k)
             .max(1);
 
-        let (source_path, markdown) = match doc_input_markdown_or_parse(params, false) {
+        let (source_path, markdown) = match doc_input_markdown_or_parse(params, false).await {
             Ok(v) => v,
             Err(err) => return ActionResult::error(format!("doc_qa {}", err)),
         };
@@ -1019,7 +1020,7 @@ impl Action for DocMergeAction {
 
         let mut chunks = Vec::new();
         for path in &source_paths {
-            let parsed = match parse_document_with_kreuzberg(path, false) {
+            let parsed = match parse_document_with_kreuzberg(path, false).await {
                 Ok(parsed) => parsed,
                 Err(err) => return ActionResult::error(err),
             };
