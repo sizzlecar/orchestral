@@ -155,7 +155,7 @@ let builder = ComposedRuntimeAppBuilder::with_extension_catalog(RuntimeTarget::S
 
 - Parser pipeline is standardized as `source -> kreuzberg markdown -> downstream`.
 - Conversion still uses `pandoc`, but conversion input is always the markdown emitted by `kreuzberg`.
-- Document capabilities are split into dedicated built-in action kinds:
+- Document capabilities are provided by runtime extension `builtin.docs_assistant` and split into dedicated action kinds:
   - `doc_parse`: parse document to normalized markdown + metadata
   - `doc_convert`: convert with pandoc from markdown intermediate
   - `doc_summarize`: summary/outline/overview generation

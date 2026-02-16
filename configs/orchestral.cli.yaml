@@ -40,14 +40,18 @@ ingestion:
 extensions:
   # Backward-compatible alias: you may use `plugins:` with the same structure.
   runtime:
-    # Optional docs ingestion extension (async parse/chunk/embed pipeline).
-    # - name: builtin.docs_assistant
-    #   enabled: true
-    #   targets: ["cli", "server"]
-    #   options:
-    #     max_chunk_chars: 900
-    #     chunk_overlap: 120
-    #     embedding_dim: 24
+    - name: builtin.docs_assistant
+      enabled: true
+      targets: ["cli", "server"]
+      options:
+        max_chunk_chars: 900
+        chunk_overlap: 120
+        embedding_dim: 24
+        action_allowlist:
+          - doc_parse
+          - doc_convert
+          - doc_generate
+          - doc_merge
 
 stores:
   # For quick local testing in a single process.
