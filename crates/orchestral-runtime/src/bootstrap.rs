@@ -42,8 +42,7 @@ use crate::interpreter::{LlmResultInterpreter, LlmResultInterpreterConfig};
 use crate::orchestrator::OrchestratorConfig;
 use crate::{
     ConcurrencyPolicy, DefaultConcurrencyPolicy, Orchestrator, ParallelConcurrencyPolicy,
-    QueueConcurrencyPolicy, RejectWhenBusyConcurrencyPolicy, Thread, ThreadRuntime,
-    ThreadRuntimeConfig,
+    RejectWhenBusyConcurrencyPolicy, Thread, ThreadRuntime, ThreadRuntimeConfig,
 };
 
 /// Runtime bootstrap errors.
@@ -499,7 +498,9 @@ fn concurrency_policy_from_name(
 ) -> Result<Arc<dyn ConcurrencyPolicy>, BootstrapError> {
     match policy {
         "interrupt_and_start_new" | "interrupt" => Ok(Arc::new(DefaultConcurrencyPolicy)),
-        "queue" => Ok(Arc::new(QueueConcurrencyPolicy)),
+        "queue" => Err(BootstrapError::UnsupportedConcurrencyPolicy(
+            "queue (not implemented; use interrupt/parallel/reject)".to_string(),
+        )),
         "parallel" => Ok(Arc::new(ParallelConcurrencyPolicy::default())),
         "reject" | "reject_when_busy" => Ok(Arc::new(RejectWhenBusyConcurrencyPolicy)),
         other => Err(BootstrapError::UnsupportedConcurrencyPolicy(
@@ -863,5 +864,19 @@ mod tests {
 
         assert!(options.get("stores").is_some());
         assert!(options.get("blobs").is_some());
+    }
+
+    #[test]
+    fn test_queue_concurrency_policy_is_rejected_in_bootstrap() {
+        let err = match concurrency_policy_from_name("queue") {
+            Ok(_) => panic!("queue should be unsupported"),
+            Err(err) => err,
+        };
+        match err {
+            BootstrapError::UnsupportedConcurrencyPolicy(message) => {
+                assert!(message.contains("not implemented"));
+            }
+            other => panic!("expected UnsupportedConcurrencyPolicy, got {}", other),
+        }
     }
 }

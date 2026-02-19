@@ -163,10 +163,12 @@ let builder = ComposedRuntimeAppBuilder::with_extension_catalog(RuntimeTarget::S
   - `doc_qa`: document QA with evidence snippets
   - `doc_merge`: merge multi-source docs with optional format conversion
 - Runtime config reference: `configs/orchestral.cli.yaml`.
+- Docs ingestion placeholder embeddings are disabled by default (`enable_placeholder_embeddings: false`).
 
 ### Document Runtime Dependencies
 
 - `pandoc` must be installed and available in `PATH`.
+- PDF parsing is optional and disabled by default in the docs extension. To enable it, build with `--features orchestral-docs-assistant/pdf`.
 - When `kreuzberg` is built with `pdf` support, PDFium is required at build time:
   - either allow network download of prebuilt PDFium binaries, or
   - set `KREUZBERG_PDFIUM_PREBUILT` to a local PDFium directory.
@@ -177,6 +179,8 @@ let builder = ComposedRuntimeAppBuilder::with_extension_catalog(RuntimeTarget::S
 - No web updates: ensure server is running and SSE endpoint is reachable.
 - Empty/failed runs: check runtime logs at `logs/orchestral-runtime.log`.
 - PDF-related build failures: verify PDFium availability (`KREUZBERG_PDFIUM_PREBUILT`) or network access for `kreuzberg` prebuilt download.
+- Runtime extension actions (`doc_*`) require composition builder wiring (`ComposedRuntimeAppBuilder`). `RuntimeApi::from_config_path` is minimal-runtime only.
+- `runtime.concurrency_policy=queue` is intentionally unsupported in bootstrap (use `interrupt`, `parallel`, or `reject`).
 
 ## License
 

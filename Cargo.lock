@@ -3119,7 +3119,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3283,7 +3283,7 @@ dependencies = [
  "console_error_panic_hook",
  "console_log",
  "image",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "js-sys",
  "libloading",
  "log",
@@ -4097,6 +4097,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "orchestral-config",
  "orchestral-runtime",
  "orchestral-stores",
  "serde",

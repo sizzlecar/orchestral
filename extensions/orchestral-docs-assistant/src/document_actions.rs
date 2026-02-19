@@ -188,8 +188,10 @@ async fn parse_document_with_kreuzberg(
         return Err(format!("source file not found: {}", source_path));
     }
 
-    let mut config = ExtractionConfig::default();
-    config.output_format = OutputFormat::Markdown;
+    let mut config = ExtractionConfig {
+        output_format: OutputFormat::Markdown,
+        ..ExtractionConfig::default()
+    };
     if extract_pages {
         config.pages = Some(PageConfig {
             extract_pages: true,
@@ -1110,7 +1112,7 @@ impl Action for DocMergeAction {
                 chunks.push(parsed.markdown);
             }
         }
-        chunks.extend(inline_markdowns.into_iter());
+        chunks.extend(inline_markdowns);
 
         let merged_markdown = chunks.join(&separator);
         let to_format = params_get_string(params, "to_format")

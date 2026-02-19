@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -7,6 +7,7 @@ use serde_json::json;
 use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
 
+use orchestral_config::load_config;
 use orchestral_runtime::{OrchestratorResult, RuntimeApp};
 use orchestral_stores::Event;
 
@@ -25,10 +26,28 @@ struct DefaultRuntimeAppBuilder;
 #[async_trait]
 impl RuntimeAppBuilder for DefaultRuntimeAppBuilder {
     async fn build(&self, config_path: PathBuf) -> Result<RuntimeApp, ApiError> {
+        if config_has_enabled_runtime_extensions(&config_path)? {
+            return Err(ApiError::InvalidArgument(
+                "config enables runtime extensions; use RuntimeApi::from_config_path_with_builder \
+                 with orchestral-composition::ComposedRuntimeAppBuilder"
+                    .to_string(),
+            ));
+        }
         RuntimeApp::from_config_path(config_path)
             .await
             .map_err(|err| ApiError::Internal(format!("build runtime app failed: {}", err)))
     }
+}
+
+fn config_has_enabled_runtime_extensions(config_path: &Path) -> Result<bool, ApiError> {
+    let config = load_config(config_path).map_err(|err| {
+        ApiError::InvalidArgument(format!(
+            "load config '{}' failed: {}",
+            config_path.display(),
+            err
+        ))
+    })?;
+    Ok(config.extensions.runtime.iter().any(|spec| spec.enabled))
 }
 
 #[derive(Clone)]
@@ -309,6 +328,14 @@ mod tests {
             .expect("config path")
     }
 
+    fn sample_cli_config_path() -> PathBuf {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        manifest_dir
+            .join("../../configs/orchestral.cli.yaml")
+            .canonicalize()
+            .expect("cli config path")
+    }
+
     #[tokio::test]
     async fn test_runtime_api_uses_injected_builder() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -325,5 +352,24 @@ mod tests {
             .expect("create thread");
         assert_eq!(thread.id, "thread-with-builder");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_default_builder_rejects_extension_config() {
+        let api = RuntimeApi::from_config_path(sample_cli_config_path())
+            .await
+            .expect("api");
+
+        let err = api
+            .create_thread(Some("thread-default-builder".to_string()))
+            .await
+            .expect_err("expected extension config rejection");
+
+        match err {
+            ApiError::InvalidArgument(message) => {
+                assert!(message.contains("runtime extensions"));
+            }
+            other => panic!("expected invalid argument, got {}", other),
+        }
     }
 }

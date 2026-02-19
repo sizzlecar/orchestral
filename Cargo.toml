@@ -59,7 +59,6 @@ futures-util = "0.3"
 bytes = "1"
 kreuzberg = { version = "4.2.0", default-features = false, features = [
     "tokio-runtime",
-    "pdf",
     "office",
     "excel",
     "email",

@@ -66,6 +66,8 @@ pub struct DocsAssistantOptions {
     #[serde(default = "default_embedding_dim")]
     pub embedding_dim: usize,
     #[serde(default)]
+    pub enable_placeholder_embeddings: bool,
+    #[serde(default)]
     pub action_allowlist: Vec<String>,
     #[serde(default = "default_path_suffix_allowlist")]
     pub path_suffix_allowlist: Vec<String>,
@@ -105,6 +107,7 @@ impl Default for DocsAssistantOptions {
             max_chunk_chars: default_max_chunk_chars(),
             chunk_overlap: default_chunk_overlap(),
             embedding_dim: default_embedding_dim(),
+            enable_placeholder_embeddings: false,
             action_allowlist: Vec::new(),
             path_suffix_allowlist: default_path_suffix_allowlist(),
         }
@@ -452,15 +455,17 @@ async fn process_job(
             })
             .await;
 
-        catalog
-            .save_embedding(DocEmbeddingRecord {
-                embedding_id: Uuid::new_v4().to_string(),
-                chunk_id,
-                model: "placeholder-hash-v1".to_string(),
-                vector: placeholder_embed(&content, options.embedding_dim),
-                created_at: Utc::now(),
-            })
-            .await;
+        if options.enable_placeholder_embeddings {
+            catalog
+                .save_embedding(DocEmbeddingRecord {
+                    embedding_id: Uuid::new_v4().to_string(),
+                    chunk_id,
+                    model: "placeholder-hash-v1".to_string(),
+                    vector: placeholder_embed(&content, options.embedding_dim),
+                    created_at: Utc::now(),
+                })
+                .await;
+        }
     }
 
     Ok(())
@@ -602,7 +607,8 @@ mod tests {
                 &test_spec(serde_json::json!({
                     "max_chunk_chars": 10,
                     "chunk_overlap": 2,
-                    "embedding_dim": 8
+                    "embedding_dim": 8,
+                    "enable_placeholder_embeddings": true
                 })),
             )
             .await

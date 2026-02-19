@@ -47,6 +47,7 @@ extensions:
         max_chunk_chars: 900
         chunk_overlap: 120
         embedding_dim: 24
+        enable_placeholder_embeddings: false
         action_allowlist:
           - doc_parse
           - doc_convert
@@ -234,7 +235,7 @@ actions:
           properties:
             source_path:
               type: string
-              description: "Local document path to parse (pdf/docx/pptx/xlsx/html/xml/email/archive/text...)."
+              description: "Local document path to parse (docx/pptx/xlsx/html/xml/email/archive/text; pdf requires docs extension built with `pdf` feature)."
               example: "docs/spec.pdf"
             extract_pages:
               type: boolean

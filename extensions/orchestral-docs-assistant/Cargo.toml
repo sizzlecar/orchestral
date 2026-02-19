@@ -6,6 +6,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+pdf = ["kreuzberg/pdf"]
+
 [dependencies]
 orchestral-actions = { workspace = true }
 orchestral-config = { workspace = true }

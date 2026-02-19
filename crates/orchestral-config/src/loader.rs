@@ -214,20 +214,19 @@ fn validate_blobs(config: &OrchestralConfig) -> Result<(), ConfigError> {
         .eq_ignore_ascii_case("s3");
     let needs_s3 = mode == "s3" || (mode == "hybrid" && write_to_s3);
 
-    if needs_s3 {
-        if config
+    if needs_s3
+        && config
             .blobs
             .s3
             .bucket
             .as_ref()
             .map(|s| s.trim().is_empty())
             .unwrap_or(true)
-        {
-            return Err(ConfigError::Invalid(
-                "blobs.s3.bucket must be set when blobs.mode is s3 or hybrid(write_to=s3)"
-                    .to_string(),
-            ));
-        }
+    {
+        return Err(ConfigError::Invalid(
+            "blobs.s3.bucket must be set when blobs.mode is s3 or hybrid(write_to=s3)"
+                .to_string(),
+        ));
     }
 
     let has_access_env = config
