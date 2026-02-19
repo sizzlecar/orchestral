@@ -23,8 +23,10 @@ use orchestral_spi::{
 use orchestral_stores::{InMemoryEventStore, InMemoryReferenceStore, InMemoryTaskStore};
 use orchestral_stores_backends::{
     PostgresEventStore, PostgresReferenceStore, PostgresTaskStore, RedisEventStore,
-    RedisReferenceStore, RedisTaskStore,
+    RedisReferenceStore, RedisTaskStore, SqliteEventStore, SqliteReferenceStore, SqliteTaskStore,
 };
+
+const DEFAULT_SQLITE_STORES_URL: &str = "sqlite://orchestral-runtime.db";
 
 #[derive(Debug, Clone, Default)]
 pub struct InfraFactoryOptions {
@@ -109,6 +111,20 @@ async fn build_event_store(
                 .map_err(|err| SpiError::Internal(err.to_string()))?;
             Ok(Arc::new(store))
         }
+        "sqlite" => {
+            let url = spec
+                .connection_url
+                .as_deref()
+                .unwrap_or(DEFAULT_SQLITE_STORES_URL);
+            let prefix = spec
+                .key_prefix
+                .clone()
+                .unwrap_or_else(|| "orchestral".to_string());
+            let store = SqliteEventStore::new(url, prefix)
+                .await
+                .map_err(|err| SpiError::Internal(err.to_string()))?;
+            Ok(Arc::new(store))
+        }
         backend => Err(SpiError::UnsupportedBackend {
             component: "event_store".to_string(),
             backend: backend.to_string(),
@@ -140,6 +156,20 @@ async fn build_task_store(
                 .clone()
                 .unwrap_or_else(|| "orchestral".to_string());
             let store = PostgresTaskStore::new(url, prefix)
+                .await
+                .map_err(|err| SpiError::Internal(err.to_string()))?;
+            Ok(Arc::new(store))
+        }
+        "sqlite" => {
+            let url = spec
+                .connection_url
+                .as_deref()
+                .unwrap_or(DEFAULT_SQLITE_STORES_URL);
+            let prefix = spec
+                .key_prefix
+                .clone()
+                .unwrap_or_else(|| "orchestral".to_string());
+            let store = SqliteTaskStore::new(url, prefix)
                 .await
                 .map_err(|err| SpiError::Internal(err.to_string()))?;
             Ok(Arc::new(store))
@@ -181,6 +211,34 @@ async fn build_reference_store(
                 .clone()
                 .unwrap_or_else(|| "orchestral".to_string());
             let store = PostgresReferenceStore::new(url, prefix)
+                .await
+                .map_err(|err| SpiError::Internal(err.to_string()))?;
+            Ok(Arc::new(store))
+        }
+        "sqlite" => {
+            let url = spec
+                .connection_url
+                .as_deref()
+                .unwrap_or(DEFAULT_SQLITE_STORES_URL);
+            let prefix = spec
+                .key_prefix
+                .clone()
+                .unwrap_or_else(|| "orchestral".to_string());
+            let store = SqliteReferenceStore::new(url, prefix)
+                .await
+                .map_err(|err| SpiError::Internal(err.to_string()))?;
+            Ok(Arc::new(store))
+        }
+        "sqlite_vector" | "sqlite-vector" => {
+            let url = spec
+                .connection_url
+                .as_deref()
+                .unwrap_or(DEFAULT_SQLITE_STORES_URL);
+            let prefix = spec
+                .key_prefix
+                .clone()
+                .unwrap_or_else(|| "orchestral".to_string());
+            let store = SqliteReferenceStore::new_vector(url, prefix)
                 .await
                 .map_err(|err| SpiError::Internal(err.to_string()))?;
             Ok(Arc::new(store))
@@ -469,8 +527,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_infra_factory_skip_blob() {
+        let mut config = OrchestralConfig::default();
+        config.stores.event.backend = "in_memory".to_string();
+        config.stores.task.backend = "in_memory".to_string();
+        config.stores.reference.backend = "in_memory".to_string();
         let factory = InfraComponentFactory::with_options(
-            Arc::new(OrchestralConfig::default()),
+            Arc::new(config),
             InfraFactoryOptions { skip_blob: true },
         );
         let components = factory

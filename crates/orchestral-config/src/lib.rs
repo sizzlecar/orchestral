@@ -307,19 +307,45 @@ fn default_ingestion_max_file_size_mb() -> usize {
     30
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct StoresConfig {
-    #[serde(default)]
+    #[serde(default = "default_event_store_spec")]
     pub event: StoreSpec,
-    #[serde(default)]
+    #[serde(default = "default_task_store_spec")]
     pub task: StoreSpec,
-    #[serde(default)]
+    #[serde(default = "default_reference_store_spec")]
     pub reference: StoreSpec,
+}
+
+impl Default for StoresConfig {
+    fn default() -> Self {
+        Self {
+            event: default_event_store_spec(),
+            task: default_task_store_spec(),
+            reference: default_reference_store_spec(),
+        }
+    }
+}
+
+fn default_event_store_spec() -> StoreSpec {
+    StoreSpec::default()
+}
+
+fn default_task_store_spec() -> StoreSpec {
+    StoreSpec::default()
+}
+
+fn default_reference_store_spec() -> StoreSpec {
+    StoreSpec {
+        backend: default_reference_backend(),
+        connection_url: None,
+        key_prefix: None,
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct StoreSpec {
-    #[serde(default = "default_backend")]
+    #[serde(default = "default_store_backend")]
     pub backend: String,
     #[serde(default)]
     pub connection_url: Option<String>,
@@ -331,7 +357,7 @@ pub struct StoreSpec {
 impl Default for StoreSpec {
     fn default() -> Self {
         Self {
-            backend: default_backend(),
+            backend: default_store_backend(),
             connection_url: None,
             key_prefix: None,
         }
@@ -424,7 +450,7 @@ fn default_hybrid_write_to() -> String {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BlobCatalogConfig {
-    #[serde(default = "default_backend")]
+    #[serde(default = "default_blob_catalog_backend")]
     pub backend: String,
     #[serde(default)]
     pub connection_url: Option<String>,
@@ -435,7 +461,7 @@ pub struct BlobCatalogConfig {
 impl Default for BlobCatalogConfig {
     fn default() -> Self {
         Self {
-            backend: default_backend(),
+            backend: default_blob_catalog_backend(),
             connection_url: None,
             table_prefix: default_file_catalog_table_prefix(),
         }
@@ -446,7 +472,15 @@ fn default_file_catalog_table_prefix() -> String {
     "orchestral".to_string()
 }
 
-fn default_backend() -> String {
+fn default_store_backend() -> String {
+    "sqlite".to_string()
+}
+
+fn default_reference_backend() -> String {
+    "sqlite_vector".to_string()
+}
+
+fn default_blob_catalog_backend() -> String {
     "in_memory".to_string()
 }
 

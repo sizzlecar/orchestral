@@ -55,24 +55,33 @@ extensions:
           - doc_merge
 
 stores:
-  # For quick local testing in a single process.
-  # If you need durable persistence, switch backend to postgres and add connection_url.
-  # Example:
-  # event:
-  #   backend: postgres
-  #   connection_url: "postgres://postgres:postgres@127.0.0.1:5432/orchestral"
-  #   key_prefix: "orchestral"   # table prefix
+  # Default local persistence:
+  # event/task use sqlite, reference uses sqlite_vector with local vector index.
+  # backend: sqlite | sqlite_vector | postgres | redis | in_memory
+  # SQLite example:
+  # connection_url: "sqlite://orchestral-runtime.db"
+  # key_prefix: "orchestral"   # table prefix
+  # Postgres example:
+  # backend: postgres
+  # connection_url: "postgres://postgres:postgres@127.0.0.1:5432/orchestral"
+  # key_prefix: "orchestral"
   # Redis example:
   # event:
   #   backend: redis
   #   connection_url: "redis://127.0.0.1:6379"
   #   key_prefix: "orchestral:event"
   event:
-    backend: in_memory
+    backend: sqlite
+    connection_url: "sqlite://orchestral-runtime.db"
+    key_prefix: "orchestral"
   task:
-    backend: in_memory
+    backend: sqlite
+    connection_url: "sqlite://orchestral-runtime.db"
+    key_prefix: "orchestral"
   reference:
-    backend: in_memory
+    backend: sqlite_vector
+    connection_url: "sqlite://orchestral-runtime.db"
+    key_prefix: "orchestral"
 
 blobs:
   mode: local

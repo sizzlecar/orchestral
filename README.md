@@ -148,8 +148,10 @@ let builder = ComposedRuntimeAppBuilder::with_extension_catalog(RuntimeTarget::S
 - Infra selection is **not** done via runtime extensions:
   - stores are configured by `stores.*.backend`
   - blob storage is configured by `blobs.*`
-  - supported backends include `in_memory | redis | postgres` for stores and
+  - supported backends include `sqlite | sqlite_vector | in_memory | redis | postgres` for stores and
     `local | s3 | hybrid` for blobs.
+  - default store profile is local sqlite (`event/task=sqlite`, `reference=sqlite_vector`).
+  - `sqlite_vector` reads vectors from `reference.metadata.embedding_vector` (or `metadata.vector`) as `f32[]`.
 
 ## Document Assistant Actions (Rust SDK)
 
@@ -184,4 +186,4 @@ let builder = ComposedRuntimeAppBuilder::with_extension_catalog(RuntimeTarget::S
 
 ## License
 
-See repository license information.
+MIT. See `LICENSE`.

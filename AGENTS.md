@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- Workspace root: `Cargo.toml`, `Cargo.lock`, `readme.md`.
+- Workspace root: `Cargo.toml`, `Cargo.lock`, `README.md`.
 - Core crates are under `crates/`:
   - `crates/orchestral-core/` — deterministic abstractions (Intent/Plan/Step/Task), planner/normalizer/executor.
   - `crates/orchestral-runtime/` — Thread/Interaction model, concurrency policies, runtime orchestration.

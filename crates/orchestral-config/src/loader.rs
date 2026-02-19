@@ -224,8 +224,7 @@ fn validate_blobs(config: &OrchestralConfig) -> Result<(), ConfigError> {
             .unwrap_or(true)
     {
         return Err(ConfigError::Invalid(
-            "blobs.s3.bucket must be set when blobs.mode is s3 or hybrid(write_to=s3)"
-                .to_string(),
+            "blobs.s3.bucket must be set when blobs.mode is s3 or hybrid(write_to=s3)".to_string(),
         ));
     }
 

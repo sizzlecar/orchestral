@@ -46,21 +46,32 @@ extensions:
     #     embedding_dim: 24
 
 stores:
-  # Production recommendation:
-  # event/task/reference all use postgres with same connection_url.
+  # Default local persistence:
+  # event/task use sqlite, reference uses sqlite_vector with local vector index.
+  # backend: sqlite | sqlite_vector | postgres | redis | in_memory
+  # SQLite example:
+  # connection_url: "sqlite://orchestral-runtime.db"
+  # key_prefix: "orchestral"   # table prefix
+  # Postgres example:
   # backend: postgres | postgresql | pgsql
   # connection_url: "postgres://postgres:postgres@127.0.0.1:5432/orchestral"
-  # key_prefix: "orchestral"   # table prefix
+  # key_prefix: "orchestral"
   # Redis example:
   # backend: redis
   # connection_url: "redis://127.0.0.1:6379"
   # key_prefix: "orchestral:event"
   event:
-    backend: in_memory
+    backend: sqlite
+    connection_url: "sqlite://orchestral-runtime.db"
+    key_prefix: "orchestral"
   task:
-    backend: in_memory
+    backend: sqlite
+    connection_url: "sqlite://orchestral-runtime.db"
+    key_prefix: "orchestral"
   reference:
-    backend: in_memory
+    backend: sqlite_vector
+    connection_url: "sqlite://orchestral-runtime.db"
+    key_prefix: "orchestral"
 
 blobs:
   # mode: local | s3 | hybrid
