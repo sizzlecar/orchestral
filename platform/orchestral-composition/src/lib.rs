@@ -3,12 +3,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use orchestral_api::{ApiError, RuntimeAppBuilder};
-use orchestral_config::load_config;
+use orchestral_core::config::load_config;
+use orchestral_core::spi::{
+    ComponentRegistry, RuntimeBuildRequest, RuntimeComponentFactory, SpiError,
+};
 use orchestral_extension_host::build_extension_runtime_bundle;
 use orchestral_infra::{InfraComponentFactory, InfraFactoryOptions};
+use orchestral_runtime::api::{ApiError, RuntimeAppBuilder};
 use orchestral_runtime::RuntimeApp;
-use orchestral_spi::{ComponentRegistry, RuntimeBuildRequest, RuntimeComponentFactory, SpiError};
 
 pub use orchestral_extension_host::{RuntimeExtensionCatalog, RuntimeTarget};
 

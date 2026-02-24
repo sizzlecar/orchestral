@@ -11,9 +11,8 @@ default = []
 pdf = ["kreuzberg/pdf"]
 
 [dependencies]
-orchestral-actions = { workspace = true }
-orchestral-config = { workspace = true }
-orchestral-spi = { workspace = true }
+orchestral-core = { workspace = true }
+orchestral-runtime = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -25,5 +24,4 @@ chrono = { workspace = true }
 kreuzberg = { workspace = true }
 
 [dev-dependencies]
-orchestral-core = { workspace = true }
 tokio-test = { workspace = true }

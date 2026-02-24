@@ -3,12 +3,12 @@ use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use orchestral_actions::ActionFactory;
-use orchestral_config::{OrchestralConfig, RuntimeExtensionSpec};
-use orchestral_spi::{
+use orchestral_core::config::{OrchestralConfig, RuntimeExtensionSpec};
+use orchestral_core::spi::{
     ComponentRegistry, HookError, RuntimeBuildRequest, RuntimeHook, RuntimeHookContext,
     RuntimeHookEventEnvelope, SpiError,
 };
+use orchestral_runtime::action::ActionFactory;
 use serde::Deserialize;
 use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
@@ -558,7 +558,7 @@ mod tests {
 
     fn sample_request() -> RuntimeBuildRequest {
         RuntimeBuildRequest {
-            meta: orchestral_spi::SpiMeta::runtime_defaults("0.1.0"),
+            meta: orchestral_core::spi::SpiMeta::runtime_defaults("0.1.0"),
             config_path: "configs/orchestral.yaml".to_string(),
             profile: Some("test".to_string()),
             options: serde_json::Map::new(),
@@ -580,7 +580,7 @@ mod tests {
 
     fn sample_completed_event(path: &str, action: &str) -> RuntimeHookEventEnvelope {
         RuntimeHookEventEnvelope {
-            meta: orchestral_spi::SpiMeta::runtime_defaults("0.1.0"),
+            meta: orchestral_core::spi::SpiMeta::runtime_defaults("0.1.0"),
             event_type: "step.completed".to_string(),
             event_version: "1.0.0".to_string(),
             occurred_at_unix_ms: Utc::now().timestamp_millis(),
@@ -642,7 +642,7 @@ mod tests {
             .await
             .expect("hooks");
         let event = RuntimeHookEventEnvelope {
-            meta: orchestral_spi::SpiMeta::runtime_defaults("0.1.0"),
+            meta: orchestral_core::spi::SpiMeta::runtime_defaults("0.1.0"),
             event_type: "step.completed".to_string(),
             event_version: "1.0.0".to_string(),
             occurred_at_unix_ms: Utc::now().timestamp_millis(),

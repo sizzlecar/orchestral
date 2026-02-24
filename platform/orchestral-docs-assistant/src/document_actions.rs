@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use kreuzberg::{extract_file, ExtractionConfig, OutputFormat, PageConfig};
-use orchestral_actions::{
+use orchestral_runtime::action::{
     Action, ActionBuildError, ActionContext, ActionFactory, ActionInput, ActionInterfaceSpec,
     ActionMeta, ActionResult, ActionSpec,
 };

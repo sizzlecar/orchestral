@@ -4,12 +4,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use orchestral_actions::{ActionBuildError, ActionFactory, ActionSpec, DefaultActionFactory};
-use orchestral_config::{ConfigError, OrchestralConfig, RuntimeExtensionSpec};
-use orchestral_docs_assistant::{DocsAssistantExtension, EXTENSION_NAME as DOCS_EXTENSION_NAME};
-use orchestral_spi::{
+use orchestral_core::config::{ConfigError, OrchestralConfig, RuntimeExtensionSpec};
+use orchestral_core::spi::{
     ComponentRegistry, HookRegistry, RuntimeBuildRequest, RuntimeComponentFactory, RuntimeHook,
     SpiError, SpiMeta,
+};
+use orchestral_docs_assistant::{DocsAssistantExtension, EXTENSION_NAME as DOCS_EXTENSION_NAME};
+use orchestral_runtime::action::{
+    ActionBuildError, ActionFactory, ActionSpec, DefaultActionFactory,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -295,7 +297,7 @@ impl ActionFactory for CompositeActionFactory {
     fn build(
         &self,
         spec: &ActionSpec,
-    ) -> Result<Arc<dyn orchestral_actions::Action>, ActionBuildError> {
+    ) -> Result<Arc<dyn orchestral_runtime::action::Action>, ActionBuildError> {
         for factory in &self.factories {
             match factory.build(spec) {
                 Ok(action) => return Ok(action),

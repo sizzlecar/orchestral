@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -11,17 +12,33 @@ use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use orchestral_api::{ApiService, RuntimeApi};
-use orchestral_channels::{InMemoryChannelBindingStore, WebChannel};
 use orchestral_composition::{ComposedRuntimeAppBuilder, RuntimeTarget};
-use orchestral_stores::Event;
+use orchestral_core::store::Event;
+use orchestral_runtime::api::{
+    ApiError, ApiService, ErrorCode, InteractionSubmitRequest, RuntimeApi,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::RwLock;
 
 #[derive(Clone)]
 struct AppState {
-    web: Arc<WebChannel<RuntimeApi, InMemoryChannelBindingStore>>,
     api: Arc<RuntimeApi>,
+    bindings: Arc<RwLock<HashMap<String, String>>>,
+}
+
+impl AppState {
+    async fn resolve_or_create_thread(&self, session: &str) -> Result<String, ApiError> {
+        if let Some(tid) = self.bindings.read().await.get(session).cloned() {
+            return Ok(tid);
+        }
+        let thread = self.api.create_thread(None).await?;
+        self.bindings
+            .write()
+            .await
+            .insert(session.to_string(), thread.id.clone());
+        Ok(thread.id)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -39,12 +56,11 @@ struct ErrorBody {
 pub async fn run_server(config: PathBuf, listen: SocketAddr) -> anyhow::Result<()> {
     let runtime_builder = Arc::new(ComposedRuntimeAppBuilder::new(RuntimeTarget::Server));
     let api = Arc::new(RuntimeApi::from_config_path_with_builder(config, runtime_builder).await?);
-    let web = Arc::new(WebChannel::new(
-        api.clone(),
-        Arc::new(InMemoryChannelBindingStore::new()),
-    ));
 
-    let state = AppState { web, api };
+    let state = AppState {
+        api,
+        bindings: Arc::new(RwLock::new(HashMap::new())),
+    };
 
     let app = Router::new()
         .route("/health", get(health))
@@ -70,9 +86,17 @@ async fn submit_message(
     Path(session): Path<String>,
     Json(payload): Json<SubmitRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    let thread_id = state
+        .resolve_or_create_thread(&session)
+        .await
+        .map_err(map_api_error)?;
+    let request = InteractionSubmitRequest {
+        request_id: payload.request_id,
+        input: payload.input,
+    };
     let resp = state
-        .web
-        .submit_message(&session, payload.request_id, payload.input)
+        .api
+        .submit_interaction(&thread_id, request)
         .await
         .map_err(map_api_error)?;
     Ok(Json(resp))
@@ -86,8 +110,7 @@ async fn stream_events(
     (StatusCode, Json<ErrorBody>),
 > {
     let thread_id = state
-        .web
-        .resolve_thread_id(&session)
+        .resolve_or_create_thread(&session)
         .await
         .map_err(map_api_error)?;
 
@@ -128,13 +151,13 @@ async fn stream_events(
     ))
 }
 
-fn map_api_error(err: orchestral_api::ApiError) -> (StatusCode, Json<ErrorBody>) {
+fn map_api_error(err: ApiError) -> (StatusCode, Json<ErrorBody>) {
     let (status, code) = match err.code() {
-        orchestral_api::ErrorCode::NotFound => (StatusCode::NOT_FOUND, "not_found"),
-        orchestral_api::ErrorCode::PermissionDenied => (StatusCode::FORBIDDEN, "permission_denied"),
-        orchestral_api::ErrorCode::Conflict => (StatusCode::CONFLICT, "conflict"),
-        orchestral_api::ErrorCode::InvalidArgument => (StatusCode::BAD_REQUEST, "invalid_argument"),
-        orchestral_api::ErrorCode::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+        ErrorCode::NotFound => (StatusCode::NOT_FOUND, "not_found"),
+        ErrorCode::PermissionDenied => (StatusCode::FORBIDDEN, "permission_denied"),
+        ErrorCode::Conflict => (StatusCode::CONFLICT, "conflict"),
+        ErrorCode::InvalidArgument => (StatusCode::BAD_REQUEST, "invalid_argument"),
+        ErrorCode::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
     };
     (
         status,

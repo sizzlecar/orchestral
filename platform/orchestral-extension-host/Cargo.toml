@@ -7,10 +7,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-orchestral-actions = { workspace = true }
-orchestral-config = { workspace = true }
+orchestral-core = { workspace = true }
+orchestral-runtime = { workspace = true }
 orchestral-docs-assistant = { workspace = true }
-orchestral-spi = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

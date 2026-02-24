@@ -7,10 +7,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-orchestral-api = { workspace = true }
-orchestral-config = { workspace = true }
+orchestral-core = { workspace = true }
 orchestral-infra = { workspace = true }
 orchestral-extension-host = { workspace = true }
 orchestral-runtime = { workspace = true }
-orchestral-spi = { workspace = true }
 async-trait = { workspace = true }

@@ -11,16 +11,16 @@ use aws_types::region::Region;
 use bytes::Bytes;
 use futures_util::StreamExt;
 
-use orchestral_config::{OrchestralConfig, StoreSpec};
+use orchestral_core::config::{OrchestralConfig, StoreSpec};
 use orchestral_core::io::{BlobHead, BlobIoError, BlobStore, BlobStream};
+use orchestral_core::spi::{
+    ComponentRegistry, RuntimeBuildRequest, RuntimeComponentFactory, SpiError, StoreBundle,
+};
+use orchestral_core::store::{InMemoryEventStore, InMemoryReferenceStore, InMemoryTaskStore};
 use orchestral_files::{
     BlobMode, BlobServiceConfig, FileService, LocalBlobStoreConfig, S3BlobClient,
     S3BlobStoreConfig, S3GetObjectResult, S3PutObjectResult,
 };
-use orchestral_spi::{
-    ComponentRegistry, RuntimeBuildRequest, RuntimeComponentFactory, SpiError, StoreBundle,
-};
-use orchestral_stores::{InMemoryEventStore, InMemoryReferenceStore, InMemoryTaskStore};
 use orchestral_stores_backends::{
     PostgresEventStore, PostgresReferenceStore, PostgresTaskStore, RedisEventStore,
     RedisReferenceStore, RedisTaskStore, SqliteEventStore, SqliteReferenceStore, SqliteTaskStore,
@@ -523,7 +523,7 @@ fn require_setting<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orchestral_spi::SpiMeta;
+    use orchestral_core::spi::SpiMeta;
 
     #[tokio::test]
     async fn test_infra_factory_skip_blob() {

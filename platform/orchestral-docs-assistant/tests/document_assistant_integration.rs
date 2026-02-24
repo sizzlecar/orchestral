@@ -5,10 +5,10 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use orchestral_actions::{ActionFactory, ActionInput, ActionSpec};
 use orchestral_core::action::ActionContext;
 use orchestral_core::store::{Reference, ReferenceStore, ReferenceType, StoreError, WorkingSet};
 use orchestral_docs_assistant::DocsAssistantActionFactory;
+use orchestral_runtime::action::{ActionFactory, ActionInput, ActionSpec};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
