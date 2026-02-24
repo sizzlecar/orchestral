@@ -21,13 +21,8 @@ name = "config_loading"
 path = "config_loading.rs"
 
 [dependencies]
-orchestral-core = { path = "../crates/orchestral-core" }
-orchestral-config = { path = "../crates/orchestral-config" }
-orchestral-context = { path = "../crates/orchestral-context" }
-orchestral-planners = { path = "../crates/orchestral-planners" }
-orchestral-runtime = { path = "../crates/orchestral-runtime" }
-orchestral-stores = { path = "../crates/orchestral-stores" }
-orchestral-actions = { path = "../crates/orchestral-actions" }
+orchestral-core = { path = "../core/orchestral-core" }
+orchestral-runtime = { path = "../core/orchestral-runtime" }
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 serde_json = "1"

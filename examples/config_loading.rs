@@ -14,9 +14,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use orchestral_actions::{ActionRegistryManager, DefaultActionFactory};
-use orchestral_config::{load_config, OrchestralConfig};
-use orchestral_planners::{DefaultLlmClientFactory, LlmClientFactory, LlmInvocationConfig};
+use orchestral_core::config::{load_config, OrchestralConfig};
+use orchestral_runtime::action::{ActionRegistryManager, DefaultActionFactory};
+use orchestral_runtime::planner::{DefaultLlmClientFactory, LlmClientFactory, LlmInvocationConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -100,7 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build actions manually from config
     let factory = DefaultActionFactory::new();
     for spec in &actions.actions {
-        match orchestral_actions::ActionFactory::build(&factory, spec) {
+        match orchestral_runtime::action::ActionFactory::build(&factory, spec) {
             Ok(action) => {
                 println!("Registered action: {}", action.name());
                 reg.register(action);

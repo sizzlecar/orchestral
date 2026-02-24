@@ -1,8 +1,8 @@
 //! LLM planner example (mock client)
 
 use orchestral_core::prelude::*;
-use orchestral_planners::{LlmPlanner, LlmPlannerConfig, MockLlmClient};
-use orchestral_stores::InMemoryReferenceStore;
+use orchestral_core::store::InMemoryReferenceStore;
+use orchestral_runtime::planner::{LlmPlanner, LlmPlannerConfig, MockLlmClient};
 use tracing::info;
 
 #[tokio::main]

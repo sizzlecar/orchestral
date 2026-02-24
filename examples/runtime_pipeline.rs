@@ -4,8 +4,8 @@
 
 use serde_json::json;
 
+use orchestral_core::store::Event;
 use orchestral_runtime::{OrchestratorResult, RuntimeApp};
-use orchestral_stores::Event;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

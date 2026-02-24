@@ -3119,7 +3119,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3283,7 +3283,7 @@ dependencies = [
  "console_error_panic_hook",
  "console_log",
  "image",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "js-sys",
  "libloading",
  "log",
@@ -4074,50 +4074,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
-name = "orchestral-actions"
+name = "orchestral"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "notify",
- "orchestral-config",
  "orchestral-core",
- "orchestral-stores",
- "reqwest",
- "serde",
- "serde_json",
- "serde_yaml",
- "thiserror 1.0.69",
- "tokio",
- "tokio-test",
- "tracing",
-]
-
-[[package]]
-name = "orchestral-api"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "orchestral-config",
  "orchestral-runtime",
- "orchestral-stores",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "orchestral-channels"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "orchestral-api",
- "orchestral-composition",
- "orchestral-stores",
- "thiserror 1.0.69",
- "tokio",
 ]
 
 [[package]]
@@ -4128,13 +4089,12 @@ dependencies = [
  "clap",
  "crossterm 0.28.1",
  "futures-util",
- "orchestral-api",
- "orchestral-channels",
- "orchestral-composition",
- "orchestral-server",
+ "orchestral-core",
+ "orchestral-runtime",
  "ratatui",
  "serde_json",
  "textwrap",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
  "unicode-width 0.1.14",
@@ -4145,37 +4105,10 @@ name = "orchestral-composition"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "orchestral-api",
- "orchestral-config",
+ "orchestral-core",
  "orchestral-extension-host",
  "orchestral-infra",
  "orchestral-runtime",
- "orchestral-spi",
-]
-
-[[package]]
-name = "orchestral-config"
-version = "0.1.0"
-dependencies = [
- "notify",
- "serde",
- "serde_json",
- "serde_yaml",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "orchestral-context"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "orchestral-core",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -4186,8 +4119,10 @@ dependencies = [
  "bytes",
  "chrono",
  "futures-util",
+ "notify",
  "serde",
  "serde_json",
+ "serde_yaml",
  "thiserror 1.0.69",
  "tokio",
  "tokio-test",
@@ -4203,10 +4138,8 @@ dependencies = [
  "async-trait",
  "chrono",
  "kreuzberg",
- "orchestral-actions",
- "orchestral-config",
  "orchestral-core",
- "orchestral-spi",
+ "orchestral-runtime",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -4221,13 +4154,8 @@ name = "orchestral-examples"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "orchestral-actions",
- "orchestral-config",
- "orchestral-context",
  "orchestral-core",
- "orchestral-planners",
  "orchestral-runtime",
- "orchestral-stores",
  "serde_json",
  "tokio",
  "tracing",
@@ -4239,10 +4167,9 @@ name = "orchestral-extension-host"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "orchestral-actions",
- "orchestral-config",
+ "orchestral-core",
  "orchestral-docs-assistant",
- "orchestral-spi",
+ "orchestral-runtime",
  "serde_json",
  "serde_yaml",
  "thiserror 1.0.69",
@@ -4278,31 +4205,11 @@ dependencies = [
  "aws-types",
  "bytes",
  "futures-util",
- "orchestral-config",
  "orchestral-core",
  "orchestral-files",
- "orchestral-spi",
- "orchestral-stores",
  "orchestral-stores-backends",
  "serde_json",
  "tokio",
-]
-
-[[package]]
-name = "orchestral-planners"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures-util",
- "llm",
- "orchestral-config",
- "orchestral-core",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -4313,15 +4220,13 @@ dependencies = [
  "bytes",
  "chrono",
  "futures-util",
- "orchestral-actions",
- "orchestral-config",
- "orchestral-context",
+ "llm",
+ "notify",
  "orchestral-core",
- "orchestral-planners",
- "orchestral-spi",
- "orchestral-stores",
+ "reqwest",
  "serde",
  "serde_json",
+ "serde_yaml",
  "thiserror 1.0.69",
  "tokio",
  "tokio-test",
@@ -4341,42 +4246,14 @@ dependencies = [
  "chrono",
  "clap",
  "futures-util",
- "orchestral-api",
- "orchestral-channels",
  "orchestral-composition",
- "orchestral-stores",
+ "orchestral-core",
+ "orchestral-runtime",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "orchestral-spi"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures-util",
- "orchestral-core",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tokio-test",
- "tracing",
-]
-
-[[package]]
-name = "orchestral-stores"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "orchestral-core",
- "serde",
- "serde_json",
- "tokio",
- "tokio-test",
 ]
 
 [[package]]
@@ -6005,7 +5882,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6781,7 +6658,6 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.52.0",
  "windows-sys 0.59.0",
 ]
 
