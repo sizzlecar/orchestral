@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use orchestral_channels::ChannelEvent as Event;
+use orchestral_core::store::Event;
 
 const MAX_PREVIEW_CHARS: usize = 320;
 

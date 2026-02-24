@@ -6,9 +6,10 @@ use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::time::{timeout, Duration};
 use tracing::{debug, warn};
 
-use orchestral_api::RuntimeApi;
-use orchestral_channels::{ChannelEvent, CliRuntime};
-use orchestral_composition::{ComposedRuntimeAppBuilder, RuntimeTarget};
+use orchestral_core::store::Event as ChannelEvent;
+use orchestral_runtime::api::RuntimeApi;
+
+use crate::channel::CliRuntime;
 
 use super::event_projection::{project_event, UiEvent};
 use crate::runtime::protocol::{ActivityKind, RuntimeMsg, TransientSlot};
@@ -27,11 +28,10 @@ impl RuntimeClient {
         config: PathBuf,
         thread_id_override: Option<String>,
     ) -> anyhow::Result<Self> {
-        let runtime_builder = Arc::new(ComposedRuntimeAppBuilder::new(RuntimeTarget::Cli));
         let api = Arc::new(
-            RuntimeApi::from_config_path_with_builder(config, runtime_builder)
+            RuntimeApi::from_config_path(config)
                 .await
-                .context("failed to build runtime api with composition builder")?,
+                .context("failed to build runtime api")?,
         );
         let runtime = CliRuntime::from_api(api, thread_id_override)
             .await
