@@ -30,6 +30,13 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Architecture guard - core must not depend on platform
+        run: |
+          if grep -r 'platform/' core/orchestral-core/Cargo.toml core/orchestral-runtime/Cargo.toml core/orchestral/Cargo.toml 2>/dev/null; then
+            echo "FAIL: core/ crates must not depend on platform/"
+            exit 1
+          fi
+
       - name: Format check
         run: cargo fmt --all -- --check
 
