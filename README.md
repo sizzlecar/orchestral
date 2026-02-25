@@ -6,13 +6,13 @@ This README focuses on **how to run and use it**.
 
 ## What You Can Run
 
-- `orchestral-cli`: terminal UI for interactive runs
-- `orchestral-server`: HTTP + SSE runtime server
+- `orchestral-cli`: terminal UI for interactive runs (only depends on core, no platform dependencies)
+- `orchestral-server`: HTTP + SSE runtime server (includes all backends and extensions)
 - `orchestral-web`: browser UI that mirrors CLI conversation and step activity
 
 ## Prerequisites
 
-- Rust toolchain (stable)
+- Rust toolchain (stable, 1.91.0+)
 - Node.js 18+ (for web UI)
 - API key for your configured planner/interpreter backend
 
@@ -30,7 +30,7 @@ If you switch models/providers in config, set the corresponding key (for example
 ### 1. Build
 
 ```bash
-cargo build
+cargo build -p orchestral-cli
 ```
 
 ### 2. Start interactive CLI (TUI)
@@ -47,12 +47,18 @@ You will get a chat-like terminal session.
 cargo run -p orchestral-cli -- run "Plan a 3-day Tokyo trip"
 ```
 
+### 4. Run from script file (multi-turn)
+
+```bash
+cargo run -p orchestral-cli -- run --script scripts/cli_multiturn_regression.sh
+```
+
 ## Run Server + Web UI
 
 ### 1. Start server
 
 ```bash
-cargo run -p orchestral-cli -- server --config configs/orchestral.cli.yaml --listen 127.0.0.1:8080
+cargo run -p orchestral-server -- --config configs/orchestral.cli.yaml --listen 127.0.0.1:8080
 ```
 
 Server endpoints:
@@ -82,54 +88,82 @@ Open: `http://127.0.0.1:5173`
 
 ```bash
 # Run tests
-cargo test
+cargo test --workspace --all-targets
 
 # Format
-cargo fmt
+cargo fmt --all
 
 # Lint
-cargo clippy --all-targets --all-features
+cargo clippy --workspace --all-targets -- -D warnings
 
 # Example program
 cargo run --example basic_usage
 ```
 
+## Architecture Overview
+
+The project follows a **two-tier architecture** with strict one-way dependencies:
+
+```
+Core (Tier 1)  ←  Platform (Tier 2)  ←  Apps
+```
+
+- **Core**: types, traits, SPI contracts, config, in-memory stores, runtime, planners, actions, API — everything needed for a minimal standalone binary.
+- **Platform**: optional layer providing persistent store backends, blob storage, HTTP server, extension host, and business extensions.
+- **Apps**: composition roots that wire core and (optionally) platform together.
+
+CI enforces that `core/` crates never depend on `platform/`.
+
 ## Workspace Layout
 
 ```text
 orchestral/
-├── crates/
-│   ├── orchestral-core/
-│   ├── orchestral-runtime/
-│   ├── orchestral-stores/
-│   ├── orchestral-actions/
-│   └── orchestral-composition/
-├── adapters/
-│   ├── orchestral-infra/
-│   ├── orchestral-files/
-│   └── orchestral-stores-backends/
-├── extensions/
-│   ├── orchestral-extension-host/
-│   └── orchestral-docs-assistant/
+├── core/                              # Tier 1: publishable as library
+│   ├── orchestral-core/               #   types + traits + SPI + config + in-memory stores
+│   ├── orchestral-runtime/            #   runtime + context + planners + actions + API
+│   └── orchestral/                    #   facade crate (re-exports core + runtime)
+├── platform/                          # Tier 2: optional, depends on core
+│   ├── orchestral-stores-backends/    #   SQLite / Redis / Postgres (feature-gated)
+│   ├── orchestral-files/              #   blob storage (local / S3 / hybrid)
+│   ├── orchestral-infra/              #   infrastructure factory
+│   ├── orchestral-composition/        #   composition root (wires infra + extensions)
+│   ├── orchestral-extension-host/     #   extension host system
+│   ├── orchestral-docs-assistant/     #   document assistant extension
+│   └── orchestral-server/             #   HTTP/SSE server (axum)
 ├── apps/
-│   ├── orchestral-cli/
-│   └── orchestral-server/
+│   └── orchestral-cli/                # minimal CLI, depends only on core
 ├── configs/
 ├── web/
-│   └── orchestral-web/
+│   └── orchestral-web/                # browser UI
+├── scripts/
 └── examples/
 ```
 
+## Store Backends (Feature Flags)
+
+`orchestral-stores-backends` uses feature flags to control which backends are compiled:
+
+| Feature    | Backends                 | Default |
+|------------|--------------------------|---------|
+| `sqlite`   | SQLite + SQLite-Vector   | yes     |
+| `external` | Redis + Postgres         | no      |
+| `all`      | All backends             | no      |
+
+Infra selection is configured via `stores.*.backend` and `blobs.*` in config:
+- Supported store backends: `sqlite | sqlite_vector | in_memory | redis | postgres`
+- Supported blob backends: `local | s3 | hybrid`
+- Default store profile: local SQLite (`event/task=sqlite`, `reference=sqlite_vector`)
+- `sqlite_vector` reads vectors from `reference.metadata.embedding_vector` (or `metadata.vector`) as `f32[]`
+
 ## Extension Model
 
-- `Extension Point`: trait-level abstraction in core/runtime (`Action`, hooks, SPI components).
-- `Adapter`: infra implementation for storage/blob backends (Redis/Postgres/S3, etc.).
-- `Extension Package`: business/runtime extension that contributes actions/hooks/components.
+- **Extension Point**: trait-level abstraction in core (`Action`, hooks, SPI components).
+- **Adapter**: infra implementation for storage/blob backends.
+- **Extension Package**: business/runtime extension that contributes actions/hooks/components.
 - Layering rule:
-  - `crates/*` keep abstractions and orchestration only.
-  - `adapters/*` hold concrete infra backends.
-  - `extensions/*` hold runtime extension packages.
-  - `apps/*` are composition roots; they wire `infra + extensions`.
+  - `core/*` keeps abstractions, orchestration, and in-memory defaults only.
+  - `platform/*` holds concrete infra backends and runtime extension packages.
+  - `apps/*` are composition roots that wire implementations.
 - Config naming:
   - `extensions.runtime` is preferred.
   - `plugins.runtime` remains a backward-compatible alias.
@@ -145,19 +179,11 @@ let catalog = RuntimeExtensionCatalog::with_builtin_extensions()
 let builder = ComposedRuntimeAppBuilder::with_extension_catalog(RuntimeTarget::Server, catalog);
 ```
 
-- Infra selection is **not** done via runtime extensions:
-  - stores are configured by `stores.*.backend`
-  - blob storage is configured by `blobs.*`
-  - supported backends include `sqlite | sqlite_vector | in_memory | redis | postgres` for stores and
-    `local | s3 | hybrid` for blobs.
-  - default store profile is local sqlite (`event/task=sqlite`, `reference=sqlite_vector`).
-  - `sqlite_vector` reads vectors from `reference.metadata.embedding_vector` (or `metadata.vector`) as `f32[]`.
-
 ## Document Assistant Actions (Rust SDK)
 
-- Parser pipeline is standardized as `source -> kreuzberg markdown -> downstream`.
-- Conversion still uses `pandoc`, but conversion input is always the markdown emitted by `kreuzberg`.
-- Document capabilities are provided by runtime extension `builtin.docs_assistant` and split into dedicated action kinds:
+- Parser pipeline: `source -> kreuzberg markdown -> downstream`.
+- Conversion uses `pandoc`; input is always the markdown emitted by `kreuzberg`.
+- Provided by runtime extension `builtin.docs_assistant`, split into dedicated action kinds:
   - `doc_parse`: parse document to normalized markdown + metadata
   - `doc_convert`: convert with pandoc from markdown intermediate
   - `doc_summarize`: summary/outline/overview generation
@@ -165,12 +191,12 @@ let builder = ComposedRuntimeAppBuilder::with_extension_catalog(RuntimeTarget::S
   - `doc_qa`: document QA with evidence snippets
   - `doc_merge`: merge multi-source docs with optional format conversion
 - Runtime config reference: `configs/orchestral.cli.yaml`.
-- Docs ingestion placeholder embeddings are disabled by default (`enable_placeholder_embeddings: false`).
+- Placeholder embeddings disabled by default (`enable_placeholder_embeddings: false`).
 
 ### Document Runtime Dependencies
 
 - `pandoc` must be installed and available in `PATH`.
-- PDF parsing is optional and disabled by default in the docs extension. To enable it, build with `--features orchestral-docs-assistant/pdf`.
+- PDF parsing is optional and disabled by default. To enable: build with `--features orchestral-docs-assistant/pdf`.
 - When `kreuzberg` is built with `pdf` support, PDFium is required at build time:
   - either allow network download of prebuilt PDFium binaries, or
   - set `KREUZBERG_PDFIUM_PREBUILT` to a local PDFium directory.
