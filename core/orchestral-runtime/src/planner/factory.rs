@@ -99,9 +99,25 @@ pub fn build_client_from_backend(
 fn resolve_api_key(spec: &BackendSpec) -> Result<String, LlmBuildError> {
     let env_name = spec
         .api_key_env
-        .as_ref()
+        .clone()
+        .or_else(|| default_api_key_env_for_kind(&spec.kind).map(ToString::to_string))
         .ok_or(LlmBuildError::MissingApiKey)?;
-    std::env::var(env_name).map_err(|_| LlmBuildError::EnvNotFound(env_name.clone()))
+    std::env::var(&env_name).map_err(|_| LlmBuildError::EnvNotFound(env_name.clone()))
+}
+
+fn default_api_key_env_for_kind(kind: &str) -> Option<&'static str> {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "openai" => Some("OPENAI_API_KEY"),
+        "google" | "gemini" => Some("GEMINI_API_KEY"),
+        "anthropic" => Some("ANTHROPIC_API_KEY"),
+        "deepseek" => Some("DEEPSEEK_API_KEY"),
+        "groq" => Some("GROQ_API_KEY"),
+        "xai" => Some("XAI_API_KEY"),
+        "mistral" => Some("MISTRAL_API_KEY"),
+        "cohere" => Some("COHERE_API_KEY"),
+        "openrouter" => Some("OPENROUTER_API_KEY"),
+        _ => None,
+    }
 }
 
 fn parse_backend(kind: &str) -> Result<LLMBackend, LlmBuildError> {

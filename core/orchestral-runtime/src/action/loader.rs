@@ -5,10 +5,11 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use thiserror::Error;
 use tokio::sync::RwLock;
 
-use orchestral_core::config::{load_actions_config, ActionsConfig, ConfigError};
+use orchestral_core::config::{load_config, ActionSpec, ConfigError, OrchestralConfig};
 use orchestral_core::executor::ActionRegistry;
 
 use super::factory::{ActionBuildError, ActionFactory};
+use super::providers::collect_action_specs;
 
 /// Action config errors
 #[derive(Debug, Error)]
@@ -42,17 +43,22 @@ impl ActionRegistryManager {
     }
 
     pub async fn load(&self) -> Result<usize, ActionConfigError> {
-        let config = load_actions_config(&self.path)?;
-        self.load_from_config(&config).await
+        let config = load_config(&self.path)?;
+        self.load_from_orchestral_config(&config).await
     }
 
-    /// Load from an already-parsed config.
-    pub async fn load_from_config(
+    /// Load from an already-parsed full orchestral config.
+    pub async fn load_from_orchestral_config(
         &self,
-        config: &ActionsConfig,
+        config: &OrchestralConfig,
     ) -> Result<usize, ActionConfigError> {
+        let specs = collect_action_specs(config, &self.path)?;
+        self.load_from_specs(specs).await
+    }
+
+    async fn load_from_specs(&self, specs: Vec<ActionSpec>) -> Result<usize, ActionConfigError> {
         let mut registry = ActionRegistry::new();
-        for spec in &config.actions {
+        for spec in &specs {
             match self.factory.build(spec) {
                 Ok(action) => {
                     registry.register(action);

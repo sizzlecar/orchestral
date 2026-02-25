@@ -17,6 +17,8 @@ pub use providers::{
     ApiKeyError, BackendSpec, LegacyProviderSpec, ModelPolicy, ModelProfile, ProvidersConfig,
 };
 
+use std::collections::HashMap;
+
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -495,6 +497,85 @@ pub type FileCatalogConfig = BlobCatalogConfig;
 pub struct ExtensionsConfig {
     #[serde(default)]
     pub runtime: Vec<RuntimeExtensionSpec>,
+    #[serde(default)]
+    pub mcp: McpExtensionsConfig,
+    #[serde(default, alias = "skills")]
+    pub skill: SkillExtensionsConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpExtensionsConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub auto_discover: bool,
+    /// Optional extra config files to scan for MCP servers.
+    #[serde(default)]
+    pub discover_paths: Vec<String>,
+    /// Explicit MCP server declarations in orchestral config.
+    #[serde(default)]
+    pub servers: Vec<McpServerSpec>,
+}
+
+impl Default for McpExtensionsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_discover: true,
+            discover_paths: Vec::new(),
+            servers: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpServerSpec {
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    #[serde(default)]
+    pub bearer_token_env_var: Option<String>,
+    #[serde(default)]
+    pub startup_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub tool_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub enabled_tools: Vec<String>,
+    #[serde(default)]
+    pub disabled_tools: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SkillExtensionsConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub auto_discover: bool,
+    /// Optional directories to scan for SKILL.md.
+    #[serde(default)]
+    pub directories: Vec<String>,
+}
+
+impl Default for SkillExtensionsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_discover: true,
+            directories: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

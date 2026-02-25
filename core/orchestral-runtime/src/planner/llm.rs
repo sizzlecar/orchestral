@@ -753,6 +753,55 @@ mod tests {
     }
 
     #[test]
+    fn test_system_prompt_contains_mcp_and_skill_actions() {
+        let planner = LlmPlanner::new(
+            MockLlmClient {
+                response: "{}".to_string(),
+            },
+            LlmPlannerConfig::default(),
+        );
+
+        let actions = vec![
+            ActionMeta::new("mcp__alpha", "Call MCP server alpha")
+                .with_input_schema(json!({
+                    "type":"object",
+                    "properties":{
+                        "operation":{"type":"string"},
+                        "tool":{"type":"string"},
+                        "arguments":{"type":"object"}
+                    }
+                }))
+                .with_output_schema(json!({
+                    "type":"object",
+                    "properties":{
+                        "server":{"type":"string"},
+                        "result":{}
+                    }
+                })),
+            ActionMeta::new("skill__demo", "Expose demo skill instructions")
+                .with_input_schema(json!({
+                    "type":"object",
+                    "properties":{
+                        "query":{"type":"string"}
+                    }
+                }))
+                .with_output_schema(json!({
+                    "type":"object",
+                    "properties":{
+                        "skill":{"type":"string"},
+                        "instructions":{"type":"string"}
+                    }
+                })),
+        ];
+        let context = PlannerContext::new(actions, Arc::new(NoopReferenceStore));
+        let intent = Intent::new("need tools and skills");
+        let (system, _user) = planner.build_prompt(&intent, &context);
+
+        assert!(system.contains("- name: mcp__alpha"));
+        assert!(system.contains("- name: skill__demo"));
+    }
+
+    #[test]
     fn test_parse_workflow_output() {
         let raw = r#"{
             "type":"WORKFLOW",
