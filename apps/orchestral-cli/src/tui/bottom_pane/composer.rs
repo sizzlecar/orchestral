@@ -11,6 +11,18 @@ impl Composer {
         Self::default()
     }
 
+    pub fn insert_text(&mut self, text: &str) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+        if self.cursor > self.buffer.len() || !self.buffer.is_char_boundary(self.cursor) {
+            return false;
+        }
+        self.buffer.insert_str(self.cursor, text);
+        self.cursor += text.len();
+        true
+    }
+
     pub fn on_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {

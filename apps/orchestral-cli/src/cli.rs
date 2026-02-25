@@ -1,5 +1,4 @@
 use std::env;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
@@ -15,8 +14,6 @@ pub struct Cli {
 enum Command {
     /// Run with optional initial input; enters chat by default
     Run(RunArgs),
-    /// Run HTTP/SSE server
-    Server(ServerArgs),
 }
 
 #[derive(Debug, Args, Clone)]
@@ -34,14 +31,6 @@ struct RunArgs {
     once: bool,
     #[arg(value_name = "INPUT")]
     input: Vec<String>,
-}
-
-#[derive(Debug, Args, Clone)]
-struct ServerArgs {
-    #[arg(long, default_value = "configs/orchestral.cli.yaml")]
-    config: PathBuf,
-    #[arg(long, default_value = "127.0.0.1:8080")]
-    listen: SocketAddr,
 }
 
 impl Cli {
@@ -63,10 +52,6 @@ impl Cli {
                     args.verbose,
                 )
                 .await
-            }
-            Some(Command::Server(args)) => {
-                ensure_log_filter(false);
-                orchestral_server::run_server(args.config, args.listen).await
             }
             None => {
                 ensure_log_filter(false);

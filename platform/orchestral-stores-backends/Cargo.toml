@@ -1,0 +1,29 @@
+[package]
+name = "orchestral-stores-backends"
+description = "Redis/Postgres/SQLite store backend implementations for Orchestral"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["sqlite"]
+sqlite = ["dep:sqlx"]
+external = ["dep:redis", "dep:sqlx"]
+all = ["sqlite", "external"]
+
+[dependencies]
+orchestral-core = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+redis = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+sqlx = { workspace = true }

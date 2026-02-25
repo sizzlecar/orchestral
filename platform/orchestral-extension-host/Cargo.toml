@@ -1,0 +1,19 @@
+[package]
+name = "orchestral-extension-host"
+description = "Runtime extension host (actions/hooks/components) for CLI and server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+orchestral-core = { workspace = true }
+orchestral-runtime = { workspace = true }
+orchestral-docs-assistant = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_yaml = { workspace = true }
+tokio = { workspace = true }

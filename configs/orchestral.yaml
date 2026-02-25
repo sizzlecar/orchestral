@@ -26,13 +26,80 @@ context:
   include_history: true
   include_references: true
 
+ingestion:
+  enabled: true
+  asynchronous: true
+  max_file_size_mb: 30
+  mime_allowlist: []
+  auto_for_assistant_outputs: true
+
+extensions:
+  # Backward-compatible alias: you may use `plugins:` with the same structure.
+  runtime:
+    # Optional docs ingestion extension (async parse/chunk/embed pipeline).
+    # - name: builtin.docs_assistant
+    #   enabled: true
+    #   targets: ["cli", "server"]
+    #   options:
+    #     max_chunk_chars: 900
+    #     chunk_overlap: 120
+    #     embedding_dim: 24
+
 stores:
+  # Default local persistence:
+  # event/task use sqlite, reference uses sqlite_vector with local vector index.
+  # backend: sqlite | sqlite_vector | postgres | redis | in_memory
+  # SQLite example:
+  # connection_url: "sqlite://orchestral-runtime.db"
+  # key_prefix: "orchestral"   # table prefix
+  # Postgres example:
+  # backend: postgres | postgresql | pgsql
+  # connection_url: "postgres://postgres:postgres@127.0.0.1:5432/orchestral"
+  # key_prefix: "orchestral"
+  # Redis example:
+  # backend: redis
+  # connection_url: "redis://127.0.0.1:6379"
+  # key_prefix: "orchestral:event"
   event:
-    backend: in_memory
+    backend: sqlite
+    connection_url: "sqlite://orchestral-runtime.db"
+    key_prefix: "orchestral"
   task:
-    backend: in_memory
+    backend: sqlite
+    connection_url: "sqlite://orchestral-runtime.db"
+    key_prefix: "orchestral"
   reference:
+    backend: sqlite_vector
+    connection_url: "sqlite://orchestral-runtime.db"
+    key_prefix: "orchestral"
+
+blobs:
+  # mode: local | s3 | hybrid
+  mode: local
+  local:
+    root_dir: ".orchestral/blobs"
+  s3:
+    # Enable when mode is s3 or hybrid(write_to=s3).
+    # endpoint: "http://127.0.0.1:9000" # Optional (MinIO/S3-compatible)
+    # region: "us-east-1"
+    # bucket: "orchestral-blobs"
+    # access_key_env: "S3_ACCESS_KEY_ID"   # Optional, paired with secret_key_env
+    # secret_key_env: "S3_SECRET_ACCESS_KEY"
+    endpoint:
+    region:
+    bucket:
+    key_prefix: "orchestral/blobs"
+    access_key_env:
+    secret_key_env:
+    force_path_style: true
+  hybrid:
+    # local | s3
+    write_to: s3
+  catalog:
+    # in_memory | postgres
     backend: in_memory
+    connection_url:
+    table_prefix: "orchestral"
 
 observability:
   log_level: info

@@ -1,0 +1,29 @@
+[package]
+name = "orchestral-runtime"
+description = "Thread Runtime with concurrency, interruption, scheduling, LLM planners, actions, and API for Orchestral"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+orchestral-core = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+notify = { workspace = true }
+reqwest = { workspace = true }
+llm_sdk = { package = "llm", version = "1.3.6", default-features = false, features = ["openai", "google"] }
+
+[dev-dependencies]
+tokio-test = { workspace = true }

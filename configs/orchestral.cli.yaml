@@ -30,15 +30,83 @@ context:
   include_history: true
   include_references: true
 
+ingestion:
+  enabled: true
+  asynchronous: true
+  max_file_size_mb: 30
+  mime_allowlist: []
+  auto_for_assistant_outputs: true
+
+extensions:
+  # Backward-compatible alias: you may use `plugins:` with the same structure.
+  runtime:
+    - name: builtin.docs_assistant
+      enabled: true
+      targets: ["cli", "server"]
+      options:
+        max_chunk_chars: 900
+        chunk_overlap: 120
+        embedding_dim: 24
+        enable_placeholder_embeddings: false
+        action_allowlist:
+          - doc_parse
+          - doc_convert
+          - doc_generate
+          - doc_merge
+
 stores:
-  # For quick local testing in a single process.
-  # If you need cross-process persistence, switch backend to redis and add connection_url.
+  # Default local persistence:
+  # event/task use sqlite, reference uses sqlite_vector with local vector index.
+  # backend: sqlite | sqlite_vector | postgres | redis | in_memory
+  # SQLite example:
+  # connection_url: "sqlite://orchestral-runtime.db"
+  # key_prefix: "orchestral"   # table prefix
+  # Postgres example:
+  # backend: postgres
+  # connection_url: "postgres://postgres:postgres@127.0.0.1:5432/orchestral"
+  # key_prefix: "orchestral"
+  # Redis example:
+  # event:
+  #   backend: redis
+  #   connection_url: "redis://127.0.0.1:6379"
+  #   key_prefix: "orchestral:event"
   event:
-    backend: in_memory
+    backend: sqlite
+    connection_url: "sqlite://orchestral-runtime.db"
+    key_prefix: "orchestral"
   task:
-    backend: in_memory
+    backend: sqlite
+    connection_url: "sqlite://orchestral-runtime.db"
+    key_prefix: "orchestral"
   reference:
+    backend: sqlite_vector
+    connection_url: "sqlite://orchestral-runtime.db"
+    key_prefix: "orchestral"
+
+blobs:
+  mode: local
+  local:
+    root_dir: ".orchestral/blobs"
+  s3:
+    # Enable when mode is s3 or hybrid(write_to=s3).
+    # endpoint: "http://127.0.0.1:9000" # Optional (MinIO/S3-compatible)
+    # region: "us-east-1"
+    # bucket: "orchestral-blobs"
+    # access_key_env: "S3_ACCESS_KEY_ID"   # Optional, paired with secret_key_env
+    # secret_key_env: "S3_SECRET_ACCESS_KEY"
+    endpoint:
+    region:
+    bucket:
+    key_prefix: "orchestral/blobs"
+    access_key_env:
+    secret_key_env:
+    force_path_style: true
+  hybrid:
+    write_to: s3
+  catalog:
     backend: in_memory
+    connection_url:
+    table_prefix: "orchestral"
 
 observability:
   log_level: info
@@ -123,10 +191,10 @@ providers:
       temperature: 0.2
 actions:
   hot_reload: true
-  # Optional: external process action (multi-language plugin) example:
+  # Optional: external process action (multi-language extension) example:
   # - name: echo_external
   #   kind: external_process
-  #   description: "Echo via Python plugin"
+  #   description: "Echo via Python extension"
   #   interface:
   #     input_schema:
   #       type: object
@@ -142,7 +210,7 @@ actions:
   #       required: ["result"]
   #   config:
   #     command: "python3"
-  #     args: ["examples/plugins/echo_plugin.py"]
+  #     args: ["examples/extensions/echo_extension.py"]
   #     timeout_ms: 10000
   actions:
     - name: echo
@@ -168,21 +236,27 @@ actions:
       config:
         prefix: "Echo: "
     - name: doc_parse
-      kind: external_process
-      description: "Parse document with markitdown and return structure"
+      kind: doc_parse
+      description: "Parse document with Kreuzberg Rust SDK and return normalized markdown structure"
       interface:
         input_schema:
           type: object
           properties:
             source_path:
               type: string
-              description: "Local document path to parse."
+              description: "Local document path to parse (docx/pptx/xlsx/html/xml/email/archive/text; pdf requires docs extension built with `pdf` feature)."
               example: "docs/spec.pdf"
+            extract_pages:
+              type: boolean
+              description: "Whether to include per-page extraction metadata."
+              default: false
           required: ["source_path"]
         output_schema:
           type: object
           properties:
             source_path:
+              type: string
+            mime_type:
               type: string
             markdown:
               type: string
@@ -201,88 +275,277 @@ actions:
               type: integer
             char_count:
               type: integer
-          required: ["source_path", "markdown", "headings", "word_count", "char_count"]
+            table_count:
+              type: integer
+            page_count:
+              type: ["integer", "null"]
+            parser:
+              type: string
+            metadata:
+              type: object
+          required: ["source_path", "markdown", "headings", "word_count", "char_count", "parser"]
       config:
-        command: "/Users/chejinxuan/rust_ws/orchestral/.venv/bin/python"
-        args: ["examples/plugins/markitdown_plugin.py"]
-        entrypoint: "doc_parse"
-        timeout_ms: 180000
+        extract_pages: false
     - name: doc_convert
-      kind: external_process
-      description: "Pandoc document conversion/generation tool. It can: (1) convert source files between formats (docx/pdf/html/md/txt, etc.) using mode=convert + to_format; (2) generate markdown summary/outline/overview from source files using mode=summary|outline|overview; (3) optionally write result to target_path or return inline text when target_path is omitted. Note: markdown/md/gfm outputs are normalized to gfm-raw_html by default to avoid raw HTML blocks and pandoc-specific markdown syntax."
+      kind: doc_convert
+      description: "Convert documents via pandoc, using Kreuzberg markdown as canonical intermediate (source -> kreuzberg markdown -> pandoc target format)."
       interface:
         input_schema:
           type: object
           properties:
             source_path:
               type: string
-              description: "Required local source file path. Use existing workspace file paths."
+              description: "Optional source file path. Either source_path or markdown must be provided."
               example: "docs/spec.docx"
-            mode:
+            markdown:
               type: string
-              description: "Operation mode. convert = direct pandoc conversion; summary/outline/overview = generate markdown artifacts from parsed source content."
-              default: "convert"
-            from_format:
-              type: string
-              description: "Optional pandoc --from format (for ambiguous inputs). Example: docx, markdown, html."
-              example: "docx"
+              description: "Optional markdown input. If provided, skips source_path parsing."
             to_format:
               type: string
-              description: "Target format for mode=convert (pandoc --to). Common values: markdown, html, plain, gfm. markdown/md/gfm are normalized to gfm-raw_html unless explicitly overridden."
+              description: "Pandoc target format. markdown/md/gfm are normalized to gfm-raw_html."
               default: "gfm-raw_html"
               example: "gfm-raw_html"
             target_path:
-              type: string
-              description: "Optional output file path. If provided, writes file and returns metadata; if omitted in convert mode, returns converted content inline."
+              type: ["string", "null"]
+              description: "Optional output file path. If omitted, converted content is returned inline."
               example: "output/spec.md"
-            summary_sentences:
-              type: integer
-              description: "Used by summary/overview mode to control summary length."
-              default: 5
             extra_args:
               type: array
-              description: "Optional extra pandoc CLI args for advanced conversion behavior, e.g. ['--standalone']."
+              description: "Optional extra pandoc CLI args, e.g. ['--standalone']."
               items:
                 type: string
-          required: ["source_path"]
+            return_markdown:
+              type: boolean
+              description: "Whether to return intermediate markdown used for conversion."
+              default: false
         output_schema:
           type: object
           properties:
             source_path:
-              type: string
-              description: "Original source file path."
-            mode:
-              type: string
-              description: "Executed mode: convert/summary/outline/overview."
-            from_format:
               type: ["string", "null"]
-              description: "Resolved input format hint."
             to_format:
               type: string
-              description: "Output format used by conversion."
             target_path:
               type: ["string", "null"]
-              description: "Output file path when writing to disk."
             wrote_file:
               type: boolean
-              description: "True if target_path was written."
             bytes:
               type: ["integer", "null"]
-              description: "Written file size in bytes when wrote_file=true."
             content:
               type: string
-              description: "Inline converted content for mode=convert when not writing to file."
-            generated_markdown:
-              type: string
-              description: "Generated markdown text for mode=summary|outline|overview."
             pandoc_command:
               type: string
-              description: "Pandoc command used for execution (for debugging/traceability)."
-          required: ["source_path", "mode", "to_format", "target_path", "wrote_file", "pandoc_command"]
+            parser:
+              type: string
+          required: ["to_format", "target_path", "wrote_file", "pandoc_command", "parser"]
       config:
-        command: "/Users/chejinxuan/rust_ws/orchestral/.venv/bin/python"
-        args: ["examples/plugins/pandoc_plugin.py"]
-        entrypoint: "doc_convert"
+        pandoc_command: "pandoc"
+        default_to_format: "gfm-raw_html"
+        timeout_ms: 180000
+    - name: doc_summarize
+      kind: doc_summarize
+      description: "Generate summary/outline/overview markdown from document content."
+      interface:
+        input_schema:
+          type: object
+          properties:
+            source_path:
+              type: string
+              description: "Optional source file path. Either source_path or markdown must be provided."
+            markdown:
+              type: string
+              description: "Optional markdown input."
+            mode:
+              type: string
+              description: "summary | outline | overview"
+              default: "summary"
+            summary_sentences:
+              type: integer
+              default: 5
+            target_path:
+              type: ["string", "null"]
+        output_schema:
+          type: object
+          properties:
+            source_path:
+              type: ["string", "null"]
+            mode:
+              type: string
+            generated_markdown:
+              type: string
+            target_path:
+              type: ["string", "null"]
+            wrote_file:
+              type: boolean
+            bytes:
+              type: ["integer", "null"]
+            word_count:
+              type: integer
+            heading_count:
+              type: integer
+            parser:
+              type: string
+          required: ["mode", "generated_markdown", "wrote_file", "parser"]
+      config:
+        default_mode: "summary"
+        default_sentences: 5
+    - name: doc_generate
+      kind: doc_generate
+      description: "Generate markdown documents from body/sections/source snippets, optionally convert via pandoc."
+      interface:
+        input_schema:
+          type: object
+          properties:
+            title:
+              type: string
+              default: "Generated Document"
+            body:
+              type: string
+            sections:
+              type: array
+              items:
+                type: object
+                properties:
+                  heading:
+                    type: string
+                  content:
+                    type: string
+                required: ["heading"]
+            source_markdowns:
+              type: array
+              items:
+                type: string
+            to_format:
+              type: string
+              default: "markdown"
+            target_path:
+              type: ["string", "null"]
+            extra_args:
+              type: array
+              items:
+                type: string
+        output_schema:
+          type: object
+          properties:
+            mode:
+              type: string
+            to_format:
+              type: string
+            target_path:
+              type: ["string", "null"]
+            generated_markdown:
+              type: string
+            wrote_file:
+              type: boolean
+            bytes:
+              type: ["integer", "null"]
+            content:
+              type: string
+            pandoc_command:
+              type: string
+          required: ["mode", "to_format", "generated_markdown", "wrote_file"]
+      config:
+        pandoc_command: "pandoc"
+        timeout_ms: 180000
+    - name: doc_qa
+      kind: doc_qa
+      description: "Answer questions against document content with evidence snippets."
+      interface:
+        input_schema:
+          type: object
+          properties:
+            source_path:
+              type: string
+            markdown:
+              type: string
+            question:
+              type: string
+            top_k:
+              type: integer
+              default: 3
+          required: ["question"]
+        output_schema:
+          type: object
+          properties:
+            source_path:
+              type: ["string", "null"]
+            question:
+              type: string
+            answer:
+              type: string
+            top_k:
+              type: integer
+            evidence:
+              type: array
+              items:
+                type: object
+                properties:
+                  rank:
+                    type: integer
+                  score:
+                    type: integer
+                  token_overlap:
+                    type: integer
+                  excerpt:
+                    type: string
+          required: ["question", "answer", "evidence"]
+      config:
+        default_top_k: 3
+    - name: doc_merge
+      kind: doc_merge
+      description: "Merge multiple documents/snippets into one markdown artifact, optionally convert via pandoc."
+      interface:
+        input_schema:
+          type: object
+          properties:
+            source_paths:
+              type: array
+              items:
+                type: string
+            markdowns:
+              type: array
+              items:
+                type: string
+            separator:
+              type: string
+              default: "\n\n---\n\n"
+            add_source_headers:
+              type: boolean
+              default: true
+            to_format:
+              type: string
+              default: "markdown"
+            target_path:
+              type: ["string", "null"]
+            extra_args:
+              type: array
+              items:
+                type: string
+        output_schema:
+          type: object
+          properties:
+            mode:
+              type: string
+            source_count:
+              type: integer
+            to_format:
+              type: string
+            target_path:
+              type: ["string", "null"]
+            merged_markdown:
+              type: string
+            wrote_file:
+              type: boolean
+            bytes:
+              type: ["integer", "null"]
+            content:
+              type: string
+            pandoc_command:
+              type: string
+          required: ["mode", "source_count", "to_format", "merged_markdown", "wrote_file"]
+      config:
+        add_source_headers: true
+        pandoc_command: "pandoc"
         timeout_ms: 180000
     - name: http
       kind: http

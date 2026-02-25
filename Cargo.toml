@@ -1,17 +1,24 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/orchestral-core",
-    "crates/orchestral-config",
-    "crates/orchestral-context",
-    "crates/orchestral-planners",
-    "crates/orchestral-runtime",
-    "crates/orchestral-stores",
-    "crates/orchestral-actions",
-    "crates/orchestral-api",
-    "crates/orchestral-channels",
-    "apps/orchestral-server",
+    # Core (Tier 1 - publishable as lib, no platform dependencies)
+    "core/orchestral-core",
+    "core/orchestral-runtime",
+    "core/orchestral",
+
+    # Platform (Tier 2 - optional, depends on core)
+    "platform/orchestral-stores-backends",
+    "platform/orchestral-files",
+    "platform/orchestral-infra",
+    "platform/orchestral-composition",
+    "platform/orchestral-extension-host",
+    "platform/orchestral-docs-assistant",
+    "platform/orchestral-server",
+
+    # Apps
     "apps/orchestral-cli",
+
+    # Examples
     "examples",
 ]
 
@@ -47,19 +54,32 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Utilities
 uuid = { version = "1", features = ["v4", "serde"] }
 redis = { version = "0.27", features = ["aio", "tokio-comp"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "mysql", "sqlite", "chrono", "json", "uuid"] }
 futures-util = "0.3"
+bytes = "1"
+kreuzberg = { version = "4.2.0", default-features = false, features = [
+    "tokio-runtime",
+    "office",
+    "excel",
+    "email",
+    "html",
+    "xml",
+    "archives",
+] }
 
-# Internal crates
-orchestral-core = { path = "crates/orchestral-core" }
-orchestral-config = { path = "crates/orchestral-config" }
-orchestral-context = { path = "crates/orchestral-context" }
-orchestral-planners = { path = "crates/orchestral-planners" }
-orchestral-runtime = { path = "crates/orchestral-runtime" }
-orchestral-stores = { path = "crates/orchestral-stores" }
-orchestral-actions = { path = "crates/orchestral-actions" }
-orchestral-api = { path = "crates/orchestral-api" }
-orchestral-channels = { path = "crates/orchestral-channels" }
-orchestral-server = { path = "apps/orchestral-server" }
+# Internal crates - Core
+orchestral = { path = "core/orchestral" }
+orchestral-core = { path = "core/orchestral-core" }
+orchestral-runtime = { path = "core/orchestral-runtime" }
+
+# Internal crates - Platform
+orchestral-stores-backends = { path = "platform/orchestral-stores-backends" }
+orchestral-files = { path = "platform/orchestral-files" }
+orchestral-infra = { path = "platform/orchestral-infra" }
+orchestral-composition = { path = "platform/orchestral-composition" }
+orchestral-extension-host = { path = "platform/orchestral-extension-host" }
+orchestral-docs-assistant = { path = "platform/orchestral-docs-assistant" }
+orchestral-server = { path = "platform/orchestral-server" }
 
 [workspace.dependencies.tokio-test]
 version = "0.4"

@@ -14,6 +14,24 @@ pub fn update(app: &mut App, msg: UiMsg) {
             app.height = h;
             app.set_dirty();
         }
+        UiMsg::Paste(text) => {
+            let before_len = app.bottom.composer.buffer.len();
+            let before_cursor = app.bottom.composer.cursor;
+            let inserted = app.bottom.composer.insert_text(&text);
+            tracing::debug!(
+                mode = ?app.mode,
+                paste_len = text.len(),
+                before_len,
+                before_cursor,
+                inserted,
+                after_len = app.bottom.composer.buffer.len(),
+                after_cursor = app.bottom.composer.cursor,
+                "submit_chain: paste_received"
+            );
+            if inserted {
+                app.set_dirty();
+            }
+        }
         UiMsg::AnimTick => {
             let mut changed = false;
             changed |= app.spinner.tick();
@@ -100,6 +118,11 @@ pub fn update(app: &mut App, msg: UiMsg) {
             }
 
             if let Some((action, modal_prefix)) = app.bottom.handle_key_modal(key) {
+                tracing::debug!(
+                    action = ?action,
+                    has_prefix = modal_prefix.is_some(),
+                    "tui update: modal action received"
+                );
                 match action {
                     ModalAction::SubmitApprove => {
                         update(app, UiMsg::SubmitInput("/approve".to_string()));
@@ -125,9 +148,27 @@ pub fn update(app: &mut App, msg: UiMsg) {
             }
 
             if key.code == KeyCode::Enter {
+                let buffer_len = app.bottom.composer.buffer.len();
+                let cursor = app.bottom.composer.cursor;
+                let mode_before = app.mode;
                 let input = app.bottom.composer.take_buffer();
+                tracing::debug!(
+                    mode = ?mode_before,
+                    buffer_len,
+                    cursor,
+                    trimmed_len = input.len(),
+                    trimmed_preview = %log_preview(&input, 80),
+                    "submit_chain: enter_pressed"
+                );
                 if !input.is_empty() {
+                    tracing::debug!(input_len = input.len(), "tui update: submit from Enter");
                     update(app, UiMsg::SubmitInput(input));
+                } else {
+                    app.transient.insert(
+                        TransientSlot::Status,
+                        "Input is empty. Type a message before submitting.".to_string(),
+                    );
+                    app.set_dirty();
                 }
                 return;
             }
@@ -137,6 +178,14 @@ pub fn update(app: &mut App, msg: UiMsg) {
             }
         }
         UiMsg::SubmitInput(input) => {
+            let next_turn_id = app.current_turn_id.saturating_add(1);
+            tracing::debug!(
+                turn_id = next_turn_id,
+                mode_before = ?app.mode,
+                input_len = input.len(),
+                input_preview = %log_preview(&input, 80),
+                "submit_chain: submit_input_queued"
+            );
             app.current_turn_id = app.current_turn_id.saturating_add(1);
             app.queue_submit(input.clone());
             push_history_line(app, format!("> {}", input));
@@ -145,6 +194,8 @@ pub fn update(app: &mut App, msg: UiMsg) {
             app.turn_started_at = Some(std::time::Instant::now());
             app.turn_elapsed_reported = false;
             app.assistant_stream_line = None;
+            app.assistant_output_persisted = false;
+            app.assistant_last_persist_range = None;
             app.history_scroll_back = 0;
             app.mode = AppMode::Planning;
             app.spinner.enabled = true;
@@ -154,6 +205,12 @@ pub fn update(app: &mut App, msg: UiMsg) {
             app.transient.insert(
                 TransientSlot::Footer,
                 "Working... Ctrl+C to interrupt".to_string(),
+            );
+            tracing::debug!(
+                turn_id = app.current_turn_id,
+                history_len = app.history.len(),
+                mode = ?app.mode,
+                "submit_chain: submit_input_state_applied"
             );
             app.set_dirty();
         }
@@ -200,9 +257,9 @@ fn handle_runtime(app: &mut App, msg: RuntimeMsg) {
             app.set_dirty();
         }
         RuntimeMsg::ExecutionEnd => {
-            // A stale end event from previous turn may arrive right after a new submit.
-            // Ignore it if the UI has already entered planning for the next turn.
+            tracing::debug!(mode = ?app.mode, "tui update: ExecutionEnd received");
             if matches!(app.mode, AppMode::Planning) {
+                tracing::debug!("tui update: ExecutionEnd ignored (mode=Planning)");
                 app.set_dirty();
                 return;
             }
@@ -214,11 +271,32 @@ fn handle_runtime(app: &mut App, msg: RuntimeMsg) {
             app.set_dirty();
         }
         RuntimeMsg::OutputPersist(line) => {
+            let line_preview = log_preview(&line, 80);
+            tracing::debug!(
+                mode = ?app.mode,
+                line_len = line.len(),
+                line_preview = %line_preview,
+                "tui update: OutputPersist received"
+            );
             if matches!(app.mode, AppMode::Planning | AppMode::Executing) {
                 app.history_scroll_back = 0;
             }
-            app.assistant_stream_line = None;
+            if let Some(stream_idx) = app.assistant_stream_line.take() {
+                if stream_idx < app.history.len() {
+                    let streamed = app.history.remove(stream_idx);
+                    if app.history_scroll_back > 0 {
+                        app.history_scroll_back = app.history_scroll_back.saturating_sub(1);
+                    }
+                    tracing::debug!(
+                        stream_len = streamed.len(),
+                        stream_preview = %log_preview(&streamed, 80),
+                        same_text = is_same_reply_text(&streamed, &line),
+                        "tui update: removed streamed line before OutputPersist"
+                    );
+                }
+            }
             if let Some(status) = parse_execution_status(&line) {
+                tracing::debug!(status = %status, "tui update: OutputPersist is execution status");
                 if status != "completed" {
                     enter_waiting_input(app);
                 }
@@ -232,13 +310,63 @@ fn handle_runtime(app: &mut App, msg: RuntimeMsg) {
                 return;
             }
             if is_noise_line(&line) {
+                tracing::debug!("tui update: OutputPersist filtered as noise");
                 app.set_dirty();
                 return;
             }
+            let should_replace_previous_assistant = app.assistant_output_persisted
+                && app.assistant_stream_line.is_none()
+                && !matches!(app.mode, AppMode::WaitingInput);
+            if should_replace_previous_assistant {
+                if let Some((start, end)) = app.assistant_last_persist_range.take() {
+                    if start < end && end <= app.history.len() {
+                        let removed = (end - start) as u16;
+                        app.history.drain(start..end);
+                        if app.history_scroll_back > 0 {
+                            app.history_scroll_back =
+                                app.history_scroll_back.saturating_sub(removed);
+                        }
+                        tracing::debug!(
+                            start,
+                            end,
+                            removed,
+                            "tui update: replaced previous assistant output block"
+                        );
+                    }
+                }
+            }
+            let history_len_before = app.history.len();
             push_history_multiline(app, &line);
+            app.assistant_output_persisted = true;
+            if app.history.len() > history_len_before {
+                app.assistant_last_persist_range = Some((history_len_before, app.history.len()));
+            } else if !should_replace_previous_assistant {
+                app.assistant_last_persist_range = None;
+            }
+            tracing::debug!(
+                inserted = app.history.len() != history_len_before,
+                history_len = app.history.len(),
+                "tui update: OutputPersist pushed to history"
+            );
             app.set_dirty();
         }
         RuntimeMsg::AssistantDelta { chunk, done } => {
+            if app.assistant_output_persisted {
+                tracing::debug!(
+                    chunk_len = chunk.len(),
+                    done,
+                    "tui update: AssistantDelta ignored after OutputPersist"
+                );
+                return;
+            }
+            // Stream end marker can arrive with empty chunk after final text has already
+            // been persisted; avoid inserting a blank history line in that case.
+            if chunk.is_empty() {
+                if done {
+                    app.set_dirty();
+                }
+                return;
+            }
             if matches!(app.mode, AppMode::Planning | AppMode::Executing) {
                 app.history_scroll_back = 0;
             }
@@ -254,9 +382,7 @@ fn handle_runtime(app: &mut App, msg: RuntimeMsg) {
                 }
                 app.assistant_stream_line = Some(idx);
             }
-            if done {
-                app.assistant_stream_line = None;
-            }
+            let _ = done;
             app.set_dirty();
         }
         RuntimeMsg::OutputTransient { slot, text } => {
@@ -268,6 +394,12 @@ fn handle_runtime(app: &mut App, msg: RuntimeMsg) {
             app.set_dirty();
         }
         RuntimeMsg::ApprovalRequested { reason, command } => {
+            tracing::debug!(
+                mode = ?app.mode,
+                reason = %reason,
+                command = ?command,
+                "tui update: ApprovalRequested received"
+            );
             if let Some(cmd) = command.clone() {
                 if app.is_command_auto_approved(&cmd) {
                     app.history
@@ -337,6 +469,12 @@ fn handle_runtime(app: &mut App, msg: RuntimeMsg) {
 }
 
 fn enter_waiting_input(app: &mut App) {
+    tracing::debug!(
+        from_mode = ?app.mode,
+        turn_id = app.current_turn_id,
+        history_len = app.history.len(),
+        "tui update: enter_waiting_input"
+    );
     maybe_append_elapsed_line(app);
     app.mode = AppMode::WaitingInput;
     app.spinner.enabled = false;
@@ -383,42 +521,39 @@ fn format_elapsed(elapsed: Duration) -> String {
 fn push_history_multiline(app: &mut App, text: &str) {
     let mut pushed = false;
     for line in text.lines() {
-        if line_already_in_current_turn(app, line) {
-            continue;
-        }
         if app.history.last().map(String::as_str) != Some(line) {
             push_history_line(app, line.to_string());
+        } else {
+            tracing::debug!(
+                line_len = line.len(),
+                line_preview = %log_preview(line, 80),
+                "tui update: skip consecutive duplicate line"
+            );
         }
         pushed = true;
     }
     if !pushed {
-        if line_already_in_current_turn(app, text) {
+        // For duplicated multi-line replies, every split line can already exist in
+        // history. In that case we must not fallback to pushing the full raw text,
+        // otherwise the whole reply appears again as a single long wrapped line.
+        if text.contains('\n') {
+            tracing::debug!(
+                line_len = text.len(),
+                line_preview = %log_preview(text, 80),
+                "tui update: skip fallback for duplicated multiline text"
+            );
             return;
         }
         if app.history.last().map(String::as_str) != Some(text) {
             push_history_line(app, text.to_string());
+        } else {
+            tracing::debug!(
+                line_len = text.len(),
+                line_preview = %log_preview(text, 80),
+                "tui update: skip fallback consecutive duplicate line"
+            );
         }
     }
-}
-
-fn line_already_in_current_turn(app: &App, line: &str) -> bool {
-    if line.trim().is_empty() {
-        return false;
-    }
-    let mut seen_prompts = 0usize;
-    let mut start = 0usize;
-    for (idx, item) in app.history.iter().enumerate() {
-        if item.starts_with('>') {
-            seen_prompts = seen_prompts.saturating_add(1);
-            if seen_prompts == app.current_turn_id {
-                start = idx.saturating_add(1);
-            }
-        }
-    }
-    app.history
-        .iter()
-        .skip(start)
-        .any(|existing| existing.trim() == line.trim())
 }
 
 fn parse_execution_status(line: &str) -> Option<String> {
@@ -438,6 +573,23 @@ fn is_noise_line(line: &str) -> bool {
         || trimmed.ends_with("step(s) queued")
         || trimmed.starts_with("<!doctype html")
         || trimmed.starts_with("<html")
+}
+
+fn is_same_reply_text(a: &str, b: &str) -> bool {
+    let norm_a = normalize_reply_text(a);
+    let norm_b = normalize_reply_text(b);
+    if norm_a.is_empty() || norm_b.is_empty() {
+        return false;
+    }
+    norm_a == norm_b || norm_a.contains(&norm_b) || norm_b.contains(&norm_a)
+}
+
+fn normalize_reply_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn log_preview(line: &str, max_chars: usize) -> String {
+    line.chars().take(max_chars).collect()
 }
 
 fn make_activity_key(turn_id: usize, step: &str, action: &str) -> String {
@@ -477,5 +629,371 @@ fn prune_old_activities(app: &mut App, keep_turns: usize) {
     app.activity_index.clear();
     for (idx, group) in app.activities.iter().enumerate() {
         app.activity_index.insert(group.key.clone(), idx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use super::{log_preview, update};
+    use crate::runtime::RuntimeMsg;
+    use crate::tui::app::{App, AppMode};
+    use crate::tui::protocol::UiMsg;
+
+    #[test]
+    fn test_log_preview_handles_multibyte() {
+        let line = "你好，世界！".repeat(30);
+        let preview = log_preview(&line, 80);
+        assert_eq!(preview.chars().count(), 80);
+    }
+
+    #[test]
+    fn test_log_preview_short_string() {
+        assert_eq!(log_preview("hello", 80), "hello");
+    }
+
+    #[test]
+    fn test_output_persist_dedupes_same_line_in_one_turn() {
+        let mut app = App::new(120, 40, false);
+        update(&mut app, UiMsg::SubmitInput("hello".to_string()));
+
+        update(
+            &mut app,
+            UiMsg::Runtime(RuntimeMsg::OutputPersist("same reply".to_string())),
+        );
+        let history_len_after_first = app.history.len();
+
+        update(
+            &mut app,
+            UiMsg::Runtime(RuntimeMsg::OutputPersist("same reply".to_string())),
+        );
+
+        assert_eq!(app.history.len(), history_len_after_first);
+        let occurrences = app
+            .history
+            .iter()
+            .filter(|line| line.trim() == "same reply")
+            .count();
+        assert_eq!(occurrences, 1);
+    }
+
+    #[test]
+    fn test_assistant_delta_done_without_chunk_does_not_insert_blank_line() {
+        let mut app = App::new(120, 40, false);
+        update(&mut app, UiMsg::SubmitInput("hello".to_string()));
+        let before = app.history.clone();
+
+        update(
+            &mut app,
+            UiMsg::Runtime(RuntimeMsg::AssistantDelta {
+                chunk: String::new(),
+                done: true,
+            }),
+        );
+
+        assert_eq!(app.history, before);
+        assert_eq!(app.assistant_stream_line, None);
+    }
+
+    #[test]
+    fn test_approval_modal_enter_submits_approve_once() {
+        let mut app = App::new(120, 40, false);
+        app.mode = AppMode::WaitingInput;
+
+        update(
+            &mut app,
+            UiMsg::Runtime(RuntimeMsg::ApprovalRequested {
+                reason: "needs approval".to_string(),
+                command: Some("rm /tmp/demo.txt".to_string()),
+            }),
+        );
+        assert!(app.bottom.top_modal().is_some());
+
+        update(
+            &mut app,
+            UiMsg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+
+        assert!(app.bottom.top_modal().is_none());
+        assert_eq!(app.take_pending_submit(), Some("/approve".to_string()));
+        assert_eq!(app.mode, AppMode::Planning);
+        assert_eq!(app.history.last().map(String::as_str), Some("> /approve"));
+    }
+
+    #[test]
+    fn test_approval_modal_remember_prefix_and_submit() {
+        let mut app = App::new(120, 40, false);
+        app.mode = AppMode::WaitingInput;
+        let command = "rm /Users/demo/file.txt".to_string();
+
+        update(
+            &mut app,
+            UiMsg::Runtime(RuntimeMsg::ApprovalRequested {
+                reason: "needs approval".to_string(),
+                command: Some(command.clone()),
+            }),
+        );
+        assert!(app.bottom.top_modal().is_some());
+
+        update(
+            &mut app,
+            UiMsg::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)),
+        );
+
+        assert!(app.bottom.top_modal().is_none());
+        assert_eq!(app.take_pending_submit(), Some("/approve".to_string()));
+        assert!(app.is_command_auto_approved(&command));
+        assert!(app
+            .history
+            .iter()
+            .any(|line| line.contains("Approval rule added for this session")));
+    }
+
+    #[test]
+    fn test_stream_then_outputpersist_dedupes_final_reply() {
+        let mut app = App::new(120, 40, false);
+        update(&mut app, UiMsg::SubmitInput("hello".to_string()));
+
+        update(
+            &mut app,
+            UiMsg::Runtime(RuntimeMsg::AssistantDelta {
+                chunk: "您好".to_string(),
+                done: false,
+            }),
+        );
+        update(
+            &mut app,
+            UiMsg::Runtime(RuntimeMsg::AssistantDelta {
+                chunk: String::new(),
+                done: true,
+            }),
+        );
+        update(
+            &mut app,
+            UiMsg::Runtime(RuntimeMsg::OutputPersist("您好".to_string())),
+        );
+
+        let occurrences = app
+            .history
+            .iter()
+            .filter(|line| line.trim() == "您好")
+            .count();
+        assert_eq!(occurrences, 1);
+    }
+
+    #[test]
+    fn test_outputpersist_before_execution_end_reply_kept_in_history() {
+        let mut app = App::new(120, 40, false);
+        update(
+            &mut app,
+            UiMsg::SubmitInput("我第一句话说了什么？".to_string()),
+        );
+        assert_eq!(app.mode, AppMode::Planning);
+        update(&mut app, UiMsg::Runtime(RuntimeMsg::PlanningEnd));
+        assert_eq!(app.mode, AppMode::Executing);
+
+        update(
+            &mut app,
+            UiMsg::Runtime(RuntimeMsg::OutputPersist(
+                "您第一句话说的是：“你好”。".to_string(),
+            )),
+        );
+        update(&mut app, UiMsg::Runtime(RuntimeMsg::ExecutionEnd));
+
+        assert!(app
+            .history
+            .iter()
+            .any(|line| line.contains("您第一句话说的是：“你好”。")));
+        assert_eq!(app.mode, AppMode::WaitingInput);
+    }
+
+    #[test]
+    fn test_outputpersist_after_execution_end_reply_still_rendered() {
+        let mut app = App::new(120, 40, false);
+        update(&mut app, UiMsg::SubmitInput("late reply test".to_string()));
+        update(&mut app, UiMsg::Runtime(RuntimeMsg::PlanningEnd));
+        assert_eq!(app.mode, AppMode::Executing);
+
+        update(&mut app, UiMsg::Runtime(RuntimeMsg::ExecutionEnd));
+        assert_eq!(app.mode, AppMode::WaitingInput);
+        let before = app.history.len();
+
+        update(
+            &mut app,
+            UiMsg::Runtime(RuntimeMsg::OutputPersist(
+                "late assistant reply".to_string(),
+            )),
+        );
+
+        assert_eq!(app.mode, AppMode::WaitingInput);
+        assert!(app.history.len() > before);
+        assert_eq!(
+            app.history.last().map(String::as_str),
+            Some("late assistant reply")
+        );
+    }
+
+    #[test]
+    fn test_repeated_multiline_outputpersist_does_not_add_full_text_fallback_duplicate() {
+        let mut app = App::new(120, 40, false);
+        update(&mut app, UiMsg::SubmitInput("fetch and save".to_string()));
+        update(&mut app, UiMsg::Runtime(RuntimeMsg::PlanningEnd));
+
+        let reply = "saved response body.\nurl: https://www.google.com\npath: /tmp/google_response.html\nbytes: 54755".to_string();
+        update(
+            &mut app,
+            UiMsg::Runtime(RuntimeMsg::OutputPersist(reply.clone())),
+        );
+        let history_after_first = app.history.clone();
+
+        update(&mut app, UiMsg::Runtime(RuntimeMsg::OutputPersist(reply)));
+
+        assert_eq!(app.history, history_after_first);
+        assert!(app.history.iter().all(|line| !line.contains('\n')));
+    }
+
+    #[test]
+    fn test_multiline_stream_then_outputpersist_replaces_stream_line_without_duplicate() {
+        let mut app = App::new(120, 40, false);
+        update(
+            &mut app,
+            UiMsg::SubmitInput("save conversation".to_string()),
+        );
+        update(&mut app, UiMsg::Runtime(RuntimeMsg::PlanningEnd));
+
+        let reply = "saved locally.\npath: /tmp/conversation.txt\nbytes: 723".to_string();
+        update(
+            &mut app,
+            UiMsg::Runtime(RuntimeMsg::AssistantDelta {
+                chunk: reply.clone(),
+                done: false,
+            }),
+        );
+        update(
+            &mut app,
+            UiMsg::Runtime(RuntimeMsg::AssistantDelta {
+                chunk: String::new(),
+                done: true,
+            }),
+        );
+        update(&mut app, UiMsg::Runtime(RuntimeMsg::OutputPersist(reply)));
+
+        let matches = app
+            .history
+            .iter()
+            .filter(|line| {
+                line.contains("saved locally.") || line.contains("path: /tmp/conversation.txt")
+            })
+            .count();
+        assert_eq!(matches, 2);
+        assert!(app.history.iter().all(|line| !line.contains("\npath:")));
+    }
+
+    #[test]
+    fn test_late_assistant_delta_after_outputpersist_is_ignored() {
+        let mut app = App::new(120, 40, false);
+        update(
+            &mut app,
+            UiMsg::SubmitInput("fetch github status".to_string()),
+        );
+        update(&mut app, UiMsg::Runtime(RuntimeMsg::PlanningEnd));
+
+        update(
+            &mut app,
+            UiMsg::Runtime(RuntimeMsg::AssistantDelta {
+                chunk: "GitHub status fetched ".to_string(),
+                done: false,
+            }),
+        );
+
+        update(
+            &mut app,
+            UiMsg::Runtime(RuntimeMsg::OutputPersist(
+                "GitHub status fetched and saved locally.".to_string(),
+            )),
+        );
+
+        let before = app.history.clone();
+        update(
+            &mut app,
+            UiMsg::Runtime(RuntimeMsg::AssistantDelta {
+                chunk: "late streamed tail".to_string(),
+                done: false,
+            }),
+        );
+        update(
+            &mut app,
+            UiMsg::Runtime(RuntimeMsg::AssistantDelta {
+                chunk: String::new(),
+                done: true,
+            }),
+        );
+
+        assert_eq!(app.history, before);
+        assert!(app.assistant_output_persisted);
+        assert_eq!(app.assistant_stream_line, None);
+    }
+
+    #[test]
+    fn test_second_outputpersist_before_execution_end_replaces_previous_block() {
+        let mut app = App::new(120, 40, false);
+        update(&mut app, UiMsg::SubmitInput("save body".to_string()));
+        update(&mut app, UiMsg::Runtime(RuntimeMsg::PlanningEnd));
+
+        let first = "已保存到本地。\n路径: /tmp/old.txt\n大小: 100 字节".to_string();
+        let final_msg =
+            "已成功保存响应体到本地文件。\n路径: /tmp/new.txt\n大小: 120 字节".to_string();
+        update(&mut app, UiMsg::Runtime(RuntimeMsg::OutputPersist(first)));
+        update(
+            &mut app,
+            UiMsg::Runtime(RuntimeMsg::OutputPersist(final_msg.clone())),
+        );
+
+        let joined = app.history.join("\n");
+        assert!(!joined.contains("/tmp/old.txt"));
+        assert!(joined.contains("/tmp/new.txt"));
+        assert_eq!(
+            app.history
+                .iter()
+                .filter(|line| line.contains("已成功保存响应体到本地文件。"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_stream_provisional_then_final_output_replaces_stream_line() {
+        let mut app = App::new(120, 40, false);
+        update(
+            &mut app,
+            UiMsg::SubmitInput("what was my first line".to_string()),
+        );
+        update(&mut app, UiMsg::Runtime(RuntimeMsg::PlanningEnd));
+
+        update(
+            &mut app,
+            UiMsg::Runtime(RuntimeMsg::AssistantDelta {
+                chunk: "让我先确认上下文...".to_string(),
+                done: false,
+            }),
+        );
+        update(
+            &mut app,
+            UiMsg::Runtime(RuntimeMsg::AssistantDelta {
+                chunk: String::new(),
+                done: true,
+            }),
+        );
+        update(
+            &mut app,
+            UiMsg::Runtime(RuntimeMsg::OutputPersist(
+                "您第一句话说的是：“你好”。".to_string(),
+            )),
+        );
+
+        let joined = app.history.join("\n");
+        assert!(!joined.contains("让我先确认上下文..."));
+        assert!(joined.contains("您第一句话说的是：“你好”。"));
     }
 }

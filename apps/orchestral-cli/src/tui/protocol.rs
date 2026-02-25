@@ -4,6 +4,7 @@ use crossterm::event::KeyEvent;
 #[allow(dead_code)]
 pub enum UiMsg {
     Key(KeyEvent),
+    Paste(String),
     Resize(u16, u16),
     UiTick,
     AnimTick,

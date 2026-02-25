@@ -2,7 +2,7 @@ use std::io;
 
 use anyhow::Context;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, EventStream, MouseEventKind,
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -71,7 +71,22 @@ pub async fn run_tui(
             while let Some(Ok(ev)) = events.next().await {
                 match ev {
                     Event::Key(key) => {
+                        if matches!(key.code, KeyCode::Enter) {
+                            tracing::debug!(
+                                modifiers = ?key.modifiers,
+                                "submit_chain: event_loop received Enter key"
+                            );
+                        }
                         if ui_tx.send(UiMsg::Key(key)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Event::Paste(text) => {
+                        tracing::debug!(
+                            paste_len = text.len(),
+                            "submit_chain: event_loop received paste"
+                        );
+                        if ui_tx.send(UiMsg::Paste(text)).await.is_err() {
                             break;
                         }
                     }
@@ -127,31 +142,56 @@ pub async fn run_tui(
         });
     }
 
-    // Runtime->UI forwarder.
-    {
-        let ui_tx = ui_tx.clone();
-        tokio::spawn(async move {
-            while let Some(msg) = runtime_rx.recv().await {
-                if ui_tx.send(UiMsg::Runtime(msg)).await.is_err() {
-                    break;
-                }
-            }
-        });
-    }
-
     let size = term.terminal_mut().size().context("read terminal size")?;
     app.width = size.width;
     app.height = size.height;
     app.set_dirty();
 
     if let Some(input) = initial_input {
+        tracing::debug!(
+            input_len = input.len(),
+            input_preview = %log_preview(&input, 80),
+            "submit_chain: enqueue initial input"
+        );
         let _ = ui_tx.send(UiMsg::SubmitInput(input)).await;
     }
 
     loop {
-        let Some(msg) = ui_rx.recv().await else {
-            break;
+        let msg = tokio::select! {
+            biased;
+            msg = runtime_rx.recv() => {
+                match msg {
+                    Some(rt_msg) => {
+                        tracing::debug!(msg_type = %runtime_msg_label(&rt_msg), "event_loop: runtime_rx polled");
+                        UiMsg::Runtime(rt_msg)
+                    },
+                    None => continue,
+                }
+            }
+            msg = ui_rx.recv() => {
+                match msg {
+                    Some(ui_msg) => ui_msg,
+                    None => break,
+                }
+            }
         };
+
+        match &msg {
+            UiMsg::SubmitInput(input) => tracing::debug!(
+                turn_id = app.current_turn_id.saturating_add(1),
+                input_len = input.len(),
+                input_preview = %log_preview(input, 80),
+                "submit_chain: event_loop received UiMsg::SubmitInput"
+            ),
+            UiMsg::Paste(text) => tracing::debug!(
+                paste_len = text.len(),
+                "submit_chain: event_loop received UiMsg::Paste"
+            ),
+            UiMsg::Key(key) if matches!(key.code, KeyCode::Enter) => {
+                tracing::debug!("submit_chain: event_loop processing UiMsg::Key(Enter)")
+            }
+            _ => {}
+        }
 
         update(&mut app, msg);
 
@@ -174,6 +214,13 @@ pub async fn run_tui(
         }
 
         if let Some(input) = app.take_pending_submit() {
+            tracing::debug!(
+                turn_id = app.current_turn_id,
+                mode = ?app.mode,
+                input_len = input.len(),
+                input_preview = %log_preview(&input, 80),
+                "submit_chain: pending submit dequeued"
+            );
             let trimmed = input.trim();
             if trimmed == "/exit" || trimmed == "/quit" {
                 app.should_quit = true;
@@ -181,7 +228,13 @@ pub async fn run_tui(
                 let tx = runtime_tx.clone();
                 let client = runtime_client.clone();
                 tokio::spawn(async move {
-                    let _ = client.submit_input(input, tx).await;
+                    tracing::debug!("submit_chain: submit task started");
+                    let result = client.submit_input(input, tx).await;
+                    tracing::debug!(
+                        result_ok = result.is_ok(),
+                        "submit_chain: submit task finished"
+                    );
+                    let _ = result;
                 });
             }
         }
@@ -197,4 +250,27 @@ pub async fn run_tui(
     }
 
     Ok(())
+}
+
+fn runtime_msg_label(msg: &crate::runtime::RuntimeMsg) -> &'static str {
+    use crate::runtime::RuntimeMsg;
+    match msg {
+        RuntimeMsg::PlanningStart => "PlanningStart",
+        RuntimeMsg::PlanningEnd => "PlanningEnd",
+        RuntimeMsg::ExecutionStart { .. } => "ExecutionStart",
+        RuntimeMsg::ExecutionProgress { .. } => "ExecutionProgress",
+        RuntimeMsg::ExecutionEnd => "ExecutionEnd",
+        RuntimeMsg::ActivityStart { .. } => "ActivityStart",
+        RuntimeMsg::ActivityItem { .. } => "ActivityItem",
+        RuntimeMsg::ActivityEnd { .. } => "ActivityEnd",
+        RuntimeMsg::OutputPersist(_) => "OutputPersist",
+        RuntimeMsg::AssistantDelta { .. } => "AssistantDelta",
+        RuntimeMsg::OutputTransient { .. } => "OutputTransient",
+        RuntimeMsg::ApprovalRequested { .. } => "ApprovalRequested",
+        RuntimeMsg::Error(_) => "Error",
+    }
+}
+
+fn log_preview(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
 }

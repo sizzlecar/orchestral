@@ -1,0 +1,11 @@
+[package]
+name = "orchestral"
+description = "Orchestral runtime facade - re-exports core and runtime for convenient access"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+orchestral-core = { workspace = true }
+orchestral-runtime = { workspace = true }

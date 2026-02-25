@@ -14,10 +14,10 @@ use tokio::sync::RwLock;
 
 // Import from orchestral crates
 use orchestral_core::prelude::*;
+use orchestral_core::store::{Event, EventStore, InMemoryEventStore, InMemoryReferenceStore};
 use orchestral_runtime::{
     ConcurrencyDecision, ConcurrencyPolicy, HandleEventResult, RunningState, Thread, ThreadRuntime,
 };
-use orchestral_stores::{Event, EventStore, InMemoryEventStore, InMemoryReferenceStore};
 
 /// A simple echo action that returns the input as output
 struct EchoAction;
