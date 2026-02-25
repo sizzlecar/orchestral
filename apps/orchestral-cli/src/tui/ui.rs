@@ -67,7 +67,7 @@ fn wrapped_line_count(lines: &[Line<'static>], width: usize) -> usize {
                 return 1;
             }
             let display_width = UnicodeWidthStr::width(text.as_str()).max(1);
-            (display_width + width - 1) / width
+            display_width.div_ceil(width)
         })
         .sum()
 }
