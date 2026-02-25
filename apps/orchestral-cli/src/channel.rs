@@ -8,6 +8,7 @@ use orchestral_runtime::api::{
 };
 use thiserror::Error;
 use tokio::sync::{broadcast, RwLock};
+use tracing::debug;
 
 #[derive(Debug, Error)]
 pub enum ChannelError {
@@ -55,6 +56,14 @@ impl CliChannel {
         input: String,
     ) -> Result<InteractionSubmitResponse, ChannelError> {
         let thread_id = self.bind_session(session_key).await?;
+        debug!(
+            session_key = %session_key,
+            thread_id = %thread_id,
+            request_id = ?request_id,
+            input_len = input.len(),
+            input_preview = %log_preview(&input, 80),
+            "submit_chain: cli_channel submit_input"
+        );
         let request = InteractionSubmitRequest { request_id, input };
         self.api
             .submit_interaction(&thread_id, request)
@@ -77,9 +86,19 @@ impl CliChannel {
 
     async fn bind_session(&self, session_key: &str) -> Result<String, ChannelError> {
         if let Some(thread_id) = self.binding_store.get_thread_id(session_key).await {
+            debug!(
+                session_key = %session_key,
+                thread_id = %thread_id,
+                "submit_chain: cli_channel reuse thread binding"
+            );
             return Ok(thread_id);
         }
         let thread = self.api.create_thread(None).await?;
+        debug!(
+            session_key = %session_key,
+            thread_id = %thread.id,
+            "submit_chain: cli_channel created thread binding"
+        );
         self.binding_store
             .set_thread_id(session_key, thread.id.clone())
             .await;
@@ -101,10 +120,16 @@ impl CliRuntime {
         thread_id_override: Option<String>,
     ) -> Result<Self, ChannelError> {
         let binding_store = Arc::new(InMemoryChannelBindingStore::new());
+        let thread_id_override_for_log = thread_id_override.clone();
         let thread = match thread_id_override {
             Some(thread_id) => api.create_thread(Some(thread_id)).await?,
             None => api.create_thread(None).await?,
         };
+        debug!(
+            thread_id = %thread.id,
+            thread_id_override = ?thread_id_override_for_log,
+            "submit_chain: cli_runtime initialized thread"
+        );
         let session_key = format!("cli:{}", thread.id);
         binding_store
             .set_thread_id(&session_key, thread.id.clone())
@@ -131,6 +156,13 @@ impl CliRuntime {
         &self,
         input: String,
     ) -> Result<InteractionSubmitResponse, ChannelError> {
+        debug!(
+            thread_id = %self.thread_id,
+            session_key = %self.session_key,
+            input_len = input.len(),
+            input_preview = %log_preview(&input, 80),
+            "submit_chain: cli_runtime submit_input"
+        );
         self.channel
             .submit_input(&self.session_key, Some("tui".to_string()), input)
             .await
@@ -141,4 +173,8 @@ impl CliRuntime {
         app.orchestrator.thread_runtime.cancel_all_active().await;
         Ok(())
     }
+}
+
+fn log_preview(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
 }
