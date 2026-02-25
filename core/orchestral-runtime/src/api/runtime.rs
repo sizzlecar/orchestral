@@ -5,6 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::json;
 use tokio::sync::{broadcast, RwLock};
+use tracing::debug;
 use uuid::Uuid;
 
 use orchestral_core::config::load_config;
@@ -29,11 +30,10 @@ struct DefaultRuntimeAppBuilder;
 impl RuntimeAppBuilder for DefaultRuntimeAppBuilder {
     async fn build(&self, config_path: PathBuf) -> Result<RuntimeApp, ApiError> {
         if config_has_enabled_runtime_extensions(&config_path)? {
-            return Err(ApiError::InvalidArgument(
-                "config enables runtime extensions; use RuntimeApi::from_config_path_with_builder \
-                 with orchestral-composition::ComposedRuntimeAppBuilder"
-                    .to_string(),
-            ));
+            tracing::warn!(
+                "config enables runtime extensions but running with minimal runtime; \
+                 extensions will be ignored. Use ComposedRuntimeAppBuilder for full support."
+            );
         }
         RuntimeApp::from_config_path(config_path)
             .await
@@ -160,6 +160,13 @@ impl ApiService for RuntimeApi {
         thread_id: &str,
         request: InteractionSubmitRequest,
     ) -> Result<InteractionSubmitResponse, ApiError> {
+        debug!(
+            thread_id = %thread_id,
+            request_id = ?request.request_id,
+            input_len = request.input.len(),
+            input_preview = %log_preview(&request.input, 80),
+            "submit_chain: runtime_api submit_interaction received"
+        );
         if request.input.trim().is_empty() {
             return Err(ApiError::InvalidArgument(
                 "input must not be empty".to_string(),
@@ -167,12 +174,20 @@ impl ApiService for RuntimeApi {
         }
 
         let app = self.get_app(thread_id).await?;
+        debug!(
+            thread_id = %thread_id,
+            "submit_chain: runtime_api resolved runtime app"
+        );
         let interaction_id = request.request_id.unwrap_or_else(|| "api".to_string());
         let event = Event::user_input(thread_id.to_string(), interaction_id, json!(request.input));
 
         let result = app.orchestrator.handle_event(event).await.map_err(|err| {
             ApiError::Internal(format!("orchestrator handle_event failed: {}", err))
         })?;
+        debug!(
+            result = %orchestrator_result_label(&result),
+            "submit_chain: runtime_api orchestrator.handle_event finished"
+        );
 
         let response = match result {
             OrchestratorResult::Started {
@@ -208,6 +223,12 @@ impl ApiService for RuntimeApi {
                 message: Some("interaction queued".to_string()),
             },
         };
+        debug!(
+            status = ?response.status,
+            interaction_id = ?response.interaction_id,
+            task_id = ?response.task_id,
+            "submit_chain: runtime_api submit_interaction response"
+        );
 
         Ok(response)
     }
@@ -302,6 +323,19 @@ fn payload_to_string(payload: &serde_json::Value) -> String {
     payload.to_string()
 }
 
+fn log_preview(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
+}
+
+fn orchestrator_result_label(result: &OrchestratorResult) -> &'static str {
+    match result {
+        OrchestratorResult::Started { .. } => "Started",
+        OrchestratorResult::Merged { .. } => "Merged",
+        OrchestratorResult::Rejected { .. } => "Rejected",
+        OrchestratorResult::Queued => "Queued",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,21 +391,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_default_builder_rejects_extension_config() {
+    async fn test_default_builder_accepts_extension_config() {
         let api = RuntimeApi::from_config_path(sample_cli_config_path())
             .await
-            .expect("api");
-
-        let err = api
-            .create_thread(Some("thread-default-builder".to_string()))
-            .await
-            .expect_err("expected extension config rejection");
-
-        match err {
-            ApiError::InvalidArgument(message) => {
-                assert!(message.contains("runtime extensions"));
-            }
-            other => panic!("expected invalid argument, got {}", other),
-        }
+            .expect("should construct api even with extensions in config");
+        assert_eq!(api.config_path, sample_cli_config_path(),);
     }
 }

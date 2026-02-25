@@ -53,8 +53,15 @@ impl ActionRegistryManager {
     ) -> Result<usize, ActionConfigError> {
         let mut registry = ActionRegistry::new();
         for spec in &config.actions {
-            let action = self.factory.build(spec)?;
-            registry.register(action);
+            match self.factory.build(spec) {
+                Ok(action) => {
+                    registry.register(action);
+                }
+                Err(super::factory::ActionBuildError::UnknownKind(ref kind)) => {
+                    tracing::warn!(kind = %kind, "skipping unknown action kind (may require an extension)");
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
 
         let mut current = self.registry.write().await;

@@ -253,6 +253,13 @@ fn requires_destructive_approval(
 
     if use_shell {
         let tokens = expression_command_tokens(command);
+        if tokens.contains("find")
+            && (tokens.contains("-delete")
+                || tokens.contains("--delete")
+                || tokens.contains("delete"))
+        {
+            return true;
+        }
         if tokens.contains("git") && tokens.contains("reset") {
             return true;
         }
@@ -264,6 +271,11 @@ fn requires_destructive_approval(
             .first()
             .map(|s| s.eq_ignore_ascii_case("reset"))
             .unwrap_or(false);
+    }
+    if command_name == "find" {
+        return args
+            .iter()
+            .any(|arg| matches!(arg.to_ascii_lowercase().as_str(), "-delete" | "--delete"));
     }
     destructive.contains(&command_name)
 }
@@ -321,9 +333,20 @@ async fn approval_decision_from_ctx(ctx: &ActionContext) -> Option<ApprovalDecis
         }
     }
     let message = payload
-        .get("message")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)?;
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| {
+            payload
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            payload
+                .get("text")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })?;
     let decision = parse_approval_decision(&message)?;
     // Consume the resume input once interpreted as an approval decision.
     ws.remove_task("resume_user_input");
@@ -1442,6 +1465,79 @@ mod tests {
             Arc::new(RwLock::new(WorkingSet::new())),
             Arc::new(NoopReferenceStore),
         )
+    }
+
+    #[test]
+    fn test_approval_decision_from_ctx_reads_string_payload() {
+        tokio_test::block_on(async {
+            let ctx = test_ctx();
+            {
+                let mut ws = ctx.working_set.write().await;
+                ws.set_task("resume_user_input", json!("/approve"));
+            }
+
+            let decision = approval_decision_from_ctx(&ctx).await;
+            assert_eq!(decision, Some(ApprovalDecision::Approve));
+
+            let ws = ctx.working_set.read().await;
+            assert!(ws.get_task("resume_user_input").is_none());
+        });
+    }
+
+    #[test]
+    fn test_approval_decision_from_ctx_reads_object_message() {
+        tokio_test::block_on(async {
+            let ctx = test_ctx();
+            {
+                let mut ws = ctx.working_set.write().await;
+                ws.set_task("resume_user_input", json!({"message": "/deny"}));
+            }
+
+            let decision = approval_decision_from_ctx(&ctx).await;
+            assert_eq!(decision, Some(ApprovalDecision::Deny));
+
+            let ws = ctx.working_set.read().await;
+            assert!(ws.get_task("resume_user_input").is_none());
+        });
+    }
+
+    #[test]
+    fn test_requires_destructive_approval_for_find_delete_shell_expression() {
+        assert!(requires_destructive_approval(
+            true,
+            "find",
+            "find . -name github_status.json -delete",
+            &[],
+        ));
+    }
+
+    #[test]
+    fn test_requires_destructive_approval_for_find_delete_args() {
+        assert!(requires_destructive_approval(
+            false,
+            "find",
+            "find",
+            &[
+                ".".to_string(),
+                "-name".to_string(),
+                "github_status.json".to_string(),
+                "-delete".to_string(),
+            ],
+        ));
+    }
+
+    #[test]
+    fn test_requires_destructive_approval_for_find_without_delete() {
+        assert!(!requires_destructive_approval(
+            false,
+            "find",
+            "find",
+            &[
+                ".".to_string(),
+                "-name".to_string(),
+                "github_status.json".to_string()
+            ],
+        ));
     }
 
     #[test]
