@@ -34,6 +34,12 @@ ingestion:
   auto_for_assistant_outputs: true
 
 extensions:
+  mcp:
+    enabled: true
+    auto_discover: true
+  skill:
+    enabled: true
+    auto_discover: true
   # Backward-compatible alias: you may use `plugins:` with the same structure.
   runtime:
     # Optional docs ingestion extension (async parse/chunk/embed pipeline).

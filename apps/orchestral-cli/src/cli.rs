@@ -18,10 +18,16 @@ enum Command {
 
 #[derive(Debug, Args, Clone)]
 struct RunArgs {
-    #[arg(long, default_value = "configs/orchestral.cli.yaml")]
-    config: PathBuf,
+    #[arg(long)]
+    config: Option<PathBuf>,
     #[arg(long)]
     thread_id: Option<String>,
+    /// Disable MCP action auto-discovery and registration
+    #[arg(long)]
+    no_mcp: bool,
+    /// Disable Skill action auto-discovery and registration
+    #[arg(long)]
+    no_skills: bool,
     /// Read multi-turn inputs from file (one turn per line; '#' comments supported)
     #[arg(long)]
     script: Option<PathBuf>,
@@ -43,26 +49,30 @@ impl Cli {
                 } else {
                     Some(args.input.join(" "))
                 };
-                crate::tui::run_session(
-                    args.config,
-                    args.thread_id,
+                crate::tui::run_session(crate::tui::SessionRunOptions {
+                    config: args.config,
+                    thread_id: args.thread_id,
+                    no_mcp: args.no_mcp,
+                    no_skills: args.no_skills,
                     initial_input,
-                    args.script,
-                    args.once,
-                    args.verbose,
-                )
+                    script_path: args.script,
+                    once: args.once,
+                    verbose: args.verbose,
+                })
                 .await
             }
             None => {
                 ensure_log_filter(false);
-                crate::tui::run_session(
-                    PathBuf::from("configs/orchestral.cli.yaml"),
-                    None,
-                    None,
-                    None,
-                    false,
-                    false,
-                )
+                crate::tui::run_session(crate::tui::SessionRunOptions {
+                    config: None,
+                    thread_id: None,
+                    no_mcp: false,
+                    no_skills: false,
+                    initial_input: None,
+                    script_path: None,
+                    once: false,
+                    verbose: false,
+                })
                 .await
             }
         }

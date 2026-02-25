@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -6,8 +7,9 @@ use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::time::{timeout, Duration};
 use tracing::{debug, warn};
 
+use orchestral_composition::{ComposedRuntimeAppBuilder, RuntimeTarget};
 use orchestral_core::store::Event as ChannelEvent;
-use orchestral_runtime::api::{RuntimeApi, SubmitStatus};
+use orchestral_runtime::api::{RuntimeApi, RuntimeAppBuilder, SubmitStatus};
 
 use crate::channel::CliRuntime;
 
@@ -27,11 +29,14 @@ pub struct RuntimeClient {
 
 impl RuntimeClient {
     pub async fn from_config(
-        config: PathBuf,
+        config: Option<PathBuf>,
         thread_id_override: Option<String>,
     ) -> anyhow::Result<Self> {
+        let config = resolve_runtime_config_path(config)?;
+        let app_builder: Arc<dyn RuntimeAppBuilder> =
+            Arc::new(ComposedRuntimeAppBuilder::new(RuntimeTarget::Cli));
         let api = Arc::new(
-            RuntimeApi::from_config_path(config)
+            RuntimeApi::from_config_path_with_builder(config, app_builder)
                 .await
                 .context("failed to build runtime api")?,
         );
@@ -731,6 +736,177 @@ impl RuntimeClient {
             })
             .await;
     }
+}
+
+const GENERATED_CONFIG_DIR: &str = ".orchestral/generated";
+const GENERATED_CONFIG_FILE: &str = "default.cli.yaml";
+
+fn resolve_runtime_config_path(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    if let Some(path) = explicit {
+        if !path.exists() {
+            anyhow::bail!("config file not found: {}", path.display());
+        }
+        return Ok(path);
+    }
+
+    if let Some(found) = discover_config_path() {
+        return Ok(found);
+    }
+
+    generate_default_config()
+}
+
+fn discover_config_path() -> Option<PathBuf> {
+    let candidates = [
+        PathBuf::from(".orchestral/config.yaml"),
+        PathBuf::from(".orchestral/config.yml"),
+        PathBuf::from("configs/orchestral.cli.yaml"),
+        PathBuf::from("configs/orchestral.yaml"),
+        PathBuf::from("orchestral.yaml"),
+    ];
+    candidates.into_iter().find(|path| path.exists())
+}
+
+fn generate_default_config() -> anyhow::Result<PathBuf> {
+    let cwd = std::env::current_dir().context("resolve current directory failed")?;
+    let dir = cwd.join(GENERATED_CONFIG_DIR);
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("create default config dir '{}' failed", dir.display()))?;
+    let path = dir.join(GENERATED_CONFIG_FILE);
+
+    let needs_write = match fs::read_to_string(&path) {
+        Ok(existing) => existing != embedded_default_config(),
+        Err(_) => true,
+    };
+
+    if needs_write {
+        fs::write(&path, embedded_default_config())
+            .with_context(|| format!("write generated config '{}' failed", path.display()))?;
+    }
+
+    Ok(path)
+}
+
+fn embedded_default_config() -> &'static str {
+    r#"version: 1
+
+app:
+  name: orchestral-cli
+  environment: development
+
+runtime:
+  max_interactions_per_thread: 10
+  auto_cleanup: true
+  concurrency_policy: interrupt_and_start_new
+  strict_exports: true
+
+planner:
+  mode: llm
+  backend: openai
+  model_profile: fast
+  max_history: 20
+  dynamic_model_selection: true
+
+interpreter:
+  mode: auto
+
+context:
+  history_limit: 50
+  max_tokens: 4096
+  include_history: true
+  include_references: true
+
+extensions:
+  mcp:
+    enabled: true
+    auto_discover: true
+  skill:
+    enabled: true
+    auto_discover: true
+
+providers:
+  default_backend: openai
+  default_model: fast
+  backends:
+    - name: openai
+      kind: openai
+      api_key_env: OPENAI_API_KEY
+      config:
+        timeout_secs: 30
+  models:
+    - name: fast
+      backend: openai
+      model: gpt-4o-mini
+      temperature: 0.2
+
+actions:
+  hot_reload: false
+  actions:
+    - name: echo
+      kind: echo
+      description: Echo text back.
+      interface:
+        input_schema:
+          type: object
+          properties:
+            message:
+              type: string
+          required: [message]
+        output_schema:
+          type: object
+          properties:
+            result:
+              type: string
+          required: [result]
+      config:
+        prefix: "Echo: "
+    - name: shell
+      kind: shell
+      description: Run a shell command.
+      interface:
+        input_schema:
+          type: object
+          properties:
+            command:
+              type: string
+            args:
+              type: array
+              items:
+                type: string
+          required: [command]
+        output_schema:
+          type: object
+          properties:
+            stdout:
+              type: string
+            stderr:
+              type: string
+            status:
+              type: integer
+          required: [stdout, stderr, status]
+      config:
+        timeout_ms: 10000
+    - name: file_read
+      kind: file_read
+      description: Read a file from workspace.
+      interface:
+        input_schema:
+          type: object
+          properties:
+            path:
+              type: string
+          required: [path]
+        output_schema:
+          type: object
+          properties:
+            content:
+              type: string
+            path:
+              type: string
+          required: [content, path]
+      config:
+        root_dir: "."
+"#
 }
 
 fn mark_turn_settled(turn_settled_tx: &mut Option<oneshot::Sender<()>>) {

@@ -38,6 +38,18 @@ ingestion:
   auto_for_assistant_outputs: true
 
 extensions:
+  mcp:
+    enabled: true
+    auto_discover: true
+    # Optional extra discovery files:
+    # discover_paths:
+    #   - ".mcp.json"
+  skill:
+    enabled: true
+    auto_discover: true
+    # Optional extra skill directories:
+    # directories:
+    #   - ".claude/skills"
   # Backward-compatible alias: you may use `plugins:` with the same structure.
   runtime:
     - name: builtin.docs_assistant
