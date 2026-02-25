@@ -12,6 +12,9 @@ pub enum ModalAction {
 pub trait ModalView: Send {
     fn title(&self) -> &str;
     fn lines(&self) -> Vec<String>;
+    fn anchor_to_input(&self) -> bool {
+        false
+    }
     fn command_prefix(&self) -> Option<&str> {
         None
     }
@@ -69,6 +72,10 @@ impl ApprovalModal {
 impl ModalView for ApprovalModal {
     fn title(&self) -> &str {
         "Approval Required"
+    }
+
+    fn anchor_to_input(&self) -> bool {
+        true
     }
 
     fn lines(&self) -> Vec<String> {
