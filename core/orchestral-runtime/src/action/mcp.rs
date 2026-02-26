@@ -278,6 +278,7 @@ impl Action for McpServerAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_capabilities(["mcp", "side_effect", "tool_invocation"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {

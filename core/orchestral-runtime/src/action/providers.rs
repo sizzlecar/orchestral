@@ -9,31 +9,80 @@ use orchestral_core::config::{
     ActionInterfaceSpec, ActionSpec, ConfigError, McpServerSpec, OrchestralConfig,
 };
 
-pub fn collect_action_specs(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionSpecSource {
+    McpDiscovery,
+    McpConfig,
+    SkillDiscovery,
+    ActionConfig,
+}
+
+impl ActionSpecSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::McpDiscovery => "mcp_discovery",
+            Self::McpConfig => "mcp_config",
+            Self::SkillDiscovery => "skill_discovery",
+            Self::ActionConfig => "action_config",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ActionRegistrationSpec {
+    pub source: ActionSpecSource,
+    pub spec: ActionSpec,
+}
+
+pub fn collect_action_registration_specs(
     config: &OrchestralConfig,
     config_path: &Path,
-) -> Result<Vec<ActionSpec>, ConfigError> {
+) -> Result<Vec<ActionRegistrationSpec>, ConfigError> {
     let mut all = Vec::new();
 
     // Registration order defines override priority because ActionRegistry::register replaces
     // existing actions with the same name.
     // priority: mcp < skill < explicit user actions
-    all.extend(collect_mcp_action_specs(config, config_path)?);
-    all.extend(collect_skill_action_specs(config, config_path)?);
-    all.extend(config.actions.actions.clone());
+    all.extend(collect_mcp_action_registration_specs(config, config_path)?);
+    all.extend(collect_skill_action_registration_specs(
+        config,
+        config_path,
+    )?);
+    all.extend(
+        config
+            .actions
+            .actions
+            .iter()
+            .cloned()
+            .map(|spec| ActionRegistrationSpec {
+                source: ActionSpecSource::ActionConfig,
+                spec,
+            }),
+    );
 
     Ok(all)
 }
 
+#[cfg(test)]
 fn collect_mcp_action_specs(
     config: &OrchestralConfig,
     config_path: &Path,
 ) -> Result<Vec<ActionSpec>, ConfigError> {
+    Ok(collect_mcp_action_registration_specs(config, config_path)?
+        .into_iter()
+        .map(|registration| registration.spec)
+        .collect())
+}
+
+fn collect_mcp_action_registration_specs(
+    config: &OrchestralConfig,
+    config_path: &Path,
+) -> Result<Vec<ActionRegistrationSpec>, ConfigError> {
     if !config.extensions.mcp.enabled || env_disable_flag("ORCHESTRAL_DISABLE_MCP") {
         return Ok(Vec::new());
     }
 
-    let mut servers: HashMap<String, ResolvedMcpServer> = HashMap::new();
+    let mut servers: HashMap<String, SourcedMcpServer> = HashMap::new();
 
     if config.extensions.mcp.auto_discover {
         for path in candidate_mcp_paths(config, config_path) {
@@ -49,13 +98,25 @@ fn collect_mcp_action_specs(
                 ))
             })?;
             for (name, server) in discovered {
-                servers.insert(name, server);
+                servers.insert(
+                    name,
+                    SourcedMcpServer {
+                        source: ActionSpecSource::McpDiscovery,
+                        server,
+                    },
+                );
             }
         }
     }
 
     for spec in &config.extensions.mcp.servers {
-        servers.insert(spec.name.clone(), ResolvedMcpServer::from_config_spec(spec));
+        servers.insert(
+            spec.name.clone(),
+            SourcedMcpServer {
+                source: ActionSpecSource::McpConfig,
+                server: ResolvedMcpServer::from_config_spec(spec),
+            },
+        );
     }
 
     let mut names = servers.keys().cloned().collect::<Vec<_>>();
@@ -63,9 +124,11 @@ fn collect_mcp_action_specs(
 
     let mut actions = Vec::new();
     for name in names {
-        let Some(server) = servers.get(&name).cloned() else {
+        let Some(entry) = servers.get(&name).cloned() else {
             continue;
         };
+        let source = entry.source;
+        let server = entry.server;
         if !server.enabled {
             continue;
         }
@@ -112,35 +175,51 @@ fn collect_mcp_action_specs(
             }),
         };
 
-        actions.push(ActionSpec {
-            name: action_name,
-            kind: "mcp_server".to_string(),
-            description: Some(description),
-            config: json!({
-                "server_name": name,
-                "command": server.command,
-                "args": server.args,
-                "env": server.env,
-                "url": server.url,
-                "headers": server.headers,
-                "bearer_token_env_var": server.bearer_token_env_var,
-                "required": server.required,
-                "startup_timeout_ms": server.startup_timeout_ms,
-                "tool_timeout_ms": server.tool_timeout_ms,
-                "enabled_tools": server.enabled_tools,
-                "disabled_tools": server.disabled_tools,
-            }),
-            interface: Some(interface),
+        actions.push(ActionRegistrationSpec {
+            source,
+            spec: ActionSpec {
+                name: action_name,
+                kind: "mcp_server".to_string(),
+                description: Some(description),
+                config: json!({
+                    "server_name": name,
+                    "command": server.command,
+                    "args": server.args,
+                    "env": server.env,
+                    "url": server.url,
+                    "headers": server.headers,
+                    "bearer_token_env_var": server.bearer_token_env_var,
+                    "required": server.required,
+                    "startup_timeout_ms": server.startup_timeout_ms,
+                    "tool_timeout_ms": server.tool_timeout_ms,
+                    "enabled_tools": server.enabled_tools,
+                    "disabled_tools": server.disabled_tools,
+                }),
+                interface: Some(interface),
+            },
         });
     }
 
     Ok(actions)
 }
 
+#[cfg(test)]
 fn collect_skill_action_specs(
     config: &OrchestralConfig,
     config_path: &Path,
 ) -> Result<Vec<ActionSpec>, ConfigError> {
+    Ok(
+        collect_skill_action_registration_specs(config, config_path)?
+            .into_iter()
+            .map(|registration| registration.spec)
+            .collect(),
+    )
+}
+
+fn collect_skill_action_registration_specs(
+    config: &OrchestralConfig,
+    config_path: &Path,
+) -> Result<Vec<ActionRegistrationSpec>, ConfigError> {
     if !config.extensions.skill.enabled || env_disable_flag("ORCHESTRAL_DISABLE_SKILLS") {
         return Ok(Vec::new());
     }
@@ -152,7 +231,7 @@ fn collect_skill_action_specs(
         }
     }
 
-    let mut actions_by_name: HashMap<String, ActionSpec> = HashMap::new();
+    let mut actions_by_name: HashMap<String, ActionRegistrationSpec> = HashMap::new();
 
     for file in files {
         let content = match fs::read_to_string(&file) {
@@ -176,9 +255,10 @@ fn collect_skill_action_specs(
             .unwrap_or_else(|| "skill".to_string());
 
         let action_name = format!("skill__{}", sanitize_identifier(&skill_name));
-        let description = meta
-            .description
-            .unwrap_or_else(|| format!("Expose skill '{}' instructions", skill_name));
+        let description = append_skill_instruction_only_note(
+            meta.description
+                .unwrap_or_else(|| format!("Expose skill '{}' instructions", skill_name)),
+        );
         let interface = ActionInterfaceSpec {
             input_schema: json!({
                 "type": "object",
@@ -200,16 +280,19 @@ fn collect_skill_action_specs(
 
         actions_by_name.insert(
             action_name.clone(),
-            ActionSpec {
-                name: action_name,
-                kind: "skill_prompt".to_string(),
-                description: Some(description),
-                config: json!({
-                    "skill_name": skill_name,
-                    "source_path": file.to_string_lossy().to_string(),
-                    "content": content,
-                }),
-                interface: Some(interface),
+            ActionRegistrationSpec {
+                source: ActionSpecSource::SkillDiscovery,
+                spec: ActionSpec {
+                    name: action_name,
+                    kind: "skill_prompt".to_string(),
+                    description: Some(description),
+                    config: json!({
+                        "skill_name": skill_name,
+                        "source_path": file.to_string_lossy().to_string(),
+                        "content": content,
+                    }),
+                    interface: Some(interface),
+                },
             },
         );
     }
@@ -382,6 +465,12 @@ struct ResolvedMcpServer {
     disabled_tools: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+struct SourcedMcpServer {
+    source: ActionSpecSource,
+    server: ResolvedMcpServer,
+}
+
 impl ResolvedMcpServer {
     fn from_config_spec(spec: &McpServerSpec) -> Self {
         Self {
@@ -520,6 +609,15 @@ fn env_disable_flag(var_name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn append_skill_instruction_only_note(description: String) -> String {
+    const NOTE: &str =
+        "Instruction-only: returns skill guidance text and does not directly modify files or call tools.";
+    if description.contains(NOTE) {
+        return description;
+    }
+    format!("{} {}", description.trim(), NOTE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -642,6 +740,11 @@ mod tests {
         assert_eq!(action.name, "skill__demo-skill");
         assert_eq!(action.kind, "skill_prompt");
         assert_eq!(action.config["skill_name"], "demo-skill");
+        assert!(action
+            .description
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Instruction-only: returns skill guidance text"));
         assert!(action.config["source_path"].as_str().is_some());
         assert!(action
             .config
@@ -711,7 +814,11 @@ mod tests {
             interface: None,
         }];
 
-        let specs = collect_action_specs(&config, &config_path).expect("collect should work");
+        let specs = collect_action_registration_specs(&config, &config_path)
+            .expect("collect should work")
+            .into_iter()
+            .map(|registration| registration.spec)
+            .collect::<Vec<_>>();
         let mcp_pos = specs
             .iter()
             .position(|s| s.kind == "mcp_server" && s.name == "mcp__alpha")
@@ -721,6 +828,60 @@ mod tests {
             .position(|s| s.kind == "echo" && s.name == "mcp__alpha")
             .expect("explicit action present");
         assert!(explicit_pos > mcp_pos);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn collect_action_registration_specs_records_sources() {
+        let dir = test_temp_dir("providers-sources");
+        let config_path = dir.join("orchestral.yaml");
+        fs::write(&config_path, "version: 1\n").expect("write config placeholder");
+        fs::write(
+            dir.join(".mcp.json"),
+            r#"{
+  "mcpServers": {
+    "alpha": {"url": "http://127.0.0.1:8787/mcp", "enabled": true}
+  }
+}"#,
+        )
+        .expect("write discovery file");
+
+        let skill_dir = dir.join(".claude/skills/demo");
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo-skill\ndescription: demo description\n---\nbody content\n",
+        )
+        .expect("write skill");
+
+        let mut config = OrchestralConfig::default();
+        config.extensions.mcp.enabled = true;
+        config.extensions.mcp.auto_discover = true;
+        config.extensions.skill.enabled = true;
+        config.extensions.skill.auto_discover = true;
+        config.actions.actions = vec![ActionSpec {
+            name: "echo_demo".to_string(),
+            kind: "echo".to_string(),
+            description: Some("explicit action".to_string()),
+            config: json!({"prefix":"Echo: "}),
+            interface: None,
+        }];
+
+        let registrations = collect_action_registration_specs(&config, &config_path)
+            .expect("collect registrations should work");
+        assert!(registrations.iter().any(|registration| {
+            registration.spec.name == "mcp__alpha"
+                && registration.source == ActionSpecSource::McpDiscovery
+        }));
+        assert!(registrations.iter().any(|registration| {
+            registration.spec.name == "skill__demo-skill"
+                && registration.source == ActionSpecSource::SkillDiscovery
+        }));
+        assert!(registrations.iter().any(|registration| {
+            registration.spec.name == "echo_demo"
+                && registration.source == ActionSpecSource::ActionConfig
+        }));
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -774,5 +935,13 @@ mod tests {
         std::env::set_var(&key, "0");
         assert!(!env_disable_flag(&key));
         std::env::remove_var(&key);
+    }
+
+    #[test]
+    fn append_skill_instruction_only_note_is_idempotent() {
+        let desc = "demo skill".to_string();
+        let once = append_skill_instruction_only_note(desc);
+        let twice = append_skill_instruction_only_note(once.clone());
+        assert_eq!(once, twice);
     }
 }

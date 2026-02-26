@@ -365,6 +365,19 @@ fn truncate_utf8_lossy(bytes: &[u8], max_bytes: usize) -> (String, bool, usize) 
     )
 }
 
+fn stderr_preview(stderr: &str, max_chars: usize) -> String {
+    let compact = stderr.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        return "<empty>".to_string();
+    }
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+    let mut out = compact.chars().take(max_chars).collect::<String>();
+    out.push_str("...");
+    out
+}
+
 fn bounded_u64(value: Option<u64>, default: usize, hard_max: usize) -> usize {
     value
         .and_then(|v| usize::try_from(v).ok())
@@ -484,6 +497,7 @@ impl Action for EchoAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_capability("pure")
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
@@ -569,6 +583,7 @@ impl Action for HttpAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_capabilities(["network_io", "side_effect"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
@@ -688,6 +703,7 @@ pub struct ShellAction {
     description: String,
     working_dir: Option<PathBuf>,
     timeout_ms: Option<u64>,
+    fail_on_non_zero: bool,
     allow_shell_expression: bool,
     allowed_commands: Option<HashSet<String>>,
     blocked_commands: HashSet<String>,
@@ -702,6 +718,7 @@ impl ShellAction {
     pub fn from_spec(spec: &ActionSpec) -> Self {
         let working_dir = config_string(&spec.config, "working_dir").map(PathBuf::from);
         let timeout_ms = config_u64(&spec.config, "timeout_ms");
+        let fail_on_non_zero = config_bool(&spec.config, "fail_on_non_zero").unwrap_or(true);
         let allow_shell_expression =
             config_bool(&spec.config, "allow_shell_expression").unwrap_or(false);
         let allowed_commands_vec = config_string_array(&spec.config, "allowed_commands");
@@ -765,6 +782,7 @@ impl ShellAction {
             description: spec.description_or("Runs a shell command"),
             working_dir,
             timeout_ms,
+            fail_on_non_zero,
             allow_shell_expression,
             allowed_commands,
             blocked_commands,
@@ -789,6 +807,7 @@ impl Action for ShellAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_capabilities(["filesystem_write", "shell", "side_effect", "verification"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
@@ -806,6 +825,10 @@ impl Action for ShellAction {
                     "shell": {
                         "type": "boolean",
                         "description": "Set true to force shell expression mode (`sh -c command`)."
+                    },
+                    "fail_on_non_zero": {
+                        "type": "boolean",
+                        "description": "When true, non-zero exit status returns an action error. Defaults to true."
                     },
                     "sandbox_mode": {
                         "type": "string",
@@ -878,6 +901,8 @@ impl Action for ShellAction {
         };
         let args = params_get_array(params, "args");
         let mut use_shell = params_get_bool(params, "shell").unwrap_or(self.allow_shell_expression);
+        let fail_on_non_zero =
+            params_get_bool(params, "fail_on_non_zero").unwrap_or(self.fail_on_non_zero);
         let approved = params_get_bool(params, "approved").unwrap_or(false);
         let looks_like_expression =
             contains_shell_metacharacters(&command) || command.contains(' ');
@@ -1064,6 +1089,7 @@ impl Action for ShellAction {
         let stderr_truncated = stderr_truncated || stderr_stream_truncated;
         let status = wait_result.0.as_ref().and_then(|s| s.code()).unwrap_or(-1);
         let timed_out = wait_result.1;
+        let stderr_summary = stderr_preview(&stderr, 280);
 
         let mut exports = Map::new();
         exports.insert("stdout".to_string(), Value::String(stdout));
@@ -1094,6 +1120,19 @@ impl Action for ShellAction {
             "env_policy".to_string(),
             Value::String(self.env_policy.as_str().to_string()),
         );
+
+        if timed_out {
+            return ActionResult::error(match self.timeout_ms {
+                Some(ms) => format!("Shell command timed out after {} ms", ms),
+                None => "Shell command timed out".to_string(),
+            });
+        }
+        if fail_on_non_zero && status != 0 {
+            return ActionResult::error(format!(
+                "Shell command exited with status {}. stderr={}",
+                status, stderr_summary,
+            ));
+        }
         ActionResult::success_with(exports.into_iter().collect())
     }
 }
@@ -1135,6 +1174,7 @@ impl Action for FileReadAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_capabilities(["filesystem_read", "read_only", "verification"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
@@ -1275,6 +1315,7 @@ impl Action for FileWriteAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_capabilities(["filesystem_write", "side_effect"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
@@ -1731,6 +1772,65 @@ mod tests {
                         exports.get("env_policy").and_then(|v| v.as_str()),
                         Some("minimal")
                     );
+                }
+                other => panic!("expected success, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn test_shell_non_zero_exit_is_error_by_default() {
+        tokio_test::block_on(async {
+            let spec = ActionSpec {
+                name: "shell".to_string(),
+                kind: "shell".to_string(),
+                description: None,
+                config: json!({
+                    "sandbox_mode": "none"
+                }),
+                interface: None,
+            };
+            let action = ShellAction::from_spec(&spec);
+            let input = ActionInput::with_params(json!({
+                "command": "sh",
+                "args": ["-c", "exit 7"]
+            }));
+            let result = action.run(input, test_ctx()).await;
+            match result {
+                ActionResult::Error { message } => {
+                    assert!(
+                        message.contains("status 7"),
+                        "unexpected message: {}",
+                        message
+                    );
+                }
+                other => panic!("expected error, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn test_shell_can_allow_non_zero_exit() {
+        tokio_test::block_on(async {
+            let spec = ActionSpec {
+                name: "shell".to_string(),
+                kind: "shell".to_string(),
+                description: None,
+                config: json!({
+                    "sandbox_mode": "none",
+                    "fail_on_non_zero": false
+                }),
+                interface: None,
+            };
+            let action = ShellAction::from_spec(&spec);
+            let input = ActionInput::with_params(json!({
+                "command": "sh",
+                "args": ["-c", "exit 9"]
+            }));
+            let result = action.run(input, test_ctx()).await;
+            match result {
+                ActionResult::Success { exports } => {
+                    assert_eq!(exports.get("status").and_then(|v| v.as_i64()), Some(9));
                 }
                 other => panic!("expected success, got {:?}", other),
             }

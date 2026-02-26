@@ -62,6 +62,7 @@ impl Action for SkillPromptAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_capabilities(["instruction_only", "skill_prompt"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
