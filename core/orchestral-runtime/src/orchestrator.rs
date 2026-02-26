@@ -34,6 +34,7 @@ use orchestral_core::types::{
 use crate::{HandleEventResult, InteractionState, RuntimeError, ThreadRuntime};
 
 const MAX_LOG_CHARS: usize = 8_000;
+const CAPABILITY_INSTRUCTION_ONLY: &str = "instruction_only";
 
 fn truncate_for_log(input: &str, max_chars: usize) -> String {
     let char_count = input.chars().count();
@@ -420,6 +421,21 @@ impl Orchestrator {
         );
         match planner_output {
             PlannerOutput::Workflow(plan) => {
+                if let Some(reason) = workflow_guard_violation(&plan, &context.available_actions) {
+                    self.emit_lifecycle_event(
+                        "planning_guard_rejected",
+                        Some(interaction_id.as_str()),
+                        Some(task.id.as_str()),
+                        Some("planner workflow rejected by runtime guard"),
+                        serde_json::json!({
+                            "reason": reason,
+                            "step_count": plan.steps.len(),
+                            "steps": summarize_plan_steps(&plan),
+                        }),
+                    )
+                    .await;
+                    return Err(OrchestratorError::Planner(PlanError::Generation(reason)));
+                }
                 self.emit_lifecycle_event(
                     "planning_completed",
                     Some(interaction_id.as_str()),
@@ -1838,6 +1854,36 @@ fn interaction_state_from_task(state: &TaskState) -> InteractionState {
     }
 }
 
+fn workflow_guard_violation(
+    plan: &orchestral_core::types::Plan,
+    actions: &[ActionMeta],
+) -> Option<String> {
+    let action_meta = actions
+        .iter()
+        .map(|meta| (meta.name.as_str(), meta))
+        .collect::<HashMap<_, _>>();
+
+    let executable_steps = plan
+        .steps
+        .iter()
+        .filter(|step| step.kind == StepKind::Action)
+        .filter(|step| {
+            action_meta
+                .get(step.action.as_str())
+                .map(|meta| !meta.has_capability(CAPABILITY_INSTRUCTION_ONLY))
+                .unwrap_or(true)
+        })
+        .count();
+
+    if executable_steps == 0 {
+        return Some(
+            "workflow contains only instruction-only actions; add executable steps".to_string(),
+        );
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2051,5 +2097,26 @@ mod tests {
         )
         .expect("cut");
         assert_eq!(cut.cut_step_id, "A2");
+    }
+
+    #[test]
+    fn test_workflow_guard_rejects_skill_only_plan() {
+        let plan = Plan::new("goal", vec![Step::action("s1", "skill__xlsx")]);
+        let actions =
+            vec![ActionMeta::new("skill__xlsx", "skill").with_capability("instruction_only")];
+        let reason = workflow_guard_violation(&plan, &actions);
+        assert!(reason.is_some());
+        assert!(reason
+            .unwrap_or_default()
+            .contains("instruction-only actions"));
+    }
+
+    #[test]
+    fn test_workflow_guard_accepts_executable_workflow() {
+        let plan = Plan::new("goal", vec![Step::action("s1", "file_write")]);
+        let actions =
+            vec![ActionMeta::new("file_write", "write").with_capability("filesystem_write")];
+        let reason = workflow_guard_violation(&plan, &actions);
+        assert!(reason.is_none());
     }
 }
