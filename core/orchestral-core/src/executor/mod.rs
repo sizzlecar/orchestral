@@ -369,6 +369,9 @@ pub enum ExecutionResult {
     },
     /// Waiting for external event
     WaitingEvent { step_id: StepId, event_type: String },
+    /// Execution paused at a replan step; the Orchestrator should re-invoke the
+    /// Planner with the current WorkingSet and append continuation steps.
+    NeedReplan { step_id: StepId, prompt: String },
 }
 
 /// Realtime execution progress event.
@@ -561,6 +564,11 @@ impl Executor {
                     node.step.action.clone(),
                     node.step.params.clone(),
                 )),
+                StepKind::Replan => Some((
+                    StepKind::Replan,
+                    node.step.action.clone(),
+                    node.step.params.clone(),
+                )),
                 _ => None,
             });
             if let Some((kind, action, params)) = wait_data {
@@ -604,6 +612,26 @@ impl Executor {
                                 .get("event_type")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("unknown")
+                                .to_string(),
+                        })
+                    }
+                    StepKind::Replan => {
+                        report_progress(
+                            ctx,
+                            ExecutionProgressEvent::new(
+                                ctx.task_id.clone(),
+                                Some(step_id.clone().into()),
+                                Some(action),
+                                "step_need_replan",
+                            ),
+                        )
+                        .await;
+                        Some(ExecutionResult::NeedReplan {
+                            step_id: step_id.clone().into(),
+                            prompt: params
+                                .get("prompt")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("Continue planning based on intermediate results")
                                 .to_string(),
                         })
                     }
@@ -1262,7 +1290,8 @@ async fn report_progress(ctx: &ExecutorContext, event: ExecutionProgressEvent) {
 
 fn choose_terminal_result(slot: &mut Option<ExecutionResult>, candidate: ExecutionResult) {
     let rank = |result: &ExecutionResult| match result {
-        ExecutionResult::Failed { .. } => 3,
+        ExecutionResult::Failed { .. } => 4,
+        ExecutionResult::NeedReplan { .. } => 3,
         ExecutionResult::WaitingUser { .. } => 2,
         ExecutionResult::WaitingEvent { .. } => 1,
         ExecutionResult::Completed => 0,

@@ -76,6 +76,9 @@ pub enum StepKind {
     WaitEvent,
     /// System built-in step (e.g., resolve_reference)
     System,
+    /// Pause execution and re-invoke the Planner with the current WorkingSet
+    /// so it can generate continuation steps based on intermediate results.
+    Replan,
 }
 
 /// Data binding from an upstream task key to this step's input key.
@@ -119,7 +122,9 @@ fn default_true() -> bool {
 pub struct Step {
     /// Unique identifier for this step (logical ID)
     pub id: StepId,
-    /// Name of the action to execute
+    /// Name of the action to execute.
+    /// Defaults to empty for control-flow steps (replan, wait_user, wait_event).
+    #[serde(default)]
     pub action: String,
     /// Step type for control flow semantics
     #[serde(default)]
@@ -171,6 +176,19 @@ impl Step {
             id: id.into(),
             action: "wait_user".to_string(),
             kind: StepKind::WaitUser,
+            depends_on: Vec::new(),
+            exports: Vec::new(),
+            io_bindings: Vec::new(),
+            params: Value::Null,
+        }
+    }
+
+    /// Create a replan step that pauses execution and re-invokes the Planner.
+    pub fn replan(id: impl Into<StepId>) -> Self {
+        Self {
+            id: id.into(),
+            action: "replan".to_string(),
+            kind: StepKind::Replan,
             depends_on: Vec::new(),
             exports: Vec::new(),
             io_bindings: Vec::new(),
