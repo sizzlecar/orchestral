@@ -225,14 +225,12 @@ fn collect_skill_action_specs(
 
 fn candidate_mcp_paths(config: &OrchestralConfig, config_path: &Path) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-    let base = config_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    candidates.push(base.join(".mcp.json"));
-    candidates.push(base.join("mcp.json"));
-    candidates.push(base.join(".claude").join("mcp.json"));
+    let roots = discovery_roots(config_path);
+    for root in &roots {
+        candidates.push(root.join(".mcp.json"));
+        candidates.push(root.join("mcp.json"));
+        candidates.push(root.join(".claude").join("mcp.json"));
+    }
 
     if let Ok(home) = std::env::var("HOME") {
         let home_path = PathBuf::from(home);
@@ -245,7 +243,9 @@ fn candidate_mcp_paths(config: &OrchestralConfig, config_path: &Path) -> Vec<Pat
         if path.is_absolute() {
             candidates.push(path);
         } else {
-            candidates.push(base.join(path));
+            for root in &roots {
+                candidates.push(root.join(&path));
+            }
         }
     }
 
@@ -254,14 +254,12 @@ fn candidate_mcp_paths(config: &OrchestralConfig, config_path: &Path) -> Vec<Pat
 
 fn candidate_skill_directories(config: &OrchestralConfig, config_path: &Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    let base = config_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    dirs.push(base.join(".claude").join("skills"));
-    dirs.push(base.join(".codex").join("skills"));
-    dirs.push(base.join("skills"));
+    let roots = discovery_roots(config_path);
+    for root in &roots {
+        dirs.push(root.join(".claude").join("skills"));
+        dirs.push(root.join(".codex").join("skills"));
+        dirs.push(root.join("skills"));
+    }
 
     if let Ok(home) = std::env::var("HOME") {
         let home_path = PathBuf::from(home);
@@ -274,11 +272,29 @@ fn candidate_skill_directories(config: &OrchestralConfig, config_path: &Path) ->
         if path.is_absolute() {
             dirs.push(path);
         } else {
-            dirs.push(base.join(path));
+            for root in &roots {
+                dirs.push(root.join(&path));
+            }
         }
     }
 
     dedupe_paths(dirs)
+}
+
+fn discovery_roots(config_path: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd);
+    }
+
+    if let Some(base) = config_path.parent() {
+        roots.push(base.to_path_buf());
+        if let Some(parent) = base.parent() {
+            roots.push(parent.to_path_buf());
+        }
+    }
+
+    dedupe_paths(roots)
 }
 
 fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -638,6 +654,38 @@ mod tests {
     }
 
     #[test]
+    fn collect_skill_action_specs_discovers_project_root_when_config_under_configs_dir() {
+        let root = test_temp_dir("providers-skill-root");
+        let config_dir = root.join("configs");
+        fs::create_dir_all(&config_dir).expect("create configs dir");
+        let config_path = config_dir.join("orchestral.cli.yaml");
+        fs::write(&config_path, "version: 1\n").expect("write config placeholder");
+
+        let skill_dir = root.join(".claude/skills/root-demo");
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: root-demo-skill\ndescription: root demo description\n---\nbody content\n",
+        )
+        .expect("write skill");
+
+        let mut config = OrchestralConfig::default();
+        config.extensions.skill.enabled = true;
+        config.extensions.skill.auto_discover = true;
+
+        let actions =
+            collect_skill_action_specs(&config, &config_path).expect("collect skills should work");
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.name == "skill__root-demo-skill"),
+            "expected project root skill to be discovered when config lives under configs/"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn collect_action_specs_keeps_override_order_for_same_name() {
         let dir = test_temp_dir("providers-order");
         let config_path = dir.join("orchestral.yaml");
@@ -675,6 +723,39 @@ mod tests {
         assert!(explicit_pos > mcp_pos);
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn collect_mcp_action_specs_discovers_project_root_when_config_under_configs_dir() {
+        let root = test_temp_dir("providers-mcp-root");
+        let config_dir = root.join("configs");
+        fs::create_dir_all(&config_dir).expect("create configs dir");
+        let config_path = config_dir.join("orchestral.cli.yaml");
+        fs::write(&config_path, "version: 1\n").expect("write config placeholder");
+
+        fs::write(
+            root.join(".mcp.json"),
+            r#"{
+  "mcpServers": {
+    "root-alpha": {"url": "http://127.0.0.1:8787/mcp", "enabled": true}
+  }
+}"#,
+        )
+        .expect("write root mcp file");
+
+        let mut config = OrchestralConfig::default();
+        config.extensions.mcp.enabled = true;
+        config.extensions.mcp.auto_discover = true;
+
+        let actions = collect_mcp_action_specs(&config, &config_path).expect("collect should work");
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.name == "mcp__root-alpha"),
+            "expected project root mcp server to be discovered when config lives under configs/"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
