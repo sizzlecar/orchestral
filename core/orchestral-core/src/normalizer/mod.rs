@@ -13,7 +13,7 @@ use thiserror::Error;
 
 use crate::action::ActionMeta;
 use crate::executor::ExecutionDag;
-use crate::types::{Plan, StepKind};
+use crate::types::{Plan, StepId, StepKind};
 
 /// Validation errors
 #[derive(Debug, Error)]
@@ -134,6 +134,10 @@ impl PlanNormalizer {
 
         // Step 2: Apply built-in normalization derived from action contracts.
         self.apply_implicit_contracts(&mut plan);
+
+        // Step 2.5: Control-flow steps (replan/wait) without explicit depends_on
+        // must depend on all preceding steps to avoid premature execution.
+        fix_control_flow_dependencies(&mut plan);
 
         // Step 3: Run built-in validations
         self.validate_basic(&plan)?;
@@ -339,6 +343,30 @@ impl PlanNormalizer {
                     "normalizer populated exports from action output schema"
                 );
             }
+        }
+    }
+}
+
+fn fix_control_flow_dependencies(plan: &mut Plan) {
+    let step_ids: Vec<StepId> = plan.steps.iter().map(|s| s.id.clone()).collect();
+    for i in 0..plan.steps.len() {
+        let step = &plan.steps[i];
+        let is_control = matches!(
+            step.kind,
+            StepKind::Replan | StepKind::WaitUser | StepKind::WaitEvent
+        );
+        if !is_control || !step.depends_on.is_empty() {
+            continue;
+        }
+        let preceding: Vec<StepId> = step_ids[..i].to_vec();
+        if !preceding.is_empty() {
+            tracing::debug!(
+                step_id = %plan.steps[i].id,
+                kind = ?plan.steps[i].kind,
+                deps = ?preceding,
+                "normalizer auto-assigned depends_on for control-flow step"
+            );
+            plan.steps[i].depends_on = preceding;
         }
     }
 }
