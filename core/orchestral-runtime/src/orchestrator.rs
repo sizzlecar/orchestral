@@ -686,6 +686,7 @@ impl Orchestrator {
         );
         let mut current_plan = initial_plan.clone();
         let mut remaining_replans = if self.config.auto_replan_once { 1 } else { 0 };
+        let mut remaining_iterative_replans: u32 = 2;
         let mut resume = resume_event;
         let execute_started_at = Instant::now();
         let final_result = loop {
@@ -699,6 +700,13 @@ impl Orchestrator {
                 run_elapsed_ms = one_run_started_at.elapsed().as_millis() as u64,
                 result = %truncate_debug_for_log(&run.result, MAX_LOG_CHARS),
                 "orchestrator execute_plan_once latency"
+            );
+            tracing::info!(
+                interaction_id = %interaction_id,
+                task_id = %task.id,
+                completed_steps = ?run.completed_step_ids,
+                ws_keys = ?run.working_set_snapshot.keys().collect::<Vec<_>>(),
+                "orchestrator checkpoint snapshot"
             );
             task.set_checkpoint(run.completed_step_ids, run.working_set_snapshot);
             self.task_store.save(task).await?;
@@ -769,6 +777,27 @@ impl Orchestrator {
             }
 
             if let ExecutionResult::NeedReplan { step_id, prompt } = &run.result {
+                tracing::info!(
+                    interaction_id = %interaction_id,
+                    task_id = %task.id,
+                    replan_step_id = %step_id,
+                    prompt = %truncate_for_log(prompt, 200),
+                    completed_step_ids = ?task.completed_step_ids,
+                    remaining_iterative_replans = remaining_iterative_replans,
+                    "orchestrator NeedReplan received"
+                );
+                if remaining_iterative_replans == 0 {
+                    tracing::warn!(
+                        interaction_id = %interaction_id,
+                        task_id = %task.id,
+                        "iterative replan depth limit reached, breaking"
+                    );
+                    break ExecutionResult::Failed {
+                        step_id: step_id.clone(),
+                        error: "Iterative replan depth limit reached".to_string(),
+                    };
+                }
+                remaining_iterative_replans -= 1;
                 self.emit_lifecycle_event(
                     "iterative_replan_started",
                     Some(interaction_id),
@@ -786,6 +815,9 @@ impl Orchestrator {
                     .await
                 {
                     Ok(extended_plan) => {
+                        if !task.completed_step_ids.contains(step_id) {
+                            task.completed_step_ids.push(step_id.clone());
+                        }
                         task.set_plan(extended_plan.clone());
                         task.start_executing();
                         self.task_store.save(task).await?;
@@ -855,6 +887,17 @@ impl Orchestrator {
         }
         let mut dag = normalized.dag;
         restore_checkpoint(&mut dag, task);
+        let dag_completed_after_restore: Vec<&str> = dag.completed_nodes();
+        let dag_ready_after_restore: Vec<String> = dag.ready_nodes.clone();
+        tracing::info!(
+            interaction_id = %interaction_id,
+            task_id = %task.id,
+            task_completed_step_ids = ?task.completed_step_ids,
+            dag_completed = ?dag_completed_after_restore,
+            dag_ready = ?dag_ready_after_restore,
+            plan_step_count = plan.steps.len(),
+            "execute_plan_once DAG state after restore_checkpoint"
+        );
         if let Some(event) = resume_event {
             complete_wait_step_for_resume(&mut dag, plan, &task.completed_step_ids, event);
         }
@@ -981,6 +1024,15 @@ impl Orchestrator {
         replan_prompt: &str,
         interaction_id: &str,
     ) -> Result<orchestral_core::types::Plan, OrchestratorError> {
+        tracing::info!(
+            interaction_id = %interaction_id,
+            task_id = %task.id,
+            replan_step_id = %replan_step_id,
+            completed_step_ids = ?task.completed_step_ids,
+            ws_key_count = task.working_set_snapshot.len(),
+            current_plan_steps = current_plan.steps.len(),
+            "build_continuation_plan started"
+        );
         let actions = self.available_actions().await;
         let history = self
             .history_for_planner(interaction_id, task.id.as_str())
@@ -1011,15 +1063,41 @@ impl Orchestrator {
             .with_runtime_info(runtime_info)
             .with_skill_instructions(skill_instructions);
 
+        tracing::info!(
+            interaction_id = %interaction_id,
+            task_id = %task.id,
+            "build_continuation_plan calling planner"
+        );
         let output = self.planner.plan(&continuation_intent, &context).await?;
         let continuation_plan = match output {
-            PlannerOutput::Workflow(plan) => plan,
-            PlannerOutput::DirectResponse(_) => {
+            PlannerOutput::Workflow(plan) => {
+                tracing::info!(
+                    interaction_id = %interaction_id,
+                    task_id = %task.id,
+                    continuation_step_count = plan.steps.len(),
+                    continuation_step_ids = ?plan.steps.iter().map(|s| s.id.to_string()).collect::<Vec<_>>(),
+                    "build_continuation_plan planner returned workflow"
+                );
+                plan
+            }
+            PlannerOutput::DirectResponse(msg) => {
+                tracing::warn!(
+                    interaction_id = %interaction_id,
+                    task_id = %task.id,
+                    message = %truncate_for_log(&msg, 200),
+                    "build_continuation_plan planner returned direct_response (expected workflow)"
+                );
                 return Err(OrchestratorError::Planner(PlanError::Generation(
                     "continuation planner returned direct_response; workflow required".to_string(),
                 )));
             }
-            PlannerOutput::Clarification(_) => {
+            PlannerOutput::Clarification(q) => {
+                tracing::warn!(
+                    interaction_id = %interaction_id,
+                    task_id = %task.id,
+                    question = %truncate_for_log(&q, 200),
+                    "build_continuation_plan planner returned clarification (expected workflow)"
+                );
                 return Err(OrchestratorError::Planner(PlanError::Generation(
                     "continuation planner returned clarification; workflow required".to_string(),
                 )));
@@ -1027,22 +1105,52 @@ impl Orchestrator {
         };
 
         let mut merged_steps = current_plan.steps.clone();
-        if let Some(node) = merged_steps.iter_mut().find(|s| s.id == *replan_step_id) {
-            node.kind = StepKind::System;
-        }
         let existing_ids: std::collections::HashSet<String> =
             merged_steps.iter().map(|s| s.id.to_string()).collect();
 
-        for mut step in continuation_plan.steps {
+        let continuation_steps: Vec<Step> = continuation_plan
+            .steps
+            .into_iter()
+            .filter(|s| s.kind != StepKind::Replan)
+            .collect();
+
+        let mut rename_map: HashMap<String, String> = HashMap::new();
+        for step in &continuation_steps {
             if existing_ids.contains(step.id.as_str()) {
                 let new_id = format!("c_{}", step.id);
-                step.id = new_id.into();
+                rename_map.insert(step.id.to_string(), new_id);
             }
+        }
+
+        for mut step in continuation_steps {
+            if let Some(new_id) = rename_map.get(step.id.as_str()) {
+                step.id = new_id.clone().into();
+            }
+            step.depends_on = step
+                .depends_on
+                .into_iter()
+                .map(|dep| {
+                    if let Some(renamed) = rename_map.get(dep.as_str()) {
+                        StepId::from(renamed.as_str())
+                    } else {
+                        dep
+                    }
+                })
+                .collect();
             if step.depends_on.is_empty() {
                 step.depends_on = vec![replan_step_id.clone()];
             }
             merged_steps.push(step);
         }
+
+        let merged_ids: Vec<String> = merged_steps.iter().map(|s| s.id.to_string()).collect();
+        tracing::info!(
+            interaction_id = %interaction_id,
+            task_id = %task.id,
+            merged_step_count = merged_steps.len(),
+            merged_step_ids = ?merged_ids,
+            "build_continuation_plan merged plan ready"
+        );
 
         Ok(orchestral_core::types::Plan {
             goal: current_plan.goal.clone(),
