@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, info};
 
+use crate::system_prompts::render_planner_prompt;
 use orchestral_core::planner::{HistoryItem, PlanError, Planner, PlannerContext, PlannerOutput};
 use orchestral_core::types::{Intent, Plan, Step};
 
@@ -157,65 +158,41 @@ fn select_history_for_prompt(history: &[HistoryItem], max_history: usize) -> Vec
 }
 
 fn build_system_prompt(base: &str, context: &PlannerContext) -> String {
-    let mut system = String::new();
-    system.push_str(
-        "You are Orchestral Planner, the planning component of the Orchestral runtime.\n",
-    );
-    system.push_str(
-        "Project context:\n- Workspace: Rust multi-crate project.\n- Core crates: orchestral-core, orchestral-runtime, orchestral-actions, orchestral-stores, orchestral-planners, orchestral-cli.\n- Execution model: Intent -> Plan -> Normalize -> Execute.\n",
-    );
-    system.push('\n');
-    system.push_str(base.trim());
-    if !context.runtime_info.os.is_empty() {
-        system.push_str("\n\nExecution Environment:\n");
-        system.push_str(&format!(
-            "- os: {}\n- os_family: {}\n- arch: {}\n",
-            context.runtime_info.os, context.runtime_info.os_family, context.runtime_info.arch
-        ));
-        if let Some(shell) = &context.runtime_info.shell {
-            system.push_str(&format!("- shell: {}\n", shell));
-        }
+    let execution_environment = build_execution_environment_block(context);
+    let action_catalog = build_action_catalog(context);
+    render_planner_prompt(base, &execution_environment, &action_catalog)
+}
+
+fn build_execution_environment_block(context: &PlannerContext) -> String {
+    if context.runtime_info.os.is_empty() {
+        return String::new();
     }
-    system.push_str("\n\nPlanning Rules:\n");
-    system.push_str("1) Return ONLY one valid JSON object matching one allowed output shape.\n");
-    system.push_str("2) If no tool/action execution is needed, return DIRECT_RESPONSE.\n");
-    system
-        .push_str("3) If information is missing, return CLARIFICATION with a concrete question.\n");
-    system.push_str("4) Only return WORKFLOW when execution is required.\n");
-    system.push_str("5) For WORKFLOW: step.id must be unique and stable.\n");
-    system.push_str("6) For WORKFLOW: step.params must satisfy selected action input_schema.\n");
-    system.push_str("7) For WORKFLOW: prefer minimal steps; omit optional fields unless needed.\n");
-    system.push_str("8) For WORKFLOW: if a step consumes upstream output, declare io_bindings.\n");
-    system.push_str("9) Do not invent action names not listed in Action Catalog.\n");
-    system.push_str(
-        "10) If clarifying via WORKFLOW, use wait_user; otherwise return CLARIFICATION.\n",
-    );
-    system.push_str(
-        "11) For wait_user/wait_event/system steps, set kind explicitly; normal action steps can omit kind.\n",
-    );
-    system.push_str(
-        "12) When generating step.params, strictly follow Action Catalog input fields.\n",
-    );
-    system.push_str(
-        "13) Any shell/file operation must be compatible with current host platform and shell.\n",
-    );
-    system.push_str(
-        "14) Only use `echo` when user explicitly asks to echo/repeat text; otherwise avoid `echo`.\n",
-    );
-    system.push_str(
-        "15) For HTTP headers requests, use `http` method `HEAD` and return headers directly.\n",
-    );
-    system.push_str("\nAction Catalog:\n");
+
+    let mut out = String::new();
+    out.push_str("Execution Environment:\n");
+    out.push_str(&format!(
+        "- os: {}\n- os_family: {}\n- arch: {}\n",
+        context.runtime_info.os, context.runtime_info.os_family, context.runtime_info.arch
+    ));
+    if let Some(shell) = &context.runtime_info.shell {
+        out.push_str(&format!("- shell: {}\n", shell));
+    }
+    out
+}
+
+fn build_action_catalog(context: &PlannerContext) -> String {
+    let mut out = String::new();
     for action in &context.available_actions {
         append_action_catalog_entry(
-            &mut system,
+            &mut out,
             &action.name,
             &action.description,
             &action.input_schema,
             &action.output_schema,
+            &action.capabilities,
         );
     }
-    system
+    out
 }
 
 fn append_action_catalog_entry(
@@ -224,9 +201,15 @@ fn append_action_catalog_entry(
     description: &str,
     input_schema: &serde_json::Value,
     output_schema: &serde_json::Value,
+    capabilities: &[String],
 ) {
     let _ = writeln!(buf, "- name: {}", name);
     let _ = writeln!(buf, "  description: {}", description);
+    if capabilities.is_empty() {
+        let _ = writeln!(buf, "  capabilities: []");
+    } else {
+        let _ = writeln!(buf, "  capabilities: [{}]", capabilities.join(", "));
+    }
     append_schema_fields(buf, "input_fields", input_schema);
     append_schema_fields(buf, "output_fields", output_schema);
     let _ = writeln!(buf, "  input_schema: {}", input_schema);
@@ -719,6 +702,7 @@ mod tests {
         );
 
         let actions = vec![ActionMeta::new("write_doc", "Write markdown to file")
+            .with_capabilities(["filesystem_write", "side_effect"])
             .with_input_schema(json!({
                 "type":"object",
                 "properties":{
@@ -744,6 +728,7 @@ mod tests {
         assert!(system.contains("Orchestral Planner"));
         assert!(system.contains("Intent -> Plan -> Normalize -> Execute"));
         assert!(system.contains("write_doc"));
+        assert!(system.contains("capabilities: [filesystem_write, side_effect]"));
         assert!(system.contains("input_fields"));
         assert!(system.contains("path (string, required)"));
         assert!(system.contains("desc=Target markdown path"));
@@ -763,6 +748,7 @@ mod tests {
 
         let actions = vec![
             ActionMeta::new("mcp__alpha", "Call MCP server alpha")
+                .with_capabilities(["mcp", "side_effect"])
                 .with_input_schema(json!({
                     "type":"object",
                     "properties":{
@@ -779,6 +765,7 @@ mod tests {
                     }
                 })),
             ActionMeta::new("skill__demo", "Expose demo skill instructions")
+                .with_capabilities(["instruction_only", "skill_prompt"])
                 .with_input_schema(json!({
                     "type":"object",
                     "properties":{
@@ -799,6 +786,8 @@ mod tests {
 
         assert!(system.contains("- name: mcp__alpha"));
         assert!(system.contains("- name: skill__demo"));
+        assert!(system.contains("Actions named `skill__*` are instruction-only"));
+        assert!(system.contains("capabilities: [instruction_only, skill_prompt]"));
     }
 
     #[test]
