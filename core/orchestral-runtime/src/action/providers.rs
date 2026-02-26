@@ -13,7 +13,6 @@ use orchestral_core::config::{
 pub enum ActionSpecSource {
     McpDiscovery,
     McpConfig,
-    SkillDiscovery,
     ActionConfig,
 }
 
@@ -22,7 +21,6 @@ impl ActionSpecSource {
         match self {
             Self::McpDiscovery => "mcp_discovery",
             Self::McpConfig => "mcp_config",
-            Self::SkillDiscovery => "skill_discovery",
             Self::ActionConfig => "action_config",
         }
     }
@@ -42,12 +40,8 @@ pub fn collect_action_registration_specs(
 
     // Registration order defines override priority because ActionRegistry::register replaces
     // existing actions with the same name.
-    // priority: mcp < skill < explicit user actions
+    // priority: mcp < explicit user actions
     all.extend(collect_mcp_action_registration_specs(config, config_path)?);
-    all.extend(collect_skill_action_registration_specs(
-        config,
-        config_path,
-    )?);
     all.extend(
         config
             .actions
@@ -203,109 +197,6 @@ fn collect_mcp_action_registration_specs(
     Ok(actions)
 }
 
-#[cfg(test)]
-fn collect_skill_action_specs(
-    config: &OrchestralConfig,
-    config_path: &Path,
-) -> Result<Vec<ActionSpec>, ConfigError> {
-    Ok(
-        collect_skill_action_registration_specs(config, config_path)?
-            .into_iter()
-            .map(|registration| registration.spec)
-            .collect(),
-    )
-}
-
-fn collect_skill_action_registration_specs(
-    config: &OrchestralConfig,
-    config_path: &Path,
-) -> Result<Vec<ActionRegistrationSpec>, ConfigError> {
-    if !config.extensions.skill.enabled || env_disable_flag("ORCHESTRAL_DISABLE_SKILLS") {
-        return Ok(Vec::new());
-    }
-
-    let mut files = Vec::new();
-    if config.extensions.skill.auto_discover {
-        for dir in candidate_skill_directories(config, config_path) {
-            collect_skill_files(&dir, 3, &mut files);
-        }
-    }
-
-    let mut actions_by_name: HashMap<String, ActionRegistrationSpec> = HashMap::new();
-
-    for file in files {
-        let content = match fs::read_to_string(&file) {
-            Ok(value) => value,
-            Err(err) => {
-                tracing::warn!(path = %file.display(), error = %err, "skip unreadable SKILL.md");
-                continue;
-            }
-        };
-
-        let meta = parse_skill_frontmatter(&content);
-        let skill_name = meta
-            .name
-            .clone()
-            .or_else(|| {
-                file.parent()
-                    .and_then(|p| p.file_name())
-                    .and_then(|name| name.to_str())
-                    .map(ToString::to_string)
-            })
-            .unwrap_or_else(|| "skill".to_string());
-
-        let action_name = format!("skill__{}", sanitize_identifier(&skill_name));
-        let description = append_skill_instruction_only_note(
-            meta.description
-                .unwrap_or_else(|| format!("Expose skill '{}' instructions", skill_name)),
-        );
-        let interface = ActionInterfaceSpec {
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"}
-                }
-            }),
-            output_schema: json!({
-                "type": "object",
-                "properties": {
-                    "skill": {"type": "string"},
-                    "source_path": {"type": "string"},
-                    "instructions": {"type": "string"},
-                    "query": {"type": "string"}
-                },
-                "required": ["skill", "source_path", "instructions"]
-            }),
-        };
-
-        actions_by_name.insert(
-            action_name.clone(),
-            ActionRegistrationSpec {
-                source: ActionSpecSource::SkillDiscovery,
-                spec: ActionSpec {
-                    name: action_name,
-                    kind: "skill_prompt".to_string(),
-                    description: Some(description),
-                    config: json!({
-                        "skill_name": skill_name,
-                        "source_path": file.to_string_lossy().to_string(),
-                        "content": content,
-                    }),
-                    interface: Some(interface),
-                },
-            },
-        );
-    }
-
-    let mut names = actions_by_name.keys().cloned().collect::<Vec<_>>();
-    names.sort();
-
-    Ok(names
-        .into_iter()
-        .filter_map(|name| actions_by_name.remove(&name))
-        .collect())
-}
-
 fn candidate_mcp_paths(config: &OrchestralConfig, config_path: &Path) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let roots = discovery_roots(config_path);
@@ -335,35 +226,6 @@ fn candidate_mcp_paths(config: &OrchestralConfig, config_path: &Path) -> Vec<Pat
     dedupe_paths(candidates)
 }
 
-fn candidate_skill_directories(config: &OrchestralConfig, config_path: &Path) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    let roots = discovery_roots(config_path);
-    for root in &roots {
-        dirs.push(root.join(".claude").join("skills"));
-        dirs.push(root.join(".codex").join("skills"));
-        dirs.push(root.join("skills"));
-    }
-
-    if let Ok(home) = std::env::var("HOME") {
-        let home_path = PathBuf::from(home);
-        dirs.push(home_path.join(".claude").join("skills"));
-        dirs.push(home_path.join(".codex").join("skills"));
-    }
-
-    for custom in &config.extensions.skill.directories {
-        let path = PathBuf::from(custom);
-        if path.is_absolute() {
-            dirs.push(path);
-        } else {
-            for root in &roots {
-                dirs.push(root.join(&path));
-            }
-        }
-    }
-
-    dedupe_paths(dirs)
-}
-
 fn discovery_roots(config_path: &Path) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {
@@ -390,63 +252,6 @@ fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
         }
     }
     out
-}
-
-fn collect_skill_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
-    if depth == 0 {
-        return;
-    }
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(_) => return,
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_skill_files(&path, depth - 1, out);
-            continue;
-        }
-
-        let is_skill = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| name.eq_ignore_ascii_case("SKILL.md"))
-            .unwrap_or(false);
-        if is_skill {
-            out.push(path);
-        }
-    }
-}
-
-#[derive(Debug, Default, Clone)]
-struct SkillFrontmatter {
-    name: Option<String>,
-    description: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct SkillFrontmatterRaw {
-    name: Option<String>,
-    description: Option<String>,
-}
-
-fn parse_skill_frontmatter(content: &str) -> SkillFrontmatter {
-    let Some(rest) = content.strip_prefix("---\n") else {
-        return SkillFrontmatter::default();
-    };
-
-    let Some((frontmatter, _tail)) = rest.split_once("\n---\n") else {
-        return SkillFrontmatter::default();
-    };
-
-    match serde_yaml::from_str::<SkillFrontmatterRaw>(frontmatter) {
-        Ok(raw) => SkillFrontmatter {
-            name: raw.name,
-            description: raw.description,
-        },
-        Err(_) => SkillFrontmatter::default(),
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -609,15 +414,6 @@ fn env_disable_flag(var_name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn append_skill_instruction_only_note(description: String) -> String {
-    const NOTE: &str =
-        "Instruction-only: returns skill guidance text and does not directly modify files or call tools.";
-    if description.contains(NOTE) {
-        return description;
-    }
-    format!("{} {}", description.trim(), NOTE)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -704,88 +500,12 @@ mod tests {
         assert_eq!(action.name, "mcp__alpha");
         assert_eq!(action.kind, "mcp_server");
         assert_eq!(action.config["server_name"], "alpha");
-        // explicit config should override discovered url-only config
         assert_eq!(action.config["command"], "npx");
         assert_eq!(action.config["required"], true);
         assert_eq!(action.config["enabled_tools"], json!(["ping"]));
         assert_eq!(action.config["disabled_tools"], json!(["danger"]));
 
         let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn collect_skill_action_specs_discovers_skill_markdown() {
-        let dir = test_temp_dir("providers-skill");
-        let config_path = dir.join("orchestral.yaml");
-        fs::write(&config_path, "version: 1\n").expect("write config placeholder");
-
-        let skill_dir = dir.join(".claude/skills/demo");
-        fs::create_dir_all(&skill_dir).expect("create skill dir");
-        fs::write(
-            skill_dir.join("SKILL.md"),
-            "---\nname: demo-skill\ndescription: demo description\n---\nbody content\n",
-        )
-        .expect("write skill");
-
-        let mut config = OrchestralConfig::default();
-        config.extensions.skill.enabled = true;
-        config.extensions.skill.auto_discover = true;
-
-        let actions =
-            collect_skill_action_specs(&config, &config_path).expect("collect skills should work");
-        let action = actions
-            .iter()
-            .find(|action| action.name == "skill__demo-skill")
-            .expect("discovered skill action should include demo-skill");
-        assert_eq!(action.name, "skill__demo-skill");
-        assert_eq!(action.kind, "skill_prompt");
-        assert_eq!(action.config["skill_name"], "demo-skill");
-        assert!(action
-            .description
-            .as_deref()
-            .unwrap_or_default()
-            .contains("Instruction-only: returns skill guidance text"));
-        assert!(action.config["source_path"].as_str().is_some());
-        assert!(action
-            .config
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .contains("body content"));
-
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn collect_skill_action_specs_discovers_project_root_when_config_under_configs_dir() {
-        let root = test_temp_dir("providers-skill-root");
-        let config_dir = root.join("configs");
-        fs::create_dir_all(&config_dir).expect("create configs dir");
-        let config_path = config_dir.join("orchestral.cli.yaml");
-        fs::write(&config_path, "version: 1\n").expect("write config placeholder");
-
-        let skill_dir = root.join(".claude/skills/root-demo");
-        fs::create_dir_all(&skill_dir).expect("create skill dir");
-        fs::write(
-            skill_dir.join("SKILL.md"),
-            "---\nname: root-demo-skill\ndescription: root demo description\n---\nbody content\n",
-        )
-        .expect("write skill");
-
-        let mut config = OrchestralConfig::default();
-        config.extensions.skill.enabled = true;
-        config.extensions.skill.auto_discover = true;
-
-        let actions =
-            collect_skill_action_specs(&config, &config_path).expect("collect skills should work");
-        assert!(
-            actions
-                .iter()
-                .any(|action| action.name == "skill__root-demo-skill"),
-            "expected project root skill to be discovered when config lives under configs/"
-        );
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -847,19 +567,9 @@ mod tests {
         )
         .expect("write discovery file");
 
-        let skill_dir = dir.join(".claude/skills/demo");
-        fs::create_dir_all(&skill_dir).expect("create skill dir");
-        fs::write(
-            skill_dir.join("SKILL.md"),
-            "---\nname: demo-skill\ndescription: demo description\n---\nbody content\n",
-        )
-        .expect("write skill");
-
         let mut config = OrchestralConfig::default();
         config.extensions.mcp.enabled = true;
         config.extensions.mcp.auto_discover = true;
-        config.extensions.skill.enabled = true;
-        config.extensions.skill.auto_discover = true;
         config.actions.actions = vec![ActionSpec {
             name: "echo_demo".to_string(),
             kind: "echo".to_string(),
@@ -873,10 +583,6 @@ mod tests {
         assert!(registrations.iter().any(|registration| {
             registration.spec.name == "mcp__alpha"
                 && registration.source == ActionSpecSource::McpDiscovery
-        }));
-        assert!(registrations.iter().any(|registration| {
-            registration.spec.name == "skill__demo-skill"
-                && registration.source == ActionSpecSource::SkillDiscovery
         }));
         assert!(registrations.iter().any(|registration| {
             registration.spec.name == "echo_demo"
@@ -920,14 +626,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_skill_frontmatter_handles_missing_delimiters() {
-        let no_frontmatter = "name: a\ndescription: b";
-        let parsed = parse_skill_frontmatter(no_frontmatter);
-        assert!(parsed.name.is_none());
-        assert!(parsed.description.is_none());
-    }
-
-    #[test]
     fn env_disable_flag_interprets_boolean_values() {
         let key = format!("ORCHESTRAL_TEST_DISABLE_{}", std::process::id());
         std::env::set_var(&key, "true");
@@ -935,13 +633,5 @@ mod tests {
         std::env::set_var(&key, "0");
         assert!(!env_disable_flag(&key));
         std::env::remove_var(&key);
-    }
-
-    #[test]
-    fn append_skill_instruction_only_note_is_idempotent() {
-        let desc = "demo skill".to_string();
-        let once = append_skill_instruction_only_note(desc);
-        let twice = append_skill_instruction_only_note(once.clone());
-        assert_eq!(once, twice);
     }
 }

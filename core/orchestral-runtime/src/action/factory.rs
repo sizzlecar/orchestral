@@ -9,7 +9,6 @@ use orchestral_core::config::{ActionInterfaceSpec, ActionSpec};
 use super::builtin::build_builtin_action;
 use super::external::build_external_action;
 use super::mcp::build_mcp_action;
-use super::skill::build_skill_action;
 
 /// Action factory errors
 #[derive(Debug, Error)]
@@ -57,13 +56,7 @@ impl ActionFactory for DefaultActionFactory {
                         let action: Arc<dyn Action> = Arc::from(action);
                         Ok(Arc::new(ConfiguredAction::new(action, spec)))
                     }
-                    None => match build_skill_action(spec)? {
-                        Some(action) => {
-                            let action: Arc<dyn Action> = Arc::from(action);
-                            Ok(Arc::new(ConfiguredAction::new(action, spec)))
-                        }
-                        None => Err(ActionBuildError::UnknownKind(spec.kind.clone())),
-                    },
+                    None => Err(ActionBuildError::UnknownKind(spec.kind.clone())),
                 },
             },
         }
