@@ -563,6 +563,8 @@ pub struct SkillExtensionsConfig {
     pub enabled: bool,
     #[serde(default = "default_true")]
     pub auto_discover: bool,
+    #[serde(default = "default_max_active_skills")]
+    pub max_active_skills: usize,
     /// Optional directories to scan for SKILL.md.
     #[serde(default)]
     pub directories: Vec<String>,
@@ -573,9 +575,14 @@ impl Default for SkillExtensionsConfig {
         Self {
             enabled: true,
             auto_discover: true,
+            max_active_skills: default_max_active_skills(),
             directories: Vec::new(),
         }
     }
+}
+
+fn default_max_active_skills() -> usize {
+    3
 }
 
 #[derive(Debug, Clone, Deserialize)]
