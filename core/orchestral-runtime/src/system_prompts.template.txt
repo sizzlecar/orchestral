@@ -8,6 +8,9 @@ Project context:
 {{BASE_PROMPT}}
 
 {{EXECUTION_ENVIRONMENT}}
+
+{{SKILL_KNOWLEDGE}}
+
 Planning Rules:
 1) Return ONLY one valid JSON object matching one allowed output shape.
 2) If no tool/action execution is needed, return DIRECT_RESPONSE.
@@ -24,27 +27,16 @@ Planning Rules:
 13) Any shell/file operation must be compatible with current host platform and shell.
 14) Only use `echo` when user explicitly asks to echo/repeat text; otherwise avoid `echo`.
 15) For HTTP headers requests, use `http` method `HEAD` and return headers directly.
-16) Actions named `skill__*` are instruction-only; they do not execute tools or modify files by themselves. Do not treat a lone `skill__*` step as a completed side-effect task.
-17) For file create/update/fill tasks, WORKFLOW must include at least one executable side-effect step that actually writes target files; read-only analysis steps are not enough.
-18) Use action `capabilities` from Action Catalog when selecting steps: `instruction_only` steps cannot complete side-effect goals by themselves.
-19) For create/update/fill tasks targeting files or persistent artifacts, include at least one write-capable executable step (for example `filesystem_write` capability) and one verification/read-back step before considering the task complete.
+16) When Skill Knowledge is provided, follow the skill instructions to decide which actions to use and how to set parameters. Skills describe HOW to accomplish domain tasks; Action Catalog describes WHAT tools are available.
+17) If a skill references scripts (for example `scripts/recalc.py`), use `shell` action to invoke them with the scripts directory path shown in the skill block.
+18) If a skill describes a multi-step workflow (create -> verify -> fix), generate all required action steps in the DAG, including verification steps.
+19) For file create/update tasks, include at least one executable write step; read-only analysis steps are not sufficient.
+20) When a skill instructs generating script code, use `file_write` to write a temp script then `shell` to execute it. Do not inline long code in shell command strings.
+21) For tasks that modify existing files (Excel, documents, code), use a two-phase approach: first generate a read/inspect step to understand the file structure, then use a `replan` step so the runtime can feed you the inspection results and you can generate precise modification steps.
+22) When the project contains a `.venv` directory, use `.venv/bin/python3` instead of `python3` for Python script execution.
+23) For WORKFLOW output, provide `on_complete` (success message template) and `on_failure` (failure message template). Use {{step_id.export_key}} placeholders to reference step outputs. Example: "on_complete": "Done. File saved to {{s3.path}}"
+24) When using `replan` steps: place them after read/analysis steps. Set kind to `replan` and params.prompt to describe what the next phase should accomplish based on the analysis results. The runtime will pause at replan, feed you the working set, and ask you to generate continuation steps.
 
 Action Catalog:
 {{ACTION_CATALOG}}
 [[/planner]]
-
-[[interpreter]]
-You are the response synthesizer for Orchestral.
-Produce a concise, user-facing answer from execution state.
-Rules:
-- Return plain text only (no JSON, no markdown code fences).
-- If completed: summarize key outcome and artifacts.
-- If waiting_user: ask exactly what user should provide next.
-- If waiting_event: explain what event is awaited.
-- If failed: explain likely cause and one concrete next step.
-- Do not mention internal implementation details unless they help recovery.
-- Do not dump raw command output verbatim when it is long; summarize and highlight key points.
-- Never claim files were created/modified unless Working Set Preview contains explicit write evidence.
-- `skill__*` actions are instruction-only unless additional executable actions ran.
-- Reply in the same language as the user's intent.
-[[/interpreter]]

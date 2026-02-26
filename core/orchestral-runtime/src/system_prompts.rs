@@ -3,26 +3,13 @@ use std::sync::OnceLock;
 const TEMPLATE: &str = include_str!("system_prompts.template.txt");
 const PLANNER_START: &str = "[[planner]]";
 const PLANNER_END: &str = "[[/planner]]";
-const INTERPRETER_START: &str = "[[interpreter]]";
-const INTERPRETER_END: &str = "[[/interpreter]]";
 
-struct PromptTemplates {
-    planner: &'static str,
-    interpreter: &'static str,
-}
+static PLANNER_TEMPLATE: OnceLock<&'static str> = OnceLock::new();
 
-static PROMPT_TEMPLATES: OnceLock<PromptTemplates> = OnceLock::new();
-
-fn templates() -> &'static PromptTemplates {
-    PROMPT_TEMPLATES.get_or_init(|| {
-        let planner = extract_section(TEMPLATE, PLANNER_START, PLANNER_END)
-            .expect("missing [[planner]] section in system prompts template");
-        let interpreter = extract_section(TEMPLATE, INTERPRETER_START, INTERPRETER_END)
-            .expect("missing [[interpreter]] section in system prompts template");
-        PromptTemplates {
-            planner,
-            interpreter,
-        }
+fn planner_template() -> &'static str {
+    PLANNER_TEMPLATE.get_or_init(|| {
+        extract_section(TEMPLATE, PLANNER_START, PLANNER_END)
+            .expect("missing [[planner]] section in system prompts template")
     })
 }
 
@@ -46,19 +33,17 @@ pub fn render_planner_prompt(
     base_prompt: &str,
     execution_environment: &str,
     action_catalog: &str,
+    skill_knowledge: &str,
 ) -> String {
     render_template(
-        templates().planner,
+        planner_template(),
         &[
             ("BASE_PROMPT", base_prompt.trim()),
             ("EXECUTION_ENVIRONMENT", execution_environment.trim()),
+            ("SKILL_KNOWLEDGE", skill_knowledge.trim()),
             ("ACTION_CATALOG", action_catalog.trim()),
         ],
     )
-}
-
-pub fn default_interpreter_prompt() -> &'static str {
-    templates().interpreter
 }
 
 #[cfg(test)]
@@ -67,16 +52,11 @@ mod tests {
 
     #[test]
     fn planner_prompt_template_renders_dynamic_fields() {
-        let rendered = render_planner_prompt("base", "env", "- name: shell");
+        let rendered = render_planner_prompt("base", "env", "- name: shell", "skill block");
         assert!(rendered.contains("base"));
         assert!(rendered.contains("env"));
+        assert!(rendered.contains("skill block"));
         assert!(rendered.contains("- name: shell"));
         assert!(!rendered.contains("{{BASE_PROMPT}}"));
-    }
-
-    #[test]
-    fn interpreter_prompt_template_is_available() {
-        let prompt = default_interpreter_prompt();
-        assert!(prompt.contains("response synthesizer"));
     }
 }

@@ -8,7 +8,9 @@ use thiserror::Error;
 use tracing::{debug, info};
 
 use crate::system_prompts::render_planner_prompt;
-use orchestral_core::planner::{HistoryItem, PlanError, Planner, PlannerContext, PlannerOutput};
+use orchestral_core::planner::{
+    HistoryItem, PlanError, Planner, PlannerContext, PlannerOutput, SkillInstruction,
+};
 use orchestral_core::types::{Intent, Plan, Step};
 
 const MAX_PROMPT_LOG_CHARS: usize = 4_000;
@@ -118,7 +120,7 @@ impl<C: LlmClient> LlmPlanner<C> {
 
         user.push_str("Return ONE JSON object in one of these shapes:\n");
         user.push_str(
-            r#"{"type":"WORKFLOW","goal":"...","steps":[{"id":"s1","action":"action_name","params":{},"io_bindings":[{"from":"s1.output_key","to":"input_key","required":true}]}],"confidence":0.0}"#,
+            r#"{"type":"WORKFLOW","goal":"...","steps":[{"id":"s1","action":"action_name","params":{},"io_bindings":[{"from":"s1.output_key","to":"input_key","required":true}]}],"confidence":0.0,"on_complete":"...","on_failure":"..."}"#,
         );
         user.push('\n');
         user.push_str(r#"{"type":"DIRECT_RESPONSE","message":"..."}"#);
@@ -160,7 +162,32 @@ fn select_history_for_prompt(history: &[HistoryItem], max_history: usize) -> Vec
 fn build_system_prompt(base: &str, context: &PlannerContext) -> String {
     let execution_environment = build_execution_environment_block(context);
     let action_catalog = build_action_catalog(context);
-    render_planner_prompt(base, &execution_environment, &action_catalog)
+    let skill_knowledge = build_skill_knowledge_block(&context.skill_instructions);
+    render_planner_prompt(
+        base,
+        &execution_environment,
+        &action_catalog,
+        &skill_knowledge,
+    )
+}
+
+fn build_skill_knowledge_block(skills: &[SkillInstruction]) -> String {
+    if skills.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    out.push_str("Activated Skill Knowledge:\n");
+    for skill in skills {
+        let _ = writeln!(out, "--- skill: {} ---", skill.skill_name);
+        out.push_str(skill.instructions.trim());
+        out.push('\n');
+        if let Some(dir) = &skill.scripts_dir {
+            let _ = writeln!(out, "[scripts directory: {}]", dir);
+        }
+        out.push_str("--- end skill ---\n");
+    }
+    out
 }
 
 fn build_execution_environment_block(context: &PlannerContext) -> String {
@@ -428,6 +455,10 @@ enum PlannerJsonOutput {
         steps: Vec<Step>,
         #[serde(default)]
         confidence: Option<f32>,
+        #[serde(default)]
+        on_complete: Option<String>,
+        #[serde(default)]
+        on_failure: Option<String>,
     },
     DirectResponse {
         message: String,
@@ -446,9 +477,13 @@ fn parse_planner_output(json: &str) -> Result<PlannerOutput, PlanError> {
             goal,
             steps,
             confidence,
+            on_complete,
+            on_failure,
         } => {
             let mut plan = Plan::new(goal, steps);
             plan.confidence = confidence.map(|c| c.clamp(0.0, 1.0));
+            plan.on_complete = on_complete;
+            plan.on_failure = on_failure;
             Ok(PlannerOutput::Workflow(plan))
         }
         PlannerJsonOutput::DirectResponse { message } => Ok(PlannerOutput::DirectResponse(message)),
@@ -738,7 +773,7 @@ mod tests {
     }
 
     #[test]
-    fn test_system_prompt_contains_mcp_and_skill_actions() {
+    fn test_system_prompt_contains_mcp_and_skill_knowledge() {
         let planner = LlmPlanner::new(
             MockLlmClient {
                 response: "{}".to_string(),
@@ -746,48 +781,37 @@ mod tests {
             LlmPlannerConfig::default(),
         );
 
-        let actions = vec![
-            ActionMeta::new("mcp__alpha", "Call MCP server alpha")
-                .with_capabilities(["mcp", "side_effect"])
-                .with_input_schema(json!({
-                    "type":"object",
-                    "properties":{
-                        "operation":{"type":"string"},
-                        "tool":{"type":"string"},
-                        "arguments":{"type":"object"}
-                    }
-                }))
-                .with_output_schema(json!({
-                    "type":"object",
-                    "properties":{
-                        "server":{"type":"string"},
-                        "result":{}
-                    }
-                })),
-            ActionMeta::new("skill__demo", "Expose demo skill instructions")
-                .with_capabilities(["instruction_only", "skill_prompt"])
-                .with_input_schema(json!({
-                    "type":"object",
-                    "properties":{
-                        "query":{"type":"string"}
-                    }
-                }))
-                .with_output_schema(json!({
-                    "type":"object",
-                    "properties":{
-                        "skill":{"type":"string"},
-                        "instructions":{"type":"string"}
-                    }
-                })),
-        ];
-        let context = PlannerContext::new(actions, Arc::new(NoopReferenceStore));
+        let actions = vec![ActionMeta::new("mcp__alpha", "Call MCP server alpha")
+            .with_capabilities(["mcp", "side_effect"])
+            .with_input_schema(json!({
+                "type":"object",
+                "properties":{
+                    "operation":{"type":"string"},
+                    "tool":{"type":"string"},
+                    "arguments":{"type":"object"}
+                }
+            }))
+            .with_output_schema(json!({
+                "type":"object",
+                "properties":{
+                    "server":{"type":"string"},
+                    "result":{}
+                }
+            }))];
+        let context = PlannerContext::new(actions, Arc::new(NoopReferenceStore))
+            .with_skill_instructions(vec![SkillInstruction {
+                skill_name: "demo".to_string(),
+                instructions: "Always write then verify.".to_string(),
+                scripts_dir: Some(".claude/skills/demo/scripts".to_string()),
+            }]);
         let intent = Intent::new("need tools and skills");
         let (system, _user) = planner.build_prompt(&intent, &context);
 
         assert!(system.contains("- name: mcp__alpha"));
-        assert!(system.contains("- name: skill__demo"));
-        assert!(system.contains("Actions named `skill__*` are instruction-only"));
-        assert!(system.contains("capabilities: [instruction_only, skill_prompt]"));
+        assert!(!system.contains("skill__demo"));
+        assert!(system.contains("Activated Skill Knowledge"));
+        assert!(system.contains("--- skill: demo ---"));
+        assert!(system.contains("[scripts directory: .claude/skills/demo/scripts]"));
     }
 
     #[test]

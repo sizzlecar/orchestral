@@ -11,13 +11,12 @@ use serde_json::Value;
 use tokio::sync::RwLock;
 
 use crate::context::{ContextBuilder, ContextError, ContextRequest, ContextWindow, TokenBudget};
+use crate::skill::SkillCatalog;
 use orchestral_core::action::{extract_meta, ActionMeta};
 use orchestral_core::executor::{
     ExecutionProgressEvent, ExecutionProgressReporter, ExecutionResult, Executor, ExecutorContext,
 };
-use orchestral_core::interpreter::{
-    InterpretDeltaSink, InterpretRequest, NoopResultInterpreter, ResultInterpreter,
-};
+use orchestral_core::interpreter::InterpretRequest;
 use orchestral_core::normalizer::{NormalizeError, PlanNormalizer};
 use orchestral_core::planner::{
     HistoryItem, PlanError, Planner, PlannerContext, PlannerOutput, PlannerRuntimeInfo,
@@ -34,7 +33,6 @@ use orchestral_core::types::{
 use crate::{HandleEventResult, InteractionState, RuntimeError, ThreadRuntime};
 
 const MAX_LOG_CHARS: usize = 8_000;
-const CAPABILITY_INSTRUCTION_ONLY: &str = "instruction_only";
 
 fn truncate_for_log(input: &str, max_chars: usize) -> String {
     let char_count = input.chars().count();
@@ -112,9 +110,9 @@ pub struct Orchestrator {
     pub task_store: Arc<dyn TaskStore>,
     pub reference_store: Arc<dyn ReferenceStore>,
     pub context_builder: Option<Arc<dyn ContextBuilder>>,
-    pub result_interpreter: Arc<dyn ResultInterpreter>,
     pub config: OrchestratorConfig,
     pub hook_registry: Arc<HookRegistry>,
+    pub skill_catalog: Arc<SkillCatalog>,
 }
 
 /// Orchestrator configuration
@@ -183,9 +181,9 @@ impl Orchestrator {
             task_store,
             reference_store,
             context_builder: None,
-            result_interpreter: Arc::new(NoopResultInterpreter),
             config,
             hook_registry: Arc::new(HookRegistry::new()),
+            skill_catalog: Arc::new(SkillCatalog::new(Vec::new(), 0)),
         }
     }
 
@@ -195,15 +193,15 @@ impl Orchestrator {
         self
     }
 
-    /// Attach a result interpreter (optional override).
-    pub fn with_result_interpreter(mut self, interpreter: Arc<dyn ResultInterpreter>) -> Self {
-        self.result_interpreter = interpreter;
-        self
-    }
-
     /// Attach runtime hook registry.
     pub fn with_hook_registry(mut self, hook_registry: Arc<HookRegistry>) -> Self {
         self.hook_registry = hook_registry;
+        self
+    }
+
+    /// Attach skill catalog for planner-time instruction injection.
+    pub fn with_skill_catalog(mut self, skill_catalog: Arc<SkillCatalog>) -> Self {
+        self.skill_catalog = skill_catalog;
         self
     }
 
@@ -407,9 +405,11 @@ impl Orchestrator {
             history_items = history.len(),
             "orchestrator planning started"
         );
+        let skill_instructions = self.skill_catalog.build_instructions(&task.intent.content);
         let runtime_info = PlannerRuntimeInfo::detect();
         let context = PlannerContext::with_history(actions, history, self.reference_store.clone())
-            .with_runtime_info(runtime_info);
+            .with_runtime_info(runtime_info)
+            .with_skill_instructions(skill_instructions);
         let planner_started_at = Instant::now();
         let planner_output = self.planner.plan(&task.intent, &context).await?;
         let planner_elapsed_ms = planner_started_at.elapsed().as_millis() as u64;
@@ -421,21 +421,6 @@ impl Orchestrator {
         );
         match planner_output {
             PlannerOutput::Workflow(plan) => {
-                if let Some(reason) = workflow_guard_violation(&plan, &context.available_actions) {
-                    self.emit_lifecycle_event(
-                        "planning_guard_rejected",
-                        Some(interaction_id.as_str()),
-                        Some(task.id.as_str()),
-                        Some("planner workflow rejected by runtime guard"),
-                        serde_json::json!({
-                            "reason": reason,
-                            "step_count": plan.steps.len(),
-                            "steps": summarize_plan_steps(&plan),
-                        }),
-                    )
-                    .await;
-                    return Err(OrchestratorError::Planner(PlanError::Generation(reason)));
-                }
                 self.emit_lifecycle_event(
                     "planning_completed",
                     Some(interaction_id.as_str()),
@@ -782,6 +767,57 @@ impl Orchestrator {
                     }
                 }
             }
+
+            if let ExecutionResult::NeedReplan { step_id, prompt } = &run.result {
+                self.emit_lifecycle_event(
+                    "iterative_replan_started",
+                    Some(interaction_id),
+                    Some(task.id.as_str()),
+                    Some("replan step reached, invoking planner for continuation"),
+                    serde_json::json!({
+                        "replan_step_id": step_id,
+                        "prompt": truncate_for_log(prompt, 400),
+                    }),
+                )
+                .await;
+
+                match self
+                    .build_continuation_plan(task, &current_plan, step_id, prompt, interaction_id)
+                    .await
+                {
+                    Ok(extended_plan) => {
+                        task.set_plan(extended_plan.clone());
+                        task.start_executing();
+                        self.task_store.save(task).await?;
+                        current_plan = extended_plan;
+                        resume = None;
+                        self.emit_lifecycle_event(
+                            "iterative_replan_completed",
+                            Some(interaction_id),
+                            Some(task.id.as_str()),
+                            Some("continuation steps appended"),
+                            serde_json::json!({
+                                "step_count": current_plan.steps.len(),
+                            }),
+                        )
+                        .await;
+                        continue;
+                    }
+                    Err(err) => {
+                        self.emit_lifecycle_event(
+                            "iterative_replan_failed",
+                            Some(interaction_id),
+                            Some(task.id.as_str()),
+                            Some("iterative replan failed"),
+                            serde_json::json!({
+                                "error": truncate_for_log(&err.to_string(), 400),
+                            }),
+                        )
+                        .await;
+                    }
+                }
+            }
+
             break run.result;
         };
 
@@ -902,10 +938,6 @@ impl Orchestrator {
         let history = self
             .history_for_planner(interaction_id, task.id.as_str())
             .await?;
-        let runtime_info = PlannerRuntimeInfo::detect();
-        let context = PlannerContext::with_history(actions, history, self.reference_store.clone())
-            .with_runtime_info(runtime_info);
-
         let recovery_intent = build_recovery_intent(
             &task.intent,
             plan,
@@ -915,6 +947,13 @@ impl Orchestrator {
             &affected,
             &task.completed_step_ids,
         );
+        let runtime_info = PlannerRuntimeInfo::detect();
+        let skill_instructions = self
+            .skill_catalog
+            .build_instructions(&recovery_intent.content);
+        let context = PlannerContext::with_history(actions, history, self.reference_store.clone())
+            .with_runtime_info(runtime_info)
+            .with_skill_instructions(skill_instructions);
         let recovery_output = self.planner.plan(&recovery_intent, &context).await?;
         let recovery_plan = match recovery_output {
             PlannerOutput::Workflow(plan) => plan,
@@ -932,6 +971,90 @@ impl Orchestrator {
         let patched =
             patch_plan_with_recovery(plan, &cut.cut_step_id, &affected, &recovery_plan.steps)?;
         Ok(Some(patched))
+    }
+
+    async fn build_continuation_plan(
+        &self,
+        task: &Task,
+        current_plan: &orchestral_core::types::Plan,
+        replan_step_id: &StepId,
+        replan_prompt: &str,
+        interaction_id: &str,
+    ) -> Result<orchestral_core::types::Plan, OrchestratorError> {
+        let actions = self.available_actions().await;
+        let history = self
+            .history_for_planner(interaction_id, task.id.as_str())
+            .await?;
+
+        let ws_summary = summarize_working_set(&task.working_set_snapshot);
+        let content = format!(
+            "Continuation planning request.\n\
+            Original goal: {}\n\
+            Original intent: {}\n\
+            Completed steps: {}\n\
+            Current working set summary:\n{}\n\
+            Replan prompt: {}\n\
+            Rules: generate ONLY the continuation steps. \
+            Do not repeat completed steps. \
+            New step IDs must not collide with existing ones.",
+            current_plan.goal,
+            task.intent.content,
+            serde_json::to_string(&task.completed_step_ids).unwrap_or_else(|_| "[]".to_string()),
+            ws_summary,
+            replan_prompt,
+        );
+        let continuation_intent = Intent::new(content);
+
+        let runtime_info = PlannerRuntimeInfo::detect();
+        let skill_instructions = self.skill_catalog.build_instructions(&task.intent.content);
+        let context = PlannerContext::with_history(actions, history, self.reference_store.clone())
+            .with_runtime_info(runtime_info)
+            .with_skill_instructions(skill_instructions);
+
+        let output = self.planner.plan(&continuation_intent, &context).await?;
+        let continuation_plan = match output {
+            PlannerOutput::Workflow(plan) => plan,
+            PlannerOutput::DirectResponse(_) => {
+                return Err(OrchestratorError::Planner(PlanError::Generation(
+                    "continuation planner returned direct_response; workflow required".to_string(),
+                )));
+            }
+            PlannerOutput::Clarification(_) => {
+                return Err(OrchestratorError::Planner(PlanError::Generation(
+                    "continuation planner returned clarification; workflow required".to_string(),
+                )));
+            }
+        };
+
+        let mut merged_steps = current_plan.steps.clone();
+        if let Some(node) = merged_steps.iter_mut().find(|s| s.id == *replan_step_id) {
+            node.kind = StepKind::System;
+        }
+        let existing_ids: std::collections::HashSet<String> =
+            merged_steps.iter().map(|s| s.id.to_string()).collect();
+
+        for mut step in continuation_plan.steps {
+            if existing_ids.contains(step.id.as_str()) {
+                let new_id = format!("c_{}", step.id);
+                step.id = new_id.into();
+            }
+            if step.depends_on.is_empty() {
+                step.depends_on = vec![replan_step_id.clone()];
+            }
+            merged_steps.push(step);
+        }
+
+        Ok(orchestral_core::types::Plan {
+            goal: current_plan.goal.clone(),
+            steps: merged_steps,
+            confidence: current_plan.confidence,
+            on_complete: continuation_plan
+                .on_complete
+                .or_else(|| current_plan.on_complete.clone()),
+            on_failure: continuation_plan
+                .on_failure
+                .or_else(|| current_plan.on_failure.clone()),
+        })
     }
 
     async fn available_actions(&self) -> Vec<ActionMeta> {
@@ -1037,52 +1160,24 @@ impl Orchestrator {
         let Some(plan) = task.plan.clone() else {
             return;
         };
-        let request = InterpretRequest {
-            intent: task.intent.content.clone(),
-            plan,
-            execution_result: result.clone(),
-            completed_step_ids: task.completed_step_ids.clone(),
-            working_set_snapshot: task.working_set_snapshot.clone(),
-        };
-        let stream_sink = Arc::new(RuntimeInterpreterDeltaSink::new(
-            self.thread_runtime.thread_id().await,
-            InteractionId::from(interaction_id),
-            task.id.clone(),
-            self.thread_runtime.event_store.clone(),
-            self.thread_runtime.event_bus.clone(),
-        ));
-        let interpreted = match self
-            .result_interpreter
-            .interpret_stream(request.clone(), Some(stream_sink))
-            .await
-        {
-            Ok(output) => output,
-            Err(err) => {
-                tracing::warn!(
-                    task_id = %task.id,
-                    interaction_id = %interaction_id,
-                    error = %err,
-                    "result interpretation failed"
-                );
-                match NoopResultInterpreter.interpret(request).await {
-                    Ok(fallback) => fallback,
-                    Err(fallback_err) => {
-                        tracing::warn!(
-                            task_id = %task.id,
-                            interaction_id = %interaction_id,
-                            error = %fallback_err,
-                            "fallback interpretation failed"
-                        );
-                        return;
-                    }
-                }
-            }
-        };
+
+        let message = resolve_plan_response_template(&plan, result, &task.working_set_snapshot)
+            .unwrap_or_else(|| {
+                let request = InterpretRequest {
+                    intent: task.intent.content.clone(),
+                    plan: plan.clone(),
+                    execution_result: result.clone(),
+                    completed_step_ids: task.completed_step_ids.clone(),
+                    working_set_snapshot: task.working_set_snapshot.clone(),
+                };
+                noop_interpret_sync(&request)
+            });
+
         self.emit_assistant_output_message(
             interaction_id,
             task.id.as_str(),
-            interpreted.message,
-            interpreted.metadata,
+            message,
+            Value::Null,
             Some(execution_result_metadata(result)),
         )
         .await;
@@ -1256,69 +1351,6 @@ impl ExecutionProgressReporter for RuntimeProgressReporter {
             .map_err(|e| e.to_string())?;
 
         Ok(())
-    }
-}
-
-struct RuntimeInterpreterDeltaSink {
-    thread_id: ThreadId,
-    interaction_id: InteractionId,
-    task_id: TaskId,
-    event_store: Arc<dyn EventStore>,
-    event_bus: Arc<dyn EventBus>,
-}
-
-impl RuntimeInterpreterDeltaSink {
-    fn new(
-        thread_id: ThreadId,
-        interaction_id: InteractionId,
-        task_id: TaskId,
-        event_store: Arc<dyn EventStore>,
-        event_bus: Arc<dyn EventBus>,
-    ) -> Self {
-        Self {
-            thread_id,
-            interaction_id,
-            task_id,
-            event_store,
-            event_bus,
-        }
-    }
-}
-
-#[async_trait]
-impl InterpretDeltaSink for RuntimeInterpreterDeltaSink {
-    async fn on_delta(&self, delta: &str) {
-        if delta.is_empty() {
-            return;
-        }
-        let trace = Event::trace(
-            self.thread_id.clone(),
-            "info",
-            serde_json::json!({
-                "category": "assistant_stream",
-                "interaction_id": self.interaction_id.to_string(),
-                "task_id": self.task_id.to_string(),
-                "delta": delta,
-                "done": false,
-            }),
-        );
-        let _ = self.event_store.append(trace.clone()).await;
-        let _ = self.event_bus.publish(trace).await;
-    }
-
-    async fn on_done(&self) {
-        let trace = Event::trace(
-            self.thread_id.clone(),
-            "info",
-            serde_json::json!({
-                "category": "assistant_stream",
-                "interaction_id": self.interaction_id.to_string(),
-                "task_id": self.task_id.to_string(),
-                "done": true,
-            }),
-        );
-        let _ = self.event_store.append(trace.clone()).await;
-        let _ = self.event_bus.publish(trace).await;
     }
 }
 
@@ -1574,6 +1606,8 @@ fn patch_plan_with_recovery(
         goal: current_plan.goal.clone(),
         steps: base_steps,
         confidence: current_plan.confidence,
+        on_complete: current_plan.on_complete.clone(),
+        on_failure: current_plan.on_failure.clone(),
     })
 }
 
@@ -1750,6 +1784,11 @@ fn execution_result_metadata(result: &ExecutionResult) -> Value {
             "step_id": step_id,
             "event_type": event_type,
         }),
+        ExecutionResult::NeedReplan { step_id, prompt } => serde_json::json!({
+            "status": "need_replan",
+            "step_id": step_id,
+            "prompt": truncate_for_log(prompt, 400),
+        }),
     }
 }
 
@@ -1775,6 +1814,7 @@ fn task_state_from_execution(result: &ExecutionResult) -> TaskState {
         ExecutionResult::WaitingEvent { event_type, .. } => TaskState::WaitingEvent {
             event_type: event_type.clone(),
         },
+        ExecutionResult::NeedReplan { .. } => TaskState::Executing,
     }
 }
 
@@ -1854,34 +1894,100 @@ fn interaction_state_from_task(state: &TaskState) -> InteractionState {
     }
 }
 
-fn workflow_guard_violation(
+fn resolve_plan_response_template(
     plan: &orchestral_core::types::Plan,
-    actions: &[ActionMeta],
+    result: &ExecutionResult,
+    working_set: &HashMap<String, Value>,
 ) -> Option<String> {
-    let action_meta = actions
-        .iter()
-        .map(|meta| (meta.name.as_str(), meta))
-        .collect::<HashMap<_, _>>();
+    let template = match result {
+        ExecutionResult::Completed => plan.on_complete.as_deref(),
+        ExecutionResult::Failed { .. } => plan.on_failure.as_deref(),
+        _ => None,
+    }?;
 
-    let executable_steps = plan
-        .steps
-        .iter()
-        .filter(|step| step.kind == StepKind::Action)
-        .filter(|step| {
-            action_meta
-                .get(step.action.as_str())
-                .map(|meta| !meta.has_capability(CAPABILITY_INSTRUCTION_ONLY))
-                .unwrap_or(true)
-        })
-        .count();
-
-    if executable_steps == 0 {
-        return Some(
-            "workflow contains only instruction-only actions; add executable steps".to_string(),
-        );
+    let mut resolved = template.to_string();
+    for (key, value) in working_set {
+        let placeholder = format!("{{{{{}}}}}", key);
+        let replacement = match value {
+            Value::String(s) => s.clone(),
+            Value::Number(n) => n.to_string(),
+            Value::Bool(b) => b.to_string(),
+            Value::Null => "null".to_string(),
+            other => other.to_string(),
+        };
+        resolved = resolved.replace(&placeholder, &replacement);
     }
+    if let ExecutionResult::Failed { error, .. } = result {
+        resolved = resolved.replace("{{error}}", error);
+    }
+    Some(resolved)
+}
 
-    None
+fn noop_interpret_sync(request: &InterpretRequest) -> String {
+    let completed = request.completed_step_ids.len();
+    let total = request.plan.steps.len();
+    match &request.execution_result {
+        ExecutionResult::Completed => {
+            format!("Done ({}/{} steps).", completed, total)
+        }
+        ExecutionResult::Failed { step_id, error } => {
+            format!(
+                "Failed at step '{}' ({}/{} steps): {}",
+                step_id,
+                completed,
+                total,
+                truncate_for_log(error, 400)
+            )
+        }
+        ExecutionResult::WaitingUser { prompt, .. } => {
+            format!(
+                "Need input ({}/{} steps done): {}",
+                completed, total, prompt
+            )
+        }
+        ExecutionResult::WaitingEvent {
+            step_id,
+            event_type,
+        } => {
+            format!(
+                "Waiting for '{}' at step '{}' ({}/{} steps done).",
+                event_type, step_id, completed, total
+            )
+        }
+        ExecutionResult::NeedReplan { step_id, prompt } => {
+            format!(
+                "Replanning at step '{}' ({}/{} steps done): {}",
+                step_id, completed, total, prompt
+            )
+        }
+    }
+}
+
+fn summarize_working_set(snapshot: &HashMap<String, Value>) -> String {
+    let mut lines = Vec::new();
+    for (key, value) in snapshot {
+        let preview = match value {
+            Value::String(s) => {
+                let trimmed = s.trim();
+                if trimmed.len() > 200 {
+                    format!("\"{}...\"", &trimmed[..200])
+                } else {
+                    format!("\"{}\"", trimmed)
+                }
+            }
+            Value::Number(n) => n.to_string(),
+            Value::Bool(b) => b.to_string(),
+            Value::Null => "null".to_string(),
+            other => truncate_for_log(&other.to_string(), 200),
+        };
+        lines.push(format!("  {}: {}", key, preview));
+    }
+    if lines.is_empty() {
+        "(empty)".to_string()
+    } else {
+        lines.sort();
+        lines.join("\n")
+    }
 }
 
 #[cfg(test)]
@@ -2097,26 +2203,5 @@ mod tests {
         )
         .expect("cut");
         assert_eq!(cut.cut_step_id, "A2");
-    }
-
-    #[test]
-    fn test_workflow_guard_rejects_skill_only_plan() {
-        let plan = Plan::new("goal", vec![Step::action("s1", "skill__xlsx")]);
-        let actions =
-            vec![ActionMeta::new("skill__xlsx", "skill").with_capability("instruction_only")];
-        let reason = workflow_guard_violation(&plan, &actions);
-        assert!(reason.is_some());
-        assert!(reason
-            .unwrap_or_default()
-            .contains("instruction-only actions"));
-    }
-
-    #[test]
-    fn test_workflow_guard_accepts_executable_workflow() {
-        let plan = Plan::new("goal", vec![Step::action("s1", "file_write")]);
-        let actions =
-            vec![ActionMeta::new("file_write", "write").with_capability("filesystem_write")];
-        let reason = workflow_guard_violation(&plan, &actions);
-        assert!(reason.is_none());
     }
 }
