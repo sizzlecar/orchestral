@@ -1108,8 +1108,28 @@ impl Orchestrator {
         let existing_ids: std::collections::HashSet<String> =
             merged_steps.iter().map(|s| s.id.to_string()).collect();
 
-        let continuation_steps: Vec<Step> = continuation_plan
-            .steps
+        let all_continuation_steps = continuation_plan.steps;
+
+        let replan_ids: std::collections::HashSet<String> = all_continuation_steps
+            .iter()
+            .filter(|s| s.kind == StepKind::Replan)
+            .map(|s| s.id.to_string())
+            .collect();
+
+        let mut replan_redirect: HashMap<String, String> = HashMap::new();
+        for replan_step in all_continuation_steps
+            .iter()
+            .filter(|s| s.kind == StepKind::Replan)
+        {
+            let redirect_to = replan_step
+                .depends_on
+                .last()
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| replan_step_id.to_string());
+            replan_redirect.insert(replan_step.id.to_string(), redirect_to);
+        }
+
+        let continuation_steps: Vec<Step> = all_continuation_steps
             .into_iter()
             .filter(|s| s.kind != StepKind::Replan)
             .collect();
@@ -1129,11 +1149,18 @@ impl Orchestrator {
             step.depends_on = step
                 .depends_on
                 .into_iter()
-                .map(|dep| {
-                    if let Some(renamed) = rename_map.get(dep.as_str()) {
-                        StepId::from(renamed.as_str())
+                .filter_map(|dep| {
+                    if replan_ids.contains(dep.as_str()) {
+                        replan_redirect.get(dep.as_str()).map(|target| {
+                            rename_map
+                                .get(target)
+                                .map(|r| StepId::from(r.as_str()))
+                                .unwrap_or_else(|| StepId::from(target.as_str()))
+                        })
+                    } else if let Some(renamed) = rename_map.get(dep.as_str()) {
+                        Some(StepId::from(renamed.as_str()))
                     } else {
-                        dep
+                        Some(dep)
                     }
                 })
                 .collect();
@@ -2072,30 +2099,119 @@ fn noop_interpret_sync(request: &InterpretRequest) -> String {
 }
 
 fn summarize_working_set(snapshot: &HashMap<String, Value>) -> String {
-    let mut lines = Vec::new();
-    for (key, value) in snapshot {
-        let preview = match value {
-            Value::String(s) => {
-                let trimmed = s.trim();
-                if trimmed.len() > 200 {
-                    format!("\"{}...\"", &trimmed[..200])
-                } else {
-                    format!("\"{}\"", trimmed)
-                }
-            }
+    const MAX_WS_SUMMARY_CHARS: usize = 16_000;
+    const LIMIT_STDOUT: usize = 4_000;
+    const LIMIT_STDERR: usize = 1_000;
+    const LIMIT_CONTENT: usize = 4_000;
+    const LIMIT_DEFAULT: usize = 200;
+
+    #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
+    enum KeyPriority {
+        High = 0,
+        Medium = 1,
+        Low = 2,
+    }
+
+    fn classify_key(key: &str) -> (KeyPriority, usize) {
+        if key == "stdout" || key.ends_with(".stdout") {
+            (KeyPriority::High, LIMIT_STDOUT)
+        } else if key == "content" || key.ends_with(".content") {
+            (KeyPriority::High, LIMIT_CONTENT)
+        } else if key == "stderr" || key.ends_with(".stderr") {
+            (KeyPriority::Medium, LIMIT_STDERR)
+        } else {
+            (KeyPriority::Low, LIMIT_DEFAULT)
+        }
+    }
+
+    fn truncate_plain(input: &str, max_chars: usize) -> String {
+        let char_count = input.chars().count();
+        if char_count <= max_chars {
+            return input.to_string();
+        }
+        if max_chars <= 3 {
+            return ".".repeat(max_chars);
+        }
+        let mut out: String = input.chars().take(max_chars - 3).collect();
+        out.push_str("...");
+        out
+    }
+
+    fn preview_value(value: &Value, max_chars: usize) -> String {
+        match value {
+            Value::String(s) => format!("\"{}\"", truncate_plain(s.trim(), max_chars)),
             Value::Number(n) => n.to_string(),
             Value::Bool(b) => b.to_string(),
             Value::Null => "null".to_string(),
-            other => truncate_for_log(&other.to_string(), 200),
-        };
-        lines.push(format!("  {}: {}", key, preview));
+            other => truncate_plain(&other.to_string(), max_chars),
+        }
     }
-    if lines.is_empty() {
-        "(empty)".to_string()
-    } else {
-        lines.sort();
-        lines.join("\n")
+
+    let mut entries = snapshot.iter().collect::<Vec<_>>();
+    entries.sort_by(|(k1, _), (k2, _)| k1.cmp(k2));
+
+    let mut buckets: [Vec<(&String, &Value)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for (key, value) in entries {
+        let (priority, _) = classify_key(key);
+        buckets[priority as usize].push((key, value));
     }
+
+    let mut output = String::new();
+    let mut remaining = MAX_WS_SUMMARY_CHARS;
+    let mut omitted_count = 0usize;
+
+    for bucket in &buckets {
+        for (key, value) in bucket {
+            if remaining == 0 {
+                omitted_count += 1;
+                continue;
+            }
+            let (_, per_key_limit) = classify_key(key.as_str());
+            let preview = preview_value(value, per_key_limit);
+            let line = format!("  {}: {}", key, preview);
+            let line_len = line.chars().count();
+            let sep_len = if output.is_empty() { 0 } else { 1 };
+
+            if remaining <= sep_len {
+                omitted_count += 1;
+                continue;
+            }
+            let line_budget = remaining - sep_len;
+            let line_to_append = if line_len > line_budget {
+                truncate_plain(&line, line_budget)
+            } else {
+                line
+            };
+            if !output.is_empty() {
+                output.push('\n');
+                remaining -= 1;
+            }
+            remaining = remaining.saturating_sub(line_to_append.chars().count());
+            output.push_str(&line_to_append);
+
+            if line_len > line_budget {
+                omitted_count += 1;
+            }
+        }
+    }
+
+    if output.is_empty() {
+        return "(empty)".to_string();
+    }
+
+    if omitted_count > 0 && remaining > 0 {
+        let summary_line = format!(
+            "  ... ({} keys omitted due to summary limit)",
+            omitted_count
+        );
+        let truncated = truncate_plain(&summary_line, remaining);
+        if !truncated.is_empty() {
+            output.push('\n');
+            output.push_str(&truncated);
+        }
+    }
+
+    output
 }
 
 #[cfg(test)]
@@ -2311,5 +2427,93 @@ mod tests {
         )
         .expect("cut");
         assert_eq!(cut.cut_step_id, "A2");
+    }
+
+    #[test]
+    fn test_summarize_working_set_applies_semantic_limits() {
+        let mut snapshot = HashMap::new();
+        snapshot.insert("stdout".to_string(), json!("s".repeat(5_000)));
+        snapshot.insert("stderr".to_string(), json!("e".repeat(1_500)));
+        snapshot.insert("path".to_string(), json!("p".repeat(500)));
+        snapshot.insert("reader.content".to_string(), json!("c".repeat(5_000)));
+
+        let summary = summarize_working_set(&snapshot);
+
+        let stdout_line = summary
+            .lines()
+            .find(|line| line.starts_with("  stdout: \""))
+            .expect("stdout line");
+        let stdout_value = stdout_line
+            .strip_prefix("  stdout: \"")
+            .and_then(|line| line.strip_suffix('"'))
+            .expect("stdout quoted value");
+        assert_eq!(stdout_value.chars().count(), 4_000);
+
+        let stderr_line = summary
+            .lines()
+            .find(|line| line.starts_with("  stderr: \""))
+            .expect("stderr line");
+        let stderr_value = stderr_line
+            .strip_prefix("  stderr: \"")
+            .and_then(|line| line.strip_suffix('"'))
+            .expect("stderr quoted value");
+        assert_eq!(stderr_value.chars().count(), 1_000);
+
+        let path_line = summary
+            .lines()
+            .find(|line| line.starts_with("  path: \""))
+            .expect("path line");
+        let path_value = path_line
+            .strip_prefix("  path: \"")
+            .and_then(|line| line.strip_suffix('"'))
+            .expect("path quoted value");
+        assert_eq!(path_value.chars().count(), 200);
+
+        let content_line = summary
+            .lines()
+            .find(|line| line.starts_with("  reader.content: \""))
+            .expect("content line");
+        let content_value = content_line
+            .strip_prefix("  reader.content: \"")
+            .and_then(|line| line.strip_suffix('"'))
+            .expect("content quoted value");
+        assert_eq!(content_value.chars().count(), 4_000);
+    }
+
+    #[test]
+    fn test_summarize_working_set_is_utf8_safe() {
+        let mut snapshot = HashMap::new();
+        snapshot.insert("note".to_string(), json!("你好".repeat(260)));
+
+        let summary = summarize_working_set(&snapshot);
+        let note_line = summary
+            .lines()
+            .find(|line| line.starts_with("  note: \""))
+            .expect("note line");
+        let note_value = note_line
+            .strip_prefix("  note: \"")
+            .and_then(|line| line.strip_suffix('"'))
+            .expect("note quoted value");
+
+        assert_eq!(note_value.chars().count(), 200);
+        assert!(note_value.ends_with("..."));
+    }
+
+    #[test]
+    fn test_summarize_working_set_prioritizes_stdout_content_and_stderr() {
+        let mut snapshot = HashMap::new();
+        snapshot.insert("stdout".to_string(), json!("s".repeat(10_000)));
+        snapshot.insert("stderr".to_string(), json!("e".repeat(3_000)));
+        snapshot.insert("reader.content".to_string(), json!("c".repeat(10_000)));
+        for idx in 0..120 {
+            snapshot.insert(format!("low_{idx:03}"), json!("l".repeat(400)));
+        }
+
+        let summary = summarize_working_set(&snapshot);
+
+        assert!(summary.contains("  stdout: \""));
+        assert!(summary.contains("  reader.content: \""));
+        assert!(summary.contains("  stderr: \""));
+        assert!(!summary.contains("  low_119: \""));
     }
 }

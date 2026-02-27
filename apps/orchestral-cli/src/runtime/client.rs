@@ -245,23 +245,24 @@ impl RuntimeClient {
                         input_summary,
                         ..
                     } => {
-                        let action = action.unwrap_or_else(|| "-".to_string());
-                        let kind = classify_activity_kind(&action);
+                        let action_label = normalize_step_action_label(&step_id, action);
+                        let kind = classify_activity_kind(&action_label);
                         let _ = runtime_tx_events
                             .send(RuntimeMsg::ActivityStart {
                                 kind,
                                 step_id: step_id.clone(),
-                                action: action.clone(),
+                                action: action_label.clone(),
                                 input_summary: input_summary.clone(),
                             })
                             .await;
                         let input_summary = input_summary
                             .map(|s| format!(" | {}", s))
                             .unwrap_or_default();
+                        let running_label = format_running_label(&step_id, &action_label);
                         let _ = runtime_tx_events
                             .send(RuntimeMsg::OutputTransient {
                                 slot: TransientSlot::Status,
-                                text: format!("Running {} ({}){}", step_id, action, input_summary),
+                                text: format!("{}{}", running_label, input_summary),
                             })
                             .await;
                     }
@@ -271,7 +272,7 @@ impl RuntimeClient {
                         output,
                     } => {
                         completed_steps = completed_steps.saturating_add(1);
-                        let action_name = action.unwrap_or_else(|| "-".to_string());
+                        let action_name = normalize_step_action_label(&step_id, action);
                         if let Some(preview) = output.preview.clone() {
                             last_preview = Some(preview);
                         }
@@ -337,7 +338,7 @@ impl RuntimeClient {
                         action,
                         message,
                     } => {
-                        let action_name = action.unwrap_or_else(|| "-".to_string());
+                        let action_name = normalize_step_action_label(&step_id, action);
                         let _ = runtime_tx_events
                             .send(RuntimeMsg::ActivityItem {
                                 step_id: step_id.clone(),
@@ -942,6 +943,27 @@ fn classify_activity_kind(action: &str) -> ActivityKind {
     }
 }
 
+fn normalize_step_action_label(step_id: &str, action: Option<String>) -> String {
+    action
+        .and_then(|raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+        .unwrap_or_else(|| step_id.to_string())
+}
+
+fn format_running_label(step_id: &str, action_label: &str) -> String {
+    if action_label == step_id {
+        format!("Running {}", step_id)
+    } else {
+        format!("Running {} ({})", step_id, action_label)
+    }
+}
+
 fn channel_event_label(event: &ChannelEvent) -> &'static str {
     match event {
         ChannelEvent::UserInput { .. } => "UserInput",
@@ -1024,5 +1046,37 @@ mod tests {
     fn test_event_interaction_id_from_system_trace_payload() {
         let event = ChannelEvent::trace("thread-1", "info", json!({"interaction_id":"int-2"}));
         assert_eq!(event_interaction_id(&event), Some("int-2"));
+    }
+
+    #[test]
+    fn test_normalize_step_action_label_falls_back_to_step_id_for_empty_action() {
+        assert_eq!(
+            normalize_step_action_label("process_xlsx", Some("".to_string())),
+            "process_xlsx"
+        );
+        assert_eq!(
+            normalize_step_action_label("process_xlsx", Some("   ".to_string())),
+            "process_xlsx"
+        );
+        assert_eq!(
+            normalize_step_action_label("process_xlsx", None),
+            "process_xlsx"
+        );
+        assert_eq!(
+            normalize_step_action_label("process_xlsx", Some("file_read".to_string())),
+            "file_read"
+        );
+    }
+
+    #[test]
+    fn test_format_running_label_avoids_duplicate_parentheses() {
+        assert_eq!(
+            format_running_label("process_xlsx", "process_xlsx"),
+            "Running process_xlsx"
+        );
+        assert_eq!(
+            format_running_label("read_skill_docs", "file_read"),
+            "Running read_skill_docs (file_read)"
+        );
     }
 }
