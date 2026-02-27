@@ -14,6 +14,7 @@ use tokio::sync::RwLock;
 use crate::action::{
     ActionConfigError, ActionFactory, ActionRegistryManager, ActionWatcher, DefaultActionFactory,
 };
+use crate::agent::{LlmAgentExecutor, LlmAgentExecutorConfig};
 use crate::context::{BasicContextBuilder, TokenBudget};
 use crate::planner::{
     DefaultLlmClientFactory, LlmBuildError, LlmClient, LlmClientFactory, LlmInvocationConfig,
@@ -190,6 +191,11 @@ impl RuntimeApp {
 
         let executor = Executor::with_registry(action_registry_manager.registry())
             .with_export_contract(config.runtime.strict_exports);
+        let executor = if let Some(agent_executor) = build_agent_step_executor(&config)? {
+            executor.with_agent_step_executor(agent_executor)
+        } else {
+            executor
+        };
         let planner = build_planner(&config)?;
         let skill_entries = discover_skills(&config, &path)?;
         let skill_catalog = Arc::new(SkillCatalog::new(
@@ -585,21 +591,10 @@ fn build_planner(config: &OrchestralConfig) -> Result<Arc<dyn Planner>, Bootstra
             };
 
             let client = DefaultLlmClientFactory::new().build(&backend, &invocation)?;
-            let default_cfg = LlmPlannerConfig::default();
-            let prompt_from_profile = config
-                .planner
-                .model_profile
-                .as_ref()
-                .and_then(|name| config.providers.get_model(name))
-                .and_then(|p| p.system_prompt.clone());
-            let prompt_from_backend = backend.get_config::<String>("system_prompt");
-            let (system_prompt, prompt_source) = if let Some(prompt) = prompt_from_profile {
-                (prompt, "model_profile")
-            } else if let Some(prompt) = prompt_from_backend {
-                (prompt, "backend")
-            } else {
-                (default_cfg.system_prompt, "default")
-            };
+            // Planner prompt comes from the built-in template + runtime dynamic injection only.
+            // Do not pull prompt text from model profile/backend config to avoid rule drift.
+            let system_prompt = String::new();
+            let prompt_source = "template";
 
             tracing::info!(
                 backend_name = %backend.name,
@@ -622,12 +617,84 @@ fn build_planner(config: &OrchestralConfig) -> Result<Arc<dyn Planner>, Bootstra
                 temperature,
                 max_history: config.planner.max_history,
                 system_prompt,
+                log_full_prompts: config.planner.log_full_prompts,
             };
 
             let planner: LlmPlanner<Arc<dyn LlmClient>> = LlmPlanner::new(client, planner_cfg);
             Ok(Arc::new(planner))
         }
         "deterministic" => Ok(Arc::new(DeterministicPlanner)),
+        other => Err(BootstrapError::UnsupportedPlannerMode(other.to_string())),
+    }
+}
+
+fn build_agent_step_executor(
+    config: &OrchestralConfig,
+) -> Result<Option<Arc<dyn orchestral_core::executor::AgentStepExecutor>>, BootstrapError> {
+    match config.planner.mode.as_str() {
+        "llm" => {
+            let profile = if let Some(profile_name) = &config.planner.model_profile {
+                Some(config.providers.get_model(profile_name).ok_or_else(|| {
+                    BootstrapError::ModelProfileNotFound(profile_name.to_string())
+                })?)
+            } else {
+                config.providers.get_default_model()
+            };
+
+            let backend = if let Some(profile) = &profile {
+                if let Some(backend_name) = &profile.backend {
+                    config
+                        .providers
+                        .get_backend(backend_name)
+                        .ok_or_else(|| BootstrapError::BackendNotFound(backend_name.to_string()))?
+                } else {
+                    config
+                        .providers
+                        .get_default_backend()
+                        .ok_or(BootstrapError::MissingProviderConfig)?
+                }
+            } else if let Some(backend_name) = &config.planner.backend {
+                config
+                    .providers
+                    .get_backend(backend_name)
+                    .ok_or_else(|| BootstrapError::BackendNotFound(backend_name.to_string()))?
+            } else if let Some(default_provider) = config.providers.get_default() {
+                config
+                    .providers
+                    .get_backend(&default_provider.name)
+                    .ok_or_else(|| BootstrapError::BackendNotFound(default_provider.name.clone()))?
+            } else {
+                return Err(BootstrapError::MissingProviderConfig);
+            };
+
+            let model = config
+                .planner
+                .model
+                .clone()
+                .or_else(|| profile.as_ref().map(|p| p.model.clone()))
+                .unwrap_or_else(|| LlmPlannerConfig::default().model);
+            let temperature_candidate = config
+                .planner
+                .temperature
+                .or_else(|| profile.as_ref().and_then(|p| p.temperature))
+                .unwrap_or_else(|| LlmPlannerConfig::default().temperature);
+            let temperature = profile
+                .as_ref()
+                .map(|p| p.clamp_temperature(temperature_candidate))
+                .unwrap_or(temperature_candidate);
+
+            let invocation = LlmInvocationConfig {
+                model: model.clone(),
+                temperature,
+                normalize_response: true,
+            };
+
+            let client = DefaultLlmClientFactory::new().build(&backend, &invocation)?;
+            let executor =
+                LlmAgentExecutor::new(client, LlmAgentExecutorConfig { model, temperature });
+            Ok(Some(Arc::new(executor)))
+        }
+        "deterministic" => Ok(None),
         other => Err(BootstrapError::UnsupportedPlannerMode(other.to_string())),
     }
 }

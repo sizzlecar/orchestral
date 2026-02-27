@@ -34,6 +34,7 @@ pub fn render_planner_prompt(
     execution_environment: &str,
     action_catalog: &str,
     skill_knowledge: &str,
+    conditional_rules: &str,
 ) -> String {
     render_template(
         planner_template(),
@@ -41,6 +42,7 @@ pub fn render_planner_prompt(
             ("BASE_PROMPT", base_prompt.trim()),
             ("EXECUTION_ENVIRONMENT", execution_environment.trim()),
             ("SKILL_KNOWLEDGE", skill_knowledge.trim()),
+            ("CONDITIONAL_RULES", conditional_rules.trim()),
             ("ACTION_CATALOG", action_catalog.trim()),
         ],
     )
@@ -52,10 +54,17 @@ mod tests {
 
     #[test]
     fn planner_prompt_template_renders_dynamic_fields() {
-        let rendered = render_planner_prompt("base", "env", "- name: shell", "skill block");
+        let rendered = render_planner_prompt(
+            "base",
+            "env",
+            "- name: shell",
+            "skill block",
+            "- only for shell",
+        );
         assert!(rendered.contains("base"));
         assert!(rendered.contains("env"));
         assert!(rendered.contains("skill block"));
+        assert!(rendered.contains("- only for shell"));
         assert!(rendered.contains("- name: shell"));
         assert!(!rendered.contains("{{BASE_PROMPT}}"));
     }

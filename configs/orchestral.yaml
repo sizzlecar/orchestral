@@ -15,6 +15,7 @@ planner:
   backend: openai
   model_profile: fast
   max_history: 20
+  log_full_prompts: false
   dynamic_model_selection: true
 
 interpreter:

@@ -82,6 +82,7 @@ pub struct PlannerContext {
 pub struct SkillInstruction {
     pub skill_name: String,
     pub instructions: String,
+    pub skill_path: Option<String>,
     pub scripts_dir: Option<String>,
 }
 

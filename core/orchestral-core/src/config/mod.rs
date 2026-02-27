@@ -177,6 +177,9 @@ pub struct PlannerConfig {
     pub dynamic_model_selection: bool,
     #[serde(default = "default_max_history")]
     pub max_history: usize,
+    /// Whether to log full planner prompts (system/user). Disabled by default.
+    #[serde(default = "default_false")]
+    pub log_full_prompts: bool,
 }
 
 impl Default for PlannerConfig {
@@ -189,6 +192,7 @@ impl Default for PlannerConfig {
             temperature: None,
             dynamic_model_selection: default_dynamic_model_selection(),
             max_history: default_max_history(),
+            log_full_prompts: default_false(),
         }
     }
 }
@@ -203,6 +207,10 @@ fn default_max_history() -> usize {
 
 fn default_dynamic_model_selection() -> bool {
     true
+}
+
+fn default_false() -> bool {
+    false
 }
 
 #[derive(Debug, Clone, Deserialize)]

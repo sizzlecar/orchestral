@@ -67,7 +67,8 @@ impl SkillCatalog {
             .into_iter()
             .map(|entry| SkillInstruction {
                 skill_name: entry.name.clone(),
-                instructions: entry.instructions.clone(),
+                instructions: summarize_skill_instructions(&entry.instructions, 600),
+                skill_path: Some(entry.source_path.to_string_lossy().to_string()),
                 scripts_dir: entry
                     .scripts_dir
                     .as_ref()
@@ -75,6 +76,26 @@ impl SkillCatalog {
             })
             .collect()
     }
+}
+
+fn summarize_skill_instructions(input: &str, max_chars: usize) -> String {
+    let text = input.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+    let mut summary_lines = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .take(10)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let char_count = summary_lines.chars().count();
+    if char_count > max_chars {
+        summary_lines = summary_lines.chars().take(max_chars).collect::<String>();
+        summary_lines.push_str("... [skill summary truncated]");
+    }
+    summary_lines
 }
 
 fn tokenize(input: &str) -> Vec<String> {
@@ -136,5 +157,41 @@ mod tests {
 
         let matched = catalog.match_intent("deploy kubernetes");
         assert!(matched.is_empty());
+    }
+
+    #[test]
+    fn test_summarize_skill_instructions_limits_lines() {
+        let input = (1..=12)
+            .map(|i| format!("line-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let summary = summarize_skill_instructions(&input, 10_000);
+        let lines = summary.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 10);
+        assert_eq!(lines[0], "line-1");
+        assert_eq!(lines[9], "line-10");
+    }
+
+    #[test]
+    fn test_build_instructions_uses_summary_and_path() {
+        let long = "x".repeat(700);
+        let catalog = SkillCatalog::new(
+            vec![SkillEntry {
+                name: "xlsx".to_string(),
+                description: "spreadsheet skill".to_string(),
+                instructions: long,
+                source_path: PathBuf::from("/tmp/xlsx/SKILL.md"),
+                scripts_dir: Some(PathBuf::from("/tmp/xlsx/scripts")),
+            }],
+            3,
+        );
+
+        let instructions = catalog.build_instructions("please use xlsx");
+        assert_eq!(instructions.len(), 1);
+        let first = &instructions[0];
+        assert_eq!(first.skill_name, "xlsx");
+        assert_eq!(first.skill_path.as_deref(), Some("/tmp/xlsx/SKILL.md"));
+        assert_eq!(first.scripts_dir.as_deref(), Some("/tmp/xlsx/scripts"));
+        assert!(first.instructions.contains("[skill summary truncated]"));
     }
 }

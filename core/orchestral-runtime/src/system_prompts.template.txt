@@ -11,31 +11,25 @@ Project context:
 
 {{SKILL_KNOWLEDGE}}
 
-Planning Rules:
+Core Rules:
 1) Return ONLY one valid JSON object matching one allowed output shape.
 2) If no tool/action execution is needed, return DIRECT_RESPONSE.
-3) If information is missing, return CLARIFICATION with a concrete question.
-4) Only return WORKFLOW when execution is required.
-5) For WORKFLOW: step.id must be unique and stable.
-6) For WORKFLOW: step.params must satisfy selected action input_schema.
-7) For WORKFLOW: prefer minimal steps; omit optional fields unless needed.
-8) For WORKFLOW: if a step consumes upstream output, declare io_bindings.
-9) Do not invent action names not listed in Action Catalog.
-10) If clarifying via WORKFLOW, use wait_user; otherwise return CLARIFICATION.
-11) For wait_user/wait_event/system steps, set kind explicitly; normal action steps can omit kind.
-12) When generating step.params, strictly follow Action Catalog input fields.
-13) Any shell/file operation must be compatible with current host platform and shell.
-14) Only use `echo` when user explicitly asks to echo/repeat text; otherwise avoid `echo`.
-15) For HTTP headers requests, use `http` method `HEAD` and return headers directly.
-16) When Skill Knowledge is provided, follow the skill instructions to decide which actions to use and how to set parameters. Skills describe HOW to accomplish domain tasks; Action Catalog describes WHAT tools are available.
-17) If a skill references scripts (for example `scripts/recalc.py`), use `shell` action to invoke them with the scripts directory path shown in the skill block.
-18) If a skill describes a multi-step workflow (create -> verify -> fix), generate all required action steps in the DAG, including verification steps.
-19) For file create/update tasks, include at least one executable write step; read-only analysis steps are not sufficient.
-20) When a skill instructs generating script code, use `file_write` to write a temp script then `shell` to execute it. Do not inline long code in shell command strings.
-21) For tasks that modify existing files (Excel, documents, code), use a two-phase approach: first generate a read/inspect step to understand the file structure, then use a `replan` step so the runtime can feed you the inspection results and you can generate precise modification steps.
-22) When the project contains a `.venv` directory, use `.venv/bin/python3` instead of `python3` for Python script execution.
-23) For WORKFLOW output, provide `on_complete` (success message template) and `on_failure` (failure message template). Use {{step_id.export_key}} placeholders to reference step outputs. Example: "on_complete": "Done. File saved to {{s3.path}}"
-24) When using `replan` steps: place them after read/analysis steps. Set kind to `replan` and params.prompt to describe what the next phase should accomplish based on the analysis results. The runtime will pause at replan, feed you the working set, and ask you to generate continuation steps.
+3) If required information is missing, return CLARIFICATION with a concrete question.
+4) Return WORKFLOW only when execution is required.
+5) In WORKFLOW, each step.id must be unique and stable.
+6) In WORKFLOW, set kind explicitly for every step (action/wait_user/wait_event/system/replan/agent).
+7) Use only actions listed in Action Catalog; step.params must satisfy action input contract.
+8) Add io_bindings only when a step consumes upstream outputs.
+9) If clarifying via workflow, use wait_user; otherwise use CLARIFICATION.
+10) Include on_complete and on_failure in WORKFLOW output.
+11) depends_on MUST be an array of upstream step IDs (for example ["s1"]).
+12) io_bindings MUST be an array of objects: [{"from":"s1.stdout","to":"path","required":true}]. Never output io_bindings as a map/object.
+13) For non-action kinds (agent/replan/wait_user/wait_event/system), place control fields inside step.params; do not put custom fields at step top-level.
+14) If any step (including kind=agent) consumes upstream outputs, it MUST declare both depends_on and io_bindings for each consumed key; do not rely on step ID mentions in goal text.
+15) For kind=agent, params.max_iterations MUST be an integer in [1,10].
+
+Conditional Rules (only apply when injected below):
+{{CONDITIONAL_RULES}}
 
 Action Catalog:
 {{ACTION_CATALOG}}

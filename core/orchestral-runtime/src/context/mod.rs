@@ -277,7 +277,7 @@ impl ContextBuilder for BasicContextBuilder {
             events.sort_by_key(|a| a.timestamp());
             for event in events {
                 if let Some(slice) = event_to_slice(&event) {
-                    window.core.push(slice);
+                    push_slice_with_budget(&mut window, slice, SliceBucket::Core);
                 }
             }
         }
@@ -301,7 +301,7 @@ impl ContextBuilder for BasicContextBuilder {
                     continue;
                 }
                 if let Some(slice) = reference_to_slice(&reference, self.config.include_summaries) {
-                    window.optional.push(slice);
+                    push_slice_with_budget(&mut window, slice, SliceBucket::Optional);
                 }
             }
         }
@@ -441,4 +441,118 @@ fn matches_tags(reference: &Reference, tags: &[String]) -> bool {
         .unwrap_or_default();
 
     tags.iter().all(|t| ref_tags.contains(t))
+}
+
+#[derive(Copy, Clone)]
+enum SliceBucket {
+    Core,
+    Optional,
+}
+
+fn push_slice_with_budget(window: &mut ContextWindow, slice: ContextSlice, bucket: SliceBucket) {
+    let tokens = estimate_slice_tokens(&slice);
+    let remaining = window.budget.remaining();
+    if tokens <= remaining {
+        window.budget.used_tokens = window.budget.used_tokens.saturating_add(tokens);
+        match bucket {
+            SliceBucket::Core => window.core.push(slice),
+            SliceBucket::Optional => window.optional.push(slice),
+        }
+    } else {
+        window.deferred.push(slice);
+    }
+}
+
+fn estimate_slice_tokens(slice: &ContextSlice) -> usize {
+    let attachment_chars: usize = slice.attachments.iter().map(|s| s.chars().count()).sum();
+    // Rough estimate for budget packing; avoids pulling in tokenizer deps.
+    let total_chars = slice.content.chars().count() + attachment_chars + slice.role.chars().count();
+    std::cmp::max(1, total_chars.div_ceil(4))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orchestral_core::store::{
+        Event, InMemoryEventStore, InMemoryReferenceStore, Reference, ReferenceType,
+    };
+    use serde_json::json;
+
+    fn make_builder() -> BasicContextBuilder {
+        let event_store = Arc::new(InMemoryEventStore::new());
+        let reference_store = Arc::new(InMemoryReferenceStore::new());
+        BasicContextBuilder::new(event_store, reference_store)
+    }
+
+    #[test]
+    fn test_context_budget_keeps_core_when_fit() {
+        tokio_test::block_on(async {
+            let builder = make_builder();
+            builder
+                .event_store
+                .append(Event::user_input(
+                    "thread-1",
+                    "i-1",
+                    json!("12345678901234567890"),
+                ))
+                .await
+                .expect("append event 1");
+            builder
+                .event_store
+                .append(Event::user_input(
+                    "thread-1",
+                    "i-1",
+                    json!("abcdefghijabcdefghij"),
+                ))
+                .await
+                .expect("append event 2");
+
+            let mut request = ContextRequest::new("thread-1");
+            request.budget = TokenBudget::new(12);
+            request.include_references = false;
+
+            let window = builder.build(&request).await.expect("build context");
+            assert_eq!(window.core.len(), 2);
+            assert_eq!(window.deferred.len(), 0);
+            assert_eq!(window.budget.used_tokens, 12);
+        });
+    }
+
+    #[test]
+    fn test_context_budget_defers_optional_when_overflow() {
+        tokio_test::block_on(async {
+            let builder = make_builder();
+            builder
+                .event_store
+                .append(Event::user_input(
+                    "thread-2",
+                    "i-2",
+                    json!("12345678901234567890"),
+                ))
+                .await
+                .expect("append event");
+
+            let mut reference = Reference::new(
+                "thread-2",
+                ReferenceType::Text,
+                json!("abcdefghijklmnopqrstuvwxyz"),
+            );
+            reference.id = "ref-1".to_string();
+            builder
+                .reference_store
+                .add(reference)
+                .await
+                .expect("add reference");
+
+            let mut request = ContextRequest::new("thread-2");
+            request.budget = TokenBudget::new(8);
+            request.include_references = true;
+
+            let window = builder.build(&request).await.expect("build context");
+            assert_eq!(window.core.len(), 1);
+            assert_eq!(window.optional.len(), 0);
+            assert_eq!(window.deferred.len(), 1);
+            assert_eq!(window.deferred[0].attachments, vec!["ref-1".to_string()]);
+        });
+    }
 }

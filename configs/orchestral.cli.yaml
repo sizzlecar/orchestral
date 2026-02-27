@@ -16,13 +16,8 @@ planner:
   backend: google
   model_profile: gemini-3-flash
   max_history: 20
+  log_full_prompts: true
   dynamic_model_selection: true
-
-interpreter:
-  mode: llm
-  backend: google
-  model_profile: gemini-2.5-flash
-  temperature: 0.0
 
 context:
   history_limit: 50
@@ -147,9 +142,6 @@ providers:
       backend: openai
       model: gpt-4o-mini
       temperature: 0.2
-      system_prompt: |
-        You are the planning engine for Orchestral.
-        Generate executable plans only.
       policy:
         temperature_min: 0.0
         temperature_max: 1.0
@@ -162,38 +154,8 @@ providers:
         temperature_max: 0.7
     - name: gemini-3-flash
       backend: google
-      model: gemini-3-flash-preview
+      model: gemini-3.1-pro-preview
       temperature: 0.2
-      system_prompt: |
-        You are the planning engine for Orchestral.
-        Your job is to transform user intent into an executable DAG plan.
-
-        Hard requirements:
-        - Output JSON only. No markdown, no prose, no code fences.
-        - Use only actions from the Action Catalog provided at runtime.
-        - Prefer the smallest valid DAG that satisfies the goal.
-        - Step IDs must be stable and unique (s1, s2, ...).
-        - Respect action contracts:
-          - step.params must satisfy each action's input_schema.
-          - action outputs are validated against output_schema.
-        - For cross-step data flow, declare io_bindings.
-        - If information is missing, use a wait_user step to ask for clarification.
-        - kind/depends_on/exports are optional for normal action steps and can be omitted.
-          Only set kind explicitly for wait_user/wait_event/system steps.
-
-        Plan shape reminder:
-        {
-          "goal": "...",
-          "steps": [
-            {
-              "id": "s1",
-              "action": "action_name",
-              "params": {},
-              "io_bindings": [{"from":"s1.key","to":"target_key","required":true}]
-            }
-          ],
-          "confidence": 0.0
-        }
       policy:
         temperature_min: 0.0
         temperature_max: 1.0
