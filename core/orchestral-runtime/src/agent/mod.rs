@@ -13,7 +13,8 @@ use crate::planner::{LlmClient, LlmRequest};
 
 const MAX_PROMPT_OBSERVATION_CHARS: usize = 600;
 const MAX_AGENT_LOG_TEXT_CHARS: usize = 1_200;
-const MAX_BOUND_INPUT_VALUE_CHARS: usize = 500;
+const MAX_BOUND_INPUT_VALUE_CHARS: usize = 1_200;
+const MAX_BOUND_SKILL_VALUE_CHARS: usize = 12_000;
 const MAX_BOUND_INPUT_KEYS: usize = 4;
 const MAX_RECENT_OBSERVATIONS: usize = 4;
 
@@ -445,11 +446,15 @@ fn build_bound_inputs_block(bound_inputs: &HashMap<String, Value>) -> String {
     lines.push("Bound upstream inputs (from io_bindings):".to_string());
     for key in keys.iter().take(MAX_BOUND_INPUT_KEYS) {
         if let Some(value) = bound_inputs.get(key) {
-            lines.push(format!(
-                "- {} = {}",
-                key,
-                summarize_bound_input_value(key, value)
-            ));
+            let summarized = summarize_bound_input_value(key, value);
+            if summarized.contains('\n') {
+                lines.push(format!("- {}:", key));
+                for line in summarized.lines() {
+                    lines.push(format!("  {}", line));
+                }
+            } else {
+                lines.push(format!("- {} = {}", key, summarized));
+            }
         }
     }
     if keys.len() > MAX_BOUND_INPUT_KEYS {
@@ -470,17 +475,22 @@ fn summarize_bound_input_value(key: &str, value: &Value) -> String {
     match value {
         Value::String(text) => {
             let normalized = if key_lower.contains("skill") {
-                summarize_multiline_text(text, 10)
+                // Keep far more skill detail for explicit skill-driven tasks.
+                summarize_multiline_text(text, 120, "\n")
             } else {
-                summarize_multiline_text(text, 4)
+                summarize_multiline_text(text, 4, " | ")
             };
-            truncate_with_limit(&normalized, MAX_BOUND_INPUT_VALUE_CHARS)
+            if key_lower.contains("skill") {
+                truncate_with_limit(&normalized, MAX_BOUND_SKILL_VALUE_CHARS)
+            } else {
+                truncate_with_limit(&normalized, MAX_BOUND_INPUT_VALUE_CHARS)
+            }
         }
         _ => truncate_with_limit(&value.to_string(), MAX_BOUND_INPUT_VALUE_CHARS),
     }
 }
 
-fn summarize_multiline_text(text: &str, max_lines: usize) -> String {
+fn summarize_multiline_text(text: &str, max_lines: usize, separator: &str) -> String {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return String::new();
@@ -495,7 +505,7 @@ fn summarize_multiline_text(text: &str, max_lines: usize) -> String {
     if lines.is_empty() {
         trimmed.to_string()
     } else {
-        lines.join(" | ")
+        lines.join(separator)
     }
 }
 
@@ -806,7 +816,25 @@ mod tests {
             .join("\n");
         let summarized =
             summarize_bound_input_value("skill_instructions", &Value::String(skill_text));
-        assert!(summarized.contains("line-1 | line-2 | line-3"));
-        assert!(!summarized.contains('\n'));
+        assert!(summarized.contains("line-1\nline-2\nline-3"));
+        assert!(summarized.contains('\n'));
+    }
+
+    #[test]
+    fn test_build_bound_inputs_block_uses_multiline_block_for_skill() {
+        let mut bound_inputs = HashMap::new();
+        bound_inputs.insert(
+            "skill_doc".to_string(),
+            Value::String("line-1\nline-2".to_string()),
+        );
+        bound_inputs.insert(
+            "excel_file".to_string(),
+            Value::String("docs/a.xlsx".to_string()),
+        );
+        let block = build_bound_inputs_block(&bound_inputs);
+        assert!(block.contains("- skill_doc:"));
+        assert!(block.contains("  line-1"));
+        assert!(block.contains("  line-2"));
+        assert!(block.contains("- excel_file = docs/a.xlsx"));
     }
 }

@@ -67,7 +67,11 @@ impl SkillCatalog {
             .into_iter()
             .map(|entry| SkillInstruction {
                 skill_name: entry.name.clone(),
-                instructions: summarize_skill_instructions(&entry.instructions, 600),
+                instructions: if is_skill_explicitly_requested(intent, &entry.name) {
+                    entry.instructions.trim().to_string()
+                } else {
+                    summarize_skill_instructions(&entry.instructions, 48, 2_400)
+                },
                 skill_path: Some(entry.source_path.to_string_lossy().to_string()),
                 scripts_dir: entry
                     .scripts_dir
@@ -78,7 +82,16 @@ impl SkillCatalog {
     }
 }
 
-fn summarize_skill_instructions(input: &str, max_chars: usize) -> String {
+fn is_skill_explicitly_requested(intent: &str, skill_name: &str) -> bool {
+    if intent.trim().is_empty() || skill_name.trim().is_empty() {
+        return false;
+    }
+    intent
+        .to_ascii_lowercase()
+        .contains(&skill_name.to_ascii_lowercase())
+}
+
+fn summarize_skill_instructions(input: &str, max_lines: usize, max_chars: usize) -> String {
     let text = input.trim();
     if text.is_empty() {
         return String::new();
@@ -86,7 +99,7 @@ fn summarize_skill_instructions(input: &str, max_chars: usize) -> String {
     let mut summary_lines = text
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .take(10)
+        .take(max_lines)
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -165,7 +178,7 @@ mod tests {
             .map(|i| format!("line-{i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let summary = summarize_skill_instructions(&input, 10_000);
+        let summary = summarize_skill_instructions(&input, 10, 10_000);
         let lines = summary.lines().collect::<Vec<_>>();
         assert_eq!(lines.len(), 10);
         assert_eq!(lines[0], "line-1");
@@ -173,25 +186,45 @@ mod tests {
     }
 
     #[test]
-    fn test_build_instructions_uses_summary_and_path() {
-        let long = "x".repeat(700);
+    fn test_build_instructions_uses_summary_and_path_when_not_explicit() {
+        let long = "x".repeat(3_000);
         let catalog = SkillCatalog::new(
             vec![SkillEntry {
                 name: "xlsx".to_string(),
                 description: "spreadsheet skill".to_string(),
-                instructions: long,
+                instructions: long.clone(),
                 source_path: PathBuf::from("/tmp/xlsx/SKILL.md"),
                 scripts_dir: Some(PathBuf::from("/tmp/xlsx/scripts")),
             }],
             3,
         );
 
-        let instructions = catalog.build_instructions("please use xlsx");
+        let instructions = catalog.build_instructions("please help with spreadsheet data");
         assert_eq!(instructions.len(), 1);
         let first = &instructions[0];
         assert_eq!(first.skill_name, "xlsx");
         assert_eq!(first.skill_path.as_deref(), Some("/tmp/xlsx/SKILL.md"));
         assert_eq!(first.scripts_dir.as_deref(), Some("/tmp/xlsx/scripts"));
         assert!(first.instructions.contains("[skill summary truncated]"));
+    }
+
+    #[test]
+    fn test_build_instructions_uses_full_skill_when_explicitly_requested() {
+        let long = "x".repeat(5_000);
+        let catalog = SkillCatalog::new(
+            vec![SkillEntry {
+                name: "xlsx".to_string(),
+                description: "spreadsheet skill".to_string(),
+                instructions: long.clone(),
+                source_path: PathBuf::from("/tmp/xlsx/SKILL.md"),
+                scripts_dir: Some(PathBuf::from("/tmp/xlsx/scripts")),
+            }],
+            3,
+        );
+
+        let instructions = catalog.build_instructions("use xlsx skill to update this file");
+        assert_eq!(instructions.len(), 1);
+        let first = &instructions[0];
+        assert_eq!(first.instructions, long);
     }
 }
