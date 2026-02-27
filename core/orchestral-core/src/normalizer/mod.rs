@@ -9,6 +9,7 @@
 //! - Repair common LLM planning errors
 //! - Produce an executable DAG for the executor
 
+use serde_json::Value;
 use thiserror::Error;
 
 use crate::action::ActionMeta;
@@ -38,6 +39,9 @@ pub enum ValidationError {
 
     #[error("Step '{0}' binds from '{1}' but does not depend on that step")]
     IoBindingMissingDependency(String, String),
+
+    #[error("Invalid agent params in step '{0}': {1}")]
+    InvalidAgentParams(String, String),
 }
 
 /// Fix errors
@@ -218,6 +222,8 @@ impl PlanNormalizer {
                     }
                 }
             }
+
+            validate_agent_params(step)?;
         }
 
         // Check for unknown actions (if we have a registry)
@@ -309,8 +315,16 @@ impl PlanNormalizer {
             let original_kind = step.kind.clone();
             let original_depends_on = step.depends_on.clone();
             let original_exports = step.exports.clone();
+            let original_params = step.params.clone();
             infer_special_step_kind(step);
+            apply_agent_defaults(step);
             derive_depends_on_from_bindings(step);
+
+            if step.kind == StepKind::Agent {
+                if let Some(keys) = agent_output_keys(step) {
+                    step.exports = keys;
+                }
+            }
 
             if let Some(contract) = self.known_actions.get(&step.action) {
                 if !contract.output_keys.is_empty() {
@@ -341,6 +355,14 @@ impl PlanNormalizer {
                     action = %step.action,
                     exports = ?step.exports,
                     "normalizer populated exports from action output schema"
+                );
+            }
+            if step.params != original_params {
+                tracing::debug!(
+                    step_id = %step.id,
+                    action = %step.action,
+                    params = ?step.params,
+                    "normalizer updated step params"
                 );
             }
         }
@@ -379,8 +401,110 @@ fn infer_special_step_kind(step: &mut crate::types::Step) {
     match step.action.as_str() {
         "wait_user" => step.kind = StepKind::WaitUser,
         "wait_event" => step.kind = StepKind::WaitEvent,
+        "agent" => step.kind = StepKind::Agent,
         _ => {}
     }
+}
+
+fn apply_agent_defaults(step: &mut crate::types::Step) {
+    if step.kind != StepKind::Agent {
+        return;
+    }
+
+    if step.params.is_null() {
+        step.params = Value::Object(serde_json::Map::new());
+    }
+
+    if let Some(params) = step.params.as_object_mut() {
+        params
+            .entry("max_iterations".to_string())
+            .or_insert(Value::from(5_u64));
+    }
+}
+
+fn validate_agent_params(step: &crate::types::Step) -> Result<(), ValidationError> {
+    if step.kind != StepKind::Agent {
+        return Ok(());
+    }
+
+    let Some(params) = step.params.as_object() else {
+        return Err(ValidationError::InvalidAgentParams(
+            step.id.to_string(),
+            "params must be an object".to_string(),
+        ));
+    };
+
+    let goal = params.get("goal").and_then(|v| v.as_str()).map(str::trim);
+    if goal.is_none() || goal == Some("") {
+        return Err(ValidationError::InvalidAgentParams(
+            step.id.to_string(),
+            "goal must be a non-empty string".to_string(),
+        ));
+    }
+
+    let Some(allowed_actions) = params.get("allowed_actions").and_then(|v| v.as_array()) else {
+        return Err(ValidationError::InvalidAgentParams(
+            step.id.to_string(),
+            "allowed_actions must be a non-empty string array".to_string(),
+        ));
+    };
+    if allowed_actions.is_empty()
+        || allowed_actions.iter().any(|v| {
+            v.as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_none()
+        })
+    {
+        return Err(ValidationError::InvalidAgentParams(
+            step.id.to_string(),
+            "allowed_actions must be a non-empty string array".to_string(),
+        ));
+    }
+
+    let max_iterations = params.get("max_iterations").and_then(|v| v.as_u64());
+    if !(Some(1)..=Some(10)).contains(&max_iterations) {
+        return Err(ValidationError::InvalidAgentParams(
+            step.id.to_string(),
+            "max_iterations must be an integer between 1 and 10".to_string(),
+        ));
+    }
+
+    let Some(output_keys) = params.get("output_keys").and_then(|v| v.as_array()) else {
+        return Err(ValidationError::InvalidAgentParams(
+            step.id.to_string(),
+            "output_keys must be a non-empty string array".to_string(),
+        ));
+    };
+    if output_keys.is_empty()
+        || output_keys.iter().any(|v| {
+            v.as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_none()
+        })
+    {
+        return Err(ValidationError::InvalidAgentParams(
+            step.id.to_string(),
+            "output_keys must be a non-empty string array".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn agent_output_keys(step: &crate::types::Step) -> Option<Vec<String>> {
+    if step.kind != StepKind::Agent {
+        return None;
+    }
+    step.params
+        .get("output_keys")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
 }
 
 fn derive_depends_on_from_bindings(step: &mut crate::types::Step) {
@@ -490,5 +614,99 @@ mod tests {
         let normalized = normalizer.normalize(plan).expect("normalize");
         let step = normalized.plan.get_step("s1").expect("s1");
         assert_eq!(step.kind, StepKind::WaitUser);
+    }
+
+    #[test]
+    fn test_normalizer_infers_agent_kind_and_applies_default_iterations() {
+        let normalizer = PlanNormalizer::new();
+        let plan = Plan::new(
+            "agent",
+            vec![Step::action("s1", "agent").with_params(json!({
+                "goal": "inspect workbook structure",
+                "allowed_actions": ["file_read", "shell"],
+                "output_keys": ["inspection"]
+            }))],
+        );
+
+        let normalized = normalizer.normalize(plan).expect("normalize");
+        let step = normalized.plan.get_step("s1").expect("s1");
+        assert_eq!(step.kind, StepKind::Agent);
+        assert_eq!(
+            step.params
+                .get("max_iterations")
+                .and_then(|v| v.as_u64())
+                .expect("max_iterations"),
+            5
+        );
+    }
+
+    #[test]
+    fn test_normalizer_rejects_agent_params_without_goal() {
+        let normalizer = PlanNormalizer::new();
+        let plan = Plan::new(
+            "agent-invalid",
+            vec![Step::agent("s1").with_params(json!({
+                "allowed_actions": ["file_read"],
+                "max_iterations": 3,
+                "output_keys": ["summary"]
+            }))],
+        );
+
+        let err = normalizer
+            .normalize(plan)
+            .expect_err("expected validation error");
+        match err {
+            NormalizeError::Validation(ValidationError::InvalidAgentParams(step_id, reason)) => {
+                assert_eq!(step_id, "s1");
+                assert!(reason.contains("goal"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_normalizer_rejects_agent_params_when_iterations_out_of_range() {
+        let normalizer = PlanNormalizer::new();
+        let plan = Plan::new(
+            "agent-invalid",
+            vec![Step::agent("s1").with_params(json!({
+                "goal": "inspect",
+                "allowed_actions": ["file_read"],
+                "max_iterations": 99,
+                "output_keys": ["summary"]
+            }))],
+        );
+
+        let err = normalizer
+            .normalize(plan)
+            .expect_err("expected validation error");
+        match err {
+            NormalizeError::Validation(ValidationError::InvalidAgentParams(step_id, reason)) => {
+                assert_eq!(step_id, "s1");
+                assert!(reason.contains("max_iterations"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_normalizer_populates_agent_exports_from_output_keys() {
+        let normalizer = PlanNormalizer::new();
+        let plan = Plan::new(
+            "agent-exports",
+            vec![Step::agent("s1").with_params(json!({
+                "goal": "inspect",
+                "allowed_actions": ["file_read"],
+                "max_iterations": 3,
+                "output_keys": ["summary", "next_step"]
+            }))],
+        );
+
+        let normalized = normalizer.normalize(plan).expect("normalize");
+        let step = normalized.plan.get_step("s1").expect("s1");
+        assert_eq!(
+            step.exports,
+            vec!["summary".to_string(), "next_step".to_string()]
+        );
     }
 }

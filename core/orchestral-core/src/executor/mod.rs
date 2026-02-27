@@ -422,6 +422,19 @@ pub trait ExecutionProgressReporter: Send + Sync {
     async fn report(&self, event: ExecutionProgressEvent) -> Result<(), String>;
 }
 
+/// Runtime-provided executor for `StepKind::Agent`.
+#[async_trait]
+pub trait AgentStepExecutor: Send + Sync {
+    async fn execute_agent_step(
+        &self,
+        step: &Step,
+        resolved_params: serde_json::Value,
+        execution_id: &str,
+        ctx: &ExecutorContext,
+        action_registry: Arc<RwLock<ActionRegistry>>,
+    ) -> ActionResult;
+}
+
 /// The executor - orchestrates DAG execution
 pub struct Executor {
     /// Action registry
@@ -436,6 +449,8 @@ pub struct Executor {
     pub retry_max_delay: Duration,
     /// Whether declared exports are required at runtime.
     pub strict_exports: bool,
+    /// Optional runtime hook for handling agent steps.
+    pub agent_step_executor: Option<Arc<dyn AgentStepExecutor>>,
 }
 
 impl Executor {
@@ -453,6 +468,7 @@ impl Executor {
             retry_base_delay: DEFAULT_RETRY_BASE_DELAY,
             retry_max_delay: DEFAULT_RETRY_MAX_DELAY,
             strict_exports: true,
+            agent_step_executor: None,
         }
     }
 
@@ -478,6 +494,12 @@ impl Executor {
     /// Configure strict runtime checks for step exports.
     pub fn with_export_contract(mut self, strict_exports: bool) -> Self {
         self.strict_exports = strict_exports;
+        self
+    }
+
+    /// Configure runtime-provided executor for `StepKind::Agent`.
+    pub fn with_agent_step_executor(mut self, agent_executor: Arc<dyn AgentStepExecutor>) -> Self {
+        self.agent_step_executor = Some(agent_executor);
         self
     }
 
@@ -946,16 +968,6 @@ impl Executor {
         execution_id: &str,
         ctx: &ExecutorContext,
     ) -> ActionResult {
-        let action = {
-            let registry = self.action_registry.read().await;
-            registry.get(&step.action)
-        };
-
-        let action = match action {
-            Some(a) => a,
-            None => return ActionResult::error(format!("Action '{}' not found", step.action)),
-        };
-        let action_meta = action.metadata();
         if tracing::enabled!(tracing::Level::DEBUG) {
             tracing::debug!(
                 task_id = %ctx.task_id,
@@ -1012,6 +1024,35 @@ impl Executor {
                 }
             }
         }
+
+        if step.kind == StepKind::Agent {
+            if let Some(agent_executor) = &self.agent_step_executor {
+                return agent_executor
+                    .execute_agent_step(
+                        step,
+                        resolved_params,
+                        execution_id,
+                        ctx,
+                        self.action_registry.clone(),
+                    )
+                    .await;
+            }
+            return ActionResult::error(format!(
+                "Agent step '{}' is not enabled: missing agent executor",
+                step.id
+            ));
+        }
+
+        let action = {
+            let registry = self.action_registry.read().await;
+            registry.get(&step.action)
+        };
+
+        let action = match action {
+            Some(a) => a,
+            None => return ActionResult::error(format!("Action '{}' not found", step.action)),
+        };
+        let action_meta = action.metadata();
 
         if let Err(error) = validate_schema(
             &resolved_params,
@@ -1637,6 +1678,24 @@ mod tests {
         }
     }
 
+    struct StaticAgentExecutor {
+        result: ActionResult,
+    }
+
+    #[async_trait]
+    impl AgentStepExecutor for StaticAgentExecutor {
+        async fn execute_agent_step(
+            &self,
+            _step: &Step,
+            _resolved_params: Value,
+            _execution_id: &str,
+            _ctx: &ExecutorContext,
+            _action_registry: Arc<RwLock<ActionRegistry>>,
+        ) -> ActionResult {
+            self.result.clone()
+        }
+    }
+
     #[async_trait]
     impl Action for FlakyRetryAction {
         fn name(&self) -> &str {
@@ -2048,6 +2107,65 @@ mod tests {
             }
             // initial attempt + 2 retries
             assert_eq!(calls.load(Ordering::SeqCst), 3);
+        });
+    }
+
+    #[test]
+    fn test_agent_step_requires_executor_or_fails() {
+        tokio_test::block_on(async {
+            let executor = Executor::new(ActionRegistry::new());
+            let plan = Plan::new(
+                "agent missing",
+                vec![Step::agent("s1").with_params(json!({
+                    "goal":"inspect",
+                    "allowed_actions":["echo"],
+                    "max_iterations": 2,
+                    "output_keys":["summary"]
+                }))],
+            );
+            let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
+            let ctx = ExecutorContext::new(
+                "task-1",
+                Arc::new(RwLock::new(WorkingSet::new())),
+                Arc::new(NoopReferenceStore),
+            );
+
+            let result = executor.execute(&mut dag, &ctx).await;
+            match result {
+                ExecutionResult::Failed { error, .. } => {
+                    assert!(error.contains("missing agent executor"));
+                }
+                other => panic!("expected failed result, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn test_agent_step_uses_configured_agent_executor() {
+        tokio_test::block_on(async {
+            let agent_executor = Arc::new(StaticAgentExecutor {
+                result: ActionResult::success_with_one("summary", json!("ok")),
+            });
+            let executor =
+                Executor::new(ActionRegistry::new()).with_agent_step_executor(agent_executor);
+
+            let plan = Plan::new(
+                "agent success",
+                vec![Step::agent("s1").with_params(json!({
+                    "goal":"inspect",
+                    "allowed_actions":["echo"],
+                    "max_iterations": 2,
+                    "output_keys":["summary"]
+                }))],
+            );
+            let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
+            let ws = Arc::new(RwLock::new(WorkingSet::new()));
+            let ctx = ExecutorContext::new("task-1", ws.clone(), Arc::new(NoopReferenceStore));
+
+            let result = executor.execute(&mut dag, &ctx).await;
+            assert!(matches!(result, ExecutionResult::Completed));
+            assert_eq!(ws.read().await.get_task("summary"), Some(&json!("ok")));
+            assert_eq!(ws.read().await.get_task("s1.summary"), Some(&json!("ok")));
         });
     }
 }

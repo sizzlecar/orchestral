@@ -79,6 +79,8 @@ pub enum StepKind {
     /// Pause execution and re-invoke the Planner with the current WorkingSet
     /// so it can generate continuation steps based on intermediate results.
     Replan,
+    /// Constrained internal LLM loop for iterative local exploration.
+    Agent,
 }
 
 /// Data binding from an upstream task key to this step's input key.
@@ -123,7 +125,7 @@ pub struct Step {
     /// Unique identifier for this step (logical ID)
     pub id: StepId,
     /// Name of the action to execute.
-    /// Defaults to empty for control-flow steps (replan, wait_user, wait_event).
+    /// Defaults to empty for non-action steps (replan, wait_user, wait_event, agent).
     #[serde(default)]
     pub action: String,
     /// Step type for control flow semantics
@@ -189,6 +191,19 @@ impl Step {
             id: id.into(),
             action: "replan".to_string(),
             kind: StepKind::Replan,
+            depends_on: Vec::new(),
+            exports: Vec::new(),
+            io_bindings: Vec::new(),
+            params: Value::Null,
+        }
+    }
+
+    /// Create an agent step.
+    pub fn agent(id: impl Into<StepId>) -> Self {
+        Self {
+            id: id.into(),
+            action: "agent".to_string(),
+            kind: StepKind::Agent,
             depends_on: Vec::new(),
             exports: Vec::new(),
             io_bindings: Vec::new(),

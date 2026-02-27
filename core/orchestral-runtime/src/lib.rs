@@ -4,6 +4,7 @@
 //! built-in actions, context building, and application-layer API.
 
 pub mod action;
+pub mod agent;
 pub mod api;
 mod bootstrap;
 mod concurrency;
