@@ -49,10 +49,11 @@ fn parse_skill_file(path: &Path) -> Option<SkillEntry> {
         .unwrap_or_else(|| "skill".to_string());
 
     let instructions = extract_skill_body(&content);
-    let scripts_dir = path
-        .parent()
-        .map(|p| p.join("scripts"))
-        .filter(|p| p.is_dir());
+    let skill_dir = path.parent();
+    let scripts_dir = skill_dir.map(|p| p.join("scripts")).filter(|p| p.is_dir());
+    let venv_python = skill_dir
+        .map(|p| p.join(".venv/bin/python3"))
+        .filter(|p| p.exists());
 
     Some(SkillEntry {
         name,
@@ -60,6 +61,7 @@ fn parse_skill_file(path: &Path) -> Option<SkillEntry> {
         instructions,
         source_path: path.to_path_buf(),
         scripts_dir,
+        venv_python,
     })
 }
 

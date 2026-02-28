@@ -915,12 +915,16 @@ impl Orchestrator {
             self.thread_runtime.event_bus.clone(),
             self.hook_registry.clone(),
         ));
+        let runtime_info = PlannerRuntimeInfo::detect();
+        let skill_instructions = self.skill_catalog.build_instructions(&task.intent.content);
         let exec_ctx = ExecutorContext::new(
             task.id.clone(),
             working_set.clone(),
             self.reference_store.clone(),
         )
-        .with_progress_reporter(progress_reporter);
+        .with_progress_reporter(progress_reporter)
+        .with_runtime_info(runtime_info)
+        .with_skill_instructions(skill_instructions);
         let result = self.executor.execute(&mut dag, &exec_ctx).await;
         tracing::info!(
             interaction_id = %interaction_id,

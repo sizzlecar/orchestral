@@ -10,6 +10,8 @@ pub struct SkillEntry {
     pub instructions: String,
     pub source_path: PathBuf,
     pub scripts_dir: Option<PathBuf>,
+    /// Skill-local virtual-env python binary, auto-detected from `<skill_dir>/.venv/bin/python3`.
+    pub venv_python: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -67,14 +69,14 @@ impl SkillCatalog {
             .into_iter()
             .map(|entry| SkillInstruction {
                 skill_name: entry.name.clone(),
-                instructions: if is_skill_explicitly_requested(intent, &entry.name) {
-                    entry.instructions.trim().to_string()
-                } else {
-                    summarize_skill_instructions(&entry.instructions, 48, 2_400)
-                },
+                instructions: entry.description.clone(),
                 skill_path: Some(entry.source_path.to_string_lossy().to_string()),
                 scripts_dir: entry
                     .scripts_dir
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string()),
+                venv_python: entry
+                    .venv_python
                     .as_ref()
                     .map(|p| p.to_string_lossy().to_string()),
             })
@@ -131,6 +133,7 @@ mod tests {
             instructions: format!("instructions for {name}"),
             source_path: PathBuf::from(format!("/tmp/{name}/SKILL.md")),
             scripts_dir: None,
+            venv_python: None,
         }
     }
 
@@ -186,15 +189,16 @@ mod tests {
     }
 
     #[test]
-    fn test_build_instructions_uses_summary_and_path_when_not_explicit() {
+    fn test_build_instructions_returns_description_and_path_only() {
         let long = "x".repeat(3_000);
         let catalog = SkillCatalog::new(
             vec![SkillEntry {
                 name: "xlsx".to_string(),
-                description: "spreadsheet skill".to_string(),
-                instructions: long.clone(),
+                description: "spreadsheet skill for formulas and formatting".to_string(),
+                instructions: long,
                 source_path: PathBuf::from("/tmp/xlsx/SKILL.md"),
                 scripts_dir: Some(PathBuf::from("/tmp/xlsx/scripts")),
+                venv_python: Some(PathBuf::from("/tmp/xlsx/.venv/bin/python3")),
             }],
             3,
         );
@@ -203,28 +207,15 @@ mod tests {
         assert_eq!(instructions.len(), 1);
         let first = &instructions[0];
         assert_eq!(first.skill_name, "xlsx");
+        assert_eq!(
+            first.instructions,
+            "spreadsheet skill for formulas and formatting"
+        );
         assert_eq!(first.skill_path.as_deref(), Some("/tmp/xlsx/SKILL.md"));
         assert_eq!(first.scripts_dir.as_deref(), Some("/tmp/xlsx/scripts"));
-        assert!(first.instructions.contains("[skill summary truncated]"));
-    }
-
-    #[test]
-    fn test_build_instructions_uses_full_skill_when_explicitly_requested() {
-        let long = "x".repeat(5_000);
-        let catalog = SkillCatalog::new(
-            vec![SkillEntry {
-                name: "xlsx".to_string(),
-                description: "spreadsheet skill".to_string(),
-                instructions: long.clone(),
-                source_path: PathBuf::from("/tmp/xlsx/SKILL.md"),
-                scripts_dir: Some(PathBuf::from("/tmp/xlsx/scripts")),
-            }],
-            3,
+        assert_eq!(
+            first.venv_python.as_deref(),
+            Some("/tmp/xlsx/.venv/bin/python3")
         );
-
-        let instructions = catalog.build_instructions("use xlsx skill to update this file");
-        assert_eq!(instructions.len(), 1);
-        let first = &instructions[0];
-        assert_eq!(first.instructions, long);
     }
 }

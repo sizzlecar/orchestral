@@ -84,6 +84,8 @@ pub struct SkillInstruction {
     pub instructions: String,
     pub skill_path: Option<String>,
     pub scripts_dir: Option<String>,
+    /// Skill-local virtual-env python path (e.g. `.claude/skills/xlsx/.venv/bin/python3`).
+    pub venv_python: Option<String>,
 }
 
 impl PlannerContext {

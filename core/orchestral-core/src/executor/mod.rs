@@ -16,6 +16,7 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde_json::Value;
 
 use crate::action::{Action, ActionContext, ActionInput, ActionResult, ApprovalRequest};
+use crate::planner::{PlannerRuntimeInfo, SkillInstruction};
 use crate::store::{ReferenceStore, WorkingSet};
 use crate::types::{Plan, Step, StepId, StepKind, TaskId};
 
@@ -330,6 +331,10 @@ pub struct ExecutorContext {
     pub task_id: TaskId,
     /// Optional execution progress reporter.
     pub progress_reporter: Option<Arc<dyn ExecutionProgressReporter>>,
+    /// Runtime host information (OS, arch, shell, python) for platform-aware execution.
+    pub runtime_info: Option<PlannerRuntimeInfo>,
+    /// Activated skill instructions for this execution turn.
+    pub skill_instructions: Vec<SkillInstruction>,
 }
 
 impl ExecutorContext {
@@ -344,12 +349,26 @@ impl ExecutorContext {
             working_set,
             reference_store,
             progress_reporter: None,
+            runtime_info: None,
+            skill_instructions: Vec::new(),
         }
     }
 
     /// Attach a realtime execution progress reporter.
     pub fn with_progress_reporter(mut self, reporter: Arc<dyn ExecutionProgressReporter>) -> Self {
         self.progress_reporter = Some(reporter);
+        self
+    }
+
+    /// Attach runtime host information for platform-aware execution.
+    pub fn with_runtime_info(mut self, info: PlannerRuntimeInfo) -> Self {
+        self.runtime_info = Some(info);
+        self
+    }
+
+    /// Attach activated skill instructions for this execution turn.
+    pub fn with_skill_instructions(mut self, skills: Vec<SkillInstruction>) -> Self {
+        self.skill_instructions = skills;
         self
     }
 }
