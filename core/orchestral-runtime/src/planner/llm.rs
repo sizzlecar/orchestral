@@ -25,12 +25,44 @@ pub struct LlmRequest {
     pub temperature: f32,
 }
 
+/// Tool definition for LLM function calling.
+#[derive(Debug, Clone)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema describing the tool parameters.
+    pub parameters: serde_json::Value,
+}
+
+/// LLM response that may contain a structured tool call instead of text.
+#[derive(Debug, Clone)]
+pub enum LlmResponse {
+    Text(String),
+    ToolCall {
+        id: String,
+        name: String,
+        arguments: serde_json::Value,
+    },
+}
+
 pub type StreamChunkCallback = Arc<dyn Fn(String) + Send + Sync>;
 
 /// LLM client trait
 #[async_trait]
 pub trait LlmClient: Send + Sync {
     async fn complete(&self, request: LlmRequest) -> Result<String, LlmError>;
+
+    /// Chat with tool definitions. LLM must call one of the provided tools.
+    /// Default implementation falls back to text-only `complete`.
+    async fn complete_with_tools(
+        &self,
+        request: LlmRequest,
+        tools: &[ToolDefinition],
+    ) -> Result<LlmResponse, LlmError> {
+        let _ = tools;
+        let text = self.complete(request).await?;
+        Ok(LlmResponse::Text(text))
+    }
 
     async fn complete_stream(
         &self,
@@ -51,6 +83,14 @@ pub trait LlmClient: Send + Sync {
 impl LlmClient for Arc<dyn LlmClient> {
     async fn complete(&self, request: LlmRequest) -> Result<String, LlmError> {
         (**self).complete(request).await
+    }
+
+    async fn complete_with_tools(
+        &self,
+        request: LlmRequest,
+        tools: &[ToolDefinition],
+    ) -> Result<LlmResponse, LlmError> {
+        (**self).complete_with_tools(request, tools).await
     }
 
     async fn complete_stream(
@@ -86,7 +126,7 @@ pub struct LlmPlannerConfig {
 impl Default for LlmPlannerConfig {
     fn default() -> Self {
         Self {
-            model: "gpt-4o-mini".to_string(),
+            model: "anthropic/claude-sonnet-4.5".to_string(),
             temperature: 0.2,
             max_history: 20,
             system_prompt: String::new(),
@@ -125,18 +165,18 @@ impl<C: LlmClient> LlmPlanner<C> {
         );
         user.push('\n');
         user.push_str(
-            r#"{"type":"WORKFLOW","goal":"...","steps":[{"id":"s1","kind":"action","action":"find_excel","params":{"command":"find","args":["docs","-name","*.xlsx"]}},{"id":"s2","kind":"action","action":"file_read","depends_on":["s1"],"io_bindings":[{"from":"s1.stdout","to":"path","required":true}],"params":{"path":"{{s1.stdout}}"}}],"confidence":0.0,"on_complete":"...","on_failure":"..."}"#,
+            r#"{"type":"WORKFLOW","goal":"...","steps":[{"id":"s1","kind":"action","action":"shell","params":{"command":"find","args":["docs","-type","f"]}},{"id":"s2","kind":"action","action":"file_read","depends_on":["s1"],"io_bindings":[{"from":"s1.stdout","to":"path","required":true}],"params":{"path":"{{s1.stdout}}"}}],"confidence":0.0,"on_complete":"...","on_failure":"..."}"#,
         );
         user.push('\n');
         user.push_str(
-            r#"{"type":"WORKFLOW","goal":"...","steps":[{"id":"s1","kind":"action","action":"shell","params":{"command":"find","args":["docs","-name","*.xlsx"]}},{"id":"s2","kind":"agent","depends_on":["s1"],"io_bindings":[{"from":"s1.stdout","to":"xlsx_candidates","required":true}],"params":{"goal":"inspect and update xlsx","allowed_actions":["shell","file_read","file_write"],"max_iterations":6,"output_keys":["modified_file","status"]}}],"confidence":0.0,"on_complete":"...","on_failure":"..."}"#,
+            r#"{"type":"WORKFLOW","goal":"...","steps":[{"id":"s1","kind":"action","action":"shell","params":{"command":"find","args":["docs","-type","f"]}},{"id":"s2","kind":"agent","depends_on":["s1"],"io_bindings":[{"from":"s1.stdout","to":"input_candidates","required":true}],"params":{"goal":"inspect and update local artifacts","allowed_actions":["shell","file_read","file_write"],"max_iterations":6,"output_keys":["modified_file","status"]}}],"confidence":0.0,"on_complete":"...","on_failure":"..."}"#,
         );
         user.push('\n');
         user.push_str(r#"{"type":"DIRECT_RESPONSE","message":"..."}"#);
         user.push('\n');
         user.push_str(r#"{"type":"CLARIFICATION","question":"..."}"#);
         user.push_str(
-            "\nUse only action names listed in Action Catalog when type is WORKFLOW. Add io_bindings only when step inputs depend on previous step outputs (including kind=agent). If kind=agent consumes upstream outputs, provide depends_on + io_bindings explicitly. For kind=agent, params.max_iterations MUST be an integer in [1,10]. io_bindings MUST be an array (never a map). Return JSON only.\n",
+            "\nUse only action names listed in Action Catalog when type is WORKFLOW. Prefer explicit action steps first. If a fixed sequence of actions can solve the task with depends_on + io_bindings, do not use kind=agent. Use kind=agent only when runtime observations must determine subsequent actions, target selection, or key parameters cannot be fixed reliably at planning time. Add io_bindings only when step inputs depend on previous step outputs (including kind=agent). If kind=agent consumes upstream outputs, provide depends_on + io_bindings explicitly. For kind=agent, params.max_iterations MUST be an integer in [1,10]. io_bindings MUST be an array (never a map). Return JSON only.\n",
         );
         user.push('\n');
 
@@ -248,9 +288,11 @@ fn build_conditional_rules(context: &PlannerContext, caps: PromptCapabilities) -
     }
 
     if caps.has_file_read && (caps.has_file_write || caps.has_shell) {
-        lines.push("- For local single-step exploration/inspect-debug loops, prefer kind=agent with goal/allowed_actions/max_iterations/output_keys.");
+        lines.push("- Prefer explicit action workflows first; use depends_on + io_bindings when upstream outputs only provide later step parameters.");
+        lines.push("- Use kind=agent only when runtime observations must determine subsequent actions, target selection, or key parameters.");
+        lines.push("- Do not use kind=agent for simple discovery steps whose outputs can flow into fixed downstream actions.");
         lines.push("- If kind=agent consumes upstream step outputs, include both depends_on and io_bindings for those consumed keys.");
-        lines.push("- For kind=agent, params.max_iterations must be an integer in [1,10].");
+        lines.push("- For kind=agent, params.max_iterations must be an integer in [1,10]. Keep the agent scoped to a local subproblem.");
         lines.push("- Use kind=replan only when the remaining global plan topology depends on intermediate outputs.");
         lines.push("- Replan continuation plans must not include another replan step.");
     }
@@ -272,21 +314,15 @@ fn build_skill_knowledge_block(skills: &[SkillInstruction]) -> String {
     }
 
     let mut out = String::new();
-    out.push_str("Activated Skill Knowledge:\n");
-    out.push_str(
-        "Use this section as a compact index. If full skill details are required, read SKILL.md via file_read using the path below.\n",
-    );
+    out.push_str("Activated Skills:\n");
     for skill in skills {
-        let _ = writeln!(out, "--- skill: {} ---", skill.skill_name);
-        out.push_str(skill.instructions.trim());
-        out.push('\n');
+        let _ = writeln!(out, "- {}: {}", skill.skill_name, skill.instructions.trim());
         if let Some(path) = &skill.skill_path {
-            let _ = writeln!(out, "[skill file: {}]", path);
+            let _ = writeln!(out, "  [skill file: {}]", path);
         }
         if let Some(dir) = &skill.scripts_dir {
-            let _ = writeln!(out, "[scripts directory: {}]", dir);
+            let _ = writeln!(out, "  [scripts: {}]", dir);
         }
-        out.push_str("--- end skill ---\n");
     }
     out
 }
@@ -305,13 +341,29 @@ fn build_execution_environment_block(context: &PlannerContext) -> String {
     if let Some(shell) = &context.runtime_info.shell {
         out.push_str(&format!("- shell: {}\n", shell));
     }
-    let venv_python = std::path::Path::new(".venv/bin/python3");
-    if venv_python.exists() {
-        out.push_str(
-            "- python: .venv/bin/python3 (MUST use this, system python3 lacks packages)\n",
-        );
+    if let Some(python) = resolve_python_path(&context.skill_instructions) {
+        out.push_str(&format!(
+            "- python: {} (MUST use this, system python3 lacks packages)\n",
+            python
+        ));
     }
     out
+}
+
+/// Resolve the best python path: skill venv > project root venv > None.
+fn resolve_python_path(skills: &[SkillInstruction]) -> Option<String> {
+    for skill in skills {
+        if let Some(venv) = &skill.venv_python {
+            if std::path::Path::new(venv).exists() {
+                return Some(venv.clone());
+            }
+        }
+    }
+    let project_venv = std::path::Path::new(".venv/bin/python3");
+    if project_venv.exists() {
+        return Some(".venv/bin/python3".to_string());
+    }
+    None
 }
 
 fn build_action_catalog(context: &PlannerContext) -> String {
@@ -924,17 +976,17 @@ mod tests {
                 instructions: "Always write then verify.".to_string(),
                 skill_path: Some("skills/demo/SKILL.md".to_string()),
                 scripts_dir: Some(".claude/skills/demo/scripts".to_string()),
+                venv_python: None,
             }]);
         let intent = Intent::new("need tools and skills");
         let (system, _user) = planner.build_prompt(&intent, &context);
 
         assert!(system.contains("- name: mcp__alpha"));
         assert!(!system.contains("skill__demo"));
-        assert!(system.contains("Activated Skill Knowledge"));
-        assert!(system.contains("--- skill: demo ---"));
+        assert!(system.contains("Activated Skills:"));
+        assert!(system.contains("- demo: Always write then verify."));
         assert!(system.contains("[skill file: skills/demo/SKILL.md]"));
-        assert!(system.contains("[scripts directory: .claude/skills/demo/scripts]"));
-        assert!(system.contains("Skill mode: treat Skill Knowledge as summary-first guidance."));
+        assert!(system.contains("[scripts: .claude/skills/demo/scripts]"));
         assert!(system.contains("file_read step for the provided skill file path"));
     }
 
@@ -970,7 +1022,7 @@ mod tests {
             "\"io_bindings\":[{\"from\":\"s1.stdout\",\"to\":\"path\",\"required\":true}]"
         ));
         assert!(user.contains("\"kind\":\"agent\",\"depends_on\":[\"s1\"],\"io_bindings\":"));
-        assert!(user.contains("\"to\":\"xlsx_candidates\""));
+        assert!(user.contains("\"to\":\"input_candidates\""));
         assert!(user.contains("params.max_iterations MUST be an integer in [1,10]"));
         assert!(user.contains("io_bindings MUST be an array (never a map)"));
     }
