@@ -12,9 +12,9 @@ runtime:
 
 planner:
   mode: llm
-  # Requires GEMINI_API_KEY (or switch to deterministic mode for offline testing).
-  backend: google
-  model_profile: gemini-3-flash
+  # Requires OPENROUTER_API_KEY.
+  backend: openrouter
+  model_profile: claude-sonnet-4-5
   max_history: 20
   log_full_prompts: true
   dynamic_model_selection: true
@@ -123,14 +123,15 @@ observability:
   log_file: "logs/orchestral-runtime.log"
 
 providers:
-  default_backend: openai
-  default_model: fast
+  default_backend: openrouter
+  default_model: claude-sonnet-4-5
   backends:
-    - name: openai
-      kind: openai
-      api_key_env: OPENAI_API_KEY
+    - name: openrouter
+      kind: openrouter
+      api_key_env: OPENROUTER_API_KEY
+      endpoint: https://openrouter.ai/api/v1/
       config:
-        timeout_secs: 30
+        timeout_secs: 60
     - name: google
       kind: google
       api_key_env: GEMINI_API_KEY
@@ -138,16 +139,16 @@ providers:
         timeout_secs: 60
         interpreter_timeout_secs: 8
   models:
-    - name: fast
-      backend: openai
-      model: gpt-4o-mini
+    - name: claude-sonnet-4-5
+      backend: openrouter
+      model: anthropic/claude-sonnet-4.5
       temperature: 0.2
       policy:
         temperature_min: 0.0
         temperature_max: 1.0
-    - name: deep
-      backend: openai
-      model: gpt-4.1
+    - name: claude-opus-4-1
+      backend: openrouter
+      model: anthropic/claude-opus-4.1
       temperature: 0.1
       policy:
         temperature_min: 0.0

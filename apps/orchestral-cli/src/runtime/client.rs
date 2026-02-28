@@ -893,8 +893,8 @@ runtime:
 
 planner:
   mode: llm
-  backend: openai
-  model_profile: fast
+  backend: openrouter
+  model_profile: claude-sonnet-4-5
   max_history: 20
   dynamic_model_selection: true
 
@@ -916,18 +916,19 @@ extensions:
     auto_discover: true
 
 providers:
-  default_backend: openai
-  default_model: fast
+  default_backend: openrouter
+  default_model: claude-sonnet-4-5
   backends:
-    - name: openai
-      kind: openai
-      api_key_env: OPENAI_API_KEY
+    - name: openrouter
+      kind: openrouter
+      api_key_env: OPENROUTER_API_KEY
+      endpoint: https://openrouter.ai/api/v1/
       config:
-        timeout_secs: 30
+        timeout_secs: 60
   models:
-    - name: fast
-      backend: openai
-      model: gpt-4o-mini
+    - name: claude-sonnet-4-5
+      backend: openrouter
+      model: anthropic/claude-sonnet-4.5
       temperature: 0.2
 
 actions:
