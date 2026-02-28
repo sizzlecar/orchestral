@@ -2040,22 +2040,67 @@ fn resolve_plan_response_template(
         _ => None,
     }?;
 
+    let is_completed = matches!(result, ExecutionResult::Completed);
     let mut resolved = template.to_string();
     for (key, value) in working_set {
         let placeholder = format!("{{{{{}}}}}", key);
-        let replacement = match value {
-            Value::String(s) => s.clone(),
-            Value::Number(n) => n.to_string(),
-            Value::Bool(b) => b.to_string(),
-            Value::Null => "null".to_string(),
-            other => other.to_string(),
-        };
+        let replacement = value_to_template_replacement(value);
         resolved = resolved.replace(&placeholder, &replacement);
     }
     if let ExecutionResult::Failed { error, .. } = result {
         resolved = resolved.replace("{{error}}", error);
     }
+    if is_completed && !template_contains_summary_placeholder(template) {
+        if let Some(summary) = best_summary_from_working_set(working_set) {
+            if !summary.trim().is_empty() && !resolved.contains(&summary) {
+                if !resolved.trim().is_empty() {
+                    resolved.push_str("\n\n");
+                }
+                resolved.push_str(&summary);
+            }
+        }
+    }
     Some(resolved)
+}
+
+fn value_to_template_replacement(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Null => "null".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn template_contains_summary_placeholder(template: &str) -> bool {
+    template.contains("{{summary}}") || template.contains(".summary}}")
+}
+
+fn best_summary_from_working_set(working_set: &HashMap<String, Value>) -> Option<String> {
+    if let Some(value) = working_set.get("summary") {
+        let summary = value_to_template_replacement(value);
+        if !summary.trim().is_empty() {
+            return Some(summary);
+        }
+    }
+
+    let mut scoped_keys = working_set
+        .keys()
+        .filter(|key| key.ends_with(".summary"))
+        .cloned()
+        .collect::<Vec<_>>();
+    scoped_keys.sort();
+
+    for key in scoped_keys {
+        if let Some(value) = working_set.get(&key) {
+            let summary = value_to_template_replacement(value);
+            if !summary.trim().is_empty() {
+                return Some(summary);
+            }
+        }
+    }
+    None
 }
 
 fn noop_interpret_sync(request: &InterpretRequest) -> String {
@@ -2515,5 +2560,50 @@ mod tests {
         assert!(summary.contains("  reader.content: \""));
         assert!(summary.contains("  stderr: \""));
         assert!(!summary.contains("  low_119: \""));
+    }
+
+    #[test]
+    fn test_resolve_plan_response_template_appends_summary_when_on_complete_is_static() {
+        let mut plan = Plan::new("goal", vec![]);
+        plan.on_complete = Some("Successfully found and summarized the Excel file.".to_string());
+        let mut ws = HashMap::new();
+        ws.insert("summary".to_string(), json!("Sheet 2025-Q2: 28 rows"));
+
+        let resolved =
+            resolve_plan_response_template(&plan, &ExecutionResult::Completed, &ws).expect("msg");
+
+        assert_eq!(
+            resolved,
+            "Successfully found and summarized the Excel file.\n\nSheet 2025-Q2: 28 rows"
+        );
+    }
+
+    #[test]
+    fn test_resolve_plan_response_template_does_not_duplicate_summary_when_placeholder_exists() {
+        let mut plan = Plan::new("goal", vec![]);
+        plan.on_complete = Some("Done:\n{{summary}}".to_string());
+        let mut ws = HashMap::new();
+        ws.insert("summary".to_string(), json!("Sheet 2025-Q2: 28 rows"));
+
+        let resolved =
+            resolve_plan_response_template(&plan, &ExecutionResult::Completed, &ws).expect("msg");
+
+        assert_eq!(resolved, "Done:\nSheet 2025-Q2: 28 rows");
+    }
+
+    #[test]
+    fn test_resolve_plan_response_template_uses_scoped_summary_fallback() {
+        let mut plan = Plan::new("goal", vec![]);
+        plan.on_complete = Some("Done".to_string());
+        let mut ws = HashMap::new();
+        ws.insert(
+            "summarize_excel_agent.summary".to_string(),
+            json!("Sheet 2025-Q2: 28 rows"),
+        );
+
+        let resolved =
+            resolve_plan_response_template(&plan, &ExecutionResult::Completed, &ws).expect("msg");
+
+        assert_eq!(resolved, "Done\n\nSheet 2025-Q2: 28 rows");
     }
 }
