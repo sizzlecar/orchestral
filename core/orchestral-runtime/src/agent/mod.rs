@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -6,12 +7,13 @@ use orchestral_core::action::{ActionContext, ActionInput, ActionResult};
 use orchestral_core::executor::{
     ActionRegistry, AgentStepExecutor, ExecutionProgressEvent, ExecutorContext,
 };
+use orchestral_core::planner::SkillInstruction;
 use orchestral_core::types::Step;
 use serde_json::Value;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::planner::{LlmClient, LlmRequest};
+use crate::planner::{LlmClient, LlmRequest, LlmResponse, ToolDefinition};
 
 const MAX_PROMPT_OBSERVATION_CHARS: usize = 600;
 const MAX_AGENT_LOG_TEXT_CHARS: usize = 1_200;
@@ -29,7 +31,7 @@ pub struct LlmAgentExecutorConfig {
 impl Default for LlmAgentExecutorConfig {
     fn default() -> Self {
         Self {
-            model: "gpt-4o-mini".to_string(),
+            model: "anthropic/claude-sonnet-4.5".to_string(),
             temperature: 0.2,
         }
     }
@@ -55,6 +57,7 @@ struct AgentStepParams {
     bound_inputs: HashMap<String, Value>,
 }
 
+#[derive(Debug)]
 enum AgentDecision {
     Action { name: String, params: Value },
     Final { exports: HashMap<String, Value> },
@@ -111,7 +114,7 @@ impl<C: LlmClient> AgentStepExecutor for LlmAgentExecutor<C> {
                 "agent iteration started"
             );
             let request = LlmRequest {
-                system: build_agent_system_prompt(&params),
+                system: build_agent_system_prompt(&params, ctx),
                 user: build_agent_user_prompt(iteration, &observations),
                 model: self.config.model.clone(),
                 temperature: self.config.temperature,
@@ -126,53 +129,91 @@ impl<C: LlmClient> AgentStepExecutor for LlmAgentExecutor<C> {
                 "agent llm request"
             );
 
-            let raw = match self.client.complete(request).await {
-                Ok(v) => v,
-                Err(err) => {
-                    warn!(
+            let tools = agent_tool_definitions();
+            let llm_response =
+                match self.client.complete_with_tools(request, &tools).await {
+                    Ok(v) => v,
+                    Err(err) => {
+                        warn!(
+                            step_id = %step.id,
+                            iteration = iteration,
+                            error = %err,
+                            "agent llm call failed"
+                        );
+                        report_agent_progress(
+                            ctx,
+                            step,
+                            "note",
+                            None,
+                            format!("llm call failed: {}", truncate_text(&err.to_string())),
+                        )
+                        .await;
+                        return ActionResult::error(format!("agent llm call failed: {}", err));
+                    }
+                };
+
+            let decision = match &llm_response {
+                LlmResponse::ToolCall {
+                    name, arguments, ..
+                } => {
+                    debug!(
                         step_id = %step.id,
                         iteration = iteration,
-                        error = %err,
-                        "agent llm call failed"
+                        tool_name = %name,
+                        tool_args = %truncate_log_text(&arguments.to_string()),
+                        "agent llm tool_call response"
                     );
-                    report_agent_progress(
-                        ctx,
-                        step,
-                        "note",
-                        None,
-                        format!("llm call failed: {}", truncate_text(&err.to_string())),
-                    )
-                    .await;
-                    return ActionResult::error(format!("agent llm call failed: {}", err));
+                    match parse_tool_call_decision(name, arguments.clone()) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            warn!(
+                                step_id = %step.id,
+                                iteration = iteration,
+                                error = %err,
+                                tool_name = %name,
+                                "agent tool_call parse failed"
+                            );
+                            observations.push(format!(
+                                "invalid_tool_call: {}",
+                                truncate_text(&err)
+                            ));
+                            continue;
+                        }
+                    }
                 }
-            };
-            debug!(
-                step_id = %step.id,
-                iteration = iteration,
-                llm_output = %truncate_log_text(&raw),
-                "agent llm response"
-            );
-            let json = extract_json(&raw).unwrap_or(raw);
-            let decision = match parse_agent_decision(&json) {
-                Ok(v) => v,
-                Err(err) => {
-                    warn!(
+                LlmResponse::Text(raw) => {
+                    debug!(
                         step_id = %step.id,
                         iteration = iteration,
-                        error = %err,
-                        response = %truncate_log_text(&json),
-                        "agent decision parse failed"
+                        llm_output = %truncate_log_text(raw),
+                        "agent llm text response (fallback)"
                     );
-                    report_agent_progress(
-                        ctx,
-                        step,
-                        "note",
-                        None,
-                        format!("invalid agent response: {}", truncate_text(&err)),
-                    )
-                    .await;
-                    observations.push(format!("invalid_decision: {}", truncate_text(&err)));
-                    continue;
+                    let json = extract_json(raw).unwrap_or_else(|| raw.clone());
+                    match parse_agent_decision(&json) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            warn!(
+                                step_id = %step.id,
+                                iteration = iteration,
+                                error = %err,
+                                response = %truncate_log_text(&json),
+                                "agent decision parse failed"
+                            );
+                            report_agent_progress(
+                                ctx,
+                                step,
+                                "note",
+                                None,
+                                format!("invalid agent response: {}", truncate_text(&err)),
+                            )
+                            .await;
+                            observations.push(format!(
+                                "invalid_decision: {}",
+                                truncate_text(&err)
+                            ));
+                            continue;
+                        }
+                    }
                 }
             };
 
@@ -561,21 +602,97 @@ async fn report_agent_progress(
     }
 }
 
-fn build_agent_system_prompt(params: &AgentStepParams) -> String {
+fn build_agent_system_prompt(params: &AgentStepParams, ctx: &ExecutorContext) -> String {
     let mut actions: Vec<&str> = params.allowed_actions.iter().map(String::as_str).collect();
     actions.sort_unstable();
     let bound_inputs_block = build_bound_inputs_block(&params.bound_inputs);
+    let env_block = build_execution_environment_block(ctx);
+    let skill_block = build_skill_knowledge_block(&ctx.skill_instructions);
     format!(
-        "You are a constrained execution agent.\nGoal: {}\nAllowed actions: {}\nRequired output keys: {}.\n{}\n\
-Return strict JSON only in one of the two shapes:\n\
-1) {{\"type\":\"action\",\"action\":\"<name>\",\"params\":{{...}}}}\n\
-2) {{\"type\":\"final\",\"exports\":{{\"key\":\"value\"}}}}\n\
-Never call actions outside the allowed list.",
-        params.goal,
-        actions.join(", "),
-        params.output_keys.join(", "),
-        bound_inputs_block
+        "You are a constrained execution agent.\n\
+Goal: {goal}\n\
+Allowed actions: {actions}\n\
+Required output keys: {output_keys}.\n\
+{env}{skill}{bound}\n\
+You have two tools:\n\
+1) execute_action — run one of the allowed actions. Example: execute_action({{\"action\":\"shell\",\"params\":{{\"command\":\"ls\"}}}})\n\
+2) return_final — submit results when the goal is achieved. You MUST call this when done. Example: return_final({{\"exports\":{{{output_keys_example}}}}})\n\
+\n\
+Rules:\n\
+- Act first, analyze minimally. Do not spend iterations only reading/analyzing.\n\
+- Never call actions outside the allowed list.\n\
+- You MUST call return_final before iterations run out. If the main task is done, call return_final immediately.",
+        goal = params.goal,
+        actions = actions.join(", "),
+        output_keys = params.output_keys.join(", "),
+        env = env_block,
+        skill = skill_block,
+        bound = bound_inputs_block,
+        output_keys_example = params.output_keys.iter()
+            .map(|k| format!("\"{}\":\"...\"", k))
+            .collect::<Vec<_>>()
+            .join(","),
     )
+}
+
+fn build_execution_environment_block(ctx: &ExecutorContext) -> String {
+    let Some(info) = &ctx.runtime_info else {
+        return String::new();
+    };
+    if info.os.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("Execution Environment:\n");
+    let _ = writeln!(out, "- os: {}", info.os);
+    let _ = writeln!(out, "- os_family: {}", info.os_family);
+    let _ = writeln!(out, "- arch: {}", info.arch);
+    if let Some(shell) = &info.shell {
+        let _ = writeln!(out, "- shell: {}", shell);
+    }
+    if let Some(python) = resolve_python_path(&ctx.skill_instructions) {
+        let _ = writeln!(
+            out,
+            "- python: {} (preferred managed runtime when Python execution is needed)",
+            python
+        );
+    }
+    out
+}
+
+/// Resolve the best python path: skill venv > project root venv > None.
+fn resolve_python_path(skills: &[SkillInstruction]) -> Option<String> {
+    for skill in skills {
+        if let Some(venv) = &skill.venv_python {
+            if std::path::Path::new(venv).exists() {
+                return Some(venv.clone());
+            }
+        }
+    }
+    let project_venv = std::path::Path::new(".venv/bin/python3");
+    if project_venv.exists() {
+        return Some(".venv/bin/python3".to_string());
+    }
+    None
+}
+
+fn build_skill_knowledge_block(skills: &[SkillInstruction]) -> String {
+    if skills.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("Activated Skills:\n");
+    out.push_str(
+        "If the skill summary is insufficient for concrete execution details, read its skill file via file_read before acting.\n",
+    );
+    for skill in skills {
+        let _ = writeln!(out, "- {}: {}", skill.skill_name, skill.instructions.trim());
+        if let Some(path) = &skill.skill_path {
+            let _ = writeln!(out, "  [skill file: {}]", path);
+        }
+        if let Some(dir) = &skill.scripts_dir {
+            let _ = writeln!(out, "  [scripts: {}]", dir);
+        }
+    }
+    out
 }
 
 fn build_bound_inputs_block(bound_inputs: &HashMap<String, Value>) -> String {
@@ -671,6 +788,76 @@ fn build_agent_user_prompt(iteration: u64, observations: &[String]) -> String {
         iteration,
         tail.join("\n- ")
     )
+}
+
+fn agent_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "execute_action".to_string(),
+            description: "Execute one of the allowed actions".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": "Action name from the allowed list"
+                    },
+                    "params": {
+                        "type": "object",
+                        "description": "Action parameters"
+                    }
+                },
+                "required": ["action", "params"]
+            }),
+        },
+        ToolDefinition {
+            name: "return_final".to_string(),
+            description: "Return final results when the goal is achieved".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "exports": {
+                        "type": "object",
+                        "description": "Key-value map of required output_keys"
+                    }
+                },
+                "required": ["exports"]
+            }),
+        },
+    ]
+}
+
+fn parse_tool_call_decision(name: &str, args: Value) -> Result<AgentDecision, String> {
+    match name {
+        "execute_action" => {
+            let action = args
+                .get("action")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| "execute_action: missing 'action' field".to_string())?
+                .to_string();
+            let params = args
+                .get("params")
+                .cloned()
+                .unwrap_or(Value::Object(Default::default()));
+            Ok(AgentDecision::Action {
+                name: action,
+                params,
+            })
+        }
+        "return_final" => {
+            let exports = args
+                .get("exports")
+                .and_then(|v| v.as_object())
+                .ok_or_else(|| "return_final: missing object field 'exports'".to_string())?
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<HashMap<_, _>>();
+            Ok(AgentDecision::Final { exports })
+        }
+        other => Err(format!("unknown tool: '{}'", other)),
+    }
 }
 
 fn parse_agent_decision(json: &str) -> Result<AgentDecision, String> {
@@ -821,6 +1008,31 @@ mod tests {
         }
     }
 
+    struct ToolCallLlmClient {
+        responses: Mutex<VecDeque<LlmResponse>>,
+    }
+
+    #[async_trait]
+    impl LlmClient for ToolCallLlmClient {
+        async fn complete(
+            &self,
+            _request: LlmRequest,
+        ) -> Result<String, crate::planner::LlmError> {
+            Ok("{}".to_string())
+        }
+
+        async fn complete_with_tools(
+            &self,
+            _request: LlmRequest,
+            _tools: &[ToolDefinition],
+        ) -> Result<LlmResponse, crate::planner::LlmError> {
+            let mut locked = self.responses.lock().expect("lock");
+            Ok(locked
+                .pop_front()
+                .unwrap_or_else(|| LlmResponse::Text("{}".to_string())))
+        }
+    }
+
     struct EchoAction;
 
     #[async_trait]
@@ -932,24 +1144,91 @@ mod tests {
             "allowed_actions": ["echo"],
             "max_iterations": 3,
             "output_keys": ["summary"],
-            "xlsx_candidates": "docs/sample.xlsx",
-            "skill_path": ".claude/skills/xlsx/SKILL.md"
+            "input_candidates": "docs/sample.dat",
+            "skill_path": ".claude/skills/tabular/SKILL.md"
         });
 
         let parsed = parse_agent_params("s1", &params).expect("parse agent params");
         assert_eq!(
-            parsed.bound_inputs.get("xlsx_candidates"),
-            Some(&Value::String("docs/sample.xlsx".to_string()))
+            parsed.bound_inputs.get("input_candidates"),
+            Some(&Value::String("docs/sample.dat".to_string()))
         );
         assert_eq!(
             parsed.bound_inputs.get("skill_path"),
-            Some(&Value::String(".claude/skills/xlsx/SKILL.md".to_string()))
+            Some(&Value::String(".claude/skills/tabular/SKILL.md".to_string()))
         );
 
-        let prompt = build_agent_system_prompt(&parsed);
+        let prompt = build_agent_system_prompt(&parsed, &test_ctx());
         assert!(prompt.contains("Bound upstream inputs (from io_bindings):"));
-        assert!(prompt.contains("xlsx_candidates"));
+        assert!(prompt.contains("input_candidates"));
         assert!(prompt.contains("skill_path"));
+    }
+
+    #[test]
+    fn test_agent_prompt_includes_execution_environment() {
+        use orchestral_core::planner::PlannerRuntimeInfo;
+
+        let params = parse_agent_params(
+            "s1",
+            &serde_json::json!({
+                "goal": "do stuff",
+                "allowed_actions": ["shell"],
+                "max_iterations": 3,
+                "output_keys": ["result"]
+            }),
+        )
+        .unwrap();
+
+        let ctx = ExecutorContext::new(
+            TaskId::from("task-1"),
+            Arc::new(RwLock::new(WorkingSet::new())),
+            Arc::new(InMemoryReferenceStore::new()),
+        )
+        .with_runtime_info(PlannerRuntimeInfo {
+            os: "macos".to_string(),
+            os_family: "unix".to_string(),
+            arch: "aarch64".to_string(),
+            shell: Some("/bin/zsh".to_string()),
+        });
+
+        let prompt = build_agent_system_prompt(&params, &ctx);
+        assert!(prompt.contains("Execution Environment:"));
+        assert!(prompt.contains("os: macos"));
+        assert!(prompt.contains("arch: aarch64"));
+        assert!(prompt.contains("shell: /bin/zsh"));
+    }
+
+    #[test]
+    fn test_agent_prompt_includes_skill_knowledge() {
+        let params = parse_agent_params(
+            "s1",
+            &serde_json::json!({
+                "goal": "update artifact",
+                "allowed_actions": ["shell", "file_read"],
+                "max_iterations": 5,
+                "output_keys": ["path"]
+            }),
+        )
+        .unwrap();
+
+        let ctx = ExecutorContext::new(
+            TaskId::from("task-1"),
+            Arc::new(RwLock::new(WorkingSet::new())),
+            Arc::new(InMemoryReferenceStore::new()),
+        )
+        .with_skill_instructions(vec![SkillInstruction {
+            skill_name: "tabular".to_string(),
+            instructions: "data processing and formatting".to_string(),
+            skill_path: Some("/skills/tabular/SKILL.md".to_string()),
+            scripts_dir: Some("/skills/tabular/scripts".to_string()),
+            venv_python: None,
+        }]);
+
+        let prompt = build_agent_system_prompt(&params, &ctx);
+        assert!(prompt.contains("Activated Skills:"));
+        assert!(prompt.contains("- tabular: data processing and formatting"));
+        assert!(prompt.contains("[skill file: /skills/tabular/SKILL.md]"));
+        assert!(prompt.contains("[scripts: /skills/tabular/scripts]"));
     }
 
     #[test]
@@ -972,13 +1251,118 @@ mod tests {
             Value::String("line-1\nline-2".to_string()),
         );
         bound_inputs.insert(
-            "excel_file".to_string(),
-            Value::String("docs/a.xlsx".to_string()),
+            "input_file".to_string(),
+            Value::String("docs/a.dat".to_string()),
         );
         let block = build_bound_inputs_block(&bound_inputs);
         assert!(block.contains("- skill_doc:"));
         assert!(block.contains("  line-1"));
         assert!(block.contains("  line-2"));
-        assert!(block.contains("- excel_file = docs/a.xlsx"));
+        assert!(block.contains("- input_file = docs/a.dat"));
+    }
+
+    #[test]
+    fn test_parse_tool_call_execute_action() {
+        let args = serde_json::json!({
+            "action": "shell",
+            "params": {"command": "ls", "args": ["-la"]}
+        });
+        let decision = parse_tool_call_decision("execute_action", args).unwrap();
+        match decision {
+            AgentDecision::Action { name, params } => {
+                assert_eq!(name, "shell");
+                assert_eq!(params.get("command").unwrap(), "ls");
+            }
+            other => panic!("expected Action, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_tool_call_return_final() {
+        let args = serde_json::json!({
+            "exports": {"path": "/tmp/output.dat", "summary": "done"}
+        });
+        let decision = parse_tool_call_decision("return_final", args).unwrap();
+        match decision {
+            AgentDecision::Final { exports } => {
+                assert_eq!(
+                    exports.get("path"),
+                    Some(&Value::String("/tmp/output.dat".to_string()))
+                );
+                assert_eq!(
+                    exports.get("summary"),
+                    Some(&Value::String("done".to_string()))
+                );
+            }
+            other => panic!("expected Final, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_tool_call_unknown_tool() {
+        let args = serde_json::json!({"foo": "bar"});
+        let result = parse_tool_call_decision("unknown_tool", args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown tool"));
+    }
+
+    #[tokio::test]
+    async fn test_agent_executor_with_tool_call_client() {
+        let client = ToolCallLlmClient {
+            responses: Mutex::new(VecDeque::from(vec![
+                LlmResponse::ToolCall {
+                    id: "call-1".to_string(),
+                    name: "execute_action".to_string(),
+                    arguments: serde_json::json!({
+                        "action": "echo",
+                        "params": {"message": "hello"}
+                    }),
+                },
+                LlmResponse::ToolCall {
+                    id: "call-2".to_string(),
+                    name: "return_final".to_string(),
+                    arguments: serde_json::json!({
+                        "exports": {"summary": "completed via tool_use"}
+                    }),
+                },
+            ])),
+        };
+        let executor = LlmAgentExecutor::new(client, LlmAgentExecutorConfig::default());
+
+        let step = Step::agent("s1").with_params(serde_json::json!({
+            "goal": "test tool_use",
+            "allowed_actions": ["echo"],
+            "max_iterations": 3,
+            "output_keys": ["summary"]
+        }));
+        let mut registry = ActionRegistry::new();
+        registry.register(Arc::new(EchoAction));
+        let result = executor
+            .execute_agent_step(
+                &step,
+                step.params.clone(),
+                "exec-1",
+                &test_ctx(),
+                Arc::new(RwLock::new(registry)),
+            )
+            .await;
+
+        match result {
+            ActionResult::Success { exports } => {
+                assert_eq!(
+                    exports.get("summary"),
+                    Some(&Value::String("completed via tool_use".to_string()))
+                );
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_agent_tool_definitions_has_two_tools() {
+        let tools = agent_tool_definitions();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].name, "execute_action");
+        assert_eq!(tools[1].name, "return_final");
     }
 }
