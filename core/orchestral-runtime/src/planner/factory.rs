@@ -6,13 +6,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use llm_sdk::builder::{LLMBackend, LLMBuilder};
-use llm_sdk::chat::ChatMessage;
+use llm_sdk::builder::{FunctionBuilder, LLMBackend, LLMBuilder};
+use llm_sdk::chat::{ChatMessage, ToolChoice};
 use thiserror::Error;
 
 use orchestral_core::config::BackendSpec;
 
-use super::llm::{LlmClient, LlmError, LlmRequest, StreamChunkCallback};
+use super::llm::{LlmClient, LlmError, LlmRequest, LlmResponse, StreamChunkCallback, ToolDefinition};
 
 /// Runtime invocation config for an LLM call chain.
 #[derive(Debug, Clone)]
@@ -25,7 +25,7 @@ pub struct LlmInvocationConfig {
 impl Default for LlmInvocationConfig {
     fn default() -> Self {
         Self {
-            model: "gpt-4o-mini".to_string(),
+            model: "anthropic/claude-sonnet-4.5".to_string(),
             temperature: 0.2,
             normalize_response: true,
         }
@@ -88,6 +88,7 @@ pub fn build_client_from_backend(
     let client = GranietLlmClient {
         backend: backend_kind,
         api_key: Some(api_key),
+        base_url: backend.endpoint.clone(),
         model: invocation.model.clone(),
         temperature: invocation.temperature,
         normalize_response: invocation.normalize_response,
@@ -148,6 +149,7 @@ fn parse_backend(kind: &str) -> Result<LLMBackend, LlmBuildError> {
 struct GranietLlmClient {
     backend: LLMBackend,
     api_key: Option<String>,
+    base_url: Option<String>,
     model: String,
     temperature: f32,
     normalize_response: bool,
@@ -179,6 +181,9 @@ impl LlmClient for GranietLlmClient {
             .model(model)
             .temperature(temperature)
             .normalize_response(self.normalize_response);
+        if let Some(endpoint) = &self.base_url {
+            builder = builder.base_url(endpoint.clone());
+        }
         if let Some(api_key) = &self.api_key {
             builder = builder.api_key(api_key.clone());
         }
@@ -200,6 +205,82 @@ impl LlmClient for GranietLlmClient {
             .text()
             .map(|s| s.to_string())
             .ok_or_else(|| LlmError::Response("llm response had no text".to_string()))
+    }
+
+    async fn complete_with_tools(
+        &self,
+        request: LlmRequest,
+        tools: &[ToolDefinition],
+    ) -> Result<LlmResponse, LlmError> {
+        let prompt = if request.system.trim().is_empty() {
+            request.user
+        } else {
+            format!("System:\n{}\n\nUser:\n{}", request.system, request.user)
+        };
+
+        let model = if request.model.trim().is_empty() {
+            self.model.clone()
+        } else {
+            request.model
+        };
+        let temperature = if request.temperature <= 0.0 {
+            self.temperature
+        } else {
+            request.temperature
+        };
+
+        let mut builder = LLMBuilder::new()
+            .backend(self.backend.clone())
+            .model(model)
+            .temperature(temperature)
+            .normalize_response(self.normalize_response);
+        for t in tools {
+            builder = builder.function(
+                FunctionBuilder::new(&t.name)
+                    .description(&t.description)
+                    .json_schema(t.parameters.clone()),
+            );
+        }
+        builder = builder.tool_choice(ToolChoice::Any);
+        if let Some(endpoint) = &self.base_url {
+            builder = builder.base_url(endpoint.clone());
+        }
+        if let Some(api_key) = &self.api_key {
+            builder = builder.api_key(api_key.clone());
+        }
+
+        let llm = builder
+            .build()
+            .map_err(|e| LlmError::Http(format!("llm builder error: {}", e)))?;
+
+        let messages = vec![ChatMessage::user().content(prompt).build()];
+        let response = tokio::time::timeout(
+            Duration::from_secs(self.timeout_secs),
+            llm.chat(&messages),
+        )
+        .await
+        .map_err(|_| LlmError::Http(format!("llm chat timeout after {}s", self.timeout_secs)))?
+        .map_err(|e| LlmError::Http(format!("llm chat_with_tools error: {}", e)))?;
+
+        if let Some(tool_calls) = response.tool_calls() {
+            if let Some(tc) = tool_calls.into_iter().next() {
+                let arguments: serde_json::Value =
+                    serde_json::from_str(&tc.function.arguments).map_err(|e| {
+                        LlmError::Serialization(format!(
+                            "failed to parse tool call arguments: {}",
+                            e
+                        ))
+                    })?;
+                return Ok(LlmResponse::ToolCall {
+                    id: tc.id.clone(),
+                    name: tc.function.name.clone(),
+                    arguments,
+                });
+            }
+        }
+
+        let text = response.text().unwrap_or_default();
+        Ok(LlmResponse::Text(text))
     }
 
     async fn complete_stream(
@@ -228,6 +309,9 @@ impl LlmClient for GranietLlmClient {
             .model(model)
             .temperature(temperature)
             .normalize_response(self.normalize_response);
+        if let Some(endpoint) = &self.base_url {
+            builder = builder.base_url(endpoint.clone());
+        }
         if let Some(api_key) = &self.api_key {
             builder = builder.api_key(api_key.clone());
         }
