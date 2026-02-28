@@ -27,3 +27,8 @@
 
 /docs/
 logs/
+
+*.db
+.claude/
+__pycache__/
+*.py
