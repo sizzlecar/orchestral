@@ -67,6 +67,12 @@ pub enum UiEvent {
         action: Option<String>,
         message: Option<String>,
     },
+    AgentProgress {
+        step_id: String,
+        kind: AgentProgressKind,
+        action: Option<String>,
+        message: Option<String>,
+    },
     InputRequired {
         prompt: Option<String>,
         waiting_kind: Option<String>,
@@ -77,6 +83,15 @@ pub enum UiEvent {
     TaskFailed {
         message: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentProgressKind {
+    Note,
+    Iteration,
+    ActionStarted,
+    ActionCompleted,
+    ActionFailed,
 }
 
 pub fn project_event(event: &Event) -> Option<UiEvent> {
@@ -230,6 +245,15 @@ fn project_execution_progress(payload: &Value) -> Option<UiEvent> {
             action,
             message,
         }),
+        "agent_progress" => Some(UiEvent::AgentProgress {
+            step_id: step_id?,
+            kind: parse_agent_progress_kind(metadata)?,
+            action: metadata
+                .and_then(|m| m.get("agent_action"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            message,
+        }),
         "step_waiting_user" | "step_waiting_event" => Some(UiEvent::InputRequired {
             prompt: message,
             waiting_kind: metadata
@@ -292,6 +316,21 @@ fn as_usize(value: &Value) -> Option<usize> {
         .or_else(|| value.as_i64().and_then(|n| usize::try_from(n).ok()))
 }
 
+fn parse_agent_progress_kind(metadata: Option<&Value>) -> Option<AgentProgressKind> {
+    let raw = metadata
+        .and_then(|m| m.get("agent_progress_kind"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("note");
+    match raw {
+        "note" => Some(AgentProgressKind::Note),
+        "iteration" => Some(AgentProgressKind::Iteration),
+        "action_started" => Some(AgentProgressKind::ActionStarted),
+        "action_completed" => Some(AgentProgressKind::ActionCompleted),
+        "action_failed" => Some(AgentProgressKind::ActionFailed),
+        _ => None,
+    }
+}
+
 fn truncate(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
@@ -299,4 +338,46 @@ fn truncate(text: &str, max_chars: usize) -> String {
     let mut preview: String = text.chars().take(max_chars).collect();
     preview.push_str("...");
     preview
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orchestral_core::store::Event;
+    use serde_json::json;
+
+    #[test]
+    fn test_project_execution_progress_agent_progress() {
+        let event = Event::trace(
+            "thread-1",
+            "info",
+            json!({
+                "category": "execution_progress",
+                "interaction_id": "int-1",
+                "task_id": "task-1",
+                "phase": "agent_progress",
+                "step_id": "summarize_excel",
+                "message": "iteration 2/8",
+                "metadata": {
+                    "agent_progress_kind": "iteration"
+                }
+            }),
+        );
+
+        let projected = project_event(&event);
+        match projected {
+            Some(UiEvent::AgentProgress {
+                step_id,
+                kind,
+                action,
+                message,
+            }) => {
+                assert_eq!(step_id, "summarize_excel");
+                assert_eq!(kind, AgentProgressKind::Iteration);
+                assert_eq!(action, None);
+                assert_eq!(message.as_deref(), Some("iteration 2/8"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
 }

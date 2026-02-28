@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,7 +14,7 @@ use orchestral_runtime::api::{RuntimeApi, RuntimeAppBuilder, SubmitStatus};
 
 use crate::channel::CliRuntime;
 
-use super::event_projection::{project_event, UiEvent};
+use super::event_projection::{project_event, AgentProgressKind, UiEvent};
 use crate::runtime::protocol::{ActivityKind, RuntimeMsg, TransientSlot};
 
 const TURN_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -98,6 +99,8 @@ impl RuntimeClient {
             let mut assistant_output_received = false;
             let mut pending_execution_end = false;
             let mut stop_requested = false;
+            let mut agent_action_counts: HashMap<String, usize> = HashMap::new();
+            let mut active_agent_groups: HashMap<String, String> = HashMap::new();
 
             loop {
                 let event = if stop_requested {
@@ -325,6 +328,15 @@ impl RuntimeClient {
                                     .await;
                             }
                         }
+                        if let Some(agent_group) = active_agent_groups.remove(&step_id) {
+                            let _ = runtime_tx_events
+                                .send(RuntimeMsg::ActivityEnd {
+                                    step_id: step_id.clone(),
+                                    action: agent_group,
+                                    failed: false,
+                                })
+                                .await;
+                        }
                         let _ = runtime_tx_events
                             .send(RuntimeMsg::ActivityEnd {
                                 step_id,
@@ -349,6 +361,15 @@ impl RuntimeClient {
                                 ),
                             })
                             .await;
+                        if let Some(agent_group) = active_agent_groups.remove(&step_id) {
+                            let _ = runtime_tx_events
+                                .send(RuntimeMsg::ActivityEnd {
+                                    step_id: step_id.clone(),
+                                    action: agent_group,
+                                    failed: true,
+                                })
+                                .await;
+                        }
                         let _ = runtime_tx_events
                             .send(RuntimeMsg::ActivityEnd {
                                 step_id,
@@ -357,6 +378,75 @@ impl RuntimeClient {
                             })
                             .await;
                     }
+                    UiEvent::AgentProgress {
+                        step_id,
+                        kind,
+                        action,
+                        message,
+                    } => match kind {
+                        AgentProgressKind::Iteration | AgentProgressKind::Note => {
+                            if let Some(line) = message.filter(|m| !m.trim().is_empty()) {
+                                let activity_action = step_id.clone();
+                                let _ = runtime_tx_events
+                                    .send(RuntimeMsg::ActivityItem {
+                                        step_id,
+                                        action: activity_action,
+                                        line,
+                                    })
+                                    .await;
+                            }
+                        }
+                        AgentProgressKind::ActionStarted => {
+                            let base_action = action.unwrap_or_else(|| "agent_action".to_string());
+                            if let Some(previous_group) = active_agent_groups.remove(&step_id) {
+                                let _ = runtime_tx_events
+                                    .send(RuntimeMsg::ActivityEnd {
+                                        step_id: step_id.clone(),
+                                        action: previous_group,
+                                        failed: true,
+                                    })
+                                    .await;
+                            }
+                            let counter_key =
+                                format!("{}::{}", step_id, base_action.to_ascii_lowercase());
+                            let next = agent_action_counts
+                                .entry(counter_key)
+                                .and_modify(|n| *n += 1)
+                                .or_insert(1);
+                            let group_action = format!("{} #{}", base_action, *next);
+                            active_agent_groups.insert(step_id.clone(), group_action.clone());
+                            let _ = runtime_tx_events
+                                .send(RuntimeMsg::ActivityStart {
+                                    kind: classify_activity_kind(&base_action),
+                                    step_id,
+                                    action: group_action,
+                                    input_summary: None,
+                                })
+                                .await;
+                        }
+                        AgentProgressKind::ActionCompleted | AgentProgressKind::ActionFailed => {
+                            let group_action =
+                                active_agent_groups.remove(&step_id).unwrap_or_else(|| {
+                                    action.clone().unwrap_or_else(|| "agent_action".to_string())
+                                });
+                            if let Some(line) = message.filter(|m| !m.trim().is_empty()) {
+                                let _ = runtime_tx_events
+                                    .send(RuntimeMsg::ActivityItem {
+                                        step_id: step_id.clone(),
+                                        action: group_action.clone(),
+                                        line,
+                                    })
+                                    .await;
+                            }
+                            let _ = runtime_tx_events
+                                .send(RuntimeMsg::ActivityEnd {
+                                    step_id,
+                                    action: group_action,
+                                    failed: matches!(kind, AgentProgressKind::ActionFailed),
+                                })
+                                .await;
+                        }
+                    },
                     UiEvent::InputRequired {
                         prompt,
                         waiting_kind,
@@ -992,6 +1082,7 @@ fn ui_event_label(event: &UiEvent) -> &'static str {
         UiEvent::StepStarted { .. } => "StepStarted",
         UiEvent::StepCompleted { .. } => "StepCompleted",
         UiEvent::StepFailed { .. } => "StepFailed",
+        UiEvent::AgentProgress { .. } => "AgentProgress",
         UiEvent::InputRequired { .. } => "InputRequired",
         UiEvent::TaskCompleted => "TaskCompleted",
         UiEvent::TaskFailed { .. } => "TaskFailed",

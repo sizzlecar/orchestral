@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use orchestral_core::action::{ActionContext, ActionInput, ActionResult};
-use orchestral_core::executor::{ActionRegistry, AgentStepExecutor, ExecutorContext};
+use orchestral_core::executor::{
+    ActionRegistry, AgentStepExecutor, ExecutionProgressEvent, ExecutorContext,
+};
 use orchestral_core::types::Step;
 use serde_json::Value;
 use tokio::sync::RwLock;
@@ -92,6 +94,14 @@ impl<C: LlmClient> AgentStepExecutor for LlmAgentExecutor<C> {
 
         let mut observations: Vec<String> = Vec::new();
         for iteration in 1..=params.max_iterations {
+            report_agent_progress(
+                ctx,
+                step,
+                "iteration",
+                None,
+                format!("iteration {}/{}", iteration, params.max_iterations),
+            )
+            .await;
             info!(
                 step_id = %step.id,
                 execution_id = %execution_id,
@@ -125,6 +135,14 @@ impl<C: LlmClient> AgentStepExecutor for LlmAgentExecutor<C> {
                         error = %err,
                         "agent llm call failed"
                     );
+                    report_agent_progress(
+                        ctx,
+                        step,
+                        "note",
+                        None,
+                        format!("llm call failed: {}", truncate_text(&err.to_string())),
+                    )
+                    .await;
                     return ActionResult::error(format!("agent llm call failed: {}", err));
                 }
             };
@@ -145,6 +163,14 @@ impl<C: LlmClient> AgentStepExecutor for LlmAgentExecutor<C> {
                         response = %truncate_log_text(&json),
                         "agent decision parse failed"
                     );
+                    report_agent_progress(
+                        ctx,
+                        step,
+                        "note",
+                        None,
+                        format!("invalid agent response: {}", truncate_text(&err)),
+                    )
+                    .await;
                     observations.push(format!("invalid_decision: {}", truncate_text(&err)));
                     continue;
                 }
@@ -161,6 +187,14 @@ impl<C: LlmClient> AgentStepExecutor for LlmAgentExecutor<C> {
                         action = %action_name,
                         "agent decided action"
                     );
+                    report_agent_progress(
+                        ctx,
+                        step,
+                        "action_started",
+                        Some(action_name.as_str()),
+                        format!("run {}", action_name),
+                    )
+                    .await;
                     if !params.allowed_actions.contains(action_name.as_str()) {
                         warn!(
                             step_id = %step.id,
@@ -168,6 +202,14 @@ impl<C: LlmClient> AgentStepExecutor for LlmAgentExecutor<C> {
                             action = %action_name,
                             "agent action blocked by allowed_actions"
                         );
+                        report_agent_progress(
+                            ctx,
+                            step,
+                            "action_failed",
+                            Some(action_name.as_str()),
+                            format!("blocked {}", action_name),
+                        )
+                        .await;
                         observations.push(format!(
                             "blocked_action: '{}' is not in allowed_actions",
                             action_name
@@ -186,6 +228,14 @@ impl<C: LlmClient> AgentStepExecutor for LlmAgentExecutor<C> {
                             action = %action_name,
                             "agent action missing in registry"
                         );
+                        report_agent_progress(
+                            ctx,
+                            step,
+                            "action_failed",
+                            Some(action_name.as_str()),
+                            format!("missing action {}", action_name),
+                        )
+                        .await;
                         observations.push(format!("missing_action: '{}'", action_name));
                         continue;
                     };
@@ -209,6 +259,18 @@ impl<C: LlmClient> AgentStepExecutor for LlmAgentExecutor<C> {
                                 export_keys = ?exports.keys().collect::<Vec<_>>(),
                                 "agent action succeeded"
                             );
+                            let status = exports.get("status").and_then(|v| v.as_i64());
+                            let progress_line = status
+                                .map(|code| format!("{} completed status={}", action_name, code))
+                                .unwrap_or_else(|| format!("{} completed", action_name));
+                            report_agent_progress(
+                                ctx,
+                                step,
+                                "action_completed",
+                                Some(action_name.as_str()),
+                                progress_line,
+                            )
+                            .await;
                             observations.push(format!(
                                 "action_success {} => {}",
                                 action_name,
@@ -231,6 +293,14 @@ impl<C: LlmClient> AgentStepExecutor for LlmAgentExecutor<C> {
                                 action = %action_name,
                                 "agent action requested user interaction"
                             );
+                            report_agent_progress(
+                                ctx,
+                                step,
+                                "action_completed",
+                                Some(action_name.as_str()),
+                                format!("{} requires user input", action_name),
+                            )
+                            .await;
                             return action_result;
                         }
                         ActionResult::RetryableError { message, .. } => {
@@ -241,6 +311,18 @@ impl<C: LlmClient> AgentStepExecutor for LlmAgentExecutor<C> {
                                 error = %truncate_log_text(&message),
                                 "agent action retryable error"
                             );
+                            report_agent_progress(
+                                ctx,
+                                step,
+                                "action_failed",
+                                Some(action_name.as_str()),
+                                format!(
+                                    "{} retryable error: {}",
+                                    action_name,
+                                    truncate_text(&message)
+                                ),
+                            )
+                            .await;
                             observations.push(format!(
                                 "action_retryable_error {} => {}",
                                 action_name,
@@ -255,6 +337,14 @@ impl<C: LlmClient> AgentStepExecutor for LlmAgentExecutor<C> {
                                 error = %truncate_log_text(&message),
                                 "agent action failed"
                             );
+                            report_agent_progress(
+                                ctx,
+                                step,
+                                "action_failed",
+                                Some(action_name.as_str()),
+                                format!("{} failed: {}", action_name, truncate_text(&message)),
+                            )
+                            .await;
                             observations.push(format!(
                                 "action_error {} => {}",
                                 action_name,
@@ -276,6 +366,14 @@ impl<C: LlmClient> AgentStepExecutor for LlmAgentExecutor<C> {
                             available_keys = ?exports.keys().collect::<Vec<_>>(),
                             "agent final result missing required output key"
                         );
+                        report_agent_progress(
+                            ctx,
+                            step,
+                            "note",
+                            None,
+                            format!("final result missing '{}'; retrying", missing),
+                        )
+                        .await;
                         observations.push(format!(
                             "invalid_final: missing required output_key '{}'",
                             missing
@@ -294,6 +392,7 @@ impl<C: LlmClient> AgentStepExecutor for LlmAgentExecutor<C> {
                         output_keys = ?params.output_keys,
                         "agent step completed"
                     );
+                    report_agent_progress(ctx, step, "note", None, "agent completed").await;
                     return ActionResult::success_with(filtered);
                 }
             }
@@ -307,6 +406,14 @@ impl<C: LlmClient> AgentStepExecutor for LlmAgentExecutor<C> {
             recent_observations = %observation_tail,
             "agent step exhausted max_iterations"
         );
+        report_agent_progress(
+            ctx,
+            step,
+            "note",
+            None,
+            format!("agent exhausted after {} iterations", params.max_iterations),
+        )
+        .await;
         ActionResult::error(format!(
             "agent step '{}' reached max_iterations without a valid final result; recent_observations={}",
             step.id,
@@ -415,6 +522,43 @@ fn parse_agent_params(step_id: &str, params: &Value) -> Result<AgentStepParams, 
         output_keys,
         bound_inputs,
     })
+}
+
+async fn report_agent_progress(
+    ctx: &ExecutorContext,
+    step: &Step,
+    kind: &str,
+    action: Option<&str>,
+    message: impl Into<String>,
+) {
+    if let Some(reporter) = &ctx.progress_reporter {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(
+            "agent_progress_kind".to_string(),
+            Value::String(kind.to_string()),
+        );
+        if let Some(action_name) = action.filter(|s| !s.trim().is_empty()) {
+            metadata.insert(
+                "agent_action".to_string(),
+                Value::String(action_name.to_string()),
+            );
+        }
+        let event = ExecutionProgressEvent::new(
+            ctx.task_id.clone(),
+            Some(step.id.clone()),
+            Some("agent".to_string()),
+            "agent_progress",
+        )
+        .with_message(message.into())
+        .with_metadata(Value::Object(metadata));
+        if let Err(err) = reporter.report(event).await {
+            warn!(
+                step_id = %step.id,
+                error = %err,
+                "failed to report agent progress"
+            );
+        }
+    }
 }
 
 fn build_agent_system_prompt(params: &AgentStepParams) -> String {
