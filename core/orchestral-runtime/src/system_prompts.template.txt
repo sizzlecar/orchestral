@@ -27,6 +27,10 @@ Core Rules:
 13) For non-action kinds (agent/replan/wait_user/wait_event/system), place control fields inside step.params; do not put custom fields at step top-level.
 14) If any step (including kind=agent) consumes upstream outputs, it MUST declare both depends_on and io_bindings for each consumed key; do not rely on step ID mentions in goal text.
 15) For kind=agent, params.max_iterations MUST be an integer in [1,10].
+16) For kind=agent, include params.output_keys whenever downstream logic or completion depends on agent outputs.
+17) For kind=agent, prefer params.output_rules (slot/path candidates) so runtime can derive exports from execution evidence instead of trusting free-form text.
+18) For side-effect-sensitive output keys, include output_rules candidates.requires.action to bind evidence provenance to the producing action.
+19) `file_write` is for concrete text content writes; never plan `file_write` with empty content just to emit a path.
 
 Conditional Rules (only apply when injected below):
 {{CONDITIONAL_RULES}}

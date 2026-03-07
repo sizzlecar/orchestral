@@ -15,6 +15,7 @@ use orchestral_core::types::{Intent, Plan, Step};
 
 const MAX_PROMPT_LOG_CHARS: usize = 4_000;
 const MAX_LLM_OUTPUT_LOG_CHARS: usize = 8_000;
+const MAX_DISCOVERED_SKILL_SCRIPTS: usize = 12;
 
 /// LLM request payload
 #[derive(Debug, Clone)]
@@ -169,14 +170,14 @@ impl<C: LlmClient> LlmPlanner<C> {
         );
         user.push('\n');
         user.push_str(
-            r#"{"type":"WORKFLOW","goal":"...","steps":[{"id":"s1","kind":"action","action":"shell","params":{"command":"find","args":["docs","-type","f"]}},{"id":"s2","kind":"agent","depends_on":["s1"],"io_bindings":[{"from":"s1.stdout","to":"input_candidates","required":true}],"params":{"goal":"inspect and update local artifacts","allowed_actions":["shell","file_read","file_write"],"max_iterations":6,"output_keys":["modified_file","status"]}}],"confidence":0.0,"on_complete":"...","on_failure":"..."}"#,
+            r#"{"type":"WORKFLOW","goal":"...","steps":[{"id":"s1","kind":"action","action":"shell","params":{"command":"find","args":["docs","-type","f"]}},{"id":"s2","kind":"agent","depends_on":["s1"],"io_bindings":[{"from":"s1.stdout","to":"input_candidates","required":true}],"params":{"goal":"inspect and update local artifacts","allowed_actions":["shell","file_read","file_write"],"max_iterations":6,"output_keys":["updated_file_path","summary"],"output_rules":{"updated_file_path":{"candidates":[{"slot":"fill_result","path":"updated_file_path","requires":{"action":"file_write"}}]},"summary":{"candidates":[{"slot":"fill_result","path":"summary"}]}}}}],"confidence":0.0,"on_complete":"...","on_failure":"..."}"#,
         );
         user.push('\n');
         user.push_str(r#"{"type":"DIRECT_RESPONSE","message":"..."}"#);
         user.push('\n');
         user.push_str(r#"{"type":"CLARIFICATION","question":"..."}"#);
         user.push_str(
-            "\nUse only action names listed in Action Catalog when type is WORKFLOW. Prefer explicit action steps first. If a fixed sequence of actions can solve the task with depends_on + io_bindings, do not use kind=agent. Use kind=agent only when runtime observations must determine subsequent actions, target selection, or key parameters cannot be fixed reliably at planning time. Add io_bindings only when step inputs depend on previous step outputs (including kind=agent). If kind=agent consumes upstream outputs, provide depends_on + io_bindings explicitly. For kind=agent, params.max_iterations MUST be an integer in [1,10]. io_bindings MUST be an array (never a map). Return JSON only.\n",
+            "\nUse only action names listed in Action Catalog when type is WORKFLOW. Prefer explicit action steps first. If a fixed sequence of actions can solve the task with depends_on + io_bindings, do not use kind=agent. Use kind=agent only when runtime observations must determine subsequent actions, target selection, or key parameters cannot be fixed reliably at planning time. Add io_bindings only when step inputs depend on previous step outputs (including kind=agent). If kind=agent consumes upstream outputs, provide depends_on + io_bindings explicitly. For kind=agent, params.max_iterations MUST be an integer in [1,10]. For kind=agent, include params.output_keys and prefer params.output_rules (slot/path candidates) so runtime can materialize exports from evidence. For side-effect-sensitive keys (for example file paths produced by file_write), add requires.action in output_rules candidates. Do not rely on return_final.exports as ground truth. io_bindings MUST be an array (never a map). Return JSON only.\n",
         );
         user.push('\n');
 
@@ -266,7 +267,7 @@ fn build_conditional_rules(context: &PlannerContext, caps: PromptCapabilities) -
     if !context.skill_instructions.is_empty() {
         lines.push("- Skill mode: treat Skill Knowledge as summary-first guidance.");
         lines.push("- If skill summary is insufficient for concrete params, add an early file_read step for the provided skill file path.");
-        lines.push("- If skill lists scripts, invoke them through shell using the provided scripts directory.");
+        lines.push("- If skill lists scripts, invoke them through shell using the provided scripts directory and verify the script path exists.");
     }
 
     if caps.has_http {
@@ -293,6 +294,10 @@ fn build_conditional_rules(context: &PlannerContext, caps: PromptCapabilities) -
         lines.push("- Do not use kind=agent for simple discovery steps whose outputs can flow into fixed downstream actions.");
         lines.push("- If kind=agent consumes upstream step outputs, include both depends_on and io_bindings for those consumed keys.");
         lines.push("- For kind=agent, params.max_iterations must be an integer in [1,10]. Keep the agent scoped to a local subproblem.");
+        lines.push("- For kind=agent, include params.output_keys and prefer params.output_rules (slot/path candidates) so runtime materializes exports from evidence.");
+        lines.push("- For side-effect-sensitive outputs, annotate candidates with requires.action to bind evidence provenance to the producing action.");
+        lines.push("- Do not depend on return_final.exports values as the final truth; runtime evidence materialization is authoritative.");
+        lines.push("- `file_write` is for concrete text writes; do not emit file_write with empty content as a path marker.");
         lines.push("- Use kind=replan only when the remaining global plan topology depends on intermediate outputs.");
         lines.push("- Replan continuation plans must not include another replan step.");
     }
@@ -315,6 +320,9 @@ fn build_skill_knowledge_block(skills: &[SkillInstruction]) -> String {
 
     let mut out = String::new();
     out.push_str("Activated Skills:\n");
+    out.push_str(
+        "Only execute scripts that are listed under scripts discovered or verified at runtime; never invent script filenames.\n",
+    );
     for skill in skills {
         let _ = writeln!(out, "- {}: {}", skill.skill_name, skill.instructions.trim());
         if let Some(path) = &skill.skill_path {
@@ -322,8 +330,63 @@ fn build_skill_knowledge_block(skills: &[SkillInstruction]) -> String {
         }
         if let Some(dir) = &skill.scripts_dir {
             let _ = writeln!(out, "  [scripts: {}]", dir);
+            let discovered = discover_skill_scripts(dir, MAX_DISCOVERED_SKILL_SCRIPTS);
+            if discovered.is_empty() {
+                let _ = writeln!(out, "  [scripts discovered: none]");
+            } else {
+                let _ = writeln!(out, "  [scripts discovered: {}]", discovered.join(", "));
+            }
         }
     }
+    out
+}
+
+fn discover_skill_scripts(dir: &str, limit: usize) -> Vec<String> {
+    let root = std::path::Path::new(dir);
+    if !root.is_dir() || limit == 0 {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(read_dir) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        let mut entries = read_dir
+            .filter_map(|entry| entry.ok().map(|v| v.path()))
+            .collect::<Vec<_>>();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !path.is_file() {
+                continue;
+            }
+            let extension = path
+                .extension()
+                .and_then(|v| v.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if !matches!(extension.as_str(), "py" | "sh" | "js" | "ts" | "rb") {
+                continue;
+            }
+            let display = path
+                .strip_prefix(root)
+                .unwrap_or(path.as_path())
+                .display()
+                .to_string();
+            out.push(display);
+            if out.len() >= limit {
+                out.sort_unstable();
+                return out;
+            }
+        }
+    }
+
+    out.sort_unstable();
     out
 }
 
@@ -984,6 +1047,7 @@ mod tests {
         assert!(system.contains("- name: mcp__alpha"));
         assert!(!system.contains("skill__demo"));
         assert!(system.contains("Activated Skills:"));
+        assert!(system.contains("never invent script filenames"));
         assert!(system.contains("- demo: Always write then verify."));
         assert!(system.contains("[skill file: skills/demo/SKILL.md]"));
         assert!(system.contains("[scripts: .claude/skills/demo/scripts]"));
@@ -1011,9 +1075,11 @@ mod tests {
 
         assert!(system.contains("Shell mode: commands must be host-platform compatible"));
         assert!(system.contains("headers-only requests, use http action with method HEAD"));
-        assert!(system.contains("prefer kind=agent"));
+        assert!(system.contains("Use kind=agent only when runtime observations"));
         assert!(system.contains("include both depends_on and io_bindings"));
         assert!(system.contains("params.max_iterations must be an integer in [1,10]"));
+        assert!(system.contains("prefer params.output_rules"));
+        assert!(system.contains("runtime evidence materialization is authoritative"));
         assert!(system.contains("Use kind=replan only when the remaining global plan topology"));
         assert!(system.contains("working_set summaries (stdout/content/stderr)"));
         assert!(user.contains("\"on_complete\":\"...\",\"on_failure\":\"...\""));
@@ -1023,7 +1089,9 @@ mod tests {
         ));
         assert!(user.contains("\"kind\":\"agent\",\"depends_on\":[\"s1\"],\"io_bindings\":"));
         assert!(user.contains("\"to\":\"input_candidates\""));
+        assert!(user.contains("\"output_rules\":"));
         assert!(user.contains("params.max_iterations MUST be an integer in [1,10]"));
+        assert!(user.contains("include params.output_keys and prefer params.output_rules"));
         assert!(user.contains("io_bindings MUST be an array (never a map)"));
     }
 

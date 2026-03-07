@@ -12,7 +12,9 @@ use thiserror::Error;
 
 use orchestral_core::config::BackendSpec;
 
-use super::llm::{LlmClient, LlmError, LlmRequest, LlmResponse, StreamChunkCallback, ToolDefinition};
+use super::llm::{
+    LlmClient, LlmError, LlmRequest, LlmResponse, StreamChunkCallback, ToolDefinition,
+};
 
 /// Runtime invocation config for an LLM call chain.
 #[derive(Debug, Clone)]
@@ -254,18 +256,18 @@ impl LlmClient for GranietLlmClient {
             .map_err(|e| LlmError::Http(format!("llm builder error: {}", e)))?;
 
         let messages = vec![ChatMessage::user().content(prompt).build()];
-        let response = tokio::time::timeout(
-            Duration::from_secs(self.timeout_secs),
-            llm.chat(&messages),
-        )
-        .await
-        .map_err(|_| LlmError::Http(format!("llm chat timeout after {}s", self.timeout_secs)))?
-        .map_err(|e| LlmError::Http(format!("llm chat_with_tools error: {}", e)))?;
+        let response =
+            tokio::time::timeout(Duration::from_secs(self.timeout_secs), llm.chat(&messages))
+                .await
+                .map_err(|_| {
+                    LlmError::Http(format!("llm chat timeout after {}s", self.timeout_secs))
+                })?
+                .map_err(|e| LlmError::Http(format!("llm chat_with_tools error: {}", e)))?;
 
         if let Some(tool_calls) = response.tool_calls() {
             if let Some(tc) = tool_calls.into_iter().next() {
-                let arguments: serde_json::Value =
-                    serde_json::from_str(&tc.function.arguments).map_err(|e| {
+                let arguments: serde_json::Value = serde_json::from_str(&tc.function.arguments)
+                    .map_err(|e| {
                         LlmError::Serialization(format!(
                             "failed to parse tool call arguments: {}",
                             e

@@ -37,10 +37,7 @@ impl SkillCatalog {
             return Vec::new();
         }
 
-        self.entries
-            .iter()
-            .take(self.max_active)
-            .collect()
+        self.entries.iter().take(self.max_active).collect()
     }
 
     pub fn build_instructions(&self, _intent: &str) -> Vec<SkillInstruction> {
