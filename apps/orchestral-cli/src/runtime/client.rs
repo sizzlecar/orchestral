@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -6,12 +8,13 @@ use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::time::{timeout, Duration};
 use tracing::{debug, warn};
 
+use orchestral_composition::{ComposedRuntimeAppBuilder, RuntimeTarget};
 use orchestral_core::store::Event as ChannelEvent;
-use orchestral_runtime::api::{RuntimeApi, SubmitStatus};
+use orchestral_runtime::api::{RuntimeApi, RuntimeAppBuilder, SubmitStatus};
 
 use crate::channel::CliRuntime;
 
-use super::event_projection::{project_event, UiEvent};
+use super::event_projection::{project_event, AgentProgressKind, UiEvent};
 use crate::runtime::protocol::{ActivityKind, RuntimeMsg, TransientSlot};
 
 const TURN_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -27,11 +30,14 @@ pub struct RuntimeClient {
 
 impl RuntimeClient {
     pub async fn from_config(
-        config: PathBuf,
+        config: Option<PathBuf>,
         thread_id_override: Option<String>,
     ) -> anyhow::Result<Self> {
+        let config = resolve_runtime_config_path(config)?;
+        let app_builder: Arc<dyn RuntimeAppBuilder> =
+            Arc::new(ComposedRuntimeAppBuilder::new(RuntimeTarget::Cli));
         let api = Arc::new(
-            RuntimeApi::from_config_path(config)
+            RuntimeApi::from_config_path_with_builder(config, app_builder)
                 .await
                 .context("failed to build runtime api")?,
         );
@@ -93,6 +99,8 @@ impl RuntimeClient {
             let mut assistant_output_received = false;
             let mut pending_execution_end = false;
             let mut stop_requested = false;
+            let mut agent_action_counts: HashMap<String, usize> = HashMap::new();
+            let mut active_agent_groups: HashMap<String, String> = HashMap::new();
 
             loop {
                 let event = if stop_requested {
@@ -240,23 +248,24 @@ impl RuntimeClient {
                         input_summary,
                         ..
                     } => {
-                        let action = action.unwrap_or_else(|| "-".to_string());
-                        let kind = classify_activity_kind(&action);
+                        let action_label = normalize_step_action_label(&step_id, action);
+                        let kind = classify_activity_kind(&action_label);
                         let _ = runtime_tx_events
                             .send(RuntimeMsg::ActivityStart {
                                 kind,
                                 step_id: step_id.clone(),
-                                action: action.clone(),
+                                action: action_label.clone(),
                                 input_summary: input_summary.clone(),
                             })
                             .await;
                         let input_summary = input_summary
                             .map(|s| format!(" | {}", s))
                             .unwrap_or_default();
+                        let running_label = format_running_label(&step_id, &action_label);
                         let _ = runtime_tx_events
                             .send(RuntimeMsg::OutputTransient {
                                 slot: TransientSlot::Status,
-                                text: format!("Running {} ({}){}", step_id, action, input_summary),
+                                text: format!("{}{}", running_label, input_summary),
                             })
                             .await;
                     }
@@ -266,7 +275,7 @@ impl RuntimeClient {
                         output,
                     } => {
                         completed_steps = completed_steps.saturating_add(1);
-                        let action_name = action.unwrap_or_else(|| "-".to_string());
+                        let action_name = normalize_step_action_label(&step_id, action);
                         if let Some(preview) = output.preview.clone() {
                             last_preview = Some(preview);
                         }
@@ -319,6 +328,15 @@ impl RuntimeClient {
                                     .await;
                             }
                         }
+                        if let Some(agent_group) = active_agent_groups.remove(&step_id) {
+                            let _ = runtime_tx_events
+                                .send(RuntimeMsg::ActivityEnd {
+                                    step_id: step_id.clone(),
+                                    action: agent_group,
+                                    failed: false,
+                                })
+                                .await;
+                        }
                         let _ = runtime_tx_events
                             .send(RuntimeMsg::ActivityEnd {
                                 step_id,
@@ -332,7 +350,7 @@ impl RuntimeClient {
                         action,
                         message,
                     } => {
-                        let action_name = action.unwrap_or_else(|| "-".to_string());
+                        let action_name = normalize_step_action_label(&step_id, action);
                         let _ = runtime_tx_events
                             .send(RuntimeMsg::ActivityItem {
                                 step_id: step_id.clone(),
@@ -343,6 +361,15 @@ impl RuntimeClient {
                                 ),
                             })
                             .await;
+                        if let Some(agent_group) = active_agent_groups.remove(&step_id) {
+                            let _ = runtime_tx_events
+                                .send(RuntimeMsg::ActivityEnd {
+                                    step_id: step_id.clone(),
+                                    action: agent_group,
+                                    failed: true,
+                                })
+                                .await;
+                        }
                         let _ = runtime_tx_events
                             .send(RuntimeMsg::ActivityEnd {
                                 step_id,
@@ -351,6 +378,75 @@ impl RuntimeClient {
                             })
                             .await;
                     }
+                    UiEvent::AgentProgress {
+                        step_id,
+                        kind,
+                        action,
+                        message,
+                    } => match kind {
+                        AgentProgressKind::Iteration | AgentProgressKind::Note => {
+                            if let Some(line) = message.filter(|m| !m.trim().is_empty()) {
+                                let activity_action = step_id.clone();
+                                let _ = runtime_tx_events
+                                    .send(RuntimeMsg::ActivityItem {
+                                        step_id,
+                                        action: activity_action,
+                                        line,
+                                    })
+                                    .await;
+                            }
+                        }
+                        AgentProgressKind::ActionStarted => {
+                            let base_action = action.unwrap_or_else(|| "agent_action".to_string());
+                            if let Some(previous_group) = active_agent_groups.remove(&step_id) {
+                                let _ = runtime_tx_events
+                                    .send(RuntimeMsg::ActivityEnd {
+                                        step_id: step_id.clone(),
+                                        action: previous_group,
+                                        failed: true,
+                                    })
+                                    .await;
+                            }
+                            let counter_key =
+                                format!("{}::{}", step_id, base_action.to_ascii_lowercase());
+                            let next = agent_action_counts
+                                .entry(counter_key)
+                                .and_modify(|n| *n += 1)
+                                .or_insert(1);
+                            let group_action = format!("{} #{}", base_action, *next);
+                            active_agent_groups.insert(step_id.clone(), group_action.clone());
+                            let _ = runtime_tx_events
+                                .send(RuntimeMsg::ActivityStart {
+                                    kind: classify_activity_kind(&base_action),
+                                    step_id,
+                                    action: group_action,
+                                    input_summary: None,
+                                })
+                                .await;
+                        }
+                        AgentProgressKind::ActionCompleted | AgentProgressKind::ActionFailed => {
+                            let group_action =
+                                active_agent_groups.remove(&step_id).unwrap_or_else(|| {
+                                    action.clone().unwrap_or_else(|| "agent_action".to_string())
+                                });
+                            if let Some(line) = message.filter(|m| !m.trim().is_empty()) {
+                                let _ = runtime_tx_events
+                                    .send(RuntimeMsg::ActivityItem {
+                                        step_id: step_id.clone(),
+                                        action: group_action.clone(),
+                                        line,
+                                    })
+                                    .await;
+                            }
+                            let _ = runtime_tx_events
+                                .send(RuntimeMsg::ActivityEnd {
+                                    step_id,
+                                    action: group_action,
+                                    failed: matches!(kind, AgentProgressKind::ActionFailed),
+                                })
+                                .await;
+                        }
+                    },
                     UiEvent::InputRequired {
                         prompt,
                         waiting_kind,
@@ -733,6 +829,178 @@ impl RuntimeClient {
     }
 }
 
+const GENERATED_CONFIG_DIR: &str = ".orchestral/generated";
+const GENERATED_CONFIG_FILE: &str = "default.cli.yaml";
+
+fn resolve_runtime_config_path(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    if let Some(path) = explicit {
+        if !path.exists() {
+            anyhow::bail!("config file not found: {}", path.display());
+        }
+        return Ok(path);
+    }
+
+    if let Some(found) = discover_config_path() {
+        return Ok(found);
+    }
+
+    generate_default_config()
+}
+
+fn discover_config_path() -> Option<PathBuf> {
+    let candidates = [
+        PathBuf::from(".orchestral/config.yaml"),
+        PathBuf::from(".orchestral/config.yml"),
+        PathBuf::from("configs/orchestral.cli.yaml"),
+        PathBuf::from("configs/orchestral.yaml"),
+        PathBuf::from("orchestral.yaml"),
+    ];
+    candidates.into_iter().find(|path| path.exists())
+}
+
+fn generate_default_config() -> anyhow::Result<PathBuf> {
+    let cwd = std::env::current_dir().context("resolve current directory failed")?;
+    let dir = cwd.join(GENERATED_CONFIG_DIR);
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("create default config dir '{}' failed", dir.display()))?;
+    let path = dir.join(GENERATED_CONFIG_FILE);
+
+    let needs_write = match fs::read_to_string(&path) {
+        Ok(existing) => existing != embedded_default_config(),
+        Err(_) => true,
+    };
+
+    if needs_write {
+        fs::write(&path, embedded_default_config())
+            .with_context(|| format!("write generated config '{}' failed", path.display()))?;
+    }
+
+    Ok(path)
+}
+
+fn embedded_default_config() -> &'static str {
+    r#"version: 1
+
+app:
+  name: orchestral-cli
+  environment: development
+
+runtime:
+  max_interactions_per_thread: 10
+  auto_cleanup: true
+  concurrency_policy: interrupt_and_start_new
+  strict_exports: true
+
+planner:
+  mode: llm
+  backend: openrouter
+  model_profile: claude-sonnet-4-5
+  max_history: 20
+  dynamic_model_selection: true
+
+interpreter:
+  mode: auto
+
+context:
+  history_limit: 50
+  max_tokens: 4096
+  include_history: true
+  include_references: true
+
+extensions:
+  mcp:
+    enabled: true
+    auto_discover: true
+  skill:
+    enabled: true
+    auto_discover: true
+
+providers:
+  default_backend: openrouter
+  default_model: claude-sonnet-4-5
+  backends:
+    - name: openrouter
+      kind: openrouter
+      api_key_env: OPENROUTER_API_KEY
+      endpoint: https://openrouter.ai/api/v1/
+      config:
+        timeout_secs: 60
+  models:
+    - name: claude-sonnet-4-5
+      backend: openrouter
+      model: anthropic/claude-sonnet-4.5
+      temperature: 0.2
+
+actions:
+  hot_reload: false
+  actions:
+    - name: echo
+      kind: echo
+      description: Echo text back.
+      interface:
+        input_schema:
+          type: object
+          properties:
+            message:
+              type: string
+          required: [message]
+        output_schema:
+          type: object
+          properties:
+            result:
+              type: string
+          required: [result]
+      config:
+        prefix: "Echo: "
+    - name: shell
+      kind: shell
+      description: Run a shell command.
+      interface:
+        input_schema:
+          type: object
+          properties:
+            command:
+              type: string
+            args:
+              type: array
+              items:
+                type: string
+          required: [command]
+        output_schema:
+          type: object
+          properties:
+            stdout:
+              type: string
+            stderr:
+              type: string
+            status:
+              type: integer
+          required: [stdout, stderr, status]
+      config:
+        timeout_ms: 10000
+    - name: file_read
+      kind: file_read
+      description: Read a file from workspace.
+      interface:
+        input_schema:
+          type: object
+          properties:
+            path:
+              type: string
+          required: [path]
+        output_schema:
+          type: object
+          properties:
+            content:
+              type: string
+            path:
+              type: string
+          required: [content, path]
+      config:
+        root_dir: "."
+"#
+}
+
 fn mark_turn_settled(turn_settled_tx: &mut Option<oneshot::Sender<()>>) {
     if let Some(tx) = turn_settled_tx.take() {
         let _ = tx.send(());
@@ -766,6 +1034,27 @@ fn classify_activity_kind(action: &str) -> ActivityKind {
     }
 }
 
+fn normalize_step_action_label(step_id: &str, action: Option<String>) -> String {
+    action
+        .and_then(|raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+        .unwrap_or_else(|| step_id.to_string())
+}
+
+fn format_running_label(step_id: &str, action_label: &str) -> String {
+    if action_label == step_id {
+        format!("Running {}", step_id)
+    } else {
+        format!("Running {} ({})", step_id, action_label)
+    }
+}
+
 fn channel_event_label(event: &ChannelEvent) -> &'static str {
     match event {
         ChannelEvent::UserInput { .. } => "UserInput",
@@ -794,6 +1083,7 @@ fn ui_event_label(event: &UiEvent) -> &'static str {
         UiEvent::StepStarted { .. } => "StepStarted",
         UiEvent::StepCompleted { .. } => "StepCompleted",
         UiEvent::StepFailed { .. } => "StepFailed",
+        UiEvent::AgentProgress { .. } => "AgentProgress",
         UiEvent::InputRequired { .. } => "InputRequired",
         UiEvent::TaskCompleted => "TaskCompleted",
         UiEvent::TaskFailed { .. } => "TaskFailed",
@@ -848,5 +1138,37 @@ mod tests {
     fn test_event_interaction_id_from_system_trace_payload() {
         let event = ChannelEvent::trace("thread-1", "info", json!({"interaction_id":"int-2"}));
         assert_eq!(event_interaction_id(&event), Some("int-2"));
+    }
+
+    #[test]
+    fn test_normalize_step_action_label_falls_back_to_step_id_for_empty_action() {
+        assert_eq!(
+            normalize_step_action_label("process_xlsx", Some("".to_string())),
+            "process_xlsx"
+        );
+        assert_eq!(
+            normalize_step_action_label("process_xlsx", Some("   ".to_string())),
+            "process_xlsx"
+        );
+        assert_eq!(
+            normalize_step_action_label("process_xlsx", None),
+            "process_xlsx"
+        );
+        assert_eq!(
+            normalize_step_action_label("process_xlsx", Some("file_read".to_string())),
+            "file_read"
+        );
+    }
+
+    #[test]
+    fn test_format_running_label_avoids_duplicate_parentheses() {
+        assert_eq!(
+            format_running_label("process_xlsx", "process_xlsx"),
+            "Running process_xlsx"
+        );
+        assert_eq!(
+            format_running_label("read_skill_docs", "file_read"),
+            "Running read_skill_docs (file_read)"
+        );
     }
 }

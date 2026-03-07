@@ -201,6 +201,29 @@ fn validate_extensions(config: &OrchestralConfig) -> Result<(), ConfigError> {
             ));
         }
     }
+    for spec in &config.extensions.mcp.servers {
+        if spec.name.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "extensions.mcp.servers[].name must not be empty".to_string(),
+            ));
+        }
+        let has_stdio = spec
+            .command
+            .as_ref()
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+        let has_http = spec
+            .url
+            .as_ref()
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+        if !has_stdio && !has_http {
+            return Err(ConfigError::Invalid(format!(
+                "extensions.mcp.servers[{}] must set command or url",
+                spec.name
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -316,7 +339,7 @@ pub struct ConfigWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RuntimeExtensionSpec;
+    use crate::config::{McpServerSpec, RuntimeExtensionSpec};
     use serde_yaml::from_str;
 
     #[test]
@@ -366,5 +389,52 @@ plugins:
             validate_config(&config),
             Err(ConfigError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn test_validate_config_rejects_mcp_server_without_transport() {
+        let mut config = OrchestralConfig::default();
+        config.extensions.mcp.servers = vec![McpServerSpec {
+            name: "alpha".to_string(),
+            enabled: true,
+            required: false,
+            command: None,
+            args: Vec::new(),
+            env: std::collections::HashMap::new(),
+            url: None,
+            headers: std::collections::HashMap::new(),
+            bearer_token_env_var: None,
+            startup_timeout_ms: None,
+            tool_timeout_ms: None,
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+        }];
+
+        assert!(matches!(
+            validate_config(&config),
+            Err(ConfigError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_config_accepts_mcp_server_with_command() {
+        let mut config = OrchestralConfig::default();
+        config.extensions.mcp.servers = vec![McpServerSpec {
+            name: "alpha".to_string(),
+            enabled: true,
+            required: false,
+            command: Some("npx".to_string()),
+            args: vec!["-y".to_string(), "demo-mcp".to_string()],
+            env: std::collections::HashMap::new(),
+            url: None,
+            headers: std::collections::HashMap::new(),
+            bearer_token_env_var: None,
+            startup_timeout_ms: Some(1000),
+            tool_timeout_ms: Some(2000),
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+        }];
+
+        assert!(validate_config(&config).is_ok());
     }
 }

@@ -65,6 +65,7 @@ impl Action for ExternalProcessAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_capabilities(["external_process", "filesystem_write", "side_effect"])
             .with_input_schema(json!({
                 "type": "object",
                 "description": "Extension-defined input. Declare interface.input_schema in YAML for planner/runtime validation."

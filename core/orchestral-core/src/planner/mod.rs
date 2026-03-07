@@ -73,6 +73,19 @@ pub struct PlannerContext {
     pub reference_store: Arc<dyn ReferenceStore>,
     /// Runtime host information for platform-aware planning.
     pub runtime_info: PlannerRuntimeInfo,
+    /// Activated skill instructions for this planning turn.
+    pub skill_instructions: Vec<SkillInstruction>,
+}
+
+/// Matched skill instruction attached to planner context.
+#[derive(Debug, Clone, Default)]
+pub struct SkillInstruction {
+    pub skill_name: String,
+    pub instructions: String,
+    pub skill_path: Option<String>,
+    pub scripts_dir: Option<String>,
+    /// Skill-local virtual-env python path (e.g. `.claude/skills/xlsx/.venv/bin/python3`).
+    pub venv_python: Option<String>,
 }
 
 impl PlannerContext {
@@ -86,6 +99,7 @@ impl PlannerContext {
             history: Vec::new(),
             reference_store,
             runtime_info: PlannerRuntimeInfo::default(),
+            skill_instructions: Vec::new(),
         }
     }
 
@@ -100,12 +114,19 @@ impl PlannerContext {
             history,
             reference_store,
             runtime_info: PlannerRuntimeInfo::default(),
+            skill_instructions: Vec::new(),
         }
     }
 
     /// Attach runtime host information.
     pub fn with_runtime_info(mut self, runtime_info: PlannerRuntimeInfo) -> Self {
         self.runtime_info = runtime_info;
+        self
+    }
+
+    /// Attach matched skill instructions.
+    pub fn with_skill_instructions(mut self, skills: Vec<SkillInstruction>) -> Self {
+        self.skill_instructions = skills;
         self
     }
 

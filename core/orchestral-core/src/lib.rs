@@ -34,8 +34,9 @@ pub mod prelude {
         Action, ActionContext, ActionInput, ActionMeta, ActionResult, CancellationToken,
     };
     pub use crate::executor::{
-        ActionRegistry, DagNode, ExecutionDag, ExecutionProgressEvent, ExecutionProgressReporter,
-        ExecutionResult, Executor, ExecutorContext, NodeState,
+        ActionExecutionOptions, ActionPreflightHook, ActionRegistry, DagNode, ExecutionDag,
+        ExecutionProgressEvent, ExecutionProgressReporter, ExecutionResult, Executor,
+        ExecutorContext, NodeState,
     };
     pub use crate::interpreter::{
         InterpretDeltaSink, InterpretError, InterpretRequest, InterpretResult,
@@ -63,7 +64,8 @@ pub mod prelude {
 // Re-export key types at crate root
 pub use action::{Action, ActionContext, ActionInput, ActionResult};
 pub use executor::{
-    ExecutionDag, ExecutionProgressEvent, ExecutionProgressReporter, ExecutionResult, Executor,
+    ActionExecutionOptions, ActionPreflightHook, ExecutionDag, ExecutionProgressEvent,
+    ExecutionProgressReporter, ExecutionResult, Executor,
 };
 pub use interpreter::{
     InterpretDeltaSink, InterpretRequest, InterpretResult, NoopResultInterpreter, ResultInterpreter,

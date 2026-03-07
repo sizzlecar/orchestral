@@ -16,14 +16,14 @@ This README focuses on **how to run and use it**.
 - Node.js 18+ (for web UI)
 - API key for your configured planner/interpreter backend
 
-Default config is `configs/orchestral.cli.yaml` and currently uses Google Gemini models for planning/interpreting.
+CLI supports zero-manual-config startup. If no config file is provided/found, it generates a minimal runtime config automatically and reads provider keys from environment variables.
 Set at least:
 
 ```bash
-export GEMINI_API_KEY=your_key
+export OPENAI_API_KEY=your_key
 ```
 
-If you switch models/providers in config, set the corresponding key (for example `OPENAI_API_KEY`).
+If you use a different backend/provider, set the corresponding key (for example `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`).
 
 ## Quick Start (CLI)
 
@@ -40,6 +40,19 @@ cargo run -p orchestral-cli
 ```
 
 You will get a chat-like terminal session.
+
+Optional flags:
+
+```bash
+# Disable MCP auto-discovery/actions
+cargo run -p orchestral-cli -- run --no-mcp "hello"
+
+# Disable Skill auto-discovery/actions
+cargo run -p orchestral-cli -- run --no-skills "hello"
+
+# Use an explicit config file
+cargo run -p orchestral-cli -- run --config configs/orchestral.cli.yaml
+```
 
 ### 3. Run one turn directly
 
@@ -207,7 +220,7 @@ let builder = ComposedRuntimeAppBuilder::with_extension_catalog(RuntimeTarget::S
 - No web updates: ensure server is running and SSE endpoint is reachable.
 - Empty/failed runs: check runtime logs at `logs/orchestral-runtime.log`.
 - PDF-related build failures: verify PDFium availability (`KREUZBERG_PDFIUM_PREBUILT`) or network access for `kreuzberg` prebuilt download.
-- Runtime extension actions (`doc_*`) require composition builder wiring (`ComposedRuntimeAppBuilder`). `RuntimeApi::from_config_path` is minimal-runtime only.
+- Runtime extension actions (`doc_*`) require composition builder wiring (`ComposedRuntimeAppBuilder`), which CLI now uses by default.
 - `runtime.concurrency_policy=queue` is intentionally unsupported in bootstrap (use `interrupt`, `parallel`, or `reject`).
 
 ## License

@@ -15,6 +15,7 @@ planner:
   backend: openai
   model_profile: fast
   max_history: 20
+  log_full_prompts: false
   dynamic_model_selection: true
 
 interpreter:
@@ -34,6 +35,12 @@ ingestion:
   auto_for_assistant_outputs: true
 
 extensions:
+  mcp:
+    enabled: true
+    auto_discover: true
+  skill:
+    enabled: true
+    auto_discover: true
   # Backward-compatible alias: you may use `plugins:` with the same structure.
   runtime:
     # Optional docs ingestion extension (async parse/chunk/embed pipeline).

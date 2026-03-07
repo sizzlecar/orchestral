@@ -116,6 +116,10 @@ impl ResultInterpreter for NoopResultInterpreter {
                 "Waiting for event '{}' at step '{}' ({} / {} steps done).",
                 event_type, step_id, completed, total
             ),
+            ExecutionResult::NeedReplan { step_id, prompt } => format!(
+                "Replanning at step '{}' ({} / {} steps done): {}",
+                step_id, completed, total, prompt
+            ),
         };
         Ok(
             InterpretResult::new(message).with_metadata(serde_json::json!({

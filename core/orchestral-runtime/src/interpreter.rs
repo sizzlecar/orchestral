@@ -9,18 +9,6 @@ use orchestral_core::interpreter::{
     InterpretDeltaSink, InterpretError, InterpretRequest, InterpretResult, ResultInterpreter,
 };
 
-const DEFAULT_INTERPRETER_PROMPT: &str = "You are the response synthesizer for Orchestral.
-Produce a concise, user-facing answer from execution state.
-Rules:
-- Return plain text only (no JSON, no markdown code fences).
-- If completed: summarize key outcome and artifacts.
-- If waiting_user: ask exactly what user should provide next.
-- If waiting_event: explain what event is awaited.
-- If failed: explain likely cause and one concrete next step.
-- Do not mention internal implementation details unless they help recovery.
-- Do not dump raw command output verbatim when it is long; summarize and highlight key points.
-- Reply in the same language as the user's intent.";
-
 #[derive(Debug, Clone)]
 pub struct LlmResultInterpreterConfig {
     pub model: String,
@@ -34,7 +22,7 @@ impl Default for LlmResultInterpreterConfig {
         Self {
             model: "gpt-4o-mini".to_string(),
             temperature: 0.2,
-            system_prompt: DEFAULT_INTERPRETER_PROMPT.to_string(),
+            system_prompt: String::new(),
             timeout_secs: 12,
         }
     }
@@ -335,6 +323,9 @@ fn execution_status(result: &ExecutionResult) -> String {
             step_id,
             event_type,
         } => format!("waiting_event at {} for {}", step_id, event_type),
+        ExecutionResult::NeedReplan { step_id, prompt } => {
+            format!("need_replan at {}: {}", step_id, truncate(prompt, 600))
+        }
     }
 }
 
@@ -371,4 +362,25 @@ fn truncate(input: &str, max_chars: usize) -> String {
     let mut out: String = input.chars().take(max_chars).collect();
     out.push_str("...");
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orchestral_core::types::{Plan, Step};
+    use std::collections::HashMap;
+
+    #[test]
+    fn postprocess_message_keeps_non_skill_completion_message() {
+        let request = InterpretRequest {
+            intent: "list docs".to_string(),
+            plan: Plan::new("shell list", vec![Step::action("s1", "shell")]),
+            execution_result: ExecutionResult::Completed,
+            completed_step_ids: vec!["s1".into()],
+            working_set_snapshot: HashMap::new(),
+        };
+        let original = "done";
+        let message = postprocess_message(&request, original);
+        assert_eq!(message, original);
+    }
 }

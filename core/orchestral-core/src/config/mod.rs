@@ -17,6 +17,8 @@ pub use providers::{
     ApiKeyError, BackendSpec, LegacyProviderSpec, ModelPolicy, ModelProfile, ProvidersConfig,
 };
 
+use std::collections::HashMap;
+
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -175,6 +177,9 @@ pub struct PlannerConfig {
     pub dynamic_model_selection: bool,
     #[serde(default = "default_max_history")]
     pub max_history: usize,
+    /// Whether to log full planner prompts (system/user). Disabled by default.
+    #[serde(default = "default_false")]
+    pub log_full_prompts: bool,
 }
 
 impl Default for PlannerConfig {
@@ -187,6 +192,7 @@ impl Default for PlannerConfig {
             temperature: None,
             dynamic_model_selection: default_dynamic_model_selection(),
             max_history: default_max_history(),
+            log_full_prompts: default_false(),
         }
     }
 }
@@ -201,6 +207,10 @@ fn default_max_history() -> usize {
 
 fn default_dynamic_model_selection() -> bool {
     true
+}
+
+fn default_false() -> bool {
+    false
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -495,6 +505,92 @@ pub type FileCatalogConfig = BlobCatalogConfig;
 pub struct ExtensionsConfig {
     #[serde(default)]
     pub runtime: Vec<RuntimeExtensionSpec>,
+    #[serde(default)]
+    pub mcp: McpExtensionsConfig,
+    #[serde(default, alias = "skills")]
+    pub skill: SkillExtensionsConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpExtensionsConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub auto_discover: bool,
+    /// Optional extra config files to scan for MCP servers.
+    #[serde(default)]
+    pub discover_paths: Vec<String>,
+    /// Explicit MCP server declarations in orchestral config.
+    #[serde(default)]
+    pub servers: Vec<McpServerSpec>,
+}
+
+impl Default for McpExtensionsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_discover: true,
+            discover_paths: Vec::new(),
+            servers: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpServerSpec {
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    #[serde(default)]
+    pub bearer_token_env_var: Option<String>,
+    #[serde(default)]
+    pub startup_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub tool_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub enabled_tools: Vec<String>,
+    #[serde(default)]
+    pub disabled_tools: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SkillExtensionsConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub auto_discover: bool,
+    #[serde(default = "default_max_active_skills")]
+    pub max_active_skills: usize,
+    /// Optional directories to scan for SKILL.md.
+    #[serde(default)]
+    pub directories: Vec<String>,
+}
+
+impl Default for SkillExtensionsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_discover: true,
+            max_active_skills: default_max_active_skills(),
+            directories: Vec::new(),
+        }
+    }
+}
+
+fn default_max_active_skills() -> usize {
+    3
 }
 
 #[derive(Debug, Clone, Deserialize)]

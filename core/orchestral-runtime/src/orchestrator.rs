@@ -11,13 +11,12 @@ use serde_json::Value;
 use tokio::sync::RwLock;
 
 use crate::context::{ContextBuilder, ContextError, ContextRequest, ContextWindow, TokenBudget};
+use crate::skill::SkillCatalog;
 use orchestral_core::action::{extract_meta, ActionMeta};
 use orchestral_core::executor::{
     ExecutionProgressEvent, ExecutionProgressReporter, ExecutionResult, Executor, ExecutorContext,
 };
-use orchestral_core::interpreter::{
-    InterpretDeltaSink, InterpretRequest, NoopResultInterpreter, ResultInterpreter,
-};
+use orchestral_core::interpreter::InterpretRequest;
 use orchestral_core::normalizer::{NormalizeError, PlanNormalizer};
 use orchestral_core::planner::{
     HistoryItem, PlanError, Planner, PlannerContext, PlannerOutput, PlannerRuntimeInfo,
@@ -111,9 +110,9 @@ pub struct Orchestrator {
     pub task_store: Arc<dyn TaskStore>,
     pub reference_store: Arc<dyn ReferenceStore>,
     pub context_builder: Option<Arc<dyn ContextBuilder>>,
-    pub result_interpreter: Arc<dyn ResultInterpreter>,
     pub config: OrchestratorConfig,
     pub hook_registry: Arc<HookRegistry>,
+    pub skill_catalog: Arc<SkillCatalog>,
 }
 
 /// Orchestrator configuration
@@ -182,9 +181,9 @@ impl Orchestrator {
             task_store,
             reference_store,
             context_builder: None,
-            result_interpreter: Arc::new(NoopResultInterpreter),
             config,
             hook_registry: Arc::new(HookRegistry::new()),
+            skill_catalog: Arc::new(SkillCatalog::new(Vec::new(), 0)),
         }
     }
 
@@ -194,15 +193,15 @@ impl Orchestrator {
         self
     }
 
-    /// Attach a result interpreter (optional override).
-    pub fn with_result_interpreter(mut self, interpreter: Arc<dyn ResultInterpreter>) -> Self {
-        self.result_interpreter = interpreter;
-        self
-    }
-
     /// Attach runtime hook registry.
     pub fn with_hook_registry(mut self, hook_registry: Arc<HookRegistry>) -> Self {
         self.hook_registry = hook_registry;
+        self
+    }
+
+    /// Attach skill catalog for planner-time instruction injection.
+    pub fn with_skill_catalog(mut self, skill_catalog: Arc<SkillCatalog>) -> Self {
+        self.skill_catalog = skill_catalog;
         self
     }
 
@@ -406,9 +405,11 @@ impl Orchestrator {
             history_items = history.len(),
             "orchestrator planning started"
         );
+        let skill_instructions = self.skill_catalog.build_instructions(&task.intent.content);
         let runtime_info = PlannerRuntimeInfo::detect();
         let context = PlannerContext::with_history(actions, history, self.reference_store.clone())
-            .with_runtime_info(runtime_info);
+            .with_runtime_info(runtime_info)
+            .with_skill_instructions(skill_instructions);
         let planner_started_at = Instant::now();
         let planner_output = self.planner.plan(&task.intent, &context).await?;
         let planner_elapsed_ms = planner_started_at.elapsed().as_millis() as u64;
@@ -685,6 +686,7 @@ impl Orchestrator {
         );
         let mut current_plan = initial_plan.clone();
         let mut remaining_replans = if self.config.auto_replan_once { 1 } else { 0 };
+        let mut remaining_iterative_replans: u32 = 2;
         let mut resume = resume_event;
         let execute_started_at = Instant::now();
         let final_result = loop {
@@ -698,6 +700,13 @@ impl Orchestrator {
                 run_elapsed_ms = one_run_started_at.elapsed().as_millis() as u64,
                 result = %truncate_debug_for_log(&run.result, MAX_LOG_CHARS),
                 "orchestrator execute_plan_once latency"
+            );
+            tracing::info!(
+                interaction_id = %interaction_id,
+                task_id = %task.id,
+                completed_steps = ?run.completed_step_ids,
+                ws_keys = ?run.working_set_snapshot.keys().collect::<Vec<_>>(),
+                "orchestrator checkpoint snapshot"
             );
             task.set_checkpoint(run.completed_step_ids, run.working_set_snapshot);
             self.task_store.save(task).await?;
@@ -766,6 +775,81 @@ impl Orchestrator {
                     }
                 }
             }
+
+            if let ExecutionResult::NeedReplan { step_id, prompt } = &run.result {
+                tracing::info!(
+                    interaction_id = %interaction_id,
+                    task_id = %task.id,
+                    replan_step_id = %step_id,
+                    prompt = %truncate_for_log(prompt, 200),
+                    completed_step_ids = ?task.completed_step_ids,
+                    remaining_iterative_replans = remaining_iterative_replans,
+                    "orchestrator NeedReplan received"
+                );
+                if remaining_iterative_replans == 0 {
+                    tracing::warn!(
+                        interaction_id = %interaction_id,
+                        task_id = %task.id,
+                        "iterative replan depth limit reached, breaking"
+                    );
+                    break ExecutionResult::Failed {
+                        step_id: step_id.clone(),
+                        error: "Iterative replan depth limit reached".to_string(),
+                    };
+                }
+                remaining_iterative_replans -= 1;
+                self.emit_lifecycle_event(
+                    "iterative_replan_started",
+                    Some(interaction_id),
+                    Some(task.id.as_str()),
+                    Some("replan step reached, invoking planner for continuation"),
+                    serde_json::json!({
+                        "replan_step_id": step_id,
+                        "prompt": truncate_for_log(prompt, 400),
+                    }),
+                )
+                .await;
+
+                match self
+                    .build_continuation_plan(task, &current_plan, step_id, prompt, interaction_id)
+                    .await
+                {
+                    Ok(extended_plan) => {
+                        if !task.completed_step_ids.contains(step_id) {
+                            task.completed_step_ids.push(step_id.clone());
+                        }
+                        task.set_plan(extended_plan.clone());
+                        task.start_executing();
+                        self.task_store.save(task).await?;
+                        current_plan = extended_plan;
+                        resume = None;
+                        self.emit_lifecycle_event(
+                            "iterative_replan_completed",
+                            Some(interaction_id),
+                            Some(task.id.as_str()),
+                            Some("continuation steps appended"),
+                            serde_json::json!({
+                                "step_count": current_plan.steps.len(),
+                            }),
+                        )
+                        .await;
+                        continue;
+                    }
+                    Err(err) => {
+                        self.emit_lifecycle_event(
+                            "iterative_replan_failed",
+                            Some(interaction_id),
+                            Some(task.id.as_str()),
+                            Some("iterative replan failed"),
+                            serde_json::json!({
+                                "error": truncate_for_log(&err.to_string(), 400),
+                            }),
+                        )
+                        .await;
+                    }
+                }
+            }
+
             break run.result;
         };
 
@@ -803,6 +887,17 @@ impl Orchestrator {
         }
         let mut dag = normalized.dag;
         restore_checkpoint(&mut dag, task);
+        let dag_completed_after_restore: Vec<&str> = dag.completed_nodes();
+        let dag_ready_after_restore: Vec<String> = dag.ready_nodes.clone();
+        tracing::info!(
+            interaction_id = %interaction_id,
+            task_id = %task.id,
+            task_completed_step_ids = ?task.completed_step_ids,
+            dag_completed = ?dag_completed_after_restore,
+            dag_ready = ?dag_ready_after_restore,
+            plan_step_count = plan.steps.len(),
+            "execute_plan_once DAG state after restore_checkpoint"
+        );
         if let Some(event) = resume_event {
             complete_wait_step_for_resume(&mut dag, plan, &task.completed_step_ids, event);
         }
@@ -820,12 +915,16 @@ impl Orchestrator {
             self.thread_runtime.event_bus.clone(),
             self.hook_registry.clone(),
         ));
+        let runtime_info = PlannerRuntimeInfo::detect();
+        let skill_instructions = self.skill_catalog.build_instructions(&task.intent.content);
         let exec_ctx = ExecutorContext::new(
             task.id.clone(),
             working_set.clone(),
             self.reference_store.clone(),
         )
-        .with_progress_reporter(progress_reporter);
+        .with_progress_reporter(progress_reporter)
+        .with_runtime_info(runtime_info)
+        .with_skill_instructions(skill_instructions);
         let result = self.executor.execute(&mut dag, &exec_ctx).await;
         tracing::info!(
             interaction_id = %interaction_id,
@@ -886,10 +985,6 @@ impl Orchestrator {
         let history = self
             .history_for_planner(interaction_id, task.id.as_str())
             .await?;
-        let runtime_info = PlannerRuntimeInfo::detect();
-        let context = PlannerContext::with_history(actions, history, self.reference_store.clone())
-            .with_runtime_info(runtime_info);
-
         let recovery_intent = build_recovery_intent(
             &task.intent,
             plan,
@@ -899,6 +994,13 @@ impl Orchestrator {
             &affected,
             &task.completed_step_ids,
         );
+        let runtime_info = PlannerRuntimeInfo::detect();
+        let skill_instructions = self
+            .skill_catalog
+            .build_instructions(&recovery_intent.content);
+        let context = PlannerContext::with_history(actions, history, self.reference_store.clone())
+            .with_runtime_info(runtime_info)
+            .with_skill_instructions(skill_instructions);
         let recovery_output = self.planner.plan(&recovery_intent, &context).await?;
         let recovery_plan = match recovery_output {
             PlannerOutput::Workflow(plan) => plan,
@@ -916,6 +1018,182 @@ impl Orchestrator {
         let patched =
             patch_plan_with_recovery(plan, &cut.cut_step_id, &affected, &recovery_plan.steps)?;
         Ok(Some(patched))
+    }
+
+    async fn build_continuation_plan(
+        &self,
+        task: &Task,
+        current_plan: &orchestral_core::types::Plan,
+        replan_step_id: &StepId,
+        replan_prompt: &str,
+        interaction_id: &str,
+    ) -> Result<orchestral_core::types::Plan, OrchestratorError> {
+        tracing::info!(
+            interaction_id = %interaction_id,
+            task_id = %task.id,
+            replan_step_id = %replan_step_id,
+            completed_step_ids = ?task.completed_step_ids,
+            ws_key_count = task.working_set_snapshot.len(),
+            current_plan_steps = current_plan.steps.len(),
+            "build_continuation_plan started"
+        );
+        let actions = self.available_actions().await;
+        let history = self
+            .history_for_planner(interaction_id, task.id.as_str())
+            .await?;
+
+        let ws_summary = summarize_working_set(&task.working_set_snapshot);
+        let content = format!(
+            "Continuation planning request.\n\
+            Original goal: {}\n\
+            Original intent: {}\n\
+            Completed steps: {}\n\
+            Current working set summary:\n{}\n\
+            Replan prompt: {}\n\
+            Rules: generate ONLY the continuation steps. \
+            Do not repeat completed steps. \
+            New step IDs must not collide with existing ones.",
+            current_plan.goal,
+            task.intent.content,
+            serde_json::to_string(&task.completed_step_ids).unwrap_or_else(|_| "[]".to_string()),
+            ws_summary,
+            replan_prompt,
+        );
+        let continuation_intent = Intent::new(content);
+
+        let runtime_info = PlannerRuntimeInfo::detect();
+        let skill_instructions = self.skill_catalog.build_instructions(&task.intent.content);
+        let context = PlannerContext::with_history(actions, history, self.reference_store.clone())
+            .with_runtime_info(runtime_info)
+            .with_skill_instructions(skill_instructions);
+
+        tracing::info!(
+            interaction_id = %interaction_id,
+            task_id = %task.id,
+            "build_continuation_plan calling planner"
+        );
+        let output = self.planner.plan(&continuation_intent, &context).await?;
+        let continuation_plan = match output {
+            PlannerOutput::Workflow(plan) => {
+                tracing::info!(
+                    interaction_id = %interaction_id,
+                    task_id = %task.id,
+                    continuation_step_count = plan.steps.len(),
+                    continuation_step_ids = ?plan.steps.iter().map(|s| s.id.to_string()).collect::<Vec<_>>(),
+                    "build_continuation_plan planner returned workflow"
+                );
+                plan
+            }
+            PlannerOutput::DirectResponse(msg) => {
+                tracing::warn!(
+                    interaction_id = %interaction_id,
+                    task_id = %task.id,
+                    message = %truncate_for_log(&msg, 200),
+                    "build_continuation_plan planner returned direct_response (expected workflow)"
+                );
+                return Err(OrchestratorError::Planner(PlanError::Generation(
+                    "continuation planner returned direct_response; workflow required".to_string(),
+                )));
+            }
+            PlannerOutput::Clarification(q) => {
+                tracing::warn!(
+                    interaction_id = %interaction_id,
+                    task_id = %task.id,
+                    question = %truncate_for_log(&q, 200),
+                    "build_continuation_plan planner returned clarification (expected workflow)"
+                );
+                return Err(OrchestratorError::Planner(PlanError::Generation(
+                    "continuation planner returned clarification; workflow required".to_string(),
+                )));
+            }
+        };
+
+        let mut merged_steps = current_plan.steps.clone();
+        let existing_ids: std::collections::HashSet<String> =
+            merged_steps.iter().map(|s| s.id.to_string()).collect();
+
+        let all_continuation_steps = continuation_plan.steps;
+
+        let replan_ids: std::collections::HashSet<String> = all_continuation_steps
+            .iter()
+            .filter(|s| s.kind == StepKind::Replan)
+            .map(|s| s.id.to_string())
+            .collect();
+
+        let mut replan_redirect: HashMap<String, String> = HashMap::new();
+        for replan_step in all_continuation_steps
+            .iter()
+            .filter(|s| s.kind == StepKind::Replan)
+        {
+            let redirect_to = replan_step
+                .depends_on
+                .last()
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| replan_step_id.to_string());
+            replan_redirect.insert(replan_step.id.to_string(), redirect_to);
+        }
+
+        let continuation_steps: Vec<Step> = all_continuation_steps
+            .into_iter()
+            .filter(|s| s.kind != StepKind::Replan)
+            .collect();
+
+        let mut rename_map: HashMap<String, String> = HashMap::new();
+        for step in &continuation_steps {
+            if existing_ids.contains(step.id.as_str()) {
+                let new_id = format!("c_{}", step.id);
+                rename_map.insert(step.id.to_string(), new_id);
+            }
+        }
+
+        for mut step in continuation_steps {
+            if let Some(new_id) = rename_map.get(step.id.as_str()) {
+                step.id = new_id.clone().into();
+            }
+            step.depends_on = step
+                .depends_on
+                .into_iter()
+                .filter_map(|dep| {
+                    if replan_ids.contains(dep.as_str()) {
+                        replan_redirect.get(dep.as_str()).map(|target| {
+                            rename_map
+                                .get(target)
+                                .map(|r| StepId::from(r.as_str()))
+                                .unwrap_or_else(|| StepId::from(target.as_str()))
+                        })
+                    } else if let Some(renamed) = rename_map.get(dep.as_str()) {
+                        Some(StepId::from(renamed.as_str()))
+                    } else {
+                        Some(dep)
+                    }
+                })
+                .collect();
+            if step.depends_on.is_empty() {
+                step.depends_on = vec![replan_step_id.clone()];
+            }
+            merged_steps.push(step);
+        }
+
+        let merged_ids: Vec<String> = merged_steps.iter().map(|s| s.id.to_string()).collect();
+        tracing::info!(
+            interaction_id = %interaction_id,
+            task_id = %task.id,
+            merged_step_count = merged_steps.len(),
+            merged_step_ids = ?merged_ids,
+            "build_continuation_plan merged plan ready"
+        );
+
+        Ok(orchestral_core::types::Plan {
+            goal: current_plan.goal.clone(),
+            steps: merged_steps,
+            confidence: current_plan.confidence,
+            on_complete: continuation_plan
+                .on_complete
+                .or_else(|| current_plan.on_complete.clone()),
+            on_failure: continuation_plan
+                .on_failure
+                .or_else(|| current_plan.on_failure.clone()),
+        })
     }
 
     async fn available_actions(&self) -> Vec<ActionMeta> {
@@ -1021,52 +1299,24 @@ impl Orchestrator {
         let Some(plan) = task.plan.clone() else {
             return;
         };
-        let request = InterpretRequest {
-            intent: task.intent.content.clone(),
-            plan,
-            execution_result: result.clone(),
-            completed_step_ids: task.completed_step_ids.clone(),
-            working_set_snapshot: task.working_set_snapshot.clone(),
-        };
-        let stream_sink = Arc::new(RuntimeInterpreterDeltaSink::new(
-            self.thread_runtime.thread_id().await,
-            InteractionId::from(interaction_id),
-            task.id.clone(),
-            self.thread_runtime.event_store.clone(),
-            self.thread_runtime.event_bus.clone(),
-        ));
-        let interpreted = match self
-            .result_interpreter
-            .interpret_stream(request.clone(), Some(stream_sink))
-            .await
-        {
-            Ok(output) => output,
-            Err(err) => {
-                tracing::warn!(
-                    task_id = %task.id,
-                    interaction_id = %interaction_id,
-                    error = %err,
-                    "result interpretation failed"
-                );
-                match NoopResultInterpreter.interpret(request).await {
-                    Ok(fallback) => fallback,
-                    Err(fallback_err) => {
-                        tracing::warn!(
-                            task_id = %task.id,
-                            interaction_id = %interaction_id,
-                            error = %fallback_err,
-                            "fallback interpretation failed"
-                        );
-                        return;
-                    }
-                }
-            }
-        };
+
+        let message = resolve_plan_response_template(&plan, result, &task.working_set_snapshot)
+            .unwrap_or_else(|| {
+                let request = InterpretRequest {
+                    intent: task.intent.content.clone(),
+                    plan: plan.clone(),
+                    execution_result: result.clone(),
+                    completed_step_ids: task.completed_step_ids.clone(),
+                    working_set_snapshot: task.working_set_snapshot.clone(),
+                };
+                noop_interpret_sync(&request)
+            });
+
         self.emit_assistant_output_message(
             interaction_id,
             task.id.as_str(),
-            interpreted.message,
-            interpreted.metadata,
+            message,
+            Value::Null,
             Some(execution_result_metadata(result)),
         )
         .await;
@@ -1240,69 +1490,6 @@ impl ExecutionProgressReporter for RuntimeProgressReporter {
             .map_err(|e| e.to_string())?;
 
         Ok(())
-    }
-}
-
-struct RuntimeInterpreterDeltaSink {
-    thread_id: ThreadId,
-    interaction_id: InteractionId,
-    task_id: TaskId,
-    event_store: Arc<dyn EventStore>,
-    event_bus: Arc<dyn EventBus>,
-}
-
-impl RuntimeInterpreterDeltaSink {
-    fn new(
-        thread_id: ThreadId,
-        interaction_id: InteractionId,
-        task_id: TaskId,
-        event_store: Arc<dyn EventStore>,
-        event_bus: Arc<dyn EventBus>,
-    ) -> Self {
-        Self {
-            thread_id,
-            interaction_id,
-            task_id,
-            event_store,
-            event_bus,
-        }
-    }
-}
-
-#[async_trait]
-impl InterpretDeltaSink for RuntimeInterpreterDeltaSink {
-    async fn on_delta(&self, delta: &str) {
-        if delta.is_empty() {
-            return;
-        }
-        let trace = Event::trace(
-            self.thread_id.clone(),
-            "info",
-            serde_json::json!({
-                "category": "assistant_stream",
-                "interaction_id": self.interaction_id.to_string(),
-                "task_id": self.task_id.to_string(),
-                "delta": delta,
-                "done": false,
-            }),
-        );
-        let _ = self.event_store.append(trace.clone()).await;
-        let _ = self.event_bus.publish(trace).await;
-    }
-
-    async fn on_done(&self) {
-        let trace = Event::trace(
-            self.thread_id.clone(),
-            "info",
-            serde_json::json!({
-                "category": "assistant_stream",
-                "interaction_id": self.interaction_id.to_string(),
-                "task_id": self.task_id.to_string(),
-                "done": true,
-            }),
-        );
-        let _ = self.event_store.append(trace.clone()).await;
-        let _ = self.event_bus.publish(trace).await;
     }
 }
 
@@ -1558,6 +1745,8 @@ fn patch_plan_with_recovery(
         goal: current_plan.goal.clone(),
         steps: base_steps,
         confidence: current_plan.confidence,
+        on_complete: current_plan.on_complete.clone(),
+        on_failure: current_plan.on_failure.clone(),
     })
 }
 
@@ -1734,6 +1923,11 @@ fn execution_result_metadata(result: &ExecutionResult) -> Value {
             "step_id": step_id,
             "event_type": event_type,
         }),
+        ExecutionResult::NeedReplan { step_id, prompt } => serde_json::json!({
+            "status": "need_replan",
+            "step_id": step_id,
+            "prompt": truncate_for_log(prompt, 400),
+        }),
     }
 }
 
@@ -1759,6 +1953,7 @@ fn task_state_from_execution(result: &ExecutionResult) -> TaskState {
         ExecutionResult::WaitingEvent { event_type, .. } => TaskState::WaitingEvent {
             event_type: event_type.clone(),
         },
+        ExecutionResult::NeedReplan { .. } => TaskState::Executing,
     }
 }
 
@@ -1836,6 +2031,236 @@ fn interaction_state_from_task(state: &TaskState) -> InteractionState {
         TaskState::Paused => InteractionState::Paused,
         TaskState::Planning | TaskState::Executing => InteractionState::Active,
     }
+}
+
+fn resolve_plan_response_template(
+    plan: &orchestral_core::types::Plan,
+    result: &ExecutionResult,
+    working_set: &HashMap<String, Value>,
+) -> Option<String> {
+    let template = match result {
+        ExecutionResult::Completed => plan.on_complete.as_deref(),
+        ExecutionResult::Failed { .. } => plan.on_failure.as_deref(),
+        _ => None,
+    }?;
+
+    let is_completed = matches!(result, ExecutionResult::Completed);
+    let mut resolved = template.to_string();
+    for (key, value) in working_set {
+        let placeholder = format!("{{{{{}}}}}", key);
+        let replacement = value_to_template_replacement(value);
+        resolved = resolved.replace(&placeholder, &replacement);
+    }
+    if let ExecutionResult::Failed { error, .. } = result {
+        resolved = resolved.replace("{{error}}", error);
+    }
+    if is_completed && !template_contains_summary_placeholder(template) {
+        if let Some(summary) = best_summary_from_working_set(working_set) {
+            if !summary.trim().is_empty() && !resolved.contains(&summary) {
+                if !resolved.trim().is_empty() {
+                    resolved.push_str("\n\n");
+                }
+                resolved.push_str(&summary);
+            }
+        }
+    }
+    Some(resolved)
+}
+
+fn value_to_template_replacement(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Null => "null".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn template_contains_summary_placeholder(template: &str) -> bool {
+    template.contains("{{summary}}") || template.contains(".summary}}")
+}
+
+fn best_summary_from_working_set(working_set: &HashMap<String, Value>) -> Option<String> {
+    if let Some(value) = working_set.get("summary") {
+        let summary = value_to_template_replacement(value);
+        if !summary.trim().is_empty() {
+            return Some(summary);
+        }
+    }
+
+    let mut scoped_keys = working_set
+        .keys()
+        .filter(|key| key.ends_with(".summary"))
+        .cloned()
+        .collect::<Vec<_>>();
+    scoped_keys.sort();
+
+    for key in scoped_keys {
+        if let Some(value) = working_set.get(&key) {
+            let summary = value_to_template_replacement(value);
+            if !summary.trim().is_empty() {
+                return Some(summary);
+            }
+        }
+    }
+    None
+}
+
+fn noop_interpret_sync(request: &InterpretRequest) -> String {
+    let completed = request.completed_step_ids.len();
+    let total = request.plan.steps.len();
+    match &request.execution_result {
+        ExecutionResult::Completed => {
+            format!("Done ({}/{} steps).", completed, total)
+        }
+        ExecutionResult::Failed { step_id, error } => {
+            format!(
+                "Failed at step '{}' ({}/{} steps): {}",
+                step_id,
+                completed,
+                total,
+                truncate_for_log(error, 400)
+            )
+        }
+        ExecutionResult::WaitingUser { prompt, .. } => {
+            format!(
+                "Need input ({}/{} steps done): {}",
+                completed, total, prompt
+            )
+        }
+        ExecutionResult::WaitingEvent {
+            step_id,
+            event_type,
+        } => {
+            format!(
+                "Waiting for '{}' at step '{}' ({}/{} steps done).",
+                event_type, step_id, completed, total
+            )
+        }
+        ExecutionResult::NeedReplan { step_id, prompt } => {
+            format!(
+                "Replanning at step '{}' ({}/{} steps done): {}",
+                step_id, completed, total, prompt
+            )
+        }
+    }
+}
+
+fn summarize_working_set(snapshot: &HashMap<String, Value>) -> String {
+    const MAX_WS_SUMMARY_CHARS: usize = 16_000;
+    const LIMIT_STDOUT: usize = 4_000;
+    const LIMIT_STDERR: usize = 1_000;
+    const LIMIT_CONTENT: usize = 4_000;
+    const LIMIT_DEFAULT: usize = 200;
+
+    #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
+    enum KeyPriority {
+        High = 0,
+        Medium = 1,
+        Low = 2,
+    }
+
+    fn classify_key(key: &str) -> (KeyPriority, usize) {
+        if key == "stdout" || key.ends_with(".stdout") {
+            (KeyPriority::High, LIMIT_STDOUT)
+        } else if key == "content" || key.ends_with(".content") {
+            (KeyPriority::High, LIMIT_CONTENT)
+        } else if key == "stderr" || key.ends_with(".stderr") {
+            (KeyPriority::Medium, LIMIT_STDERR)
+        } else {
+            (KeyPriority::Low, LIMIT_DEFAULT)
+        }
+    }
+
+    fn truncate_plain(input: &str, max_chars: usize) -> String {
+        let char_count = input.chars().count();
+        if char_count <= max_chars {
+            return input.to_string();
+        }
+        if max_chars <= 3 {
+            return ".".repeat(max_chars);
+        }
+        let mut out: String = input.chars().take(max_chars - 3).collect();
+        out.push_str("...");
+        out
+    }
+
+    fn preview_value(value: &Value, max_chars: usize) -> String {
+        match value {
+            Value::String(s) => format!("\"{}\"", truncate_plain(s.trim(), max_chars)),
+            Value::Number(n) => n.to_string(),
+            Value::Bool(b) => b.to_string(),
+            Value::Null => "null".to_string(),
+            other => truncate_plain(&other.to_string(), max_chars),
+        }
+    }
+
+    let mut entries = snapshot.iter().collect::<Vec<_>>();
+    entries.sort_by(|(k1, _), (k2, _)| k1.cmp(k2));
+
+    let mut buckets: [Vec<(&String, &Value)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for (key, value) in entries {
+        let (priority, _) = classify_key(key);
+        buckets[priority as usize].push((key, value));
+    }
+
+    let mut output = String::new();
+    let mut remaining = MAX_WS_SUMMARY_CHARS;
+    let mut omitted_count = 0usize;
+
+    for bucket in &buckets {
+        for (key, value) in bucket {
+            if remaining == 0 {
+                omitted_count += 1;
+                continue;
+            }
+            let (_, per_key_limit) = classify_key(key.as_str());
+            let preview = preview_value(value, per_key_limit);
+            let line = format!("  {}: {}", key, preview);
+            let line_len = line.chars().count();
+            let sep_len = if output.is_empty() { 0 } else { 1 };
+
+            if remaining <= sep_len {
+                omitted_count += 1;
+                continue;
+            }
+            let line_budget = remaining - sep_len;
+            let line_to_append = if line_len > line_budget {
+                truncate_plain(&line, line_budget)
+            } else {
+                line
+            };
+            if !output.is_empty() {
+                output.push('\n');
+                remaining -= 1;
+            }
+            remaining = remaining.saturating_sub(line_to_append.chars().count());
+            output.push_str(&line_to_append);
+
+            if line_len > line_budget {
+                omitted_count += 1;
+            }
+        }
+    }
+
+    if output.is_empty() {
+        return "(empty)".to_string();
+    }
+
+    if omitted_count > 0 && remaining > 0 {
+        let summary_line = format!(
+            "  ... ({} keys omitted due to summary limit)",
+            omitted_count
+        );
+        let truncated = truncate_plain(&summary_line, remaining);
+        if !truncated.is_empty() {
+            output.push('\n');
+            output.push_str(&truncated);
+        }
+    }
+
+    output
 }
 
 #[cfg(test)]
@@ -2051,5 +2476,138 @@ mod tests {
         )
         .expect("cut");
         assert_eq!(cut.cut_step_id, "A2");
+    }
+
+    #[test]
+    fn test_summarize_working_set_applies_semantic_limits() {
+        let mut snapshot = HashMap::new();
+        snapshot.insert("stdout".to_string(), json!("s".repeat(5_000)));
+        snapshot.insert("stderr".to_string(), json!("e".repeat(1_500)));
+        snapshot.insert("path".to_string(), json!("p".repeat(500)));
+        snapshot.insert("reader.content".to_string(), json!("c".repeat(5_000)));
+
+        let summary = summarize_working_set(&snapshot);
+
+        let stdout_line = summary
+            .lines()
+            .find(|line| line.starts_with("  stdout: \""))
+            .expect("stdout line");
+        let stdout_value = stdout_line
+            .strip_prefix("  stdout: \"")
+            .and_then(|line| line.strip_suffix('"'))
+            .expect("stdout quoted value");
+        assert_eq!(stdout_value.chars().count(), 4_000);
+
+        let stderr_line = summary
+            .lines()
+            .find(|line| line.starts_with("  stderr: \""))
+            .expect("stderr line");
+        let stderr_value = stderr_line
+            .strip_prefix("  stderr: \"")
+            .and_then(|line| line.strip_suffix('"'))
+            .expect("stderr quoted value");
+        assert_eq!(stderr_value.chars().count(), 1_000);
+
+        let path_line = summary
+            .lines()
+            .find(|line| line.starts_with("  path: \""))
+            .expect("path line");
+        let path_value = path_line
+            .strip_prefix("  path: \"")
+            .and_then(|line| line.strip_suffix('"'))
+            .expect("path quoted value");
+        assert_eq!(path_value.chars().count(), 200);
+
+        let content_line = summary
+            .lines()
+            .find(|line| line.starts_with("  reader.content: \""))
+            .expect("content line");
+        let content_value = content_line
+            .strip_prefix("  reader.content: \"")
+            .and_then(|line| line.strip_suffix('"'))
+            .expect("content quoted value");
+        assert_eq!(content_value.chars().count(), 4_000);
+    }
+
+    #[test]
+    fn test_summarize_working_set_is_utf8_safe() {
+        let mut snapshot = HashMap::new();
+        snapshot.insert("note".to_string(), json!("你好".repeat(260)));
+
+        let summary = summarize_working_set(&snapshot);
+        let note_line = summary
+            .lines()
+            .find(|line| line.starts_with("  note: \""))
+            .expect("note line");
+        let note_value = note_line
+            .strip_prefix("  note: \"")
+            .and_then(|line| line.strip_suffix('"'))
+            .expect("note quoted value");
+
+        assert_eq!(note_value.chars().count(), 200);
+        assert!(note_value.ends_with("..."));
+    }
+
+    #[test]
+    fn test_summarize_working_set_prioritizes_stdout_content_and_stderr() {
+        let mut snapshot = HashMap::new();
+        snapshot.insert("stdout".to_string(), json!("s".repeat(10_000)));
+        snapshot.insert("stderr".to_string(), json!("e".repeat(3_000)));
+        snapshot.insert("reader.content".to_string(), json!("c".repeat(10_000)));
+        for idx in 0..120 {
+            snapshot.insert(format!("low_{idx:03}"), json!("l".repeat(400)));
+        }
+
+        let summary = summarize_working_set(&snapshot);
+
+        assert!(summary.contains("  stdout: \""));
+        assert!(summary.contains("  reader.content: \""));
+        assert!(summary.contains("  stderr: \""));
+        assert!(!summary.contains("  low_119: \""));
+    }
+
+    #[test]
+    fn test_resolve_plan_response_template_appends_summary_when_on_complete_is_static() {
+        let mut plan = Plan::new("goal", vec![]);
+        plan.on_complete = Some("Successfully found and summarized the Excel file.".to_string());
+        let mut ws = HashMap::new();
+        ws.insert("summary".to_string(), json!("Sheet 2025-Q2: 28 rows"));
+
+        let resolved =
+            resolve_plan_response_template(&plan, &ExecutionResult::Completed, &ws).expect("msg");
+
+        assert_eq!(
+            resolved,
+            "Successfully found and summarized the Excel file.\n\nSheet 2025-Q2: 28 rows"
+        );
+    }
+
+    #[test]
+    fn test_resolve_plan_response_template_does_not_duplicate_summary_when_placeholder_exists() {
+        let mut plan = Plan::new("goal", vec![]);
+        plan.on_complete = Some("Done:\n{{summary}}".to_string());
+        let mut ws = HashMap::new();
+        ws.insert("summary".to_string(), json!("Sheet 2025-Q2: 28 rows"));
+
+        let resolved =
+            resolve_plan_response_template(&plan, &ExecutionResult::Completed, &ws).expect("msg");
+
+        assert_eq!(resolved, "Done:\nSheet 2025-Q2: 28 rows");
+    }
+
+    #[test]
+    fn test_resolve_plan_response_template_uses_scoped_summary_fallback() {
+        let mut plan = Plan::new("goal", vec![]);
+        plan.on_complete = Some("Done".to_string());
+        let mut ws = HashMap::new();
+        ws.insert(
+            "summarize_excel_agent.summary".to_string(),
+            json!("Sheet 2025-Q2: 28 rows"),
+        );
+
+        let resolved =
+            resolve_plan_response_template(&plan, &ExecutionResult::Completed, &ws).expect("msg");
+
+        assert_eq!(resolved, "Done\n\nSheet 2025-Q2: 28 rows");
     }
 }

@@ -4089,6 +4089,7 @@ dependencies = [
  "clap",
  "crossterm 0.28.1",
  "futures-util",
+ "orchestral-composition",
  "orchestral-core",
  "orchestral-runtime",
  "ratatui",

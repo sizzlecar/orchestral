@@ -16,6 +16,7 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde_json::Value;
 
 use crate::action::{Action, ActionContext, ActionInput, ActionResult, ApprovalRequest};
+use crate::planner::{PlannerRuntimeInfo, SkillInstruction};
 use crate::store::{ReferenceStore, WorkingSet};
 use crate::types::{Plan, Step, StepId, StepKind, TaskId};
 
@@ -330,6 +331,10 @@ pub struct ExecutorContext {
     pub task_id: TaskId,
     /// Optional execution progress reporter.
     pub progress_reporter: Option<Arc<dyn ExecutionProgressReporter>>,
+    /// Runtime host information (OS, arch, shell, python) for platform-aware execution.
+    pub runtime_info: Option<PlannerRuntimeInfo>,
+    /// Activated skill instructions for this execution turn.
+    pub skill_instructions: Vec<SkillInstruction>,
 }
 
 impl ExecutorContext {
@@ -344,12 +349,26 @@ impl ExecutorContext {
             working_set,
             reference_store,
             progress_reporter: None,
+            runtime_info: None,
+            skill_instructions: Vec::new(),
         }
     }
 
     /// Attach a realtime execution progress reporter.
     pub fn with_progress_reporter(mut self, reporter: Arc<dyn ExecutionProgressReporter>) -> Self {
         self.progress_reporter = Some(reporter);
+        self
+    }
+
+    /// Attach runtime host information for platform-aware execution.
+    pub fn with_runtime_info(mut self, info: PlannerRuntimeInfo) -> Self {
+        self.runtime_info = Some(info);
+        self
+    }
+
+    /// Attach activated skill instructions for this execution turn.
+    pub fn with_skill_instructions(mut self, skills: Vec<SkillInstruction>) -> Self {
+        self.skill_instructions = skills;
         self
     }
 }
@@ -369,6 +388,9 @@ pub enum ExecutionResult {
     },
     /// Waiting for external event
     WaitingEvent { step_id: StepId, event_type: String },
+    /// Execution paused at a replan step; the Orchestrator should re-invoke the
+    /// Planner with the current WorkingSet and append continuation steps.
+    NeedReplan { step_id: StepId, prompt: String },
 }
 
 /// Realtime execution progress event.
@@ -419,6 +441,204 @@ pub trait ExecutionProgressReporter: Send + Sync {
     async fn report(&self, event: ExecutionProgressEvent) -> Result<(), String>;
 }
 
+/// Runtime-provided executor for `StepKind::Agent`.
+#[async_trait]
+pub trait AgentStepExecutor: Send + Sync {
+    async fn execute_agent_step(
+        &self,
+        step: &Step,
+        resolved_params: serde_json::Value,
+        execution_id: &str,
+        ctx: &ExecutorContext,
+        action_registry: Arc<RwLock<ActionRegistry>>,
+    ) -> ActionResult;
+}
+
+pub type ActionPreflightHook = Arc<dyn Fn(&str, &Value) -> Option<String> + Send + Sync>;
+
+#[derive(Clone, Default)]
+pub struct ActionExecutionOptions {
+    pub preflight_hook: Option<ActionPreflightHook>,
+}
+
+impl ActionExecutionOptions {
+    pub fn with_preflight_hook(mut self, hook: ActionPreflightHook) -> Self {
+        self.preflight_hook = Some(hook);
+        self
+    }
+}
+
+/// Unified action execution entrypoint used by both step execution and agent subloops.
+/// This centralizes registry lookup, schema validation, action run, and result logging.
+pub async fn execute_action_with_registry(
+    action_registry: Arc<RwLock<ActionRegistry>>,
+    ctx: &ExecutorContext,
+    step_id: &StepId,
+    action_name: &str,
+    execution_id: &str,
+    resolved_params: Value,
+) -> ActionResult {
+    let options = ActionExecutionOptions::default();
+    execute_action_with_registry_with_options(
+        action_registry,
+        ctx,
+        step_id,
+        action_name,
+        execution_id,
+        resolved_params,
+        &options,
+    )
+    .await
+}
+
+pub async fn execute_action_with_registry_with_options(
+    action_registry: Arc<RwLock<ActionRegistry>>,
+    ctx: &ExecutorContext,
+    step_id: &StepId,
+    action_name: &str,
+    execution_id: &str,
+    resolved_params: Value,
+    options: &ActionExecutionOptions,
+) -> ActionResult {
+    if let Some(preflight_hook) = options.preflight_hook.as_ref() {
+        if let Some(reason) = preflight_hook(action_name, &resolved_params) {
+            tracing::warn!(
+                task_id = %ctx.task_id,
+                step_id = %step_id,
+                action = %action_name,
+                reason = %truncate_for_log(&reason, MAX_LOG_TEXT_CHARS),
+                "action preflight rejected"
+            );
+            return ActionResult::error(format!(
+                "action '{}' failed preflight: {}",
+                action_name, reason
+            ));
+        }
+    }
+
+    let action = {
+        let registry = action_registry.read().await;
+        registry.get(action_name)
+    };
+
+    let action = match action {
+        Some(a) => a,
+        None => return ActionResult::error(format!("Action '{}' not found", action_name)),
+    };
+    let action_meta = action.metadata();
+
+    if let Err(error) = validate_schema(
+        &resolved_params,
+        &action_meta.input_schema,
+        "input",
+        step_id,
+        action_name,
+    ) {
+        return ActionResult::error(error);
+    }
+
+    let input = ActionInput::with_params(resolved_params);
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        tracing::debug!(
+            task_id = %ctx.task_id,
+            step_id = %step_id,
+            action = %action_name,
+            resolved_params = %truncate_json_for_log(&input.params, MAX_LOG_JSON_CHARS),
+            "action input resolved"
+        );
+    }
+
+    let action_ctx = ActionContext::new(
+        ctx.task_id.clone(),
+        step_id.clone(),
+        execution_id.to_string(),
+        ctx.working_set.clone(),
+        ctx.reference_store.clone(),
+    );
+
+    let result = action.run(input, action_ctx).await;
+    match result {
+        ActionResult::Success { exports } => {
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                tracing::debug!(
+                    task_id = %ctx.task_id,
+                    step_id = %step_id,
+                    action = %action_name,
+                    exports = %truncate_json_map_for_log(&exports, MAX_LOG_JSON_CHARS),
+                    "action returned success"
+                );
+            }
+            let export_value = serde_json::Value::Object(
+                exports
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            );
+            if let Err(error) = validate_schema(
+                &export_value,
+                &action_meta.output_schema,
+                "output",
+                step_id,
+                action_name,
+            ) {
+                return ActionResult::error(error);
+            }
+            ActionResult::Success { exports }
+        }
+        ActionResult::NeedClarification { question } => {
+            tracing::info!(
+                task_id = %ctx.task_id,
+                step_id = %step_id,
+                action = %action_name,
+                question = %truncate_for_log(&question, MAX_LOG_TEXT_CHARS),
+                "action requested clarification"
+            );
+            ActionResult::NeedClarification { question }
+        }
+        ActionResult::NeedApproval { request } => {
+            tracing::info!(
+                task_id = %ctx.task_id,
+                step_id = %step_id,
+                action = %action_name,
+                reason = %truncate_for_log(&request.reason, MAX_LOG_TEXT_CHARS),
+                command = ?request.command,
+                "action requested approval"
+            );
+            ActionResult::NeedApproval { request }
+        }
+        ActionResult::RetryableError {
+            message,
+            retry_after,
+            attempt,
+        } => {
+            tracing::warn!(
+                task_id = %ctx.task_id,
+                step_id = %step_id,
+                action = %action_name,
+                message = %truncate_for_log(&message, MAX_LOG_TEXT_CHARS),
+                retry_after_ms = retry_after.map(|d| d.as_millis() as u64),
+                attempt = attempt,
+                "action returned retryable error"
+            );
+            ActionResult::RetryableError {
+                message,
+                retry_after,
+                attempt,
+            }
+        }
+        ActionResult::Error { message } => {
+            tracing::error!(
+                task_id = %ctx.task_id,
+                step_id = %step_id,
+                action = %action_name,
+                error = %truncate_for_log(&message, MAX_LOG_TEXT_CHARS),
+                "action returned terminal error"
+            );
+            ActionResult::Error { message }
+        }
+    }
+}
+
 /// The executor - orchestrates DAG execution
 pub struct Executor {
     /// Action registry
@@ -433,6 +653,10 @@ pub struct Executor {
     pub retry_max_delay: Duration,
     /// Whether declared exports are required at runtime.
     pub strict_exports: bool,
+    /// Optional runtime hook for handling agent steps.
+    pub agent_step_executor: Option<Arc<dyn AgentStepExecutor>>,
+    /// Optional execution options applied to all non-agent action executions.
+    pub action_execution_options: ActionExecutionOptions,
 }
 
 impl Executor {
@@ -450,6 +674,8 @@ impl Executor {
             retry_base_delay: DEFAULT_RETRY_BASE_DELAY,
             retry_max_delay: DEFAULT_RETRY_MAX_DELAY,
             strict_exports: true,
+            agent_step_executor: None,
+            action_execution_options: ActionExecutionOptions::default(),
         }
     }
 
@@ -475,6 +701,24 @@ impl Executor {
     /// Configure strict runtime checks for step exports.
     pub fn with_export_contract(mut self, strict_exports: bool) -> Self {
         self.strict_exports = strict_exports;
+        self
+    }
+
+    /// Configure runtime-provided executor for `StepKind::Agent`.
+    pub fn with_agent_step_executor(mut self, agent_executor: Arc<dyn AgentStepExecutor>) -> Self {
+        self.agent_step_executor = Some(agent_executor);
+        self
+    }
+
+    /// Configure common action execution options.
+    pub fn with_action_execution_options(mut self, options: ActionExecutionOptions) -> Self {
+        self.action_execution_options = options;
+        self
+    }
+
+    /// Configure a preflight hook for non-agent action execution.
+    pub fn with_action_preflight_hook(mut self, hook: ActionPreflightHook) -> Self {
+        self.action_execution_options.preflight_hook = Some(hook);
         self
     }
 
@@ -561,6 +805,11 @@ impl Executor {
                     node.step.action.clone(),
                     node.step.params.clone(),
                 )),
+                StepKind::Replan => Some((
+                    StepKind::Replan,
+                    node.step.action.clone(),
+                    node.step.params.clone(),
+                )),
                 _ => None,
             });
             if let Some((kind, action, params)) = wait_data {
@@ -604,6 +853,26 @@ impl Executor {
                                 .get("event_type")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("unknown")
+                                .to_string(),
+                        })
+                    }
+                    StepKind::Replan => {
+                        report_progress(
+                            ctx,
+                            ExecutionProgressEvent::new(
+                                ctx.task_id.clone(),
+                                Some(step_id.clone().into()),
+                                Some(action),
+                                "step_need_replan",
+                            ),
+                        )
+                        .await;
+                        Some(ExecutionResult::NeedReplan {
+                            step_id: step_id.clone().into(),
+                            prompt: params
+                                .get("prompt")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("Continue planning based on intermediate results")
                                 .to_string(),
                         })
                     }
@@ -918,16 +1187,6 @@ impl Executor {
         execution_id: &str,
         ctx: &ExecutorContext,
     ) -> ActionResult {
-        let action = {
-            let registry = self.action_registry.read().await;
-            registry.get(&step.action)
-        };
-
-        let action = match action {
-            Some(a) => a,
-            None => return ActionResult::error(format!("Action '{}' not found", step.action)),
-        };
-        let action_meta = action.metadata();
         if tracing::enabled!(tracing::Level::DEBUG) {
             tracing::debug!(
                 task_id = %ctx.task_id,
@@ -985,116 +1244,34 @@ impl Executor {
             }
         }
 
-        if let Err(error) = validate_schema(
-            &resolved_params,
-            &action_meta.input_schema,
-            "input",
+        if step.kind == StepKind::Agent {
+            if let Some(agent_executor) = &self.agent_step_executor {
+                return agent_executor
+                    .execute_agent_step(
+                        step,
+                        resolved_params,
+                        execution_id,
+                        ctx,
+                        self.action_registry.clone(),
+                    )
+                    .await;
+            }
+            return ActionResult::error(format!(
+                "Agent step '{}' is not enabled: missing agent executor",
+                step.id
+            ));
+        }
+
+        execute_action_with_registry_with_options(
+            self.action_registry.clone(),
+            ctx,
             &step.id,
             &step.action,
-        ) {
-            return ActionResult::error(error);
-        }
-
-        let input = ActionInput::with_params(resolved_params);
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            tracing::debug!(
-                task_id = %ctx.task_id,
-                step_id = %step.id,
-                action = %step.action,
-                resolved_params = %truncate_json_for_log(&input.params, MAX_LOG_JSON_CHARS),
-                "action input resolved"
-            );
-        }
-
-        let action_ctx = ActionContext::new(
-            ctx.task_id.clone(),
-            step.id.clone(),
-            execution_id.to_string(),
-            ctx.working_set.clone(),
-            ctx.reference_store.clone(),
-        );
-
-        let result = action.run(input, action_ctx).await;
-        match result {
-            ActionResult::Success { exports } => {
-                if tracing::enabled!(tracing::Level::DEBUG) {
-                    tracing::debug!(
-                        task_id = %ctx.task_id,
-                        step_id = %step.id,
-                        action = %step.action,
-                        exports = %truncate_json_map_for_log(&exports, MAX_LOG_JSON_CHARS),
-                        "action returned success"
-                    );
-                }
-                let export_value = serde_json::Value::Object(
-                    exports
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect(),
-                );
-                if let Err(error) = validate_schema(
-                    &export_value,
-                    &action_meta.output_schema,
-                    "output",
-                    &step.id,
-                    &step.action,
-                ) {
-                    return ActionResult::error(error);
-                }
-                ActionResult::Success { exports }
-            }
-            ActionResult::NeedClarification { question } => {
-                tracing::info!(
-                    task_id = %ctx.task_id,
-                    step_id = %step.id,
-                    action = %step.action,
-                    question = %truncate_for_log(&question, MAX_LOG_TEXT_CHARS),
-                    "action requested clarification"
-                );
-                ActionResult::NeedClarification { question }
-            }
-            ActionResult::NeedApproval { request } => {
-                tracing::info!(
-                    task_id = %ctx.task_id,
-                    step_id = %step.id,
-                    action = %step.action,
-                    reason = %truncate_for_log(&request.reason, MAX_LOG_TEXT_CHARS),
-                    command = ?request.command,
-                    "action requested approval"
-                );
-                ActionResult::NeedApproval { request }
-            }
-            ActionResult::RetryableError {
-                message,
-                retry_after,
-                attempt,
-            } => {
-                tracing::warn!(
-                    task_id = %ctx.task_id,
-                    step_id = %step.id,
-                    action = %step.action,
-                    message = %truncate_for_log(&message, MAX_LOG_TEXT_CHARS),
-                    retry_after_ms = retry_after.map(|d| d.as_millis() as u64),
-                    attempt = attempt,
-                    "action returned retryable error"
-                );
-                ActionResult::RetryableError {
-                    message,
-                    retry_after,
-                    attempt,
-                }
-            }
-            ActionResult::Error { message } => {
-                tracing::error!(
-                    task_id = %ctx.task_id,
-                    step_id = %step.id,
-                    action = %step.action,
-                    error = %truncate_for_log(&message, MAX_LOG_TEXT_CHARS),
-                    "action returned terminal error"
-                );
-                ActionResult::Error { message }
-            }
-        }
+            execution_id,
+            resolved_params,
+            &self.action_execution_options,
+        )
+        .await
     }
 }
 
@@ -1262,7 +1439,8 @@ async fn report_progress(ctx: &ExecutorContext, event: ExecutionProgressEvent) {
 
 fn choose_terminal_result(slot: &mut Option<ExecutionResult>, candidate: ExecutionResult) {
     let rank = |result: &ExecutionResult| match result {
-        ExecutionResult::Failed { .. } => 3,
+        ExecutionResult::Failed { .. } => 4,
+        ExecutionResult::NeedReplan { .. } => 3,
         ExecutionResult::WaitingUser { .. } => 2,
         ExecutionResult::WaitingEvent { .. } => 1,
         ExecutionResult::Completed => 0,
@@ -1608,6 +1786,24 @@ mod tests {
         }
     }
 
+    struct StaticAgentExecutor {
+        result: ActionResult,
+    }
+
+    #[async_trait]
+    impl AgentStepExecutor for StaticAgentExecutor {
+        async fn execute_agent_step(
+            &self,
+            _step: &Step,
+            _resolved_params: Value,
+            _execution_id: &str,
+            _ctx: &ExecutorContext,
+            _action_registry: Arc<RwLock<ActionRegistry>>,
+        ) -> ActionResult {
+            self.result.clone()
+        }
+    }
+
     #[async_trait]
     impl Action for FlakyRetryAction {
         fn name(&self) -> &str {
@@ -1796,6 +1992,40 @@ mod tests {
                     assert!(error.contains("input schema validation failed"));
                 }
                 _ => panic!("expected failed result"),
+            }
+        });
+    }
+
+    #[test]
+    fn test_action_preflight_hook_rejects_step_before_action_run() {
+        tokio_test::block_on(async {
+            let mut registry = ActionRegistry::new();
+            registry.register(Arc::new(StaticAction::new("noop", ActionResult::success())));
+            let executor = Executor::new(registry).with_action_preflight_hook(Arc::new(
+                |action_name: &str, _params: &Value| {
+                    if action_name == "noop" {
+                        Some("blocked by preflight policy".to_string())
+                    } else {
+                        None
+                    }
+                },
+            ));
+
+            let plan = Plan::new("preflight deny", vec![Step::action("s1", "noop")]);
+            let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
+            let ctx = ExecutorContext::new(
+                "task-1",
+                Arc::new(RwLock::new(WorkingSet::new())),
+                Arc::new(NoopReferenceStore),
+            );
+
+            let result = executor.execute(&mut dag, &ctx).await;
+            match result {
+                ExecutionResult::Failed { error, .. } => {
+                    assert!(error.contains("failed preflight"));
+                    assert!(error.contains("blocked by preflight policy"));
+                }
+                other => panic!("expected failed result, got {:?}", other),
             }
         });
     }
@@ -2019,6 +2249,65 @@ mod tests {
             }
             // initial attempt + 2 retries
             assert_eq!(calls.load(Ordering::SeqCst), 3);
+        });
+    }
+
+    #[test]
+    fn test_agent_step_requires_executor_or_fails() {
+        tokio_test::block_on(async {
+            let executor = Executor::new(ActionRegistry::new());
+            let plan = Plan::new(
+                "agent missing",
+                vec![Step::agent("s1").with_params(json!({
+                    "goal":"inspect",
+                    "allowed_actions":["echo"],
+                    "max_iterations": 2,
+                    "output_keys":["summary"]
+                }))],
+            );
+            let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
+            let ctx = ExecutorContext::new(
+                "task-1",
+                Arc::new(RwLock::new(WorkingSet::new())),
+                Arc::new(NoopReferenceStore),
+            );
+
+            let result = executor.execute(&mut dag, &ctx).await;
+            match result {
+                ExecutionResult::Failed { error, .. } => {
+                    assert!(error.contains("missing agent executor"));
+                }
+                other => panic!("expected failed result, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn test_agent_step_uses_configured_agent_executor() {
+        tokio_test::block_on(async {
+            let agent_executor = Arc::new(StaticAgentExecutor {
+                result: ActionResult::success_with_one("summary", json!("ok")),
+            });
+            let executor =
+                Executor::new(ActionRegistry::new()).with_agent_step_executor(agent_executor);
+
+            let plan = Plan::new(
+                "agent success",
+                vec![Step::agent("s1").with_params(json!({
+                    "goal":"inspect",
+                    "allowed_actions":["echo"],
+                    "max_iterations": 2,
+                    "output_keys":["summary"]
+                }))],
+            );
+            let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
+            let ws = Arc::new(RwLock::new(WorkingSet::new()));
+            let ctx = ExecutorContext::new("task-1", ws.clone(), Arc::new(NoopReferenceStore));
+
+            let result = executor.execute(&mut dag, &ctx).await;
+            assert!(matches!(result, ExecutionResult::Completed));
+            assert_eq!(ws.read().await.get_task("summary"), Some(&json!("ok")));
+            assert_eq!(ws.read().await.get_task("s1.summary"), Some(&json!("ok")));
         });
     }
 }

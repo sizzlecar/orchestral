@@ -14,11 +14,15 @@ pub struct Plan {
     /// Ordered list of steps to execute
     pub steps: Vec<Step>,
     /// Planning confidence (0.0 - 1.0)
-    /// Used for:
-    /// - High-risk tasks → require user confirmation
-    /// - Low confidence → ask clarifying questions
     #[serde(default)]
     pub confidence: Option<f32>,
+    /// User-facing message template on successful completion.
+    /// Supports `{{step_id.export_key}}` placeholders resolved from WorkingSet.
+    #[serde(default)]
+    pub on_complete: Option<String>,
+    /// User-facing message template on failure.
+    #[serde(default)]
+    pub on_failure: Option<String>,
 }
 
 impl Plan {
@@ -28,6 +32,8 @@ impl Plan {
             goal: goal.into(),
             steps,
             confidence: None,
+            on_complete: None,
+            on_failure: None,
         }
     }
 
@@ -37,6 +43,8 @@ impl Plan {
             goal: goal.into(),
             steps,
             confidence: Some(confidence.clamp(0.0, 1.0)),
+            on_complete: None,
+            on_failure: None,
         }
     }
 

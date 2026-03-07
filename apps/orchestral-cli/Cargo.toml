@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 orchestral-core = { workspace = true }
 orchestral-runtime = { workspace = true }
+orchestral-composition = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }

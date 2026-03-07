@@ -54,6 +54,8 @@ pub struct ActionMeta {
     pub input_schema: serde_json::Value,
     /// JSON schema for action output payload.
     pub output_schema: serde_json::Value,
+    /// Semantic capability tags used by planner/runtime guardrails.
+    pub capabilities: Vec<String>,
 }
 
 impl ActionMeta {
@@ -64,6 +66,7 @@ impl ActionMeta {
             description: description.into(),
             input_schema: serde_json::Value::Null,
             output_schema: serde_json::Value::Null,
+            capabilities: Vec::new(),
         }
     }
 
@@ -77,6 +80,32 @@ impl ActionMeta {
     pub fn with_output_schema(mut self, schema: serde_json::Value) -> Self {
         self.output_schema = schema;
         self
+    }
+
+    /// Add one capability tag.
+    pub fn with_capability(mut self, capability: impl Into<String>) -> Self {
+        self.capabilities.push(capability.into());
+        self.capabilities.sort();
+        self.capabilities.dedup();
+        self
+    }
+
+    /// Add multiple capability tags.
+    pub fn with_capabilities<I, S>(mut self, capabilities: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.capabilities
+            .extend(capabilities.into_iter().map(Into::into));
+        self.capabilities.sort();
+        self.capabilities.dedup();
+        self
+    }
+
+    /// Check whether this action advertises a capability.
+    pub fn has_capability(&self, capability: &str) -> bool {
+        self.capabilities.iter().any(|item| item == capability)
     }
 }
 

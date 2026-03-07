@@ -14,17 +14,19 @@ use tokio::sync::RwLock;
 use crate::action::{
     ActionConfigError, ActionFactory, ActionRegistryManager, ActionWatcher, DefaultActionFactory,
 };
+use crate::agent::{default_action_preflight_hook, LlmAgentExecutor, LlmAgentExecutorConfig};
 use crate::context::{BasicContextBuilder, TokenBudget};
 use crate::planner::{
     DefaultLlmClientFactory, LlmBuildError, LlmClient, LlmClientFactory, LlmInvocationConfig,
     LlmPlanner, LlmPlannerConfig,
 };
+use crate::skill::discovery::discover_skills;
+use crate::skill::SkillCatalog;
 use orchestral_core::action::extract_meta;
 use orchestral_core::config::{
     ConfigError, ConfigManager, ObservabilityConfig, OrchestralConfig, StoreSpec,
 };
 use orchestral_core::executor::Executor;
-use orchestral_core::interpreter::{NoopResultInterpreter, ResultInterpreter};
 use orchestral_core::io::{
     BlobHead, BlobId, BlobIoError, BlobMeta, BlobRead, BlobStore, BlobWriteRequest,
 };
@@ -39,7 +41,6 @@ use orchestral_core::store::{
 };
 use orchestral_core::types::{Intent, Plan, Step};
 
-use crate::interpreter::{LlmResultInterpreter, LlmResultInterpreterConfig};
 use crate::orchestrator::OrchestratorConfig;
 use crate::{
     ConcurrencyPolicy, DefaultConcurrencyPolicy, Orchestrator, ParallelConcurrencyPolicy,
@@ -179,7 +180,8 @@ impl RuntimeApp {
             runtime_cfg,
         );
 
-        let action_registry_manager = Arc::new(ActionRegistryManager::new(path, action_factory));
+        let action_registry_manager =
+            Arc::new(ActionRegistryManager::new(path.clone(), action_factory));
         action_registry_manager.load().await?;
         let action_watcher = if config.actions.hot_reload {
             Some(action_registry_manager.start_watching()?)
@@ -188,9 +190,19 @@ impl RuntimeApp {
         };
 
         let executor = Executor::with_registry(action_registry_manager.registry())
+            .with_action_preflight_hook(default_action_preflight_hook())
             .with_export_contract(config.runtime.strict_exports);
+        let executor = if let Some(agent_executor) = build_agent_step_executor(&config)? {
+            executor.with_agent_step_executor(agent_executor)
+        } else {
+            executor
+        };
         let planner = build_planner(&config)?;
-        let result_interpreter = build_result_interpreter(&config)?;
+        let skill_entries = discover_skills(&config, &path)?;
+        let skill_catalog = Arc::new(SkillCatalog::new(
+            skill_entries,
+            config.extensions.skill.max_active_skills,
+        ));
 
         let mut normalizer = PlanNormalizer::new();
         {
@@ -227,8 +239,8 @@ impl RuntimeApp {
             orchestrator_cfg,
         )
         .with_context_builder(context_builder)
-        .with_result_interpreter(result_interpreter)
-        .with_hook_registry(hook_registry.clone());
+        .with_hook_registry(hook_registry.clone())
+        .with_skill_catalog(skill_catalog);
 
         Ok(Self {
             orchestrator,
@@ -580,21 +592,10 @@ fn build_planner(config: &OrchestralConfig) -> Result<Arc<dyn Planner>, Bootstra
             };
 
             let client = DefaultLlmClientFactory::new().build(&backend, &invocation)?;
-            let default_cfg = LlmPlannerConfig::default();
-            let prompt_from_profile = config
-                .planner
-                .model_profile
-                .as_ref()
-                .and_then(|name| config.providers.get_model(name))
-                .and_then(|p| p.system_prompt.clone());
-            let prompt_from_backend = backend.get_config::<String>("system_prompt");
-            let (system_prompt, prompt_source) = if let Some(prompt) = prompt_from_profile {
-                (prompt, "model_profile")
-            } else if let Some(prompt) = prompt_from_backend {
-                (prompt, "backend")
-            } else {
-                (default_cfg.system_prompt, "default")
-            };
+            // Planner prompt comes from the built-in template + runtime dynamic injection only.
+            // Do not pull prompt text from model profile/backend config to avoid rule drift.
+            let system_prompt = String::new();
+            let prompt_source = "template";
 
             tracing::info!(
                 backend_name = %backend.name,
@@ -617,6 +618,7 @@ fn build_planner(config: &OrchestralConfig) -> Result<Arc<dyn Planner>, Bootstra
                 temperature,
                 max_history: config.planner.max_history,
                 system_prompt,
+                log_full_prompts: config.planner.log_full_prompts,
             };
 
             let planner: LlmPlanner<Arc<dyn LlmClient>> = LlmPlanner::new(client, planner_cfg);
@@ -627,137 +629,75 @@ fn build_planner(config: &OrchestralConfig) -> Result<Arc<dyn Planner>, Bootstra
     }
 }
 
-fn build_result_interpreter(
+fn build_agent_step_executor(
     config: &OrchestralConfig,
-) -> Result<Arc<dyn ResultInterpreter>, BootstrapError> {
-    let mode = config.interpreter.mode.trim().to_ascii_lowercase();
-    let use_llm = match mode.as_str() {
-        "auto" | "" => config.planner.mode.trim().eq_ignore_ascii_case("llm"),
-        "llm" => true,
-        "noop" | "rule" | "rules" => false,
-        other => {
-            return Err(BootstrapError::UnsupportedInterpreterMode(
-                other.to_string(),
-            ))
+) -> Result<Option<Arc<dyn orchestral_core::executor::AgentStepExecutor>>, BootstrapError> {
+    match config.planner.mode.as_str() {
+        "llm" => {
+            let profile = if let Some(profile_name) = &config.planner.model_profile {
+                Some(config.providers.get_model(profile_name).ok_or_else(|| {
+                    BootstrapError::ModelProfileNotFound(profile_name.to_string())
+                })?)
+            } else {
+                config.providers.get_default_model()
+            };
+
+            let backend = if let Some(profile) = &profile {
+                if let Some(backend_name) = &profile.backend {
+                    config
+                        .providers
+                        .get_backend(backend_name)
+                        .ok_or_else(|| BootstrapError::BackendNotFound(backend_name.to_string()))?
+                } else {
+                    config
+                        .providers
+                        .get_default_backend()
+                        .ok_or(BootstrapError::MissingProviderConfig)?
+                }
+            } else if let Some(backend_name) = &config.planner.backend {
+                config
+                    .providers
+                    .get_backend(backend_name)
+                    .ok_or_else(|| BootstrapError::BackendNotFound(backend_name.to_string()))?
+            } else if let Some(default_provider) = config.providers.get_default() {
+                config
+                    .providers
+                    .get_backend(&default_provider.name)
+                    .ok_or_else(|| BootstrapError::BackendNotFound(default_provider.name.clone()))?
+            } else {
+                return Err(BootstrapError::MissingProviderConfig);
+            };
+
+            let model = config
+                .planner
+                .model
+                .clone()
+                .or_else(|| profile.as_ref().map(|p| p.model.clone()))
+                .unwrap_or_else(|| LlmPlannerConfig::default().model);
+            let temperature_candidate = config
+                .planner
+                .temperature
+                .or_else(|| profile.as_ref().and_then(|p| p.temperature))
+                .unwrap_or_else(|| LlmPlannerConfig::default().temperature);
+            let temperature = profile
+                .as_ref()
+                .map(|p| p.clamp_temperature(temperature_candidate))
+                .unwrap_or(temperature_candidate);
+
+            let invocation = LlmInvocationConfig {
+                model: model.clone(),
+                temperature,
+                normalize_response: true,
+            };
+
+            let client = DefaultLlmClientFactory::new().build(&backend, &invocation)?;
+            let executor =
+                LlmAgentExecutor::new(client, LlmAgentExecutorConfig { model, temperature });
+            Ok(Some(Arc::new(executor)))
         }
-    };
-    if !use_llm {
-        return Ok(Arc::new(NoopResultInterpreter));
+        "deterministic" => Ok(None),
+        other => Err(BootstrapError::UnsupportedPlannerMode(other.to_string())),
     }
-
-    let backend = resolve_interpreter_backend(config)?;
-    let profile = resolve_interpreter_model_profile(config);
-    let default_cfg = LlmResultInterpreterConfig::default();
-    let model = config
-        .interpreter
-        .model
-        .clone()
-        .or_else(|| profile.as_ref().map(|p| p.model.clone()))
-        .or_else(|| config.planner.model.clone())
-        .unwrap_or(default_cfg.model.clone());
-    let temperature_candidate = config
-        .interpreter
-        .temperature
-        .or_else(|| profile.as_ref().and_then(|p| p.temperature))
-        .or(config.planner.temperature)
-        .unwrap_or(default_cfg.temperature);
-    let temperature = profile
-        .as_ref()
-        .map(|p| p.clamp_temperature(temperature_candidate))
-        .unwrap_or(temperature_candidate);
-    let system_prompt = config
-        .interpreter
-        .system_prompt
-        .clone()
-        .or_else(|| profile.as_ref().and_then(|p| p.system_prompt.clone()))
-        .or_else(|| backend.get_config::<String>("interpreter_system_prompt"))
-        .unwrap_or(default_cfg.system_prompt);
-
-    let invocation = LlmInvocationConfig {
-        model: model.clone(),
-        temperature,
-        normalize_response: true,
-    };
-    let client = DefaultLlmClientFactory::new().build(&backend, &invocation)?;
-    let cfg = LlmResultInterpreterConfig {
-        model,
-        temperature,
-        system_prompt,
-        timeout_secs: backend
-            .get_config::<u64>("interpreter_timeout_secs")
-            .unwrap_or(12),
-    };
-    tracing::info!(
-        mode = %mode,
-        backend_name = %backend.name,
-        backend_kind = %backend.kind,
-        model = %cfg.model,
-        temperature = cfg.temperature,
-        timeout_secs = cfg.timeout_secs,
-        "result interpreter configured"
-    );
-    Ok(Arc::new(LlmResultInterpreter::new(client, cfg)))
-}
-
-fn resolve_interpreter_backend(
-    config: &OrchestralConfig,
-) -> Result<orchestral_core::config::BackendSpec, BootstrapError> {
-    if let Some(name) = &config.interpreter.backend {
-        return config
-            .providers
-            .get_backend(name)
-            .ok_or_else(|| BootstrapError::BackendNotFound(name.clone()));
-    }
-    if let Some(profile_name) = &config.interpreter.model_profile {
-        let profile = config
-            .providers
-            .get_model(profile_name)
-            .ok_or_else(|| BootstrapError::ModelProfileNotFound(profile_name.clone()))?;
-        let backend_name = profile
-            .backend
-            .clone()
-            .ok_or(BootstrapError::MissingProviderConfig)?;
-        return config
-            .providers
-            .get_backend(&backend_name)
-            .ok_or(BootstrapError::BackendNotFound(backend_name));
-    }
-    if let Some(name) = &config.planner.backend {
-        return config
-            .providers
-            .get_backend(name)
-            .ok_or_else(|| BootstrapError::BackendNotFound(name.clone()));
-    }
-    if let Some(profile_name) = &config.planner.model_profile {
-        let profile = config
-            .providers
-            .get_model(profile_name)
-            .ok_or_else(|| BootstrapError::ModelProfileNotFound(profile_name.clone()))?;
-        let backend_name = profile
-            .backend
-            .clone()
-            .ok_or(BootstrapError::MissingProviderConfig)?;
-        return config
-            .providers
-            .get_backend(&backend_name)
-            .ok_or(BootstrapError::BackendNotFound(backend_name));
-    }
-    config
-        .providers
-        .get_default_backend()
-        .ok_or(BootstrapError::MissingProviderConfig)
-}
-
-fn resolve_interpreter_model_profile(
-    config: &OrchestralConfig,
-) -> Option<orchestral_core::config::ModelProfile> {
-    if let Some(name) = &config.interpreter.model_profile {
-        return config.providers.get_model(name);
-    }
-    if let Some(name) = &config.planner.model_profile {
-        return config.providers.get_model(name);
-    }
-    config.providers.get_default_model()
 }
 
 fn build_runtime_component_options(

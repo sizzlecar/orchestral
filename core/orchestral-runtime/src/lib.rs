@@ -4,14 +4,18 @@
 //! built-in actions, context building, and application-layer API.
 
 pub mod action;
+pub mod agent;
 pub mod api;
 mod bootstrap;
 mod concurrency;
 pub mod context;
 mod interaction;
+#[allow(dead_code)]
 mod interpreter;
 mod orchestrator;
 pub mod planner;
+pub mod skill;
+mod system_prompts;
 mod thread;
 mod thread_runtime;
 

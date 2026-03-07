@@ -16,14 +16,28 @@ use crate::runtime::{RuntimeClient, RuntimeMsg, TransientSlot};
 
 use app::App;
 
-pub async fn run_session(
-    config: PathBuf,
-    thread_id: Option<String>,
-    initial_input: Option<String>,
-    script_path: Option<PathBuf>,
-    once: bool,
-    verbose: bool,
-) -> anyhow::Result<()> {
+pub struct SessionRunOptions {
+    pub config: Option<PathBuf>,
+    pub thread_id: Option<String>,
+    pub no_mcp: bool,
+    pub no_skills: bool,
+    pub initial_input: Option<String>,
+    pub script_path: Option<PathBuf>,
+    pub once: bool,
+    pub verbose: bool,
+}
+
+pub async fn run_session(options: SessionRunOptions) -> anyhow::Result<()> {
+    let SessionRunOptions {
+        config,
+        thread_id,
+        no_mcp,
+        no_skills,
+        initial_input,
+        script_path,
+        once,
+        verbose,
+    } = options;
     if script_path.is_some() && initial_input.is_some() {
         bail!("cannot combine positional INPUT with --script");
     }
@@ -36,6 +50,13 @@ pub async fn run_session(
     if use_tui {
         std::env::set_var("ORCHESTRAL_TUI_SILENT_LOGS", "1");
     }
+    if no_mcp {
+        std::env::set_var("ORCHESTRAL_DISABLE_MCP", "1");
+    }
+    if no_skills {
+        std::env::set_var("ORCHESTRAL_DISABLE_SKILLS", "1");
+    }
+
     let runtime_client = RuntimeClient::from_config(config, thread_id)
         .await
         .context("initialize runtime client")?;

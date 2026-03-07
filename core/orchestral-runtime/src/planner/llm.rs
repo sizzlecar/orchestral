@@ -7,11 +7,15 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, info};
 
-use orchestral_core::planner::{HistoryItem, PlanError, Planner, PlannerContext, PlannerOutput};
+use crate::system_prompts::render_planner_prompt;
+use orchestral_core::planner::{
+    HistoryItem, PlanError, Planner, PlannerContext, PlannerOutput, SkillInstruction,
+};
 use orchestral_core::types::{Intent, Plan, Step};
 
 const MAX_PROMPT_LOG_CHARS: usize = 4_000;
 const MAX_LLM_OUTPUT_LOG_CHARS: usize = 8_000;
+const MAX_DISCOVERED_SKILL_SCRIPTS: usize = 12;
 
 /// LLM request payload
 #[derive(Debug, Clone)]
@@ -22,12 +26,44 @@ pub struct LlmRequest {
     pub temperature: f32,
 }
 
+/// Tool definition for LLM function calling.
+#[derive(Debug, Clone)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema describing the tool parameters.
+    pub parameters: serde_json::Value,
+}
+
+/// LLM response that may contain a structured tool call instead of text.
+#[derive(Debug, Clone)]
+pub enum LlmResponse {
+    Text(String),
+    ToolCall {
+        id: String,
+        name: String,
+        arguments: serde_json::Value,
+    },
+}
+
 pub type StreamChunkCallback = Arc<dyn Fn(String) + Send + Sync>;
 
 /// LLM client trait
 #[async_trait]
 pub trait LlmClient: Send + Sync {
     async fn complete(&self, request: LlmRequest) -> Result<String, LlmError>;
+
+    /// Chat with tool definitions. LLM must call one of the provided tools.
+    /// Default implementation falls back to text-only `complete`.
+    async fn complete_with_tools(
+        &self,
+        request: LlmRequest,
+        tools: &[ToolDefinition],
+    ) -> Result<LlmResponse, LlmError> {
+        let _ = tools;
+        let text = self.complete(request).await?;
+        Ok(LlmResponse::Text(text))
+    }
 
     async fn complete_stream(
         &self,
@@ -48,6 +84,14 @@ pub trait LlmClient: Send + Sync {
 impl LlmClient for Arc<dyn LlmClient> {
     async fn complete(&self, request: LlmRequest) -> Result<String, LlmError> {
         (**self).complete(request).await
+    }
+
+    async fn complete_with_tools(
+        &self,
+        request: LlmRequest,
+        tools: &[ToolDefinition],
+    ) -> Result<LlmResponse, LlmError> {
+        (**self).complete_with_tools(request, tools).await
     }
 
     async fn complete_stream(
@@ -77,16 +121,17 @@ pub struct LlmPlannerConfig {
     pub temperature: f32,
     pub max_history: usize,
     pub system_prompt: String,
+    pub log_full_prompts: bool,
 }
 
 impl Default for LlmPlannerConfig {
     fn default() -> Self {
         Self {
-            model: "gpt-4o-mini".to_string(),
+            model: "anthropic/claude-sonnet-4.5".to_string(),
             temperature: 0.2,
             max_history: 20,
-            system_prompt: "You are a task planner. Return ONLY valid JSON for the Plan."
-                .to_string(),
+            system_prompt: String::new(),
+            log_full_prompts: false,
         }
     }
 }
@@ -117,14 +162,22 @@ impl<C: LlmClient> LlmPlanner<C> {
 
         user.push_str("Return ONE JSON object in one of these shapes:\n");
         user.push_str(
-            r#"{"type":"WORKFLOW","goal":"...","steps":[{"id":"s1","action":"action_name","params":{},"io_bindings":[{"from":"s1.output_key","to":"input_key","required":true}]}],"confidence":0.0}"#,
+            r#"{"type":"WORKFLOW","goal":"...","steps":[{"id":"s1","kind":"action","action":"action_name","params":{}}],"confidence":0.0,"on_complete":"...","on_failure":"..."}"#,
+        );
+        user.push('\n');
+        user.push_str(
+            r#"{"type":"WORKFLOW","goal":"...","steps":[{"id":"s1","kind":"action","action":"shell","params":{"command":"find","args":["docs","-type","f"]}},{"id":"s2","kind":"action","action":"file_read","depends_on":["s1"],"io_bindings":[{"from":"s1.stdout","to":"path","required":true}],"params":{"path":"{{s1.stdout}}"}}],"confidence":0.0,"on_complete":"...","on_failure":"..."}"#,
+        );
+        user.push('\n');
+        user.push_str(
+            r#"{"type":"WORKFLOW","goal":"...","steps":[{"id":"s1","kind":"action","action":"shell","params":{"command":"find","args":["docs","-type","f"]}},{"id":"s2","kind":"agent","depends_on":["s1"],"io_bindings":[{"from":"s1.stdout","to":"input_candidates","required":true}],"params":{"goal":"inspect and update local artifacts","allowed_actions":["shell","file_read","file_write"],"max_iterations":6,"output_keys":["updated_file_path","summary"],"output_rules":{"updated_file_path":{"candidates":[{"slot":"fill_result","path":"updated_file_path","requires":{"action":"file_write"}}]},"summary":{"candidates":[{"slot":"fill_result","path":"summary"}]}}}}],"confidence":0.0,"on_complete":"...","on_failure":"..."}"#,
         );
         user.push('\n');
         user.push_str(r#"{"type":"DIRECT_RESPONSE","message":"..."}"#);
         user.push('\n');
         user.push_str(r#"{"type":"CLARIFICATION","question":"..."}"#);
         user.push_str(
-            "\nUse only action names listed in Action Catalog when type is WORKFLOW. Return JSON only.\n",
+            "\nUse only action names listed in Action Catalog when type is WORKFLOW. Prefer explicit action steps first. If a fixed sequence of actions can solve the task with depends_on + io_bindings, do not use kind=agent. Use kind=agent only when runtime observations must determine subsequent actions, target selection, or key parameters cannot be fixed reliably at planning time. Add io_bindings only when step inputs depend on previous step outputs (including kind=agent). If kind=agent consumes upstream outputs, provide depends_on + io_bindings explicitly. For kind=agent, params.max_iterations MUST be an integer in [1,10]. For kind=agent, include params.output_keys and prefer params.output_rules (slot/path candidates) so runtime can materialize exports from evidence. For side-effect-sensitive keys (for example file paths produced by file_write), add requires.action in output_rules candidates. Do not rely on return_final.exports as ground truth. io_bindings MUST be an array (never a map). Return JSON only.\n",
         );
         user.push('\n');
 
@@ -157,65 +210,238 @@ fn select_history_for_prompt(history: &[HistoryItem], max_history: usize) -> Vec
 }
 
 fn build_system_prompt(base: &str, context: &PlannerContext) -> String {
-    let mut system = String::new();
-    system.push_str(
-        "You are Orchestral Planner, the planning component of the Orchestral runtime.\n",
+    let capabilities = detect_prompt_capabilities(context);
+    let execution_environment = build_execution_environment_block(context);
+    let action_catalog = build_action_catalog(context);
+    let skill_knowledge = build_skill_knowledge_block(&context.skill_instructions);
+    let conditional_rules = build_conditional_rules(context, capabilities);
+    render_planner_prompt(
+        base,
+        &execution_environment,
+        &action_catalog,
+        &skill_knowledge,
+        &conditional_rules,
+    )
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PromptCapabilities {
+    has_shell: bool,
+    has_http: bool,
+    has_file_read: bool,
+    has_file_write: bool,
+    has_python_venv: bool,
+}
+
+fn detect_prompt_capabilities(context: &PlannerContext) -> PromptCapabilities {
+    let has_shell = context
+        .available_actions
+        .iter()
+        .any(|action| action.name == "shell" || action.has_capability("shell"));
+    let has_http = context
+        .available_actions
+        .iter()
+        .any(|action| action.name == "http" || action.has_capability("network_io"));
+    let has_file_read = context
+        .available_actions
+        .iter()
+        .any(|action| action.name == "file_read" || action.has_capability("filesystem_read"));
+    let has_file_write = context
+        .available_actions
+        .iter()
+        .any(|action| action.name == "file_write" || action.has_capability("filesystem_write"));
+    let has_python_venv = std::path::Path::new(".venv/bin/python3").exists();
+
+    PromptCapabilities {
+        has_shell,
+        has_http,
+        has_file_read,
+        has_file_write,
+        has_python_venv,
+    }
+}
+
+fn build_conditional_rules(context: &PlannerContext, caps: PromptCapabilities) -> String {
+    let mut lines: Vec<&str> = Vec::new();
+
+    if !context.skill_instructions.is_empty() {
+        lines.push("- Skill mode: treat Skill Knowledge as summary-first guidance.");
+        lines.push("- If skill summary is insufficient for concrete params, add an early file_read step for the provided skill file path.");
+        lines.push("- If skill lists scripts, invoke them through shell using the provided scripts directory and verify the script path exists.");
+    }
+
+    if caps.has_http {
+        lines.push("- For headers-only requests, use http action with method HEAD.");
+    }
+
+    if caps.has_shell {
+        lines.push(
+            "- Shell mode: commands must be host-platform compatible and prefer args array style.",
+        );
+        lines
+            .push("- Use find -name for file discovery instead of fragile glob-based ls patterns.");
+    }
+
+    if caps.has_shell && caps.has_python_venv {
+        lines.push(
+            "- Python mode: use .venv/bin/python3 for all Python execution; avoid bare python3.",
+        );
+    }
+
+    if caps.has_file_read && (caps.has_file_write || caps.has_shell) {
+        lines.push("- Prefer explicit action workflows first; use depends_on + io_bindings when upstream outputs only provide later step parameters.");
+        lines.push("- Use kind=agent only when runtime observations must determine subsequent actions, target selection, or key parameters.");
+        lines.push("- Do not use kind=agent for simple discovery steps whose outputs can flow into fixed downstream actions.");
+        lines.push("- If kind=agent consumes upstream step outputs, include both depends_on and io_bindings for those consumed keys.");
+        lines.push("- For kind=agent, params.max_iterations must be an integer in [1,10]. Keep the agent scoped to a local subproblem.");
+        lines.push("- For kind=agent, include params.output_keys and prefer params.output_rules (slot/path candidates) so runtime materializes exports from evidence.");
+        lines.push("- For side-effect-sensitive outputs, annotate candidates with requires.action to bind evidence provenance to the producing action.");
+        lines.push("- Do not depend on return_final.exports values as the final truth; runtime evidence materialization is authoritative.");
+        lines.push("- `file_write` is for concrete text writes; do not emit file_write with empty content as a path marker.");
+        lines.push("- Use kind=replan only when the remaining global plan topology depends on intermediate outputs.");
+        lines.push("- Replan continuation plans must not include another replan step.");
+    }
+
+    if caps.has_file_read {
+        lines.push("- Be context-budget aware: prefer existing working_set summaries (stdout/content/stderr) before adding large reads.");
+    }
+
+    if lines.is_empty() {
+        "none".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
+fn build_skill_knowledge_block(skills: &[SkillInstruction]) -> String {
+    if skills.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    out.push_str("Activated Skills:\n");
+    out.push_str(
+        "Only execute scripts that are listed under scripts discovered or verified at runtime; never invent script filenames.\n",
     );
-    system.push_str(
-        "Project context:\n- Workspace: Rust multi-crate project.\n- Core crates: orchestral-core, orchestral-runtime, orchestral-actions, orchestral-stores, orchestral-planners, orchestral-cli.\n- Execution model: Intent -> Plan -> Normalize -> Execute.\n",
-    );
-    system.push('\n');
-    system.push_str(base.trim());
-    if !context.runtime_info.os.is_empty() {
-        system.push_str("\n\nExecution Environment:\n");
-        system.push_str(&format!(
-            "- os: {}\n- os_family: {}\n- arch: {}\n",
-            context.runtime_info.os, context.runtime_info.os_family, context.runtime_info.arch
-        ));
-        if let Some(shell) = &context.runtime_info.shell {
-            system.push_str(&format!("- shell: {}\n", shell));
+    for skill in skills {
+        let _ = writeln!(out, "- {}: {}", skill.skill_name, skill.instructions.trim());
+        if let Some(path) = &skill.skill_path {
+            let _ = writeln!(out, "  [skill file: {}]", path);
+        }
+        if let Some(dir) = &skill.scripts_dir {
+            let _ = writeln!(out, "  [scripts: {}]", dir);
+            let discovered = discover_skill_scripts(dir, MAX_DISCOVERED_SKILL_SCRIPTS);
+            if discovered.is_empty() {
+                let _ = writeln!(out, "  [scripts discovered: none]");
+            } else {
+                let _ = writeln!(out, "  [scripts discovered: {}]", discovered.join(", "));
+            }
         }
     }
-    system.push_str("\n\nPlanning Rules:\n");
-    system.push_str("1) Return ONLY one valid JSON object matching one allowed output shape.\n");
-    system.push_str("2) If no tool/action execution is needed, return DIRECT_RESPONSE.\n");
-    system
-        .push_str("3) If information is missing, return CLARIFICATION with a concrete question.\n");
-    system.push_str("4) Only return WORKFLOW when execution is required.\n");
-    system.push_str("5) For WORKFLOW: step.id must be unique and stable.\n");
-    system.push_str("6) For WORKFLOW: step.params must satisfy selected action input_schema.\n");
-    system.push_str("7) For WORKFLOW: prefer minimal steps; omit optional fields unless needed.\n");
-    system.push_str("8) For WORKFLOW: if a step consumes upstream output, declare io_bindings.\n");
-    system.push_str("9) Do not invent action names not listed in Action Catalog.\n");
-    system.push_str(
-        "10) If clarifying via WORKFLOW, use wait_user; otherwise return CLARIFICATION.\n",
-    );
-    system.push_str(
-        "11) For wait_user/wait_event/system steps, set kind explicitly; normal action steps can omit kind.\n",
-    );
-    system.push_str(
-        "12) When generating step.params, strictly follow Action Catalog input fields.\n",
-    );
-    system.push_str(
-        "13) Any shell/file operation must be compatible with current host platform and shell.\n",
-    );
-    system.push_str(
-        "14) Only use `echo` when user explicitly asks to echo/repeat text; otherwise avoid `echo`.\n",
-    );
-    system.push_str(
-        "15) For HTTP headers requests, use `http` method `HEAD` and return headers directly.\n",
-    );
-    system.push_str("\nAction Catalog:\n");
+    out
+}
+
+fn discover_skill_scripts(dir: &str, limit: usize) -> Vec<String> {
+    let root = std::path::Path::new(dir);
+    if !root.is_dir() || limit == 0 {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(read_dir) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        let mut entries = read_dir
+            .filter_map(|entry| entry.ok().map(|v| v.path()))
+            .collect::<Vec<_>>();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !path.is_file() {
+                continue;
+            }
+            let extension = path
+                .extension()
+                .and_then(|v| v.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if !matches!(extension.as_str(), "py" | "sh" | "js" | "ts" | "rb") {
+                continue;
+            }
+            let display = path
+                .strip_prefix(root)
+                .unwrap_or(path.as_path())
+                .display()
+                .to_string();
+            out.push(display);
+            if out.len() >= limit {
+                out.sort_unstable();
+                return out;
+            }
+        }
+    }
+
+    out.sort_unstable();
+    out
+}
+
+fn build_execution_environment_block(context: &PlannerContext) -> String {
+    if context.runtime_info.os.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    out.push_str("Execution Environment:\n");
+    out.push_str(&format!(
+        "- os: {}\n- os_family: {}\n- arch: {}\n",
+        context.runtime_info.os, context.runtime_info.os_family, context.runtime_info.arch
+    ));
+    if let Some(shell) = &context.runtime_info.shell {
+        out.push_str(&format!("- shell: {}\n", shell));
+    }
+    if let Some(python) = resolve_python_path(&context.skill_instructions) {
+        out.push_str(&format!(
+            "- python: {} (MUST use this, system python3 lacks packages)\n",
+            python
+        ));
+    }
+    out
+}
+
+/// Resolve the best python path: skill venv > project root venv > None.
+fn resolve_python_path(skills: &[SkillInstruction]) -> Option<String> {
+    for skill in skills {
+        if let Some(venv) = &skill.venv_python {
+            if std::path::Path::new(venv).exists() {
+                return Some(venv.clone());
+            }
+        }
+    }
+    let project_venv = std::path::Path::new(".venv/bin/python3");
+    if project_venv.exists() {
+        return Some(".venv/bin/python3".to_string());
+    }
+    None
+}
+
+fn build_action_catalog(context: &PlannerContext) -> String {
+    let mut out = String::new();
     for action in &context.available_actions {
         append_action_catalog_entry(
-            &mut system,
+            &mut out,
             &action.name,
             &action.description,
             &action.input_schema,
             &action.output_schema,
+            &action.capabilities,
         );
     }
-    system
+    out
 }
 
 fn append_action_catalog_entry(
@@ -224,13 +450,17 @@ fn append_action_catalog_entry(
     description: &str,
     input_schema: &serde_json::Value,
     output_schema: &serde_json::Value,
+    capabilities: &[String],
 ) {
     let _ = writeln!(buf, "- name: {}", name);
     let _ = writeln!(buf, "  description: {}", description);
+    if capabilities.is_empty() {
+        let _ = writeln!(buf, "  capabilities: []");
+    } else {
+        let _ = writeln!(buf, "  capabilities: [{}]", capabilities.join(", "));
+    }
     append_schema_fields(buf, "input_fields", input_schema);
     append_schema_fields(buf, "output_fields", output_schema);
-    let _ = writeln!(buf, "  input_schema: {}", input_schema);
-    let _ = writeln!(buf, "  output_schema: {}", output_schema);
 }
 
 fn append_schema_fields(buf: &mut String, label: &str, schema: &serde_json::Value) {
@@ -365,13 +595,25 @@ impl<C: LlmClient> Planner for LlmPlanner<C> {
             "planner request prepared"
         );
         if tracing::enabled!(tracing::Level::DEBUG) {
-            let system_preview = truncate_for_log(&system, MAX_PROMPT_LOG_CHARS);
-            let user_preview = truncate_for_log(&user, MAX_PROMPT_LOG_CHARS);
-            debug!(
-                system_prompt = %system_preview,
-                user_prompt = %user_preview,
-                "planner prompts"
-            );
+            if self.config.log_full_prompts {
+                debug!(
+                    system_prompt = %system,
+                    user_prompt = %user,
+                    system_chars = system.chars().count(),
+                    user_chars = user.chars().count(),
+                    "planner prompts (full)"
+                );
+            } else {
+                let system_preview = truncate_for_log(&system, MAX_PROMPT_LOG_CHARS);
+                let user_preview = truncate_for_log(&user, MAX_PROMPT_LOG_CHARS);
+                debug!(
+                    system_prompt = %system_preview,
+                    user_prompt = %user_preview,
+                    system_chars = system.chars().count(),
+                    user_chars = user.chars().count(),
+                    "planner prompts"
+                );
+            }
         }
         let request = LlmRequest {
             system,
@@ -445,6 +687,10 @@ enum PlannerJsonOutput {
         steps: Vec<Step>,
         #[serde(default)]
         confidence: Option<f32>,
+        #[serde(default)]
+        on_complete: Option<String>,
+        #[serde(default)]
+        on_failure: Option<String>,
     },
     DirectResponse {
         message: String,
@@ -463,9 +709,13 @@ fn parse_planner_output(json: &str) -> Result<PlannerOutput, PlanError> {
             goal,
             steps,
             confidence,
+            on_complete,
+            on_failure,
         } => {
             let mut plan = Plan::new(goal, steps);
             plan.confidence = confidence.map(|c| c.clamp(0.0, 1.0));
+            plan.on_complete = on_complete;
+            plan.on_failure = on_failure;
             Ok(PlannerOutput::Workflow(plan))
         }
         PlannerJsonOutput::DirectResponse { message } => Ok(PlannerOutput::DirectResponse(message)),
@@ -707,7 +957,7 @@ mod tests {
     }
 
     #[test]
-    fn test_system_prompt_contains_action_catalog_with_schema_and_field_hints() {
+    fn test_system_prompt_contains_compact_action_catalog_and_core_rules() {
         let planner = LlmPlanner::new(
             MockLlmClient {
                 response: "{}".to_string(),
@@ -719,6 +969,7 @@ mod tests {
         );
 
         let actions = vec![ActionMeta::new("write_doc", "Write markdown to file")
+            .with_capabilities(["filesystem_write", "side_effect"])
             .with_input_schema(json!({
                 "type":"object",
                 "properties":{
@@ -743,13 +994,105 @@ mod tests {
         assert!(system.contains("Action Catalog"));
         assert!(system.contains("Orchestral Planner"));
         assert!(system.contains("Intent -> Plan -> Normalize -> Execute"));
+        assert!(system.contains("Core Rules"));
         assert!(system.contains("write_doc"));
+        assert!(system.contains("capabilities: [filesystem_write, side_effect]"));
         assert!(system.contains("input_fields"));
         assert!(system.contains("path (string, required)"));
         assert!(system.contains("desc=Target markdown path"));
         assert!(system.contains("example=\"guide.md\""));
-        assert!(system.contains("input_schema"));
-        assert!(system.contains("output_schema"));
+        assert!(!system.contains("input_schema:"));
+        assert!(!system.contains("output_schema:"));
+        assert!(system.contains("Conditional Rules"));
+        assert!(system.contains("none"));
+    }
+
+    #[test]
+    fn test_system_prompt_contains_mcp_and_skill_knowledge() {
+        let planner = LlmPlanner::new(
+            MockLlmClient {
+                response: "{}".to_string(),
+            },
+            LlmPlannerConfig::default(),
+        );
+
+        let actions = vec![ActionMeta::new("mcp__alpha", "Call MCP server alpha")
+            .with_capabilities(["mcp", "side_effect"])
+            .with_input_schema(json!({
+                "type":"object",
+                "properties":{
+                    "operation":{"type":"string"},
+                    "tool":{"type":"string"},
+                    "arguments":{"type":"object"}
+                }
+            }))
+            .with_output_schema(json!({
+                "type":"object",
+                "properties":{
+                    "server":{"type":"string"},
+                    "result":{}
+                }
+            }))];
+        let context = PlannerContext::new(actions, Arc::new(NoopReferenceStore))
+            .with_skill_instructions(vec![SkillInstruction {
+                skill_name: "demo".to_string(),
+                instructions: "Always write then verify.".to_string(),
+                skill_path: Some("skills/demo/SKILL.md".to_string()),
+                scripts_dir: Some(".claude/skills/demo/scripts".to_string()),
+                venv_python: None,
+            }]);
+        let intent = Intent::new("need tools and skills");
+        let (system, _user) = planner.build_prompt(&intent, &context);
+
+        assert!(system.contains("- name: mcp__alpha"));
+        assert!(!system.contains("skill__demo"));
+        assert!(system.contains("Activated Skills:"));
+        assert!(system.contains("never invent script filenames"));
+        assert!(system.contains("- demo: Always write then verify."));
+        assert!(system.contains("[skill file: skills/demo/SKILL.md]"));
+        assert!(system.contains("[scripts: .claude/skills/demo/scripts]"));
+        assert!(system.contains("file_read step for the provided skill file path"));
+    }
+
+    #[test]
+    fn test_system_prompt_injects_shell_http_and_exploration_rules() {
+        let planner = LlmPlanner::new(
+            MockLlmClient {
+                response: "{}".to_string(),
+            },
+            LlmPlannerConfig::default(),
+        );
+
+        let actions = vec![
+            ActionMeta::new("shell", "Run shell command")
+                .with_capabilities(["shell", "filesystem_write"]),
+            ActionMeta::new("http", "HTTP request").with_capabilities(["network_io"]),
+            ActionMeta::new("file_read", "Read file").with_capabilities(["filesystem_read"]),
+        ];
+        let context = PlannerContext::new(actions, Arc::new(NoopReferenceStore));
+        let intent = Intent::new("inspect and modify a file");
+        let (system, user) = planner.build_prompt(&intent, &context);
+
+        assert!(system.contains("Shell mode: commands must be host-platform compatible"));
+        assert!(system.contains("headers-only requests, use http action with method HEAD"));
+        assert!(system.contains("Use kind=agent only when runtime observations"));
+        assert!(system.contains("include both depends_on and io_bindings"));
+        assert!(system.contains("params.max_iterations must be an integer in [1,10]"));
+        assert!(system.contains("prefer params.output_rules"));
+        assert!(system.contains("runtime evidence materialization is authoritative"));
+        assert!(system.contains("Use kind=replan only when the remaining global plan topology"));
+        assert!(system.contains("working_set summaries (stdout/content/stderr)"));
+        assert!(user.contains("\"on_complete\":\"...\",\"on_failure\":\"...\""));
+        assert!(user.contains("\"depends_on\":[\"s1\"]"));
+        assert!(user.contains(
+            "\"io_bindings\":[{\"from\":\"s1.stdout\",\"to\":\"path\",\"required\":true}]"
+        ));
+        assert!(user.contains("\"kind\":\"agent\",\"depends_on\":[\"s1\"],\"io_bindings\":"));
+        assert!(user.contains("\"to\":\"input_candidates\""));
+        assert!(user.contains("\"output_rules\":"));
+        assert!(user.contains("params.max_iterations MUST be an integer in [1,10]"));
+        assert!(user.contains("include params.output_keys and prefer params.output_rules"));
+        assert!(user.contains("io_bindings MUST be an array (never a map)"));
     }
 
     #[test]
