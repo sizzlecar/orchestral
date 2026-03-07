@@ -1,0 +1,15 @@
+version: 1
+name: one-turn-smoke
+config: ../orchestral.cli.yaml
+# env_file can also be passed from CLI via --env-file
+# env_file: ../../.orchestral/env/openrouter.env
+timeout_secs: 300
+
+turns:
+  - name: smoke
+    input: >
+      docs 目前下有一个excel 你看下内容 把需要填的都填了
+    expect:
+      require_execution_end: true
+      max_approvals: 0
+      max_errors: 0

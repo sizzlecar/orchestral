@@ -12,12 +12,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context};
 use tokio::sync::mpsc;
 
-use crate::runtime::{RuntimeClient, RuntimeMsg, TransientSlot};
+use crate::runtime::{PlannerOverrides, RuntimeClient, RuntimeMsg, TransientSlot};
 
 use app::App;
 
 pub struct SessionRunOptions {
     pub config: Option<PathBuf>,
+    pub planner_overrides: PlannerOverrides,
     pub thread_id: Option<String>,
     pub no_mcp: bool,
     pub no_skills: bool,
@@ -30,6 +31,7 @@ pub struct SessionRunOptions {
 pub async fn run_session(options: SessionRunOptions) -> anyhow::Result<()> {
     let SessionRunOptions {
         config,
+        planner_overrides,
         thread_id,
         no_mcp,
         no_skills,
@@ -57,7 +59,7 @@ pub async fn run_session(options: SessionRunOptions) -> anyhow::Result<()> {
         std::env::set_var("ORCHESTRAL_DISABLE_SKILLS", "1");
     }
 
-    let runtime_client = RuntimeClient::from_config(config, thread_id)
+    let runtime_client = RuntimeClient::from_config(config, thread_id, planner_overrides)
         .await
         .context("initialize runtime client")?;
 

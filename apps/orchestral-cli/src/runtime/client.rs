@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::Context;
+use anyhow::{bail, Context};
+use orchestral_core::config::{load_config, OrchestralConfig};
+use serde_yaml::{Mapping, Value as YamlValue};
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::time::{timeout, Duration};
 use tracing::{debug, warn};
@@ -28,12 +30,30 @@ pub struct RuntimeClient {
     submit_lock: Arc<Mutex<()>>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct PlannerOverrides {
+    pub backend: Option<String>,
+    pub model_profile: Option<String>,
+    pub model: Option<String>,
+    pub temperature: Option<f32>,
+}
+
+impl PlannerOverrides {
+    pub fn is_empty(&self) -> bool {
+        self.backend.is_none()
+            && self.model_profile.is_none()
+            && self.model.is_none()
+            && self.temperature.is_none()
+    }
+}
+
 impl RuntimeClient {
     pub async fn from_config(
         config: Option<PathBuf>,
         thread_id_override: Option<String>,
+        planner_overrides: PlannerOverrides,
     ) -> anyhow::Result<Self> {
-        let config = resolve_runtime_config_path(config)?;
+        let config = prepare_runtime_config_path(config, &planner_overrides)?;
         let app_builder: Arc<dyn RuntimeAppBuilder> =
             Arc::new(ComposedRuntimeAppBuilder::new(RuntimeTarget::Cli));
         let api = Arc::new(
@@ -831,6 +851,18 @@ impl RuntimeClient {
 
 const GENERATED_CONFIG_DIR: &str = ".orchestral/generated";
 const GENERATED_CONFIG_FILE: &str = "default.cli.yaml";
+const GENERATED_OVERRIDE_CONFIG_SUFFIX: &str = ".runtime.override.yaml";
+
+fn prepare_runtime_config_path(
+    explicit: Option<PathBuf>,
+    planner_overrides: &PlannerOverrides,
+) -> anyhow::Result<PathBuf> {
+    let resolved = resolve_runtime_config_path(explicit)?;
+    if planner_overrides.is_empty() {
+        return Ok(resolved);
+    }
+    write_overridden_runtime_config(&resolved, planner_overrides)
+}
 
 fn resolve_runtime_config_path(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     if let Some(path) = explicit {
@@ -876,6 +908,110 @@ fn generate_default_config() -> anyhow::Result<PathBuf> {
     }
 
     Ok(path)
+}
+
+fn write_overridden_runtime_config(
+    base_path: &Path,
+    planner_overrides: &PlannerOverrides,
+) -> anyhow::Result<PathBuf> {
+    let config = load_config(base_path)
+        .with_context(|| format!("load config '{}' for overrides failed", base_path.display()))?;
+    let raw = fs::read_to_string(base_path)
+        .with_context(|| format!("read config '{}' failed", base_path.display()))?;
+    let mut yaml: YamlValue = serde_yaml::from_str(&raw)
+        .with_context(|| format!("parse config '{}' as yaml failed", base_path.display()))?;
+    apply_planner_overrides_to_yaml(&mut yaml, &config, planner_overrides)?;
+
+    let serialized = serde_yaml::to_string(&yaml).context("serialize overridden config failed")?;
+    let override_path = runtime_override_config_path(base_path);
+    fs::write(&override_path, serialized).with_context(|| {
+        format!(
+            "write overridden config '{}' failed",
+            override_path.display()
+        )
+    })?;
+    Ok(override_path)
+}
+
+fn runtime_override_config_path(base_path: &Path) -> PathBuf {
+    let parent = base_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = base_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("orchestral");
+    parent.join(format!("{}{}", stem, GENERATED_OVERRIDE_CONFIG_SUFFIX))
+}
+
+fn apply_planner_overrides_to_yaml(
+    yaml: &mut YamlValue,
+    config: &OrchestralConfig,
+    planner_overrides: &PlannerOverrides,
+) -> anyhow::Result<()> {
+    let root = yaml
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("config root must be a YAML mapping"))?;
+    let planner = ensure_mapping_entry(root, "planner");
+
+    if let Some(profile_name) = planner_overrides.model_profile.as_ref() {
+        let profile = config
+            .providers
+            .get_model(profile_name)
+            .ok_or_else(|| anyhow::anyhow!("planner model profile not found: {}", profile_name))?;
+        set_yaml_key(
+            planner,
+            "model_profile",
+            YamlValue::String(profile_name.clone()),
+        );
+        set_yaml_key(planner, "model", YamlValue::Null);
+        if planner_overrides.temperature.is_none() {
+            set_yaml_key(planner, "temperature", YamlValue::Null);
+        }
+        if planner_overrides.backend.is_none() {
+            let backend_value = profile
+                .backend
+                .as_ref()
+                .map(|backend| YamlValue::String(backend.clone()))
+                .unwrap_or(YamlValue::Null);
+            set_yaml_key(planner, "backend", backend_value);
+        }
+    }
+
+    if let Some(model) = planner_overrides.model.as_ref() {
+        set_yaml_key(planner, "model", YamlValue::String(model.clone()));
+    }
+
+    if let Some(backend) = planner_overrides.backend.as_ref() {
+        if config.providers.get_backend(backend).is_none() {
+            bail!("planner backend not found: {}", backend);
+        }
+        set_yaml_key(planner, "backend", YamlValue::String(backend.clone()));
+    }
+
+    if let Some(temperature) = planner_overrides.temperature {
+        let value =
+            serde_yaml::to_value(temperature).context("serialize planner temperature failed")?;
+        set_yaml_key(planner, "temperature", value);
+    }
+
+    Ok(())
+}
+
+fn ensure_mapping_entry<'a>(map: &'a mut Mapping, key: &str) -> &'a mut Mapping {
+    let key_value = YamlValue::String(key.to_string());
+    let entry = map
+        .entry(key_value)
+        .or_insert_with(|| YamlValue::Mapping(Mapping::new()));
+    if !entry.is_mapping() {
+        *entry = YamlValue::Mapping(Mapping::new());
+    }
+    entry
+        .as_mapping_mut()
+        .expect("mapping entry should exist after normalization")
+}
+
+fn set_yaml_key(map: &mut Mapping, key: &str, value: YamlValue) {
+    map.insert(YamlValue::String(key.to_string()), value);
 }
 
 fn embedded_default_config() -> &'static str {
@@ -1126,7 +1262,9 @@ fn preview_to_activity_lines(preview: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orchestral_core::config::{BackendSpec, ModelPolicy, ModelProfile, OrchestralConfig};
     use serde_json::json;
+    use serde_yaml::Value as YamlValue;
 
     #[test]
     fn test_event_interaction_id_from_assistant_output() {
@@ -1169,6 +1307,85 @@ mod tests {
         assert_eq!(
             format_running_label("read_skill_docs", "file_read"),
             "Running read_skill_docs (file_read)"
+        );
+    }
+
+    #[test]
+    fn test_apply_planner_overrides_aligns_backend_with_model_profile() {
+        let mut yaml: YamlValue = serde_yaml::from_str(
+            r#"
+planner:
+  backend: openrouter
+  model_profile: claude-sonnet-4-5
+  model: anthropic/claude-sonnet-4.5
+"#,
+        )
+        .unwrap();
+        let mut config = OrchestralConfig::default();
+        config.providers.backends = vec![
+            BackendSpec {
+                name: "openrouter".to_string(),
+                kind: "openrouter".to_string(),
+                endpoint: None,
+                api_key_env: None,
+                config: json!(null),
+            },
+            BackendSpec {
+                name: "google".to_string(),
+                kind: "google".to_string(),
+                endpoint: None,
+                api_key_env: None,
+                config: json!(null),
+            },
+        ];
+        config.providers.models = vec![ModelProfile {
+            name: "gemini-2.5-flash".to_string(),
+            backend: Some("google".to_string()),
+            model: "gemini-2.5-flash".to_string(),
+            temperature: Some(0.2),
+            max_tokens: None,
+            system_prompt: None,
+            policy: ModelPolicy::default(),
+            config: json!(null),
+        }];
+
+        apply_planner_overrides_to_yaml(
+            &mut yaml,
+            &config,
+            &PlannerOverrides {
+                backend: None,
+                model_profile: Some("gemini-2.5-flash".to_string()),
+                model: None,
+                temperature: None,
+            },
+        )
+        .unwrap();
+
+        let planner = yaml
+            .get("planner")
+            .and_then(|value| value.as_mapping())
+            .unwrap();
+        let backend_key = YamlValue::String("backend".to_string());
+        let profile_key = YamlValue::String("model_profile".to_string());
+        let model_key = YamlValue::String("model".to_string());
+        assert_eq!(
+            planner.get(&backend_key).and_then(|value| value.as_str()),
+            Some("google")
+        );
+        assert_eq!(
+            planner.get(&profile_key).and_then(|value| value.as_str()),
+            Some("gemini-2.5-flash")
+        );
+        assert!(planner.get(&model_key).is_some_and(YamlValue::is_null));
+    }
+
+    #[test]
+    fn test_runtime_override_config_path_is_stable_sibling_file() {
+        let base = Path::new("configs/orchestral.cli.yaml");
+        let override_path = runtime_override_config_path(base);
+        assert_eq!(
+            override_path,
+            PathBuf::from("configs/orchestral.cli.runtime.override.yaml")
         );
     }
 }

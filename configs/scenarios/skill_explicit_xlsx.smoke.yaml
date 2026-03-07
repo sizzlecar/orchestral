@@ -1,0 +1,29 @@
+version: 1
+name: skill-explicit-xlsx-smoke
+config: ../orchestral.cli.yaml
+no_mcp: true
+timeout_secs: 300
+workspace:
+  copies:
+    - from: ../../docs/绩效考核-2025Q4_副本.xlsx
+      to: docs/绩效考核-2025Q4_运行副本.xlsx
+
+turns:
+  - name: fill-excel-with-xlsx-skill
+    input: >
+      用 xlsx skill 看 docs 目前下的 excel 内容，把需要填的都填了。
+    expect:
+      require_execution_end: true
+      max_approvals: 0
+      max_errors: 0
+      persist_not_contains:
+        - "Plan: no actions"
+        - "请提供 docs 下那个 Excel 的具体文件路径"
+      activity_contains:
+        - "\"cells_filled\":"
+    verify:
+      - name: workbook-fill-quality
+        command: ../../.claude/skills/xlsx/.venv/bin/python3
+        args:
+          - validators/verify_perf_review_fill.py
+          - docs/绩效考核-2025Q4_运行副本.xlsx

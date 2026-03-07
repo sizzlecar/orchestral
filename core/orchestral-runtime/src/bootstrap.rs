@@ -32,6 +32,7 @@ use orchestral_core::io::{
 };
 use orchestral_core::normalizer::PlanNormalizer;
 use orchestral_core::planner::{PlanError, Planner, PlannerContext, PlannerOutput};
+use orchestral_core::recipe::{RecipeRegistry, RECIPE_REGISTRY_COMPONENT_KEY};
 use orchestral_core::spi::{
     ComponentRegistry, HookRegistry, RuntimeBuildRequest, RuntimeComponentFactory, SpiError,
     SpiMeta, StoreBundle,
@@ -152,6 +153,7 @@ impl RuntimeApp {
             options: build_runtime_component_options(&config),
         };
         let components = component_factory.build(&build_request).await?;
+        let recipe_registry = extract_recipe_registry_component(&components)?;
         let stores = components.stores.unwrap_or_else(|| {
             tracing::warn!("component factory missing stores; fallback to in-memory stores");
             StoreBundle {
@@ -215,6 +217,7 @@ impl RuntimeApp {
                 }
             }
         }
+        register_recipe_templates(&mut normalizer, &config, recipe_registry.as_deref());
 
         let context_builder = Arc::new(BasicContextBuilder::new(
             stores.event_store.clone(),
@@ -227,6 +230,7 @@ impl RuntimeApp {
             include_history: config.context.include_history,
             include_references: config.context.include_references,
             auto_replan_once: true,
+            auto_repair_plan_once: true,
         };
 
         let orchestrator = Orchestrator::with_config(
@@ -250,6 +254,37 @@ impl RuntimeApp {
             action_registry_manager,
             _action_watcher: action_watcher,
         })
+    }
+}
+
+fn extract_recipe_registry_component(
+    components: &ComponentRegistry,
+) -> Result<Option<Arc<RecipeRegistry>>, BootstrapError> {
+    let Some(component) = components.get_named_component(RECIPE_REGISTRY_COMPONENT_KEY) else {
+        return Ok(None);
+    };
+    Arc::downcast::<RecipeRegistry>(component)
+        .map(Some)
+        .map_err(|_| {
+            BootstrapError::Spi(SpiError::Internal(format!(
+                "named component '{}' must be Arc<RecipeRegistry>",
+                RECIPE_REGISTRY_COMPONENT_KEY
+            )))
+        })
+}
+
+fn register_recipe_templates(
+    normalizer: &mut PlanNormalizer,
+    config: &OrchestralConfig,
+    registry: Option<&RecipeRegistry>,
+) {
+    if let Some(registry) = registry {
+        for template in registry.templates() {
+            normalizer.register_recipe_template(template.clone());
+        }
+    }
+    for template in &config.recipes.templates {
+        normalizer.register_recipe_template(template.clone());
     }
 }
 
@@ -769,6 +804,10 @@ impl Planner for DeterministicPlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orchestral_core::action::ActionMeta;
+    use orchestral_core::recipe::{ActionSelector, RecipeStageTemplate, RecipeTemplate};
+    use orchestral_core::types::{Step, StepIoBinding, StepKind};
+    use serde_json::{json, Value};
 
     #[tokio::test]
     async fn test_default_component_factory_builds_min_runtime_components() {
@@ -819,5 +858,164 @@ mod tests {
             }
             other => panic!("expected UnsupportedConcurrencyPolicy, got {}", other),
         }
+    }
+
+    #[test]
+    fn test_register_recipe_templates_from_config_and_component_registry() {
+        let mut normalizer = PlanNormalizer::new();
+        normalizer.register_action_meta(
+            &ActionMeta::new("file_read", "file_read").with_capabilities(["filesystem_read"]),
+        );
+        normalizer.register_action_meta(
+            &ActionMeta::new("file_write", "file_write").with_capabilities(["filesystem_write"]),
+        );
+        normalizer.register_action("custom_verify");
+
+        let mut config = OrchestralConfig::default();
+        config.recipes.templates.push(
+            RecipeTemplate::new(
+                "config_fill",
+                vec![
+                    RecipeStageTemplate {
+                        id: "inspect".into(),
+                        kind: StepKind::Action,
+                        action: Some("file_read".to_string()),
+                        selector: None,
+                        depends_on: Vec::new(),
+                        exports: vec!["content".to_string()],
+                        io_bindings: Vec::new(),
+                        params: Value::Null,
+                        verify_with: None,
+                    },
+                    RecipeStageTemplate {
+                        id: "derive".into(),
+                        kind: StepKind::Agent,
+                        action: None,
+                        selector: None,
+                        depends_on: vec!["inspect".into()],
+                        exports: Vec::new(),
+                        io_bindings: vec![StepIoBinding::required(
+                            "inspect.content",
+                            "source_content",
+                        )],
+                        params: json!({
+                            "mode": "leaf",
+                            "goal": "derive patch",
+                            "output_keys": ["change_spec"]
+                        }),
+                        verify_with: None,
+                    },
+                ],
+            )
+            .with_export_from(std::collections::HashMap::from([(
+                "change_spec".to_string(),
+                "derive.change_spec".to_string(),
+            )])),
+        );
+
+        let mut registry = RecipeRegistry::new();
+        registry.register(
+            RecipeTemplate::new(
+                "component_fill",
+                vec![
+                    RecipeStageTemplate {
+                        id: "inspect".into(),
+                        kind: StepKind::Action,
+                        action: None,
+                        selector: Some(ActionSelector::default().with_all_of(["filesystem_read"])),
+                        depends_on: Vec::new(),
+                        exports: vec!["content".to_string()],
+                        io_bindings: Vec::new(),
+                        params: Value::Null,
+                        verify_with: None,
+                    },
+                    RecipeStageTemplate {
+                        id: "apply".into(),
+                        kind: StepKind::Action,
+                        action: None,
+                        selector: Some(ActionSelector::default().with_all_of(["filesystem_write"])),
+                        depends_on: vec!["inspect".into()],
+                        exports: vec!["path".to_string()],
+                        io_bindings: vec![StepIoBinding::required("inspect.content", "content")],
+                        params: Value::Null,
+                        verify_with: None,
+                    },
+                    RecipeStageTemplate {
+                        id: "verify".into(),
+                        kind: StepKind::Action,
+                        action: Some("custom_verify".to_string()),
+                        selector: None,
+                        depends_on: vec!["apply".into()],
+                        exports: vec!["verified".to_string()],
+                        io_bindings: vec![StepIoBinding::required("apply.path", "path")],
+                        params: Value::Null,
+                        verify_with: None,
+                    },
+                ],
+            )
+            .with_export_from(std::collections::HashMap::from([(
+                "verified".to_string(),
+                "verify.verified".to_string(),
+            )])),
+        );
+
+        register_recipe_templates(&mut normalizer, &config, Some(&registry));
+
+        let config_plan = Plan::new(
+            "config recipe",
+            vec![Step::recipe("r1").with_params(json!({
+                "template": "config_fill"
+            }))],
+        );
+        let normalized = normalizer
+            .normalize(config_plan)
+            .expect("normalize config recipe");
+        assert!(normalized.plan.get_step("r1__inspect").is_some());
+        assert!(normalized.plan.get_step("r1__derive").is_some());
+
+        let component_plan = Plan::new(
+            "component recipe",
+            vec![Step::recipe("r2").with_params(json!({
+                "template": "component_fill"
+            }))],
+        );
+        let normalized = normalizer
+            .normalize(component_plan)
+            .expect("normalize component recipe");
+        assert_eq!(
+            normalized
+                .plan
+                .get_step("r2__inspect")
+                .map(|step| step.action.as_str()),
+            Some("file_read")
+        );
+        assert_eq!(
+            normalized
+                .plan
+                .get_step("r2__apply")
+                .map(|step| step.action.as_str()),
+            Some("file_write")
+        );
+        assert_eq!(
+            normalized
+                .plan
+                .get_step("r2__verify")
+                .map(|step| step.action.as_str()),
+            Some("custom_verify")
+        );
+    }
+
+    #[test]
+    fn test_extract_recipe_registry_component_downcasts_named_component() {
+        let mut components = ComponentRegistry::new();
+        components.insert_named_component(
+            RECIPE_REGISTRY_COMPONENT_KEY,
+            Arc::new(RecipeRegistry::default()),
+        );
+
+        let registry = extract_recipe_registry_component(&components)
+            .expect("extract")
+            .expect("registry");
+        assert!(registry.get("inspect_derive_apply_verify").is_some());
     }
 }

@@ -52,6 +52,9 @@ cargo run -p orchestral-cli -- run --no-skills "hello"
 
 # Use an explicit config file
 cargo run -p orchestral-cli -- run --config configs/orchestral.cli.yaml
+
+# Load env vars from a file before boot (KEY=VALUE or export KEY=VALUE)
+cargo run -p orchestral-cli -- run --env-file .orchestral/env/openrouter.env "hello"
 ```
 
 ### 3. Run one turn directly
@@ -65,6 +68,26 @@ cargo run -p orchestral-cli -- run "Plan a 3-day Tokyo trip"
 ```bash
 cargo run -p orchestral-cli -- run --script scripts/cli_multiturn_regression.sh
 ```
+
+### 5. Run a repeatable scenario
+
+```bash
+# Ad-hoc single-turn scenario with structured report and assertions
+cargo run -p orchestral-cli -- scenario \
+  --env-file .orchestral/env/openrouter.env \
+  --config configs/orchestral.cli.yaml \
+  --timeout-secs 300 \
+  --max-approvals 0 \
+  --max-errors 0 \
+  "docs 目前下有一个excel 你看下内容 把需要填的都填了"
+
+# YAML-driven scenario spec
+cargo run -p orchestral-cli -- scenario \
+  --env-file .orchestral/env/openrouter.env \
+  --spec configs/scenarios/one_turn.example.yaml
+```
+
+Scenario reports are written to `.orchestral/scenario-runs/*.json` by default.
 
 ## Run Server + Web UI
 
