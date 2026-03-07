@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -8,6 +9,7 @@ use serde_json::{json, Map, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::time::timeout;
+use tracing::debug;
 
 use super::shell_sandbox::{
     resolve_root_path, sandbox_command, ShellSandboxBackendKind, ShellSandboxMode,
@@ -15,6 +17,8 @@ use super::shell_sandbox::{
 };
 use orchestral_core::action::{Action, ActionContext, ActionInput, ActionMeta, ActionResult};
 use orchestral_core::config::ActionSpec;
+
+static FILE_WRITE_TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 fn config_string(config: &Value, key: &str) -> Option<String> {
     config
@@ -378,6 +382,24 @@ fn stderr_preview(stderr: &str, max_chars: usize) -> String {
     out
 }
 
+fn extract_inline_script_body<'a>(use_shell: bool, args: &'a [String]) -> Option<&'a str> {
+    if use_shell {
+        return args
+            .first()
+            .filter(|flag| flag.as_str() == "-c" || flag.as_str() == "-lc")
+            .and_then(|_| args.get(1))
+            .map(String::as_str);
+    }
+    args.windows(2).find_map(|pair| {
+        let flag = pair.first()?.as_str();
+        let body = pair.get(1)?;
+        match flag {
+            "-c" | "-lc" => Some(body.as_str()),
+            _ => None,
+        }
+    })
+}
+
 fn bounded_u64(value: Option<u64>, default: usize, hard_max: usize) -> usize {
     value
         .and_then(|v| usize::try_from(v).ok())
@@ -416,6 +438,10 @@ async fn resolve_safe_path_with_policy(
     path: &str,
     allow_nonexistent_target: bool,
 ) -> Result<PathBuf, String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("Invalid path: empty after trimming whitespace".to_string());
+    }
     if has_parent_dir(path) {
         return Err("Path escapes sandbox roots".to_string());
     }
@@ -498,6 +524,9 @@ impl Action for EchoAction {
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
             .with_capability("pure")
+            .with_roles(["emit"])
+            .with_input_kinds(["text"])
+            .with_output_kinds(["text"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
@@ -528,6 +557,87 @@ impl Action for EchoAction {
             .unwrap_or("No message provided");
         let result = format!("{}{}", self.prefix, message);
         ActionResult::success_with_one("result", Value::String(result))
+    }
+}
+
+/// Pure structured-output action used by leaf agents.
+pub struct JsonStdoutAction {
+    name: String,
+    description: String,
+}
+
+impl JsonStdoutAction {
+    pub fn from_spec(spec: &ActionSpec) -> Self {
+        Self {
+            name: spec.name.clone(),
+            description: spec.description_or(
+                "Serializes payload to stdout as one JSON object without side effects",
+            ),
+        }
+    }
+
+    pub fn internal() -> Self {
+        Self {
+            name: "json_stdout".to_string(),
+            description: "Serializes payload to stdout as one JSON object without side effects"
+                .to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl Action for JsonStdoutAction {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn metadata(&self) -> ActionMeta {
+        ActionMeta::new(self.name(), self.description())
+            .with_capabilities(["pure", "structured_output"])
+            .with_roles(["emit"])
+            .with_input_kinds(["structured"])
+            .with_output_kinds(["structured", "text"])
+            .with_input_schema(json!({
+                "type": "object",
+                "properties": {
+                    "payload": {
+                        "description": "Arbitrary JSON object to serialize to stdout."
+                    }
+                },
+                "required": ["payload"]
+            }))
+            .with_output_schema(json!({
+                "type": "object",
+                "properties": {
+                    "stdout": { "type": "string" },
+                    "stderr": { "type": "string" },
+                    "status": { "type": "integer" }
+                },
+                "required": ["stdout", "stderr", "status"]
+            }))
+    }
+
+    async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
+        let payload = input
+            .params
+            .get("payload")
+            .cloned()
+            .unwrap_or(Value::Object(Default::default()));
+        let stdout = match serde_json::to_string(&payload) {
+            Ok(value) => value,
+            Err(error) => {
+                return ActionResult::error(format!("Failed to serialize payload: {}", error))
+            }
+        };
+        let mut exports = HashMap::new();
+        exports.insert("stdout".to_string(), Value::String(stdout));
+        exports.insert("stderr".to_string(), Value::String(String::new()));
+        exports.insert("status".to_string(), Value::Number(0.into()));
+        ActionResult::success_with(exports)
     }
 }
 
@@ -584,6 +694,9 @@ impl Action for HttpAction {
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
             .with_capabilities(["network_io", "side_effect"])
+            .with_roles(["collect", "execute"])
+            .with_input_kinds(["request"])
+            .with_output_kinds(["response", "text"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
@@ -807,7 +920,16 @@ impl Action for ShellAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
-            .with_capabilities(["filesystem_write", "shell", "side_effect", "verification"])
+            .with_capabilities([
+                "filesystem_write",
+                "shell",
+                "side_effect",
+                "verification",
+                "fallback",
+            ])
+            .with_roles(["inspect", "apply", "execute", "verify"])
+            .with_input_kinds(["command", "path", "text"])
+            .with_output_kinds(["process_result", "text"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
@@ -1011,6 +1133,24 @@ impl Action for ShellAction {
         } else {
             (command, args.unwrap_or_default())
         };
+        let inline_script = extract_inline_script_body(use_shell, &base_args);
+        debug!(
+            action = %self.name,
+            command_name = %command_name,
+            use_shell = use_shell,
+            cwd = %cwd.display(),
+            program = %base_program,
+            args = ?base_args,
+            "shell action resolved command"
+        );
+        if let Some(script) = inline_script {
+            debug!(
+                action = %self.name,
+                command_name = %command_name,
+                inline_script = %script,
+                "shell action inline script body"
+            );
+        }
 
         let sandboxed = match sandbox_command(base_program, base_args, &cwd, &sandbox_policy) {
             Ok(cmd) => cmd,
@@ -1175,6 +1315,9 @@ impl Action for FileReadAction {
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
             .with_capabilities(["filesystem_read", "read_only", "verification"])
+            .with_roles(["inspect", "verify"])
+            .with_input_kinds(["path"])
+            .with_output_kinds(["text", "path"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
@@ -1316,6 +1459,9 @@ impl Action for FileWriteAction {
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
             .with_capabilities(["filesystem_write", "side_effect"])
+            .with_roles(["apply", "emit"])
+            .with_input_kinds(["path", "text"])
+            .with_output_kinds(["path"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
@@ -1428,9 +1574,11 @@ impl Action for FileWriteAction {
                 return ActionResult::error(format!("Write failed: {}", e));
             }
         } else {
+            let tmp_counter = FILE_WRITE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
             let tmp_name = format!(
-                ".orchestral-tmp-{}-{}.tmp",
+                ".orchestral-tmp-{}-{}-{}.tmp",
                 std::process::id(),
+                tmp_counter,
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_nanos())
@@ -1459,6 +1607,7 @@ impl Action for FileWriteAction {
 pub fn build_builtin_action(spec: &ActionSpec) -> Option<Box<dyn Action>> {
     match spec.kind.as_str() {
         "echo" => Some(Box::new(EchoAction::from_spec(spec))),
+        "json_stdout" => Some(Box::new(JsonStdoutAction::from_spec(spec))),
         "http" => Some(Box::new(HttpAction::from_spec(spec))),
         "shell" => Some(Box::new(ShellAction::from_spec(spec))),
         "file_read" => Some(Box::new(FileReadAction::from_spec(spec))),
@@ -1470,8 +1619,8 @@ pub fn build_builtin_action(spec: &ActionSpec) -> Option<Box<dyn Action>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use async_trait::async_trait;
     use orchestral_core::store::{
@@ -1481,6 +1630,7 @@ mod tests {
     use tokio::sync::RwLock;
 
     struct NoopReferenceStore;
+    static TEST_PATH_COUNTER: AtomicU64 = AtomicU64::new(1);
 
     #[async_trait]
     impl ReferenceStore for NoopReferenceStore {
@@ -1516,6 +1666,41 @@ mod tests {
             Arc::new(RwLock::new(WorkingSet::new())),
             Arc::new(NoopReferenceStore),
         )
+    }
+
+    fn unique_test_path(prefix: &str) -> String {
+        let unique = TEST_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("target/{}_{}_{}.txt", prefix, std::process::id(), unique)
+    }
+
+    #[tokio::test]
+    async fn test_json_stdout_action_serializes_payload_to_stdout() {
+        let action = JsonStdoutAction::internal();
+        let result = action
+            .run(
+                ActionInput::with_params(json!({
+                    "payload": {
+                        "change_spec": {
+                            "cells": 2
+                        }
+                    }
+                })),
+                test_ctx(),
+            )
+            .await;
+
+        match result {
+            ActionResult::Success { exports } => {
+                assert_eq!(exports.get("status"), Some(&json!(0)));
+                let stdout = exports
+                    .get("stdout")
+                    .and_then(|value| value.as_str())
+                    .expect("stdout");
+                let parsed: Value = serde_json::from_str(stdout).expect("valid json");
+                assert_eq!(parsed["change_spec"]["cells"], json!(2));
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
     }
 
     #[test]
@@ -1592,13 +1777,28 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_inline_script_body_detects_python_c_and_shell_c() {
+        let python_args = vec![
+            "-c".to_string(),
+            "print('hello')\nprint('world')".to_string(),
+            "arg1".to_string(),
+        ];
+        assert_eq!(
+            extract_inline_script_body(false, &python_args),
+            Some("print('hello')\nprint('world')")
+        );
+
+        let shell_args = vec!["-c".to_string(), "echo hi && echo bye".to_string()];
+        assert_eq!(
+            extract_inline_script_body(true, &shell_args),
+            Some("echo hi && echo bye")
+        );
+    }
+
+    #[test]
     fn test_file_write_allows_new_file_under_workspace_roots() {
         tokio_test::block_on(async {
-            let unique = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time")
-                .as_nanos();
-            let path = format!("target/orchestral_file_write_{}.txt", unique);
+            let path = unique_test_path("orchestral_file_write");
             let spec = ActionSpec {
                 name: "file_write".to_string(),
                 kind: "file_write".to_string(),
@@ -1853,11 +2053,7 @@ mod tests {
             tokio::fs::create_dir_all("target")
                 .await
                 .expect("create target dir");
-            let unique = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time")
-                .as_nanos();
-            let path = format!("target/orchestral_file_read_{}.txt", unique);
+            let path = unique_test_path("orchestral_file_read");
             tokio::fs::write(&path, "abcdefghij")
                 .await
                 .expect("seed file");
@@ -1943,11 +2139,7 @@ mod tests {
     #[test]
     fn test_file_write_rejects_empty_content_by_default() {
         tokio_test::block_on(async {
-            let unique = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time")
-                .as_nanos();
-            let path = format!("target/orchestral_file_write_empty_{}.txt", unique);
+            let path = unique_test_path("orchestral_file_write_empty");
             let spec = ActionSpec {
                 name: "file_write".to_string(),
                 kind: "file_write".to_string(),
@@ -1978,11 +2170,7 @@ mod tests {
     #[test]
     fn test_file_write_allows_empty_content_with_opt_in() {
         tokio_test::block_on(async {
-            let unique = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time")
-                .as_nanos();
-            let path = format!("target/orchestral_file_write_empty_optin_{}.txt", unique);
+            let path = unique_test_path("orchestral_file_write_empty_optin");
             let spec = ActionSpec {
                 name: "file_write".to_string(),
                 kind: "file_write".to_string(),
@@ -2047,6 +2235,45 @@ mod tests {
                 }
                 other => panic!("expected error, got {:?}", other),
             }
+        });
+    }
+
+    #[test]
+    fn test_file_read_trims_whitespace_around_path() {
+        tokio_test::block_on(async {
+            tokio::fs::create_dir_all("target")
+                .await
+                .expect("create target dir");
+            let path = unique_test_path("orchestral_file_read_trim");
+            tokio::fs::write(&path, "trim-me").await.expect("seed file");
+
+            let spec = ActionSpec {
+                name: "file_read".to_string(),
+                kind: "file_read".to_string(),
+                description: None,
+                config: json!({
+                    "sandbox_mode": "workspace_write",
+                    "sandbox_writable_roots": ["."]
+                }),
+                interface: None,
+            };
+            let action = FileReadAction::from_spec(&spec);
+            let input = ActionInput::with_params(json!({
+                "path": format!("  {}\n", path)
+            }));
+
+            let result = action.run(input, test_ctx()).await;
+            match result {
+                ActionResult::Success { exports } => {
+                    assert_eq!(
+                        exports.get("content").and_then(|value| value.as_str()),
+                        Some("trim-me")
+                    );
+                }
+                other => panic!("expected success, got {:?}", other),
+            }
+
+            let _ = tokio::fs::remove_file(&path).await;
         });
     }
 }

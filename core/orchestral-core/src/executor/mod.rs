@@ -1242,6 +1242,12 @@ impl Executor {
                     );
                 }
             }
+            if let Err(error) = resolve_param_templates(&mut resolved_params, &ws) {
+                return ActionResult::error(format!(
+                    "Template resolution failed for step '{}': {}",
+                    step.id, error
+                ));
+            }
         }
 
         if step.kind == StepKind::Agent {
@@ -1608,6 +1614,99 @@ fn bind_param_value(
     }
 }
 
+fn resolve_param_templates(params: &mut serde_json::Value, ws: &WorkingSet) -> Result<(), String> {
+    let root_snapshot = params.clone();
+    resolve_param_templates_inner(params, ws, &root_snapshot)
+}
+
+fn resolve_param_templates_inner(
+    params: &mut serde_json::Value,
+    ws: &WorkingSet,
+    root: &serde_json::Value,
+) -> Result<(), String> {
+    match params {
+        serde_json::Value::Object(map) => {
+            for value in map.values_mut() {
+                resolve_param_templates_inner(value, ws, root)?;
+            }
+            Ok(())
+        }
+        serde_json::Value::Array(items) => {
+            for value in items {
+                resolve_param_templates_inner(value, ws, root)?;
+            }
+            Ok(())
+        }
+        serde_json::Value::String(text) => {
+            if !text.contains("{{") {
+                return Ok(());
+            }
+            *text = render_param_template(text, ws, root)?;
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn render_param_template(
+    template: &str,
+    ws: &WorkingSet,
+    root: &serde_json::Value,
+) -> Result<String, String> {
+    let mut rendered = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        rendered.push_str(&rest[..start]);
+        let after_start = &rest[start + 2..];
+        let Some(end) = after_start.find("}}") else {
+            return Err(format!("unclosed template placeholder in '{}'", template));
+        };
+        let key = after_start[..end].trim();
+        if key.is_empty() {
+            return Err(format!("empty template placeholder in '{}'", template));
+        }
+        let value = ws
+            .get_task(key)
+            .or_else(|| lookup_template_value(root, key))
+            .ok_or_else(|| format!("missing template value '{}'", key))?;
+        rendered.push_str(&template_value_to_string(value));
+        rest = &after_start[end + 2..];
+    }
+    rendered.push_str(rest);
+    Ok(rendered)
+}
+
+fn lookup_template_value<'a>(
+    root: &'a serde_json::Value,
+    key: &str,
+) -> Option<&'a serde_json::Value> {
+    let mut current = root;
+    for segment in key.split('.') {
+        if segment.is_empty() {
+            return None;
+        }
+        match current {
+            serde_json::Value::Object(map) => {
+                current = map.get(segment)?;
+            }
+            serde_json::Value::Array(items) => {
+                let index = segment.parse::<usize>().ok()?;
+                current = items.get(index)?;
+            }
+            _ => return None,
+        }
+    }
+    Some(current)
+}
+
+fn template_value_to_string(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
 fn validate_declared_exports(
     step: &Step,
     exports: &HashMap<String, serde_json::Value>,
@@ -1753,6 +1852,23 @@ mod tests {
                 }
                 None => ActionResult::error("content binding not applied"),
             }
+        }
+    }
+
+    struct EchoParamsAction;
+
+    #[async_trait]
+    impl Action for EchoParamsAction {
+        fn name(&self) -> &str {
+            "echo_params"
+        }
+
+        fn description(&self) -> &str {
+            "echo params"
+        }
+
+        async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
+            ActionResult::success_with_one("params", input.params.clone())
         }
     }
 
@@ -1922,6 +2038,78 @@ mod tests {
                 }
                 _ => panic!("expected failed result"),
             }
+        });
+    }
+
+    #[test]
+    fn test_executor_resolves_param_templates_from_working_set() {
+        tokio_test::block_on(async {
+            let mut registry = ActionRegistry::new();
+            registry.register(Arc::new(EchoParamsAction));
+            let executor = Executor::new(registry);
+
+            let plan = Plan::new(
+                "template params",
+                vec![Step::action("s1", "echo_params")
+                    .with_params(json!({
+                        "path": "{{artifact.path}}",
+                        "message": "open {{artifact.path}}",
+                        "payload": "{{artifact.meta}}"
+                    }))
+                    .with_exports(vec!["params".to_string()])],
+            );
+            let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
+            let ws = Arc::new(RwLock::new(WorkingSet::new()));
+            {
+                let mut guard = ws.write().await;
+                guard.set_task("artifact.path", json!("docs/sample.xlsx"));
+                guard.set_task("artifact.meta", json!({"rows": 3}));
+            }
+            let ctx = ExecutorContext::new("task-1", ws.clone(), Arc::new(NoopReferenceStore));
+
+            let result = executor.execute(&mut dag, &ctx).await;
+            assert!(matches!(result, ExecutionResult::Completed));
+
+            let ws = ws.read().await;
+            let params = ws.get_task("s1.params").expect("params export");
+            assert_eq!(params["path"], json!("docs/sample.xlsx"));
+            assert_eq!(params["message"], json!("open docs/sample.xlsx"));
+            assert_eq!(params["payload"], json!("{\"rows\":3}"));
+        });
+    }
+
+    #[test]
+    fn test_executor_resolves_param_templates_from_io_bound_params() {
+        tokio_test::block_on(async {
+            let mut registry = ActionRegistry::new();
+            registry.register(Arc::new(EchoParamsAction));
+            let executor = Executor::new(registry);
+
+            let plan = Plan::new(
+                "io-bound template params",
+                vec![Step::action("s1", "echo_params")
+                    .with_io_bindings(vec![StepIoBinding::required("artifact.path", "file_path")])
+                    .with_params(json!({
+                        "path": "{{file_path}}",
+                        "message": "open {{file_path}}"
+                    }))
+                    .with_exports(vec!["params".to_string()])],
+            );
+            let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
+            let ws = Arc::new(RwLock::new(WorkingSet::new()));
+            {
+                let mut guard = ws.write().await;
+                guard.set_task("artifact.path", json!("docs/sample.xlsx"));
+            }
+            let ctx = ExecutorContext::new("task-1", ws.clone(), Arc::new(NoopReferenceStore));
+
+            let result = executor.execute(&mut dag, &ctx).await;
+            assert!(matches!(result, ExecutionResult::Completed));
+
+            let ws = ws.read().await;
+            let params = ws.get_task("s1.params").expect("params export");
+            assert_eq!(params["path"], json!("docs/sample.xlsx"));
+            assert_eq!(params["message"], json!("open docs/sample.xlsx"));
         });
     }
 

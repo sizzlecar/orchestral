@@ -24,7 +24,6 @@ const MAX_BOUND_INPUT_VALUE_CHARS: usize = 1_200;
 const MAX_BOUND_SKILL_VALUE_CHARS: usize = 12_000;
 const MAX_BOUND_INPUT_KEYS: usize = 4;
 const MAX_RECENT_OBSERVATIONS: usize = 4;
-const MAX_DISCOVERED_SKILL_SCRIPTS: usize = 12;
 
 #[derive(Debug, Clone)]
 pub struct LlmAgentExecutorConfig {
@@ -54,12 +53,29 @@ impl<C: LlmClient> LlmAgentExecutor<C> {
 
 #[derive(Debug)]
 struct AgentStepParams {
+    mode: AgentMode,
     goal: String,
     allowed_actions: HashSet<String>,
     max_iterations: u64,
     output_keys: Vec<String>,
     output_rules: HashMap<String, AgentOutputRule>,
+    result_slot: Option<String>,
     bound_inputs: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentMode {
+    Explore,
+    Leaf,
+}
+
+impl AgentMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Explore => "explore",
+            Self::Leaf => "leaf",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -130,6 +146,12 @@ struct MaterializeError {
     key: String,
     reason_code: &'static str,
     detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentDebugTextPayload {
+    path: String,
+    text: String,
 }
 
 impl MaterializeError {
@@ -263,6 +285,7 @@ impl<C: LlmClient> AgentStepExecutor for LlmAgentExecutor<C> {
         info!(
             step_id = %step.id,
             execution_id = %execution_id,
+            mode = %params.mode.as_str(),
             max_iterations = params.max_iterations,
             output_keys = ?params.output_keys,
             allowed_actions = ?allowed_actions,
@@ -307,7 +330,7 @@ impl<C: LlmClient> AgentStepExecutor for LlmAgentExecutor<C> {
                 "agent llm request"
             );
 
-            let tools = agent_tool_definitions();
+            let tools = agent_tool_definitions(&params);
             let llm_response = match self.client.complete_with_tools(request, &tools).await {
                 Ok(v) => v,
                 Err(err) => {
@@ -339,6 +362,12 @@ impl<C: LlmClient> AgentStepExecutor for LlmAgentExecutor<C> {
                         tool_name = %name,
                         tool_args = %truncate_log_text(&arguments.to_string()),
                         "agent llm tool_call response"
+                    );
+                    log_agent_debug_text_payloads(
+                        step.id.as_ref(),
+                        iteration,
+                        "tool_call_arguments",
+                        arguments,
                     );
                     match parse_tool_call_decision(name, arguments.clone()) {
                         Ok(v) => v,
@@ -392,7 +421,7 @@ impl<C: LlmClient> AgentStepExecutor for LlmAgentExecutor<C> {
             match decision {
                 AgentDecision::Action {
                     name: action_name,
-                    params: action_params,
+                    params: mut action_params,
                     save_as,
                     capture,
                 } => {
@@ -401,6 +430,12 @@ impl<C: LlmClient> AgentStepExecutor for LlmAgentExecutor<C> {
                         iteration = iteration,
                         action = %action_name,
                         "agent decided action"
+                    );
+                    log_agent_debug_text_payloads(
+                        step.id.as_ref(),
+                        iteration,
+                        "decision_action_params",
+                        &action_params,
                     );
                     report_agent_progress(
                         ctx,
@@ -432,6 +467,8 @@ impl<C: LlmClient> AgentStepExecutor for LlmAgentExecutor<C> {
                         continue;
                     }
 
+                    action_params = normalize_agent_action_params(&action_name, action_params);
+
                     let action_result = execute_action_with_registry_with_options(
                         action_registry.clone(),
                         ctx,
@@ -461,6 +498,41 @@ impl<C: LlmClient> AgentStepExecutor for LlmAgentExecutor<C> {
                                         )
                                     }
                                 };
+                            if let Err(err) = validate_agent_action_success(
+                                &params,
+                                &evidence,
+                                &action_name,
+                                &exports,
+                                &captured_value,
+                                save_as.as_deref(),
+                            ) {
+                                let summary = err.summary();
+                                warn!(
+                                    step_id = %step.id,
+                                    iteration = iteration,
+                                    action = %action_name,
+                                    reason = %summary,
+                                    "agent action produced invalid materialized output"
+                                );
+                                report_agent_progress(
+                                    ctx,
+                                    step,
+                                    "action_failed",
+                                    Some(action_name.as_str()),
+                                    format!(
+                                        "{} invalid structured output: {}",
+                                        action_name,
+                                        truncate_text(&summary)
+                                    ),
+                                )
+                                .await;
+                                observations.push(format!(
+                                    "invalid_action_output {} => {}",
+                                    action_name,
+                                    truncate_text(&summary)
+                                ));
+                                continue;
+                            }
                             evidence.record_success(
                                 &action_name,
                                 exports.clone(),
@@ -1226,6 +1298,27 @@ fn derive_evidence_value(
     }
 }
 
+fn validate_agent_action_success(
+    params: &AgentStepParams,
+    evidence: &AgentEvidenceStore,
+    action_name: &str,
+    exports: &HashMap<String, Value>,
+    captured_value: &Value,
+    save_as: Option<&str>,
+) -> Result<(), MaterializeError> {
+    if params.mode != AgentMode::Leaf || action_name != "json_stdout" {
+        return Ok(());
+    }
+    let mut probe = evidence.clone();
+    probe.record_success(
+        action_name,
+        exports.clone(),
+        captured_value.clone(),
+        save_as,
+    );
+    materialize_final_exports(params, &probe).map(|_| ())
+}
+
 pub(crate) fn default_action_preflight_hook() -> ActionPreflightHook {
     Arc::new(|action_name: &str, params: &Value| action_preflight_error(action_name, params))
 }
@@ -1816,6 +1909,17 @@ fn parse_agent_params(step_id: &str, params: &Value) -> Result<AgentStepParams, 
         ));
     };
 
+    let mode = match obj.get("mode").and_then(|v| v.as_str()) {
+        None | Some("explore") => AgentMode::Explore,
+        Some("leaf") => AgentMode::Leaf,
+        Some(other) => {
+            return Err(format!(
+                "invalid agent params in step '{}': unsupported mode '{}'",
+                step_id, other
+            ));
+        }
+    };
+
     let goal = obj
         .get("goal")
         .and_then(|v| v.as_str())
@@ -1849,6 +1953,12 @@ fn parse_agent_params(step_id: &str, params: &Value) -> Result<AgentStepParams, 
             step_id
         ));
     }
+    if mode == AgentMode::Leaf && allowed_actions.iter().any(|action| action != "json_stdout") {
+        return Err(format!(
+            "invalid agent params in step '{}': leaf mode only supports allowed_actions=['json_stdout']",
+            step_id
+        ));
+    }
 
     let max_iterations = obj
         .get("max_iterations")
@@ -1862,6 +1972,12 @@ fn parse_agent_params(step_id: &str, params: &Value) -> Result<AgentStepParams, 
     if !(1..=10).contains(&max_iterations) {
         return Err(format!(
             "invalid agent params in step '{}': max_iterations must be in [1,10]",
+            step_id
+        ));
+    }
+    if mode == AgentMode::Leaf && !(1..=3).contains(&max_iterations) {
+        return Err(format!(
+            "invalid agent params in step '{}': leaf mode max_iterations must be in [1,3]",
             step_id
         ));
     }
@@ -1887,6 +2003,19 @@ fn parse_agent_params(step_id: &str, params: &Value) -> Result<AgentStepParams, 
         ));
     }
 
+    let result_slot = obj
+        .get("result_slot")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+    if mode == AgentMode::Leaf && result_slot.is_none() {
+        return Err(format!(
+            "invalid agent params in step '{}': leaf mode requires result_slot",
+            step_id
+        ));
+    }
+
     let output_rules = parse_output_rules(
         step_id,
         obj.get("output_rules"),
@@ -1899,7 +2028,12 @@ fn parse_agent_params(step_id: &str, params: &Value) -> Result<AgentStepParams, 
         .filter_map(|(key, value)| {
             if matches!(
                 key.as_str(),
-                "goal"
+                "mode"
+                    | "result_slot"
+                    | "result_hint"
+                    | "leaf_hint"
+                    | "leaf_schema"
+                    | "goal"
                     | "allowed_actions"
                     | "max_iterations"
                     | "output_keys"
@@ -1914,11 +2048,13 @@ fn parse_agent_params(step_id: &str, params: &Value) -> Result<AgentStepParams, 
         .collect::<HashMap<_, _>>();
 
     Ok(AgentStepParams {
+        mode,
         goal,
         allowed_actions,
         max_iterations,
         output_keys,
         output_rules,
+        result_slot,
         bound_inputs,
     })
 }
@@ -1963,16 +2099,19 @@ async fn report_agent_progress(
 fn build_agent_system_prompt(params: &AgentStepParams, ctx: &ExecutorContext) -> String {
     let mut actions: Vec<&str> = params.allowed_actions.iter().map(String::as_str).collect();
     actions.sort_unstable();
-    let bound_inputs_block = build_bound_inputs_block(&params.bound_inputs);
+    let bound_inputs_block = build_bound_inputs_block(params);
     let output_rules_block = build_output_rules_block(&params.output_rules);
     let env_block = build_execution_environment_block(ctx);
     let skill_block = build_skill_knowledge_block(&ctx.skill_instructions);
+    let skill_rules = build_skill_execution_rules(&ctx.skill_instructions);
+    let mode_rules = build_agent_mode_rules(params);
     format!(
         "You are a constrained execution agent.\n\
+Mode: {mode}\n\
 Goal: {goal}\n\
 Allowed actions: {actions}\n\
 Required output keys: {output_keys}.\n\
-{sources}{env}{skill}{bound}\n\
+{sources}{mode_rules}{env}{skill}{skill_rules}{bound}\n\
 You have three tools:\n\
 1) execute_action — run one of the allowed actions. Optional save_as stores the result in a named slot; capture=json_stdout parses stdout as JSON before storing. Example: execute_action({{\"action\":\"shell\",\"params\":{{\"command\":\"ls\"}},\"save_as\":\"listing\"}})\n\
 2) finish — ask runtime to materialize required output keys from saved evidence. Prefer this when saved slots already contain the needed values. Example: finish({{}})\n\
@@ -1981,6 +2120,7 @@ You have three tools:\n\
 Rules:\n\
 - Act first, analyze minimally. Do not spend iterations only reading/analyzing.\n\
 - Never call actions outside the allowed list.\n\
+- json_stdout is a pure serializer, not a command runner. Never place shell commands, Python snippets, or pseudo-tool calls where final structured data is required.\n\
 - Runtime always stores evidence slots: last, last_raw, last_action, action:<name>, action:<name>:raw. If stdout/body is JSON, runtime also stores action:<name>:stdout_json/body_json.\n\
 - Save useful structured results with save_as so runtime can materialize outputs deterministically.\n\
 - If output_rules specify requires.action, that slot evidence must be produced by the required action.\n\
@@ -1991,18 +2131,55 @@ Rules:\n\
 - Missing file/command shell errors are treated as deterministic and may abort the step early.\n\
 - When the required outputs can be derived from saved evidence, call finish immediately.\n\
 - You MUST call finish or return_final before iterations run out.",
+        mode = params.mode.as_str(),
         goal = params.goal,
         actions = actions.join(", "),
         output_keys = params.output_keys.join(", "),
         sources = output_rules_block,
+        mode_rules = mode_rules,
         env = env_block,
         skill = skill_block,
+        skill_rules = skill_rules,
         bound = bound_inputs_block,
         output_keys_example = params.output_keys.iter()
             .map(|k| format!("\"{}\":\"...\"", k))
             .collect::<Vec<_>>()
             .join(","),
     )
+}
+
+fn build_agent_mode_rules(params: &AgentStepParams) -> String {
+    match params.mode {
+        AgentMode::Explore => String::new(),
+        AgentMode::Leaf => {
+            let result_slot = params.result_slot.as_deref().unwrap_or("leaf_result");
+            let has_change_list_output = params.output_keys.iter().any(|key| {
+                matches!(
+                    key.to_ascii_lowercase().as_str(),
+                    "fills" | "changes" | "patch" | "patches" | "edits" | "change_spec"
+                )
+            });
+            let empty_change_rule = if has_change_list_output {
+                "- If the required output is a change list (for example fills/changes/patches), do not return an empty list unless the bound inputs clearly prove no updates are needed.\n\
+- Treat common placeholders such as N/A, NA, TBD, '-', '待填写', or similar sentinel values as missing data when the user asked to fill or complete an artifact.\n\
+- In tables/forms, when one row has several adjacent placeholder cells under user-entered headers, infer all clearly required fields rather than filling only a single notes column.\n"
+            } else {
+                ""
+            };
+            format!(
+                "Leaf Mode:\n\
+- Solve exactly one local derivation problem; do not explore the filesystem, network, or external tools.\n\
+- The only allowed action is json_stdout.\n\
+- Emit one JSON object whose top-level keys are the required output keys.\n\
+- Empty objects, missing required keys, or payloads that cannot satisfy output_rules are invalid and will be rejected.\n\
+{empty_change_rule}\
+- Do not emit commands, scripts, code, or tool requests. Emit the final structured answer only.\n\
+- Call execute_action with action=json_stdout, capture=json_stdout, save_as={result_slot}.\n\
+- After storing that structured payload, call finish immediately.\n",
+                empty_change_rule = empty_change_rule,
+            )
+        }
+    }
 }
 
 fn build_execution_environment_block(ctx: &ExecutorContext) -> String {
@@ -2057,84 +2234,99 @@ fn build_skill_knowledge_block(skills: &[SkillInstruction]) -> String {
         "Only execute scripts that are explicitly listed below or verified at runtime; do not guess script filenames.\n",
     );
     for skill in skills {
-        let _ = writeln!(out, "- {}: {}", skill.skill_name, skill.instructions.trim());
+        let _ = writeln!(out, "- {}", skill.skill_name);
+        for line in skill.instructions.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let _ = writeln!(out, "  {}", line);
+        }
         if let Some(path) = &skill.skill_path {
             let _ = writeln!(out, "  [skill file: {}]", path);
         }
         if let Some(dir) = &skill.scripts_dir {
             let _ = writeln!(out, "  [scripts: {}]", dir);
-            let discovered = discover_skill_scripts(dir, MAX_DISCOVERED_SKILL_SCRIPTS);
-            if discovered.is_empty() {
-                let _ = writeln!(out, "  [scripts discovered: none]");
+            let referenced = extract_skill_card_scripts(&skill.instructions);
+            if referenced.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "  [scripts referenced: inspect skill file or scripts dir before use]"
+                );
             } else {
-                let _ = writeln!(out, "  [scripts discovered: {}]", discovered.join(", "));
+                let _ = writeln!(out, "  [scripts referenced: {}]", referenced.join(", "));
             }
         }
     }
     out
 }
 
-fn discover_skill_scripts(dir: &str, limit: usize) -> Vec<String> {
-    let root = std::path::Path::new(dir);
-    if !root.is_dir() || limit == 0 {
-        return Vec::new();
+fn build_skill_execution_rules(skills: &[SkillInstruction]) -> String {
+    if !skills_match_keywords(
+        skills,
+        &["xlsx", "excel", "spreadsheet", "workbook", "worksheet"],
+    ) {
+        return String::new();
     }
 
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(current) = stack.pop() {
-        let Ok(read_dir) = std::fs::read_dir(&current) else {
-            continue;
-        };
-        let mut entries = read_dir
-            .filter_map(|entry| entry.ok().map(|v| v.path()))
-            .collect::<Vec<_>>();
-        entries.sort();
-        for path in entries {
-            if path.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            if !path.is_file() {
-                continue;
-            }
-            let extension = path
-                .extension()
-                .and_then(|v| v.to_str())
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            if !matches!(extension.as_str(), "py" | "sh" | "js" | "ts" | "rb") {
-                continue;
-            }
-            let display = path
-                .strip_prefix(root)
-                .unwrap_or(path.as_path())
-                .display()
-                .to_string();
-            out.push(display);
-            if out.len() >= limit {
-                out.sort_unstable();
-                return out;
-            }
-        }
-    }
-
-    out.sort_unstable();
-    out
+    String::from(
+        "Skill-Specific Rules:\n\
+- file_read is text-only; never call file_read on .xlsx, .xlsm, .pdf, .docx, .pptx, .zip, or image files.\n\
+- For spreadsheet workbooks, inspect or modify the workbook with shell plus the provided Python/runtime or verified skill scripts.\n\
+- For plain value fills or template completion, avoid recalc.py unless formulas were added/changed or dependent formula outputs must be refreshed during verification.\n\
+- If a workbook must be changed, keep the reasoning local and save structured evidence, but perform the actual read/write/recalc steps with explicit actions.\n",
+    )
 }
 
-fn build_bound_inputs_block(bound_inputs: &HashMap<String, Value>) -> String {
-    if bound_inputs.is_empty() {
+fn skills_match_keywords(skills: &[SkillInstruction], keywords: &[&str]) -> bool {
+    skills.iter().any(|skill| {
+        let haystack = format!(
+            "{} {}",
+            skill.skill_name.to_ascii_lowercase(),
+            skill.instructions.to_ascii_lowercase()
+        );
+        keywords.iter().any(|keyword| haystack.contains(keyword))
+    })
+}
+
+fn extract_skill_card_scripts(instructions: &str) -> Vec<String> {
+    instructions
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("scripts:"))
+        .map(|line| {
+            line.split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn build_bound_inputs_block(params: &AgentStepParams) -> String {
+    if params.bound_inputs.is_empty() {
         return "Bound upstream inputs: none".to_string();
     }
 
-    let mut keys = bound_inputs.keys().cloned().collect::<Vec<_>>();
+    let mut keys = params.bound_inputs.keys().cloned().collect::<Vec<_>>();
     keys.sort_unstable();
+    if params.mode == AgentMode::Leaf {
+        let non_skill_keys = keys
+            .iter()
+            .filter(|key| !key.to_ascii_lowercase().contains("skill"))
+            .count();
+        if non_skill_keys > 0 {
+            keys.retain(|key| !key.to_ascii_lowercase().contains("skill"));
+        }
+    }
+    if keys.is_empty() {
+        return "Bound upstream inputs: none".to_string();
+    }
 
     let mut lines = Vec::with_capacity(keys.len() + 2);
     lines.push("Bound upstream inputs (from io_bindings):".to_string());
     for key in keys.iter().take(MAX_BOUND_INPUT_KEYS) {
-        if let Some(value) = bound_inputs.get(key) {
+        if let Some(value) = params.bound_inputs.get(key) {
             let summarized = summarize_bound_input_value(key, value);
             if summarized.contains('\n') {
                 lines.push(format!("- {}:", key));
@@ -2151,6 +2343,17 @@ fn build_bound_inputs_block(bound_inputs: &HashMap<String, Value>) -> String {
             "- ... {} more bound input key(s) omitted",
             keys.len() - MAX_BOUND_INPUT_KEYS
         ));
+    }
+    if params.mode == AgentMode::Leaf
+        && params
+            .bound_inputs
+            .keys()
+            .any(|key| key.to_ascii_lowercase().contains("skill"))
+    {
+        lines.push(
+            "- skill_* bound inputs omitted in leaf mode to reduce noise; use Activated Skills summary unless directly required."
+                .to_string(),
+        );
     }
     lines.push(
         "Treat bound upstream inputs as authoritative context; do not rediscover unless verification is necessary."
@@ -2334,33 +2537,38 @@ fn build_agent_finalization_user_prompt(
     lines.join("\n")
 }
 
-fn agent_tool_definitions() -> Vec<ToolDefinition> {
+fn agent_tool_definitions(params: &AgentStepParams) -> Vec<ToolDefinition> {
+    let execute_action_parameters = if params.mode == AgentMode::Leaf {
+        leaf_execute_action_schema(params)
+    } else {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "Action name from the allowed list"
+                },
+                "params": {
+                    "type": "object",
+                    "description": "Action parameters"
+                },
+                "save_as": {
+                    "type": "string",
+                    "description": "Optional evidence slot name for storing this action result"
+                },
+                "capture": {
+                    "type": "string",
+                    "description": "Optional capture mode. Use 'json_stdout' when stdout is exactly one JSON object."
+                }
+            },
+            "required": ["action", "params"]
+        })
+    };
     vec![
         ToolDefinition {
             name: "execute_action".to_string(),
             description: "Execute one of the allowed actions".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "description": "Action name from the allowed list"
-                    },
-                    "params": {
-                        "type": "object",
-                        "description": "Action parameters"
-                    },
-                    "save_as": {
-                        "type": "string",
-                        "description": "Optional evidence slot name for storing this action result"
-                    },
-                    "capture": {
-                        "type": "string",
-                        "description": "Optional capture mode. Use 'json_stdout' when stdout is exactly one JSON object."
-                    }
-                },
-                "required": ["action", "params"]
-            }),
+            parameters: execute_action_parameters,
         },
         ToolDefinition {
             name: "finish".to_string(),
@@ -2387,6 +2595,60 @@ fn agent_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
     ]
+}
+
+fn leaf_execute_action_schema(params: &AgentStepParams) -> Value {
+    let result_slot = params
+        .result_slot
+        .as_deref()
+        .unwrap_or("leaf_result")
+        .to_string();
+    let payload_properties = params
+        .output_keys
+        .iter()
+        .map(|key| {
+            (
+                key.clone(),
+                serde_json::json!({
+                    "description": format!("Required structured value for output key '{}'.", key)
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["json_stdout"],
+                "description": "Must be json_stdout in leaf mode."
+            },
+            "params": {
+                "type": "object",
+                "properties": {
+                    "payload": {
+                        "type": "object",
+                        "description": "Structured JSON object containing every required output key.",
+                        "properties": payload_properties,
+                        "required": params.output_keys,
+                        "additionalProperties": true
+                    }
+                },
+                "required": ["payload"]
+            },
+            "save_as": {
+                "type": "string",
+                "enum": [result_slot],
+                "description": "Must save the structured payload into the leaf result slot."
+            },
+            "capture": {
+                "type": "string",
+                "enum": ["json_stdout"],
+                "description": "Must capture the JSON payload from stdout."
+            }
+        },
+        "required": ["action", "params", "save_as", "capture"]
+    })
 }
 
 fn agent_final_tool_definitions() -> Vec<ToolDefinition> {
@@ -2588,6 +2850,86 @@ fn summarize_recent_observations(observations: &[String], take_last: usize) -> S
         .collect::<Vec<_>>()
         .join(" | ");
     truncate_log_text(&tail)
+}
+
+fn log_agent_debug_text_payloads(step_id: &str, iteration: u64, stage: &str, value: &Value) {
+    let payloads = collect_agent_debug_text_payloads(value);
+    if payloads.is_empty() {
+        return;
+    }
+    for payload in payloads {
+        debug!(
+            step_id = %step_id,
+            iteration = iteration,
+            stage = stage,
+            payload_path = %payload.path,
+            payload_text = %payload.text,
+            "agent text payload"
+        );
+    }
+}
+
+fn collect_agent_debug_text_payloads(value: &Value) -> Vec<AgentDebugTextPayload> {
+    let mut out = Vec::new();
+    collect_agent_debug_text_payloads_inner("$", None, value, &mut out);
+    out
+}
+
+fn collect_agent_debug_text_payloads_inner(
+    path: &str,
+    current_key: Option<&str>,
+    value: &Value,
+    out: &mut Vec<AgentDebugTextPayload>,
+) {
+    match value {
+        Value::Object(map) => {
+            for (key, value) in map {
+                let child_path = format!("{}.{}", path, key);
+                collect_agent_debug_text_payloads_inner(&child_path, Some(key), value, out);
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                let child_path = format!("{}[{}]", path, index);
+                collect_agent_debug_text_payloads_inner(&child_path, current_key, item, out);
+            }
+        }
+        Value::String(text) => {
+            if should_log_agent_text_payload(current_key, text) {
+                out.push(AgentDebugTextPayload {
+                    path: path.to_string(),
+                    text: text.clone(),
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+fn should_log_agent_text_payload(current_key: Option<&str>, text: &str) -> bool {
+    let Some(key) = current_key else {
+        return false;
+    };
+    let normalized = key.trim().to_ascii_lowercase();
+    let key_suggests_code = matches!(
+        normalized.as_str(),
+        "script" | "code" | "source" | "program" | "python" | "bash" | "sh" | "cmd"
+    );
+    key_suggests_code
+        || ((text.contains('\n') || text.contains("\r\n")) && text.chars().count() >= 80)
+}
+
+fn normalize_agent_action_params(action_name: &str, params: Value) -> Value {
+    if action_name != "json_stdout" {
+        return params;
+    }
+    let Some(obj) = params.as_object() else {
+        return serde_json::json!({ "payload": params });
+    };
+    if obj.contains_key("payload") {
+        return Value::Object(obj.clone());
+    }
+    serde_json::json!({ "payload": Value::Object(obj.clone()) })
 }
 
 #[cfg(test)]
@@ -2855,6 +3197,57 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_leaf_agent_params_and_prompt() {
+        let params = serde_json::json!({
+            "mode": "leaf",
+            "goal": "derive a structured patch",
+            "allowed_actions": ["json_stdout"],
+            "max_iterations": 1,
+            "result_slot": "leaf_result",
+            "output_keys": ["change_spec"]
+        });
+
+        let parsed = parse_agent_params("s1", &params).expect("parse agent params");
+        assert_eq!(parsed.mode, AgentMode::Leaf);
+        assert_eq!(parsed.result_slot.as_deref(), Some("leaf_result"));
+
+        let prompt = build_agent_system_prompt(&parsed, &test_ctx());
+        assert!(prompt.contains("Mode: leaf"));
+        assert!(prompt.contains("Leaf Mode:"));
+        assert!(prompt.contains("The only allowed action is json_stdout."));
+        assert!(prompt.contains("Empty objects, missing required keys"));
+        assert!(prompt.contains("do not return an empty list unless"));
+        assert!(prompt.contains("save_as=leaf_result"));
+    }
+
+    #[test]
+    fn test_leaf_execute_action_schema_requires_payload_and_result_slot() {
+        let params = AgentStepParams {
+            mode: AgentMode::Leaf,
+            goal: "derive".to_string(),
+            allowed_actions: HashSet::from(["json_stdout".to_string()]),
+            max_iterations: 1,
+            output_keys: vec!["fills".to_string(), "file_path".to_string()],
+            output_rules: HashMap::new(),
+            result_slot: Some("leaf_result".to_string()),
+            bound_inputs: HashMap::new(),
+        };
+        let schema = leaf_execute_action_schema(&params);
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["action", "params", "save_as", "capture"])
+        );
+        assert_eq!(
+            schema["properties"]["save_as"]["enum"],
+            serde_json::json!(["leaf_result"])
+        );
+        assert_eq!(
+            schema["properties"]["params"]["properties"]["payload"]["required"],
+            serde_json::json!(["fills", "file_path"])
+        );
+    }
+
+    #[test]
     fn test_parse_agent_params_supports_legacy_output_sources() {
         let params = serde_json::json!({
             "goal": "inspect",
@@ -2938,9 +3331,45 @@ mod tests {
 
         let prompt = build_agent_system_prompt(&params, &ctx);
         assert!(prompt.contains("Activated Skills:"));
-        assert!(prompt.contains("- tabular: data processing and formatting"));
+        assert!(prompt.contains("- tabular"));
+        assert!(prompt.contains("data processing and formatting"));
         assert!(prompt.contains("[skill file: /skills/tabular/SKILL.md]"));
         assert!(prompt.contains("[scripts: /skills/tabular/scripts]"));
+    }
+
+    #[test]
+    fn test_agent_prompt_adds_spreadsheet_binary_rules() {
+        let params = parse_agent_params(
+            "s1",
+            &serde_json::json!({
+                "goal": "update workbook",
+                "allowed_actions": ["shell", "file_read"],
+                "max_iterations": 5,
+                "output_keys": ["summary"]
+            }),
+        )
+        .unwrap();
+
+        let ctx = ExecutorContext::new(
+            TaskId::from("task-1"),
+            Arc::new(RwLock::new(WorkingSet::new())),
+            Arc::new(InMemoryReferenceStore::new()),
+        )
+        .with_skill_instructions(vec![SkillInstruction {
+            skill_name: "xlsx".to_string(),
+            instructions:
+                "summary: spreadsheet workbook editing\nkeywords: excel, spreadsheet, workbook"
+                    .to_string(),
+            skill_path: Some("/skills/xlsx/SKILL.md".to_string()),
+            scripts_dir: Some("/skills/xlsx/scripts".to_string()),
+            venv_python: Some("/skills/xlsx/.venv/bin/python3".to_string()),
+        }]);
+
+        let prompt = build_agent_system_prompt(&params, &ctx);
+        assert!(prompt.contains("Skill-Specific Rules:"));
+        assert!(prompt.contains("never call file_read on .xlsx"));
+        assert!(prompt.contains("inspect or modify the workbook with shell"));
+        assert!(prompt.contains("avoid recalc.py unless formulas were added/changed"));
     }
 
     #[test]
@@ -2956,7 +3385,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_bound_inputs_block_uses_multiline_block_for_skill() {
+    fn test_build_bound_inputs_block_omits_skill_doc_in_leaf_mode_when_other_inputs_exist() {
         let mut bound_inputs = HashMap::new();
         bound_inputs.insert(
             "skill_doc".to_string(),
@@ -2966,11 +3395,20 @@ mod tests {
             "input_file".to_string(),
             Value::String("docs/a.dat".to_string()),
         );
-        let block = build_bound_inputs_block(&bound_inputs);
-        assert!(block.contains("- skill_doc:"));
-        assert!(block.contains("  line-1"));
-        assert!(block.contains("  line-2"));
+        let params = AgentStepParams {
+            mode: AgentMode::Leaf,
+            goal: "derive".to_string(),
+            allowed_actions: HashSet::from(["json_stdout".to_string()]),
+            max_iterations: 1,
+            output_keys: vec!["fills".to_string()],
+            output_rules: HashMap::new(),
+            result_slot: Some("leaf_result".to_string()),
+            bound_inputs,
+        };
+        let block = build_bound_inputs_block(&params);
+        assert!(!block.contains("- skill_doc:"));
         assert!(block.contains("- input_file = docs/a.dat"));
+        assert!(block.contains("skill_* bound inputs omitted in leaf mode"));
     }
 
     #[test]
@@ -3032,6 +3470,23 @@ mod tests {
         let result = parse_tool_call_decision("unknown_tool", args);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("unknown tool"));
+    }
+
+    #[test]
+    fn test_collect_agent_debug_text_payloads_finds_multiline_script() {
+        let payload = serde_json::json!({
+            "action": "json_stdout",
+            "params": {
+                "payload": {
+                    "script": "import openpyxl\nprint('fill')\nprint('done')",
+                    "note": "short"
+                }
+            }
+        });
+        let matches = collect_agent_debug_text_payloads(&payload);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].path, "$.params.payload.script");
+        assert!(matches[0].text.contains("import openpyxl"));
     }
 
     #[test]
@@ -3283,9 +3738,74 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_agent_executor_wraps_json_stdout_payload_for_leaf_outputs() {
+        let client = ToolCallLlmClient {
+            responses: Mutex::new(VecDeque::from(vec![LlmResponse::ToolCall {
+                id: "call-1".to_string(),
+                name: "execute_action".to_string(),
+                arguments: serde_json::json!({
+                    "action": "json_stdout",
+                    "params": {
+                        "updated_file_path": "/tmp/mock.xlsx",
+                        "summary": "filled workbook"
+                    },
+                    "save_as": "fill_result",
+                    "capture": "json_stdout"
+                }),
+            }])),
+        };
+        let executor = LlmAgentExecutor::new(client, LlmAgentExecutorConfig::default());
+
+        let step = Step::agent("s1").with_params(serde_json::json!({
+            "goal": "fill workbook",
+            "allowed_actions": ["json_stdout"],
+            "max_iterations": 1,
+            "output_keys": ["updated_file_path", "summary"],
+            "output_rules": {
+                "updated_file_path": {
+                    "candidates": [
+                        { "slot": "fill_result", "path": "updated_file_path" }
+                    ]
+                },
+                "summary": {
+                    "candidates": [
+                        { "slot": "fill_result", "path": "summary" }
+                    ]
+                }
+            }
+        }));
+        let mut registry = ActionRegistry::new();
+        registry.register(Arc::new(JsonStdoutAction));
+        let result = executor
+            .execute_agent_step(
+                &step,
+                step.params.clone(),
+                "exec-1",
+                &test_ctx(),
+                Arc::new(RwLock::new(registry)),
+            )
+            .await;
+
+        match result {
+            ActionResult::Success { exports } => {
+                assert_eq!(
+                    exports.get("updated_file_path"),
+                    Some(&Value::String("/tmp/mock.xlsx".to_string()))
+                );
+                assert_eq!(
+                    exports.get("summary"),
+                    Some(&Value::String("filled workbook".to_string()))
+                );
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
     #[test]
     fn test_materialize_output_rules_do_not_fallback_to_generic_aliases() {
         let params = AgentStepParams {
+            mode: AgentMode::Explore,
             goal: "fill workbook".to_string(),
             allowed_actions: HashSet::new(),
             max_iterations: 1,
@@ -3303,6 +3823,7 @@ mod tests {
                     required_action: None,
                 },
             )]),
+            result_slot: None,
             bound_inputs: HashMap::new(),
         };
 
@@ -3326,8 +3847,65 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_agent_action_success_rejects_empty_leaf_payload() {
+        let params = AgentStepParams {
+            mode: AgentMode::Leaf,
+            goal: "fill workbook".to_string(),
+            allowed_actions: HashSet::from(["json_stdout".to_string()]),
+            max_iterations: 1,
+            output_keys: vec!["fills".to_string(), "file_path".to_string()],
+            output_rules: HashMap::from([
+                (
+                    "fills".to_string(),
+                    AgentOutputRule {
+                        candidates: vec![AgentOutputCandidate {
+                            slot: "leaf_result".to_string(),
+                            path: parse_path_segments("fills").expect("valid path"),
+                            required_action: Some("json_stdout".to_string()),
+                        }],
+                        template: None,
+                        fallback_aliases: vec![],
+                        required_action: Some("json_stdout".to_string()),
+                    },
+                ),
+                (
+                    "file_path".to_string(),
+                    AgentOutputRule {
+                        candidates: vec![AgentOutputCandidate {
+                            slot: "leaf_result".to_string(),
+                            path: parse_path_segments("file_path").expect("valid path"),
+                            required_action: Some("json_stdout".to_string()),
+                        }],
+                        template: None,
+                        fallback_aliases: vec![],
+                        required_action: Some("json_stdout".to_string()),
+                    },
+                ),
+            ]),
+            result_slot: Some("leaf_result".to_string()),
+            bound_inputs: HashMap::new(),
+        };
+        let mut exports = HashMap::new();
+        exports.insert("stdout".to_string(), serde_json::json!("{}"));
+        exports.insert("stderr".to_string(), serde_json::json!(""));
+        exports.insert("status".to_string(), serde_json::json!(0));
+        let err = validate_agent_action_success(
+            &params,
+            &AgentEvidenceStore::default(),
+            "json_stdout",
+            &exports,
+            &serde_json::json!({}),
+            Some("leaf_result"),
+        )
+        .expect_err("empty payload should be rejected");
+        assert_eq!(err.key, "fills");
+        assert_eq!(err.reason_code, "rule_unresolved");
+    }
+
+    #[test]
     fn test_materialize_output_rules_allow_explicit_fallback_aliases() {
         let params = AgentStepParams {
+            mode: AgentMode::Explore,
             goal: "fill workbook".to_string(),
             allowed_actions: HashSet::new(),
             max_iterations: 1,
@@ -3345,6 +3923,7 @@ mod tests {
                     required_action: None,
                 },
             )]),
+            result_slot: None,
             bound_inputs: HashMap::new(),
         };
 
@@ -3371,6 +3950,7 @@ mod tests {
     #[test]
     fn test_materialize_output_rules_reject_spoofed_action_named_slot() {
         let params = AgentStepParams {
+            mode: AgentMode::Explore,
             goal: "fill workbook".to_string(),
             allowed_actions: HashSet::from([
                 "shell".to_string(),
@@ -3392,6 +3972,7 @@ mod tests {
                     required_action: None,
                 },
             )]),
+            result_slot: None,
             bound_inputs: HashMap::new(),
         };
 
@@ -3412,6 +3993,7 @@ mod tests {
     #[test]
     fn test_materialize_output_rules_accept_requires_action_evidence() {
         let params = AgentStepParams {
+            mode: AgentMode::Explore,
             goal: "fill workbook".to_string(),
             allowed_actions: HashSet::from(["file_write".to_string(), "shell".to_string()]),
             max_iterations: 1,
@@ -3429,6 +4011,7 @@ mod tests {
                     required_action: None,
                 },
             )]),
+            result_slot: None,
             bound_inputs: HashMap::new(),
         };
 
@@ -3660,7 +4243,17 @@ mod tests {
 
     #[test]
     fn test_agent_tool_definitions_has_three_tools() {
-        let tools = agent_tool_definitions();
+        let params = AgentStepParams {
+            mode: AgentMode::Explore,
+            goal: "inspect".to_string(),
+            allowed_actions: HashSet::from(["echo".to_string()]),
+            max_iterations: 1,
+            output_keys: vec!["summary".to_string()],
+            output_rules: HashMap::new(),
+            result_slot: None,
+            bound_inputs: HashMap::new(),
+        };
+        let tools = agent_tool_definitions(&params);
         assert_eq!(tools.len(), 3);
         assert_eq!(tools[0].name, "execute_action");
         assert_eq!(tools[1].name, "finish");

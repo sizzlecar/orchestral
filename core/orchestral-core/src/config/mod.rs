@@ -22,6 +22,8 @@ use std::collections::HashMap;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::recipe::RecipeTemplate;
+
 /// Top-level configuration schema for Orchestral.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OrchestralConfig {
@@ -51,6 +53,8 @@ pub struct OrchestralConfig {
     #[serde(default)]
     pub actions: ActionsConfig,
     #[serde(default)]
+    pub recipes: RecipesConfig,
+    #[serde(default)]
     #[serde(alias = "plugins")]
     pub extensions: ExtensionsConfig,
 }
@@ -74,6 +78,7 @@ impl Default for OrchestralConfig {
             observability: ObservabilityConfig::default(),
             providers: ProvidersConfig::default(),
             actions: ActionsConfig::default(),
+            recipes: RecipesConfig::default(),
             extensions: ExtensionsConfig::default(),
         }
     }
@@ -86,6 +91,10 @@ impl OrchestralConfig {
 
     pub fn actions(&self) -> &ActionsConfig {
         &self.actions
+    }
+
+    pub fn recipes(&self) -> &RecipesConfig {
+        &self.recipes
     }
 
     pub fn extensions(&self) -> &ExtensionsConfig {
@@ -500,6 +509,12 @@ pub type LocalFilesConfig = LocalBlobsConfig;
 pub type S3FilesConfig = S3BlobsConfig;
 pub type HybridFilesConfig = HybridBlobsConfig;
 pub type FileCatalogConfig = BlobCatalogConfig;
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct RecipesConfig {
+    #[serde(default)]
+    pub templates: Vec<RecipeTemplate>,
+}
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ExtensionsConfig {

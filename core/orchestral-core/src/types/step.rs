@@ -3,7 +3,7 @@
 //! Step represents an atomic execution unit in a Plan.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::fmt;
 
 /// Strongly-typed Step ID.
@@ -70,6 +70,8 @@ pub enum StepKind {
     /// Normal Action execution
     #[default]
     Action,
+    /// Macro step lowered into a concrete action DAG before validation/execution.
+    Recipe,
     /// Wait for user input
     WaitUser,
     /// Wait for external event
@@ -204,6 +206,34 @@ impl Step {
             id: id.into(),
             action: "agent".to_string(),
             kind: StepKind::Agent,
+            depends_on: Vec::new(),
+            exports: Vec::new(),
+            io_bindings: Vec::new(),
+            params: Value::Null,
+        }
+    }
+
+    /// Create a bounded leaf-agent step.
+    pub fn leaf_agent(id: impl Into<StepId>) -> Self {
+        Self {
+            id: id.into(),
+            action: "agent".to_string(),
+            kind: StepKind::Agent,
+            depends_on: Vec::new(),
+            exports: Vec::new(),
+            io_bindings: Vec::new(),
+            params: json!({
+                "mode": "leaf"
+            }),
+        }
+    }
+
+    /// Create a recipe step that will be compiled into concrete steps.
+    pub fn recipe(id: impl Into<StepId>) -> Self {
+        Self {
+            id: id.into(),
+            action: "recipe".to_string(),
+            kind: StepKind::Recipe,
             depends_on: Vec::new(),
             exports: Vec::new(),
             io_bindings: Vec::new(),
