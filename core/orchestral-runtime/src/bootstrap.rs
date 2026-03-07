@@ -14,7 +14,7 @@ use tokio::sync::RwLock;
 use crate::action::{
     ActionConfigError, ActionFactory, ActionRegistryManager, ActionWatcher, DefaultActionFactory,
 };
-use crate::agent::{LlmAgentExecutor, LlmAgentExecutorConfig};
+use crate::agent::{default_action_preflight_hook, LlmAgentExecutor, LlmAgentExecutorConfig};
 use crate::context::{BasicContextBuilder, TokenBudget};
 use crate::planner::{
     DefaultLlmClientFactory, LlmBuildError, LlmClient, LlmClientFactory, LlmInvocationConfig,
@@ -190,6 +190,7 @@ impl RuntimeApp {
         };
 
         let executor = Executor::with_registry(action_registry_manager.registry())
+            .with_action_preflight_hook(default_action_preflight_hook())
             .with_export_contract(config.runtime.strict_exports);
         let executor = if let Some(agent_executor) = build_agent_step_executor(&config)? {
             executor.with_agent_step_executor(agent_executor)

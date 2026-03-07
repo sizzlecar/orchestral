@@ -1332,6 +1332,10 @@ impl Action for FileWriteAction {
                         "description": "Append content instead of overwrite when true.",
                         "default": self.default_append
                     },
+                    "allow_empty": {
+                        "type": "boolean",
+                        "description": "Allow empty content writes. Defaults to false to avoid accidental truncation."
+                    },
                     "max_bytes": {
                         "type": "integer",
                         "description": "Maximum allowed content bytes for this call (clamped by action config max_write_bytes)."
@@ -1365,6 +1369,12 @@ impl Action for FileWriteAction {
             Some(c) => c,
             None => return ActionResult::error("Missing content for file_write"),
         };
+        let allow_empty = params_get_bool(params, "allow_empty").unwrap_or(false);
+        if content.is_empty() && !allow_empty {
+            return ActionResult::error(
+                "Refusing to write empty content; set allow_empty=true if intentional",
+            );
+        }
         let content_bytes = content.as_bytes();
         let max_bytes = bounded_u64(
             params_get_u64(params, "max_bytes"),
@@ -1926,6 +1936,86 @@ mod tests {
                     assert!(message.contains("read_only"));
                 }
                 other => panic!("expected error, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn test_file_write_rejects_empty_content_by_default() {
+        tokio_test::block_on(async {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos();
+            let path = format!("target/orchestral_file_write_empty_{}.txt", unique);
+            let spec = ActionSpec {
+                name: "file_write".to_string(),
+                kind: "file_write".to_string(),
+                description: None,
+                config: json!({
+                    "sandbox_mode": "workspace_write",
+                    "sandbox_writable_roots": ["."],
+                    "create_dirs": true
+                }),
+                interface: None,
+            };
+            let action = FileWriteAction::from_spec(&spec);
+            let input = ActionInput::with_params(json!({
+                "path": path,
+                "content": ""
+            }));
+
+            let result = action.run(input, test_ctx()).await;
+            match result {
+                ActionResult::Error { message } => {
+                    assert!(message.contains("allow_empty=true"));
+                }
+                other => panic!("expected error, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn test_file_write_allows_empty_content_with_opt_in() {
+        tokio_test::block_on(async {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos();
+            let path = format!("target/orchestral_file_write_empty_optin_{}.txt", unique);
+            let spec = ActionSpec {
+                name: "file_write".to_string(),
+                kind: "file_write".to_string(),
+                description: None,
+                config: json!({
+                    "sandbox_mode": "workspace_write",
+                    "sandbox_writable_roots": ["."],
+                    "create_dirs": true
+                }),
+                interface: None,
+            };
+            let action = FileWriteAction::from_spec(&spec);
+            let input = ActionInput::with_params(json!({
+                "path": path,
+                "content": "",
+                "allow_empty": true
+            }));
+
+            let result = action.run(input, test_ctx()).await;
+            match result {
+                ActionResult::Success { exports } => {
+                    assert_eq!(exports.get("bytes").and_then(|v| v.as_u64()), Some(0));
+                    let written_path = exports
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .expect("path export");
+                    let content = tokio::fs::read_to_string(written_path)
+                        .await
+                        .expect("read back");
+                    assert_eq!(content, "");
+                    let _ = tokio::fs::remove_file(written_path).await;
+                }
+                other => panic!("expected success, got {:?}", other),
             }
         });
     }
