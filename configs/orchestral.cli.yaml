@@ -14,7 +14,7 @@ planner:
   mode: llm
   # Requires OPENROUTER_API_KEY.
   backend: openrouter
-  model_profile: claude-sonnet-4-5
+  model_profile: claude-opus-4-6
   max_history: 20
   log_full_prompts: true
   dynamic_model_selection: true
@@ -124,7 +124,7 @@ observability:
 
 providers:
   default_backend: openrouter
-  default_model: claude-sonnet-4-5
+  default_model: claude-opus-4-6
   backends:
     - name: openrouter
       kind: openrouter
@@ -139,6 +139,13 @@ providers:
         timeout_secs: 60
         interpreter_timeout_secs: 8
   models:
+    - name: claude-opus-4-6
+      backend: openrouter
+      model: anthropic/claude-opus-4.6
+      temperature: 0.1
+      policy:
+        temperature_min: 0.0
+        temperature_max: 0.7
     - name: claude-sonnet-4-5
       backend: openrouter
       model: anthropic/claude-sonnet-4.5
