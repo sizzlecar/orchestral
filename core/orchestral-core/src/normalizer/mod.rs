@@ -433,6 +433,7 @@ fn apply_agent_defaults(step: &mut crate::types::Step) {
 
     if let Some(params) = step.params.as_object_mut() {
         normalize_agent_output_rules(params);
+        repair_leaf_mode_for_read_only_inputs(params);
         if agent_mode_from_params(params) == Some(AgentMode::Leaf) {
             append_leaf_goal_guard(params);
             let result_slot = params
@@ -465,6 +466,30 @@ fn apply_agent_defaults(step: &mut crate::types::Step) {
                 .entry("max_iterations".to_string())
                 .or_insert(Value::from(5_u64));
         }
+    }
+}
+
+fn repair_leaf_mode_for_read_only_inputs(params: &mut serde_json::Map<String, Value>) {
+    if agent_mode_from_params(params) != Some(AgentMode::Leaf) {
+        return;
+    }
+
+    let Some(actions) = params.get("allowed_actions").and_then(Value::as_array) else {
+        return;
+    };
+    let extra_actions = actions
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|action| *action != "json_stdout")
+        .collect::<Vec<_>>();
+    if extra_actions.is_empty() {
+        return;
+    }
+    if extra_actions.iter().all(|action| *action == "file_read")
+        && !output_rules_require_explicit_action(params)
+    {
+        params.insert("mode".to_string(), Value::String("explore".to_string()));
+        params.remove("result_slot");
     }
 }
 
@@ -1170,7 +1195,28 @@ mod tests {
     }
 
     #[test]
-    fn test_normalizer_rejects_leaf_agent_with_non_json_stdout_actions() {
+    fn test_normalizer_repairs_leaf_agent_with_file_read_actions_to_explore() {
+        let normalizer = PlanNormalizer::new();
+        let plan = Plan::new(
+            "repair-leaf-agent",
+            vec![Step::agent("s1").with_params(json!({
+                "mode": "leaf",
+                "goal": "derive a patch",
+                "allowed_actions": ["file_read", "json_stdout"],
+                "max_iterations": 3,
+                "output_keys": ["change_spec"]
+            }))],
+        );
+
+        let normalized = normalizer.normalize(plan).expect("normalize");
+        let step = normalized.plan.get_step("s1").expect("s1");
+        assert_eq!(step.params.get("mode"), Some(&json!("explore")));
+        assert_eq!(step.params.get("max_iterations"), Some(&json!(3)));
+        assert!(step.params.get("result_slot").is_none());
+    }
+
+    #[test]
+    fn test_normalizer_rejects_leaf_agent_with_shell_actions() {
         let normalizer = PlanNormalizer::new();
         let plan = Plan::new(
             "invalid-leaf-agent",
