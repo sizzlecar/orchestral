@@ -382,7 +382,7 @@ fn stderr_preview(stderr: &str, max_chars: usize) -> String {
     out
 }
 
-fn extract_inline_script_body<'a>(use_shell: bool, args: &'a [String]) -> Option<&'a str> {
+fn extract_inline_script_body(use_shell: bool, args: &[String]) -> Option<&str> {
     if use_shell {
         return args
             .first()

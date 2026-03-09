@@ -537,7 +537,7 @@ fn archive_runtime_log(source: &Path, destination: &Path) -> anyhow::Result<Opti
             )
         })?;
     }
-    fs::copy(source, &destination).with_context(|| {
+    fs::copy(source, destination).with_context(|| {
         format!(
             "archive runtime log '{}' -> '{}' failed",
             source.display(),
