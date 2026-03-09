@@ -39,6 +39,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         PlannerOutput::Clarification(question) => {
             info!(%question, "clarification required");
         }
+        PlannerOutput::StageChoice(choice) => {
+            info!(
+                recipe_family = ?choice.recipe_family,
+                artifact_family = ?choice.artifact_family,
+                current_stage = ?choice.current_stage,
+                "reactor stage choice"
+            );
+        }
     }
 
     Ok(())

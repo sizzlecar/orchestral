@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::sync::RwLock;
 
@@ -17,9 +18,10 @@ use orchestral_core::executor::{
     ExecutionProgressEvent, ExecutionProgressReporter, ExecutionResult, Executor, ExecutorContext,
 };
 use orchestral_core::interpreter::InterpretRequest;
-use orchestral_core::normalizer::{NormalizeError, PlanNormalizer};
+use orchestral_core::normalizer::{NormalizeError, PlanNormalizer, ValidationError};
 use orchestral_core::planner::{
     HistoryItem, PlanError, Planner, PlannerContext, PlannerOutput, PlannerRuntimeInfo,
+    SkillInstruction,
 };
 use orchestral_core::spi::{HookRegistry, RuntimeHookContext, RuntimeHookEventEnvelope, SpiMeta};
 use orchestral_core::store::{
@@ -27,12 +29,19 @@ use orchestral_core::store::{
     WorkingSet,
 };
 use orchestral_core::types::{
-    Intent, IntentContext, Step, StepId, StepKind, Task, TaskId, TaskState, WaitUserReason,
+    ContinuationState, ContinuationStatus, Intent, IntentContext, ReactorTaskState, StageChoice,
+    StageKind, Step, StepId, StepIoBinding, StepKind, Task, TaskId, TaskState, VerifyDecision,
+    VerifyStatus, WaitUserReason,
 };
 
 use crate::{HandleEventResult, InteractionState, RuntimeError, ThreadRuntime};
 
 const MAX_LOG_CHARS: usize = 8_000;
+const REACTOR_SPREADSHEET_LOCATE_ACTION: &str = "reactor_spreadsheet_locate";
+const REACTOR_SPREADSHEET_INSPECT_ACTION: &str = "reactor_spreadsheet_inspect";
+const REACTOR_SPREADSHEET_ASSESS_ACTION: &str = "reactor_spreadsheet_assess_readiness";
+const REACTOR_SPREADSHEET_APPLY_ACTION: &str = "reactor_spreadsheet_apply_patch";
+const REACTOR_SPREADSHEET_VERIFY_ACTION: &str = "reactor_spreadsheet_verify_patch";
 
 fn truncate_for_log(input: &str, max_chars: usize) -> String {
     let char_count = input.chars().count();
@@ -46,6 +55,476 @@ fn truncate_for_log(input: &str, max_chars: usize) -> String {
 
 fn truncate_debug_for_log(value: &impl std::fmt::Debug, max_chars: usize) -> String {
     truncate_for_log(&format!("{:?}", value), max_chars)
+}
+
+fn parse_working_set_value<T: DeserializeOwned>(
+    snapshot: &HashMap<String, Value>,
+    key: &str,
+) -> Result<T, OrchestratorError> {
+    let value = snapshot.get(key).ok_or_else(|| {
+        OrchestratorError::Planner(PlanError::Generation(format!(
+            "reactor expected working_set key '{}'",
+            key
+        )))
+    })?;
+    serde_json::from_value::<T>(value.clone()).map_err(|err| {
+        OrchestratorError::Planner(PlanError::Generation(format!(
+            "reactor failed to parse working_set key '{}': {}",
+            key, err
+        )))
+    })
+}
+
+fn require_working_set_string(
+    snapshot: &HashMap<String, Value>,
+    key: &str,
+) -> Result<String, OrchestratorError> {
+    snapshot
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            OrchestratorError::Planner(PlanError::Generation(format!(
+                "reactor expected string working_set key '{}'",
+                key
+            )))
+        })
+}
+
+fn build_leaf_output_rules(keys: &[&str], result_slot: &str) -> Value {
+    let mut map = serde_json::Map::new();
+    for key in keys {
+        map.insert(
+            (*key).to_string(),
+            serde_json::json!({
+                "candidates": [
+                    { "slot": result_slot, "path": key }
+                ]
+            }),
+        );
+    }
+    Value::Object(map)
+}
+
+fn build_spreadsheet_probe_plan(task: &Task, choice: &StageChoice) -> orchestral_core::types::Plan {
+    let mut plan = orchestral_core::types::Plan::new(
+        choice.stage_goal.clone(),
+        vec![
+            Step::action("reactor_probe_locate", REACTOR_SPREADSHEET_LOCATE_ACTION)
+                .with_exports(vec![
+                    "source_path".to_string(),
+                    "artifact_candidates".to_string(),
+                    "artifact_count".to_string(),
+                ])
+                .with_params(serde_json::json!({
+                    "source_root": ".",
+                    "user_request": task.intent.content,
+                })),
+            Step::action("reactor_probe_inspect", REACTOR_SPREADSHEET_INSPECT_ACTION)
+                .with_depends_on(vec![StepId::from("reactor_probe_locate")])
+                .with_exports(vec!["inspection".to_string()])
+                .with_io_bindings(vec![StepIoBinding::required("reactor_probe_locate.source_path", "path")]),
+            Step::leaf_agent("reactor_probe_derive")
+                .with_depends_on(vec![
+                    StepId::from("reactor_probe_locate"),
+                    StepId::from("reactor_probe_inspect"),
+                ])
+                .with_exports(vec!["patch_candidates".to_string(), "summary".to_string()])
+                .with_io_bindings(vec![
+                    StepIoBinding::required("reactor_probe_locate.source_path", "source_path"),
+                    StepIoBinding::required("reactor_probe_inspect.inspection", "inspection"),
+                ])
+                .with_params(serde_json::json!({
+                    "mode": "leaf",
+                    "goal": "Probe a spreadsheet patch task. Using user_request, source_path, inspection, and derivation_policy, return JSON with keys patch_candidates and summary. patch_candidates must describe candidate fills for patchable cells without modifying the file. permissive policy may propose generic but coherent spreadsheet fill content when structure is clear. strict policy should surface unresolved unknowns through patch_candidates. Do not decide continuation here.",
+                    "allowed_actions": ["json_stdout"],
+                    "max_iterations": 1,
+                    "result_slot": "probe_result",
+                    "output_keys": ["patch_candidates", "summary"],
+                    "output_rules": build_leaf_output_rules(&["patch_candidates", "summary"], "probe_result"),
+                    "user_request": task.intent.content,
+                    "stage_goal": choice.stage_goal,
+                    "derivation_policy": choice.derivation_policy,
+                })),
+            Step::action("reactor_probe_assess", REACTOR_SPREADSHEET_ASSESS_ACTION)
+                .with_depends_on(vec![
+                    StepId::from("reactor_probe_inspect"),
+                    StepId::from("reactor_probe_derive"),
+                ])
+                .with_exports(vec!["continuation".to_string(), "summary".to_string()])
+                .with_io_bindings(vec![
+                    StepIoBinding::required("reactor_probe_inspect.inspection", "inspection"),
+                    StepIoBinding::required("reactor_probe_derive.patch_candidates", "patch_candidates"),
+                ])
+                .with_params(serde_json::json!({
+                    "derivation_policy": choice.derivation_policy,
+                })),
+        ],
+    );
+    plan.on_failure = Some("Spreadsheet probe failed: {{error}}".to_string());
+    plan
+}
+
+fn build_spreadsheet_commit_plan(
+    task: &Task,
+    choice: &StageChoice,
+) -> Result<orchestral_core::types::Plan, OrchestratorError> {
+    let source_path = require_working_set_string(&task.working_set_snapshot, "source_path")?;
+    let mut plan = orchestral_core::types::Plan::new(
+        choice.stage_goal.clone(),
+        vec![
+            Step::leaf_agent("reactor_commit_derive")
+                .with_exports(vec!["patch_spec".to_string(), "summary".to_string()])
+                .with_params(serde_json::json!({
+                    "mode": "leaf",
+                    "goal": "Commit stage for spreadsheet patching. Using user_request, source_path, inspection, patch_candidates, and derivation_policy, return JSON with keys patch_spec and summary. patch_spec must be an object with path and fills. patch_spec.fills must be an array of {cell, value}. Cover every patchable cell listed in inspection.selected_region.patchable_cells unless the cell is already handled by a formula or existing non-empty value. If derivation_policy is permissive, fill any remaining uncovered patchable cells with coherent generic content inferred from row labels and column headers instead of leaving gaps. Do not include unchanged cells. Preserve formulas and workbook structure. When a proposed fill is numeric, emit a numeric JSON value instead of prose.",
+                    "allowed_actions": ["json_stdout"],
+                    "max_iterations": 1,
+                    "result_slot": "commit_result",
+                    "output_keys": ["patch_spec", "summary"],
+                    "output_rules": build_leaf_output_rules(&["patch_spec", "summary"], "commit_result"),
+                    "user_request": task.intent.content,
+                    "source_path": source_path,
+                    "inspection": task.working_set_snapshot.get("inspection").cloned().unwrap_or(Value::Null),
+                    "patch_candidates": task.working_set_snapshot.get("patch_candidates").cloned().unwrap_or(Value::Null),
+                    "derivation_policy": choice.derivation_policy,
+                })),
+            Step::action("reactor_commit_apply", REACTOR_SPREADSHEET_APPLY_ACTION)
+                .with_depends_on(vec![StepId::from("reactor_commit_derive")])
+                .with_exports(vec![
+                    "updated_file_path".to_string(),
+                    "patch_count".to_string(),
+                    "summary".to_string(),
+                ])
+                .with_io_bindings(vec![StepIoBinding::required("reactor_commit_derive.patch_spec", "patch_spec")])
+                .with_params(serde_json::json!({
+                    "path": source_path,
+                })),
+        ],
+    );
+    plan.on_failure = Some("Spreadsheet commit failed: {{error}}".to_string());
+    Ok(plan)
+}
+
+fn build_spreadsheet_verify_plan(
+    task: &Task,
+    choice: &StageChoice,
+) -> Result<orchestral_core::types::Plan, OrchestratorError> {
+    let path = require_working_set_string(&task.working_set_snapshot, "updated_file_path")
+        .or_else(|_| require_working_set_string(&task.working_set_snapshot, "source_path"))?;
+    let mut plan = orchestral_core::types::Plan::new(
+        choice.stage_goal.clone(),
+        vec![
+            Step::action("reactor_verify", REACTOR_SPREADSHEET_VERIFY_ACTION)
+                .with_exports(vec!["verify_decision".to_string(), "summary".to_string()])
+                .with_params(serde_json::json!({
+                    "path": path,
+                })),
+        ],
+    );
+    plan.on_complete = Some("Workbook updated and verified.".to_string());
+    plan.on_failure = Some("Spreadsheet verify failed: {{error}}".to_string());
+    Ok(plan)
+}
+
+fn maybe_shape_probe_first_plan(
+    intent: &Intent,
+    skills: &[SkillInstruction],
+    available_actions: &[ActionMeta],
+    mut plan: orchestral_core::types::Plan,
+) -> orchestral_core::types::Plan {
+    if plan.steps.is_empty()
+        || plan.steps.iter().any(|step| {
+            matches!(
+                step.kind,
+                StepKind::Recipe | StepKind::WaitUser | StepKind::WaitEvent | StepKind::Replan
+            )
+        })
+    {
+        return plan;
+    }
+
+    let split_index = probe_split_index(&plan, available_actions);
+    let probe_scope_len = split_index.unwrap_or(plan.steps.len());
+    if !looks_like_local_exploratory_task(intent, skills, &plan, probe_scope_len, available_actions)
+    {
+        return plan;
+    }
+
+    if split_index.is_none()
+        && plan
+            .steps
+            .iter()
+            .all(|step| is_probe_action(step, available_actions))
+        && plan_needs_follow_up(intent, &plan)
+    {
+        let prompt = probe_replan_prompt(intent, &plan.on_complete, None);
+        append_probe_replan_step(&mut plan, prompt);
+        tracing::info!(
+            shaped_step_count = plan.steps.len(),
+            "orchestrator appended continuation replan to probe-only workflow"
+        );
+        return plan;
+    }
+
+    let Some(split_index) = split_index else {
+        return plan;
+    };
+
+    let probe_steps = plan.steps[..split_index].to_vec();
+    let tail_ids = terminal_step_ids(&probe_steps);
+    if tail_ids.is_empty() {
+        return plan;
+    }
+
+    let deferred_summary = summarize_deferred_steps(&plan.steps[split_index..]);
+    let prompt = probe_replan_prompt(intent, &plan.on_complete, Some(&deferred_summary));
+    let original_step_count = plan.steps.len();
+    plan.steps = probe_steps;
+    append_probe_replan_step_with_deps(&mut plan, tail_ids, prompt);
+    tracing::info!(
+        original_step_count,
+        shaped_step_count = plan.steps.len(),
+        split_index,
+        "orchestrator shaped initial workflow into probe-first plan"
+    );
+    plan
+}
+
+fn probe_split_index(
+    plan: &orchestral_core::types::Plan,
+    available_actions: &[ActionMeta],
+) -> Option<usize> {
+    for (index, step) in plan.steps.iter().enumerate() {
+        if index == 0 {
+            continue;
+        }
+        if step.kind == StepKind::Agent {
+            return Some(index);
+        }
+        if is_explicit_mutation_step(step, available_actions) {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn is_explicit_mutation_step(step: &Step, available_actions: &[ActionMeta]) -> bool {
+    if step.kind != StepKind::Action {
+        return false;
+    }
+    if step.action == "file_write" {
+        return true;
+    }
+    let Some(meta) = available_actions
+        .iter()
+        .find(|meta| meta.name == step.action)
+    else {
+        return false;
+    };
+    meta.has_role("apply")
+        && !meta.has_role("inspect")
+        && !meta.has_role("collect")
+        && !meta.has_role("verify")
+}
+
+fn looks_like_local_exploratory_task(
+    intent: &Intent,
+    skills: &[SkillInstruction],
+    plan: &orchestral_core::types::Plan,
+    split_index: usize,
+    available_actions: &[ActionMeta],
+) -> bool {
+    let probe_steps = &plan.steps[..split_index];
+    let has_probe_action = probe_steps
+        .iter()
+        .any(|step| is_probe_action(step, available_actions));
+    if !has_probe_action {
+        return false;
+    }
+
+    let has_network = probe_steps.iter().any(|step| {
+        available_actions
+            .iter()
+            .find(|meta| meta.name == step.action)
+            .is_some_and(|meta| meta.has_capability("network_io"))
+    });
+    if has_network {
+        return false;
+    }
+
+    let lowered_intent = intent.content.to_ascii_lowercase();
+    let local_keywords = [
+        "docs",
+        "directory",
+        "folder",
+        "file",
+        "local",
+        "excel",
+        "xlsx",
+        "csv",
+        "json",
+        "yaml",
+        "markdown",
+        "md",
+        "workbook",
+        "spreadsheet",
+        "目录",
+        "文件",
+        "文档",
+        "表格",
+    ];
+    if local_keywords
+        .iter()
+        .any(|keyword| lowered_intent.contains(keyword))
+    {
+        return true;
+    }
+
+    skills_match_keywords(
+        skills,
+        &[
+            "excel",
+            "xlsx",
+            "spreadsheet",
+            "workbook",
+            "markdown",
+            "document",
+            "file",
+        ],
+    )
+}
+
+fn is_probe_action(step: &Step, available_actions: &[ActionMeta]) -> bool {
+    if step.kind != StepKind::Action {
+        return false;
+    }
+    if matches!(step.action.as_str(), "shell" | "file_read") {
+        return true;
+    }
+    available_actions
+        .iter()
+        .find(|meta| meta.name == step.action)
+        .is_some_and(|meta| meta.has_role("inspect") || meta.has_role("collect"))
+}
+
+fn terminal_step_ids(steps: &[Step]) -> Vec<String> {
+    let mut has_downstream: HashMap<&str, bool> =
+        steps.iter().map(|step| (step.id.as_str(), false)).collect();
+    for step in steps {
+        for dep in &step.depends_on {
+            if let Some(value) = has_downstream.get_mut(dep.as_str()) {
+                *value = true;
+            }
+        }
+    }
+    steps
+        .iter()
+        .filter(|step| {
+            !has_downstream
+                .get(step.id.as_str())
+                .copied()
+                .unwrap_or(false)
+        })
+        .map(|step| step.id.to_string())
+        .collect()
+}
+
+fn summarize_deferred_steps(steps: &[Step]) -> String {
+    steps
+        .iter()
+        .map(|step| format!("{}:{}:{:?}", step.id, step.action, step.kind))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn append_probe_replan_step(plan: &mut orchestral_core::types::Plan, prompt: String) {
+    let tail_ids = terminal_step_ids(&plan.steps);
+    append_probe_replan_step_with_deps(plan, tail_ids, prompt);
+}
+
+fn append_probe_replan_step_with_deps(
+    plan: &mut orchestral_core::types::Plan,
+    tail_ids: Vec<String>,
+    prompt: String,
+) {
+    if tail_ids.is_empty() {
+        return;
+    }
+    let replan_step_id = unique_step_id("probe_commit", plan);
+    let replan_step = Step::replan(replan_step_id)
+        .with_depends_on(tail_ids.into_iter().map(StepId::from).collect())
+        .with_params(serde_json::json!({ "prompt": prompt }));
+    plan.steps.push(replan_step);
+}
+
+fn unique_step_id(prefix: &str, plan: &orchestral_core::types::Plan) -> String {
+    if plan.get_step(prefix).is_none() {
+        return prefix.to_string();
+    }
+    let mut suffix = 1usize;
+    loop {
+        let candidate = format!("{}_{}", prefix, suffix);
+        if plan.get_step(&candidate).is_none() {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+fn probe_replan_prompt(
+    intent: &Intent,
+    on_complete: &Option<String>,
+    deferred_summary: Option<&str>,
+) -> String {
+    let mut prompt = format!(
+        "Probe phase is complete for intent: {}.\n\
+        Continue from the current working set only. Do not repeat discovery or inspection when \
+        the target path, content preview, or environment facts are already available. \
+        If commit parameters are still ambiguous, ask the user or wait instead of guessing.",
+        intent.content
+    );
+    if let Some(summary) = deferred_summary.filter(|value| !value.trim().is_empty()) {
+        prompt.push_str(&format!(
+            "\nDeferred plan summary before shaping: {}",
+            summary
+        ));
+    }
+    if let Some(message) = on_complete
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        prompt.push_str(&format!("\nOriginal completion hint: {}", message));
+    }
+    prompt
+}
+
+fn plan_needs_follow_up(intent: &Intent, plan: &orchestral_core::types::Plan) -> bool {
+    let mut haystack = intent.content.to_ascii_lowercase();
+    haystack.push(' ');
+    haystack.push_str(&plan.goal.to_ascii_lowercase());
+    if let Some(on_complete) = &plan.on_complete {
+        haystack.push(' ');
+        haystack.push_str(&on_complete.to_ascii_lowercase());
+    }
+    let follow_up_keywords = [
+        "fill", "write", "update", "modify", "edit", "patch", "apply", "verify", "save", "emit",
+        "replan", "continue", "生成", "填写", "补", "改", "写", "更新", "保存", "输出", "继续",
+    ];
+    follow_up_keywords
+        .iter()
+        .any(|keyword| haystack.contains(keyword))
+}
+
+fn skills_match_keywords(skills: &[SkillInstruction], keywords: &[&str]) -> bool {
+    skills.iter().any(|skill| {
+        let haystack = format!(
+            "{} {}",
+            skill.skill_name.to_ascii_lowercase(),
+            skill.instructions.to_ascii_lowercase()
+        );
+        keywords.iter().any(|keyword| haystack.contains(keyword))
+    })
 }
 
 fn map_progress_phase_to_event_type(phase: &str) -> &'static str {
@@ -128,6 +607,12 @@ pub struct OrchestratorConfig {
     pub include_references: bool,
     /// Retry once by replanning only the failed subgraph.
     pub auto_replan_once: bool,
+    /// Retry once by asking the planner to repair a plan rejected by normalization.
+    pub auto_repair_plan_once: bool,
+    /// Enable stage-based reactor flow for supported artifact families.
+    pub reactor_enabled: bool,
+    /// Max stages runtime may execute in one turn before failing closed.
+    pub reactor_stage_loop_limit: usize,
 }
 
 impl Default for OrchestratorConfig {
@@ -138,6 +623,38 @@ impl Default for OrchestratorConfig {
             include_history: true,
             include_references: true,
             auto_replan_once: true,
+            auto_repair_plan_once: true,
+            reactor_enabled: false,
+            reactor_stage_loop_limit: 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum NormalizeRepairMode {
+    FullPlan,
+    SubgraphPatch { cut_step_id: String },
+}
+
+#[derive(Debug, Clone)]
+struct NormalizeRepairTarget {
+    mode: NormalizeRepairMode,
+    invalid_step_id: Option<String>,
+    affected_steps: Vec<String>,
+}
+
+impl NormalizeRepairTarget {
+    fn mode_label(&self) -> &'static str {
+        match self.mode {
+            NormalizeRepairMode::FullPlan => "full_plan",
+            NormalizeRepairMode::SubgraphPatch { .. } => "subgraph_patch",
+        }
+    }
+
+    fn cut_step_id(&self) -> Option<&str> {
+        match &self.mode {
+            NormalizeRepairMode::FullPlan => None,
+            NormalizeRepairMode::SubgraphPatch { cut_step_id } => Some(cut_step_id.as_str()),
         }
     }
 }
@@ -409,7 +926,7 @@ impl Orchestrator {
         let runtime_info = PlannerRuntimeInfo::detect();
         let context = PlannerContext::with_history(actions, history, self.reference_store.clone())
             .with_runtime_info(runtime_info)
-            .with_skill_instructions(skill_instructions);
+            .with_skill_instructions(skill_instructions.clone());
         let planner_started_at = Instant::now();
         let planner_output = self.planner.plan(&task.intent, &context).await?;
         let planner_elapsed_ms = planner_started_at.elapsed().as_millis() as u64;
@@ -421,6 +938,12 @@ impl Orchestrator {
         );
         match planner_output {
             PlannerOutput::Workflow(plan) => {
+                let plan = maybe_shape_probe_first_plan(
+                    &task.intent,
+                    &skill_instructions,
+                    &context.available_actions,
+                    plan,
+                );
                 self.emit_lifecycle_event(
                     "planning_completed",
                     Some(interaction_id.as_str()),
@@ -508,6 +1031,16 @@ impl Orchestrator {
                     },
                 };
                 Ok(response)
+            }
+            PlannerOutput::StageChoice(choice) => {
+                if !self.config.reactor_enabled {
+                    return Err(OrchestratorError::Planner(PlanError::Generation(
+                        "planner returned stage_choice while runtime.reactor.enabled=false"
+                            .to_string(),
+                    )));
+                }
+                self.run_reactor_pipeline(interaction_id, started_kind, task, choice)
+                    .await
             }
             PlannerOutput::DirectResponse(message) => {
                 self.emit_lifecycle_event(
@@ -668,6 +1201,371 @@ impl Orchestrator {
         }
     }
 
+    async fn run_reactor_pipeline(
+        &self,
+        interaction_id: InteractionId,
+        started_kind: &str,
+        mut task: Task,
+        initial_choice: StageChoice,
+    ) -> Result<OrchestratorResult, OrchestratorError> {
+        let turn_started_at = Instant::now();
+        let mut choice = initial_choice;
+        let mut remaining_stages = self.config.reactor_stage_loop_limit;
+
+        let final_result = loop {
+            if remaining_stages == 0 {
+                break ExecutionResult::Failed {
+                    step_id: StepId::from("reactor"),
+                    error: "reactor stage loop limit reached".to_string(),
+                };
+            }
+            remaining_stages -= 1;
+
+            let mut reactor_state = task.reactor.clone().unwrap_or(ReactorTaskState {
+                recipe_family: choice.recipe_family,
+                artifact_family: choice.artifact_family,
+                current_stage: choice.current_stage,
+                derivation_policy: choice.derivation_policy,
+                last_continuation: None,
+                last_verify: None,
+                verify_required: true,
+            });
+            reactor_state.recipe_family = choice.recipe_family;
+            reactor_state.artifact_family = choice.artifact_family;
+            reactor_state.current_stage = choice.current_stage;
+            reactor_state.derivation_policy = choice.derivation_policy;
+            task.set_reactor_state(reactor_state.clone());
+            self.task_store.save(&task).await?;
+
+            let stage_plan = match choice.current_stage {
+                StageKind::Probe | StageKind::Commit | StageKind::Verify => {
+                    Some(self.lower_reactor_stage_plan(&task, &choice)?)
+                }
+                StageKind::WaitUser | StageKind::Done | StageKind::Failed => None,
+            };
+
+            self.emit_lifecycle_event(
+                "planning_completed",
+                Some(interaction_id.as_str()),
+                Some(task.id.as_str()),
+                Some("reactor stage selected"),
+                serde_json::json!({
+                    "output_type": "stage_choice",
+                    "recipe_family": choice.recipe_family,
+                    "artifact_family": choice.artifact_family,
+                    "current_stage": choice.current_stage,
+                    "stage_goal": choice.stage_goal,
+                    "derivation_policy": choice.derivation_policy,
+                    "reason": choice.reason,
+                    "step_count": stage_plan.as_ref().map(|plan| plan.steps.len()).unwrap_or(0),
+                    "steps": stage_plan
+                        .as_ref()
+                        .map(summarize_plan_steps)
+                        .unwrap_or_else(|| serde_json::json!({ "items": [], "total_steps": 0 })),
+                }),
+            )
+            .await;
+
+            match choice.current_stage {
+                StageKind::WaitUser => {
+                    let prompt = choice
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "Need additional input".to_string());
+                    break ExecutionResult::WaitingUser {
+                        step_id: StepId::from("reactor"),
+                        prompt,
+                        approval: None,
+                    };
+                }
+                StageKind::Done => break ExecutionResult::Completed,
+                StageKind::Failed => {
+                    break ExecutionResult::Failed {
+                        step_id: StepId::from("reactor"),
+                        error: choice
+                            .reason
+                            .clone()
+                            .unwrap_or_else(|| "reactor stage failed".to_string()),
+                    }
+                }
+                StageKind::Probe | StageKind::Commit | StageKind::Verify => {}
+            }
+
+            let plan = stage_plan.expect("stage plan must exist for executable reactor stages");
+            task.set_plan(plan.clone());
+            task.start_executing();
+            self.task_store.save(&task).await?;
+            self.emit_lifecycle_event(
+                "execution_started",
+                Some(interaction_id.as_str()),
+                Some(task.id.as_str()),
+                Some("reactor stage execution started"),
+                serde_json::json!({
+                    "execution_mode": "reactor",
+                    "current_stage": choice.current_stage,
+                    "step_count": plan.steps.len(),
+                }),
+            )
+            .await;
+
+            let snapshot = self
+                .execute_plan_once(&task, interaction_id.as_str(), &plan, None)
+                .await?;
+            task.set_checkpoint(
+                snapshot.completed_step_ids.clone(),
+                snapshot.working_set_snapshot.clone(),
+            );
+            self.task_store.save(&task).await?;
+            self.emit_lifecycle_event(
+                "execution_completed",
+                Some(interaction_id.as_str()),
+                Some(task.id.as_str()),
+                Some("reactor stage execution completed"),
+                serde_json::json!({
+                    "execution_mode": "reactor",
+                    "current_stage": choice.current_stage,
+                    "result": execution_result_metadata(&snapshot.result),
+                }),
+            )
+            .await;
+
+            match snapshot.result.clone() {
+                ExecutionResult::Completed => match choice.current_stage {
+                    StageKind::Probe => {
+                        let continuation: ContinuationState = parse_working_set_value(
+                            &snapshot.working_set_snapshot,
+                            "continuation",
+                        )?;
+                        reactor_state.last_continuation = Some(continuation.clone());
+                        task.set_reactor_state(reactor_state);
+                        self.task_store.save(&task).await?;
+                        match continuation.status {
+                            ContinuationStatus::CommitReady => {
+                                choice = StageChoice {
+                                    recipe_family: choice.recipe_family,
+                                    artifact_family: choice.artifact_family,
+                                    current_stage: StageKind::Commit,
+                                    stage_goal: "derive a typed spreadsheet patch and apply it"
+                                        .to_string(),
+                                    derivation_policy: choice.derivation_policy,
+                                    reason: Some(continuation.reason),
+                                };
+                                continue;
+                            }
+                            ContinuationStatus::WaitUser => {
+                                let prompt = continuation.user_message.unwrap_or_else(|| {
+                                    format!("Need more input: {}", continuation.reason)
+                                });
+                                break ExecutionResult::WaitingUser {
+                                    step_id: StepId::from("reactor_probe"),
+                                    prompt,
+                                    approval: None,
+                                };
+                            }
+                            ContinuationStatus::NeedReplan => {
+                                choice = self
+                                    .build_reactor_replan_choice(
+                                        &task,
+                                        &choice,
+                                        &continuation.reason,
+                                        interaction_id.as_str(),
+                                    )
+                                    .await?;
+                                continue;
+                            }
+                            ContinuationStatus::Done => break ExecutionResult::Completed,
+                            ContinuationStatus::Failed => {
+                                break ExecutionResult::Failed {
+                                    step_id: StepId::from("reactor_probe"),
+                                    error: continuation.reason,
+                                };
+                            }
+                        }
+                    }
+                    StageKind::Commit => {
+                        choice = StageChoice {
+                            recipe_family: choice.recipe_family,
+                            artifact_family: choice.artifact_family,
+                            current_stage: StageKind::Verify,
+                            stage_goal: "verify the applied spreadsheet patch".to_string(),
+                            derivation_policy: choice.derivation_policy,
+                            reason: choice.reason.clone(),
+                        };
+                        continue;
+                    }
+                    StageKind::Verify => {
+                        let verify_decision: VerifyDecision = parse_working_set_value(
+                            &snapshot.working_set_snapshot,
+                            "verify_decision",
+                        )?;
+                        let mut updated_reactor_state =
+                            task.reactor.clone().unwrap_or(ReactorTaskState {
+                                recipe_family: choice.recipe_family,
+                                artifact_family: choice.artifact_family,
+                                current_stage: choice.current_stage,
+                                derivation_policy: choice.derivation_policy,
+                                last_continuation: None,
+                                last_verify: None,
+                                verify_required: true,
+                            });
+                        updated_reactor_state.last_verify = Some(verify_decision.clone());
+                        task.set_reactor_state(updated_reactor_state);
+                        self.task_store.save(&task).await?;
+                        match verify_decision.status {
+                            VerifyStatus::Passed => break ExecutionResult::Completed,
+                            VerifyStatus::Failed => {
+                                break ExecutionResult::Failed {
+                                    step_id: StepId::from("reactor_verify"),
+                                    error: verify_decision.reason,
+                                }
+                            }
+                        }
+                    }
+                    StageKind::WaitUser | StageKind::Done | StageKind::Failed => {
+                        break ExecutionResult::Completed;
+                    }
+                },
+                ExecutionResult::NeedReplan { prompt, .. } => {
+                    choice = self
+                        .build_reactor_replan_choice(
+                            &task,
+                            &choice,
+                            &prompt,
+                            interaction_id.as_str(),
+                        )
+                        .await?;
+                    continue;
+                }
+                other => break other,
+            }
+        };
+
+        let new_state = task_state_from_execution(&final_result);
+        task.set_state(new_state.clone());
+        self.task_store.save(&task).await?;
+        self.thread_runtime
+            .update_interaction_state(
+                interaction_id.as_str(),
+                interaction_state_from_task(&new_state),
+            )
+            .await?;
+        self.emit_interpreted_output(interaction_id.as_str(), &task, &final_result)
+            .await;
+        tracing::info!(
+            interaction_id = %interaction_id,
+            task_id = %task.id,
+            total_turn_elapsed_ms = turn_started_at.elapsed().as_millis() as u64,
+            "orchestrator reactor pipeline finished"
+        );
+
+        let response = match started_kind {
+            "started" => OrchestratorResult::Started {
+                interaction_id,
+                task_id: task.id,
+                result: final_result,
+            },
+            _ => OrchestratorResult::Merged {
+                interaction_id,
+                task_id: task.id,
+                result: final_result,
+            },
+        };
+        Ok(response)
+    }
+
+    fn lower_reactor_stage_plan(
+        &self,
+        task: &Task,
+        choice: &StageChoice,
+    ) -> Result<orchestral_core::types::Plan, OrchestratorError> {
+        match (choice.artifact_family, choice.current_stage) {
+            (orchestral_core::types::ArtifactFamily::Spreadsheet, StageKind::Probe) => {
+                Ok(build_spreadsheet_probe_plan(task, choice))
+            }
+            (orchestral_core::types::ArtifactFamily::Spreadsheet, StageKind::Commit) => {
+                build_spreadsheet_commit_plan(task, choice)
+            }
+            (orchestral_core::types::ArtifactFamily::Spreadsheet, StageKind::Verify) => {
+                build_spreadsheet_verify_plan(task, choice)
+            }
+            _ => Err(OrchestratorError::Planner(PlanError::Generation(format!(
+                "reactor lowering not implemented for artifact_family={:?} current_stage={:?}",
+                choice.artifact_family, choice.current_stage
+            )))),
+        }
+    }
+
+    async fn build_reactor_replan_choice(
+        &self,
+        task: &Task,
+        current_choice: &StageChoice,
+        replan_prompt: &str,
+        interaction_id: &str,
+    ) -> Result<StageChoice, OrchestratorError> {
+        tracing::info!(
+            interaction_id = %interaction_id,
+            task_id = %task.id,
+            current_stage = ?current_choice.current_stage,
+            recipe_family = ?current_choice.recipe_family,
+            artifact_family = ?current_choice.artifact_family,
+            replan_prompt = %truncate_for_log(replan_prompt, 400),
+            "build_reactor_replan_choice started"
+        );
+
+        let actions = self.available_actions().await;
+        let history = self
+            .history_for_planner(interaction_id, task.id.as_str())
+            .await?;
+        let ws_summary = summarize_working_set(&task.working_set_snapshot);
+        let content = format!(
+            "Reactor stage replanning request.\n\
+            Original user intent: {}\n\
+            Current recipe family: {:?}\n\
+            Current artifact family: {:?}\n\
+            Current stage: {:?}\n\
+            Current working set summary:\n{}\n\
+            Replan reason: {}\n\
+            Return the next STAGE_CHOICE for the current reactor task. \
+            Prefer staying within the current recipe/artifact family unless current evidence requires otherwise. \
+            Do not return a full workflow unless the task is truly outside reactor coverage.",
+            task.intent.content,
+            current_choice.recipe_family,
+            current_choice.artifact_family,
+            current_choice.current_stage,
+            ws_summary,
+            replan_prompt,
+        );
+        let intent = Intent::new(content);
+
+        let runtime_info = PlannerRuntimeInfo::detect();
+        let skill_instructions = self.skill_catalog.build_instructions(&task.intent.content);
+        let context = PlannerContext::with_history(actions, history, self.reference_store.clone())
+            .with_runtime_info(runtime_info)
+            .with_skill_instructions(skill_instructions);
+
+        let output = self.planner.plan(&intent, &context).await?;
+        match output {
+            PlannerOutput::StageChoice(choice) => Ok(choice),
+            PlannerOutput::Clarification(question) => Ok(StageChoice {
+                recipe_family: current_choice.recipe_family,
+                artifact_family: current_choice.artifact_family,
+                current_stage: StageKind::WaitUser,
+                stage_goal: "wait for additional user input".to_string(),
+                derivation_policy: current_choice.derivation_policy,
+                reason: Some(question),
+            }),
+            PlannerOutput::Workflow(_) => Err(OrchestratorError::Planner(PlanError::Generation(
+                "reactor replan returned workflow; stage_choice required".to_string(),
+            ))),
+            PlannerOutput::DirectResponse(message) => {
+                Err(OrchestratorError::Planner(PlanError::Generation(format!(
+                    "reactor replan returned direct_response unexpectedly: {}",
+                    truncate_for_log(&message, 200)
+                ))))
+            }
+        }
+    }
+
     async fn execute_existing_task(
         &self,
         task: &mut Task,
@@ -686,14 +1584,88 @@ impl Orchestrator {
         );
         let mut current_plan = initial_plan.clone();
         let mut remaining_replans = if self.config.auto_replan_once { 1 } else { 0 };
+        let mut remaining_plan_repairs = if self.config.auto_repair_plan_once {
+            1
+        } else {
+            0
+        };
         let mut remaining_iterative_replans: u32 = 2;
         let mut resume = resume_event;
         let execute_started_at = Instant::now();
         let final_result = loop {
             let one_run_started_at = Instant::now();
-            let run = self
+            let run = match self
                 .execute_plan_once(task, interaction_id, &current_plan, resume)
-                .await?;
+                .await
+            {
+                Ok(run) => run,
+                Err(OrchestratorError::Normalize(normalize_error))
+                    if remaining_plan_repairs > 0 =>
+                {
+                    remaining_plan_repairs -= 1;
+                    self.emit_lifecycle_event(
+                        "plan_repair_started",
+                        Some(interaction_id),
+                        Some(task.id.as_str()),
+                        Some("plan normalization failed, attempting constrained repair replan"),
+                        serde_json::json!({
+                            "error": truncate_for_log(&normalize_error.to_string(), 400),
+                        }),
+                    )
+                    .await;
+                    match self
+                        .build_normalization_repair_plan(
+                            task,
+                            &current_plan,
+                            &normalize_error,
+                            interaction_id,
+                        )
+                        .await
+                    {
+                        Ok(Some(repaired_plan)) => {
+                            task.set_plan(repaired_plan.clone());
+                            task.start_executing();
+                            self.task_store.save(task).await?;
+                            current_plan = repaired_plan;
+                            resume = None;
+                            self.emit_lifecycle_event(
+                                "plan_repair_completed",
+                                Some(interaction_id),
+                                Some(task.id.as_str()),
+                                Some(
+                                    "planner returned a repaired plan after normalization failure",
+                                ),
+                                serde_json::json!({
+                                    "step_count": current_plan.steps.len(),
+                                }),
+                            )
+                            .await;
+                            tracing::info!(
+                                interaction_id = %interaction_id,
+                                task_id = %task.id,
+                                plan_repair_elapsed_ms = one_run_started_at.elapsed().as_millis() as u64,
+                                "orchestrator plan repair latency"
+                            );
+                            continue;
+                        }
+                        Ok(None) => return Err(OrchestratorError::Normalize(normalize_error)),
+                        Err(err) => {
+                            self.emit_lifecycle_event(
+                                "plan_repair_failed",
+                                Some(interaction_id),
+                                Some(task.id.as_str()),
+                                Some("plan repair failed after normalization error"),
+                                serde_json::json!({
+                                    "error": truncate_for_log(&err.to_string(), 400),
+                                }),
+                            )
+                            .await;
+                            return Err(err);
+                        }
+                    }
+                }
+                Err(err) => return Err(err),
+            };
             tracing::info!(
                 interaction_id = %interaction_id,
                 task_id = %task.id,
@@ -1004,6 +1976,11 @@ impl Orchestrator {
         let recovery_output = self.planner.plan(&recovery_intent, &context).await?;
         let recovery_plan = match recovery_output {
             PlannerOutput::Workflow(plan) => plan,
+            PlannerOutput::StageChoice(_) => {
+                return Err(OrchestratorError::Planner(PlanError::Generation(
+                    "recovery planner returned stage_choice; workflow required".to_string(),
+                )));
+            }
             PlannerOutput::DirectResponse(_) => {
                 return Err(OrchestratorError::Planner(PlanError::Generation(
                     "recovery planner returned direct_response; workflow required".to_string(),
@@ -1018,6 +1995,88 @@ impl Orchestrator {
         let patched =
             patch_plan_with_recovery(plan, &cut.cut_step_id, &affected, &recovery_plan.steps)?;
         Ok(Some(patched))
+    }
+
+    async fn build_normalization_repair_plan(
+        &self,
+        task: &Task,
+        plan: &orchestral_core::types::Plan,
+        normalize_error: &NormalizeError,
+        interaction_id: &str,
+    ) -> Result<Option<orchestral_core::types::Plan>, OrchestratorError> {
+        let Some(target) =
+            locate_normalization_repair_target(plan, normalize_error, &task.completed_step_ids)
+        else {
+            return Ok(None);
+        };
+        self.emit_lifecycle_event(
+            "plan_repair_target_selected",
+            Some(interaction_id),
+            Some(task.id.as_str()),
+            Some("selected constrained repair target for normalization failure"),
+            serde_json::json!({
+                "mode": target.mode_label(),
+                "invalid_step_id": target.invalid_step_id.clone(),
+                "cut_step_id": target.cut_step_id(),
+                "affected_steps": target.affected_steps,
+                "error": truncate_for_log(&normalize_error.to_string(), 400),
+            }),
+        )
+        .await;
+
+        let actions = self.available_actions().await;
+        let history = self
+            .history_for_planner(interaction_id, task.id.as_str())
+            .await?;
+        let repair_intent = build_normalization_repair_intent(
+            &task.intent,
+            plan,
+            normalize_error,
+            &target,
+            &task.completed_step_ids,
+        );
+        let runtime_info = PlannerRuntimeInfo::detect();
+        let skill_instructions = self
+            .skill_catalog
+            .build_instructions(&repair_intent.content);
+        let context = PlannerContext::with_history(actions, history, self.reference_store.clone())
+            .with_runtime_info(runtime_info)
+            .with_skill_instructions(skill_instructions);
+        let repair_output = self.planner.plan(&repair_intent, &context).await?;
+        let repair_plan = match repair_output {
+            PlannerOutput::Workflow(plan) => plan,
+            PlannerOutput::StageChoice(_) => {
+                return Err(OrchestratorError::Planner(PlanError::Generation(
+                    "normalization repair planner returned stage_choice; workflow required"
+                        .to_string(),
+                )));
+            }
+            PlannerOutput::DirectResponse(_) => {
+                return Err(OrchestratorError::Planner(PlanError::Generation(
+                    "normalization repair planner returned direct_response; workflow required"
+                        .to_string(),
+                )));
+            }
+            PlannerOutput::Clarification(_) => {
+                return Err(OrchestratorError::Planner(PlanError::Generation(
+                    "normalization repair planner returned clarification; workflow required"
+                        .to_string(),
+                )));
+            }
+        };
+
+        match &target.mode {
+            NormalizeRepairMode::FullPlan => Ok(Some(repair_plan)),
+            NormalizeRepairMode::SubgraphPatch { cut_step_id } => {
+                let patched = patch_plan_with_recovery(
+                    plan,
+                    cut_step_id,
+                    &target.affected_steps,
+                    &repair_plan.steps,
+                )?;
+                Ok(Some(patched))
+            }
+        }
     }
 
     async fn build_continuation_plan(
@@ -1052,6 +2111,8 @@ impl Orchestrator {
             Replan prompt: {}\n\
             Rules: generate ONLY the continuation steps. \
             Do not repeat completed steps. \
+            If the working set already contains target paths, previews, or environment facts, do not rediscover or reinspect them. \
+            Prefer derive/apply/verify or wait_user from the current evidence. \
             New step IDs must not collide with existing ones.",
             current_plan.goal,
             task.intent.content,
@@ -1083,6 +2144,16 @@ impl Orchestrator {
                     "build_continuation_plan planner returned workflow"
                 );
                 plan
+            }
+            PlannerOutput::StageChoice(_) => {
+                tracing::warn!(
+                    interaction_id = %interaction_id,
+                    task_id = %task.id,
+                    "build_continuation_plan planner returned stage_choice (expected workflow)"
+                );
+                return Err(OrchestratorError::Planner(PlanError::Generation(
+                    "continuation planner returned stage_choice; workflow required".to_string(),
+                )));
             }
             PlannerOutput::DirectResponse(msg) => {
                 tracing::warn!(
@@ -1676,6 +2747,119 @@ Rules: return ONLY replacement steps for the affected subgraph; do not redesign 
     Intent::with_context(content, context)
 }
 
+fn build_normalization_repair_intent(
+    original: &Intent,
+    current_plan: &orchestral_core::types::Plan,
+    normalize_error: &NormalizeError,
+    target: &NormalizeRepairTarget,
+    completed_step_ids: &[StepId],
+) -> Intent {
+    let mut context = original.context.clone().unwrap_or_default();
+    context.metadata.insert(
+        "recovery_mode".to_string(),
+        Value::String(format!("normalize_{}", target.mode_label())),
+    );
+    if let Some(step_id) = &target.invalid_step_id {
+        context.metadata.insert(
+            "normalize_invalid_step_id".to_string(),
+            Value::String(step_id.clone()),
+        );
+    }
+
+    let affected_summary = summarize_selected_plan_steps(current_plan, &target.affected_steps);
+    let affected_summary = serde_json::to_string_pretty(&affected_summary)
+        .unwrap_or_else(|_| "<unable to serialize affected steps>".to_string());
+    let mode_rule = match &target.mode {
+        NormalizeRepairMode::FullPlan => {
+            "Return a FULL replacement WORKFLOW for the original goal. Reuse safe discovery steps if helpful, but do not preserve the invalid topology."
+        }
+        NormalizeRepairMode::SubgraphPatch { .. } => {
+            "Return ONLY replacement steps for the affected subgraph. Do not redesign completed immutable steps."
+        }
+    };
+    let content = format!(
+        "Normalization repair request.\n\
+Original goal: {}\n\
+Original intent: {}\n\
+Current plan was rejected by the runtime normalizer before execution.\n\
+Normalization error: {}\n\
+Repair mode: {}\n\
+Invalid step: {}\n\
+Affected steps to replace: {}\n\
+Completed immutable steps: {}\n\
+Affected step summary:\n{}\n\
+Rules:\n\
+- {}\n\
+- Materialize side effects in explicit action or recipe stages.\n\
+- Never return an explore agent that owns outputs with output_rules candidates.requires.action.\n\
+- If local reasoning is needed, use kind=agent with params.mode=\"leaf\" and let runtime materialize outputs from json_stdout evidence.\n\
+- Prefer kind=recipe for multi-stage repairs. A good generic shape is inspect/collect -> derive leaf -> apply/emit -> verify.\n\
+- If shell is the only applicable mutable tool, use shell in explicit action stages and verify the outcome explicitly.\n",
+        current_plan.goal,
+        original.content,
+        truncate_for_log(&normalize_error.to_string(), 600),
+        target.mode_label(),
+        target.invalid_step_id.as_deref().unwrap_or("<unknown>"),
+        serde_json::to_string(&target.affected_steps).unwrap_or_else(|_| "[]".to_string()),
+        serde_json::to_string(completed_step_ids).unwrap_or_else(|_| "[]".to_string()),
+        truncate_for_log(&affected_summary, 3_000),
+        mode_rule,
+    );
+    Intent::with_context(content, context)
+}
+
+fn locate_normalization_repair_target(
+    current_plan: &orchestral_core::types::Plan,
+    normalize_error: &NormalizeError,
+    completed_step_ids: &[StepId],
+) -> Option<NormalizeRepairTarget> {
+    let invalid_step_id = normalize_error_step_id(normalize_error)
+        .filter(|step_id| current_plan.get_step(step_id).is_some())
+        .map(str::to_string);
+    let affected_steps = invalid_step_id
+        .as_deref()
+        .map(|step_id| affected_subgraph_steps(current_plan, step_id))
+        .filter(|steps| !steps.is_empty())
+        .unwrap_or_else(|| {
+            current_plan
+                .steps
+                .iter()
+                .map(|step| step.id.to_string())
+                .collect()
+        });
+
+    if completed_step_ids.is_empty() {
+        return Some(NormalizeRepairTarget {
+            mode: NormalizeRepairMode::FullPlan,
+            invalid_step_id,
+            affected_steps,
+        });
+    }
+
+    let cut_step_id = invalid_step_id?;
+    Some(NormalizeRepairTarget {
+        mode: NormalizeRepairMode::SubgraphPatch {
+            cut_step_id: cut_step_id.clone(),
+        },
+        invalid_step_id: Some(cut_step_id),
+        affected_steps,
+    })
+}
+
+fn normalize_error_step_id(normalize_error: &NormalizeError) -> Option<&str> {
+    match normalize_error {
+        NormalizeError::Validation(ValidationError::MissingDependency(step_id, _))
+        | NormalizeError::Validation(ValidationError::InvalidIoBinding(step_id, _))
+        | NormalizeError::Validation(ValidationError::IoBindingMissingDependency(step_id, _))
+        | NormalizeError::Validation(ValidationError::InvalidAgentParams(step_id, _))
+        | NormalizeError::Validation(ValidationError::CycleDetected(step_id))
+        | NormalizeError::Validation(ValidationError::DuplicateStepId(step_id)) => {
+            Some(step_id.as_str())
+        }
+        _ => None,
+    }
+}
+
 fn patch_plan_with_recovery(
     current_plan: &orchestral_core::types::Plan,
     cut_step_id: &str,
@@ -1789,6 +2973,34 @@ fn intent_from_event(
             context,
         )),
     }
+}
+
+fn summarize_selected_plan_steps(
+    plan: &orchestral_core::types::Plan,
+    selected_step_ids: &[String],
+) -> Value {
+    let selected: std::collections::HashSet<&str> =
+        selected_step_ids.iter().map(String::as_str).collect();
+    let steps = plan
+        .steps
+        .iter()
+        .filter(|step| selected.contains(step.id.as_str()))
+        .map(|step| {
+            serde_json::json!({
+                "id": step.id.clone(),
+                "kind": step.kind.clone(),
+                "action": step.action.clone(),
+                "depends_on": step.depends_on.clone(),
+                "exports": step.exports.clone(),
+                "io_bindings": step.io_bindings.clone(),
+                "params": step.params.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "items": steps,
+        "total_steps": steps.len(),
+    })
 }
 
 fn payload_to_string(payload: &Value) -> String {
@@ -2476,6 +3688,129 @@ mod tests {
         )
         .expect("cut");
         assert_eq!(cut.cut_step_id, "A2");
+    }
+
+    #[test]
+    fn test_locate_normalization_repair_target_prefers_full_rewrite_without_checkpoint() {
+        let plan = Plan::new(
+            "goal",
+            vec![
+                Step::action("s1", "shell"),
+                Step::agent("s2")
+                    .with_depends_on(vec![StepId::from("s1")])
+                    .with_params(json!({
+                        "goal": "inspect and update",
+                        "allowed_actions": ["shell", "file_write"],
+                        "max_iterations": 5,
+                        "output_keys": ["updated_file_path"],
+                        "output_rules": {
+                            "updated_file_path": {
+                                "candidates": [
+                                    {
+                                        "slot": "fill_result",
+                                        "path": "updated_file_path",
+                                        "requires": { "action": "file_write" }
+                                    }
+                                ]
+                            }
+                        }
+                    })),
+            ],
+        );
+        let error = NormalizeError::Validation(ValidationError::InvalidAgentParams(
+            "s2".to_string(),
+            "explore agent may not own side-effect-sensitive outputs".to_string(),
+        ));
+
+        let target = locate_normalization_repair_target(&plan, &error, &[]).expect("target");
+
+        assert_eq!(target.mode_label(), "full_plan");
+        assert_eq!(target.invalid_step_id.as_deref(), Some("s2"));
+        assert_eq!(target.affected_steps, vec!["s2".to_string()]);
+    }
+
+    #[test]
+    fn test_locate_normalization_repair_target_patches_only_unfinished_subgraph() {
+        let plan = Plan::new(
+            "goal",
+            vec![
+                Step::action("s1", "shell"),
+                Step::agent("s2")
+                    .with_depends_on(vec![StepId::from("s1")])
+                    .with_params(json!({
+                        "goal": "inspect and update",
+                        "allowed_actions": ["shell", "file_write"],
+                        "max_iterations": 5,
+                        "output_keys": ["updated_file_path"],
+                        "output_rules": {
+                            "updated_file_path": {
+                                "candidates": [
+                                    {
+                                        "slot": "fill_result",
+                                        "path": "updated_file_path",
+                                        "requires": { "action": "file_write" }
+                                    }
+                                ]
+                            }
+                        }
+                    })),
+                Step::action("s3", "notify").with_depends_on(vec![StepId::from("s2")]),
+            ],
+        );
+        let error = NormalizeError::Validation(ValidationError::InvalidAgentParams(
+            "s2".to_string(),
+            "explore agent may not own side-effect-sensitive outputs".to_string(),
+        ));
+
+        let target = locate_normalization_repair_target(&plan, &error, &[StepId::from("s1")])
+            .expect("target");
+
+        assert_eq!(target.mode_label(), "subgraph_patch");
+        assert_eq!(target.cut_step_id(), Some("s2"));
+        assert_eq!(target.invalid_step_id.as_deref(), Some("s2"));
+        let affected: std::collections::HashSet<_> = target.affected_steps.into_iter().collect();
+        assert_eq!(
+            affected,
+            std::collections::HashSet::from(["s2".to_string(), "s3".to_string(),])
+        );
+    }
+
+    #[test]
+    fn test_build_normalization_repair_intent_adds_hard_rules() {
+        let plan = Plan::new(
+            "goal",
+            vec![Step::agent("s2").with_params(json!({
+                "goal": "inspect and update",
+                "allowed_actions": ["shell", "file_write"],
+                "max_iterations": 5,
+                "output_keys": ["updated_file_path"]
+            }))],
+        );
+        let target = NormalizeRepairTarget {
+            mode: NormalizeRepairMode::FullPlan,
+            invalid_step_id: Some("s2".to_string()),
+            affected_steps: vec!["s2".to_string()],
+        };
+        let error = NormalizeError::Validation(ValidationError::InvalidAgentParams(
+            "s2".to_string(),
+            "bad agent".to_string(),
+        ));
+        let intent = build_normalization_repair_intent(
+            &Intent::new("fill the workbook"),
+            &plan,
+            &error,
+            &target,
+            &[],
+        );
+
+        assert!(intent.content.contains("Normalization repair request."));
+        assert!(intent.content.contains("Repair mode: full_plan"));
+        assert!(intent
+            .content
+            .contains("Never return an explore agent that owns outputs"));
+        assert!(intent
+            .content
+            .contains("inspect/collect -> derive leaf -> apply/emit -> verify"));
     }
 
     #[test]

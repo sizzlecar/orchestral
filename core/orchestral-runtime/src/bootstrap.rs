@@ -231,6 +231,8 @@ impl RuntimeApp {
             include_references: config.context.include_references,
             auto_replan_once: true,
             auto_repair_plan_once: true,
+            reactor_enabled: config.runtime.reactor.enabled,
+            reactor_stage_loop_limit: config.runtime.reactor.stage_loop_limit,
         };
 
         let orchestrator = Orchestrator::with_config(
@@ -654,6 +656,8 @@ fn build_planner(config: &OrchestralConfig) -> Result<Arc<dyn Planner>, Bootstra
                 max_history: config.planner.max_history,
                 system_prompt,
                 log_full_prompts: config.planner.log_full_prompts,
+                reactor_enabled: config.runtime.reactor.enabled,
+                reactor_default_derivation_policy: config.runtime.reactor.default_derivation_policy,
             };
 
             let planner: LlmPlanner<Arc<dyn LlmClient>> = LlmPlanner::new(client, planner_cfg);

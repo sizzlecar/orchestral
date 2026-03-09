@@ -8,15 +8,16 @@ use thiserror::Error;
 use tracing::{debug, info};
 
 use crate::system_prompts::render_planner_prompt;
+use orchestral_core::action::ActionMeta;
 use orchestral_core::planner::{
     HistoryItem, PlanError, Planner, PlannerContext, PlannerOutput, SkillInstruction,
 };
-use orchestral_core::types::{Intent, Plan, Step};
+use orchestral_core::types::{
+    ArtifactFamily, DerivationPolicy, Intent, Plan, RecipeFamily, StageChoice, StageKind, Step,
+};
 
 const MAX_PROMPT_LOG_CHARS: usize = 4_000;
 const MAX_LLM_OUTPUT_LOG_CHARS: usize = 8_000;
-const MAX_DISCOVERED_SKILL_SCRIPTS: usize = 12;
-
 /// LLM request payload
 #[derive(Debug, Clone)]
 pub struct LlmRequest {
@@ -122,6 +123,8 @@ pub struct LlmPlannerConfig {
     pub max_history: usize,
     pub system_prompt: String,
     pub log_full_prompts: bool,
+    pub reactor_enabled: bool,
+    pub reactor_default_derivation_policy: DerivationPolicy,
 }
 
 impl Default for LlmPlannerConfig {
@@ -132,6 +135,8 @@ impl Default for LlmPlannerConfig {
             max_history: 20,
             system_prompt: String::new(),
             log_full_prompts: false,
+            reactor_enabled: false,
+            reactor_default_derivation_policy: DerivationPolicy::Strict,
         }
     }
 }
@@ -148,6 +153,16 @@ impl<C: LlmClient> LlmPlanner<C> {
     }
 
     fn build_prompt(&self, intent: &Intent, context: &PlannerContext) -> (String, String) {
+        if self.config.reactor_enabled {
+            return build_reactor_prompt(
+                &self.config.system_prompt,
+                intent,
+                context,
+                self.config.max_history,
+                self.config.reactor_default_derivation_policy,
+            );
+        }
+
         let system = build_system_prompt(&self.config.system_prompt, context);
         let mut user = String::new();
         user.push_str(&format!("Intent:\n{}\n\n", intent.content));
@@ -161,28 +176,89 @@ impl<C: LlmClient> LlmPlanner<C> {
         }
 
         user.push_str("Return ONE JSON object in one of these shapes:\n");
+        if self.config.reactor_enabled {
+            user.push_str(
+                r#"{"type":"STAGE_CHOICE","recipe_family":"artifact_locate_and_patch","artifact_family":"spreadsheet","current_stage":"probe","stage_goal":"inspect workbook structure and assess readiness","derivation_policy":"permissive","reason":"..."}"#,
+            );
+            user.push('\n');
+        }
         user.push_str(
             r#"{"type":"WORKFLOW","goal":"...","steps":[{"id":"s1","kind":"action","action":"action_name","params":{}}],"confidence":0.0,"on_complete":"...","on_failure":"..."}"#,
         );
         user.push('\n');
         user.push_str(
-            r#"{"type":"WORKFLOW","goal":"...","steps":[{"id":"s1","kind":"action","action":"shell","params":{"command":"find","args":["docs","-type","f"]}},{"id":"s2","kind":"action","action":"file_read","depends_on":["s1"],"io_bindings":[{"from":"s1.stdout","to":"path","required":true}],"params":{"path":"{{s1.stdout}}"}}],"confidence":0.0,"on_complete":"...","on_failure":"..."}"#,
-        );
-        user.push('\n');
-        user.push_str(
-            r#"{"type":"WORKFLOW","goal":"...","steps":[{"id":"s1","kind":"action","action":"shell","params":{"command":"find","args":["docs","-type","f"]}},{"id":"s2","kind":"agent","depends_on":["s1"],"io_bindings":[{"from":"s1.stdout","to":"input_candidates","required":true}],"params":{"goal":"inspect and update local artifacts","allowed_actions":["shell","file_read","file_write"],"max_iterations":6,"output_keys":["updated_file_path","summary"],"output_rules":{"updated_file_path":{"candidates":[{"slot":"fill_result","path":"updated_file_path","requires":{"action":"file_write"}}]},"summary":{"candidates":[{"slot":"fill_result","path":"summary"}]}}}}],"confidence":0.0,"on_complete":"...","on_failure":"..."}"#,
+            r#"{"type":"WORKFLOW","goal":"...","steps":[{"id":"r1","kind":"recipe","depends_on":["s1"],"io_bindings":[{"from":"s1.path","to":"path","required":true}],"params":{"template":"inspect_derive_apply_verify","stage_overrides":{"inspect":{"selector":{"roles_all_of":["inspect"],"none_of":["fallback"]},"exports":["content"]},"derive":{"params":{"mode":"leaf","goal":"derive a structured change spec","output_keys":["change_spec"]},"io_bindings":[{"from":"inspect.content","to":"source_content","required":true}]},"apply":{"selector":{"roles_all_of":["apply"],"none_of":["fallback"]},"exports":["updated_file_path"],"io_bindings":[{"from":"derive.change_spec","to":"content","required":true}]},"verify":{"selector":{"roles_any_of":["verify"],"none_of":["fallback"]},"exports":["verified"],"io_bindings":[{"from":"apply.updated_file_path","to":"path","required":true}]}},"export_from":{"updated_file_path":"apply.updated_file_path","verified":"verify.verified"}}}],"confidence":0.0,"on_complete":"...","on_failure":"..."}"#,
         );
         user.push('\n');
         user.push_str(r#"{"type":"DIRECT_RESPONSE","message":"..."}"#);
         user.push('\n');
         user.push_str(r#"{"type":"CLARIFICATION","question":"..."}"#);
         user.push_str(
-            "\nUse only action names listed in Action Catalog when type is WORKFLOW. Prefer explicit action steps first. If a fixed sequence of actions can solve the task with depends_on + io_bindings, do not use kind=agent. Use kind=agent only when runtime observations must determine subsequent actions, target selection, or key parameters cannot be fixed reliably at planning time. Add io_bindings only when step inputs depend on previous step outputs (including kind=agent). If kind=agent consumes upstream outputs, provide depends_on + io_bindings explicitly. For kind=agent, params.max_iterations MUST be an integer in [1,10]. For kind=agent, include params.output_keys and prefer params.output_rules (slot/path candidates) so runtime can materialize exports from evidence. For side-effect-sensitive keys (for example file paths produced by file_write), add requires.action in output_rules candidates. Do not rely on return_final.exports as ground truth. io_bindings MUST be an array (never a map). Return JSON only.\n",
+            "\nUse only action names from Action Catalog. Prefer explicit action steps or kind=recipe for stable multi-stage work. Use kind=agent only for local, bounded uncertainty; for structured local derivations prefer params.mode=\"leaf\" and keep leaf allowed_actions to json_stdout only. When a local artifact task needs discovery or inspection before parameters are known, prefer an initial read-only probe flow and end it with kind=replan instead of guessing the full commit path up front. Never use file_read on binary/container artifacts. io_bindings MUST be an array. Return JSON only.\n",
         );
+        if self.config.reactor_enabled {
+            let default_policy = match self.config.reactor_default_derivation_policy {
+                DerivationPolicy::Strict => "strict",
+                DerivationPolicy::Permissive => "permissive",
+            };
+            user.push_str(&format!(
+                "Reactor mode is enabled for supported local artifact tasks. For spreadsheet/local artifact work, prefer STAGE_CHOICE over WORKFLOW. On the first pass, current_stage MUST be \"probe\". derivation_policy MUST be either \"strict\" or \"permissive\" and should default to \"{}\" unless the task clearly needs a different posture.\n",
+                default_policy
+            ));
+        }
         user.push('\n');
 
         (system, user)
     }
+}
+
+fn build_reactor_prompt(
+    base: &str,
+    intent: &Intent,
+    context: &PlannerContext,
+    max_history: usize,
+    default_policy: DerivationPolicy,
+) -> (String, String) {
+    let system = build_reactor_system_prompt(base, context, default_policy);
+    let mut user = String::new();
+    user.push_str(&format!("Intent:\n{}\n\n", intent.content));
+
+    if !context.history.is_empty() {
+        user.push_str("History:\n");
+        for item in select_history_for_prompt(&context.history, max_history) {
+            user.push_str(&format!("- {}: {}\n", item.role, item.content));
+        }
+        user.push('\n');
+    }
+
+    let default_policy = match default_policy {
+        DerivationPolicy::Strict => "strict",
+        DerivationPolicy::Permissive => "permissive",
+    };
+
+    user.push_str("Return exactly one JSON object:\n");
+    user.push_str(
+        r#"{"type":"STAGE_CHOICE","recipe_family":"artifact_locate_and_patch","artifact_family":"spreadsheet","current_stage":"probe","stage_goal":"inspect workbook structure and assess readiness","derivation_policy":"permissive","reason":"..."}"#,
+    );
+    user.push('\n');
+    user.push_str(
+        r#"{"type":"WORKFLOW","goal":"...","steps":[{"id":"s1","kind":"action","action":"action_name","params":{}}],"confidence":0.0,"on_complete":"...","on_failure":"..."}"#,
+    );
+    user.push('\n');
+    user.push_str(r#"{"type":"DIRECT_RESPONSE","message":"..."}"#);
+    user.push('\n');
+    user.push_str(r#"{"type":"CLARIFICATION","question":"..."}"#);
+    user.push_str(
+        "\nRules:\n- JSON only.\n- For supported local spreadsheet/artifact work, prefer STAGE_CHOICE over WORKFLOW.\n- On the first pass, current_stage MUST be \"probe\".\n- recipe_family/artifact_family must match the supported family when returning STAGE_CHOICE.\n- derivation_policy must be \"strict\" or \"permissive\".\n- Use WORKFLOW only when the task is outside current reactor coverage.\n",
+    );
+    user.push_str(&format!(
+        "- Default derivation_policy is \"{}\" unless the task clearly needs otherwise.\n",
+        default_policy
+    ));
+    user.push_str("- Never use file_read on .xlsx/.xlsm artifacts.\n");
+    user.push_str("- Return JSON only.\n");
+
+    (system, user)
 }
 
 fn select_history_for_prompt(history: &[HistoryItem], max_history: usize) -> Vec<&HistoryItem> {
@@ -224,6 +300,50 @@ fn build_system_prompt(base: &str, context: &PlannerContext) -> String {
     )
 }
 
+fn build_reactor_system_prompt(
+    base: &str,
+    _context: &PlannerContext,
+    default_policy: DerivationPolicy,
+) -> String {
+    let mut out = String::new();
+    if !base.trim().is_empty() {
+        out.push_str(base.trim());
+        out.push_str("\n\n");
+    }
+
+    out.push_str("You are Orchestral Reactor Planner.\n");
+    out.push_str("This prompt is a short constitution, not a full execution manual.\n");
+    out.push_str("Planner decides only family selection, current stage, stage goal, and derivation posture.\n");
+    out.push_str("Runtime owns stage lowering, typed action wiring, continuation handling, and verify gates.\n");
+    out.push_str("Continuation must be explicit. Done may only come from verify success.\n");
+    out.push_str("Do not design a full end-to-end workflow when a stage choice is sufficient.\n");
+    out.push_str(
+        "Do not use shell or free-form file reads as the main path for spreadsheet artifacts.\n",
+    );
+
+    out.push_str("\nSupported family:\n");
+    out.push_str("- recipe_family=artifact_locate_and_patch\n");
+    out.push_str("- artifact_family=spreadsheet\n");
+    out.push_str("- stages: probe -> commit -> verify\n");
+    out.push_str("- probe must end with explicit continuation\n");
+    out.push_str("- verify is the done gate\n");
+    out.push_str("- default derivation_policy: ");
+    out.push_str(match default_policy {
+        DerivationPolicy::Strict => "strict",
+        DerivationPolicy::Permissive => "permissive",
+    });
+    out.push('\n');
+
+    out.push_str("\nHard rules:\n");
+    out.push_str("- Return JSON only.\n");
+    out.push_str("- Prefer STAGE_CHOICE for supported local spreadsheet tasks.\n");
+    out.push_str("- First pass for spreadsheet tasks must start at stage=probe.\n");
+    out.push_str("- Use WORKFLOW only when the request is outside current reactor coverage.\n");
+    out.push_str("- Never plan file_read for .xlsx/.xlsm artifacts.\n");
+    out.push_str("- Do not dump a full end-to-end plan when STAGE_CHOICE is sufficient.\n");
+    out
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct PromptCapabilities {
     has_shell: bool,
@@ -263,11 +383,14 @@ fn detect_prompt_capabilities(context: &PlannerContext) -> PromptCapabilities {
 
 fn build_conditional_rules(context: &PlannerContext, caps: PromptCapabilities) -> String {
     let mut lines: Vec<&str> = Vec::new();
+    let spreadsheet_skill_active = skills_match_keywords(
+        &context.skill_instructions,
+        &["xlsx", "excel", "spreadsheet", "workbook", "worksheet"],
+    );
 
     if !context.skill_instructions.is_empty() {
-        lines.push("- Skill mode: treat Skill Knowledge as summary-first guidance.");
-        lines.push("- If skill summary is insufficient for concrete params, add an early file_read step for the provided skill file path.");
-        lines.push("- If skill lists scripts, invoke them through shell using the provided scripts directory and verify the script path exists.");
+        lines.push("- Treat Skill Knowledge as summary-first guidance; inspect the skill file only when concrete parameters or script names still need verification.");
+        lines.push("- If a skill lists scripts, verify the script path exists before invoking it.");
     }
 
     if caps.has_http {
@@ -290,16 +413,27 @@ fn build_conditional_rules(context: &PlannerContext, caps: PromptCapabilities) -
 
     if caps.has_file_read && (caps.has_file_write || caps.has_shell) {
         lines.push("- Prefer explicit action workflows first; use depends_on + io_bindings when upstream outputs only provide later step parameters.");
+        lines.push("- file_read reads UTF-8 text only. Never use file_read on binary/container artifacts such as .xlsx, .xlsm, .pdf, .docx, .pptx, .zip, or images.");
+        lines.push("- Use kind=recipe for stable multi-stage subflows; keep local stage ids inside recipe.params.stages and expose recipe outputs through export_from.");
         lines.push("- Use kind=agent only when runtime observations must determine subsequent actions, target selection, or key parameters.");
         lines.push("- Do not use kind=agent for simple discovery steps whose outputs can flow into fixed downstream actions.");
+        lines.push("- For local structured derivations, prefer kind=agent with params.mode=\"leaf\" so runtime can force pure structured output.");
         lines.push("- If kind=agent consumes upstream step outputs, include both depends_on and io_bindings for those consumed keys.");
         lines.push("- For kind=agent, params.max_iterations must be an integer in [1,10]. Keep the agent scoped to a local subproblem.");
         lines.push("- For kind=agent, include params.output_keys and prefer params.output_rules (slot/path candidates) so runtime materializes exports from evidence.");
+        lines.push("- For kind=agent with params.mode=\"leaf\", use json_stdout only and let runtime materialize outputs from that structured payload.");
         lines.push("- For side-effect-sensitive outputs, annotate candidates with requires.action to bind evidence provenance to the producing action.");
+        lines.push("- Never let an explore agent own side-effect-sensitive outputs; split those writes into explicit action or recipe stages.");
         lines.push("- Do not depend on return_final.exports values as the final truth; runtime evidence materialization is authoritative.");
         lines.push("- `file_write` is for concrete text writes; do not emit file_write with empty content as a path marker.");
+        lines.push("- For exploratory local artifact tasks, prefer an initial read-only probe plan. If commit parameters depend on probe evidence, end the initial plan with kind=replan.");
         lines.push("- Use kind=replan only when the remaining global plan topology depends on intermediate outputs.");
         lines.push("- Replan continuation plans must not include another replan step.");
+    }
+
+    if spreadsheet_skill_active {
+        lines.push("- Spreadsheet mode: inspect the workbook with a verified tool or script, not file_read.");
+        lines.push("- Spreadsheet mode: prefer discover -> inspect -> derive leaf -> apply -> verify, or a recipe with the same phases.");
     }
 
     if caps.has_file_read {
@@ -313,6 +447,17 @@ fn build_conditional_rules(context: &PlannerContext, caps: PromptCapabilities) -
     }
 }
 
+fn skills_match_keywords(skills: &[SkillInstruction], keywords: &[&str]) -> bool {
+    skills.iter().any(|skill| {
+        let haystack = format!(
+            "{} {}",
+            skill.skill_name.to_ascii_lowercase(),
+            skill.instructions.to_ascii_lowercase()
+        );
+        keywords.iter().any(|keyword| haystack.contains(keyword))
+    })
+}
+
 fn build_skill_knowledge_block(skills: &[SkillInstruction]) -> String {
     if skills.is_empty() {
         return String::new();
@@ -324,70 +469,45 @@ fn build_skill_knowledge_block(skills: &[SkillInstruction]) -> String {
         "Only execute scripts that are listed under scripts discovered or verified at runtime; never invent script filenames.\n",
     );
     for skill in skills {
-        let _ = writeln!(out, "- {}: {}", skill.skill_name, skill.instructions.trim());
+        let _ = writeln!(out, "- {}", skill.skill_name);
+        for line in skill.instructions.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let _ = writeln!(out, "  {}", line);
+        }
         if let Some(path) = &skill.skill_path {
             let _ = writeln!(out, "  [skill file: {}]", path);
         }
         if let Some(dir) = &skill.scripts_dir {
             let _ = writeln!(out, "  [scripts: {}]", dir);
-            let discovered = discover_skill_scripts(dir, MAX_DISCOVERED_SKILL_SCRIPTS);
-            if discovered.is_empty() {
-                let _ = writeln!(out, "  [scripts discovered: none]");
+            let referenced = extract_skill_card_scripts(&skill.instructions);
+            if referenced.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "  [scripts referenced: inspect skill file or scripts dir before use]"
+                );
             } else {
-                let _ = writeln!(out, "  [scripts discovered: {}]", discovered.join(", "));
+                let _ = writeln!(out, "  [scripts referenced: {}]", referenced.join(", "));
             }
         }
     }
     out
 }
 
-fn discover_skill_scripts(dir: &str, limit: usize) -> Vec<String> {
-    let root = std::path::Path::new(dir);
-    if !root.is_dir() || limit == 0 {
-        return Vec::new();
-    }
-
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(current) = stack.pop() {
-        let Ok(read_dir) = std::fs::read_dir(&current) else {
-            continue;
-        };
-        let mut entries = read_dir
-            .filter_map(|entry| entry.ok().map(|v| v.path()))
-            .collect::<Vec<_>>();
-        entries.sort();
-        for path in entries {
-            if path.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            if !path.is_file() {
-                continue;
-            }
-            let extension = path
-                .extension()
-                .and_then(|v| v.to_str())
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            if !matches!(extension.as_str(), "py" | "sh" | "js" | "ts" | "rb") {
-                continue;
-            }
-            let display = path
-                .strip_prefix(root)
-                .unwrap_or(path.as_path())
-                .display()
-                .to_string();
-            out.push(display);
-            if out.len() >= limit {
-                out.sort_unstable();
-                return out;
-            }
-        }
-    }
-
-    out.sort_unstable();
-    out
+fn extract_skill_card_scripts(instructions: &str) -> Vec<String> {
+    instructions
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("scripts:"))
+        .map(|line| {
+            line.split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
 }
 
 fn build_execution_environment_block(context: &PlannerContext) -> String {
@@ -432,35 +552,36 @@ fn resolve_python_path(skills: &[SkillInstruction]) -> Option<String> {
 fn build_action_catalog(context: &PlannerContext) -> String {
     let mut out = String::new();
     for action in &context.available_actions {
-        append_action_catalog_entry(
-            &mut out,
-            &action.name,
-            &action.description,
-            &action.input_schema,
-            &action.output_schema,
-            &action.capabilities,
-        );
+        append_action_catalog_entry(&mut out, action);
     }
     out
 }
 
-fn append_action_catalog_entry(
-    buf: &mut String,
-    name: &str,
-    description: &str,
-    input_schema: &serde_json::Value,
-    output_schema: &serde_json::Value,
-    capabilities: &[String],
-) {
-    let _ = writeln!(buf, "- name: {}", name);
-    let _ = writeln!(buf, "  description: {}", description);
-    if capabilities.is_empty() {
+fn append_action_catalog_entry(buf: &mut String, action: &ActionMeta) {
+    let _ = writeln!(buf, "- name: {}", action.name);
+    let _ = writeln!(buf, "  description: {}", action.description);
+    if action.capabilities.is_empty() {
         let _ = writeln!(buf, "  capabilities: []");
     } else {
-        let _ = writeln!(buf, "  capabilities: [{}]", capabilities.join(", "));
+        let _ = writeln!(buf, "  capabilities: [{}]", action.capabilities.join(", "));
     }
-    append_schema_fields(buf, "input_fields", input_schema);
-    append_schema_fields(buf, "output_fields", output_schema);
+    if action.roles.is_empty() {
+        let _ = writeln!(buf, "  roles: []");
+    } else {
+        let _ = writeln!(buf, "  roles: [{}]", action.roles.join(", "));
+    }
+    if action.input_kinds.is_empty() {
+        let _ = writeln!(buf, "  input_kinds: []");
+    } else {
+        let _ = writeln!(buf, "  input_kinds: [{}]", action.input_kinds.join(", "));
+    }
+    if action.output_kinds.is_empty() {
+        let _ = writeln!(buf, "  output_kinds: []");
+    } else {
+        let _ = writeln!(buf, "  output_kinds: [{}]", action.output_kinds.join(", "));
+    }
+    append_schema_fields(buf, "input_fields", &action.input_schema);
+    append_schema_fields(buf, "output_fields", &action.output_schema);
 }
 
 fn append_schema_fields(buf: &mut String, label: &str, schema: &serde_json::Value) {
@@ -659,6 +780,16 @@ impl<C: LlmClient> Planner for LlmPlanner<C> {
                     );
                 }
             }
+            PlannerOutput::StageChoice(choice) => {
+                info!(
+                    output_type = "stage_choice",
+                    recipe_family = ?choice.recipe_family,
+                    artifact_family = ?choice.artifact_family,
+                    current_stage = ?choice.current_stage,
+                    derivation_policy = ?choice.derivation_policy,
+                    "planner parsed output"
+                );
+            }
             PlannerOutput::DirectResponse(message) => {
                 info!(
                     output_type = "direct_response",
@@ -681,6 +812,15 @@ impl<C: LlmClient> Planner for LlmPlanner<C> {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
 enum PlannerJsonOutput {
+    StageChoice {
+        recipe_family: RecipeFamily,
+        artifact_family: ArtifactFamily,
+        current_stage: StageKind,
+        stage_goal: String,
+        derivation_policy: DerivationPolicy,
+        #[serde(default)]
+        reason: Option<String>,
+    },
     Workflow {
         goal: String,
         #[serde(default)]
@@ -705,6 +845,21 @@ fn parse_planner_output(json: &str) -> Result<PlannerOutput, PlanError> {
         .map_err(|e| PlanError::Generation(format!("Invalid planner output JSON: {}", e)))?;
 
     match parsed {
+        PlannerJsonOutput::StageChoice {
+            recipe_family,
+            artifact_family,
+            current_stage,
+            stage_goal,
+            derivation_policy,
+            reason,
+        } => Ok(PlannerOutput::StageChoice(StageChoice {
+            recipe_family,
+            artifact_family,
+            current_stage,
+            stage_goal,
+            derivation_policy,
+            reason,
+        })),
         PlannerJsonOutput::Workflow {
             goal,
             steps,
@@ -970,6 +1125,9 @@ mod tests {
 
         let actions = vec![ActionMeta::new("write_doc", "Write markdown to file")
             .with_capabilities(["filesystem_write", "side_effect"])
+            .with_roles(["apply", "emit"])
+            .with_input_kinds(["path", "text"])
+            .with_output_kinds(["path"])
             .with_input_schema(json!({
                 "type":"object",
                 "properties":{
@@ -993,10 +1151,12 @@ mod tests {
 
         assert!(system.contains("Action Catalog"));
         assert!(system.contains("Orchestral Planner"));
-        assert!(system.contains("Intent -> Plan -> Normalize -> Execute"));
         assert!(system.contains("Core Rules"));
         assert!(system.contains("write_doc"));
         assert!(system.contains("capabilities: [filesystem_write, side_effect]"));
+        assert!(system.contains("roles: [apply, emit]"));
+        assert!(system.contains("input_kinds: [path, text]"));
+        assert!(system.contains("output_kinds: [path]"));
         assert!(system.contains("input_fields"));
         assert!(system.contains("path (string, required)"));
         assert!(system.contains("desc=Target markdown path"));
@@ -1018,6 +1178,9 @@ mod tests {
 
         let actions = vec![ActionMeta::new("mcp__alpha", "Call MCP server alpha")
             .with_capabilities(["mcp", "side_effect"])
+            .with_roles(["execute"])
+            .with_input_kinds(["structured"])
+            .with_output_kinds(["structured"])
             .with_input_schema(json!({
                 "type":"object",
                 "properties":{
@@ -1048,10 +1211,51 @@ mod tests {
         assert!(!system.contains("skill__demo"));
         assert!(system.contains("Activated Skills:"));
         assert!(system.contains("never invent script filenames"));
-        assert!(system.contains("- demo: Always write then verify."));
+        assert!(system.contains("- demo"));
+        assert!(system.contains("Always write then verify."));
         assert!(system.contains("[skill file: skills/demo/SKILL.md]"));
         assert!(system.contains("[scripts: .claude/skills/demo/scripts]"));
-        assert!(system.contains("file_read step for the provided skill file path"));
+        assert!(system.contains("inspect the skill file only when concrete parameters"));
+    }
+
+    #[test]
+    fn test_system_prompt_adds_spreadsheet_binary_rules_when_skill_matches() {
+        let planner = LlmPlanner::new(
+            MockLlmClient {
+                response: "{}".to_string(),
+            },
+            LlmPlannerConfig::default(),
+        );
+
+        let actions = vec![
+            ActionMeta::new("shell", "Run shell command")
+                .with_capabilities(["shell", "filesystem_write", "fallback"])
+                .with_roles(["inspect", "apply", "verify", "execute"]),
+            ActionMeta::new("file_read", "Read file")
+                .with_capabilities(["filesystem_read"])
+                .with_roles(["inspect"])
+                .with_output_kinds(["text"]),
+            ActionMeta::new("file_write", "Write file")
+                .with_capabilities(["filesystem_write", "side_effect"])
+                .with_roles(["apply"]),
+        ];
+        let context = PlannerContext::new(actions, Arc::new(NoopReferenceStore))
+            .with_skill_instructions(vec![SkillInstruction {
+                skill_name: "xlsx".to_string(),
+                instructions:
+                    "summary: spreadsheet workbook editing\nkeywords: excel, spreadsheet, workbook"
+                        .to_string(),
+                skill_path: Some("skills/xlsx/SKILL.md".to_string()),
+                scripts_dir: Some(".claude/skills/xlsx/scripts".to_string()),
+                venv_python: Some(".claude/skills/xlsx/.venv/bin/python3".to_string()),
+            }]);
+        let intent = Intent::new("docs 下有个 excel，帮我填一下");
+        let (system, _user) = planner.build_prompt(&intent, &context);
+
+        assert!(system.contains("file_read reads UTF-8 text only"));
+        assert!(system.contains("Spreadsheet mode"));
+        assert!(system.contains("prefer discover -> inspect -> derive leaf -> apply -> verify"));
+        assert!(system.contains("inspect the workbook with a verified tool or script"));
     }
 
     #[test]
@@ -1065,9 +1269,14 @@ mod tests {
 
         let actions = vec![
             ActionMeta::new("shell", "Run shell command")
-                .with_capabilities(["shell", "filesystem_write"]),
-            ActionMeta::new("http", "HTTP request").with_capabilities(["network_io"]),
-            ActionMeta::new("file_read", "Read file").with_capabilities(["filesystem_read"]),
+                .with_capabilities(["shell", "filesystem_write", "fallback"])
+                .with_roles(["inspect", "apply", "verify", "execute"]),
+            ActionMeta::new("http", "HTTP request")
+                .with_capabilities(["network_io"])
+                .with_roles(["collect", "execute"]),
+            ActionMeta::new("file_read", "Read file")
+                .with_capabilities(["filesystem_read"])
+                .with_roles(["inspect", "verify"]),
         ];
         let context = PlannerContext::new(actions, Arc::new(NoopReferenceStore));
         let intent = Intent::new("inspect and modify a file");
@@ -1075,24 +1284,27 @@ mod tests {
 
         assert!(system.contains("Shell mode: commands must be host-platform compatible"));
         assert!(system.contains("headers-only requests, use http action with method HEAD"));
+        assert!(system.contains("Use kind=recipe for stable multi-stage subflows"));
+        assert!(system.contains("selector.roles_all_of/roles_any_of"));
+        assert!(system.contains("selector.none_of"));
         assert!(system.contains("Use kind=agent only when runtime observations"));
+        assert!(system.contains("params.mode=\"leaf\""));
         assert!(system.contains("include both depends_on and io_bindings"));
         assert!(system.contains("params.max_iterations must be an integer in [1,10]"));
         assert!(system.contains("prefer params.output_rules"));
         assert!(system.contains("runtime evidence materialization is authoritative"));
         assert!(system.contains("Use kind=replan only when the remaining global plan topology"));
+        assert!(system.contains("prefer an initial read-only probe plan"));
         assert!(system.contains("working_set summaries (stdout/content/stderr)"));
         assert!(user.contains("\"on_complete\":\"...\",\"on_failure\":\"...\""));
-        assert!(user.contains("\"depends_on\":[\"s1\"]"));
-        assert!(user.contains(
-            "\"io_bindings\":[{\"from\":\"s1.stdout\",\"to\":\"path\",\"required\":true}]"
-        ));
-        assert!(user.contains("\"kind\":\"agent\",\"depends_on\":[\"s1\"],\"io_bindings\":"));
-        assert!(user.contains("\"to\":\"input_candidates\""));
-        assert!(user.contains("\"output_rules\":"));
-        assert!(user.contains("params.max_iterations MUST be an integer in [1,10]"));
-        assert!(user.contains("include params.output_keys and prefer params.output_rules"));
-        assert!(user.contains("io_bindings MUST be an array (never a map)"));
+        assert!(user.contains("\"kind\":\"recipe\""));
+        assert!(user.contains("\"template\":\"inspect_derive_apply_verify\""));
+        assert!(user
+            .contains("\"selector\":{\"roles_all_of\":[\"inspect\"],\"none_of\":[\"fallback\"]}"));
+        assert!(user.contains("\"export_from\":"));
+        assert!(user.contains("prefer an initial read-only probe flow"));
+        assert!(user.contains("keep leaf allowed_actions to json_stdout only"));
+        assert!(system.contains("io_bindings MUST be an array"));
     }
 
     #[test]
@@ -1111,6 +1323,30 @@ mod tests {
                 assert_eq!(plan.confidence, Some(1.0));
             }
             _ => panic!("expected workflow output"),
+        }
+    }
+
+    #[test]
+    fn test_parse_stage_choice_output() {
+        let raw = r#"{
+            "type":"STAGE_CHOICE",
+            "recipe_family":"artifact_locate_and_patch",
+            "artifact_family":"spreadsheet",
+            "current_stage":"probe",
+            "stage_goal":"inspect workbook structure and assess readiness",
+            "derivation_policy":"permissive",
+            "reason":"spreadsheet task"
+        }"#;
+        let parsed = parse_planner_output(raw).expect("parse stage choice");
+        match parsed {
+            PlannerOutput::StageChoice(choice) => {
+                assert_eq!(choice.recipe_family, RecipeFamily::ArtifactLocateAndPatch);
+                assert_eq!(choice.artifact_family, ArtifactFamily::Spreadsheet);
+                assert_eq!(choice.current_stage, StageKind::Probe);
+                assert_eq!(choice.derivation_policy, DerivationPolicy::Permissive);
+                assert_eq!(choice.reason.as_deref(), Some("spreadsheet task"));
+            }
+            _ => panic!("expected stage choice output"),
         }
     }
 
