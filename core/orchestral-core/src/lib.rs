@@ -62,7 +62,9 @@ pub mod prelude {
         StoreError, TaskStore, WorkingSet,
     };
     pub use crate::types::{
-        Intent, IntentContext, Plan, Step, StepId, StepKind, Task, TaskId, TaskState,
+        ArtifactFamily, ContinuationState, ContinuationStatus, DerivationPolicy, Intent,
+        IntentContext, Plan, ReactorTaskState, RecipeFamily, StageChoice, StageKind, StagePlan,
+        Step, StepId, StepKind, Task, TaskId, TaskState, VerifyDecision, VerifyStatus,
     };
 }
 
@@ -87,4 +89,8 @@ pub use recipe::{
 pub use store::{
     EmbeddingStatus, Event, EventStore, ReferenceStore, StoreError, TaskStore, WorkingSet,
 };
-pub use types::{Intent, Plan, Step, StepId, Task, TaskId, TaskState};
+pub use types::{
+    ArtifactFamily, ContinuationState, ContinuationStatus, DerivationPolicy, Intent, Plan,
+    ReactorTaskState, RecipeFamily, StageChoice, StageKind, StagePlan, Step, StepId, Task, TaskId,
+    TaskState, VerifyDecision, VerifyStatus,
+};

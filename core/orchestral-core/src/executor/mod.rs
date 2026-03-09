@@ -1340,7 +1340,7 @@ fn build_step_completion_metadata(
 }
 
 fn completion_path_from_exports(exports: &HashMap<String, serde_json::Value>) -> Option<&str> {
-    const CANDIDATE_KEYS: [&str; 7] = [
+    const CANDIDATE_KEYS: [&str; 8] = [
         "path",
         "target_path",
         "output_path",
@@ -1348,6 +1348,7 @@ fn completion_path_from_exports(exports: &HashMap<String, serde_json::Value>) ->
         "destination_path",
         "dest_path",
         "target",
+        "updated_file_path",
     ];
     for key in CANDIDATE_KEYS {
         if let Some(path) = exports.get(key).and_then(|v| v.as_str()) {

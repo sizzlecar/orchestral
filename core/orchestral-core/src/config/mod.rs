@@ -23,6 +23,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::recipe::RecipeTemplate;
+use crate::types::DerivationPolicy;
 
 /// Top-level configuration schema for Orchestral.
 #[derive(Debug, Clone, Deserialize)]
@@ -140,6 +141,8 @@ pub struct RuntimeConfig {
     pub concurrency_policy: String,
     #[serde(default = "default_true")]
     pub strict_exports: bool,
+    #[serde(default)]
+    pub reactor: ReactorConfig,
 }
 
 impl Default for RuntimeConfig {
@@ -149,6 +152,27 @@ impl Default for RuntimeConfig {
             auto_cleanup: true,
             concurrency_policy: default_concurrency_policy(),
             strict_exports: true,
+            reactor: ReactorConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReactorConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub default_derivation_policy: DerivationPolicy,
+    #[serde(default = "default_reactor_stage_loop_limit")]
+    pub stage_loop_limit: usize,
+}
+
+impl Default for ReactorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_derivation_policy: DerivationPolicy::Strict,
+            stage_loop_limit: default_reactor_stage_loop_limit(),
         }
     }
 }
@@ -163,6 +187,10 @@ fn default_true() -> bool {
 
 fn default_concurrency_policy() -> String {
     "interrupt_and_start_new".to_string()
+}
+
+fn default_reactor_stage_loop_limit() -> usize {
+    4
 }
 
 #[derive(Debug, Clone, Deserialize)]

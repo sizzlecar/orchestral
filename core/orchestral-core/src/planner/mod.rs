@@ -17,13 +17,15 @@ use thiserror::Error;
 
 use crate::action::ActionMeta;
 use crate::store::ReferenceStore;
-use crate::types::{Intent, Plan};
+use crate::types::{Intent, Plan, StageChoice};
 
 /// Planner output - decides whether runtime should execute workflow or respond directly.
 #[derive(Debug, Clone)]
 pub enum PlannerOutput {
     /// Execute a workflow plan via normalizer + executor.
     Workflow(Plan),
+    /// Select the current reactor stage; runtime lowers it into a small stage-local DAG.
+    StageChoice(StageChoice),
     /// Reply directly without executing any workflow.
     DirectResponse(String),
     /// Ask user for clarification and wait for next input.

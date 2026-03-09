@@ -62,6 +62,12 @@ fn validate_config(config: &OrchestralConfig) -> Result<(), ConfigError> {
         ));
     }
 
+    if config.runtime.reactor.stage_loop_limit == 0 {
+        return Err(ConfigError::Invalid(
+            "runtime.reactor.stage_loop_limit must be > 0".to_string(),
+        ));
+    }
+
     if config.context.max_tokens == 0 {
         return Err(ConfigError::Invalid(
             "context.max_tokens must be > 0".to_string(),
