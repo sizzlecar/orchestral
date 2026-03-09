@@ -135,12 +135,14 @@ providers:
       api_key_env: OPENROUTER_API_KEY
       endpoint: https://openrouter.ai/api/v1/
       config:
-        timeout_secs: 60
+        max_tokens: 1536
+        timeout_secs: 120
     - name: google
       kind: google
       api_key_env: GEMINI_API_KEY
       config:
-        timeout_secs: 60
+        max_tokens: 1536
+        timeout_secs: 120
         interpreter_timeout_secs: 8
   models:
     - name: claude-opus-4-6
@@ -504,3 +506,123 @@ actions:
           required: ["verify_decision", "summary"]
       config:
         default_validator_path: "configs/scenarios/validators/verify_perf_review_fill.py"
+    - name: reactor_document_locate
+      kind: document_locate
+      description: "Locate document artifacts for the reactor document family"
+      interface:
+        input_schema:
+          type: object
+          properties:
+            source_root:
+              type: string
+            user_request:
+              type: string
+          required: ["source_root", "user_request"]
+        output_schema:
+          type: object
+          properties:
+            source_paths:
+              type: array
+              items:
+                type: string
+            artifact_candidates:
+              type: array
+              items:
+                type: string
+            artifact_count:
+              type: integer
+            report_path:
+              type: string
+          required: ["source_paths", "artifact_candidates", "artifact_count"]
+      config: {}
+    - name: reactor_document_inspect
+      kind: document_inspect
+      description: "Inspect document structure for the reactor document family"
+      interface:
+        input_schema:
+          type: object
+          properties:
+            source_paths:
+              type: array
+              items:
+                type: string
+          required: ["source_paths"]
+        output_schema:
+          type: object
+          properties:
+            inspection:
+              type: object
+          required: ["inspection"]
+      config: {}
+    - name: reactor_document_assess_readiness
+      kind: document_assess_readiness
+      description: "Assess whether document probe results are ready for commit"
+      interface:
+        input_schema:
+          type: object
+          properties:
+            inspection:
+              type: object
+            patch_candidates:
+              type: object
+            derivation_policy:
+              type: string
+            user_request:
+              type: string
+          required: ["inspection", "patch_candidates", "derivation_policy", "user_request"]
+        output_schema:
+          type: object
+          properties:
+            continuation:
+              type: object
+            summary:
+              type: string
+          required: ["continuation", "summary"]
+      config: {}
+    - name: reactor_document_apply_patch
+      kind: document_apply_patch
+      description: "Apply a typed document patch for the reactor document family"
+      interface:
+        input_schema:
+          type: object
+          properties:
+            patch_spec:
+              type: object
+          required: ["patch_spec"]
+        output_schema:
+          type: object
+          properties:
+            updated_paths:
+              type: array
+              items:
+                type: string
+            patch_count:
+              type: integer
+            summary:
+              type: string
+          required: ["updated_paths", "patch_count", "summary"]
+      config: {}
+    - name: reactor_document_verify_patch
+      kind: document_verify_patch
+      description: "Verify a document patch for the reactor document family"
+      interface:
+        input_schema:
+          type: object
+          properties:
+            patch_spec:
+              type: object
+            inspection:
+              type: object
+            user_request:
+              type: string
+            resume_user_input: {}
+          required: ["patch_spec", "inspection", "user_request"]
+        output_schema:
+          type: object
+          properties:
+            verify_decision:
+              type: object
+            summary:
+              type: string
+          required: ["verify_decision", "summary"]
+      config: {}

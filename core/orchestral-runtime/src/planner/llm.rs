@@ -153,7 +153,7 @@ impl<C: LlmClient> LlmPlanner<C> {
     }
 
     fn build_prompt(&self, intent: &Intent, context: &PlannerContext) -> (String, String) {
-        if self.config.reactor_enabled {
+        if self.config.reactor_enabled && should_use_reactor_prompt(intent, context) {
             return build_reactor_prompt(
                 &self.config.system_prompt,
                 intent,
@@ -176,12 +176,6 @@ impl<C: LlmClient> LlmPlanner<C> {
         }
 
         user.push_str("Return ONE JSON object in one of these shapes:\n");
-        if self.config.reactor_enabled {
-            user.push_str(
-                r#"{"type":"STAGE_CHOICE","recipe_family":"artifact_locate_and_patch","artifact_family":"spreadsheet","current_stage":"probe","stage_goal":"inspect workbook structure and assess readiness","derivation_policy":"permissive","reason":"..."}"#,
-            );
-            user.push('\n');
-        }
         user.push_str(
             r#"{"type":"WORKFLOW","goal":"...","steps":[{"id":"s1","kind":"action","action":"action_name","params":{}}],"confidence":0.0,"on_complete":"...","on_failure":"..."}"#,
         );
@@ -196,20 +190,98 @@ impl<C: LlmClient> LlmPlanner<C> {
         user.push_str(
             "\nUse only action names from Action Catalog. Prefer explicit action steps or kind=recipe for stable multi-stage work. Use kind=agent only for local, bounded uncertainty; for structured local derivations prefer params.mode=\"leaf\" and keep leaf allowed_actions to json_stdout only. When a local artifact task needs discovery or inspection before parameters are known, prefer an initial read-only probe flow and end it with kind=replan instead of guessing the full commit path up front. Never use file_read on binary/container artifacts. io_bindings MUST be an array. Return JSON only.\n",
         );
-        if self.config.reactor_enabled {
-            let default_policy = match self.config.reactor_default_derivation_policy {
-                DerivationPolicy::Strict => "strict",
-                DerivationPolicy::Permissive => "permissive",
-            };
-            user.push_str(&format!(
-                "Reactor mode is enabled for supported local artifact tasks. For spreadsheet/local artifact work, prefer STAGE_CHOICE over WORKFLOW. On the first pass, current_stage MUST be \"probe\". derivation_policy MUST be either \"strict\" or \"permissive\" and should default to \"{}\" unless the task clearly needs a different posture.\n",
-                default_policy
-            ));
-        }
         user.push('\n');
 
         (system, user)
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ReactorPromptCoverage {
+    spreadsheet: bool,
+    document: bool,
+}
+
+fn should_use_reactor_prompt(intent: &Intent, context: &PlannerContext) -> bool {
+    let coverage = detect_reactor_prompt_coverage(context);
+    if !coverage.spreadsheet && !coverage.document {
+        return false;
+    }
+
+    let mut haystack = intent.content.to_ascii_lowercase();
+    for item in select_history_for_prompt(&context.history, context.history.len()) {
+        haystack.push('\n');
+        haystack.push_str(&item.content.to_ascii_lowercase());
+    }
+
+    if coverage.spreadsheet
+        && [
+            "excel",
+            "xlsx",
+            "xlsm",
+            "spreadsheet",
+            "workbook",
+            "worksheet",
+            "sheet",
+            "表格",
+            "工作簿",
+        ]
+        .iter()
+        .any(|keyword| haystack.contains(keyword))
+    {
+        return true;
+    }
+
+    if coverage.document
+        && [
+            "markdown", ".md", "todo", "heading", "title", "document", "docs/", "docs ", "文档",
+            "标题",
+        ]
+        .iter()
+        .any(|keyword| haystack.contains(keyword))
+    {
+        return true;
+    }
+
+    coverage.spreadsheet
+        && skills_match_keywords(
+            &context.skill_instructions,
+            &["xlsx", "excel", "spreadsheet", "workbook", "worksheet"],
+        )
+}
+
+fn detect_reactor_prompt_coverage(context: &PlannerContext) -> ReactorPromptCoverage {
+    ReactorPromptCoverage {
+        spreadsheet: has_reactor_actions(
+            context,
+            &[
+                "reactor_spreadsheet_locate",
+                "reactor_spreadsheet_inspect",
+                "reactor_spreadsheet_assess_readiness",
+                "reactor_spreadsheet_apply_patch",
+                "reactor_spreadsheet_verify_patch",
+            ],
+        ),
+        document: has_reactor_actions(
+            context,
+            &[
+                "reactor_document_locate",
+                "reactor_document_inspect",
+                "reactor_document_assess_readiness",
+                "reactor_document_apply_patch",
+                "reactor_document_verify_patch",
+            ],
+        ),
+    }
+}
+
+fn has_reactor_actions(context: &PlannerContext, names: &[&str]) -> bool {
+    names.iter().all(|name| {
+        context
+            .available_actions
+            .iter()
+            .any(|action| action.name == *name)
+    })
 }
 
 fn build_reactor_prompt(
@@ -219,7 +291,8 @@ fn build_reactor_prompt(
     max_history: usize,
     default_policy: DerivationPolicy,
 ) -> (String, String) {
-    let system = build_reactor_system_prompt(base, context, default_policy);
+    let coverage = detect_reactor_prompt_coverage(context);
+    let system = build_reactor_system_prompt(base, context, default_policy, coverage);
     let mut user = String::new();
     user.push_str(&format!("Intent:\n{}\n\n", intent.content));
 
@@ -237,10 +310,7 @@ fn build_reactor_prompt(
     };
 
     user.push_str("Return exactly one JSON object:\n");
-    user.push_str(
-        r#"{"type":"STAGE_CHOICE","recipe_family":"artifact_locate_and_patch","artifact_family":"spreadsheet","current_stage":"probe","stage_goal":"inspect workbook structure and assess readiness","derivation_policy":"permissive","reason":"..."}"#,
-    );
-    user.push('\n');
+    append_reactor_stage_choice_examples(&mut user, coverage);
     user.push_str(
         r#"{"type":"WORKFLOW","goal":"...","steps":[{"id":"s1","kind":"action","action":"action_name","params":{}}],"confidence":0.0,"on_complete":"...","on_failure":"..."}"#,
     );
@@ -249,16 +319,36 @@ fn build_reactor_prompt(
     user.push('\n');
     user.push_str(r#"{"type":"CLARIFICATION","question":"..."}"#);
     user.push_str(
-        "\nRules:\n- JSON only.\n- For supported local spreadsheet/artifact work, prefer STAGE_CHOICE over WORKFLOW.\n- On the first pass, current_stage MUST be \"probe\".\n- recipe_family/artifact_family must match the supported family when returning STAGE_CHOICE.\n- derivation_policy must be \"strict\" or \"permissive\".\n- Use WORKFLOW only when the task is outside current reactor coverage.\n",
+        "\nRules:\n- JSON only.\n- For supported local artifact work, prefer STAGE_CHOICE over WORKFLOW.\n- On the first pass, current_stage MUST be \"probe\".\n- recipe_family/artifact_family must match a supported family when returning STAGE_CHOICE.\n- derivation_policy must be \"strict\" or \"permissive\".\n- Use WORKFLOW only when the task is outside current reactor coverage.\n",
     );
     user.push_str(&format!(
         "- Default derivation_policy is \"{}\" unless the task clearly needs otherwise.\n",
         default_policy
     ));
     user.push_str("- Never use file_read on .xlsx/.xlsm artifacts.\n");
+    user.push_str("- For supported document artifacts, do not fall back to ad hoc shell/file_read/file_write as the main path when a document family stage choice is sufficient.\n");
+    user.push_str("- When returning WORKFLOW, every step.action MUST be copied exactly from Action Catalog. Never invent semantic pseudo-actions such as glob_files, read_files, derive_patches, batch_patch_markdown, or write_summary_report unless they are listed.\n");
+    user.push_str("- For kind=\"agent\", set action to \"agent\" and put the actual subproblem in params.goal. params.goal MUST be a non-empty string.\n");
+    user.push_str("- For kind=\"agent\" with params.mode=\"leaf\", include params.max_iterations in [1,10], keep allowed_actions to [\"json_stdout\"], and include output_keys or output_rules whenever downstream steps consume the result.\n");
+    user.push_str("- For text or markdown patch tasks outside reactor coverage, compose from catalog actions or recipe steps. If no exact domain action exists, use shell/file_read/file_write or recipe; do not invent new action names.\n");
     user.push_str("- Return JSON only.\n");
 
     (system, user)
+}
+
+fn append_reactor_stage_choice_examples(buf: &mut String, coverage: ReactorPromptCoverage) {
+    if coverage.spreadsheet {
+        buf.push_str(
+            r#"{"type":"STAGE_CHOICE","recipe_family":"artifact_locate_and_patch","artifact_family":"spreadsheet","current_stage":"probe","stage_goal":"inspect workbook structure and assess readiness","derivation_policy":"permissive","reason":"..."}"#,
+        );
+        buf.push('\n');
+    }
+    if coverage.document {
+        buf.push_str(
+            r#"{"type":"STAGE_CHOICE","recipe_family":"artifact_locate_and_patch","artifact_family":"document","current_stage":"probe","stage_goal":"inspect document structure and assess readiness","derivation_policy":"permissive","reason":"..."}"#,
+        );
+        buf.push('\n');
+    }
 }
 
 fn select_history_for_prompt(history: &[HistoryItem], max_history: usize) -> Vec<&HistoryItem> {
@@ -302,9 +392,15 @@ fn build_system_prompt(base: &str, context: &PlannerContext) -> String {
 
 fn build_reactor_system_prompt(
     base: &str,
-    _context: &PlannerContext,
+    context: &PlannerContext,
     default_policy: DerivationPolicy,
+    coverage: ReactorPromptCoverage,
 ) -> String {
+    let capabilities = detect_prompt_capabilities(context);
+    let execution_environment = build_execution_environment_block(context);
+    let action_catalog = build_action_catalog(context);
+    let skill_knowledge = build_skill_knowledge_block(&context.skill_instructions);
+    let conditional_rules = build_conditional_rules(context, capabilities);
     let mut out = String::new();
     if !base.trim().is_empty() {
         out.push_str(base.trim());
@@ -317,16 +413,21 @@ fn build_reactor_system_prompt(
     out.push_str("Runtime owns stage lowering, typed action wiring, continuation handling, and verify gates.\n");
     out.push_str("Continuation must be explicit. Done may only come from verify success.\n");
     out.push_str("Do not design a full end-to-end workflow when a stage choice is sufficient.\n");
-    out.push_str(
-        "Do not use shell or free-form file reads as the main path for spreadsheet artifacts.\n",
-    );
+    out.push_str("Do not use shell or free-form file reads as the main path for supported reactor artifacts.\n");
 
     out.push_str("\nSupported family:\n");
-    out.push_str("- recipe_family=artifact_locate_and_patch\n");
-    out.push_str("- artifact_family=spreadsheet\n");
-    out.push_str("- stages: probe -> commit -> verify\n");
-    out.push_str("- probe must end with explicit continuation\n");
-    out.push_str("- verify is the done gate\n");
+    if coverage.spreadsheet {
+        out.push_str("- recipe_family=artifact_locate_and_patch, artifact_family=spreadsheet\n");
+        out.push_str("  stages: probe -> commit -> verify\n");
+        out.push_str("  probe must end with explicit continuation\n");
+        out.push_str("  verify is the done gate\n");
+    }
+    if coverage.document {
+        out.push_str("- recipe_family=artifact_locate_and_patch, artifact_family=document\n");
+        out.push_str("  stages: probe -> commit -> verify\n");
+        out.push_str("  probe must end with explicit continuation\n");
+        out.push_str("  verify is the done gate\n");
+    }
     out.push_str("- default derivation_policy: ");
     out.push_str(match default_policy {
         DerivationPolicy::Strict => "strict",
@@ -336,11 +437,26 @@ fn build_reactor_system_prompt(
 
     out.push_str("\nHard rules:\n");
     out.push_str("- Return JSON only.\n");
-    out.push_str("- Prefer STAGE_CHOICE for supported local spreadsheet tasks.\n");
-    out.push_str("- First pass for spreadsheet tasks must start at stage=probe.\n");
+    out.push_str("- Prefer STAGE_CHOICE for supported local artifact tasks.\n");
+    out.push_str("- First pass for supported reactor tasks must start at stage=probe.\n");
     out.push_str("- Use WORKFLOW only when the request is outside current reactor coverage.\n");
     out.push_str("- Never plan file_read for .xlsx/.xlsm artifacts.\n");
     out.push_str("- Do not dump a full end-to-end plan when STAGE_CHOICE is sufficient.\n");
+
+    if !execution_environment.trim().is_empty() {
+        out.push('\n');
+        out.push_str(&execution_environment);
+    }
+    if !skill_knowledge.trim().is_empty() {
+        out.push('\n');
+        out.push_str(&skill_knowledge);
+    }
+    if !action_catalog.trim().is_empty() {
+        out.push_str("\nAction Catalog:\n");
+        out.push_str(&action_catalog);
+    }
+    out.push_str("\nWorkflow Fallback Rules:\n");
+    out.push_str(&conditional_rules);
     out
 }
 
@@ -1348,6 +1464,178 @@ mod tests {
             }
             _ => panic!("expected stage choice output"),
         }
+    }
+
+    #[test]
+    fn test_reactor_prompt_includes_action_catalog_and_fallback_rules() {
+        let planner = LlmPlanner::new(
+            MockLlmClient {
+                response: "{}".to_string(),
+            },
+            LlmPlannerConfig {
+                reactor_enabled: true,
+                reactor_default_derivation_policy: DerivationPolicy::Permissive,
+                ..LlmPlannerConfig::default()
+            },
+        );
+
+        let actions = vec![
+            ActionMeta::new("shell", "Run shell command")
+                .with_capabilities(["shell", "filesystem_write", "fallback"])
+                .with_roles(["inspect", "apply", "verify", "execute"]),
+            ActionMeta::new("file_read", "Read file")
+                .with_capabilities(["filesystem_read"])
+                .with_roles(["inspect", "verify"])
+                .with_output_kinds(["text"]),
+            ActionMeta::new("file_write", "Write file")
+                .with_capabilities(["filesystem_write", "side_effect"])
+                .with_roles(["apply", "emit"])
+                .with_input_kinds(["path", "text"])
+                .with_output_kinds(["path"]),
+            ActionMeta::new(
+                "reactor_spreadsheet_locate",
+                "Locate a spreadsheet artifact for the reactor spreadsheet family",
+            ),
+            ActionMeta::new(
+                "reactor_spreadsheet_inspect",
+                "Inspect spreadsheet structure for the reactor spreadsheet family",
+            ),
+            ActionMeta::new(
+                "reactor_spreadsheet_assess_readiness",
+                "Assess whether spreadsheet probe results are ready for commit",
+            ),
+            ActionMeta::new(
+                "reactor_spreadsheet_apply_patch",
+                "Apply a typed spreadsheet patch for the reactor spreadsheet family",
+            ),
+            ActionMeta::new(
+                "reactor_spreadsheet_verify_patch",
+                "Verify a spreadsheet patch for the reactor spreadsheet family",
+            ),
+        ];
+        let context = PlannerContext::new(actions, Arc::new(NoopReferenceStore));
+        let intent = Intent::new("docs 下有个 excel，帮我补全 spreadsheet 内容");
+        let (system, user) = planner.build_prompt(&intent, &context);
+
+        assert!(system.contains("Action Catalog:"));
+        assert!(system.contains("- name: shell"));
+        assert!(system.contains("Workflow Fallback Rules:"));
+        assert!(user.contains("Never invent semantic pseudo-actions"));
+        assert!(user.contains("set action to \"agent\""));
+        assert!(user.contains("shell/file_read/file_write or recipe"));
+    }
+
+    #[test]
+    fn test_reactor_enabled_non_spreadsheet_intent_uses_legacy_prompt() {
+        let planner = LlmPlanner::new(
+            MockLlmClient {
+                response: "{}".to_string(),
+            },
+            LlmPlannerConfig {
+                reactor_enabled: true,
+                reactor_default_derivation_policy: DerivationPolicy::Permissive,
+                ..LlmPlannerConfig::default()
+            },
+        );
+
+        let actions = vec![
+            ActionMeta::new("shell", "Run shell command")
+                .with_capabilities(["shell", "filesystem_write", "fallback"])
+                .with_roles(["inspect", "apply", "verify", "execute"]),
+            ActionMeta::new("file_read", "Read file")
+                .with_capabilities(["filesystem_read"])
+                .with_roles(["inspect", "verify"])
+                .with_output_kinds(["text"]),
+            ActionMeta::new("file_write", "Write file")
+                .with_capabilities(["filesystem_write", "side_effect"])
+                .with_roles(["apply", "emit"])
+                .with_input_kinds(["path", "text"])
+                .with_output_kinds(["path"]),
+            ActionMeta::new(
+                "reactor_spreadsheet_locate",
+                "Locate a spreadsheet artifact for the reactor spreadsheet family",
+            ),
+            ActionMeta::new(
+                "reactor_spreadsheet_inspect",
+                "Inspect spreadsheet structure for the reactor spreadsheet family",
+            ),
+            ActionMeta::new(
+                "reactor_spreadsheet_assess_readiness",
+                "Assess whether spreadsheet probe results are ready for commit",
+            ),
+            ActionMeta::new(
+                "reactor_spreadsheet_apply_patch",
+                "Apply a typed spreadsheet patch for the reactor spreadsheet family",
+            ),
+            ActionMeta::new(
+                "reactor_spreadsheet_verify_patch",
+                "Verify a spreadsheet patch for the reactor spreadsheet family",
+            ),
+        ];
+        let context = PlannerContext::new(actions, Arc::new(NoopReferenceStore));
+        let intent = Intent::new("扫描 markdown 并先给我修改计划");
+        let (system, user) = planner.build_prompt(&intent, &context);
+
+        assert!(system.contains("You are Orchestral Planner"));
+        assert!(!system.contains("You are Orchestral Reactor Planner"));
+        assert!(user.contains("\"type\":\"WORKFLOW\""));
+        assert!(!user.contains("\"type\":\"STAGE_CHOICE\""));
+    }
+
+    #[test]
+    fn test_document_intent_uses_reactor_prompt_when_document_family_exists() {
+        let planner = LlmPlanner::new(
+            MockLlmClient {
+                response: "{}".to_string(),
+            },
+            LlmPlannerConfig {
+                reactor_enabled: true,
+                reactor_default_derivation_policy: DerivationPolicy::Permissive,
+                ..LlmPlannerConfig::default()
+            },
+        );
+
+        let actions = vec![
+            ActionMeta::new("shell", "Run shell command")
+                .with_capabilities(["shell", "filesystem_write", "fallback"])
+                .with_roles(["inspect", "apply", "verify", "execute"]),
+            ActionMeta::new("file_read", "Read file")
+                .with_capabilities(["filesystem_read"])
+                .with_roles(["inspect", "verify"])
+                .with_output_kinds(["text"]),
+            ActionMeta::new("file_write", "Write file")
+                .with_capabilities(["filesystem_write", "side_effect"])
+                .with_roles(["apply", "emit"])
+                .with_input_kinds(["path", "text"])
+                .with_output_kinds(["path"]),
+            ActionMeta::new(
+                "reactor_document_locate",
+                "Locate document artifacts for the reactor document family",
+            ),
+            ActionMeta::new(
+                "reactor_document_inspect",
+                "Inspect document structure for the reactor document family",
+            ),
+            ActionMeta::new(
+                "reactor_document_assess_readiness",
+                "Assess whether document probe results are ready for commit",
+            ),
+            ActionMeta::new(
+                "reactor_document_apply_patch",
+                "Apply a typed document patch for the reactor document family",
+            ),
+            ActionMeta::new(
+                "reactor_document_verify_patch",
+                "Verify a document patch for the reactor document family",
+            ),
+        ];
+        let context = PlannerContext::new(actions, Arc::new(NoopReferenceStore));
+        let intent = Intent::new("扫描 docs 下所有 markdown，补全 TODO 和缺失标题");
+        let (system, user) = planner.build_prompt(&intent, &context);
+
+        assert!(system.contains("You are Orchestral Reactor Planner"));
+        assert!(system.contains("artifact_family=document"));
+        assert!(user.contains("\"artifact_family\":\"document\""));
     }
 
     #[test]
