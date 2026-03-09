@@ -94,13 +94,13 @@ providers:
     api_key_env: OPENROUTER_API_KEY
     endpoint: https://openrouter.ai/api/v1/
     config:
-      max_tokens: 1536
+      max_tokens: 4096
       timeout_secs: 120
   - name: google
     kind: google
     api_key_env: GEMINI_API_KEY
     config:
-      max_tokens: 1536
+      max_tokens: 4096
       timeout_secs: 120
       interpreter_timeout_secs: 8
   models:

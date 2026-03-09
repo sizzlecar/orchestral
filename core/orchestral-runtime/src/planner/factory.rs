@@ -30,7 +30,7 @@ impl Default for LlmInvocationConfig {
         Self {
             model: "anthropic/claude-sonnet-4.5".to_string(),
             temperature: 0.2,
-            max_tokens: 1536,
+            max_tokens: 4096,
             normalize_response: true,
         }
     }
