@@ -625,6 +625,7 @@ fn build_planner(config: &OrchestralConfig) -> Result<Arc<dyn Planner>, Bootstra
             let invocation = LlmInvocationConfig {
                 model: model.clone(),
                 temperature,
+                max_tokens: LlmInvocationConfig::default().max_tokens,
                 normalize_response: true,
             };
 
@@ -726,6 +727,7 @@ fn build_agent_step_executor(
             let invocation = LlmInvocationConfig {
                 model: model.clone(),
                 temperature,
+                max_tokens: LlmInvocationConfig::default().max_tokens,
                 normalize_response: true,
             };
 
