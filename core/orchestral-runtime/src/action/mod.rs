@@ -15,6 +15,7 @@ mod loader;
 mod mcp;
 mod providers;
 mod shell_sandbox;
+mod spreadsheet;
 
 // Re-export core action traits
 pub use orchestral_core::action::{Action, ActionContext, ActionInput, ActionMeta, ActionResult};

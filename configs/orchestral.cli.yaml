@@ -9,6 +9,10 @@ runtime:
   auto_cleanup: true
   concurrency_policy: interrupt_and_start_new
   strict_exports: true
+  reactor:
+    enabled: true
+    default_derivation_policy: permissive
+    stage_loop_limit: 4
 
 planner:
   mode: llm
@@ -387,3 +391,116 @@ actions:
         sandbox_writable_roots: ["."]
         create_dirs: true
         max_write_bytes: 524288
+    - name: reactor_spreadsheet_locate
+      kind: spreadsheet_locate
+      description: "Locate a spreadsheet artifact for the reactor spreadsheet family"
+      interface:
+        input_schema:
+          type: object
+          properties:
+            source_root:
+              type: string
+            user_request:
+              type: string
+          required: ["source_root", "user_request"]
+        output_schema:
+          type: object
+          properties:
+            source_path:
+              type: string
+            artifact_candidates:
+              type: array
+              items:
+                type: string
+            artifact_count:
+              type: integer
+          required: ["source_path", "artifact_candidates", "artifact_count"]
+      config: {}
+    - name: reactor_spreadsheet_inspect
+      kind: spreadsheet_inspect
+      description: "Inspect spreadsheet structure for the reactor spreadsheet family"
+      interface:
+        input_schema:
+          type: object
+          properties:
+            path:
+              type: string
+          required: ["path"]
+        output_schema:
+          type: object
+          properties:
+            inspection:
+              type: object
+          required: ["inspection"]
+      config: {}
+    - name: reactor_spreadsheet_assess_readiness
+      kind: spreadsheet_assess_readiness
+      description: "Assess whether spreadsheet probe results are ready for commit"
+      interface:
+        input_schema:
+          type: object
+          properties:
+            inspection:
+              type: object
+            patch_candidates: {}
+            derivation_policy:
+              type: string
+          required: ["inspection", "patch_candidates", "derivation_policy"]
+        output_schema:
+          type: object
+          properties:
+            continuation:
+              type: object
+            summary:
+              type: string
+          required: ["continuation", "summary"]
+      config: {}
+    - name: reactor_spreadsheet_apply_patch
+      kind: spreadsheet_apply_patch
+      description: "Apply a typed spreadsheet patch for the reactor spreadsheet family"
+      interface:
+        input_schema:
+          type: object
+          properties:
+            path:
+              type: string
+            patch_spec:
+              type: object
+          required: ["path", "patch_spec"]
+        output_schema:
+          type: object
+          properties:
+            updated_file_path:
+              type: string
+            patch_count:
+              type: integer
+            cells_filled:
+              type: integer
+            result:
+              type: string
+            summary:
+              type: string
+          required: ["updated_file_path", "patch_count", "summary"]
+      config: {}
+    - name: reactor_spreadsheet_verify_patch
+      kind: spreadsheet_verify_patch
+      description: "Verify a spreadsheet patch for the reactor spreadsheet family"
+      interface:
+        input_schema:
+          type: object
+          properties:
+            path:
+              type: string
+            validator_path:
+              type: string
+          required: ["path"]
+        output_schema:
+          type: object
+          properties:
+            verify_decision:
+              type: object
+            summary:
+              type: string
+          required: ["verify_decision", "summary"]
+      config:
+        default_validator_path: "configs/scenarios/validators/verify_perf_review_fill.py"
