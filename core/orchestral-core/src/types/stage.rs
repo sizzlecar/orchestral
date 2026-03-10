@@ -7,8 +7,11 @@ pub enum StageKind {
     Locate,
     #[default]
     Probe,
+    ProbeLeft,
+    ProbeRight,
     Derive,
     Assess,
+    Transform,
     Commit,
     Verify,
     Export,
