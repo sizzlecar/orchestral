@@ -270,7 +270,7 @@ fn build_reactor_prompt(
     user.push('\n');
     user.push_str(r#"{"type":"CLARIFICATION","question":"..."}"#);
     user.push_str(
-        "\nRules:\n- JSON only.\n- For supported local artifact work, first pass should prefer SKELETON_CHOICE.\n- Use STAGE_CHOICE when the task already belongs to a skeleton and you are choosing the next stage.\n- On the first executable stage, current_stage MUST be \"probe\" unless current evidence clearly requires a different stage.\n- skeleton must be one of the supported skeletons.\n- artifact_family must match a supported family when returning STAGE_CHOICE; for SKELETON_CHOICE it may be omitted if not yet certain.\n- derivation_policy must be \"strict\" or \"permissive\" when returning STAGE_CHOICE.\n",
+        "\nRules:\n- JSON only.\n- For supported local artifact work, first pass should prefer SKELETON_CHOICE.\n- Use STAGE_CHOICE when the task already belongs to a skeleton and you are choosing the next stage.\n- For SKELETON_CHOICE, initial_stage should follow the skeleton default unless current evidence clearly requires a later stage.\n- skeleton must be one of the supported skeletons.\n- artifact_family must match a supported family when returning STAGE_CHOICE; for SKELETON_CHOICE it may be omitted if not yet certain.\n- derivation_policy must be \"strict\" or \"permissive\" when returning STAGE_CHOICE.\n",
     );
     user.push_str(&format!(
         "- Default derivation_policy is \"{}\" unless the task clearly needs otherwise.\n",
@@ -286,21 +286,21 @@ fn build_reactor_prompt(
 fn append_reactor_choice_examples(buf: &mut String, coverage: ReactorPromptCoverage) {
     if coverage.spreadsheet {
         buf.push_str(
-            r#"{"type":"SKELETON_CHOICE","skeleton":"locate_and_patch","artifact_family":"spreadsheet","initial_stage":"probe","confidence":0.9,"reason":"..."}"#,
+            r#"{"type":"SKELETON_CHOICE","skeleton":"locate_and_patch","artifact_family":"spreadsheet","initial_stage":"locate","confidence":0.9,"reason":"..."}"#,
         );
         buf.push('\n');
         buf.push_str(
-            r#"{"type":"STAGE_CHOICE","skeleton":"locate_and_patch","artifact_family":"spreadsheet","current_stage":"probe","stage_goal":"inspect workbook structure and assess readiness","derivation_policy":"permissive","next_stage_hint":"commit","reason":"..."}"#,
+            r#"{"type":"STAGE_CHOICE","skeleton":"locate_and_patch","artifact_family":"spreadsheet","current_stage":"probe","stage_goal":"inspect workbook structure","derivation_policy":"permissive","next_stage_hint":"derive","reason":"..."}"#,
         );
         buf.push('\n');
     }
     if coverage.document {
         buf.push_str(
-            r#"{"type":"SKELETON_CHOICE","skeleton":"locate_and_patch","artifact_family":"document","initial_stage":"probe","confidence":0.9,"reason":"..."}"#,
+            r#"{"type":"SKELETON_CHOICE","skeleton":"locate_and_patch","artifact_family":"document","initial_stage":"locate","confidence":0.9,"reason":"..."}"#,
         );
         buf.push('\n');
         buf.push_str(
-            r#"{"type":"STAGE_CHOICE","skeleton":"locate_and_patch","artifact_family":"document","current_stage":"probe","stage_goal":"inspect document structure and assess readiness","derivation_policy":"permissive","next_stage_hint":"commit","reason":"..."}"#,
+            r#"{"type":"STAGE_CHOICE","skeleton":"locate_and_patch","artifact_family":"document","current_stage":"probe","stage_goal":"inspect document structure","derivation_policy":"permissive","next_stage_hint":"derive","reason":"..."}"#,
         );
         buf.push('\n');
     }
@@ -377,25 +377,32 @@ fn build_reactor_system_prompt(
         "Do not design a full end-to-end workflow when skeleton/stage choice is sufficient.\n",
     );
 
-    out.push_str("\nSupported skeletons:\n");
+    out.push_str("\nBuilt-in skeleton vocabulary:\n");
     out.push_str("- locate_and_patch\n");
     out.push_str("- inspect_and_extract\n");
     out.push_str("- inspect_and_transform\n");
     out.push_str("- compare_and_sync\n");
     out.push_str("- run_and_verify\n");
 
-    out.push_str("\nSupported family hints:\n");
+    out.push_str("\nCurrent executable coverage:\n");
     if coverage.spreadsheet {
-        out.push_str("- artifact_family=spreadsheet\n");
-        out.push_str("  current covered stage path: probe -> commit -> verify\n");
+        out.push_str("- skeleton=locate_and_patch, artifact_family=spreadsheet\n");
+        out.push_str(
+            "  covered stage path: locate -> probe -> derive -> assess -> commit -> verify\n",
+        );
         out.push_str("  probe must end with explicit continuation\n");
         out.push_str("  verify is the done gate\n");
     }
     if coverage.document {
-        out.push_str("- artifact_family=document\n");
-        out.push_str("  current covered stage path: probe -> commit -> verify\n");
+        out.push_str("- skeleton=locate_and_patch, artifact_family=document\n");
+        out.push_str(
+            "  covered stage path: locate -> probe -> derive -> assess -> commit -> verify\n",
+        );
         out.push_str("  probe must end with explicit continuation\n");
         out.push_str("  verify is the done gate\n");
+    }
+    if !coverage.spreadsheet && !coverage.document {
+        out.push_str("- no executable reactor family coverage detected for this request\n");
     }
     out.push_str("- default derivation_policy: ");
     out.push_str(match default_policy {
@@ -407,7 +414,8 @@ fn build_reactor_system_prompt(
     out.push_str("\nHard rules:\n");
     out.push_str("- Return JSON only.\n");
     out.push_str("- Prefer SKELETON_CHOICE or STAGE_CHOICE for supported local artifact tasks.\n");
-    out.push_str("- First pass for supported reactor tasks should start at stage=probe unless current evidence says otherwise.\n");
+    out.push_str("- For SKELETON_CHOICE, initial_stage should follow the skeleton default unless current evidence clearly requires a later stage.\n");
+    out.push_str("- Choose only from current executable coverage unless the user explicitly asks for a different reactor skeleton experiment.\n");
     out.push_str("- Do not emit a full workflow DAG for supported reactor tasks.\n");
     out.push_str("- Treat artifact_family as an adapter hint, not as task shape.\n");
     out.push_str("- Treat verification as the only done gate.\n");
@@ -1132,8 +1140,8 @@ mod tests {
         let intent = Intent::new("docs 下有个 excel，帮我补全 spreadsheet 内容");
         let (system, user) = planner.build_prompt(&intent, &context);
 
-        assert!(system.contains("Supported skeletons:"));
-        assert!(system.contains("artifact_family=spreadsheet"));
+        assert!(system.contains("Built-in skeleton vocabulary:"));
+        assert!(system.contains("skeleton=locate_and_patch, artifact_family=spreadsheet"));
         assert!(!system.contains("Action Catalog:"));
         assert!(!system.contains("Workflow Fallback Rules:"));
         assert!(user.contains("\"type\":\"SKELETON_CHOICE\""));
