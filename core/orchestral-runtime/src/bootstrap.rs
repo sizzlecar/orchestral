@@ -232,6 +232,7 @@ impl RuntimeApp {
             auto_replan_once: true,
             auto_repair_plan_once: true,
             reactor_enabled: config.runtime.reactor.enabled,
+            reactor_default_derivation_policy: config.runtime.reactor.default_derivation_policy,
             reactor_stage_loop_limit: config.runtime.reactor.stage_loop_limit,
         };
 

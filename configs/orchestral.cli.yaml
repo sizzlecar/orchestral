@@ -12,7 +12,7 @@ runtime:
   reactor:
     enabled: true
     default_derivation_policy: permissive
-    stage_loop_limit: 4
+    stage_loop_limit: 10
 
 planner:
   mode: llm

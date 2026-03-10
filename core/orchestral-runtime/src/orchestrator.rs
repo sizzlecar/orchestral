@@ -29,8 +29,8 @@ use orchestral_core::store::{
 };
 use orchestral_core::types::{
     ArtifactFamily, ContinuationState, ContinuationStatus, DerivationPolicy, Intent, IntentContext,
-    ReactorTaskState, SkeletonChoice, StageChoice, StageKind, Step, StepId, StepIoBinding,
-    StepKind, Task, TaskId, TaskState, VerifyDecision, VerifyStatus, WaitUserReason,
+    ReactorTaskState, SkeletonChoice, SkeletonKind, StageChoice, StageKind, Step, StepId,
+    StepIoBinding, StepKind, Task, TaskId, TaskState, VerifyDecision, VerifyStatus, WaitUserReason,
 };
 
 use crate::{HandleEventResult, InteractionState, RuntimeError, ThreadRuntime};
@@ -119,49 +119,154 @@ fn require_working_set_string_array(
 }
 
 fn reactor_stage_goal(
+    skeleton: SkeletonKind,
     artifact_family: orchestral_core::types::ArtifactFamily,
     stage: StageKind,
 ) -> String {
-    match (artifact_family, stage) {
-        (_, StageKind::Locate) => "locate the target artifact".to_string(),
-        (orchestral_core::types::ArtifactFamily::Spreadsheet, StageKind::Probe) => {
-            "inspect workbook structure and assess readiness".to_string()
-        }
-        (_, StageKind::Derive) => "derive a structured patch spec".to_string(),
-        (_, StageKind::Assess) => "assess whether the task is ready to commit".to_string(),
-        (orchestral_core::types::ArtifactFamily::Spreadsheet, StageKind::Commit) => {
-            "derive a typed spreadsheet patch and apply it".to_string()
-        }
-        (orchestral_core::types::ArtifactFamily::Spreadsheet, StageKind::Verify) => {
-            "verify the applied spreadsheet patch".to_string()
-        }
-        (orchestral_core::types::ArtifactFamily::Document, StageKind::Probe) => {
-            "inspect document structure and assess readiness".to_string()
-        }
-        (orchestral_core::types::ArtifactFamily::Document, StageKind::Commit) => {
-            "derive a typed document patch and apply it".to_string()
-        }
-        (orchestral_core::types::ArtifactFamily::Document, StageKind::Verify) => {
-            "verify the applied document patch".to_string()
-        }
-        (_, StageKind::Export) => "export the verified result".to_string(),
-        (_, StageKind::Prepare) => "prepare inputs for controlled execution".to_string(),
-        (_, StageKind::Run) => "run the controlled program".to_string(),
-        (_, StageKind::Collect) => "collect outputs from the controlled run".to_string(),
-        (_, StageKind::Compare) => "compare structures and derive differences".to_string(),
-        (_, StageKind::WaitUser) => "wait for user input".to_string(),
-        (_, StageKind::Done) => "finish the reactor task".to_string(),
-        (_, StageKind::Failed) => "mark the reactor task as failed".to_string(),
-        (_, StageKind::Probe) => "inspect the target artifact and assess readiness".to_string(),
-        (_, StageKind::Commit) => "derive a typed patch and apply it".to_string(),
-        (_, StageKind::Verify) => "verify the applied patch".to_string(),
+    match skeleton {
+        SkeletonKind::LocateAndPatch => match (artifact_family, stage) {
+            (_, StageKind::Locate) => "locate the target artifact".to_string(),
+            (ArtifactFamily::Spreadsheet, StageKind::Probe) => {
+                "inspect workbook structure".to_string()
+            }
+            (ArtifactFamily::Document, StageKind::Probe) => {
+                "inspect document structure".to_string()
+            }
+            (_, StageKind::Probe) => "inspect the target artifact".to_string(),
+            (_, StageKind::Derive) => "derive a structured patch candidate set".to_string(),
+            (_, StageKind::Assess) => "assess whether the task is ready to commit".to_string(),
+            (ArtifactFamily::Spreadsheet, StageKind::Commit) => {
+                "derive a typed spreadsheet patch and apply it".to_string()
+            }
+            (ArtifactFamily::Document, StageKind::Commit) => {
+                "derive a typed document patch and apply it".to_string()
+            }
+            (_, StageKind::Commit) => "derive a typed patch and apply it".to_string(),
+            (ArtifactFamily::Spreadsheet, StageKind::Verify) => {
+                "verify the applied spreadsheet patch".to_string()
+            }
+            (ArtifactFamily::Document, StageKind::Verify) => {
+                "verify the applied document patch".to_string()
+            }
+            (_, StageKind::Verify) => "verify the applied patch".to_string(),
+            (_, StageKind::WaitUser) => "wait for additional user input".to_string(),
+            (_, StageKind::Done) => "finish the patch task".to_string(),
+            (_, StageKind::Failed) => "mark the patch task as failed".to_string(),
+            (_, unsupported) => {
+                format!("stage {:?} is not valid for locate_and_patch", unsupported)
+            }
+        },
+        SkeletonKind::InspectAndExtract => match stage {
+            StageKind::Probe => "inspect the artifact and collect structured findings".to_string(),
+            StageKind::Derive => "derive the structured extraction result".to_string(),
+            StageKind::Export => "emit the extracted result".to_string(),
+            StageKind::Verify => "verify the extracted result".to_string(),
+            StageKind::WaitUser => "wait for additional user input".to_string(),
+            StageKind::Done => "finish the extraction task".to_string(),
+            StageKind::Failed => "mark the extraction task as failed".to_string(),
+            unsupported => format!(
+                "stage {:?} is not valid for inspect_and_extract",
+                unsupported
+            ),
+        },
+        SkeletonKind::InspectAndTransform => match stage {
+            StageKind::Probe => {
+                "inspect the source artifact and determine transform inputs".to_string()
+            }
+            StageKind::Transform => "apply the bounded transformation".to_string(),
+            StageKind::Verify => "verify the transformed result".to_string(),
+            StageKind::Export => "emit the transformed artifact".to_string(),
+            StageKind::WaitUser => "wait for additional user input".to_string(),
+            StageKind::Done => "finish the transform task".to_string(),
+            StageKind::Failed => "mark the transform task as failed".to_string(),
+            unsupported => format!(
+                "stage {:?} is not valid for inspect_and_transform",
+                unsupported
+            ),
+        },
+        SkeletonKind::CompareAndSync => match stage {
+            StageKind::Locate => "locate the left and right comparison targets".to_string(),
+            StageKind::ProbeLeft => "inspect the left-side artifact".to_string(),
+            StageKind::ProbeRight => "inspect the right-side artifact".to_string(),
+            StageKind::Compare => "compare both artifacts and identify differences".to_string(),
+            StageKind::Derive => "derive a structured sync patch".to_string(),
+            StageKind::Assess => "assess whether the sync patch is safe to commit".to_string(),
+            StageKind::Commit => "apply the sync patch".to_string(),
+            StageKind::Verify => "verify the synchronized result".to_string(),
+            StageKind::WaitUser => "wait for additional user input".to_string(),
+            StageKind::Done => "finish the compare-and-sync task".to_string(),
+            StageKind::Failed => "mark the compare-and-sync task as failed".to_string(),
+            unsupported => format!("stage {:?} is not valid for compare_and_sync", unsupported),
+        },
+        SkeletonKind::RunAndVerify => match stage {
+            StageKind::Prepare => "prepare inputs for controlled execution".to_string(),
+            StageKind::Run => "run the controlled program".to_string(),
+            StageKind::Collect => "collect outputs from the controlled run".to_string(),
+            StageKind::Verify => "verify the program result".to_string(),
+            StageKind::Export => "emit the verified program outputs".to_string(),
+            StageKind::WaitUser => "wait for additional user input".to_string(),
+            StageKind::Done => "finish the run-and-verify task".to_string(),
+            StageKind::Failed => "mark the run-and-verify task as failed".to_string(),
+            unsupported => format!("stage {:?} is not valid for run_and_verify", unsupported),
+        },
     }
+}
+
+fn validate_reactor_stage_choice(choice: &StageChoice) -> Result<(), OrchestratorError> {
+    if !choice.skeleton.allows_stage(choice.current_stage) {
+        return Err(OrchestratorError::Planner(PlanError::Generation(format!(
+            "reactor stage_choice invalid: skeleton={:?} does not allow current_stage={:?}",
+            choice.skeleton, choice.current_stage
+        ))));
+    }
+    if let Some(next_stage_hint) = choice.next_stage_hint {
+        if !choice.skeleton.allows_stage(next_stage_hint) {
+            return Err(OrchestratorError::Planner(PlanError::Generation(format!(
+                "reactor stage_choice invalid: skeleton={:?} does not allow next_stage_hint={:?}",
+                choice.skeleton, next_stage_hint
+            ))));
+        }
+    }
+    Ok(())
+}
+
+fn build_reactor_stage_choice(
+    skeleton: SkeletonKind,
+    artifact_family: ArtifactFamily,
+    current_stage: StageKind,
+    derivation_policy: DerivationPolicy,
+    next_stage_hint: Option<StageKind>,
+    reason: Option<String>,
+) -> Result<StageChoice, OrchestratorError> {
+    let choice = StageChoice {
+        skeleton,
+        artifact_family,
+        current_stage,
+        stage_goal: reactor_stage_goal(skeleton, artifact_family, current_stage),
+        derivation_policy,
+        next_stage_hint,
+        reason,
+    };
+    validate_reactor_stage_choice(&choice)?;
+    Ok(choice)
+}
+
+fn normalize_reactor_stage_choice(choice: StageChoice) -> Result<StageChoice, OrchestratorError> {
+    build_reactor_stage_choice(
+        choice.skeleton,
+        choice.artifact_family,
+        choice.current_stage,
+        choice.derivation_policy,
+        choice.next_stage_hint,
+        choice.reason,
+    )
 }
 
 fn resolve_stage_choice_from_skeleton_choice(
     choice: SkeletonChoice,
     fallback_artifact_family: Option<ArtifactFamily>,
     derivation_policy: DerivationPolicy,
+    force_default_initial_stage: bool,
 ) -> Result<StageChoice, OrchestratorError> {
     let artifact_family = choice
         .artifact_family
@@ -171,15 +276,19 @@ fn resolve_stage_choice_from_skeleton_choice(
                 "skeleton_choice requires explicit artifact_family hint".to_string(),
             ))
         })?;
-    Ok(StageChoice {
-        skeleton: choice.skeleton,
+    let initial_stage = if force_default_initial_stage {
+        choice.skeleton.default_initial_stage()
+    } else {
+        choice.initial_stage
+    };
+    build_reactor_stage_choice(
+        choice.skeleton,
         artifact_family,
-        current_stage: choice.initial_stage,
-        stage_goal: reactor_stage_goal(artifact_family, choice.initial_stage),
+        initial_stage,
         derivation_policy,
-        next_stage_hint: None,
-        reason: choice.reason,
-    })
+        None,
+        choice.reason,
+    )
 }
 
 fn build_leaf_output_rules(keys: &[&str], result_slot: &str) -> Value {
@@ -197,11 +306,14 @@ fn build_leaf_output_rules(keys: &[&str], result_slot: &str) -> Value {
     Value::Object(map)
 }
 
-fn build_spreadsheet_probe_plan(task: &Task, choice: &StageChoice) -> orchestral_core::types::Plan {
+fn build_spreadsheet_locate_plan(
+    task: &Task,
+    choice: &StageChoice,
+) -> orchestral_core::types::Plan {
     let mut plan = orchestral_core::types::Plan::new(
         choice.stage_goal.clone(),
         vec![
-            Step::action("reactor_probe_locate", REACTOR_SPREADSHEET_LOCATE_ACTION)
+            Step::action("reactor_locate", REACTOR_SPREADSHEET_LOCATE_ACTION)
                 .with_exports(vec![
                     "source_path".to_string(),
                     "artifact_candidates".to_string(),
@@ -211,49 +323,92 @@ fn build_spreadsheet_probe_plan(task: &Task, choice: &StageChoice) -> orchestral
                     "source_root": ".",
                     "user_request": task.intent.content,
                 })),
+        ],
+    );
+    plan.on_failure = Some("Spreadsheet locate failed: {{error}}".to_string());
+    plan
+}
+
+fn build_spreadsheet_probe_plan(
+    task: &Task,
+    choice: &StageChoice,
+) -> Result<orchestral_core::types::Plan, OrchestratorError> {
+    let source_path = require_working_set_string(&task.working_set_snapshot, "source_path")?;
+    let mut plan = orchestral_core::types::Plan::new(
+        choice.stage_goal.clone(),
+        vec![
             Step::action("reactor_probe_inspect", REACTOR_SPREADSHEET_INSPECT_ACTION)
-                .with_depends_on(vec![StepId::from("reactor_probe_locate")])
                 .with_exports(vec!["inspection".to_string()])
-                .with_io_bindings(vec![StepIoBinding::required("reactor_probe_locate.source_path", "path")]),
-            Step::leaf_agent("reactor_probe_derive")
-                .with_depends_on(vec![
-                    StepId::from("reactor_probe_locate"),
-                    StepId::from("reactor_probe_inspect"),
-                ])
-                .with_exports(vec!["patch_candidates".to_string(), "summary".to_string()])
-                .with_io_bindings(vec![
-                    StepIoBinding::required("reactor_probe_locate.source_path", "source_path"),
-                    StepIoBinding::required("reactor_probe_inspect.inspection", "inspection"),
-                ])
                 .with_params(serde_json::json!({
-                    "mode": "leaf",
-                    "goal": "Probe a spreadsheet patch task. Using user_request, source_path, inspection, and derivation_policy, return JSON with keys patch_candidates and summary. patch_candidates must describe candidate fills for patchable cells without modifying the file. permissive policy may propose generic but coherent spreadsheet fill content when structure is clear. strict policy should surface unresolved unknowns through patch_candidates. Do not decide continuation here.",
-                    "allowed_actions": ["json_stdout"],
-                    "max_iterations": 1,
-                    "result_slot": "probe_result",
-                    "output_keys": ["patch_candidates", "summary"],
-                    "output_rules": build_leaf_output_rules(&["patch_candidates", "summary"], "probe_result"),
-                    "user_request": task.intent.content,
-                    "stage_goal": choice.stage_goal,
-                    "derivation_policy": choice.derivation_policy,
-                })),
-            Step::action("reactor_probe_assess", REACTOR_SPREADSHEET_ASSESS_ACTION)
-                .with_depends_on(vec![
-                    StepId::from("reactor_probe_inspect"),
-                    StepId::from("reactor_probe_derive"),
-                ])
-                .with_exports(vec!["continuation".to_string(), "summary".to_string()])
-                .with_io_bindings(vec![
-                    StepIoBinding::required("reactor_probe_inspect.inspection", "inspection"),
-                    StepIoBinding::required("reactor_probe_derive.patch_candidates", "patch_candidates"),
-                ])
-                .with_params(serde_json::json!({
-                    "derivation_policy": choice.derivation_policy,
+                    "path": source_path,
                 })),
         ],
     );
     plan.on_failure = Some("Spreadsheet probe failed: {{error}}".to_string());
-    plan
+    Ok(plan)
+}
+
+fn build_spreadsheet_derive_plan(
+    task: &Task,
+    choice: &StageChoice,
+) -> Result<orchestral_core::types::Plan, OrchestratorError> {
+    let source_path = require_working_set_string(&task.working_set_snapshot, "source_path")?;
+    let inspection = task
+        .working_set_snapshot
+        .get("inspection")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let mut plan = orchestral_core::types::Plan::new(
+        choice.stage_goal.clone(),
+        vec![Step::leaf_agent("reactor_derive")
+                .with_exports(vec!["patch_candidates".to_string(), "summary".to_string()])
+                .with_params(serde_json::json!({
+                    "mode": "leaf",
+                    "goal": "Derive spreadsheet patch candidates. Using user_request, source_path, inspection, and derivation_policy, return JSON with keys patch_candidates and summary. patch_candidates must describe candidate fills for patchable cells without modifying the file. permissive policy may propose generic but coherent spreadsheet fill content when structure is clear. strict policy should surface unresolved unknowns through patch_candidates. Do not decide continuation here.",
+                    "allowed_actions": ["json_stdout"],
+                    "max_iterations": 1,
+                    "result_slot": "derive_result",
+                    "output_keys": ["patch_candidates", "summary"],
+                    "output_rules": build_leaf_output_rules(&["patch_candidates", "summary"], "derive_result"),
+                    "user_request": task.intent.content,
+                    "source_path": source_path,
+                    "inspection": inspection,
+                    "stage_goal": choice.stage_goal,
+                    "derivation_policy": choice.derivation_policy,
+                }))],
+    );
+    plan.on_failure = Some("Spreadsheet derive failed: {{error}}".to_string());
+    Ok(plan)
+}
+
+fn build_spreadsheet_assess_plan(
+    task: &Task,
+    choice: &StageChoice,
+) -> Result<orchestral_core::types::Plan, OrchestratorError> {
+    let inspection = task
+        .working_set_snapshot
+        .get("inspection")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let patch_candidates = task
+        .working_set_snapshot
+        .get("patch_candidates")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let mut plan = orchestral_core::types::Plan::new(
+        choice.stage_goal.clone(),
+        vec![
+            Step::action("reactor_assess", REACTOR_SPREADSHEET_ASSESS_ACTION)
+                .with_exports(vec!["continuation".to_string(), "summary".to_string()])
+                .with_params(serde_json::json!({
+                    "inspection": inspection,
+                    "patch_candidates": patch_candidates,
+                    "derivation_policy": choice.derivation_policy,
+                })),
+        ],
+    );
+    plan.on_failure = Some("Spreadsheet assess failed: {{error}}".to_string());
+    Ok(plan)
 }
 
 fn build_spreadsheet_commit_plan(
@@ -318,11 +473,11 @@ fn build_spreadsheet_verify_plan(
     Ok(plan)
 }
 
-fn build_document_probe_plan(task: &Task, choice: &StageChoice) -> orchestral_core::types::Plan {
+fn build_document_locate_plan(task: &Task, choice: &StageChoice) -> orchestral_core::types::Plan {
     let mut plan = orchestral_core::types::Plan::new(
         choice.stage_goal.clone(),
         vec![
-            Step::action("reactor_probe_locate", REACTOR_DOCUMENT_LOCATE_ACTION)
+            Step::action("reactor_locate", REACTOR_DOCUMENT_LOCATE_ACTION)
                 .with_exports(vec![
                     "source_paths".to_string(),
                     "artifact_candidates".to_string(),
@@ -332,53 +487,95 @@ fn build_document_probe_plan(task: &Task, choice: &StageChoice) -> orchestral_co
                     "source_root": ".",
                     "user_request": task.intent.content,
                 })),
+        ],
+    );
+    plan.on_failure = Some("Document locate failed: {{error}}".to_string());
+    plan
+}
+
+fn build_document_probe_plan(
+    task: &Task,
+    choice: &StageChoice,
+) -> Result<orchestral_core::types::Plan, OrchestratorError> {
+    let source_paths =
+        require_working_set_string_array(&task.working_set_snapshot, "source_paths")?;
+    let mut plan = orchestral_core::types::Plan::new(
+        choice.stage_goal.clone(),
+        vec![
             Step::action("reactor_probe_inspect", REACTOR_DOCUMENT_INSPECT_ACTION)
-                .with_depends_on(vec![StepId::from("reactor_probe_locate")])
                 .with_exports(vec!["inspection".to_string()])
-                .with_io_bindings(vec![StepIoBinding::required(
-                    "reactor_probe_locate.source_paths",
-                    "source_paths",
-                )]),
-            Step::leaf_agent("reactor_probe_derive")
-                .with_depends_on(vec![
-                    StepId::from("reactor_probe_locate"),
-                    StepId::from("reactor_probe_inspect"),
-                ])
+                .with_params(serde_json::json!({
+                    "source_paths": source_paths,
+                })),
+        ],
+    );
+    plan.on_failure = Some("Document probe failed: {{error}}".to_string());
+    Ok(plan)
+}
+
+fn build_document_derive_plan(
+    task: &Task,
+    choice: &StageChoice,
+) -> Result<orchestral_core::types::Plan, OrchestratorError> {
+    let source_paths =
+        require_working_set_string_array(&task.working_set_snapshot, "source_paths")?;
+    let inspection = task
+        .working_set_snapshot
+        .get("inspection")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let mut plan = orchestral_core::types::Plan::new(
+        choice.stage_goal.clone(),
+        vec![Step::leaf_agent("reactor_derive")
                 .with_exports(vec!["patch_candidates".to_string(), "summary".to_string()])
-                .with_io_bindings(vec![
-                    StepIoBinding::required("reactor_probe_locate.source_paths", "source_paths"),
-                    StepIoBinding::required("reactor_probe_inspect.inspection", "inspection"),
-                ])
                 .with_params(serde_json::json!({
                     "mode": "leaf",
-                    "goal": "Probe a document patch task. Using user_request, source_paths, inspection, and derivation_policy, return JSON with keys patch_candidates and summary. patch_candidates must be an object with a files array. Each file entry should contain path, planned_changes, needs_user_input, and unknowns. summary should be a concise change plan. Do not modify files. Do not decide continuation here.",
+                    "goal": "Derive document patch candidates. Using user_request, source_paths, inspection, and derivation_policy, return JSON with keys patch_candidates and summary. patch_candidates must be an object with a files array. Each file entry should contain path, planned_changes, needs_user_input, and unknowns. summary should be a concise change plan. Do not modify files. Do not decide continuation here.",
                     "allowed_actions": ["json_stdout"],
                     "max_iterations": 1,
-                    "result_slot": "probe_result",
+                    "result_slot": "derive_result",
                     "output_keys": ["patch_candidates", "summary"],
-                    "output_rules": build_leaf_output_rules(&["patch_candidates", "summary"], "probe_result"),
+                    "output_rules": build_leaf_output_rules(&["patch_candidates", "summary"], "derive_result"),
                     "user_request": task.intent.content,
+                    "source_paths": source_paths,
+                    "inspection": inspection,
                     "stage_goal": choice.stage_goal,
                     "derivation_policy": choice.derivation_policy,
-                })),
-            Step::action("reactor_probe_assess", REACTOR_DOCUMENT_ASSESS_ACTION)
-                .with_depends_on(vec![
-                    StepId::from("reactor_probe_inspect"),
-                    StepId::from("reactor_probe_derive"),
-                ])
+                }))],
+    );
+    plan.on_failure = Some("Document derive failed: {{error}}".to_string());
+    Ok(plan)
+}
+
+fn build_document_assess_plan(
+    task: &Task,
+    choice: &StageChoice,
+) -> Result<orchestral_core::types::Plan, OrchestratorError> {
+    let inspection = task
+        .working_set_snapshot
+        .get("inspection")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let patch_candidates = task
+        .working_set_snapshot
+        .get("patch_candidates")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let mut plan = orchestral_core::types::Plan::new(
+        choice.stage_goal.clone(),
+        vec![
+            Step::action("reactor_assess", REACTOR_DOCUMENT_ASSESS_ACTION)
                 .with_exports(vec!["continuation".to_string(), "summary".to_string()])
-                .with_io_bindings(vec![
-                    StepIoBinding::required("reactor_probe_inspect.inspection", "inspection"),
-                    StepIoBinding::required("reactor_probe_derive.patch_candidates", "patch_candidates"),
-                ])
                 .with_params(serde_json::json!({
+                    "inspection": inspection,
+                    "patch_candidates": patch_candidates,
                     "derivation_policy": choice.derivation_policy,
                     "user_request": task.intent.content,
                 })),
         ],
     );
-    plan.on_failure = Some("Document probe failed: {{error}}".to_string());
-    plan
+    plan.on_failure = Some("Document assess failed: {{error}}".to_string());
+    Ok(plan)
 }
 
 fn build_document_commit_plan(
@@ -611,6 +808,8 @@ pub struct OrchestratorConfig {
     pub auto_repair_plan_once: bool,
     /// Enable stage-based reactor flow for supported artifact families.
     pub reactor_enabled: bool,
+    /// Default derivation policy for newly created reactor tasks.
+    pub reactor_default_derivation_policy: DerivationPolicy,
     /// Max stages runtime may execute in one turn before failing closed.
     pub reactor_stage_loop_limit: usize,
 }
@@ -625,7 +824,8 @@ impl Default for OrchestratorConfig {
             auto_replan_once: true,
             auto_repair_plan_once: true,
             reactor_enabled: false,
-            reactor_stage_loop_limit: 4,
+            reactor_default_derivation_policy: DerivationPolicy::Strict,
+            reactor_stage_loop_limit: 10,
         }
     }
 }
@@ -955,7 +1155,8 @@ impl Orchestrator {
                 let stage_choice = resolve_stage_choice_from_skeleton_choice(
                     choice,
                     None,
-                    DerivationPolicy::Strict,
+                    self.config.reactor_default_derivation_policy,
+                    true,
                 )?;
                 self.run_reactor_pipeline(interaction_id, started_kind, task, stage_choice)
                     .await
@@ -967,6 +1168,7 @@ impl Orchestrator {
                             .to_string(),
                     )));
                 }
+                let choice = normalize_reactor_stage_choice(choice)?;
                 self.run_reactor_pipeline(interaction_id, started_kind, task, choice)
                     .await
             }
@@ -1137,7 +1339,7 @@ impl Orchestrator {
         initial_choice: StageChoice,
     ) -> Result<OrchestratorResult, OrchestratorError> {
         let turn_started_at = Instant::now();
-        let mut choice = initial_choice;
+        let mut choice = normalize_reactor_stage_choice(initial_choice)?;
         let mut remaining_stages = self.config.reactor_stage_loop_limit;
 
         let final_result = loop {
@@ -1148,6 +1350,7 @@ impl Orchestrator {
                 };
             }
             remaining_stages -= 1;
+            validate_reactor_stage_choice(&choice)?;
 
             let mut reactor_state = task.reactor.clone().unwrap_or(ReactorTaskState {
                 skeleton: choice.skeleton,
@@ -1166,9 +1369,12 @@ impl Orchestrator {
             self.task_store.save(&task).await?;
 
             let stage_plan = match choice.current_stage {
-                StageKind::Probe | StageKind::Commit | StageKind::Verify => {
-                    Some(self.lower_reactor_stage_plan(&task, &choice)?)
-                }
+                StageKind::Locate
+                | StageKind::Probe
+                | StageKind::Derive
+                | StageKind::Assess
+                | StageKind::Commit
+                | StageKind::Verify => Some(self.lower_reactor_stage_plan(&task, &choice)?),
                 StageKind::WaitUser | StageKind::Done | StageKind::Failed => None,
                 unsupported_stage => {
                     return Err(OrchestratorError::Planner(PlanError::Generation(format!(
@@ -1223,7 +1429,12 @@ impl Orchestrator {
                             .unwrap_or_else(|| "reactor stage failed".to_string()),
                     }
                 }
-                StageKind::Probe | StageKind::Commit | StageKind::Verify => {}
+                StageKind::Locate
+                | StageKind::Probe
+                | StageKind::Derive
+                | StageKind::Assess
+                | StageKind::Commit
+                | StageKind::Verify => {}
                 unsupported_stage => {
                     return Err(OrchestratorError::Planner(PlanError::Generation(format!(
                         "reactor stage {:?} cannot execute without lowering support",
@@ -1272,7 +1483,30 @@ impl Orchestrator {
 
             match snapshot.result.clone() {
                 ExecutionResult::Completed => match choice.current_stage {
-                    StageKind::Probe => {
+                    StageKind::Locate
+                    | StageKind::Probe
+                    | StageKind::Derive
+                    | StageKind::Commit => {
+                        let next_stage = choice
+                            .skeleton
+                            .next_stage_on_success(choice.current_stage)
+                            .ok_or_else(|| {
+                                OrchestratorError::Planner(PlanError::Generation(format!(
+                                    "reactor skeleton {:?} has no success transition from stage {:?}",
+                                    choice.skeleton, choice.current_stage
+                                )))
+                            })?;
+                        choice = build_reactor_stage_choice(
+                            choice.skeleton,
+                            choice.artifact_family,
+                            next_stage,
+                            choice.derivation_policy,
+                            Some(next_stage),
+                            choice.reason.clone(),
+                        )?;
+                        continue;
+                    }
+                    StageKind::Assess => {
                         let continuation: ContinuationState = parse_working_set_value(
                             &snapshot.working_set_snapshot,
                             "continuation",
@@ -1282,18 +1516,21 @@ impl Orchestrator {
                         self.task_store.save(&task).await?;
                         match continuation.status {
                             ContinuationStatus::CommitReady => {
-                                choice = StageChoice {
-                                    skeleton: choice.skeleton,
-                                    artifact_family: choice.artifact_family,
-                                    current_stage: StageKind::Commit,
-                                    stage_goal: reactor_stage_goal(
-                                        choice.artifact_family,
-                                        StageKind::Commit,
-                                    ),
-                                    derivation_policy: choice.derivation_policy,
-                                    next_stage_hint: continuation.next_stage_hint,
-                                    reason: Some(continuation.reason),
-                                };
+                                let next_stage =
+                                    continuation.next_stage_hint.unwrap_or_else(|| {
+                                        choice
+                                            .skeleton
+                                            .next_stage_on_success(choice.current_stage)
+                                            .unwrap_or(StageKind::Commit)
+                                    });
+                                choice = build_reactor_stage_choice(
+                                    choice.skeleton,
+                                    choice.artifact_family,
+                                    next_stage,
+                                    choice.derivation_policy,
+                                    continuation.next_stage_hint,
+                                    Some(continuation.reason),
+                                )?;
                                 continue;
                             }
                             ContinuationStatus::WaitUser => {
@@ -1301,7 +1538,7 @@ impl Orchestrator {
                                     format!("Need more input: {}", continuation.reason)
                                 });
                                 break ExecutionResult::WaitingUser {
-                                    step_id: StepId::from("reactor_probe"),
+                                    step_id: StepId::from("reactor_assess"),
                                     prompt,
                                     approval: None,
                                 };
@@ -1320,26 +1557,11 @@ impl Orchestrator {
                             ContinuationStatus::Done => break ExecutionResult::Completed,
                             ContinuationStatus::Failed => {
                                 break ExecutionResult::Failed {
-                                    step_id: StepId::from("reactor_probe"),
+                                    step_id: StepId::from("reactor_assess"),
                                     error: continuation.reason,
                                 };
                             }
                         }
-                    }
-                    StageKind::Commit => {
-                        choice = StageChoice {
-                            skeleton: choice.skeleton,
-                            artifact_family: choice.artifact_family,
-                            current_stage: StageKind::Verify,
-                            stage_goal: reactor_stage_goal(
-                                choice.artifact_family,
-                                StageKind::Verify,
-                            ),
-                            derivation_policy: choice.derivation_policy,
-                            next_stage_hint: Some(StageKind::Verify),
-                            reason: choice.reason.clone(),
-                        };
-                        continue;
                     }
                     StageKind::Verify => {
                         let verify_decision: VerifyDecision = parse_working_set_value(
@@ -1360,7 +1582,41 @@ impl Orchestrator {
                         task.set_reactor_state(updated_reactor_state);
                         self.task_store.save(&task).await?;
                         match verify_decision.status {
-                            VerifyStatus::Passed => break ExecutionResult::Completed,
+                            VerifyStatus::Passed => {
+                                if let Some(next_stage) =
+                                    choice.skeleton.next_stage_on_success(choice.current_stage)
+                                {
+                                    match next_stage {
+                                        StageKind::Done => break ExecutionResult::Completed,
+                                        StageKind::Failed => {
+                                            break ExecutionResult::Failed {
+                                                step_id: StepId::from("reactor_verify"),
+                                                error: "reactor verify transitioned to failed"
+                                                    .to_string(),
+                                            }
+                                        }
+                                        StageKind::WaitUser => {
+                                            break ExecutionResult::WaitingUser {
+                                                step_id: StepId::from("reactor_verify"),
+                                                prompt: verify_decision.reason,
+                                                approval: None,
+                                            }
+                                        }
+                                        _ => {
+                                            choice = build_reactor_stage_choice(
+                                                choice.skeleton,
+                                                choice.artifact_family,
+                                                next_stage,
+                                                choice.derivation_policy,
+                                                Some(next_stage),
+                                                Some(verify_decision.reason),
+                                            )?;
+                                            continue;
+                                        }
+                                    }
+                                }
+                                break ExecutionResult::Completed;
+                            }
                             VerifyStatus::Failed => {
                                 break ExecutionResult::Failed {
                                     step_id: StepId::from("reactor_verify"),
@@ -1465,24 +1721,20 @@ impl Orchestrator {
         let reactor_state = task.reactor.clone().ok_or_else(|| {
             OrchestratorError::ResumeError("reactor task state missing during resume".to_string())
         })?;
-        let current_choice = StageChoice {
-            skeleton: reactor_state.skeleton,
-            artifact_family: reactor_state.artifact_family,
-            current_stage: reactor_state.current_stage,
-            stage_goal: reactor_stage_goal(
-                reactor_state.artifact_family,
-                reactor_state.current_stage,
-            ),
-            derivation_policy: reactor_state.derivation_policy,
-            next_stage_hint: reactor_state
+        let current_choice = build_reactor_stage_choice(
+            reactor_state.skeleton,
+            reactor_state.artifact_family,
+            reactor_state.current_stage,
+            reactor_state.derivation_policy,
+            reactor_state
                 .last_continuation
                 .as_ref()
                 .and_then(|continuation| continuation.next_stage_hint),
-            reason: reactor_state
+            reactor_state
                 .last_continuation
                 .as_ref()
                 .map(|continuation| continuation.reason.clone()),
-        };
+        )?;
         let resume_text = match event {
             Event::UserInput { payload, .. } | Event::ExternalEvent { payload, .. } => {
                 payload_to_string(payload)
@@ -1497,36 +1749,31 @@ impl Orchestrator {
                     .as_ref()
                     .and_then(|continuation| continuation.next_stage_hint)
                 {
-                    return Ok(StageChoice {
-                        skeleton: reactor_state.skeleton,
-                        artifact_family: reactor_state.artifact_family,
-                        current_stage: next_stage,
-                        stage_goal: reactor_stage_goal(reactor_state.artifact_family, next_stage),
-                        derivation_policy: reactor_state.derivation_policy,
-                        next_stage_hint: Some(next_stage),
-                        reason: Some(format!(
+                    return build_reactor_stage_choice(
+                        reactor_state.skeleton,
+                        reactor_state.artifact_family,
+                        next_stage,
+                        reactor_state.derivation_policy,
+                        Some(next_stage),
+                        Some(format!(
                             "reactor resume approved by user: {}",
                             truncate_for_log(&resume_text, 300)
                         )),
-                    });
+                    );
                 }
             }
             ReactorResumeDecision::Deny => {
-                return Ok(StageChoice {
-                    skeleton: reactor_state.skeleton,
-                    artifact_family: reactor_state.artifact_family,
-                    current_stage: StageKind::WaitUser,
-                    stage_goal: reactor_stage_goal(
-                        reactor_state.artifact_family,
-                        StageKind::WaitUser,
-                    ),
-                    derivation_policy: reactor_state.derivation_policy,
-                    next_stage_hint: Some(StageKind::WaitUser),
-                    reason: Some(
+                return build_reactor_stage_choice(
+                    reactor_state.skeleton,
+                    reactor_state.artifact_family,
+                    StageKind::WaitUser,
+                    reactor_state.derivation_policy,
+                    Some(StageKind::WaitUser),
+                    Some(
                         "User declined the pending reactor change. Awaiting updated instructions."
                             .to_string(),
                     ),
-                });
+                );
             }
             ReactorResumeDecision::Unknown => {}
         }
@@ -1544,28 +1791,46 @@ impl Orchestrator {
         task: &Task,
         choice: &StageChoice,
     ) -> Result<orchestral_core::types::Plan, OrchestratorError> {
-        match (choice.artifact_family, choice.current_stage) {
-            (orchestral_core::types::ArtifactFamily::Spreadsheet, StageKind::Probe) => {
-                Ok(build_spreadsheet_probe_plan(task, choice))
+        match (choice.skeleton, choice.artifact_family, choice.current_stage) {
+            (SkeletonKind::LocateAndPatch, ArtifactFamily::Spreadsheet, StageKind::Locate) => {
+                Ok(build_spreadsheet_locate_plan(task, choice))
             }
-            (orchestral_core::types::ArtifactFamily::Spreadsheet, StageKind::Commit) => {
+            (SkeletonKind::LocateAndPatch, ArtifactFamily::Spreadsheet, StageKind::Probe) => {
+                build_spreadsheet_probe_plan(task, choice)
+            }
+            (SkeletonKind::LocateAndPatch, ArtifactFamily::Spreadsheet, StageKind::Derive) => {
+                build_spreadsheet_derive_plan(task, choice)
+            }
+            (SkeletonKind::LocateAndPatch, ArtifactFamily::Spreadsheet, StageKind::Assess) => {
+                build_spreadsheet_assess_plan(task, choice)
+            }
+            (SkeletonKind::LocateAndPatch, ArtifactFamily::Spreadsheet, StageKind::Commit) => {
                 build_spreadsheet_commit_plan(task, choice)
             }
-            (orchestral_core::types::ArtifactFamily::Spreadsheet, StageKind::Verify) => {
+            (SkeletonKind::LocateAndPatch, ArtifactFamily::Spreadsheet, StageKind::Verify) => {
                 build_spreadsheet_verify_plan(task, choice)
             }
-            (orchestral_core::types::ArtifactFamily::Document, StageKind::Probe) => {
-                Ok(build_document_probe_plan(task, choice))
+            (SkeletonKind::LocateAndPatch, ArtifactFamily::Document, StageKind::Locate) => {
+                Ok(build_document_locate_plan(task, choice))
             }
-            (orchestral_core::types::ArtifactFamily::Document, StageKind::Commit) => {
+            (SkeletonKind::LocateAndPatch, ArtifactFamily::Document, StageKind::Probe) => {
+                build_document_probe_plan(task, choice)
+            }
+            (SkeletonKind::LocateAndPatch, ArtifactFamily::Document, StageKind::Derive) => {
+                build_document_derive_plan(task, choice)
+            }
+            (SkeletonKind::LocateAndPatch, ArtifactFamily::Document, StageKind::Assess) => {
+                build_document_assess_plan(task, choice)
+            }
+            (SkeletonKind::LocateAndPatch, ArtifactFamily::Document, StageKind::Commit) => {
                 build_document_commit_plan(task, choice)
             }
-            (orchestral_core::types::ArtifactFamily::Document, StageKind::Verify) => {
+            (SkeletonKind::LocateAndPatch, ArtifactFamily::Document, StageKind::Verify) => {
                 build_document_verify_plan(task, choice)
             }
             _ => Err(OrchestratorError::Planner(PlanError::Generation(format!(
-                "reactor lowering not implemented for artifact_family={:?} current_stage={:?}",
-                choice.artifact_family, choice.current_stage
+                "reactor lowering not implemented for skeleton={:?} artifact_family={:?} current_stage={:?}",
+                choice.skeleton, choice.artifact_family, choice.current_stage
             )))),
         }
     }
@@ -1624,17 +1889,17 @@ impl Orchestrator {
                 choice,
                 Some(current_choice.artifact_family),
                 current_choice.derivation_policy,
+                false,
             ),
-            PlannerOutput::StageChoice(choice) => Ok(choice),
-            PlannerOutput::Clarification(question) => Ok(StageChoice {
-                skeleton: current_choice.skeleton,
-                artifact_family: current_choice.artifact_family,
-                current_stage: StageKind::WaitUser,
-                stage_goal: "wait for additional user input".to_string(),
-                derivation_policy: current_choice.derivation_policy,
-                next_stage_hint: Some(StageKind::WaitUser),
-                reason: Some(question),
-            }),
+            PlannerOutput::StageChoice(choice) => normalize_reactor_stage_choice(choice),
+            PlannerOutput::Clarification(question) => build_reactor_stage_choice(
+                current_choice.skeleton,
+                current_choice.artifact_family,
+                StageKind::WaitUser,
+                current_choice.derivation_policy,
+                Some(StageKind::WaitUser),
+                Some(question),
+            ),
             PlannerOutput::DirectResponse(message) => {
                 Err(OrchestratorError::Planner(PlanError::Generation(format!(
                     "reactor replan returned direct_response unexpectedly: {}",

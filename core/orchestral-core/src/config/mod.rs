@@ -190,7 +190,7 @@ fn default_concurrency_policy() -> String {
 }
 
 fn default_reactor_stage_loop_limit() -> usize {
-    4
+    10
 }
 
 #[derive(Debug, Clone, Deserialize)]
