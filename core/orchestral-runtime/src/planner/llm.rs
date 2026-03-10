@@ -203,6 +203,7 @@ fn build_non_reactor_prompt(
 struct ReactorPromptCoverage {
     spreadsheet: bool,
     document: bool,
+    structured: bool,
 }
 
 fn detect_reactor_prompt_coverage(context: &PlannerContext) -> ReactorPromptCoverage {
@@ -225,6 +226,16 @@ fn detect_reactor_prompt_coverage(context: &PlannerContext) -> ReactorPromptCove
                 "reactor_document_assess_readiness",
                 "reactor_document_apply_patch",
                 "reactor_document_verify_patch",
+            ],
+        ),
+        structured: has_reactor_actions(
+            context,
+            &[
+                "reactor_structured_locate",
+                "reactor_structured_inspect",
+                "reactor_structured_assess_readiness",
+                "reactor_structured_apply_patch",
+                "reactor_structured_verify_patch",
             ],
         ),
     }
@@ -301,6 +312,16 @@ fn append_reactor_choice_examples(buf: &mut String, coverage: ReactorPromptCover
         buf.push('\n');
         buf.push_str(
             r#"{"type":"STAGE_CHOICE","skeleton":"locate_and_patch","artifact_family":"document","current_stage":"probe","stage_goal":"inspect document structure","derivation_policy":"permissive","next_stage_hint":"derive","reason":"..."}"#,
+        );
+        buf.push('\n');
+    }
+    if coverage.structured {
+        buf.push_str(
+            r#"{"type":"SKELETON_CHOICE","skeleton":"locate_and_patch","artifact_family":"structured","initial_stage":"locate","confidence":0.9,"reason":"..."}"#,
+        );
+        buf.push('\n');
+        buf.push_str(
+            r#"{"type":"STAGE_CHOICE","skeleton":"locate_and_patch","artifact_family":"structured","current_stage":"probe","stage_goal":"inspect structured artifact contents","derivation_policy":"strict","next_stage_hint":"derive","reason":"..."}"#,
         );
         buf.push('\n');
     }
@@ -401,7 +422,15 @@ fn build_reactor_system_prompt(
         out.push_str("  probe must end with explicit continuation\n");
         out.push_str("  verify is the done gate\n");
     }
-    if !coverage.spreadsheet && !coverage.document {
+    if coverage.structured {
+        out.push_str("- skeleton=locate_and_patch, artifact_family=structured\n");
+        out.push_str(
+            "  covered stage path: locate -> probe -> derive -> assess -> commit -> verify\n",
+        );
+        out.push_str("  probe must end with explicit continuation\n");
+        out.push_str("  verify is the done gate\n");
+    }
+    if !coverage.spreadsheet && !coverage.document && !coverage.structured {
         out.push_str("- no executable reactor family coverage detected for this request\n");
     }
     out.push_str("- default derivation_policy: ");
@@ -1260,6 +1289,59 @@ mod tests {
         assert!(system.contains("You are Orchestral Reactor Planner"));
         assert!(system.contains("artifact_family=document"));
         assert!(user.contains("\"artifact_family\":\"document\""));
+    }
+
+    #[test]
+    fn test_structured_intent_uses_reactor_prompt_when_structured_family_exists() {
+        let planner = LlmPlanner::new(
+            MockLlmClient {
+                response: "{}".to_string(),
+            },
+            LlmPlannerConfig {
+                reactor_enabled: true,
+                reactor_default_derivation_policy: DerivationPolicy::Strict,
+                ..LlmPlannerConfig::default()
+            },
+        );
+
+        let actions = vec![
+            ActionMeta::new("file_read", "Read file")
+                .with_capabilities(["filesystem_read"])
+                .with_roles(["inspect", "verify"])
+                .with_output_kinds(["text"]),
+            ActionMeta::new("file_write", "Write file")
+                .with_capabilities(["filesystem_write", "side_effect"])
+                .with_roles(["apply", "emit"])
+                .with_input_kinds(["path", "text"])
+                .with_output_kinds(["path"]),
+            ActionMeta::new(
+                "reactor_structured_locate",
+                "Locate structured artifacts for the reactor structured family",
+            ),
+            ActionMeta::new(
+                "reactor_structured_inspect",
+                "Inspect structured artifact contents for the reactor structured family",
+            ),
+            ActionMeta::new(
+                "reactor_structured_assess_readiness",
+                "Assess whether structured probe results are ready for commit",
+            ),
+            ActionMeta::new(
+                "reactor_structured_apply_patch",
+                "Apply a typed structured patch for the reactor structured family",
+            ),
+            ActionMeta::new(
+                "reactor_structured_verify_patch",
+                "Verify a structured patch for the reactor structured family",
+            ),
+        ];
+        let context = PlannerContext::new(actions, Arc::new(NoopReferenceStore));
+        let intent = Intent::new("修改 config/app.json 里的 service.port 和 owner");
+        let (system, user) = planner.build_prompt(&intent, &context);
+
+        assert!(system.contains("artifact_family=structured"));
+        assert!(user.contains("\"artifact_family\":\"structured\""));
+        assert!(user.contains("\"derivation_policy\":\"strict\""));
     }
 
     #[test]

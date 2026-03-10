@@ -46,6 +46,11 @@ const REACTOR_DOCUMENT_INSPECT_ACTION: &str = "reactor_document_inspect";
 const REACTOR_DOCUMENT_ASSESS_ACTION: &str = "reactor_document_assess_readiness";
 const REACTOR_DOCUMENT_APPLY_ACTION: &str = "reactor_document_apply_patch";
 const REACTOR_DOCUMENT_VERIFY_ACTION: &str = "reactor_document_verify_patch";
+const REACTOR_STRUCTURED_LOCATE_ACTION: &str = "reactor_structured_locate";
+const REACTOR_STRUCTURED_INSPECT_ACTION: &str = "reactor_structured_inspect";
+const REACTOR_STRUCTURED_ASSESS_ACTION: &str = "reactor_structured_assess_readiness";
+const REACTOR_STRUCTURED_APPLY_ACTION: &str = "reactor_structured_apply_patch";
+const REACTOR_STRUCTURED_VERIFY_ACTION: &str = "reactor_structured_verify_patch";
 
 fn truncate_for_log(input: &str, max_chars: usize) -> String {
     let char_count = input.chars().count();
@@ -132,6 +137,9 @@ fn reactor_stage_goal(
             (ArtifactFamily::Document, StageKind::Probe) => {
                 "inspect document structure".to_string()
             }
+            (ArtifactFamily::Structured, StageKind::Probe) => {
+                "inspect structured artifact contents".to_string()
+            }
             (_, StageKind::Probe) => "inspect the target artifact".to_string(),
             (_, StageKind::Derive) => "derive a structured patch candidate set".to_string(),
             (_, StageKind::Assess) => "assess whether the task is ready to commit".to_string(),
@@ -141,12 +149,18 @@ fn reactor_stage_goal(
             (ArtifactFamily::Document, StageKind::Commit) => {
                 "derive a typed document patch and apply it".to_string()
             }
+            (ArtifactFamily::Structured, StageKind::Commit) => {
+                "derive a typed structured patch and apply it".to_string()
+            }
             (_, StageKind::Commit) => "derive a typed patch and apply it".to_string(),
             (ArtifactFamily::Spreadsheet, StageKind::Verify) => {
                 "verify the applied spreadsheet patch".to_string()
             }
             (ArtifactFamily::Document, StageKind::Verify) => {
                 "verify the applied document patch".to_string()
+            }
+            (ArtifactFamily::Structured, StageKind::Verify) => {
+                "verify the applied structured patch".to_string()
             }
             (_, StageKind::Verify) => "verify the applied patch".to_string(),
             (_, StageKind::WaitUser) => "wait for additional user input".to_string(),
@@ -306,320 +320,379 @@ fn build_leaf_output_rules(keys: &[&str], result_slot: &str) -> Value {
     Value::Object(map)
 }
 
-fn build_spreadsheet_locate_plan(
-    task: &Task,
-    choice: &StageChoice,
-) -> orchestral_core::types::Plan {
-    let mut plan = orchestral_core::types::Plan::new(
-        choice.stage_goal.clone(),
-        vec![
-            Step::action("reactor_locate", REACTOR_SPREADSHEET_LOCATE_ACTION)
-                .with_exports(vec![
-                    "source_path".to_string(),
-                    "artifact_candidates".to_string(),
-                    "artifact_count".to_string(),
-                ])
+#[derive(Debug, Clone, Copy)]
+struct LocateAndPatchFamilyAdapter {
+    artifact_family: ArtifactFamily,
+    locate_action: &'static str,
+    inspect_action: &'static str,
+    assess_action: &'static str,
+    apply_action: &'static str,
+    verify_action: &'static str,
+    locate_export_keys: &'static [&'static str],
+    verify_complete_message: &'static str,
+}
+
+impl LocateAndPatchFamilyAdapter {
+    fn for_artifact_family(artifact_family: ArtifactFamily) -> Option<Self> {
+        match artifact_family {
+            ArtifactFamily::Spreadsheet => Some(Self {
+                artifact_family,
+                locate_action: REACTOR_SPREADSHEET_LOCATE_ACTION,
+                inspect_action: REACTOR_SPREADSHEET_INSPECT_ACTION,
+                assess_action: REACTOR_SPREADSHEET_ASSESS_ACTION,
+                apply_action: REACTOR_SPREADSHEET_APPLY_ACTION,
+                verify_action: REACTOR_SPREADSHEET_VERIFY_ACTION,
+                locate_export_keys: &["source_path", "artifact_candidates", "artifact_count"],
+                verify_complete_message: "Workbook updated and verified.",
+            }),
+            ArtifactFamily::Document => Some(Self {
+                artifact_family,
+                locate_action: REACTOR_DOCUMENT_LOCATE_ACTION,
+                inspect_action: REACTOR_DOCUMENT_INSPECT_ACTION,
+                assess_action: REACTOR_DOCUMENT_ASSESS_ACTION,
+                apply_action: REACTOR_DOCUMENT_APPLY_ACTION,
+                verify_action: REACTOR_DOCUMENT_VERIFY_ACTION,
+                locate_export_keys: &["source_paths", "artifact_candidates", "artifact_count"],
+                verify_complete_message: "Documents updated and verified.",
+            }),
+            ArtifactFamily::Structured => Some(Self {
+                artifact_family,
+                locate_action: REACTOR_STRUCTURED_LOCATE_ACTION,
+                inspect_action: REACTOR_STRUCTURED_INSPECT_ACTION,
+                assess_action: REACTOR_STRUCTURED_ASSESS_ACTION,
+                apply_action: REACTOR_STRUCTURED_APPLY_ACTION,
+                verify_action: REACTOR_STRUCTURED_VERIFY_ACTION,
+                locate_export_keys: &["source_paths", "artifact_candidates", "artifact_count"],
+                verify_complete_message: "Structured files updated and verified.",
+            }),
+            _ => None,
+        }
+    }
+
+    fn source_snapshot_key(self) -> &'static str {
+        match self.artifact_family {
+            ArtifactFamily::Spreadsheet => "source_path",
+            ArtifactFamily::Document | ArtifactFamily::Structured => "source_paths",
+            unsupported => unreachable!(
+                "locate_and_patch adapter does not support artifact family {:?}",
+                unsupported
+            ),
+        }
+    }
+
+    fn inspect_input_key(self) -> &'static str {
+        match self.artifact_family {
+            ArtifactFamily::Spreadsheet => "path",
+            ArtifactFamily::Document | ArtifactFamily::Structured => "source_paths",
+            unsupported => unreachable!(
+                "locate_and_patch adapter does not support artifact family {:?}",
+                unsupported
+            ),
+        }
+    }
+
+    fn family_label(self) -> &'static str {
+        match self.artifact_family {
+            ArtifactFamily::Spreadsheet => "Spreadsheet",
+            ArtifactFamily::Document => "Document",
+            ArtifactFamily::Structured => "Structured",
+            unsupported => unreachable!(
+                "locate_and_patch adapter does not support artifact family {:?}",
+                unsupported
+            ),
+        }
+    }
+
+    fn derive_goal(self) -> &'static str {
+        match self.artifact_family {
+            ArtifactFamily::Spreadsheet => {
+                "Derive locate_and_patch spreadsheet candidates. Using user_request, source_path, inspection, and derivation_policy, return JSON with keys patch_candidates and summary. patch_candidates must be an object with keys candidates, unknowns, and assumptions. patch_candidates.candidates.cells must describe candidate fills for patchable cells without modifying the file. permissive policy may propose generic but coherent spreadsheet fill content when structure is clear. strict policy should surface unresolved unknowns through patch_candidates.unknowns. Do not decide continuation here."
+            }
+            ArtifactFamily::Document => {
+                "Derive locate_and_patch document candidates. Using user_request, source_paths, inspection, and derivation_policy, return JSON with keys patch_candidates and summary. patch_candidates must be an object with keys candidates, unknowns, and assumptions. patch_candidates.candidates.files must be an array. Each file entry should contain path, planned_changes, needs_user_input, and unknowns. summary should be a concise change plan. Do not modify files. Do not decide continuation here."
+            }
+            ArtifactFamily::Structured => {
+                "Derive locate_and_patch structured patch candidates. Using user_request, source_paths, inspection, and derivation_policy, return JSON with keys patch_candidates and summary. patch_candidates must be an object with keys candidates, unknowns, and assumptions. patch_candidates.candidates.files must be an array directly, not wrapped in another object. Each file entry must contain path, operations, needs_user_input, and unknowns. operations must be an array of JSON Pointer edits shaped as {op, path, value?}. Use op=set when assigning a concrete JSON-compatible value and op=remove when deleting a field. When user_request already states an explicit target path and target value or explicit remove instruction, you must mirror that instruction into operations, set needs_user_input=false for that file, and leave unknowns empty unless the referenced path is ambiguous or missing. strict policy should surface unresolved unknowns instead of guessing target values. Do not modify files. Do not decide continuation here."
+            }
+            unsupported => unreachable!(
+                "locate_and_patch adapter does not support artifact family {:?}",
+                unsupported
+            ),
+        }
+    }
+
+    fn commit_goal(self) -> &'static str {
+        match self.artifact_family {
+            ArtifactFamily::Spreadsheet => {
+                "Commit stage for locate_and_patch spreadsheet patching. Using user_request, source_path, inspection, patch_candidates, and derivation_policy, return JSON with keys patch_spec and summary. patch_candidates follows the derive envelope with candidates, unknowns, and assumptions. patch_spec must be an object with path and fills. patch_spec.fills must be an array of {cell, value}. Cover every patchable cell listed in inspection.selected_region.patchable_cells unless the cell is already handled by a formula or existing non-empty value. If derivation_policy is permissive, fill any remaining uncovered patchable cells with coherent generic content inferred from row labels and column headers instead of leaving gaps. Do not include unchanged cells. Preserve formulas and workbook structure. When a proposed fill is numeric, emit a numeric JSON value instead of prose."
+            }
+            ArtifactFamily::Document => {
+                "Commit stage for locate_and_patch document patching. Using user_request, resume_user_input, source_paths, inspection, patch_candidates, and derivation_policy, return JSON with keys patch_spec and summary. patch_candidates follows the derive envelope with candidates, unknowns, and assumptions. patch_spec must be an object with updates. updates must be an array of {path, content}. Generate complete final markdown/text content for each file that needs changes. Replace TODO placeholders with concrete coherent content, add a top-level title when missing, preserve unaffected content, and if resume_user_input requests a summary/report markdown path include an update for that file too. Do not emit unchanged files."
+            }
+            ArtifactFamily::Structured => {
+                "Commit stage for locate_and_patch structured patching. Using user_request, source_paths, inspection, and derivation_policy, return JSON with keys patch_spec and summary. Treat the explicit user_request as authoritative for requested field updates and removals. patch_spec must be an object with files and optional summary. files must be an array of {path, operations}. operations must be an array of JSON Pointer edits shaped as {op, path, value?}. Use op=set to assign a concrete JSON-compatible value and op=remove to delete a field. Every explicit user-requested update or removal must appear in patch_spec unless the referenced path is missing or ambiguous in inspection. Preserve unrelated keys and do not emit unchanged files."
+            }
+            unsupported => unreachable!(
+                "locate_and_patch adapter does not support artifact family {:?}",
+                unsupported
+            ),
+        }
+    }
+
+    fn source_value(self, snapshot: &HashMap<String, Value>) -> Result<Value, OrchestratorError> {
+        match self.artifact_family {
+            ArtifactFamily::Spreadsheet => Ok(Value::String(require_working_set_string(
+                snapshot,
+                "source_path",
+            )?)),
+            ArtifactFamily::Document | ArtifactFamily::Structured => Ok(Value::Array(
+                require_working_set_string_array(snapshot, "source_paths")?
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            )),
+            unsupported => unreachable!(
+                "locate_and_patch adapter does not support artifact family {:?}",
+                unsupported
+            ),
+        }
+    }
+
+    fn build_locate_plan(self, task: &Task, choice: &StageChoice) -> orchestral_core::types::Plan {
+        let mut plan = orchestral_core::types::Plan::new(
+            choice.stage_goal.clone(),
+            vec![Step::action("reactor_locate", self.locate_action)
+                .with_exports(
+                    self.locate_export_keys
+                        .iter()
+                        .map(|key| (*key).to_string())
+                        .collect(),
+                )
                 .with_params(serde_json::json!({
                     "source_root": ".",
                     "user_request": task.intent.content,
-                })),
-        ],
-    );
-    plan.on_failure = Some("Spreadsheet locate failed: {{error}}".to_string());
-    plan
-}
-
-fn build_spreadsheet_probe_plan(
-    task: &Task,
-    choice: &StageChoice,
-) -> Result<orchestral_core::types::Plan, OrchestratorError> {
-    let source_path = require_working_set_string(&task.working_set_snapshot, "source_path")?;
-    let mut plan = orchestral_core::types::Plan::new(
-        choice.stage_goal.clone(),
-        vec![
-            Step::action("reactor_probe_inspect", REACTOR_SPREADSHEET_INSPECT_ACTION)
-                .with_exports(vec!["inspection".to_string()])
-                .with_params(serde_json::json!({
-                    "path": source_path,
-                })),
-        ],
-    );
-    plan.on_failure = Some("Spreadsheet probe failed: {{error}}".to_string());
-    Ok(plan)
-}
-
-fn build_spreadsheet_derive_plan(
-    task: &Task,
-    choice: &StageChoice,
-) -> Result<orchestral_core::types::Plan, OrchestratorError> {
-    let source_path = require_working_set_string(&task.working_set_snapshot, "source_path")?;
-    let inspection = task
-        .working_set_snapshot
-        .get("inspection")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let mut plan = orchestral_core::types::Plan::new(
-        choice.stage_goal.clone(),
-        vec![Step::leaf_agent("reactor_derive")
-                .with_exports(vec!["patch_candidates".to_string(), "summary".to_string()])
-                .with_params(serde_json::json!({
-                    "mode": "leaf",
-                    "goal": "Derive spreadsheet patch candidates. Using user_request, source_path, inspection, and derivation_policy, return JSON with keys patch_candidates and summary. patch_candidates must describe candidate fills for patchable cells without modifying the file. permissive policy may propose generic but coherent spreadsheet fill content when structure is clear. strict policy should surface unresolved unknowns through patch_candidates. Do not decide continuation here.",
-                    "allowed_actions": ["json_stdout"],
-                    "max_iterations": 1,
-                    "result_slot": "derive_result",
-                    "output_keys": ["patch_candidates", "summary"],
-                    "output_rules": build_leaf_output_rules(&["patch_candidates", "summary"], "derive_result"),
-                    "user_request": task.intent.content,
-                    "source_path": source_path,
-                    "inspection": inspection,
-                    "stage_goal": choice.stage_goal,
-                    "derivation_policy": choice.derivation_policy,
                 }))],
-    );
-    plan.on_failure = Some("Spreadsheet derive failed: {{error}}".to_string());
-    Ok(plan)
-}
+        );
+        plan.on_failure = Some(format!("{} locate failed: {{error}}", self.family_label()));
+        plan
+    }
 
-fn build_spreadsheet_assess_plan(
-    task: &Task,
-    choice: &StageChoice,
-) -> Result<orchestral_core::types::Plan, OrchestratorError> {
-    let inspection = task
-        .working_set_snapshot
-        .get("inspection")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let patch_candidates = task
-        .working_set_snapshot
-        .get("patch_candidates")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let mut plan = orchestral_core::types::Plan::new(
-        choice.stage_goal.clone(),
-        vec![
-            Step::action("reactor_assess", REACTOR_SPREADSHEET_ASSESS_ACTION)
+    fn build_probe_plan(
+        self,
+        task: &Task,
+        choice: &StageChoice,
+    ) -> Result<orchestral_core::types::Plan, OrchestratorError> {
+        let source_value = self.source_value(&task.working_set_snapshot)?;
+        let mut params = serde_json::Map::new();
+        params.insert(self.inspect_input_key().to_string(), source_value);
+        let mut plan = orchestral_core::types::Plan::new(
+            choice.stage_goal.clone(),
+            vec![Step::action("reactor_probe_inspect", self.inspect_action)
+                .with_exports(vec!["inspection".to_string()])
+                .with_params(Value::Object(params))],
+        );
+        plan.on_failure = Some(format!("{} probe failed: {{error}}", self.family_label()));
+        Ok(plan)
+    }
+
+    fn build_derive_plan(
+        self,
+        task: &Task,
+        choice: &StageChoice,
+    ) -> Result<orchestral_core::types::Plan, OrchestratorError> {
+        let mut params = serde_json::Map::new();
+        params.insert("mode".to_string(), serde_json::json!("leaf"));
+        params.insert(
+            "goal".to_string(),
+            Value::String(self.derive_goal().to_string()),
+        );
+        params.insert(
+            "allowed_actions".to_string(),
+            serde_json::json!(["json_stdout"]),
+        );
+        params.insert("max_iterations".to_string(), serde_json::json!(1));
+        params.insert(
+            "result_slot".to_string(),
+            Value::String("derive_result".to_string()),
+        );
+        params.insert(
+            "output_keys".to_string(),
+            serde_json::json!(["patch_candidates", "summary"]),
+        );
+        params.insert(
+            "output_rules".to_string(),
+            build_leaf_output_rules(&["patch_candidates", "summary"], "derive_result"),
+        );
+        params.insert(
+            "user_request".to_string(),
+            Value::String(task.intent.content.clone()),
+        );
+        params.insert(
+            self.source_snapshot_key().to_string(),
+            self.source_value(&task.working_set_snapshot)?,
+        );
+        params.insert(
+            "inspection".to_string(),
+            task.working_set_snapshot
+                .get("inspection")
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+        params.insert(
+            "stage_goal".to_string(),
+            Value::String(choice.stage_goal.clone()),
+        );
+        params.insert(
+            "derivation_policy".to_string(),
+            serde_json::to_value(choice.derivation_policy).map_err(|err| {
+                OrchestratorError::Planner(PlanError::Generation(format!(
+                    "failed to serialize derivation_policy: {}",
+                    err
+                )))
+            })?,
+        );
+        let mut plan = orchestral_core::types::Plan::new(
+            choice.stage_goal.clone(),
+            vec![Step::leaf_agent("reactor_derive")
+                .with_exports(vec!["patch_candidates".to_string(), "summary".to_string()])
+                .with_params(Value::Object(params))],
+        );
+        plan.on_failure = Some(format!("{} derive failed: {{error}}", self.family_label()));
+        Ok(plan)
+    }
+
+    fn build_assess_plan(
+        self,
+        task: &Task,
+        choice: &StageChoice,
+    ) -> Result<orchestral_core::types::Plan, OrchestratorError> {
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "inspection".to_string(),
+            task.working_set_snapshot
+                .get("inspection")
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+        params.insert(
+            "patch_candidates".to_string(),
+            task.working_set_snapshot
+                .get("patch_candidates")
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+        params.insert(
+            "derivation_policy".to_string(),
+            serde_json::to_value(choice.derivation_policy).map_err(|err| {
+                OrchestratorError::Planner(PlanError::Generation(format!(
+                    "failed to serialize derivation_policy: {}",
+                    err
+                )))
+            })?,
+        );
+        if matches!(self.artifact_family, ArtifactFamily::Document) {
+            params.insert(
+                "user_request".to_string(),
+                Value::String(task.intent.content.clone()),
+            );
+        }
+        let mut plan = orchestral_core::types::Plan::new(
+            choice.stage_goal.clone(),
+            vec![Step::action("reactor_assess", self.assess_action)
                 .with_exports(vec!["continuation".to_string(), "summary".to_string()])
-                .with_params(serde_json::json!({
-                    "inspection": inspection,
-                    "patch_candidates": patch_candidates,
-                    "derivation_policy": choice.derivation_policy,
-                })),
-        ],
-    );
-    plan.on_failure = Some("Spreadsheet assess failed: {{error}}".to_string());
-    Ok(plan)
-}
+                .with_params(Value::Object(params))],
+        );
+        plan.on_failure = Some(format!("{} assess failed: {{error}}", self.family_label()));
+        Ok(plan)
+    }
 
-fn build_spreadsheet_commit_plan(
-    task: &Task,
-    choice: &StageChoice,
-) -> Result<orchestral_core::types::Plan, OrchestratorError> {
-    let source_path = require_working_set_string(&task.working_set_snapshot, "source_path")?;
-    let mut plan = orchestral_core::types::Plan::new(
-        choice.stage_goal.clone(),
-        vec![
-            Step::leaf_agent("reactor_commit_derive")
-                .with_exports(vec!["patch_spec".to_string(), "summary".to_string()])
-                .with_params(serde_json::json!({
-                    "mode": "leaf",
-                    "goal": "Commit stage for spreadsheet patching. Using user_request, source_path, inspection, patch_candidates, and derivation_policy, return JSON with keys patch_spec and summary. patch_spec must be an object with path and fills. patch_spec.fills must be an array of {cell, value}. Cover every patchable cell listed in inspection.selected_region.patchable_cells unless the cell is already handled by a formula or existing non-empty value. If derivation_policy is permissive, fill any remaining uncovered patchable cells with coherent generic content inferred from row labels and column headers instead of leaving gaps. Do not include unchanged cells. Preserve formulas and workbook structure. When a proposed fill is numeric, emit a numeric JSON value instead of prose.",
-                    "allowed_actions": ["json_stdout"],
-                    "max_iterations": 1,
-                    "result_slot": "commit_result",
-                    "output_keys": ["patch_spec", "summary"],
-                    "output_rules": build_leaf_output_rules(&["patch_spec", "summary"], "commit_result"),
-                    "user_request": task.intent.content,
-                    "source_path": source_path,
-                    "inspection": task.working_set_snapshot.get("inspection").cloned().unwrap_or(Value::Null),
-                    "patch_candidates": task.working_set_snapshot.get("patch_candidates").cloned().unwrap_or(Value::Null),
-                    "derivation_policy": choice.derivation_policy,
-                })),
-            Step::action("reactor_commit_apply", REACTOR_SPREADSHEET_APPLY_ACTION)
+    fn build_commit_plan(
+        self,
+        task: &Task,
+        choice: &StageChoice,
+    ) -> Result<orchestral_core::types::Plan, OrchestratorError> {
+        let mut params = serde_json::Map::new();
+        params.insert("mode".to_string(), serde_json::json!("leaf"));
+        params.insert(
+            "goal".to_string(),
+            Value::String(self.commit_goal().to_string()),
+        );
+        params.insert(
+            "allowed_actions".to_string(),
+            serde_json::json!(["json_stdout"]),
+        );
+        params.insert("max_iterations".to_string(), serde_json::json!(1));
+        params.insert(
+            "result_slot".to_string(),
+            Value::String("commit_result".to_string()),
+        );
+        params.insert(
+            "output_keys".to_string(),
+            serde_json::json!(["patch_spec", "summary"]),
+        );
+        params.insert(
+            "output_rules".to_string(),
+            build_leaf_output_rules(&["patch_spec", "summary"], "commit_result"),
+        );
+        params.insert(
+            "user_request".to_string(),
+            Value::String(task.intent.content.clone()),
+        );
+        params.insert(
+            self.source_snapshot_key().to_string(),
+            self.source_value(&task.working_set_snapshot)?,
+        );
+        params.insert(
+            "inspection".to_string(),
+            task.working_set_snapshot
+                .get("inspection")
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+        if !matches!(self.artifact_family, ArtifactFamily::Structured) {
+            params.insert(
+                "patch_candidates".to_string(),
+                task.working_set_snapshot
+                    .get("patch_candidates")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+        }
+        params.insert(
+            "derivation_policy".to_string(),
+            serde_json::to_value(choice.derivation_policy).map_err(|err| {
+                OrchestratorError::Planner(PlanError::Generation(format!(
+                    "failed to serialize derivation_policy: {}",
+                    err
+                )))
+            })?,
+        );
+        if matches!(self.artifact_family, ArtifactFamily::Document) {
+            params.insert(
+                "resume_user_input".to_string(),
+                task.working_set_snapshot
+                    .get("resume_user_input")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+        }
+
+        let apply_step = match self.artifact_family {
+            ArtifactFamily::Spreadsheet => Step::action("reactor_commit_apply", self.apply_action)
                 .with_depends_on(vec![StepId::from("reactor_commit_derive")])
                 .with_exports(vec![
                     "updated_file_path".to_string(),
                     "patch_count".to_string(),
                     "summary".to_string(),
                 ])
-                .with_io_bindings(vec![StepIoBinding::required("reactor_commit_derive.patch_spec", "patch_spec")])
+                .with_io_bindings(vec![StepIoBinding::required(
+                    "reactor_commit_derive.patch_spec",
+                    "patch_spec",
+                )])
                 .with_params(serde_json::json!({
-                    "path": source_path,
+                    "path": require_working_set_string(&task.working_set_snapshot, "source_path")?,
                 })),
-        ],
-    );
-    plan.on_failure = Some("Spreadsheet commit failed: {{error}}".to_string());
-    Ok(plan)
-}
-
-fn build_spreadsheet_verify_plan(
-    task: &Task,
-    choice: &StageChoice,
-) -> Result<orchestral_core::types::Plan, OrchestratorError> {
-    let path = require_working_set_string(&task.working_set_snapshot, "updated_file_path")
-        .or_else(|_| require_working_set_string(&task.working_set_snapshot, "source_path"))?;
-    let mut plan = orchestral_core::types::Plan::new(
-        choice.stage_goal.clone(),
-        vec![
-            Step::action("reactor_verify", REACTOR_SPREADSHEET_VERIFY_ACTION)
-                .with_exports(vec!["verify_decision".to_string(), "summary".to_string()])
-                .with_params(serde_json::json!({
-                    "path": path,
-                })),
-        ],
-    );
-    plan.on_complete = Some("Workbook updated and verified.".to_string());
-    plan.on_failure = Some("Spreadsheet verify failed: {{error}}".to_string());
-    Ok(plan)
-}
-
-fn build_document_locate_plan(task: &Task, choice: &StageChoice) -> orchestral_core::types::Plan {
-    let mut plan = orchestral_core::types::Plan::new(
-        choice.stage_goal.clone(),
-        vec![
-            Step::action("reactor_locate", REACTOR_DOCUMENT_LOCATE_ACTION)
-                .with_exports(vec![
-                    "source_paths".to_string(),
-                    "artifact_candidates".to_string(),
-                    "artifact_count".to_string(),
-                ])
-                .with_params(serde_json::json!({
-                    "source_root": ".",
-                    "user_request": task.intent.content,
-                })),
-        ],
-    );
-    plan.on_failure = Some("Document locate failed: {{error}}".to_string());
-    plan
-}
-
-fn build_document_probe_plan(
-    task: &Task,
-    choice: &StageChoice,
-) -> Result<orchestral_core::types::Plan, OrchestratorError> {
-    let source_paths =
-        require_working_set_string_array(&task.working_set_snapshot, "source_paths")?;
-    let mut plan = orchestral_core::types::Plan::new(
-        choice.stage_goal.clone(),
-        vec![
-            Step::action("reactor_probe_inspect", REACTOR_DOCUMENT_INSPECT_ACTION)
-                .with_exports(vec!["inspection".to_string()])
-                .with_params(serde_json::json!({
-                    "source_paths": source_paths,
-                })),
-        ],
-    );
-    plan.on_failure = Some("Document probe failed: {{error}}".to_string());
-    Ok(plan)
-}
-
-fn build_document_derive_plan(
-    task: &Task,
-    choice: &StageChoice,
-) -> Result<orchestral_core::types::Plan, OrchestratorError> {
-    let source_paths =
-        require_working_set_string_array(&task.working_set_snapshot, "source_paths")?;
-    let inspection = task
-        .working_set_snapshot
-        .get("inspection")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let mut plan = orchestral_core::types::Plan::new(
-        choice.stage_goal.clone(),
-        vec![Step::leaf_agent("reactor_derive")
-                .with_exports(vec!["patch_candidates".to_string(), "summary".to_string()])
-                .with_params(serde_json::json!({
-                    "mode": "leaf",
-                    "goal": "Derive document patch candidates. Using user_request, source_paths, inspection, and derivation_policy, return JSON with keys patch_candidates and summary. patch_candidates must be an object with a files array. Each file entry should contain path, planned_changes, needs_user_input, and unknowns. summary should be a concise change plan. Do not modify files. Do not decide continuation here.",
-                    "allowed_actions": ["json_stdout"],
-                    "max_iterations": 1,
-                    "result_slot": "derive_result",
-                    "output_keys": ["patch_candidates", "summary"],
-                    "output_rules": build_leaf_output_rules(&["patch_candidates", "summary"], "derive_result"),
-                    "user_request": task.intent.content,
-                    "source_paths": source_paths,
-                    "inspection": inspection,
-                    "stage_goal": choice.stage_goal,
-                    "derivation_policy": choice.derivation_policy,
-                }))],
-    );
-    plan.on_failure = Some("Document derive failed: {{error}}".to_string());
-    Ok(plan)
-}
-
-fn build_document_assess_plan(
-    task: &Task,
-    choice: &StageChoice,
-) -> Result<orchestral_core::types::Plan, OrchestratorError> {
-    let inspection = task
-        .working_set_snapshot
-        .get("inspection")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let patch_candidates = task
-        .working_set_snapshot
-        .get("patch_candidates")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let mut plan = orchestral_core::types::Plan::new(
-        choice.stage_goal.clone(),
-        vec![
-            Step::action("reactor_assess", REACTOR_DOCUMENT_ASSESS_ACTION)
-                .with_exports(vec!["continuation".to_string(), "summary".to_string()])
-                .with_params(serde_json::json!({
-                    "inspection": inspection,
-                    "patch_candidates": patch_candidates,
-                    "derivation_policy": choice.derivation_policy,
-                    "user_request": task.intent.content,
-                })),
-        ],
-    );
-    plan.on_failure = Some("Document assess failed: {{error}}".to_string());
-    Ok(plan)
-}
-
-fn build_document_commit_plan(
-    task: &Task,
-    choice: &StageChoice,
-) -> Result<orchestral_core::types::Plan, OrchestratorError> {
-    let source_paths =
-        require_working_set_string_array(&task.working_set_snapshot, "source_paths")?;
-    let inspection = task
-        .working_set_snapshot
-        .get("inspection")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let patch_candidates = task
-        .working_set_snapshot
-        .get("patch_candidates")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let resume_user_input = task
-        .working_set_snapshot
-        .get("resume_user_input")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let mut plan = orchestral_core::types::Plan::new(
-        choice.stage_goal.clone(),
-        vec![
-            Step::leaf_agent("reactor_commit_derive")
-                .with_exports(vec!["patch_spec".to_string(), "summary".to_string()])
-                .with_params(serde_json::json!({
-                    "mode": "leaf",
-                    "goal": "Commit stage for document patching. Using user_request, resume_user_input, source_paths, inspection, patch_candidates, and derivation_policy, return JSON with keys patch_spec and summary. patch_spec must be an object with updates. updates must be an array of {path, content}. Generate complete final markdown/text content for each file that needs changes. Replace TODO placeholders with concrete coherent content, add a top-level title when missing, preserve unaffected content, and if resume_user_input requests a summary/report markdown path include an update for that file too. Do not emit unchanged files.",
-                    "allowed_actions": ["json_stdout"],
-                    "max_iterations": 1,
-                    "result_slot": "commit_result",
-                    "output_keys": ["patch_spec", "summary"],
-                    "output_rules": build_leaf_output_rules(&["patch_spec", "summary"], "commit_result"),
-                    "user_request": task.intent.content,
-                    "resume_user_input": resume_user_input,
-                    "source_paths": source_paths,
-                    "inspection": inspection,
-                    "patch_candidates": patch_candidates,
-                    "derivation_policy": choice.derivation_policy,
-                })),
-            Step::action("reactor_commit_apply", REACTOR_DOCUMENT_APPLY_ACTION)
+            ArtifactFamily::Document => Step::action("reactor_commit_apply", self.apply_action)
                 .with_depends_on(vec![StepId::from("reactor_commit_derive")])
                 .with_exports(vec![
                     "updated_paths".to_string(),
@@ -630,55 +703,121 @@ fn build_document_commit_plan(
                     "reactor_commit_derive.patch_spec",
                     "patch_spec",
                 )]),
-        ],
-    );
-    plan.on_failure = Some("Document commit failed: {{error}}".to_string());
-    Ok(plan)
-}
+            ArtifactFamily::Structured => Step::action("reactor_commit_apply", self.apply_action)
+                .with_depends_on(vec![StepId::from("reactor_commit_derive")])
+                .with_exports(vec![
+                    "updated_paths".to_string(),
+                    "patch_count".to_string(),
+                    "summary".to_string(),
+                ])
+                .with_io_bindings(vec![StepIoBinding::required(
+                    "reactor_commit_derive.patch_spec",
+                    "patch_spec",
+                )]),
+            unsupported => unreachable!(
+                "locate_and_patch adapter does not support artifact family {:?}",
+                unsupported
+            ),
+        };
 
-fn build_document_verify_plan(
-    task: &Task,
-    choice: &StageChoice,
-) -> Result<orchestral_core::types::Plan, OrchestratorError> {
-    let patch_spec = task
-        .working_set_snapshot
-        .get("patch_spec")
-        .cloned()
-        .ok_or_else(|| {
-            OrchestratorError::Planner(PlanError::Generation(
-                "reactor expected working_set key 'patch_spec'".to_string(),
-            ))
-        })?;
-    let inspection = task
-        .working_set_snapshot
-        .get("inspection")
-        .cloned()
-        .ok_or_else(|| {
-            OrchestratorError::Planner(PlanError::Generation(
-                "reactor expected working_set key 'inspection'".to_string(),
-            ))
-        })?;
-    let resume_user_input = task
-        .working_set_snapshot
-        .get("resume_user_input")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let mut plan = orchestral_core::types::Plan::new(
-        choice.stage_goal.clone(),
-        vec![
-            Step::action("reactor_verify", REACTOR_DOCUMENT_VERIFY_ACTION)
+        let mut plan = orchestral_core::types::Plan::new(
+            choice.stage_goal.clone(),
+            vec![
+                Step::leaf_agent("reactor_commit_derive")
+                    .with_exports(vec!["patch_spec".to_string(), "summary".to_string()])
+                    .with_params(Value::Object(params)),
+                apply_step,
+            ],
+        );
+        plan.on_failure = Some(format!("{} commit failed: {{error}}", self.family_label()));
+        Ok(plan)
+    }
+
+    fn build_verify_plan(
+        self,
+        task: &Task,
+        choice: &StageChoice,
+    ) -> Result<orchestral_core::types::Plan, OrchestratorError> {
+        let mut params = serde_json::Map::new();
+        match self.artifact_family {
+            ArtifactFamily::Spreadsheet => {
+                let path =
+                    require_working_set_string(&task.working_set_snapshot, "updated_file_path")
+                        .or_else(|_| {
+                            require_working_set_string(&task.working_set_snapshot, "source_path")
+                        })?;
+                params.insert("path".to_string(), Value::String(path));
+                if let Some(patch_spec) = task.working_set_snapshot.get("patch_spec").cloned() {
+                    params.insert("patch_spec".to_string(), patch_spec);
+                }
+            }
+            ArtifactFamily::Document => {
+                params.insert(
+                    "patch_spec".to_string(),
+                    task.working_set_snapshot
+                        .get("patch_spec")
+                        .cloned()
+                        .ok_or_else(|| {
+                            OrchestratorError::Planner(PlanError::Generation(
+                                "reactor expected working_set key 'patch_spec'".to_string(),
+                            ))
+                        })?,
+                );
+                params.insert(
+                    "inspection".to_string(),
+                    task.working_set_snapshot
+                        .get("inspection")
+                        .cloned()
+                        .ok_or_else(|| {
+                            OrchestratorError::Planner(PlanError::Generation(
+                                "reactor expected working_set key 'inspection'".to_string(),
+                            ))
+                        })?,
+                );
+                params.insert(
+                    "user_request".to_string(),
+                    Value::String(task.intent.content.clone()),
+                );
+                params.insert(
+                    "resume_user_input".to_string(),
+                    task.working_set_snapshot
+                        .get("resume_user_input")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                );
+            }
+            ArtifactFamily::Structured => {
+                params.insert(
+                    "patch_spec".to_string(),
+                    task.working_set_snapshot
+                        .get("patch_spec")
+                        .cloned()
+                        .ok_or_else(|| {
+                            OrchestratorError::Planner(PlanError::Generation(
+                                "reactor expected working_set key 'patch_spec'".to_string(),
+                            ))
+                        })?,
+                );
+                if let Some(inspection) = task.working_set_snapshot.get("inspection").cloned() {
+                    params.insert("inspection".to_string(), inspection);
+                }
+            }
+            unsupported => unreachable!(
+                "locate_and_patch adapter does not support artifact family {:?}",
+                unsupported
+            ),
+        }
+
+        let mut plan = orchestral_core::types::Plan::new(
+            choice.stage_goal.clone(),
+            vec![Step::action("reactor_verify", self.verify_action)
                 .with_exports(vec!["verify_decision".to_string(), "summary".to_string()])
-                .with_params(serde_json::json!({
-                    "patch_spec": patch_spec,
-                    "inspection": inspection,
-                    "user_request": task.intent.content,
-                    "resume_user_input": resume_user_input,
-                })),
-        ],
-    );
-    plan.on_complete = Some("Documents updated and verified.".to_string());
-    plan.on_failure = Some("Document verify failed: {{error}}".to_string());
-    Ok(plan)
+                .with_params(Value::Object(params))],
+        );
+        plan.on_complete = Some(self.verify_complete_message.to_string());
+        plan.on_failure = Some(format!("{} verify failed: {{error}}", self.family_label()));
+        Ok(plan)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1791,48 +1930,29 @@ impl Orchestrator {
         task: &Task,
         choice: &StageChoice,
     ) -> Result<orchestral_core::types::Plan, OrchestratorError> {
-        match (choice.skeleton, choice.artifact_family, choice.current_stage) {
-            (SkeletonKind::LocateAndPatch, ArtifactFamily::Spreadsheet, StageKind::Locate) => {
-                Ok(build_spreadsheet_locate_plan(task, choice))
+        if choice.skeleton == SkeletonKind::LocateAndPatch {
+            if let Some(adapter) =
+                LocateAndPatchFamilyAdapter::for_artifact_family(choice.artifact_family)
+            {
+                return match choice.current_stage {
+                    StageKind::Locate => Ok(adapter.build_locate_plan(task, choice)),
+                    StageKind::Probe => adapter.build_probe_plan(task, choice),
+                    StageKind::Derive => adapter.build_derive_plan(task, choice),
+                    StageKind::Assess => adapter.build_assess_plan(task, choice),
+                    StageKind::Commit => adapter.build_commit_plan(task, choice),
+                    StageKind::Verify => adapter.build_verify_plan(task, choice),
+                    unsupported => Err(OrchestratorError::Planner(PlanError::Generation(format!(
+                        "locate_and_patch does not support stage {:?} for artifact_family={:?}",
+                        unsupported, choice.artifact_family
+                    )))),
+                };
             }
-            (SkeletonKind::LocateAndPatch, ArtifactFamily::Spreadsheet, StageKind::Probe) => {
-                build_spreadsheet_probe_plan(task, choice)
-            }
-            (SkeletonKind::LocateAndPatch, ArtifactFamily::Spreadsheet, StageKind::Derive) => {
-                build_spreadsheet_derive_plan(task, choice)
-            }
-            (SkeletonKind::LocateAndPatch, ArtifactFamily::Spreadsheet, StageKind::Assess) => {
-                build_spreadsheet_assess_plan(task, choice)
-            }
-            (SkeletonKind::LocateAndPatch, ArtifactFamily::Spreadsheet, StageKind::Commit) => {
-                build_spreadsheet_commit_plan(task, choice)
-            }
-            (SkeletonKind::LocateAndPatch, ArtifactFamily::Spreadsheet, StageKind::Verify) => {
-                build_spreadsheet_verify_plan(task, choice)
-            }
-            (SkeletonKind::LocateAndPatch, ArtifactFamily::Document, StageKind::Locate) => {
-                Ok(build_document_locate_plan(task, choice))
-            }
-            (SkeletonKind::LocateAndPatch, ArtifactFamily::Document, StageKind::Probe) => {
-                build_document_probe_plan(task, choice)
-            }
-            (SkeletonKind::LocateAndPatch, ArtifactFamily::Document, StageKind::Derive) => {
-                build_document_derive_plan(task, choice)
-            }
-            (SkeletonKind::LocateAndPatch, ArtifactFamily::Document, StageKind::Assess) => {
-                build_document_assess_plan(task, choice)
-            }
-            (SkeletonKind::LocateAndPatch, ArtifactFamily::Document, StageKind::Commit) => {
-                build_document_commit_plan(task, choice)
-            }
-            (SkeletonKind::LocateAndPatch, ArtifactFamily::Document, StageKind::Verify) => {
-                build_document_verify_plan(task, choice)
-            }
-            _ => Err(OrchestratorError::Planner(PlanError::Generation(format!(
-                "reactor lowering not implemented for skeleton={:?} artifact_family={:?} current_stage={:?}",
-                choice.skeleton, choice.artifact_family, choice.current_stage
-            )))),
         }
+
+        Err(OrchestratorError::Planner(PlanError::Generation(format!(
+            "reactor lowering not implemented for skeleton={:?} artifact_family={:?} current_stage={:?}",
+            choice.skeleton, choice.artifact_family, choice.current_stage
+        ))))
     }
 
     async fn build_reactor_replan_choice(

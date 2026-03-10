@@ -9,8 +9,8 @@ use serde_json::{json, Value};
 use orchestral_core::action::{Action, ActionContext, ActionInput, ActionMeta, ActionResult};
 use orchestral_core::config::ActionSpec;
 use orchestral_core::types::{
-    ContinuationState, ContinuationStatus, DerivationPolicy, StageKind, VerifyDecision,
-    VerifyStatus,
+    ContinuationState, ContinuationStatus, DerivationPolicy, PatchCandidatesEnvelope, StageKind,
+    VerifyDecision, VerifyStatus,
 };
 
 use super::factory::ActionBuildError;
@@ -783,11 +783,7 @@ fn parse_document_updates(patch_spec: &Value) -> Result<Vec<DocumentUpdate>, Str
 
 fn synthesize_document_plan_summary(inspection: &Value, patch_candidates: &Value) -> String {
     let mut lines = vec!["计划修改以下文档：".to_string()];
-    let candidate_files = patch_candidates
-        .get("files")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let candidate_files = document_candidate_files(patch_candidates);
     let mut candidate_map = BTreeMap::new();
     for file in candidate_files {
         let Some(path) = file.get("path").and_then(Value::as_str) else {
@@ -853,29 +849,59 @@ fn synthesize_document_plan_summary(inspection: &Value, patch_candidates: &Value
 }
 
 fn collect_candidate_unknowns(patch_candidates: &Value) -> Vec<String> {
-    let mut unknowns = Vec::new();
-    if let Some(items) = patch_candidates.get("unknowns").and_then(Value::as_array) {
-        unknowns.extend(items.iter().filter_map(Value::as_str).map(str::to_string));
-    }
-    if let Some(files) = patch_candidates.get("files").and_then(Value::as_array) {
-        for file in files {
-            if file
-                .get("needs_user_input")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                if let Some(path) = file.get("path").and_then(Value::as_str) {
-                    unknowns.push(format!("{} requires additional user input", path));
-                }
+    let mut unknowns = parse_patch_candidates_envelope(patch_candidates)
+        .map(|value| value.unknowns)
+        .unwrap_or_else(|| {
+            patch_candidates
+                .get("unknowns")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        });
+    for file in document_candidate_files(patch_candidates) {
+        if file
+            .get("needs_user_input")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            if let Some(path) = file.get("path").and_then(Value::as_str) {
+                unknowns.push(format!("{} requires additional user input", path));
             }
-            if let Some(items) = file.get("unknowns").and_then(Value::as_array) {
-                unknowns.extend(items.iter().filter_map(Value::as_str).map(str::to_string));
-            }
+        }
+        if let Some(items) = file.get("unknowns").and_then(Value::as_array) {
+            unknowns.extend(items.iter().filter_map(Value::as_str).map(str::to_string));
         }
     }
     unknowns.sort();
     unknowns.dedup();
     unknowns
+}
+
+fn document_candidate_files(patch_candidates: &Value) -> Vec<Value> {
+    let candidate_root = parse_patch_candidates_envelope(patch_candidates)
+        .map(|value| value.candidates)
+        .unwrap_or_else(|| patch_candidates.clone());
+    candidate_root
+        .get("files")
+        .and_then(Value::as_array)
+        .cloned()
+        .or_else(|| {
+            patch_candidates
+                .get("files")
+                .and_then(Value::as_array)
+                .cloned()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_patch_candidates_envelope(value: &Value) -> Option<PatchCandidatesEnvelope> {
+    serde_json::from_value::<PatchCandidatesEnvelope>(value.clone()).ok()
 }
 
 fn request_requires_confirmation(user_request: &str) -> bool {
@@ -1140,14 +1166,18 @@ mod tests {
             ]
         });
         let patch_candidates = json!({
-            "files": [
-                {
-                    "path": "docs/a.md",
-                    "planned_changes": ["补全标题", "替换 TODO"],
-                    "needs_user_input": false,
-                    "unknowns": []
-                }
-            ]
+            "candidates": {
+                "files": [
+                    {
+                        "path": "docs/a.md",
+                        "planned_changes": ["补全标题", "替换 TODO"],
+                        "needs_user_input": false,
+                        "unknowns": []
+                    }
+                ]
+            },
+            "unknowns": [],
+            "assumptions": []
         });
 
         let (continuation, summary) = assess_document_readiness(
@@ -1166,5 +1196,26 @@ mod tests {
             continuation["next_stage_hint"],
             Value::String("commit".to_string())
         );
+    }
+
+    #[test]
+    fn test_collect_candidate_unknowns_supports_enveloped_files() {
+        let patch_candidates = json!({
+            "candidates": {
+                "files": [
+                    {
+                        "path": "docs/a.md",
+                        "needs_user_input": true,
+                        "unknowns": ["missing owner"]
+                    }
+                ]
+            },
+            "unknowns": ["missing due date"]
+        });
+
+        let unknowns = collect_candidate_unknowns(&patch_candidates);
+        assert!(unknowns.contains(&"docs/a.md requires additional user input".to_string()));
+        assert!(unknowns.contains(&"missing owner".to_string()));
+        assert!(unknowns.contains(&"missing due date".to_string()));
     }
 }

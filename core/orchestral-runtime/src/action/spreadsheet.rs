@@ -13,7 +13,9 @@ use zip::{ZipArchive, ZipWriter};
 
 use orchestral_core::action::{Action, ActionContext, ActionInput, ActionMeta, ActionResult};
 use orchestral_core::config::ActionSpec;
-use orchestral_core::types::{ContinuationState, ContinuationStatus, DerivationPolicy, StageKind};
+use orchestral_core::types::{
+    ContinuationState, ContinuationStatus, DerivationPolicy, PatchCandidatesEnvelope, StageKind,
+};
 
 use super::factory::ActionBuildError;
 
@@ -364,12 +366,14 @@ impl Action for SpreadsheetVerifyPatchAction {
         ActionMeta::new(self.name(), self.description())
             .with_capabilities(["filesystem_read"])
             .with_roles(["verify"])
-            .with_input_kinds(["path"])
+            .with_input_kinds(["path", "structured"])
             .with_output_kinds(["structured"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string" }
+                    "path": { "type": "string" },
+                    "patch_spec": { "type": "object" },
+                    "validator_path": { "type": "string" }
                 },
                 "required": ["path"]
             }))
@@ -387,12 +391,13 @@ impl Action for SpreadsheetVerifyPatchAction {
         let Some(path) = input.params.get("path").and_then(Value::as_str) else {
             return ActionResult::error("Missing path for spreadsheet_verify_patch");
         };
+        let patch_spec = input.params.get("patch_spec");
         let validator_path = input
             .params
             .get("validator_path")
             .and_then(Value::as_str)
             .or(self.default_validator_path.as_deref());
-        match verify_patch(Path::new(path), validator_path) {
+        match verify_patch(Path::new(path), patch_spec, validator_path) {
             Ok(decision) => {
                 let status = decision
                     .get("status")
@@ -623,10 +628,31 @@ fn inspect_workbook(path: &Path) -> Result<Value, String> {
     }))
 }
 
-fn verify_patch(path: &Path, validator_path: Option<&str>) -> Result<Value, String> {
+fn verify_patch(
+    path: &Path,
+    patch_spec: Option<&Value>,
+    validator_path: Option<&str>,
+) -> Result<Value, String> {
     let workbook_path = normalize_path(path)?;
-    if let Some(validator_path) = validator_path.filter(|value| !value.trim().is_empty()) {
-        return run_external_validator(&workbook_path, validator_path);
+    let spec_evidence = match patch_spec {
+        Some(spec) => Some(verify_patch_against_spec(&workbook_path, spec)?),
+        None => None,
+    };
+    if let Some(evidence) = &spec_evidence {
+        let mismatch_count = evidence
+            .get("mismatch_count")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        if mismatch_count > 0 {
+            return Ok(json!({
+                "status": "failed",
+                "reason": format!("{} spreadsheet fills do not match patch_spec", mismatch_count),
+                "evidence": {
+                    "spec_verification": evidence,
+                    "path": workbook_path,
+                },
+            }));
+        }
     }
 
     let inspection = inspect_workbook(&workbook_path)?;
@@ -636,18 +662,34 @@ fn verify_patch(path: &Path, validator_path: Option<&str>) -> Result<Value, Stri
         .and_then(Value::as_array)
         .map(|v| v.len())
         .unwrap_or(0);
+    if let Some(validator_path) = validator_path.filter(|value| !value.trim().is_empty()) {
+        let validator_decision = run_external_validator(&workbook_path, validator_path)?;
+        return Ok(attach_verify_evidence(
+            validator_decision,
+            spec_evidence,
+            Some(inspection),
+        ));
+    }
     if patchable == 0 {
-        Ok(json!({
-            "status": "passed",
-            "reason": "selected spreadsheet region no longer has patchable cells",
-            "evidence": inspection,
-        }))
+        Ok(attach_verify_evidence(
+            json!({
+                "status": "passed",
+                "reason": "selected spreadsheet region no longer has patchable cells",
+                "evidence": inspection,
+            }),
+            spec_evidence,
+            None,
+        ))
     } else {
-        Ok(json!({
-            "status": "failed",
-            "reason": format!("selected spreadsheet region still has {} patchable cells", patchable),
-            "evidence": inspection,
-        }))
+        Ok(attach_verify_evidence(
+            json!({
+                "status": "failed",
+                "reason": format!("selected spreadsheet region still has {} patchable cells", patchable),
+                "evidence": inspection,
+            }),
+            spec_evidence,
+            None,
+        ))
     }
 }
 
@@ -750,15 +792,7 @@ fn assess_readiness(
         .filter_map(|cell| cell.get("cell").and_then(Value::as_str))
         .map(str::to_string)
         .collect::<HashSet<_>>();
-    let candidate_cells = match patch_candidates {
-        Value::Array(items) => items.clone(),
-        Value::Object(_) => patch_candidates
-            .get("cells")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default(),
-        _ => Vec::new(),
-    };
+    let candidate_cells = extract_spreadsheet_candidate_cells(patch_candidates);
 
     if patchable_refs.is_empty() {
         let continuation = ContinuationState {
@@ -787,44 +821,27 @@ fn assess_readiness(
             .get("proposed_action")
             .and_then(Value::as_str)
             .unwrap_or("fill");
-        let proposed_value = candidate
-            .get("proposed_value")
-            .or_else(|| candidate.get("suggested_value"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+        let proposed_value = candidate_value_text(&candidate).unwrap_or_default();
         if proposed_action != "fill" || proposed_value.trim().is_empty() {
             continue;
         }
         if patchable_refs.contains(&cell_ref) {
             covered_refs.insert(cell_ref.clone());
-            if looks_like_placeholder_value(proposed_value) {
+            if looks_like_placeholder_value(&proposed_value) {
                 placeholder_refs.push(cell_ref);
             }
         }
     }
 
-    let mut unknowns = patch_candidates
-        .get("unknowns")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let assumptions = patch_candidates
-        .get("assumptions")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let envelope = parse_patch_candidates_envelope(patch_candidates);
+    let mut unknowns = envelope
+        .as_ref()
+        .map(|value| value.unknowns.clone())
+        .unwrap_or_else(|| extract_string_array_field(patch_candidates, "unknowns"));
+    let assumptions = envelope
+        .as_ref()
+        .map(|value| value.assumptions.clone())
+        .unwrap_or_else(|| extract_string_array_field(patch_candidates, "assumptions"));
 
     if matches!(derivation_policy, DerivationPolicy::Permissive) && !covered_refs.is_empty() {
         let continuation = ContinuationState {
@@ -924,6 +941,155 @@ fn apply_patch(path: &Path, patch_spec: &Value) -> Result<(String, usize), Strin
     }
     save_xlsx_model(&workbook)?;
     Ok((display_path(&workbook.path), applied))
+}
+
+fn extract_spreadsheet_candidate_cells(patch_candidates: &Value) -> Vec<Value> {
+    match patch_candidates {
+        Value::Array(items) => items.clone(),
+        Value::Object(_) => {
+            let candidate_root = parse_patch_candidates_envelope(patch_candidates)
+                .map(|value| value.candidates)
+                .unwrap_or_else(|| patch_candidates.clone());
+            candidate_root
+                .get("cells")
+                .and_then(Value::as_array)
+                .cloned()
+                .or_else(|| {
+                    patch_candidates
+                        .get("cells")
+                        .and_then(Value::as_array)
+                        .cloned()
+                })
+                .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn parse_patch_candidates_envelope(value: &Value) -> Option<PatchCandidatesEnvelope> {
+    serde_json::from_value::<PatchCandidatesEnvelope>(value.clone()).ok()
+}
+
+fn extract_string_array_field(value: &Value, key: &str) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn candidate_value_text(candidate: &Value) -> Option<String> {
+    candidate
+        .get("proposed_value")
+        .or_else(|| candidate.get("suggested_value"))
+        .or_else(|| candidate.get("value"))
+        .and_then(value_to_text)
+}
+
+fn value_to_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(boolean) => Some(boolean.to_string()),
+        other => Some(other.to_string()),
+    }
+}
+
+fn verify_patch_against_spec(path: &Path, patch_spec: &Value) -> Result<Value, String> {
+    let workbook = load_xlsx_model(path)?;
+    let fills = patch_spec
+        .get("fills")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "patch_spec.fills must be an array".to_string())?;
+    let mut mismatches = Vec::new();
+
+    for fill in fills {
+        let Some(cell_ref) = fill.get("cell").and_then(Value::as_str) else {
+            continue;
+        };
+        let expected = fill
+            .get("value")
+            .ok_or_else(|| format!("fill {} missing value", cell_ref))?;
+        let (row, col) = parse_cell_ref(cell_ref)?;
+        let actual_text = workbook
+            .rows
+            .get(&row)
+            .and_then(|row_data| row_data.cells.get(&col))
+            .map(cell_display_text)
+            .unwrap_or_default();
+        if !cell_value_matches_expected(expected, &actual_text) {
+            mismatches.push(json!({
+                "cell": cell_ref,
+                "expected": expected,
+                "actual": actual_text,
+            }));
+        }
+    }
+
+    Ok(json!({
+        "checked_fill_count": fills.len(),
+        "mismatch_count": mismatches.len(),
+        "mismatches": mismatches,
+    }))
+}
+
+fn cell_value_matches_expected(expected: &Value, actual_text: &str) -> bool {
+    let actual = actual_text.trim();
+    match expected {
+        Value::Null => actual.is_empty(),
+        Value::Bool(boolean) => {
+            let normalized = actual.to_ascii_lowercase();
+            if *boolean {
+                normalized == "1" || normalized == "true"
+            } else {
+                normalized == "0" || normalized == "false"
+            }
+        }
+        Value::Number(number) => number
+            .as_f64()
+            .and_then(|expected_number| {
+                actual
+                    .parse::<f64>()
+                    .ok()
+                    .map(|actual_number| (actual_number - expected_number).abs() < 1e-9)
+            })
+            .unwrap_or(false),
+        Value::String(text) => actual == text.trim(),
+        other => actual == other.to_string().trim_matches('"'),
+    }
+}
+
+fn attach_verify_evidence(
+    mut decision: Value,
+    spec_evidence: Option<Value>,
+    inspection: Option<Value>,
+) -> Value {
+    let Some(decision_object) = decision.as_object_mut() else {
+        return decision;
+    };
+    let evidence = decision_object
+        .entry("evidence".to_string())
+        .or_insert_with(|| json!({}));
+    if !evidence.is_object() {
+        *evidence = json!({});
+    }
+    let evidence_object = evidence
+        .as_object_mut()
+        .expect("evidence should be an object after initialization");
+    if let Some(spec_evidence) = spec_evidence {
+        evidence_object.insert("spec_verification".to_string(), spec_evidence);
+    }
+    if let Some(inspection) = inspection {
+        evidence_object.insert("inspection".to_string(), inspection);
+    }
+    decision
 }
 
 fn looks_like_placeholder_value(value: &str) -> bool {
@@ -1969,4 +2135,56 @@ fn xml_escape_attr(input: &str) -> String {
     xml_escape_text(input)
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_assess_readiness_accepts_enveloped_candidate_cells() {
+        let inspection = json!({
+            "selected_region": {
+                "patchable_cells": [
+                    { "cell": "E5" },
+                    { "cell": "F5" }
+                ]
+            }
+        });
+        let patch_candidates = json!({
+            "candidates": {
+                "cells": [
+                    {
+                        "cell": "E5",
+                        "proposed_action": "fill",
+                        "proposed_value": "按计划完成核心需求开发"
+                    },
+                    {
+                        "cell": "F5",
+                        "proposed_action": "fill",
+                        "proposed_value": "95"
+                    }
+                ]
+            },
+            "unknowns": [],
+            "assumptions": ["generic spreadsheet wording is acceptable"]
+        });
+
+        let (continuation, summary) =
+            assess_readiness(&inspection, &patch_candidates, "strict").expect("assess");
+        assert_eq!(
+            continuation["status"],
+            Value::String("commit_ready".to_string())
+        );
+        assert!(summary.contains("ready for strict commit"));
+    }
+
+    #[test]
+    fn test_cell_value_matches_expected_handles_numeric_and_string_values() {
+        assert!(cell_value_matches_expected(&json!(95), "95"));
+        assert!(cell_value_matches_expected(&json!("完成"), "完成"));
+        assert!(cell_value_matches_expected(&Value::Null, ""));
+        assert!(!cell_value_matches_expected(&json!(96), "95"));
+        assert!(!cell_value_matches_expected(&json!("完成"), "未完成"));
+    }
 }

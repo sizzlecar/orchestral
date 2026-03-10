@@ -493,6 +493,8 @@ actions:
           properties:
             path:
               type: string
+            patch_spec:
+              type: object
             validator_path:
               type: string
           required: ["path"]
@@ -617,6 +619,119 @@ actions:
               type: string
             resume_user_input: {}
           required: ["patch_spec", "inspection", "user_request"]
+        output_schema:
+          type: object
+          properties:
+            verify_decision:
+              type: object
+            summary:
+              type: string
+          required: ["verify_decision", "summary"]
+      config: {}
+    - name: reactor_structured_locate
+      kind: structured_locate
+      description: "Locate structured artifacts for the reactor structured family"
+      interface:
+        input_schema:
+          type: object
+          properties:
+            source_root:
+              type: string
+            user_request:
+              type: string
+          required: ["source_root", "user_request"]
+        output_schema:
+          type: object
+          properties:
+            source_paths:
+              type: array
+              items:
+                type: string
+            artifact_candidates:
+              type: array
+              items:
+                type: string
+            artifact_count:
+              type: integer
+          required: ["source_paths", "artifact_candidates", "artifact_count"]
+      config: {}
+    - name: reactor_structured_inspect
+      kind: structured_inspect
+      description: "Inspect structured artifact contents for the reactor structured family"
+      interface:
+        input_schema:
+          type: object
+          properties:
+            source_paths:
+              type: array
+              items:
+                type: string
+          required: ["source_paths"]
+        output_schema:
+          type: object
+          properties:
+            inspection:
+              type: object
+          required: ["inspection"]
+      config: {}
+    - name: reactor_structured_assess_readiness
+      kind: structured_assess_readiness
+      description: "Assess whether structured probe results are ready for commit"
+      interface:
+        input_schema:
+          type: object
+          properties:
+            inspection:
+              type: object
+            patch_candidates:
+              type: object
+            derivation_policy:
+              type: string
+          required: ["inspection", "patch_candidates", "derivation_policy"]
+        output_schema:
+          type: object
+          properties:
+            continuation:
+              type: object
+            summary:
+              type: string
+          required: ["continuation", "summary"]
+      config: {}
+    - name: reactor_structured_apply_patch
+      kind: structured_apply_patch
+      description: "Apply a typed structured patch for the reactor structured family"
+      interface:
+        input_schema:
+          type: object
+          properties:
+            patch_spec:
+              type: object
+          required: ["patch_spec"]
+        output_schema:
+          type: object
+          properties:
+            updated_paths:
+              type: array
+              items:
+                type: string
+            patch_count:
+              type: integer
+            summary:
+              type: string
+          required: ["updated_paths", "patch_count", "summary"]
+      config: {}
+    - name: reactor_structured_verify_patch
+      kind: structured_verify_patch
+      description: "Verify a structured patch for the reactor structured family"
+      interface:
+        input_schema:
+          type: object
+          properties:
+            patch_spec:
+              type: object
+            inspection:
+              type: object
+          required: ["patch_spec"]
         output_schema:
           type: object
           properties:
