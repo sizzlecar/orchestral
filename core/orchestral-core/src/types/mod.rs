@@ -8,6 +8,7 @@
 
 mod continuation;
 mod intent;
+mod patch_candidates;
 mod plan;
 mod skeleton;
 mod stage;
@@ -18,6 +19,7 @@ mod verify;
 
 pub use continuation::{ContinuationState, ContinuationStatus};
 pub use intent::{Intent, IntentContext};
+pub use patch_candidates::PatchCandidatesEnvelope;
 pub use plan::Plan;
 pub use skeleton::{SkeletonChoice, SkeletonKind};
 pub use stage::{ArtifactFamily, DerivationPolicy, StageKind};
