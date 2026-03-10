@@ -13,7 +13,8 @@ use orchestral_core::planner::{
     HistoryItem, PlanError, Planner, PlannerContext, PlannerOutput, SkillInstruction,
 };
 use orchestral_core::types::{
-    ArtifactFamily, DerivationPolicy, Intent, Plan, RecipeFamily, StageChoice, StageKind, Step,
+    ArtifactFamily, DerivationPolicy, Intent, Plan, SkeletonChoice, SkeletonKind, StageChoice,
+    StageKind, Step,
 };
 
 const MAX_PROMPT_LOG_CHARS: usize = 4_000;
@@ -310,42 +311,42 @@ fn build_reactor_prompt(
     };
 
     user.push_str("Return exactly one JSON object:\n");
-    append_reactor_stage_choice_examples(&mut user, coverage);
-    user.push_str(
-        r#"{"type":"WORKFLOW","goal":"...","steps":[{"id":"s1","kind":"action","action":"action_name","params":{}}],"confidence":0.0,"on_complete":"...","on_failure":"..."}"#,
-    );
-    user.push('\n');
+    append_reactor_choice_examples(&mut user, coverage);
     user.push_str(r#"{"type":"DIRECT_RESPONSE","message":"..."}"#);
     user.push('\n');
     user.push_str(r#"{"type":"CLARIFICATION","question":"..."}"#);
     user.push_str(
-        "\nRules:\n- JSON only.\n- For supported local artifact work, prefer STAGE_CHOICE over WORKFLOW.\n- On the first pass, current_stage MUST be \"probe\".\n- recipe_family/artifact_family must match a supported family when returning STAGE_CHOICE.\n- derivation_policy must be \"strict\" or \"permissive\".\n- Use WORKFLOW only when the task is outside current reactor coverage.\n",
+        "\nRules:\n- JSON only.\n- For supported local artifact work, first pass should prefer SKELETON_CHOICE.\n- Use STAGE_CHOICE when the task already belongs to a skeleton and you are choosing the next stage.\n- On the first executable stage, current_stage MUST be \"probe\" unless current evidence clearly requires a different stage.\n- skeleton must be one of the supported skeletons.\n- artifact_family must match a supported family when returning STAGE_CHOICE; for SKELETON_CHOICE it may be omitted if not yet certain.\n- derivation_policy must be \"strict\" or \"permissive\" when returning STAGE_CHOICE.\n",
     );
     user.push_str(&format!(
         "- Default derivation_policy is \"{}\" unless the task clearly needs otherwise.\n",
         default_policy
     ));
-    user.push_str("- Never use file_read on .xlsx/.xlsm artifacts.\n");
-    user.push_str("- For supported document artifacts, do not fall back to ad hoc shell/file_read/file_write as the main path when a document family stage choice is sufficient.\n");
-    user.push_str("- When returning WORKFLOW, every step.action MUST be copied exactly from Action Catalog. Never invent semantic pseudo-actions such as glob_files, read_files, derive_patches, batch_patch_markdown, or write_summary_report unless they are listed.\n");
-    user.push_str("- For kind=\"agent\", set action to \"agent\" and put the actual subproblem in params.goal. params.goal MUST be a non-empty string.\n");
-    user.push_str("- For kind=\"agent\" with params.mode=\"leaf\", include params.max_iterations in [1,10], keep allowed_actions to [\"json_stdout\"], and include output_keys or output_rules whenever downstream steps consume the result.\n");
-    user.push_str("- For text or markdown patch tasks outside reactor coverage, compose from catalog actions or recipe steps. If no exact domain action exists, use shell/file_read/file_write or recipe; do not invent new action names.\n");
-    user.push_str("- Return JSON only.\n");
+    user.push_str("- Do not generate a full workflow DAG for supported reactor tasks.\n");
+    user.push_str("- Continuation is structural. Prefer explicit wait_user or next_stage_hint over vague narration.\n");
+    user.push_str("- Never use assistant narration as a completion signal.\n");
 
     (system, user)
 }
 
-fn append_reactor_stage_choice_examples(buf: &mut String, coverage: ReactorPromptCoverage) {
+fn append_reactor_choice_examples(buf: &mut String, coverage: ReactorPromptCoverage) {
     if coverage.spreadsheet {
         buf.push_str(
-            r#"{"type":"STAGE_CHOICE","recipe_family":"artifact_locate_and_patch","artifact_family":"spreadsheet","current_stage":"probe","stage_goal":"inspect workbook structure and assess readiness","derivation_policy":"permissive","reason":"..."}"#,
+            r#"{"type":"SKELETON_CHOICE","skeleton":"locate_and_patch","artifact_family":"spreadsheet","initial_stage":"probe","confidence":0.9,"reason":"..."}"#,
+        );
+        buf.push('\n');
+        buf.push_str(
+            r#"{"type":"STAGE_CHOICE","skeleton":"locate_and_patch","artifact_family":"spreadsheet","current_stage":"probe","stage_goal":"inspect workbook structure and assess readiness","derivation_policy":"permissive","next_stage_hint":"commit","reason":"..."}"#,
         );
         buf.push('\n');
     }
     if coverage.document {
         buf.push_str(
-            r#"{"type":"STAGE_CHOICE","recipe_family":"artifact_locate_and_patch","artifact_family":"document","current_stage":"probe","stage_goal":"inspect document structure and assess readiness","derivation_policy":"permissive","reason":"..."}"#,
+            r#"{"type":"SKELETON_CHOICE","skeleton":"locate_and_patch","artifact_family":"document","initial_stage":"probe","confidence":0.9,"reason":"..."}"#,
+        );
+        buf.push('\n');
+        buf.push_str(
+            r#"{"type":"STAGE_CHOICE","skeleton":"locate_and_patch","artifact_family":"document","current_stage":"probe","stage_goal":"inspect document structure and assess readiness","derivation_policy":"permissive","next_stage_hint":"commit","reason":"..."}"#,
         );
         buf.push('\n');
     }
@@ -396,11 +397,8 @@ fn build_reactor_system_prompt(
     default_policy: DerivationPolicy,
     coverage: ReactorPromptCoverage,
 ) -> String {
-    let capabilities = detect_prompt_capabilities(context);
     let execution_environment = build_execution_environment_block(context);
-    let action_catalog = build_action_catalog(context);
     let skill_knowledge = build_skill_knowledge_block(&context.skill_instructions);
-    let conditional_rules = build_conditional_rules(context, capabilities);
     let mut out = String::new();
     if !base.trim().is_empty() {
         out.push_str(base.trim());
@@ -409,22 +407,32 @@ fn build_reactor_system_prompt(
 
     out.push_str("You are Orchestral Reactor Planner.\n");
     out.push_str("This prompt is a short constitution, not a full execution manual.\n");
-    out.push_str("Planner decides only family selection, current stage, stage goal, and derivation posture.\n");
+    out.push_str(
+        "Planner decides only skeleton selection, current stage, family hint, and derivation posture.\n",
+    );
     out.push_str("Runtime owns stage lowering, typed action wiring, continuation handling, and verify gates.\n");
     out.push_str("Continuation must be explicit. Done may only come from verify success.\n");
-    out.push_str("Do not design a full end-to-end workflow when a stage choice is sufficient.\n");
-    out.push_str("Do not use shell or free-form file reads as the main path for supported reactor artifacts.\n");
+    out.push_str(
+        "Do not design a full end-to-end workflow when skeleton/stage choice is sufficient.\n",
+    );
 
-    out.push_str("\nSupported family:\n");
+    out.push_str("\nSupported skeletons:\n");
+    out.push_str("- locate_and_patch\n");
+    out.push_str("- inspect_and_extract\n");
+    out.push_str("- inspect_and_transform\n");
+    out.push_str("- compare_and_sync\n");
+    out.push_str("- run_and_verify\n");
+
+    out.push_str("\nSupported family hints:\n");
     if coverage.spreadsheet {
-        out.push_str("- recipe_family=artifact_locate_and_patch, artifact_family=spreadsheet\n");
-        out.push_str("  stages: probe -> commit -> verify\n");
+        out.push_str("- artifact_family=spreadsheet\n");
+        out.push_str("  current covered stage path: probe -> commit -> verify\n");
         out.push_str("  probe must end with explicit continuation\n");
         out.push_str("  verify is the done gate\n");
     }
     if coverage.document {
-        out.push_str("- recipe_family=artifact_locate_and_patch, artifact_family=document\n");
-        out.push_str("  stages: probe -> commit -> verify\n");
+        out.push_str("- artifact_family=document\n");
+        out.push_str("  current covered stage path: probe -> commit -> verify\n");
         out.push_str("  probe must end with explicit continuation\n");
         out.push_str("  verify is the done gate\n");
     }
@@ -437,11 +445,11 @@ fn build_reactor_system_prompt(
 
     out.push_str("\nHard rules:\n");
     out.push_str("- Return JSON only.\n");
-    out.push_str("- Prefer STAGE_CHOICE for supported local artifact tasks.\n");
-    out.push_str("- First pass for supported reactor tasks must start at stage=probe.\n");
-    out.push_str("- Use WORKFLOW only when the request is outside current reactor coverage.\n");
-    out.push_str("- Never plan file_read for .xlsx/.xlsm artifacts.\n");
-    out.push_str("- Do not dump a full end-to-end plan when STAGE_CHOICE is sufficient.\n");
+    out.push_str("- Prefer SKELETON_CHOICE or STAGE_CHOICE for supported local artifact tasks.\n");
+    out.push_str("- First pass for supported reactor tasks should start at stage=probe unless current evidence says otherwise.\n");
+    out.push_str("- Do not emit a full workflow DAG for supported reactor tasks.\n");
+    out.push_str("- Treat artifact_family as an adapter hint, not as task shape.\n");
+    out.push_str("- Treat verification as the only done gate.\n");
 
     if !execution_environment.trim().is_empty() {
         out.push('\n');
@@ -451,12 +459,6 @@ fn build_reactor_system_prompt(
         out.push('\n');
         out.push_str(&skill_knowledge);
     }
-    if !action_catalog.trim().is_empty() {
-        out.push_str("\nAction Catalog:\n");
-        out.push_str(&action_catalog);
-    }
-    out.push_str("\nWorkflow Fallback Rules:\n");
-    out.push_str(&conditional_rules);
     out
 }
 
@@ -881,6 +883,16 @@ impl<C: LlmClient> Planner for LlmPlanner<C> {
 
         let output = parse_planner_output(&json_str)?;
         match &output {
+            PlannerOutput::SkeletonChoice(choice) => {
+                info!(
+                    output_type = "skeleton_choice",
+                    skeleton = ?choice.skeleton,
+                    artifact_family = ?choice.artifact_family,
+                    initial_stage = ?choice.initial_stage,
+                    confidence = choice.confidence,
+                    "planner parsed output"
+                );
+            }
             PlannerOutput::Workflow(plan) => {
                 info!(
                     output_type = "workflow",
@@ -899,7 +911,7 @@ impl<C: LlmClient> Planner for LlmPlanner<C> {
             PlannerOutput::StageChoice(choice) => {
                 info!(
                     output_type = "stage_choice",
-                    recipe_family = ?choice.recipe_family,
+                    skeleton = ?choice.skeleton,
                     artifact_family = ?choice.artifact_family,
                     current_stage = ?choice.current_stage,
                     derivation_policy = ?choice.derivation_policy,
@@ -928,12 +940,27 @@ impl<C: LlmClient> Planner for LlmPlanner<C> {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
 enum PlannerJsonOutput {
+    SkeletonChoice {
+        skeleton: SkeletonKind,
+        #[serde(default)]
+        artifact_family: Option<ArtifactFamily>,
+        initial_stage: StageKind,
+        #[serde(default = "default_confidence")]
+        confidence: f32,
+        #[serde(default)]
+        reason: Option<String>,
+    },
     StageChoice {
-        recipe_family: RecipeFamily,
+        #[serde(default)]
+        skeleton: Option<SkeletonKind>,
+        #[serde(default)]
+        recipe_family: Option<LegacyRecipeFamily>,
         artifact_family: ArtifactFamily,
         current_stage: StageKind,
         stage_goal: String,
         derivation_policy: DerivationPolicy,
+        #[serde(default)]
+        next_stage_hint: Option<StageKind>,
         #[serde(default)]
         reason: Option<String>,
     },
@@ -956,24 +983,68 @@ enum PlannerJsonOutput {
     },
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LegacyRecipeFamily {
+    ArtifactLocateAndPatch,
+    CollectDeriveEmit,
+    RunProgramAndVerify,
+}
+
+impl LegacyRecipeFamily {
+    fn to_skeleton(&self) -> SkeletonKind {
+        match self {
+            Self::ArtifactLocateAndPatch => SkeletonKind::LocateAndPatch,
+            Self::CollectDeriveEmit => SkeletonKind::InspectAndExtract,
+            Self::RunProgramAndVerify => SkeletonKind::RunAndVerify,
+        }
+    }
+}
+
+fn default_confidence() -> f32 {
+    1.0
+}
+
 fn parse_planner_output(json: &str) -> Result<PlannerOutput, PlanError> {
     let parsed = serde_json::from_str::<PlannerJsonOutput>(json)
         .map_err(|e| PlanError::Generation(format!("Invalid planner output JSON: {}", e)))?;
 
     match parsed {
+        PlannerJsonOutput::SkeletonChoice {
+            skeleton,
+            artifact_family,
+            initial_stage,
+            confidence,
+            reason,
+        } => Ok(PlannerOutput::SkeletonChoice(SkeletonChoice {
+            skeleton,
+            artifact_family,
+            initial_stage,
+            confidence: confidence.clamp(0.0, 1.0),
+            reason,
+        })),
         PlannerJsonOutput::StageChoice {
+            skeleton,
             recipe_family,
             artifact_family,
             current_stage,
             stage_goal,
             derivation_policy,
+            next_stage_hint,
             reason,
         } => Ok(PlannerOutput::StageChoice(StageChoice {
-            recipe_family,
+            skeleton: skeleton
+                .or_else(|| recipe_family.as_ref().map(LegacyRecipeFamily::to_skeleton))
+                .ok_or_else(|| {
+                    PlanError::Generation(
+                        "stage_choice must include skeleton or legacy recipe_family".to_string(),
+                    )
+                })?,
             artifact_family,
             current_stage,
             stage_goal,
             derivation_policy,
+            next_stage_hint,
             reason,
         })),
         PlannerJsonOutput::Workflow {
@@ -1456,7 +1527,7 @@ mod tests {
         let parsed = parse_planner_output(raw).expect("parse stage choice");
         match parsed {
             PlannerOutput::StageChoice(choice) => {
-                assert_eq!(choice.recipe_family, RecipeFamily::ArtifactLocateAndPatch);
+                assert_eq!(choice.skeleton, SkeletonKind::LocateAndPatch);
                 assert_eq!(choice.artifact_family, ArtifactFamily::Spreadsheet);
                 assert_eq!(choice.current_stage, StageKind::Probe);
                 assert_eq!(choice.derivation_policy, DerivationPolicy::Permissive);
@@ -1467,7 +1538,30 @@ mod tests {
     }
 
     #[test]
-    fn test_reactor_prompt_includes_action_catalog_and_fallback_rules() {
+    fn test_parse_skeleton_choice_output() {
+        let raw = r#"{
+            "type":"SKELETON_CHOICE",
+            "skeleton":"locate_and_patch",
+            "artifact_family":"spreadsheet",
+            "initial_stage":"probe",
+            "confidence": 1.2,
+            "reason":"spreadsheet task"
+        }"#;
+        let parsed = parse_planner_output(raw).expect("parse skeleton choice");
+        match parsed {
+            PlannerOutput::SkeletonChoice(choice) => {
+                assert_eq!(choice.skeleton, SkeletonKind::LocateAndPatch);
+                assert_eq!(choice.artifact_family, Some(ArtifactFamily::Spreadsheet));
+                assert_eq!(choice.initial_stage, StageKind::Probe);
+                assert_eq!(choice.confidence, 1.0);
+                assert_eq!(choice.reason.as_deref(), Some("spreadsheet task"));
+            }
+            _ => panic!("expected skeleton choice output"),
+        }
+    }
+
+    #[test]
+    fn test_reactor_prompt_is_short_contract_without_action_catalog() {
         let planner = LlmPlanner::new(
             MockLlmClient {
                 response: "{}".to_string(),
@@ -1517,12 +1611,13 @@ mod tests {
         let intent = Intent::new("docs 下有个 excel，帮我补全 spreadsheet 内容");
         let (system, user) = planner.build_prompt(&intent, &context);
 
-        assert!(system.contains("Action Catalog:"));
-        assert!(system.contains("- name: shell"));
-        assert!(system.contains("Workflow Fallback Rules:"));
-        assert!(user.contains("Never invent semantic pseudo-actions"));
-        assert!(user.contains("set action to \"agent\""));
-        assert!(user.contains("shell/file_read/file_write or recipe"));
+        assert!(system.contains("Supported skeletons:"));
+        assert!(system.contains("artifact_family=spreadsheet"));
+        assert!(!system.contains("Action Catalog:"));
+        assert!(!system.contains("Workflow Fallback Rules:"));
+        assert!(user.contains("\"type\":\"SKELETON_CHOICE\""));
+        assert!(user.contains("\"type\":\"STAGE_CHOICE\""));
+        assert!(!user.contains("\"type\":\"WORKFLOW\""));
     }
 
     #[test]
@@ -1580,6 +1675,7 @@ mod tests {
         assert!(!system.contains("You are Orchestral Reactor Planner"));
         assert!(user.contains("\"type\":\"WORKFLOW\""));
         assert!(!user.contains("\"type\":\"STAGE_CHOICE\""));
+        assert!(!user.contains("\"type\":\"SKELETON_CHOICE\""));
     }
 
     #[test]

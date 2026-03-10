@@ -29,9 +29,9 @@ use orchestral_core::store::{
     WorkingSet,
 };
 use orchestral_core::types::{
-    ContinuationState, ContinuationStatus, Intent, IntentContext, ReactorTaskState, StageChoice,
-    StageKind, Step, StepId, StepIoBinding, StepKind, Task, TaskId, TaskState, VerifyDecision,
-    VerifyStatus, WaitUserReason,
+    ArtifactFamily, ContinuationState, ContinuationStatus, DerivationPolicy, Intent, IntentContext,
+    ReactorTaskState, SkeletonChoice, StageChoice, StageKind, Step, StepId, StepIoBinding,
+    StepKind, Task, TaskId, TaskState, VerifyDecision, VerifyStatus, WaitUserReason,
 };
 
 use crate::{HandleEventResult, InteractionState, RuntimeError, ThreadRuntime};
@@ -124,9 +124,12 @@ fn reactor_stage_goal(
     stage: StageKind,
 ) -> String {
     match (artifact_family, stage) {
+        (_, StageKind::Locate) => "locate the target artifact".to_string(),
         (orchestral_core::types::ArtifactFamily::Spreadsheet, StageKind::Probe) => {
             "inspect workbook structure and assess readiness".to_string()
         }
+        (_, StageKind::Derive) => "derive a structured patch spec".to_string(),
+        (_, StageKind::Assess) => "assess whether the task is ready to commit".to_string(),
         (orchestral_core::types::ArtifactFamily::Spreadsheet, StageKind::Commit) => {
             "derive a typed spreadsheet patch and apply it".to_string()
         }
@@ -142,6 +145,11 @@ fn reactor_stage_goal(
         (orchestral_core::types::ArtifactFamily::Document, StageKind::Verify) => {
             "verify the applied document patch".to_string()
         }
+        (_, StageKind::Export) => "export the verified result".to_string(),
+        (_, StageKind::Prepare) => "prepare inputs for controlled execution".to_string(),
+        (_, StageKind::Run) => "run the controlled program".to_string(),
+        (_, StageKind::Collect) => "collect outputs from the controlled run".to_string(),
+        (_, StageKind::Compare) => "compare structures and derive differences".to_string(),
         (_, StageKind::WaitUser) => "wait for user input".to_string(),
         (_, StageKind::Done) => "finish the reactor task".to_string(),
         (_, StageKind::Failed) => "mark the reactor task as failed".to_string(),
@@ -149,6 +157,30 @@ fn reactor_stage_goal(
         (_, StageKind::Commit) => "derive a typed patch and apply it".to_string(),
         (_, StageKind::Verify) => "verify the applied patch".to_string(),
     }
+}
+
+fn resolve_stage_choice_from_skeleton_choice(
+    choice: SkeletonChoice,
+    fallback_artifact_family: Option<ArtifactFamily>,
+    derivation_policy: DerivationPolicy,
+) -> Result<StageChoice, OrchestratorError> {
+    let artifact_family = choice
+        .artifact_family
+        .or(fallback_artifact_family)
+        .ok_or_else(|| {
+            OrchestratorError::Planner(PlanError::Generation(
+                "skeleton_choice requires explicit artifact_family hint".to_string(),
+            ))
+        })?;
+    Ok(StageChoice {
+        skeleton: choice.skeleton,
+        artifact_family,
+        current_stage: choice.initial_stage,
+        stage_goal: reactor_stage_goal(artifact_family, choice.initial_stage),
+        derivation_policy,
+        next_stage_hint: None,
+        reason: choice.reason,
+    })
 }
 
 fn build_leaf_output_rules(keys: &[&str], result_slot: &str) -> Value {
@@ -1211,6 +1243,21 @@ impl Orchestrator {
             "orchestrator planner latency"
         );
         match planner_output {
+            PlannerOutput::SkeletonChoice(choice) => {
+                if !self.config.reactor_enabled {
+                    return Err(OrchestratorError::Planner(PlanError::Generation(
+                        "planner returned skeleton_choice while runtime.reactor.enabled=false"
+                            .to_string(),
+                    )));
+                }
+                let stage_choice = resolve_stage_choice_from_skeleton_choice(
+                    choice,
+                    None,
+                    DerivationPolicy::Strict,
+                )?;
+                self.run_reactor_pipeline(interaction_id, started_kind, task, stage_choice)
+                    .await
+            }
             PlannerOutput::Workflow(plan) => {
                 let plan = maybe_shape_probe_first_plan(
                     &task.intent,
@@ -1496,7 +1543,7 @@ impl Orchestrator {
             remaining_stages -= 1;
 
             let mut reactor_state = task.reactor.clone().unwrap_or(ReactorTaskState {
-                recipe_family: choice.recipe_family,
+                skeleton: choice.skeleton,
                 artifact_family: choice.artifact_family,
                 current_stage: choice.current_stage,
                 derivation_policy: choice.derivation_policy,
@@ -1504,7 +1551,7 @@ impl Orchestrator {
                 last_verify: None,
                 verify_required: true,
             });
-            reactor_state.recipe_family = choice.recipe_family;
+            reactor_state.skeleton = choice.skeleton;
             reactor_state.artifact_family = choice.artifact_family;
             reactor_state.current_stage = choice.current_stage;
             reactor_state.derivation_policy = choice.derivation_policy;
@@ -1516,6 +1563,12 @@ impl Orchestrator {
                     Some(self.lower_reactor_stage_plan(&task, &choice)?)
                 }
                 StageKind::WaitUser | StageKind::Done | StageKind::Failed => None,
+                unsupported_stage => {
+                    return Err(OrchestratorError::Planner(PlanError::Generation(format!(
+                        "reactor stage {:?} not implemented yet",
+                        unsupported_stage
+                    ))));
+                }
             };
 
             self.emit_lifecycle_event(
@@ -1525,11 +1578,12 @@ impl Orchestrator {
                 Some("reactor stage selected"),
                 serde_json::json!({
                     "output_type": "stage_choice",
-                    "recipe_family": choice.recipe_family,
+                    "skeleton": choice.skeleton,
                     "artifact_family": choice.artifact_family,
                     "current_stage": choice.current_stage,
                     "stage_goal": choice.stage_goal,
                     "derivation_policy": choice.derivation_policy,
+                    "next_stage_hint": choice.next_stage_hint,
                     "reason": choice.reason,
                     "step_count": stage_plan.as_ref().map(|plan| plan.steps.len()).unwrap_or(0),
                     "steps": stage_plan
@@ -1563,6 +1617,12 @@ impl Orchestrator {
                     }
                 }
                 StageKind::Probe | StageKind::Commit | StageKind::Verify => {}
+                unsupported_stage => {
+                    return Err(OrchestratorError::Planner(PlanError::Generation(format!(
+                        "reactor stage {:?} cannot execute without lowering support",
+                        unsupported_stage
+                    ))));
+                }
             }
 
             let plan = stage_plan.expect("stage plan must exist for executable reactor stages");
@@ -1616,7 +1676,7 @@ impl Orchestrator {
                         match continuation.status {
                             ContinuationStatus::CommitReady => {
                                 choice = StageChoice {
-                                    recipe_family: choice.recipe_family,
+                                    skeleton: choice.skeleton,
                                     artifact_family: choice.artifact_family,
                                     current_stage: StageKind::Commit,
                                     stage_goal: reactor_stage_goal(
@@ -1624,6 +1684,7 @@ impl Orchestrator {
                                         StageKind::Commit,
                                     ),
                                     derivation_policy: choice.derivation_policy,
+                                    next_stage_hint: continuation.next_stage_hint,
                                     reason: Some(continuation.reason),
                                 };
                                 continue;
@@ -1660,7 +1721,7 @@ impl Orchestrator {
                     }
                     StageKind::Commit => {
                         choice = StageChoice {
-                            recipe_family: choice.recipe_family,
+                            skeleton: choice.skeleton,
                             artifact_family: choice.artifact_family,
                             current_stage: StageKind::Verify,
                             stage_goal: reactor_stage_goal(
@@ -1668,6 +1729,7 @@ impl Orchestrator {
                                 StageKind::Verify,
                             ),
                             derivation_policy: choice.derivation_policy,
+                            next_stage_hint: Some(StageKind::Verify),
                             reason: choice.reason.clone(),
                         };
                         continue;
@@ -1679,7 +1741,7 @@ impl Orchestrator {
                         )?;
                         let mut updated_reactor_state =
                             task.reactor.clone().unwrap_or(ReactorTaskState {
-                                recipe_family: choice.recipe_family,
+                                skeleton: choice.skeleton,
                                 artifact_family: choice.artifact_family,
                                 current_stage: choice.current_stage,
                                 derivation_policy: choice.derivation_policy,
@@ -1702,6 +1764,15 @@ impl Orchestrator {
                     }
                     StageKind::WaitUser | StageKind::Done | StageKind::Failed => {
                         break ExecutionResult::Completed;
+                    }
+                    unsupported_stage => {
+                        break ExecutionResult::Failed {
+                            step_id: StepId::from("reactor"),
+                            error: format!(
+                                "reactor stage {:?} completed without runtime completion handler",
+                                unsupported_stage
+                            ),
+                        };
                     }
                 },
                 ExecutionResult::NeedReplan { prompt, .. } => {
@@ -1788,7 +1859,7 @@ impl Orchestrator {
             OrchestratorError::ResumeError("reactor task state missing during resume".to_string())
         })?;
         let current_choice = StageChoice {
-            recipe_family: reactor_state.recipe_family,
+            skeleton: reactor_state.skeleton,
             artifact_family: reactor_state.artifact_family,
             current_stage: reactor_state.current_stage,
             stage_goal: reactor_stage_goal(
@@ -1796,6 +1867,10 @@ impl Orchestrator {
                 reactor_state.current_stage,
             ),
             derivation_policy: reactor_state.derivation_policy,
+            next_stage_hint: reactor_state
+                .last_continuation
+                .as_ref()
+                .and_then(|continuation| continuation.next_stage_hint),
             reason: reactor_state
                 .last_continuation
                 .as_ref()
@@ -1816,11 +1891,12 @@ impl Orchestrator {
                     .and_then(|continuation| continuation.next_stage_hint)
                 {
                     return Ok(StageChoice {
-                        recipe_family: reactor_state.recipe_family,
+                        skeleton: reactor_state.skeleton,
                         artifact_family: reactor_state.artifact_family,
                         current_stage: next_stage,
                         stage_goal: reactor_stage_goal(reactor_state.artifact_family, next_stage),
                         derivation_policy: reactor_state.derivation_policy,
+                        next_stage_hint: Some(next_stage),
                         reason: Some(format!(
                             "reactor resume approved by user: {}",
                             truncate_for_log(&resume_text, 300)
@@ -1830,7 +1906,7 @@ impl Orchestrator {
             }
             ReactorResumeDecision::Deny => {
                 return Ok(StageChoice {
-                    recipe_family: reactor_state.recipe_family,
+                    skeleton: reactor_state.skeleton,
                     artifact_family: reactor_state.artifact_family,
                     current_stage: StageKind::WaitUser,
                     stage_goal: reactor_stage_goal(
@@ -1838,6 +1914,7 @@ impl Orchestrator {
                         StageKind::WaitUser,
                     ),
                     derivation_policy: reactor_state.derivation_policy,
+                    next_stage_hint: Some(StageKind::WaitUser),
                     reason: Some(
                         "User declined the pending reactor change. Awaiting updated instructions."
                             .to_string(),
@@ -1897,7 +1974,7 @@ impl Orchestrator {
             interaction_id = %interaction_id,
             task_id = %task.id,
             current_stage = ?current_choice.current_stage,
-            recipe_family = ?current_choice.recipe_family,
+            skeleton = ?current_choice.skeleton,
             artifact_family = ?current_choice.artifact_family,
             replan_prompt = %truncate_for_log(replan_prompt, 400),
             "build_reactor_replan_choice started"
@@ -1911,16 +1988,16 @@ impl Orchestrator {
         let content = format!(
             "Reactor stage replanning request.\n\
             Original user intent: {}\n\
-            Current recipe family: {:?}\n\
+            Current skeleton: {:?}\n\
             Current artifact family: {:?}\n\
             Current stage: {:?}\n\
             Current working set summary:\n{}\n\
             Replan reason: {}\n\
             Return the next STAGE_CHOICE for the current reactor task. \
-            Prefer staying within the current recipe/artifact family unless current evidence requires otherwise. \
-            Do not return a full workflow unless the task is truly outside reactor coverage.",
+            Prefer staying within the current skeleton/artifact family unless current evidence requires otherwise. \
+            Do not return a full workflow DAG.",
             task.intent.content,
-            current_choice.recipe_family,
+            current_choice.skeleton,
             current_choice.artifact_family,
             current_choice.current_stage,
             ws_summary,
@@ -1936,13 +2013,19 @@ impl Orchestrator {
 
         let output = self.planner.plan(&intent, &context).await?;
         match output {
+            PlannerOutput::SkeletonChoice(choice) => resolve_stage_choice_from_skeleton_choice(
+                choice,
+                Some(current_choice.artifact_family),
+                current_choice.derivation_policy,
+            ),
             PlannerOutput::StageChoice(choice) => Ok(choice),
             PlannerOutput::Clarification(question) => Ok(StageChoice {
-                recipe_family: current_choice.recipe_family,
+                skeleton: current_choice.skeleton,
                 artifact_family: current_choice.artifact_family,
                 current_stage: StageKind::WaitUser,
                 stage_goal: "wait for additional user input".to_string(),
                 derivation_policy: current_choice.derivation_policy,
+                next_stage_hint: Some(StageKind::WaitUser),
                 reason: Some(question),
             }),
             PlannerOutput::Workflow(_) => Err(OrchestratorError::Planner(PlanError::Generation(
@@ -2367,6 +2450,11 @@ impl Orchestrator {
         let recovery_output = self.planner.plan(&recovery_intent, &context).await?;
         let recovery_plan = match recovery_output {
             PlannerOutput::Workflow(plan) => plan,
+            PlannerOutput::SkeletonChoice(_) => {
+                return Err(OrchestratorError::Planner(PlanError::Generation(
+                    "recovery planner returned skeleton_choice; workflow required".to_string(),
+                )));
+            }
             PlannerOutput::StageChoice(_) => {
                 return Err(OrchestratorError::Planner(PlanError::Generation(
                     "recovery planner returned stage_choice; workflow required".to_string(),
@@ -2436,6 +2524,12 @@ impl Orchestrator {
         let repair_output = self.planner.plan(&repair_intent, &context).await?;
         let repair_plan = match repair_output {
             PlannerOutput::Workflow(plan) => plan,
+            PlannerOutput::SkeletonChoice(_) => {
+                return Err(OrchestratorError::Planner(PlanError::Generation(
+                    "normalization repair planner returned skeleton_choice; workflow required"
+                        .to_string(),
+                )));
+            }
             PlannerOutput::StageChoice(_) => {
                 return Err(OrchestratorError::Planner(PlanError::Generation(
                     "normalization repair planner returned stage_choice; workflow required"
@@ -2535,6 +2629,16 @@ impl Orchestrator {
                     "build_continuation_plan planner returned workflow"
                 );
                 plan
+            }
+            PlannerOutput::SkeletonChoice(_) => {
+                tracing::warn!(
+                    interaction_id = %interaction_id,
+                    task_id = %task.id,
+                    "build_continuation_plan planner returned skeleton_choice (expected workflow)"
+                );
+                return Err(OrchestratorError::Planner(PlanError::Generation(
+                    "continuation planner returned skeleton_choice; workflow required".to_string(),
+                )));
             }
             PlannerOutput::StageChoice(_) => {
                 tracing::warn!(
