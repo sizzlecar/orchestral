@@ -19,19 +19,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reference_store = std::sync::Arc::new(InMemoryReferenceStore::new());
     let context = PlannerContext::new(available_actions, reference_store);
 
-    let response = r#"{"type":"WORKFLOW","goal":"Echo message","steps":[{"id":"s1","action":"echo","kind":"action","depends_on":[],"exports":[],"params":{"message":"Hello"}}],"confidence":0.9}"#;
+    let response = r#"{"type":"SKELETON_CHOICE","skeleton":"inspect_and_extract","initial_stage":"probe","confidence":0.9,"reason":"example output"}"#;
 
     let planner = LlmPlanner::new(
         MockLlmClient {
             response: response.to_string(),
         },
-        LlmPlannerConfig::default(),
+        LlmPlannerConfig {
+            reactor_enabled: true,
+            ..LlmPlannerConfig::default()
+        },
     );
 
     let output = planner.plan(&intent, &context).await?;
     match output {
-        PlannerOutput::Workflow(plan) => {
-            info!(goal = %plan.goal, steps = plan.steps.len(), "workflow planned");
+        PlannerOutput::SkeletonChoice(choice) => {
+            info!(
+                skeleton = ?choice.skeleton,
+                initial_stage = ?choice.initial_stage,
+                confidence = choice.confidence,
+                "skeleton chosen"
+            );
         }
         PlannerOutput::DirectResponse(message) => {
             info!(%message, "direct response");
@@ -41,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         PlannerOutput::StageChoice(choice) => {
             info!(
-                recipe_family = ?choice.recipe_family,
+                skeleton = ?choice.skeleton,
                 artifact_family = ?choice.artifact_family,
                 current_stage = ?choice.current_stage,
                 "reactor stage choice"

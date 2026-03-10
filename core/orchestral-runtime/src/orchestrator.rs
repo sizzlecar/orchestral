@@ -18,10 +18,9 @@ use orchestral_core::executor::{
     ExecutionProgressEvent, ExecutionProgressReporter, ExecutionResult, Executor, ExecutorContext,
 };
 use orchestral_core::interpreter::InterpretRequest;
-use orchestral_core::normalizer::{NormalizeError, PlanNormalizer, ValidationError};
+use orchestral_core::normalizer::{NormalizeError, PlanNormalizer};
 use orchestral_core::planner::{
     HistoryItem, PlanError, Planner, PlannerContext, PlannerOutput, PlannerRuntimeInfo,
-    SkillInstruction,
 };
 use orchestral_core::spi::{HookRegistry, RuntimeHookContext, RuntimeHookEventEnvelope, SpiMeta};
 use orchestral_core::store::{
@@ -528,306 +527,6 @@ fn parse_reactor_resume_decision(message: &str) -> ReactorResumeDecision {
     ReactorResumeDecision::Unknown
 }
 
-fn maybe_shape_probe_first_plan(
-    intent: &Intent,
-    skills: &[SkillInstruction],
-    available_actions: &[ActionMeta],
-    mut plan: orchestral_core::types::Plan,
-) -> orchestral_core::types::Plan {
-    if plan.steps.is_empty()
-        || plan.steps.iter().any(|step| {
-            matches!(
-                step.kind,
-                StepKind::Recipe | StepKind::WaitUser | StepKind::WaitEvent | StepKind::Replan
-            )
-        })
-    {
-        return plan;
-    }
-
-    let split_index = probe_split_index(&plan, available_actions);
-    let probe_scope_len = split_index.unwrap_or(plan.steps.len());
-    if !looks_like_local_exploratory_task(intent, skills, &plan, probe_scope_len, available_actions)
-    {
-        return plan;
-    }
-
-    if split_index.is_none()
-        && plan
-            .steps
-            .iter()
-            .all(|step| is_probe_action(step, available_actions))
-        && plan_needs_follow_up(intent, &plan)
-    {
-        let prompt = probe_replan_prompt(intent, &plan.on_complete, None);
-        append_probe_replan_step(&mut plan, prompt);
-        tracing::info!(
-            shaped_step_count = plan.steps.len(),
-            "orchestrator appended continuation replan to probe-only workflow"
-        );
-        return plan;
-    }
-
-    let Some(split_index) = split_index else {
-        return plan;
-    };
-
-    let probe_steps = plan.steps[..split_index].to_vec();
-    let tail_ids = terminal_step_ids(&probe_steps);
-    if tail_ids.is_empty() {
-        return plan;
-    }
-
-    let deferred_summary = summarize_deferred_steps(&plan.steps[split_index..]);
-    let prompt = probe_replan_prompt(intent, &plan.on_complete, Some(&deferred_summary));
-    let original_step_count = plan.steps.len();
-    plan.steps = probe_steps;
-    append_probe_replan_step_with_deps(&mut plan, tail_ids, prompt);
-    tracing::info!(
-        original_step_count,
-        shaped_step_count = plan.steps.len(),
-        split_index,
-        "orchestrator shaped initial workflow into probe-first plan"
-    );
-    plan
-}
-
-fn probe_split_index(
-    plan: &orchestral_core::types::Plan,
-    available_actions: &[ActionMeta],
-) -> Option<usize> {
-    for (index, step) in plan.steps.iter().enumerate() {
-        if index == 0 {
-            continue;
-        }
-        if step.kind == StepKind::Agent {
-            return Some(index);
-        }
-        if is_explicit_mutation_step(step, available_actions) {
-            return Some(index);
-        }
-    }
-    None
-}
-
-fn is_explicit_mutation_step(step: &Step, available_actions: &[ActionMeta]) -> bool {
-    if step.kind != StepKind::Action {
-        return false;
-    }
-    if step.action == "file_write" {
-        return true;
-    }
-    let Some(meta) = available_actions
-        .iter()
-        .find(|meta| meta.name == step.action)
-    else {
-        return false;
-    };
-    meta.has_role("apply")
-        && !meta.has_role("inspect")
-        && !meta.has_role("collect")
-        && !meta.has_role("verify")
-}
-
-fn looks_like_local_exploratory_task(
-    intent: &Intent,
-    skills: &[SkillInstruction],
-    plan: &orchestral_core::types::Plan,
-    split_index: usize,
-    available_actions: &[ActionMeta],
-) -> bool {
-    let probe_steps = &plan.steps[..split_index];
-    let has_probe_action = probe_steps
-        .iter()
-        .any(|step| is_probe_action(step, available_actions));
-    if !has_probe_action {
-        return false;
-    }
-
-    let has_network = probe_steps.iter().any(|step| {
-        available_actions
-            .iter()
-            .find(|meta| meta.name == step.action)
-            .is_some_and(|meta| meta.has_capability("network_io"))
-    });
-    if has_network {
-        return false;
-    }
-
-    let lowered_intent = intent.content.to_ascii_lowercase();
-    let local_keywords = [
-        "docs",
-        "directory",
-        "folder",
-        "file",
-        "local",
-        "excel",
-        "xlsx",
-        "csv",
-        "json",
-        "yaml",
-        "markdown",
-        "md",
-        "workbook",
-        "spreadsheet",
-        "目录",
-        "文件",
-        "文档",
-        "表格",
-    ];
-    if local_keywords
-        .iter()
-        .any(|keyword| lowered_intent.contains(keyword))
-    {
-        return true;
-    }
-
-    skills_match_keywords(
-        skills,
-        &[
-            "excel",
-            "xlsx",
-            "spreadsheet",
-            "workbook",
-            "markdown",
-            "document",
-            "file",
-        ],
-    )
-}
-
-fn is_probe_action(step: &Step, available_actions: &[ActionMeta]) -> bool {
-    if step.kind != StepKind::Action {
-        return false;
-    }
-    if matches!(step.action.as_str(), "shell" | "file_read") {
-        return true;
-    }
-    available_actions
-        .iter()
-        .find(|meta| meta.name == step.action)
-        .is_some_and(|meta| meta.has_role("inspect") || meta.has_role("collect"))
-}
-
-fn terminal_step_ids(steps: &[Step]) -> Vec<String> {
-    let mut has_downstream: HashMap<&str, bool> =
-        steps.iter().map(|step| (step.id.as_str(), false)).collect();
-    for step in steps {
-        for dep in &step.depends_on {
-            if let Some(value) = has_downstream.get_mut(dep.as_str()) {
-                *value = true;
-            }
-        }
-    }
-    steps
-        .iter()
-        .filter(|step| {
-            !has_downstream
-                .get(step.id.as_str())
-                .copied()
-                .unwrap_or(false)
-        })
-        .map(|step| step.id.to_string())
-        .collect()
-}
-
-fn summarize_deferred_steps(steps: &[Step]) -> String {
-    steps
-        .iter()
-        .map(|step| format!("{}:{}:{:?}", step.id, step.action, step.kind))
-        .collect::<Vec<_>>()
-        .join(" | ")
-}
-
-fn append_probe_replan_step(plan: &mut orchestral_core::types::Plan, prompt: String) {
-    let tail_ids = terminal_step_ids(&plan.steps);
-    append_probe_replan_step_with_deps(plan, tail_ids, prompt);
-}
-
-fn append_probe_replan_step_with_deps(
-    plan: &mut orchestral_core::types::Plan,
-    tail_ids: Vec<String>,
-    prompt: String,
-) {
-    if tail_ids.is_empty() {
-        return;
-    }
-    let replan_step_id = unique_step_id("probe_commit", plan);
-    let replan_step = Step::replan(replan_step_id)
-        .with_depends_on(tail_ids.into_iter().map(StepId::from).collect())
-        .with_params(serde_json::json!({ "prompt": prompt }));
-    plan.steps.push(replan_step);
-}
-
-fn unique_step_id(prefix: &str, plan: &orchestral_core::types::Plan) -> String {
-    if plan.get_step(prefix).is_none() {
-        return prefix.to_string();
-    }
-    let mut suffix = 1usize;
-    loop {
-        let candidate = format!("{}_{}", prefix, suffix);
-        if plan.get_step(&candidate).is_none() {
-            return candidate;
-        }
-        suffix += 1;
-    }
-}
-
-fn probe_replan_prompt(
-    intent: &Intent,
-    on_complete: &Option<String>,
-    deferred_summary: Option<&str>,
-) -> String {
-    let mut prompt = format!(
-        "Probe phase is complete for intent: {}.\n\
-        Continue from the current working set only. Do not repeat discovery or inspection when \
-        the target path, content preview, or environment facts are already available. \
-        If commit parameters are still ambiguous, ask the user or wait instead of guessing.",
-        intent.content
-    );
-    if let Some(summary) = deferred_summary.filter(|value| !value.trim().is_empty()) {
-        prompt.push_str(&format!(
-            "\nDeferred plan summary before shaping: {}",
-            summary
-        ));
-    }
-    if let Some(message) = on_complete
-        .as_ref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        prompt.push_str(&format!("\nOriginal completion hint: {}", message));
-    }
-    prompt
-}
-
-fn plan_needs_follow_up(intent: &Intent, plan: &orchestral_core::types::Plan) -> bool {
-    let mut haystack = intent.content.to_ascii_lowercase();
-    haystack.push(' ');
-    haystack.push_str(&plan.goal.to_ascii_lowercase());
-    if let Some(on_complete) = &plan.on_complete {
-        haystack.push(' ');
-        haystack.push_str(&on_complete.to_ascii_lowercase());
-    }
-    let follow_up_keywords = [
-        "fill", "write", "update", "modify", "edit", "patch", "apply", "verify", "save", "emit",
-        "replan", "continue", "生成", "填写", "补", "改", "写", "更新", "保存", "输出", "继续",
-    ];
-    follow_up_keywords
-        .iter()
-        .any(|keyword| haystack.contains(keyword))
-}
-
-fn skills_match_keywords(skills: &[SkillInstruction], keywords: &[&str]) -> bool {
-    skills.iter().any(|skill| {
-        let haystack = format!(
-            "{} {}",
-            skill.skill_name.to_ascii_lowercase(),
-            skill.instructions.to_ascii_lowercase()
-        );
-        keywords.iter().any(|keyword| haystack.contains(keyword))
-    })
-}
-
 fn map_progress_phase_to_event_type(phase: &str) -> &'static str {
     match phase {
         "step_started" => "step.started",
@@ -931,12 +630,14 @@ impl Default for OrchestratorConfig {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 enum NormalizeRepairMode {
     FullPlan,
     SubgraphPatch { cut_step_id: String },
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct NormalizeRepairTarget {
     mode: NormalizeRepairMode,
@@ -944,6 +645,7 @@ struct NormalizeRepairTarget {
     affected_steps: Vec<String>,
 }
 
+#[cfg(test)]
 impl NormalizeRepairTarget {
     fn mode_label(&self) -> &'static str {
         match self.mode {
@@ -1257,101 +959,6 @@ impl Orchestrator {
                 )?;
                 self.run_reactor_pipeline(interaction_id, started_kind, task, stage_choice)
                     .await
-            }
-            PlannerOutput::Workflow(plan) => {
-                let plan = maybe_shape_probe_first_plan(
-                    &task.intent,
-                    &skill_instructions,
-                    &context.available_actions,
-                    plan,
-                );
-                self.emit_lifecycle_event(
-                    "planning_completed",
-                    Some(interaction_id.as_str()),
-                    Some(task.id.as_str()),
-                    Some("planning completed"),
-                    serde_json::json!({
-                        "output_type": "workflow",
-                        "goal": plan.goal.clone(),
-                        "step_count": plan.steps.len(),
-                        "steps": summarize_plan_steps(&plan),
-                    }),
-                )
-                .await;
-                tracing::info!(
-                    interaction_id = %interaction_id,
-                    task_id = %task.id,
-                    goal = %plan.goal,
-                    step_count = plan.steps.len(),
-                    "orchestrator planning completed"
-                );
-                if tracing::enabled!(tracing::Level::DEBUG) {
-                    tracing::debug!(
-                        interaction_id = %interaction_id,
-                        task_id = %task.id,
-                        plan = %truncate_debug_for_log(&plan.steps, MAX_LOG_CHARS),
-                        "orchestrator plan detail"
-                    );
-                }
-                task.set_plan(plan);
-                task.start_executing();
-                self.task_store.save(&task).await?;
-
-                let planned_step_count = task
-                    .plan
-                    .as_ref()
-                    .map(|p| p.steps.len())
-                    .unwrap_or_default();
-                self.emit_lifecycle_event(
-                    "execution_started",
-                    Some(interaction_id.as_str()),
-                    Some(task.id.as_str()),
-                    Some("execution started"),
-                    serde_json::json!({ "step_count": planned_step_count }),
-                )
-                .await;
-                let result = self
-                    .execute_existing_task(&mut task, interaction_id.as_str(), None)
-                    .await?;
-                let execute_elapsed_ms = turn_started_at.elapsed().as_millis() as u64;
-                self.emit_lifecycle_event(
-                    "execution_completed",
-                    Some(interaction_id.as_str()),
-                    Some(task.id.as_str()),
-                    Some("execution completed"),
-                    execution_result_metadata(&result),
-                )
-                .await;
-                tracing::info!(
-                    interaction_id = %interaction_id,
-                    task_id = %task.id,
-                    execute_elapsed_ms = execute_elapsed_ms,
-                    "orchestrator execution pipeline latency"
-                );
-                let interpret_started_at = Instant::now();
-                self.emit_interpreted_output(interaction_id.as_str(), &task, &result)
-                    .await;
-                tracing::info!(
-                    interaction_id = %interaction_id,
-                    task_id = %task.id,
-                    interpret_elapsed_ms = interpret_started_at.elapsed().as_millis() as u64,
-                    total_turn_elapsed_ms = turn_started_at.elapsed().as_millis() as u64,
-                    "orchestrator interpretation latency"
-                );
-
-                let response = match started_kind {
-                    "started" => OrchestratorResult::Started {
-                        interaction_id,
-                        task_id: task.id,
-                        result,
-                    },
-                    _ => OrchestratorResult::Merged {
-                        interaction_id,
-                        task_id: task.id,
-                        result,
-                    },
-                };
-                Ok(response)
             }
             PlannerOutput::StageChoice(choice) => {
                 if !self.config.reactor_enabled {
@@ -2028,9 +1635,6 @@ impl Orchestrator {
                 next_stage_hint: Some(StageKind::WaitUser),
                 reason: Some(question),
             }),
-            PlannerOutput::Workflow(_) => Err(OrchestratorError::Planner(PlanError::Generation(
-                "reactor replan returned workflow; stage_choice required".to_string(),
-            ))),
             PlannerOutput::DirectResponse(message) => {
                 Err(OrchestratorError::Planner(PlanError::Generation(format!(
                     "reactor replan returned direct_response unexpectedly: {}",
@@ -2056,247 +1660,42 @@ impl Orchestrator {
             step_count = initial_plan.steps.len(),
             "orchestrator normalize/execute started"
         );
-        let mut current_plan = initial_plan.clone();
-        let mut remaining_replans = if self.config.auto_replan_once { 1 } else { 0 };
-        let mut remaining_plan_repairs = if self.config.auto_repair_plan_once {
-            1
-        } else {
-            0
-        };
-        let mut remaining_iterative_replans: u32 = 2;
-        let mut resume = resume_event;
+        let current_plan = initial_plan.clone();
+        let resume = resume_event;
         let execute_started_at = Instant::now();
-        let final_result = loop {
-            let one_run_started_at = Instant::now();
-            let run = match self
-                .execute_plan_once(task, interaction_id, &current_plan, resume)
-                .await
-            {
-                Ok(run) => run,
-                Err(OrchestratorError::Normalize(normalize_error))
-                    if remaining_plan_repairs > 0 =>
-                {
-                    remaining_plan_repairs -= 1;
-                    self.emit_lifecycle_event(
-                        "plan_repair_started",
-                        Some(interaction_id),
-                        Some(task.id.as_str()),
-                        Some("plan normalization failed, attempting constrained repair replan"),
-                        serde_json::json!({
-                            "error": truncate_for_log(&normalize_error.to_string(), 400),
-                        }),
-                    )
-                    .await;
-                    match self
-                        .build_normalization_repair_plan(
-                            task,
-                            &current_plan,
-                            &normalize_error,
-                            interaction_id,
-                        )
-                        .await
-                    {
-                        Ok(Some(repaired_plan)) => {
-                            task.set_plan(repaired_plan.clone());
-                            task.start_executing();
-                            self.task_store.save(task).await?;
-                            current_plan = repaired_plan;
-                            resume = None;
-                            self.emit_lifecycle_event(
-                                "plan_repair_completed",
-                                Some(interaction_id),
-                                Some(task.id.as_str()),
-                                Some(
-                                    "planner returned a repaired plan after normalization failure",
-                                ),
-                                serde_json::json!({
-                                    "step_count": current_plan.steps.len(),
-                                }),
-                            )
-                            .await;
-                            tracing::info!(
-                                interaction_id = %interaction_id,
-                                task_id = %task.id,
-                                plan_repair_elapsed_ms = one_run_started_at.elapsed().as_millis() as u64,
-                                "orchestrator plan repair latency"
-                            );
-                            continue;
-                        }
-                        Ok(None) => return Err(OrchestratorError::Normalize(normalize_error)),
-                        Err(err) => {
-                            self.emit_lifecycle_event(
-                                "plan_repair_failed",
-                                Some(interaction_id),
-                                Some(task.id.as_str()),
-                                Some("plan repair failed after normalization error"),
-                                serde_json::json!({
-                                    "error": truncate_for_log(&err.to_string(), 400),
-                                }),
-                            )
-                            .await;
-                            return Err(err);
-                        }
-                    }
-                }
-                Err(err) => return Err(err),
-            };
-            tracing::info!(
-                interaction_id = %interaction_id,
-                task_id = %task.id,
-                run_elapsed_ms = one_run_started_at.elapsed().as_millis() as u64,
-                result = %truncate_debug_for_log(&run.result, MAX_LOG_CHARS),
-                "orchestrator execute_plan_once latency"
-            );
-            tracing::info!(
-                interaction_id = %interaction_id,
-                task_id = %task.id,
-                completed_steps = ?run.completed_step_ids,
-                ws_keys = ?run.working_set_snapshot.keys().collect::<Vec<_>>(),
-                "orchestrator checkpoint snapshot"
-            );
-            task.set_checkpoint(run.completed_step_ids, run.working_set_snapshot);
-            self.task_store.save(task).await?;
+        let one_run_started_at = Instant::now();
+        let run = match self
+            .execute_plan_once(task, interaction_id, &current_plan, resume)
+            .await
+        {
+            Ok(run) => run,
+            Err(err) => return Err(err),
+        };
+        tracing::info!(
+            interaction_id = %interaction_id,
+            task_id = %task.id,
+            run_elapsed_ms = one_run_started_at.elapsed().as_millis() as u64,
+            result = %truncate_debug_for_log(&run.result, MAX_LOG_CHARS),
+            "orchestrator execute_plan_once latency"
+        );
+        tracing::info!(
+            interaction_id = %interaction_id,
+            task_id = %task.id,
+            completed_steps = ?run.completed_step_ids,
+            ws_keys = ?run.working_set_snapshot.keys().collect::<Vec<_>>(),
+            "orchestrator checkpoint snapshot"
+        );
+        task.set_checkpoint(run.completed_step_ids, run.working_set_snapshot);
+        self.task_store.save(task).await?;
 
-            if let ExecutionResult::Failed { step_id, error } = &run.result {
-                if remaining_replans > 0 {
-                    remaining_replans -= 1;
-                    self.emit_lifecycle_event(
-                        "replanning_started",
-                        Some(interaction_id),
-                        Some(task.id.as_str()),
-                        Some("execution failed, attempting one-shot recovery replan"),
-                        serde_json::json!({
-                            "failed_step_id": step_id,
-                            "error": truncate_for_log(error, 400),
-                        }),
-                    )
-                    .await;
-                    match self
-                        .build_recovery_plan(
-                            task,
-                            &current_plan,
-                            step_id.as_str(),
-                            error,
-                            interaction_id,
-                        )
-                        .await
-                    {
-                        Ok(Some(patched_plan)) => {
-                            task.set_plan(patched_plan.clone());
-                            task.start_executing();
-                            self.task_store.save(task).await?;
-                            current_plan = patched_plan;
-                            resume = None;
-                            self.emit_lifecycle_event(
-                                "replanning_completed",
-                                Some(interaction_id),
-                                Some(task.id.as_str()),
-                                Some("recovery plan patched"),
-                                serde_json::json!({
-                                    "step_count": current_plan.steps.len(),
-                                }),
-                            )
-                            .await;
-                            tracing::info!(
-                                interaction_id = %interaction_id,
-                                task_id = %task.id,
-                                recovery_replan_elapsed_ms = one_run_started_at.elapsed().as_millis() as u64,
-                                "orchestrator recovery replan latency"
-                            );
-                            continue;
-                        }
-                        Ok(None) => {}
-                        Err(err) => {
-                            self.emit_lifecycle_event(
-                                "replanning_failed",
-                                Some(interaction_id),
-                                Some(task.id.as_str()),
-                                Some("replanning failed, fallback to failure result"),
-                                serde_json::json!({
-                                    "error": truncate_for_log(&err.to_string(), 400),
-                                }),
-                            )
-                            .await;
-                        }
-                    }
-                }
-            }
-
-            if let ExecutionResult::NeedReplan { step_id, prompt } = &run.result {
-                tracing::info!(
-                    interaction_id = %interaction_id,
-                    task_id = %task.id,
-                    replan_step_id = %step_id,
-                    prompt = %truncate_for_log(prompt, 200),
-                    completed_step_ids = ?task.completed_step_ids,
-                    remaining_iterative_replans = remaining_iterative_replans,
-                    "orchestrator NeedReplan received"
-                );
-                if remaining_iterative_replans == 0 {
-                    tracing::warn!(
-                        interaction_id = %interaction_id,
-                        task_id = %task.id,
-                        "iterative replan depth limit reached, breaking"
-                    );
-                    break ExecutionResult::Failed {
-                        step_id: step_id.clone(),
-                        error: "Iterative replan depth limit reached".to_string(),
-                    };
-                }
-                remaining_iterative_replans -= 1;
-                self.emit_lifecycle_event(
-                    "iterative_replan_started",
-                    Some(interaction_id),
-                    Some(task.id.as_str()),
-                    Some("replan step reached, invoking planner for continuation"),
-                    serde_json::json!({
-                        "replan_step_id": step_id,
-                        "prompt": truncate_for_log(prompt, 400),
-                    }),
-                )
-                .await;
-
-                match self
-                    .build_continuation_plan(task, &current_plan, step_id, prompt, interaction_id)
-                    .await
-                {
-                    Ok(extended_plan) => {
-                        if !task.completed_step_ids.contains(step_id) {
-                            task.completed_step_ids.push(step_id.clone());
-                        }
-                        task.set_plan(extended_plan.clone());
-                        task.start_executing();
-                        self.task_store.save(task).await?;
-                        current_plan = extended_plan;
-                        resume = None;
-                        self.emit_lifecycle_event(
-                            "iterative_replan_completed",
-                            Some(interaction_id),
-                            Some(task.id.as_str()),
-                            Some("continuation steps appended"),
-                            serde_json::json!({
-                                "step_count": current_plan.steps.len(),
-                            }),
-                        )
-                        .await;
-                        continue;
-                    }
-                    Err(err) => {
-                        self.emit_lifecycle_event(
-                            "iterative_replan_failed",
-                            Some(interaction_id),
-                            Some(task.id.as_str()),
-                            Some("iterative replan failed"),
-                            serde_json::json!({
-                                "error": truncate_for_log(&err.to_string(), 400),
-                            }),
-                        )
-                        .await;
-                    }
-                }
-            }
-
-            break run.result;
+        let final_result = match run.result {
+            ExecutionResult::NeedReplan { step_id, .. } => ExecutionResult::Failed {
+                step_id,
+                error:
+                    "planner-owned workflow continuation has been removed; use reactor continuation instead"
+                        .to_string(),
+            },
+            other => other,
         };
 
         let new_state = task_state_from_execution(&final_result);
@@ -2391,374 +1790,6 @@ impl Orchestrator {
             result,
             completed_step_ids,
             working_set_snapshot,
-        })
-    }
-
-    async fn build_recovery_plan(
-        &self,
-        task: &Task,
-        plan: &orchestral_core::types::Plan,
-        failed_step_id: &str,
-        error: &str,
-        interaction_id: &str,
-    ) -> Result<Option<orchestral_core::types::Plan>, OrchestratorError> {
-        let cut = locate_recovery_cut_step(
-            plan,
-            failed_step_id,
-            error,
-            &task.completed_step_ids,
-            &task.working_set_snapshot,
-        )?;
-        let affected = affected_subgraph_steps(plan, &cut.cut_step_id);
-        if affected.is_empty() {
-            return Ok(None);
-        }
-        self.emit_lifecycle_event(
-            "replanning_cut_selected",
-            Some(interaction_id),
-            Some(task.id.as_str()),
-            Some("selected recovery cut step"),
-            serde_json::json!({
-                "failed_step_id": failed_step_id,
-                "cut_step_id": cut.cut_step_id,
-                "reason": cut.reason,
-                "confidence": cut.confidence,
-                "affected_steps": affected,
-            }),
-        )
-        .await;
-        let actions = self.available_actions().await;
-        let history = self
-            .history_for_planner(interaction_id, task.id.as_str())
-            .await?;
-        let recovery_intent = build_recovery_intent(
-            &task.intent,
-            plan,
-            failed_step_id,
-            &cut.cut_step_id,
-            error,
-            &affected,
-            &task.completed_step_ids,
-        );
-        let runtime_info = PlannerRuntimeInfo::detect();
-        let skill_instructions = self
-            .skill_catalog
-            .build_instructions(&recovery_intent.content);
-        let context = PlannerContext::with_history(actions, history, self.reference_store.clone())
-            .with_runtime_info(runtime_info)
-            .with_skill_instructions(skill_instructions);
-        let recovery_output = self.planner.plan(&recovery_intent, &context).await?;
-        let recovery_plan = match recovery_output {
-            PlannerOutput::Workflow(plan) => plan,
-            PlannerOutput::SkeletonChoice(_) => {
-                return Err(OrchestratorError::Planner(PlanError::Generation(
-                    "recovery planner returned skeleton_choice; workflow required".to_string(),
-                )));
-            }
-            PlannerOutput::StageChoice(_) => {
-                return Err(OrchestratorError::Planner(PlanError::Generation(
-                    "recovery planner returned stage_choice; workflow required".to_string(),
-                )));
-            }
-            PlannerOutput::DirectResponse(_) => {
-                return Err(OrchestratorError::Planner(PlanError::Generation(
-                    "recovery planner returned direct_response; workflow required".to_string(),
-                )));
-            }
-            PlannerOutput::Clarification(_) => {
-                return Err(OrchestratorError::Planner(PlanError::Generation(
-                    "recovery planner returned clarification; workflow required".to_string(),
-                )));
-            }
-        };
-        let patched =
-            patch_plan_with_recovery(plan, &cut.cut_step_id, &affected, &recovery_plan.steps)?;
-        Ok(Some(patched))
-    }
-
-    async fn build_normalization_repair_plan(
-        &self,
-        task: &Task,
-        plan: &orchestral_core::types::Plan,
-        normalize_error: &NormalizeError,
-        interaction_id: &str,
-    ) -> Result<Option<orchestral_core::types::Plan>, OrchestratorError> {
-        let Some(target) =
-            locate_normalization_repair_target(plan, normalize_error, &task.completed_step_ids)
-        else {
-            return Ok(None);
-        };
-        self.emit_lifecycle_event(
-            "plan_repair_target_selected",
-            Some(interaction_id),
-            Some(task.id.as_str()),
-            Some("selected constrained repair target for normalization failure"),
-            serde_json::json!({
-                "mode": target.mode_label(),
-                "invalid_step_id": target.invalid_step_id.clone(),
-                "cut_step_id": target.cut_step_id(),
-                "affected_steps": target.affected_steps,
-                "error": truncate_for_log(&normalize_error.to_string(), 400),
-            }),
-        )
-        .await;
-
-        let actions = self.available_actions().await;
-        let history = self
-            .history_for_planner(interaction_id, task.id.as_str())
-            .await?;
-        let repair_intent = build_normalization_repair_intent(
-            &task.intent,
-            plan,
-            normalize_error,
-            &target,
-            &task.completed_step_ids,
-        );
-        let runtime_info = PlannerRuntimeInfo::detect();
-        let skill_instructions = self
-            .skill_catalog
-            .build_instructions(&repair_intent.content);
-        let context = PlannerContext::with_history(actions, history, self.reference_store.clone())
-            .with_runtime_info(runtime_info)
-            .with_skill_instructions(skill_instructions);
-        let repair_output = self.planner.plan(&repair_intent, &context).await?;
-        let repair_plan = match repair_output {
-            PlannerOutput::Workflow(plan) => plan,
-            PlannerOutput::SkeletonChoice(_) => {
-                return Err(OrchestratorError::Planner(PlanError::Generation(
-                    "normalization repair planner returned skeleton_choice; workflow required"
-                        .to_string(),
-                )));
-            }
-            PlannerOutput::StageChoice(_) => {
-                return Err(OrchestratorError::Planner(PlanError::Generation(
-                    "normalization repair planner returned stage_choice; workflow required"
-                        .to_string(),
-                )));
-            }
-            PlannerOutput::DirectResponse(_) => {
-                return Err(OrchestratorError::Planner(PlanError::Generation(
-                    "normalization repair planner returned direct_response; workflow required"
-                        .to_string(),
-                )));
-            }
-            PlannerOutput::Clarification(_) => {
-                return Err(OrchestratorError::Planner(PlanError::Generation(
-                    "normalization repair planner returned clarification; workflow required"
-                        .to_string(),
-                )));
-            }
-        };
-
-        match &target.mode {
-            NormalizeRepairMode::FullPlan => Ok(Some(repair_plan)),
-            NormalizeRepairMode::SubgraphPatch { cut_step_id } => {
-                let patched = patch_plan_with_recovery(
-                    plan,
-                    cut_step_id,
-                    &target.affected_steps,
-                    &repair_plan.steps,
-                )?;
-                Ok(Some(patched))
-            }
-        }
-    }
-
-    async fn build_continuation_plan(
-        &self,
-        task: &Task,
-        current_plan: &orchestral_core::types::Plan,
-        replan_step_id: &StepId,
-        replan_prompt: &str,
-        interaction_id: &str,
-    ) -> Result<orchestral_core::types::Plan, OrchestratorError> {
-        tracing::info!(
-            interaction_id = %interaction_id,
-            task_id = %task.id,
-            replan_step_id = %replan_step_id,
-            completed_step_ids = ?task.completed_step_ids,
-            ws_key_count = task.working_set_snapshot.len(),
-            current_plan_steps = current_plan.steps.len(),
-            "build_continuation_plan started"
-        );
-        let actions = self.available_actions().await;
-        let history = self
-            .history_for_planner(interaction_id, task.id.as_str())
-            .await?;
-
-        let ws_summary = summarize_working_set(&task.working_set_snapshot);
-        let content = format!(
-            "Continuation planning request.\n\
-            Original goal: {}\n\
-            Original intent: {}\n\
-            Completed steps: {}\n\
-            Current working set summary:\n{}\n\
-            Replan prompt: {}\n\
-            Rules: generate ONLY the continuation steps. \
-            Do not repeat completed steps. \
-            If the working set already contains target paths, previews, or environment facts, do not rediscover or reinspect them. \
-            Prefer derive/apply/verify or wait_user from the current evidence. \
-            New step IDs must not collide with existing ones.",
-            current_plan.goal,
-            task.intent.content,
-            serde_json::to_string(&task.completed_step_ids).unwrap_or_else(|_| "[]".to_string()),
-            ws_summary,
-            replan_prompt,
-        );
-        let continuation_intent = Intent::new(content);
-
-        let runtime_info = PlannerRuntimeInfo::detect();
-        let skill_instructions = self.skill_catalog.build_instructions(&task.intent.content);
-        let context = PlannerContext::with_history(actions, history, self.reference_store.clone())
-            .with_runtime_info(runtime_info)
-            .with_skill_instructions(skill_instructions);
-
-        tracing::info!(
-            interaction_id = %interaction_id,
-            task_id = %task.id,
-            "build_continuation_plan calling planner"
-        );
-        let output = self.planner.plan(&continuation_intent, &context).await?;
-        let continuation_plan = match output {
-            PlannerOutput::Workflow(plan) => {
-                tracing::info!(
-                    interaction_id = %interaction_id,
-                    task_id = %task.id,
-                    continuation_step_count = plan.steps.len(),
-                    continuation_step_ids = ?plan.steps.iter().map(|s| s.id.to_string()).collect::<Vec<_>>(),
-                    "build_continuation_plan planner returned workflow"
-                );
-                plan
-            }
-            PlannerOutput::SkeletonChoice(_) => {
-                tracing::warn!(
-                    interaction_id = %interaction_id,
-                    task_id = %task.id,
-                    "build_continuation_plan planner returned skeleton_choice (expected workflow)"
-                );
-                return Err(OrchestratorError::Planner(PlanError::Generation(
-                    "continuation planner returned skeleton_choice; workflow required".to_string(),
-                )));
-            }
-            PlannerOutput::StageChoice(_) => {
-                tracing::warn!(
-                    interaction_id = %interaction_id,
-                    task_id = %task.id,
-                    "build_continuation_plan planner returned stage_choice (expected workflow)"
-                );
-                return Err(OrchestratorError::Planner(PlanError::Generation(
-                    "continuation planner returned stage_choice; workflow required".to_string(),
-                )));
-            }
-            PlannerOutput::DirectResponse(msg) => {
-                tracing::warn!(
-                    interaction_id = %interaction_id,
-                    task_id = %task.id,
-                    message = %truncate_for_log(&msg, 200),
-                    "build_continuation_plan planner returned direct_response (expected workflow)"
-                );
-                return Err(OrchestratorError::Planner(PlanError::Generation(
-                    "continuation planner returned direct_response; workflow required".to_string(),
-                )));
-            }
-            PlannerOutput::Clarification(q) => {
-                tracing::warn!(
-                    interaction_id = %interaction_id,
-                    task_id = %task.id,
-                    question = %truncate_for_log(&q, 200),
-                    "build_continuation_plan planner returned clarification (expected workflow)"
-                );
-                return Err(OrchestratorError::Planner(PlanError::Generation(
-                    "continuation planner returned clarification; workflow required".to_string(),
-                )));
-            }
-        };
-
-        let mut merged_steps = current_plan.steps.clone();
-        let existing_ids: std::collections::HashSet<String> =
-            merged_steps.iter().map(|s| s.id.to_string()).collect();
-
-        let all_continuation_steps = continuation_plan.steps;
-
-        let replan_ids: std::collections::HashSet<String> = all_continuation_steps
-            .iter()
-            .filter(|s| s.kind == StepKind::Replan)
-            .map(|s| s.id.to_string())
-            .collect();
-
-        let mut replan_redirect: HashMap<String, String> = HashMap::new();
-        for replan_step in all_continuation_steps
-            .iter()
-            .filter(|s| s.kind == StepKind::Replan)
-        {
-            let redirect_to = replan_step
-                .depends_on
-                .last()
-                .map(|d| d.to_string())
-                .unwrap_or_else(|| replan_step_id.to_string());
-            replan_redirect.insert(replan_step.id.to_string(), redirect_to);
-        }
-
-        let continuation_steps: Vec<Step> = all_continuation_steps
-            .into_iter()
-            .filter(|s| s.kind != StepKind::Replan)
-            .collect();
-
-        let mut rename_map: HashMap<String, String> = HashMap::new();
-        for step in &continuation_steps {
-            if existing_ids.contains(step.id.as_str()) {
-                let new_id = format!("c_{}", step.id);
-                rename_map.insert(step.id.to_string(), new_id);
-            }
-        }
-
-        for mut step in continuation_steps {
-            if let Some(new_id) = rename_map.get(step.id.as_str()) {
-                step.id = new_id.clone().into();
-            }
-            step.depends_on = step
-                .depends_on
-                .into_iter()
-                .filter_map(|dep| {
-                    if replan_ids.contains(dep.as_str()) {
-                        replan_redirect.get(dep.as_str()).map(|target| {
-                            rename_map
-                                .get(target)
-                                .map(|r| StepId::from(r.as_str()))
-                                .unwrap_or_else(|| StepId::from(target.as_str()))
-                        })
-                    } else if let Some(renamed) = rename_map.get(dep.as_str()) {
-                        Some(StepId::from(renamed.as_str()))
-                    } else {
-                        Some(dep)
-                    }
-                })
-                .collect();
-            if step.depends_on.is_empty() {
-                step.depends_on = vec![replan_step_id.clone()];
-            }
-            merged_steps.push(step);
-        }
-
-        let merged_ids: Vec<String> = merged_steps.iter().map(|s| s.id.to_string()).collect();
-        tracing::info!(
-            interaction_id = %interaction_id,
-            task_id = %task.id,
-            merged_step_count = merged_steps.len(),
-            merged_step_ids = ?merged_ids,
-            "build_continuation_plan merged plan ready"
-        );
-
-        Ok(orchestral_core::types::Plan {
-            goal: current_plan.goal.clone(),
-            steps: merged_steps,
-            confidence: current_plan.confidence,
-            on_complete: continuation_plan
-                .on_complete
-                .or_else(|| current_plan.on_complete.clone()),
-            on_failure: continuation_plan
-                .on_failure
-                .or_else(|| current_plan.on_failure.clone()),
         })
     }
 
@@ -3065,12 +2096,15 @@ struct PlanExecutionSnapshot {
     working_set_snapshot: HashMap<String, Value>,
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 struct RecoveryCutStep {
     cut_step_id: String,
     reason: String,
     confidence: f32,
 }
 
+#[cfg(test)]
 fn affected_subgraph_steps(plan: &orchestral_core::types::Plan, cut_step_id: &str) -> Vec<String> {
     if plan.get_step(cut_step_id).is_none() {
         return Vec::new();
@@ -3099,6 +2133,7 @@ fn affected_subgraph_steps(plan: &orchestral_core::types::Plan, cut_step_id: &st
     visited.into_iter().collect()
 }
 
+#[cfg(test)]
 fn locate_recovery_cut_step(
     plan: &orchestral_core::types::Plan,
     failed_step_id: &str,
@@ -3169,6 +2204,7 @@ fn locate_recovery_cut_step(
     })
 }
 
+#[cfg(test)]
 fn is_data_contract_error(error_lower: &str) -> bool {
     const TOKENS: [&str; 11] = [
         "missing declared import",
@@ -3186,6 +2222,7 @@ fn is_data_contract_error(error_lower: &str) -> bool {
     TOKENS.iter().any(|token| error_lower.contains(token))
 }
 
+#[cfg(test)]
 fn find_error_referenced_dependency<'a>(
     failed_step: &'a Step,
     error_lower: &str,
@@ -3198,6 +2235,7 @@ fn find_error_referenced_dependency<'a>(
     None
 }
 
+#[cfg(test)]
 fn step_id_from_key(key: &str) -> Option<String> {
     let (step_id, _) = key.split_once('.')?;
     if step_id.is_empty() {
@@ -3207,6 +2245,8 @@ fn step_id_from_key(key: &str) -> Option<String> {
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn build_recovery_intent(
     original: &Intent,
     current_plan: &orchestral_core::types::Plan,
@@ -3242,6 +2282,7 @@ Rules: return ONLY replacement steps for the affected subgraph; do not redesign 
     Intent::with_context(content, context)
 }
 
+#[cfg(test)]
 fn build_normalization_repair_intent(
     original: &Intent,
     current_plan: &orchestral_core::types::Plan,
@@ -3303,6 +2344,7 @@ Rules:\n\
     Intent::with_context(content, context)
 }
 
+#[cfg(test)]
 fn locate_normalization_repair_target(
     current_plan: &orchestral_core::types::Plan,
     normalize_error: &NormalizeError,
@@ -3341,20 +2383,33 @@ fn locate_normalization_repair_target(
     })
 }
 
+#[cfg(test)]
 fn normalize_error_step_id(normalize_error: &NormalizeError) -> Option<&str> {
     match normalize_error {
-        NormalizeError::Validation(ValidationError::MissingDependency(step_id, _))
-        | NormalizeError::Validation(ValidationError::InvalidIoBinding(step_id, _))
-        | NormalizeError::Validation(ValidationError::IoBindingMissingDependency(step_id, _))
-        | NormalizeError::Validation(ValidationError::InvalidAgentParams(step_id, _))
-        | NormalizeError::Validation(ValidationError::CycleDetected(step_id))
-        | NormalizeError::Validation(ValidationError::DuplicateStepId(step_id)) => {
-            Some(step_id.as_str())
-        }
+        NormalizeError::Validation(
+            orchestral_core::normalizer::ValidationError::MissingDependency(step_id, _),
+        )
+        | NormalizeError::Validation(
+            orchestral_core::normalizer::ValidationError::InvalidIoBinding(step_id, _),
+        )
+        | NormalizeError::Validation(
+            orchestral_core::normalizer::ValidationError::IoBindingMissingDependency(step_id, _),
+        )
+        | NormalizeError::Validation(
+            orchestral_core::normalizer::ValidationError::InvalidAgentParams(step_id, _),
+        )
+        | NormalizeError::Validation(
+            orchestral_core::normalizer::ValidationError::CycleDetected(step_id),
+        )
+        | NormalizeError::Validation(
+            orchestral_core::normalizer::ValidationError::DuplicateStepId(step_id),
+        ) => Some(step_id.as_str()),
         _ => None,
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn patch_plan_with_recovery(
     current_plan: &orchestral_core::types::Plan,
     cut_step_id: &str,
@@ -3470,6 +2525,7 @@ fn intent_from_event(
     }
 }
 
+#[cfg(test)]
 fn summarize_selected_plan_steps(
     plan: &orchestral_core::types::Plan,
     selected_step_ids: &[String],
@@ -3974,6 +3030,7 @@ fn summarize_working_set(snapshot: &HashMap<String, Value>) -> String {
 mod tests {
     use super::*;
     use orchestral_core::executor::{ExecutionDag, ExecutionProgressEvent};
+    use orchestral_core::normalizer::ValidationError;
     use orchestral_core::store::{BroadcastEventBus, EventBus, EventStore, InMemoryEventStore};
     use orchestral_core::types::{Plan, Step, StepId, StepIoBinding, StepKind};
     use serde_json::json;

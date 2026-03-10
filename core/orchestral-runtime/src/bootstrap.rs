@@ -40,7 +40,7 @@ use orchestral_core::spi::{
 use orchestral_core::store::{
     InMemoryEventStore, InMemoryReferenceStore, InMemoryTaskStore, StoreError,
 };
-use orchestral_core::types::{Intent, Plan, Step};
+use orchestral_core::types::Intent;
 
 use crate::orchestrator::OrchestratorConfig;
 use crate::{
@@ -790,19 +790,10 @@ impl Planner for DeterministicPlanner {
         intent: &Intent,
         context: &PlannerContext,
     ) -> Result<PlannerOutput, PlanError> {
-        let action_name = context
-            .available_actions
-            .iter()
-            .find(|a| a.name == "echo")
-            .map(|a| a.name.clone())
-            .or_else(|| context.available_actions.first().map(|a| a.name.clone()))
-            .ok_or(PlanError::NoSuitableActions)?;
-
-        Ok(PlannerOutput::Workflow(Plan::new(
-            format!("Deterministic plan for intent: {}", intent.content),
-            vec![Step::action("s1", action_name).with_params(json!({
-                "message": intent.content
-            }))],
+        let _ = context;
+        Ok(PlannerOutput::DirectResponse(format!(
+            "Deterministic planner cannot execute tasks after RFC0310 transition: {}",
+            intent.content
         )))
     }
 }
@@ -812,7 +803,7 @@ mod tests {
     use super::*;
     use orchestral_core::action::ActionMeta;
     use orchestral_core::recipe::{ActionSelector, RecipeStageTemplate, RecipeTemplate};
-    use orchestral_core::types::{Step, StepIoBinding, StepKind};
+    use orchestral_core::types::{Plan, Step, StepIoBinding, StepKind};
     use serde_json::{json, Value};
 
     #[tokio::test]
