@@ -9,6 +9,7 @@
 mod continuation;
 mod intent;
 mod plan;
+mod skeleton;
 mod stage;
 mod stage_plan;
 mod step;
@@ -18,7 +19,8 @@ mod verify;
 pub use continuation::{ContinuationState, ContinuationStatus};
 pub use intent::{Intent, IntentContext};
 pub use plan::Plan;
-pub use stage::{ArtifactFamily, DerivationPolicy, RecipeFamily, StageKind};
+pub use skeleton::{SkeletonChoice, SkeletonKind};
+pub use stage::{ArtifactFamily, DerivationPolicy, StageKind};
 pub use stage_plan::{StageChoice, StagePlan};
 pub use step::{Step, StepId, StepIoBinding, StepKind};
 pub use task::{ReactorTaskState, Task, TaskId, TaskState, WaitUserReason};

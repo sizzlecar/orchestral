@@ -63,8 +63,9 @@ pub mod prelude {
     };
     pub use crate::types::{
         ArtifactFamily, ContinuationState, ContinuationStatus, DerivationPolicy, Intent,
-        IntentContext, Plan, ReactorTaskState, RecipeFamily, StageChoice, StageKind, StagePlan,
-        Step, StepId, StepKind, Task, TaskId, TaskState, VerifyDecision, VerifyStatus,
+        IntentContext, Plan, ReactorTaskState, SkeletonChoice, SkeletonKind, StageChoice,
+        StageKind, StagePlan, Step, StepId, StepKind, Task, TaskId, TaskState, VerifyDecision,
+        VerifyStatus,
     };
 }
 
@@ -91,6 +92,6 @@ pub use store::{
 };
 pub use types::{
     ArtifactFamily, ContinuationState, ContinuationStatus, DerivationPolicy, Intent, Plan,
-    ReactorTaskState, RecipeFamily, StageChoice, StageKind, StagePlan, Step, StepId, Task, TaskId,
-    TaskState, VerifyDecision, VerifyStatus,
+    ReactorTaskState, SkeletonChoice, SkeletonKind, StageChoice, StageKind, StagePlan, Step,
+    StepId, Task, TaskId, TaskState, VerifyDecision, VerifyStatus,
 };

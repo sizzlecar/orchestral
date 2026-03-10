@@ -11,7 +11,7 @@ use std::fmt;
 use crate::action::ApprovalRequest;
 
 use super::{
-    ArtifactFamily, ContinuationState, DerivationPolicy, Intent, Plan, RecipeFamily, StageKind,
+    ArtifactFamily, ContinuationState, DerivationPolicy, Intent, Plan, SkeletonKind, StageKind,
     StepId, VerifyDecision,
 };
 
@@ -266,7 +266,7 @@ impl Task {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReactorTaskState {
-    pub recipe_family: RecipeFamily,
+    pub skeleton: SkeletonKind,
     pub artifact_family: ArtifactFamily,
     pub current_stage: StageKind,
     pub derivation_policy: DerivationPolicy,
