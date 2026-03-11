@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use orchestral_runtime::action::{Action, ActionContext, ActionInput, ActionMeta, ActionResult, ActionSpec};
+use orchestral_runtime::action::{
+    Action, ActionContext, ActionInput, ActionMeta, ActionResult, ActionSpec,
+};
 use serde_json::json;
 
 use super::support::{

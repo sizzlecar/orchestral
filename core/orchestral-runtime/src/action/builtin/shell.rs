@@ -13,12 +13,11 @@ use super::super::shell_sandbox::{
     sandbox_command, ShellSandboxBackendKind, ShellSandboxMode, ShellSandboxPolicy,
 };
 use super::support::{
-    approval_decision_from_ctx, build_shell_env, config_bool, config_string,
-    config_string_array, config_u64, contains_shell_metacharacters, extract_inline_script_body,
-    expression_command_names, expression_command_tokens, first_token, normalize_command_name,
+    approval_decision_from_ctx, bounded_u64, build_shell_env, config_bool, config_string,
+    config_string_array, config_u64, contains_shell_metacharacters, expression_command_names,
+    expression_command_tokens, extract_inline_script_body, first_token, normalize_command_name,
     params_get_array, params_get_bool, params_get_string, read_stream_limited,
-    requires_destructive_approval, stderr_preview, truncate_utf8_lossy, bounded_u64,
-    ShellEnvPolicy,
+    requires_destructive_approval, stderr_preview, truncate_utf8_lossy, ShellEnvPolicy,
 };
 use orchestral_core::action::{Action, ActionContext, ActionInput, ActionMeta, ActionResult};
 use orchestral_core::config::ActionSpec;

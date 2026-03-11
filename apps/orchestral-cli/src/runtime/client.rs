@@ -81,8 +81,17 @@ const GENERATED_OVERRIDE_CONFIG_SUFFIX: &str = ".runtime.override.yaml";
 mod tests {
     use super::*;
     use orchestral_core::config::{BackendSpec, ModelPolicy, ModelProfile, OrchestralConfig};
+    use orchestral_core::store::Event as ChannelEvent;
     use serde_json::json;
     use serde_yaml::Value as YamlValue;
+    use std::path::Path;
+
+    use crate::runtime::client::config::{
+        apply_planner_overrides_to_yaml, runtime_override_config_path,
+    };
+    use crate::runtime::client::event_support::{
+        event_interaction_id, format_running_label, normalize_step_action_label,
+    };
 
     #[test]
     fn test_event_interaction_id_from_assistant_output() {

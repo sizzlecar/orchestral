@@ -257,8 +257,12 @@ impl RuntimeApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use orchestral_core::action::ActionMeta;
+    use orchestral_core::config::OrchestralConfig;
+    use orchestral_core::io::BlobWriteRequest;
     use orchestral_core::recipe::{ActionSelector, RecipeStageTemplate, RecipeTemplate};
+    use orchestral_core::recipe::{RecipeRegistry, RECIPE_REGISTRY_COMPONENT_KEY};
     use orchestral_core::types::{Plan, Step, StepIoBinding, StepKind};
     use serde_json::{json, Value};
 

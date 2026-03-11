@@ -1,7 +1,7 @@
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::AtomicU64;
-use serde_json::Value;
 use tokio::io::AsyncReadExt;
 
 use super::super::shell_sandbox::{
@@ -308,7 +308,12 @@ pub(super) async fn approval_decision_from_ctx(ctx: &ActionContext) -> Option<Ap
                 .and_then(|v| v.as_str())
                 .map(str::to_string)
         })
-        .or_else(|| payload.get("text").and_then(|v| v.as_str()).map(str::to_string))?;
+        .or_else(|| {
+            payload
+                .get("text")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })?;
     let decision = parse_approval_decision(&message)?;
     ws.remove_task("resume_user_input");
     Some(decision)
@@ -432,7 +437,9 @@ pub(super) async fn resolve_safe_path_with_policy(
     Err("Path escapes sandbox roots".to_string())
 }
 
-pub(super) fn build_file_sandbox_policy(spec: &orchestral_core::config::ActionSpec) -> ShellSandboxPolicy {
+pub(super) fn build_file_sandbox_policy(
+    spec: &orchestral_core::config::ActionSpec,
+) -> ShellSandboxPolicy {
     let mode = config_string(&spec.config, "sandbox_mode")
         .as_deref()
         .and_then(ShellSandboxMode::from_str)

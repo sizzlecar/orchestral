@@ -111,7 +111,10 @@ fn test_recipe_compiler_rewrites_recipe_input_placeholders_in_stage_params() {
     RecipeCompiler::new().compile(&mut plan).expect("compile");
     let unpack = plan.get_step("r1__unpack").expect("unpack stage");
     assert_eq!(unpack.depends_on, vec![StepId::from("s0")]);
-    assert_eq!(unpack.params.pointer("/args/1"), Some(&json!("{{s0.stdout}}")));
+    assert_eq!(
+        unpack.params.pointer("/args/1"),
+        Some(&json!("{{s0.stdout}}"))
+    );
 }
 
 #[test]
@@ -210,7 +213,8 @@ fn test_recipe_compiler_prefers_non_fallback_action_for_builtin_template() {
 
     compiler.compile(&mut plan).expect("compile");
     assert_eq!(
-        plan.get_step("r1__inspect").map(|step| step.action.as_str()),
+        plan.get_step("r1__inspect")
+            .map(|step| step.action.as_str()),
         Some("file_read")
     );
     assert_eq!(

@@ -5,9 +5,8 @@ use orchestral_runtime::action::{Action, ActionContext, ActionInput, ActionResul
 use serde_json::{json, Value};
 
 use super::support::{
-    config_bool, config_string, config_u64, is_markdown_format, params_get_bool,
-    params_get_string, params_get_string_array, parse_document_with_kreuzberg,
-    run_pandoc_from_markdown, write_text,
+    config_bool, config_string, config_u64, is_markdown_format, params_get_bool, params_get_string,
+    params_get_string_array, parse_document_with_kreuzberg, run_pandoc_from_markdown, write_text,
 };
 
 pub(super) struct DocMergeAction {

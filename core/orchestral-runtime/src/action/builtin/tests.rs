@@ -1,15 +1,16 @@
-use super::*;
 use super::shell::ShellAction;
 use super::support::{
     approval_decision_from_ctx, extract_inline_script_body, requires_destructive_approval,
     ApprovalDecision,
 };
+use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use orchestral_core::action::{Action, ActionContext, ActionInput, ActionResult};
 use orchestral_core::store::{Reference, ReferenceStore, ReferenceType, StoreError, WorkingSet};
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
 struct NoopReferenceStore;

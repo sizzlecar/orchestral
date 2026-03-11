@@ -10,5 +10,5 @@ mod support;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use support::parse_document_markdown;
 pub use factory::DocsAssistantActionFactory;
+pub(crate) use support::parse_document_markdown;

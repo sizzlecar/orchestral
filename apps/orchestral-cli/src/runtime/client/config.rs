@@ -6,8 +6,7 @@ use orchestral_core::config::{load_config, OrchestralConfig};
 use serde_yaml::{Mapping, Value as YamlValue};
 
 use super::{
-    PlannerOverrides, GENERATED_CONFIG_DIR, GENERATED_CONFIG_FILE,
-    GENERATED_OVERRIDE_CONFIG_SUFFIX,
+    PlannerOverrides, GENERATED_CONFIG_DIR, GENERATED_CONFIG_FILE, GENERATED_OVERRIDE_CONFIG_SUFFIX,
 };
 
 pub(super) fn prepare_runtime_config_path(
@@ -90,7 +89,7 @@ fn write_overridden_runtime_config(
     Ok(override_path)
 }
 
-fn runtime_override_config_path(base_path: &Path) -> PathBuf {
+pub(super) fn runtime_override_config_path(base_path: &Path) -> PathBuf {
     let parent = base_path.parent().unwrap_or_else(|| Path::new("."));
     let stem = base_path
         .file_stem()

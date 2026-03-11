@@ -188,7 +188,7 @@ impl Default for PlanNormalizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Step, StepIoBinding};
+    use crate::types::{Step, StepId, StepIoBinding, StepKind};
     use serde_json::json;
 
     #[test]

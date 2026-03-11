@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use orchestral_runtime::action::{Action, ActionContext, ActionInput, ActionMeta, ActionResult, ActionSpec};
+use orchestral_runtime::action::{
+    Action, ActionContext, ActionInput, ActionMeta, ActionResult, ActionSpec,
+};
 use serde_json::{json, Value};
 
 use super::support::{
-    config_bool, parse_document_with_kreuzberg, parse_headings, params_get_string, word_count,
+    config_bool, params_get_string, parse_document_with_kreuzberg, parse_headings, word_count,
 };
 
 pub(super) struct DocParseAction {
@@ -70,8 +72,8 @@ impl Action for DocParseAction {
             _ => return ActionResult::error("doc_parse requires params.source_path"),
         };
 
-        let extract_pages =
-            super::support::params_get_bool(params, "extract_pages").unwrap_or(self.default_extract_pages);
+        let extract_pages = super::support::params_get_bool(params, "extract_pages")
+            .unwrap_or(self.default_extract_pages);
         let parsed = match parse_document_with_kreuzberg(&source_path, extract_pages).await {
             Ok(parsed) => parsed,
             Err(err) => return ActionResult::error(err),

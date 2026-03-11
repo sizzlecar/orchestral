@@ -293,9 +293,9 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use orchestral_core::action::ActionMeta;
-    use orchestral_core::planner::PlannerContext;
+    use orchestral_core::planner::{PlannerContext, SkillInstruction};
     use orchestral_core::store::{Reference, ReferenceStore, ReferenceType, StoreError};
-    use orchestral_core::types::Intent;
+    use orchestral_core::types::{ArtifactFamily, Intent, SkeletonKind, StageKind};
     use serde_json::json;
     use std::sync::Arc;
 
