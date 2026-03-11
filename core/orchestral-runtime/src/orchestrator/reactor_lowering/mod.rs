@@ -1,3 +1,4 @@
+mod inspect_and_extract;
 mod locate_and_patch;
 
 use orchestral_core::planner::PlanError;
@@ -9,14 +10,16 @@ pub(super) fn lower_reactor_stage_plan(
     task: &Task,
     choice: &StageChoice,
 ) -> Result<Plan, OrchestratorError> {
-    if choice.skeleton == SkeletonKind::LocateAndPatch {
-        return locate_and_patch::lower_locate_and_patch_plan(task, choice);
+    match choice.skeleton {
+        SkeletonKind::LocateAndPatch => locate_and_patch::lower_locate_and_patch_plan(task, choice),
+        SkeletonKind::InspectAndExtract => {
+            inspect_and_extract::lower_inspect_and_extract_plan(task, choice)
+        }
+        _ => Err(OrchestratorError::Planner(PlanError::Generation(format!(
+            "reactor lowering not implemented for skeleton={:?} artifact_family={:?} current_stage={:?}",
+            choice.skeleton, choice.artifact_family, choice.current_stage
+        )))),
     }
-
-    Err(OrchestratorError::Planner(PlanError::Generation(format!(
-        "reactor lowering not implemented for skeleton={:?} artifact_family={:?} current_stage={:?}",
-        choice.skeleton, choice.artifact_family, choice.current_stage
-    ))))
 }
 
 pub(super) fn unsupported_stage_error(

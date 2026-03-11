@@ -44,6 +44,7 @@ impl Orchestrator {
                 | StageKind::Derive
                 | StageKind::Assess
                 | StageKind::Commit
+                | StageKind::Export
                 | StageKind::Verify => Some(self.lower_reactor_stage_plan(&task, &choice)?),
                 StageKind::WaitUser | StageKind::Done | StageKind::Failed => None,
                 unsupported_stage => {
@@ -104,6 +105,7 @@ impl Orchestrator {
                 | StageKind::Derive
                 | StageKind::Assess
                 | StageKind::Commit
+                | StageKind::Export
                 | StageKind::Verify => {}
                 unsupported_stage => {
                     return Err(OrchestratorError::Planner(PlanError::Generation(format!(
@@ -156,6 +158,7 @@ impl Orchestrator {
                     StageKind::Locate
                     | StageKind::Probe
                     | StageKind::Derive
+                    | StageKind::Export
                     | StageKind::Commit => {
                         let next_stage = choice
                             .skeleton

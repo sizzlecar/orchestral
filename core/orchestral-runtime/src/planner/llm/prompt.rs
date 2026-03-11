@@ -169,6 +169,14 @@ fn append_reactor_choice_examples(buf: &mut String, coverage: ReactorPromptCover
             r#"{"type":"STAGE_CHOICE","skeleton":"locate_and_patch","artifact_family":"spreadsheet","current_stage":"probe","stage_goal":"inspect workbook structure","derivation_policy":"permissive","next_stage_hint":"derive","reason":"..."}"#,
         );
         buf.push('\n');
+        buf.push_str(
+            r#"{"type":"SKELETON_CHOICE","skeleton":"inspect_and_extract","artifact_family":"spreadsheet","initial_stage":"probe","confidence":0.9,"reason":"..."}"#,
+        );
+        buf.push('\n');
+        buf.push_str(
+            r#"{"type":"STAGE_CHOICE","skeleton":"inspect_and_extract","artifact_family":"spreadsheet","current_stage":"probe","stage_goal":"inspect the artifact and collect structured findings","derivation_policy":"permissive","next_stage_hint":"derive","reason":"..."}"#,
+        );
+        buf.push('\n');
     }
     if coverage.document {
         buf.push_str(
@@ -179,6 +187,14 @@ fn append_reactor_choice_examples(buf: &mut String, coverage: ReactorPromptCover
             r#"{"type":"STAGE_CHOICE","skeleton":"locate_and_patch","artifact_family":"document","current_stage":"probe","stage_goal":"inspect document structure","derivation_policy":"permissive","next_stage_hint":"derive","reason":"..."}"#,
         );
         buf.push('\n');
+        buf.push_str(
+            r#"{"type":"SKELETON_CHOICE","skeleton":"inspect_and_extract","artifact_family":"document","initial_stage":"probe","confidence":0.9,"reason":"..."}"#,
+        );
+        buf.push('\n');
+        buf.push_str(
+            r#"{"type":"STAGE_CHOICE","skeleton":"inspect_and_extract","artifact_family":"document","current_stage":"probe","stage_goal":"inspect the artifact and collect structured findings","derivation_policy":"permissive","next_stage_hint":"derive","reason":"..."}"#,
+        );
+        buf.push('\n');
     }
     if coverage.structured {
         buf.push_str(
@@ -187,6 +203,14 @@ fn append_reactor_choice_examples(buf: &mut String, coverage: ReactorPromptCover
         buf.push('\n');
         buf.push_str(
             r#"{"type":"STAGE_CHOICE","skeleton":"locate_and_patch","artifact_family":"structured","current_stage":"probe","stage_goal":"inspect structured artifact contents","derivation_policy":"strict","next_stage_hint":"derive","reason":"..."}"#,
+        );
+        buf.push('\n');
+        buf.push_str(
+            r#"{"type":"SKELETON_CHOICE","skeleton":"inspect_and_extract","artifact_family":"structured","initial_stage":"probe","confidence":0.9,"reason":"..."}"#,
+        );
+        buf.push('\n');
+        buf.push_str(
+            r#"{"type":"STAGE_CHOICE","skeleton":"inspect_and_extract","artifact_family":"structured","current_stage":"probe","stage_goal":"inspect the artifact and collect structured findings","derivation_policy":"strict","next_stage_hint":"derive","reason":"..."}"#,
         );
         buf.push('\n');
     }
@@ -256,6 +280,9 @@ fn build_reactor_system_prompt(
         );
         out.push_str("  probe must end with explicit continuation\n");
         out.push_str("  verify is the done gate\n");
+        out.push_str("- skeleton=inspect_and_extract, artifact_family=spreadsheet\n");
+        out.push_str("  covered stage path: probe -> derive -> export -> verify\n");
+        out.push_str("  verify is the done gate\n");
     }
     if coverage.document {
         out.push_str("- skeleton=locate_and_patch, artifact_family=document\n");
@@ -264,6 +291,9 @@ fn build_reactor_system_prompt(
         );
         out.push_str("  probe must end with explicit continuation\n");
         out.push_str("  verify is the done gate\n");
+        out.push_str("- skeleton=inspect_and_extract, artifact_family=document\n");
+        out.push_str("  covered stage path: probe -> derive -> export -> verify\n");
+        out.push_str("  verify is the done gate\n");
     }
     if coverage.structured {
         out.push_str("- skeleton=locate_and_patch, artifact_family=structured\n");
@@ -271,6 +301,9 @@ fn build_reactor_system_prompt(
             "  covered stage path: locate -> probe -> derive -> assess -> commit -> verify\n",
         );
         out.push_str("  probe must end with explicit continuation\n");
+        out.push_str("  verify is the done gate\n");
+        out.push_str("- skeleton=inspect_and_extract, artifact_family=structured\n");
+        out.push_str("  covered stage path: probe -> derive -> export -> verify\n");
         out.push_str("  verify is the done gate\n");
     }
     if !coverage.spreadsheet && !coverage.document && !coverage.structured {
