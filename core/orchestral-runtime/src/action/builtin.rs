@@ -11,6 +11,11 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::debug;
 
+mod echo;
+mod json_stdout;
+
+use self::echo::EchoAction;
+pub(crate) use self::json_stdout::JsonStdoutAction;
 use super::shell_sandbox::{
     resolve_root_path, sandbox_command, ShellSandboxBackendKind, ShellSandboxMode,
     ShellSandboxPolicy,
@@ -494,153 +499,6 @@ fn build_file_sandbox_policy(spec: &ActionSpec) -> ShellSandboxPolicy {
 }
 
 /// Echo action
-pub struct EchoAction {
-    name: String,
-    description: String,
-    prefix: String,
-}
-
-impl EchoAction {
-    pub fn from_spec(spec: &ActionSpec) -> Self {
-        let prefix = config_string(&spec.config, "prefix").unwrap_or_default();
-        Self {
-            name: spec.name.clone(),
-            description: spec.description_or("Echoes the input back as output"),
-            prefix,
-        }
-    }
-}
-
-#[async_trait]
-impl Action for EchoAction {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn description(&self) -> &str {
-        &self.description
-    }
-
-    fn metadata(&self) -> ActionMeta {
-        ActionMeta::new(self.name(), self.description())
-            .with_capability("pure")
-            .with_roles(["emit"])
-            .with_input_kinds(["text"])
-            .with_output_kinds(["text"])
-            .with_input_schema(json!({
-                "type": "object",
-                "properties": {
-                    "message": {
-                        "type": "string",
-                        "description": "Text to echo back."
-                    }
-                },
-                "required": ["message"]
-            }))
-            .with_output_schema(json!({
-                "type": "object",
-                "properties": {
-                    "result": {
-                        "type": "string",
-                        "description": "Echoed text result."
-                    }
-                },
-                "required": ["result"]
-            }))
-    }
-
-    async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
-        let message = input
-            .params
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("No message provided");
-        let result = format!("{}{}", self.prefix, message);
-        ActionResult::success_with_one("result", Value::String(result))
-    }
-}
-
-/// Pure structured-output action used by leaf agents.
-pub struct JsonStdoutAction {
-    name: String,
-    description: String,
-}
-
-impl JsonStdoutAction {
-    pub fn from_spec(spec: &ActionSpec) -> Self {
-        Self {
-            name: spec.name.clone(),
-            description: spec.description_or(
-                "Serializes payload to stdout as one JSON object without side effects",
-            ),
-        }
-    }
-
-    pub fn internal() -> Self {
-        Self {
-            name: "json_stdout".to_string(),
-            description: "Serializes payload to stdout as one JSON object without side effects"
-                .to_string(),
-        }
-    }
-}
-
-#[async_trait]
-impl Action for JsonStdoutAction {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn description(&self) -> &str {
-        &self.description
-    }
-
-    fn metadata(&self) -> ActionMeta {
-        ActionMeta::new(self.name(), self.description())
-            .with_capabilities(["pure", "structured_output"])
-            .with_roles(["emit"])
-            .with_input_kinds(["structured"])
-            .with_output_kinds(["structured", "text"])
-            .with_input_schema(json!({
-                "type": "object",
-                "properties": {
-                    "payload": {
-                        "description": "Arbitrary JSON object to serialize to stdout."
-                    }
-                },
-                "required": ["payload"]
-            }))
-            .with_output_schema(json!({
-                "type": "object",
-                "properties": {
-                    "stdout": { "type": "string" },
-                    "stderr": { "type": "string" },
-                    "status": { "type": "integer" }
-                },
-                "required": ["stdout", "stderr", "status"]
-            }))
-    }
-
-    async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
-        let payload = input
-            .params
-            .get("payload")
-            .cloned()
-            .unwrap_or(Value::Object(Default::default()));
-        let stdout = match serde_json::to_string(&payload) {
-            Ok(value) => value,
-            Err(error) => {
-                return ActionResult::error(format!("Failed to serialize payload: {}", error))
-            }
-        };
-        let mut exports = HashMap::new();
-        exports.insert("stdout".to_string(), Value::String(stdout));
-        exports.insert("stderr".to_string(), Value::String(String::new()));
-        exports.insert("status".to_string(), Value::Number(0.into()));
-        ActionResult::success_with(exports)
-    }
-}
-
 /// HTTP action
 pub struct HttpAction {
     name: String,
