@@ -1,38 +1,29 @@
 //! Bootstrap helpers for starting Orchestral from a single YAML config.
 
-use std::collections::HashMap;
+mod blob_store;
+mod components;
+mod observability;
+mod runtime_builder;
+
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use bytes::Bytes;
-use futures_util::StreamExt;
-use serde_json::json;
 use thiserror::Error;
-use tokio::sync::RwLock;
 
 use crate::action::{
     ActionConfigError, ActionFactory, ActionRegistryManager, ActionWatcher, DefaultActionFactory,
 };
-use crate::agent::{default_action_preflight_hook, LlmAgentExecutor, LlmAgentExecutorConfig};
+use crate::agent::default_action_preflight_hook;
 use crate::context::{BasicContextBuilder, TokenBudget};
-use crate::planner::{
-    DefaultLlmClientFactory, LlmBuildError, LlmClient, LlmClientFactory, LlmInvocationConfig,
-    LlmPlanner, LlmPlannerConfig,
-};
+use crate::planner::LlmBuildError;
 use crate::skill::discovery::discover_skills;
 use crate::skill::SkillCatalog;
 use orchestral_core::action::extract_meta;
-use orchestral_core::config::{
-    ConfigError, ConfigManager, ObservabilityConfig, OrchestralConfig, StoreSpec,
-};
+use orchestral_core::config::{ConfigError, ConfigManager};
 use orchestral_core::executor::Executor;
-use orchestral_core::io::{
-    BlobHead, BlobId, BlobIoError, BlobMeta, BlobRead, BlobStore, BlobWriteRequest,
-};
+use orchestral_core::io::{BlobIoError, BlobStore};
 use orchestral_core::normalizer::PlanNormalizer;
-use orchestral_core::planner::{PlanError, Planner, PlannerContext, PlannerOutput};
-use orchestral_core::recipe::{RecipeRegistry, RECIPE_REGISTRY_COMPONENT_KEY};
 use orchestral_core::spi::{
     ComponentRegistry, HookRegistry, RuntimeBuildRequest, RuntimeComponentFactory, SpiError,
     SpiMeta, StoreBundle,
@@ -40,12 +31,16 @@ use orchestral_core::spi::{
 use orchestral_core::store::{
     InMemoryEventStore, InMemoryReferenceStore, InMemoryTaskStore, StoreError,
 };
-use orchestral_core::types::Intent;
 
 use crate::orchestrator::OrchestratorConfig;
-use crate::{
-    ConcurrencyPolicy, DefaultConcurrencyPolicy, Orchestrator, ParallelConcurrencyPolicy,
-    RejectWhenBusyConcurrencyPolicy, Thread, ThreadRuntime, ThreadRuntimeConfig,
+use crate::{Orchestrator, Thread, ThreadRuntime, ThreadRuntimeConfig};
+
+pub use self::blob_store::InMemoryBlobStore;
+use self::components::{extract_recipe_registry_component, register_recipe_templates};
+use self::observability::init_tracing_if_needed;
+use self::runtime_builder::{
+    build_agent_step_executor, build_planner, build_runtime_component_options,
+    concurrency_policy_from_name,
 };
 
 /// Runtime bootstrap errors.
@@ -88,7 +83,6 @@ pub struct RuntimeApp {
 }
 
 static TRACING_INIT: OnceLock<()> = OnceLock::new();
-const MAX_PROMPT_LOG_CHARS: usize = 4_000;
 
 /// Default component factory providing in-memory stores and blob storage.
 pub struct DefaultRuntimeComponentFactory;
@@ -145,7 +139,7 @@ impl RuntimeApp {
         let config_manager = Arc::new(ConfigManager::new(path.clone()));
         config_manager.load().await?;
         let config = config_manager.config().read().await.clone();
-        init_tracing_if_needed(&config.observability);
+        init_tracing_if_needed(&TRACING_INIT, &config.observability);
         let build_request = RuntimeBuildRequest {
             meta: SpiMeta::runtime_defaults(env!("CARGO_PKG_VERSION")),
             config_path: path.to_string_lossy().to_string(),
@@ -257,545 +251,6 @@ impl RuntimeApp {
             action_registry_manager,
             _action_watcher: action_watcher,
         })
-    }
-}
-
-fn extract_recipe_registry_component(
-    components: &ComponentRegistry,
-) -> Result<Option<Arc<RecipeRegistry>>, BootstrapError> {
-    let Some(component) = components.get_named_component(RECIPE_REGISTRY_COMPONENT_KEY) else {
-        return Ok(None);
-    };
-    Arc::downcast::<RecipeRegistry>(component)
-        .map(Some)
-        .map_err(|_| {
-            BootstrapError::Spi(SpiError::Internal(format!(
-                "named component '{}' must be Arc<RecipeRegistry>",
-                RECIPE_REGISTRY_COMPONENT_KEY
-            )))
-        })
-}
-
-fn register_recipe_templates(
-    normalizer: &mut PlanNormalizer,
-    config: &OrchestralConfig,
-    registry: Option<&RecipeRegistry>,
-) {
-    if let Some(registry) = registry {
-        for template in registry.templates() {
-            normalizer.register_recipe_template(template.clone());
-        }
-    }
-    for template in &config.recipes.templates {
-        normalizer.register_recipe_template(template.clone());
-    }
-}
-
-#[derive(Clone)]
-struct InMemoryBlobObject {
-    meta: BlobMeta,
-    bytes: Vec<u8>,
-}
-
-#[derive(Default)]
-pub struct InMemoryBlobStore {
-    objects: RwLock<HashMap<String, InMemoryBlobObject>>,
-}
-
-#[async_trait]
-impl BlobStore for InMemoryBlobStore {
-    async fn write(&self, mut request: BlobWriteRequest) -> Result<BlobMeta, BlobIoError> {
-        let blob_id = BlobId::from(uuid::Uuid::new_v4().to_string());
-        let mut data: Vec<u8> = Vec::new();
-        while let Some(chunk) = request.body.next().await {
-            let chunk = chunk?;
-            data.extend_from_slice(&chunk);
-        }
-        if data.is_empty() {
-            return Err(BlobIoError::Invalid("empty blob payload".to_string()));
-        }
-        let now = chrono::Utc::now();
-        let meta = BlobMeta {
-            id: blob_id,
-            file_name: request.file_name.take(),
-            mime_type: request.mime_type.take(),
-            byte_size: data.len() as u64,
-            checksum_sha256: None,
-            metadata: if request.metadata.is_null() {
-                serde_json::json!({})
-            } else {
-                request.metadata
-            },
-            created_at: now,
-            updated_at: now,
-        };
-        self.objects.write().await.insert(
-            meta.id.to_string(),
-            InMemoryBlobObject {
-                meta: meta.clone(),
-                bytes: data,
-            },
-        );
-        Ok(meta)
-    }
-
-    async fn read(&self, blob_id: &BlobId) -> Result<BlobRead, BlobIoError> {
-        let obj = self
-            .objects
-            .read()
-            .await
-            .get(blob_id.as_str())
-            .cloned()
-            .ok_or_else(|| BlobIoError::NotFound(blob_id.to_string()))?;
-        let body = Box::pin(futures_util::stream::once(async move {
-            Ok(Bytes::from(obj.bytes))
-        }));
-        Ok(BlobRead {
-            meta: obj.meta,
-            body,
-        })
-    }
-
-    async fn head(&self, blob_id: &BlobId) -> Result<BlobHead, BlobIoError> {
-        let obj = self
-            .objects
-            .read()
-            .await
-            .get(blob_id.as_str())
-            .cloned()
-            .ok_or_else(|| BlobIoError::NotFound(blob_id.to_string()))?;
-        Ok(BlobHead {
-            byte_size: obj.meta.byte_size,
-            etag: None,
-            last_modified: Some(obj.meta.updated_at),
-        })
-    }
-
-    async fn delete(&self, blob_id: &BlobId) -> Result<bool, BlobIoError> {
-        Ok(self
-            .objects
-            .write()
-            .await
-            .remove(blob_id.as_str())
-            .is_some())
-    }
-}
-
-fn init_tracing_if_needed(observability: &ObservabilityConfig) {
-    TRACING_INIT.get_or_init(|| {
-        let silent_tui_logs = std::env::var("ORCHESTRAL_TUI_SILENT_LOGS")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-        let log_file_path = std::env::var("ORCHESTRAL_LOG_FILE")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .or_else(|| observability.log_file.clone());
-        let file_writer = log_file_path.as_deref().and_then(create_log_writer);
-        let fallback_level = match observability.log_level.trim().to_ascii_lowercase().as_str() {
-            "trace" => "trace",
-            "debug" => "debug",
-            "info" => "info",
-            "warn" => "warn",
-            "error" => "error",
-            _ => "info",
-        };
-
-        let make_filter = || {
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .or_else(|_| tracing_subscriber::EnvFilter::try_new(fallback_level))
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
-        };
-
-        match (observability.traces_enabled, silent_tui_logs, file_writer) {
-            (true, _, Some(writer)) => {
-                let _ = tracing_subscriber::fmt()
-                    .with_env_filter(make_filter())
-                    .with_target(true)
-                    .with_ansi(false)
-                    .with_writer(writer)
-                    .with_span_events(
-                        tracing_subscriber::fmt::format::FmtSpan::NEW
-                            | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
-                    )
-                    .try_init();
-            }
-            (true, true, None) => {
-                let _ = tracing_subscriber::fmt()
-                    .with_env_filter(make_filter())
-                    .with_target(true)
-                    .with_writer(std::io::sink)
-                    .with_span_events(
-                        tracing_subscriber::fmt::format::FmtSpan::NEW
-                            | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
-                    )
-                    .try_init();
-            }
-            (true, false, None) => {
-                let _ = tracing_subscriber::fmt()
-                    .with_env_filter(make_filter())
-                    .with_target(true)
-                    .with_span_events(
-                        tracing_subscriber::fmt::format::FmtSpan::NEW
-                            | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
-                    )
-                    .try_init();
-            }
-            (false, _, Some(writer)) => {
-                let _ = tracing_subscriber::fmt()
-                    .with_env_filter(make_filter())
-                    .with_target(true)
-                    .with_ansi(false)
-                    .with_writer(writer)
-                    .try_init();
-            }
-            (false, true, None) => {
-                let _ = tracing_subscriber::fmt()
-                    .with_env_filter(make_filter())
-                    .with_target(true)
-                    .with_writer(std::io::sink)
-                    .try_init();
-            }
-            (false, false, None) => {
-                let _ = tracing_subscriber::fmt()
-                    .with_env_filter(make_filter())
-                    .with_target(true)
-                    .try_init();
-            }
-        }
-
-        tracing::info!(
-            log_level = %observability.log_level,
-            traces_enabled = observability.traces_enabled,
-            log_file = log_file_path.as_deref().unwrap_or("(stdout)"),
-            "tracing initialized"
-        );
-    });
-}
-
-fn create_log_writer(path: &str) -> Option<SharedFileMakeWriter> {
-    use std::fs::{create_dir_all, OpenOptions};
-    use std::path::Path;
-
-    let file_path = Path::new(path);
-    if let Some(parent) = file_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            if let Err(err) = create_dir_all(parent) {
-                eprintln!(
-                    "failed to create log directory '{}': {}",
-                    parent.display(),
-                    err
-                );
-                return None;
-            }
-        }
-    }
-    let file = match OpenOptions::new().create(true).append(true).open(file_path) {
-        Ok(f) => f,
-        Err(err) => {
-            eprintln!("failed to open log file '{}': {}", file_path.display(), err);
-            return None;
-        }
-    };
-    Some(SharedFileMakeWriter::new(file))
-}
-
-#[derive(Clone)]
-struct SharedFileMakeWriter {
-    file: Arc<std::sync::Mutex<std::fs::File>>,
-}
-
-impl SharedFileMakeWriter {
-    fn new(file: std::fs::File) -> Self {
-        Self {
-            file: Arc::new(std::sync::Mutex::new(file)),
-        }
-    }
-}
-
-struct SharedFileWriter {
-    file: Arc<std::sync::Mutex<std::fs::File>>,
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedFileMakeWriter {
-    type Writer = SharedFileWriter;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        SharedFileWriter {
-            file: self.file.clone(),
-        }
-    }
-}
-
-impl std::io::Write for SharedFileWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|_| std::io::Error::other("log file mutex poisoned"))?;
-        std::io::Write::write(&mut *file, buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|_| std::io::Error::other("log file mutex poisoned"))?;
-        std::io::Write::flush(&mut *file)
-    }
-}
-
-fn concurrency_policy_from_name(
-    policy: &str,
-) -> Result<Arc<dyn ConcurrencyPolicy>, BootstrapError> {
-    match policy {
-        "interrupt_and_start_new" | "interrupt" => Ok(Arc::new(DefaultConcurrencyPolicy)),
-        "queue" => Err(BootstrapError::UnsupportedConcurrencyPolicy(
-            "queue (not implemented; use interrupt/parallel/reject)".to_string(),
-        )),
-        "parallel" => Ok(Arc::new(ParallelConcurrencyPolicy::default())),
-        "reject" | "reject_when_busy" => Ok(Arc::new(RejectWhenBusyConcurrencyPolicy)),
-        other => Err(BootstrapError::UnsupportedConcurrencyPolicy(
-            other.to_string(),
-        )),
-    }
-}
-
-fn truncate_for_log(input: &str, max_chars: usize) -> String {
-    let char_count = input.chars().count();
-    if char_count <= max_chars {
-        return input.to_string();
-    }
-    let mut preview: String = input.chars().take(max_chars).collect();
-    preview.push_str(&format!("... [truncated, total_chars={}]", char_count));
-    preview
-}
-
-fn build_planner(config: &OrchestralConfig) -> Result<Arc<dyn Planner>, BootstrapError> {
-    match config.planner.mode.as_str() {
-        "llm" => {
-            let backend = if let Some(name) = &config.planner.backend {
-                config
-                    .providers
-                    .get_backend(name)
-                    .ok_or_else(|| BootstrapError::BackendNotFound(name.clone()))?
-            } else if let Some(profile_name) = &config.planner.model_profile {
-                let profile = config
-                    .providers
-                    .get_model(profile_name)
-                    .ok_or_else(|| BootstrapError::ModelProfileNotFound(profile_name.clone()))?;
-                let backend_name = profile
-                    .backend
-                    .clone()
-                    .ok_or(BootstrapError::MissingProviderConfig)?;
-                config
-                    .providers
-                    .get_backend(&backend_name)
-                    .ok_or(BootstrapError::BackendNotFound(backend_name))?
-            } else {
-                config
-                    .providers
-                    .get_default_backend()
-                    .ok_or(BootstrapError::MissingProviderConfig)?
-            };
-
-            let profile =
-                if let Some(profile_name) = &config.planner.model_profile {
-                    Some(config.providers.get_model(profile_name).ok_or_else(|| {
-                        BootstrapError::ModelProfileNotFound(profile_name.clone())
-                    })?)
-                } else {
-                    config.providers.get_default_model()
-                };
-
-            let model = config
-                .planner
-                .model
-                .clone()
-                .or_else(|| profile.as_ref().map(|p| p.model.clone()))
-                .unwrap_or_else(|| LlmPlannerConfig::default().model);
-            let temperature_candidate = config
-                .planner
-                .temperature
-                .or_else(|| profile.as_ref().and_then(|p| p.temperature))
-                .unwrap_or_else(|| LlmPlannerConfig::default().temperature);
-            let temperature = profile
-                .as_ref()
-                .map(|p| p.clamp_temperature(temperature_candidate))
-                .unwrap_or(temperature_candidate);
-
-            let invocation = LlmInvocationConfig {
-                model: model.clone(),
-                temperature,
-                max_tokens: LlmInvocationConfig::default().max_tokens,
-                normalize_response: true,
-            };
-
-            let client = DefaultLlmClientFactory::new().build(&backend, &invocation)?;
-            // Planner prompt comes from the built-in template + runtime dynamic injection only.
-            // Do not pull prompt text from model profile/backend config to avoid rule drift.
-            let system_prompt = String::new();
-            let prompt_source = "template";
-
-            tracing::info!(
-                backend_name = %backend.name,
-                backend_kind = %backend.kind,
-                model = %model,
-                temperature = temperature,
-                prompt_source = %prompt_source,
-                planner_mode = "llm",
-                "planner llm config selected"
-            );
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                tracing::debug!(
-                    system_prompt = %truncate_for_log(&system_prompt, MAX_PROMPT_LOG_CHARS),
-                    "planner system prompt"
-                );
-            }
-
-            let planner_cfg = LlmPlannerConfig {
-                model,
-                temperature,
-                max_history: config.planner.max_history,
-                system_prompt,
-                log_full_prompts: config.planner.log_full_prompts,
-                reactor_enabled: config.runtime.reactor.enabled,
-                reactor_default_derivation_policy: config.runtime.reactor.default_derivation_policy,
-            };
-
-            let planner: LlmPlanner<Arc<dyn LlmClient>> = LlmPlanner::new(client, planner_cfg);
-            Ok(Arc::new(planner))
-        }
-        "deterministic" => Ok(Arc::new(DeterministicPlanner)),
-        other => Err(BootstrapError::UnsupportedPlannerMode(other.to_string())),
-    }
-}
-
-fn build_agent_step_executor(
-    config: &OrchestralConfig,
-) -> Result<Option<Arc<dyn orchestral_core::executor::AgentStepExecutor>>, BootstrapError> {
-    match config.planner.mode.as_str() {
-        "llm" => {
-            let profile = if let Some(profile_name) = &config.planner.model_profile {
-                Some(config.providers.get_model(profile_name).ok_or_else(|| {
-                    BootstrapError::ModelProfileNotFound(profile_name.to_string())
-                })?)
-            } else {
-                config.providers.get_default_model()
-            };
-
-            let backend = if let Some(profile) = &profile {
-                if let Some(backend_name) = &profile.backend {
-                    config
-                        .providers
-                        .get_backend(backend_name)
-                        .ok_or_else(|| BootstrapError::BackendNotFound(backend_name.to_string()))?
-                } else {
-                    config
-                        .providers
-                        .get_default_backend()
-                        .ok_or(BootstrapError::MissingProviderConfig)?
-                }
-            } else if let Some(backend_name) = &config.planner.backend {
-                config
-                    .providers
-                    .get_backend(backend_name)
-                    .ok_or_else(|| BootstrapError::BackendNotFound(backend_name.to_string()))?
-            } else if let Some(default_provider) = config.providers.get_default() {
-                config
-                    .providers
-                    .get_backend(&default_provider.name)
-                    .ok_or_else(|| BootstrapError::BackendNotFound(default_provider.name.clone()))?
-            } else {
-                return Err(BootstrapError::MissingProviderConfig);
-            };
-
-            let model = config
-                .planner
-                .model
-                .clone()
-                .or_else(|| profile.as_ref().map(|p| p.model.clone()))
-                .unwrap_or_else(|| LlmPlannerConfig::default().model);
-            let temperature_candidate = config
-                .planner
-                .temperature
-                .or_else(|| profile.as_ref().and_then(|p| p.temperature))
-                .unwrap_or_else(|| LlmPlannerConfig::default().temperature);
-            let temperature = profile
-                .as_ref()
-                .map(|p| p.clamp_temperature(temperature_candidate))
-                .unwrap_or(temperature_candidate);
-
-            let invocation = LlmInvocationConfig {
-                model: model.clone(),
-                temperature,
-                max_tokens: LlmInvocationConfig::default().max_tokens,
-                normalize_response: true,
-            };
-
-            let client = DefaultLlmClientFactory::new().build(&backend, &invocation)?;
-            let executor =
-                LlmAgentExecutor::new(client, LlmAgentExecutorConfig { model, temperature });
-            Ok(Some(Arc::new(executor)))
-        }
-        "deterministic" => Ok(None),
-        other => Err(BootstrapError::UnsupportedPlannerMode(other.to_string())),
-    }
-}
-
-fn build_runtime_component_options(
-    config: &OrchestralConfig,
-) -> serde_json::Map<String, serde_json::Value> {
-    let mut options = serde_json::Map::new();
-    options.insert(
-        "stores".to_string(),
-        json!({
-            "event": store_spec_to_json(&config.stores.event),
-            "task": store_spec_to_json(&config.stores.task),
-            "reference": store_spec_to_json(&config.stores.reference),
-        }),
-    );
-    options.insert(
-        "blobs".to_string(),
-        json!({
-            "mode": config.blobs.mode.clone(),
-            "catalog": {
-                "backend": config.blobs.catalog.backend.clone(),
-                "connection_url": config.blobs.catalog.connection_url.clone(),
-                "table_prefix": config.blobs.catalog.table_prefix.clone(),
-            },
-            "local": {
-                "root_dir": config.blobs.local.root_dir.clone(),
-            },
-            "hybrid": {
-                "write_to": config.blobs.hybrid.write_to.clone(),
-            }
-        }),
-    );
-    options
-}
-
-fn store_spec_to_json(spec: &StoreSpec) -> serde_json::Value {
-    json!({
-        "backend": spec.backend.clone(),
-        "connection_url": spec.connection_url.clone(),
-        "key_prefix": spec.key_prefix.clone(),
-    })
-}
-
-struct DeterministicPlanner;
-
-#[async_trait]
-impl Planner for DeterministicPlanner {
-    async fn plan(
-        &self,
-        intent: &Intent,
-        context: &PlannerContext,
-    ) -> Result<PlannerOutput, PlanError> {
-        let _ = context;
-        Ok(PlannerOutput::DirectResponse(format!(
-            "Deterministic planner cannot execute tasks after RFC0310 transition: {}",
-            intent.content
-        )))
     }
 }
 
