@@ -18,6 +18,7 @@ use tracing::{debug, info, warn};
 
 use crate::planner::{LlmClient, LlmRequest, LlmResponse, ToolDefinition};
 
+mod executor;
 mod finalize;
 mod materialize;
 mod parsing;
@@ -26,6 +27,7 @@ mod progress;
 mod prompt;
 mod types;
 
+pub use self::executor::{LlmAgentExecutor, LlmAgentExecutorConfig};
 use self::finalize::{attempt_forced_finalization, ForcedFinalizationContext};
 use self::materialize::{
     derive_evidence_value, materialize_final_exports, validate_agent_action_success,
@@ -58,32 +60,6 @@ const MAX_BOUND_INPUT_VALUE_CHARS: usize = 1_200;
 const MAX_BOUND_SKILL_VALUE_CHARS: usize = 12_000;
 const MAX_BOUND_INPUT_KEYS: usize = 4;
 const MAX_RECENT_OBSERVATIONS: usize = 4;
-
-#[derive(Debug, Clone)]
-pub struct LlmAgentExecutorConfig {
-    pub model: String,
-    pub temperature: f32,
-}
-
-impl Default for LlmAgentExecutorConfig {
-    fn default() -> Self {
-        Self {
-            model: "anthropic/claude-sonnet-4.5".to_string(),
-            temperature: 0.2,
-        }
-    }
-}
-
-pub struct LlmAgentExecutor<C: LlmClient> {
-    client: C,
-    config: LlmAgentExecutorConfig,
-}
-
-impl<C: LlmClient> LlmAgentExecutor<C> {
-    pub fn new(client: C, config: LlmAgentExecutorConfig) -> Self {
-        Self { client, config }
-    }
-}
 
 #[async_trait]
 impl<C: LlmClient> AgentStepExecutor for LlmAgentExecutor<C> {
