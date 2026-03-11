@@ -11,6 +11,7 @@ use orchestral_core::action::ActionMeta;
 use orchestral_core::config::{load_config, ConfigError, OrchestralConfig};
 use orchestral_core::executor::ActionRegistry;
 
+use super::builtin::JsonStdoutAction;
 use super::factory::{ActionBuildError, ActionFactory};
 use super::providers::{collect_action_registration_specs, ActionRegistrationSpec};
 
@@ -79,6 +80,7 @@ impl ActionRegistryManager {
                 Err(e) => return Err(e.into()),
             }
         }
+        registry.register(Arc::new(JsonStdoutAction::internal()));
 
         let mut current = self.registry.write().await;
         *current = registry;

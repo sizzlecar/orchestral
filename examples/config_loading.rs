@@ -67,6 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let invocation = LlmInvocationConfig {
             model: profile.model.clone(),
             temperature: profile.temperature.unwrap_or(0.2),
+            max_tokens: 4096,
             normalize_response: true,
         };
 

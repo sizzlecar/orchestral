@@ -32,3 +32,4 @@ logs/
 .claude/
 __pycache__/
 *.py
+.orchestral

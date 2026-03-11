@@ -9,12 +9,18 @@
 //! - Repair common LLM planning errors
 //! - Produce an executable DAG for the executor
 
-use serde_json::Value;
+mod agent;
+mod implicit;
+mod validation;
+
 use thiserror::Error;
 
 use crate::action::ActionMeta;
 use crate::executor::ExecutionDag;
-use crate::types::{Plan, StepId, StepKind};
+use crate::recipe::{RecipeCompileError, RecipeCompiler, RecipeTemplate};
+use crate::types::Plan;
+
+use self::implicit::{fix_control_flow_dependencies, output_keys_from_schema, ActionContract};
 
 /// Validation errors
 #[derive(Debug, Error)]
@@ -57,6 +63,9 @@ pub enum FixError {
 /// Normalization errors
 #[derive(Debug, Error)]
 pub enum NormalizeError {
+    #[error("recipe compile failed: {0}")]
+    RecipeCompile(#[from] RecipeCompileError),
+
     #[error("Validation failed: {0}")]
     Validation(#[from] ValidationError),
 
@@ -93,6 +102,7 @@ pub struct NormalizedPlan {
 pub struct PlanNormalizer {
     validators: Vec<Box<dyn PlanValidator>>,
     fixers: Vec<Box<dyn PlanFixer>>,
+    recipe_compiler: RecipeCompiler,
     /// Known action contracts keyed by action name.
     known_actions: std::collections::HashMap<String, ActionContract>,
 }
@@ -103,6 +113,7 @@ impl PlanNormalizer {
         Self {
             validators: Vec::new(),
             fixers: Vec::new(),
+            recipe_compiler: RecipeCompiler::new(),
             known_actions: std::collections::HashMap::new(),
         }
     }
@@ -119,18 +130,28 @@ impl PlanNormalizer {
 
     /// Register a known action
     pub fn register_action(&mut self, name: impl Into<String>) {
-        self.known_actions.entry(name.into()).or_default();
+        let name = name.into();
+        self.recipe_compiler.register_action(name.clone());
+        self.known_actions.entry(name).or_default();
     }
 
     /// Register a known action with metadata-derived contract.
     pub fn register_action_meta(&mut self, meta: &ActionMeta) {
+        self.recipe_compiler.register_action_meta(meta);
         let output_keys = output_keys_from_schema(&meta.output_schema);
         self.known_actions
             .insert(meta.name.clone(), ActionContract { output_keys });
     }
 
+    /// Register a reusable recipe template.
+    pub fn register_recipe_template(&mut self, template: RecipeTemplate) {
+        self.recipe_compiler.register_template(template);
+    }
+
     /// Normalize a plan
     pub fn normalize(&self, mut plan: Plan) -> Result<NormalizedPlan, NormalizeError> {
+        self.recipe_compiler.compile(&mut plan)?;
+
         // Step 1: Run fixers (they may fix issues before validation)
         for fixer in &self.fixers {
             fixer.fix(&mut plan)?;
@@ -156,403 +177,6 @@ impl PlanNormalizer {
 
         Ok(NormalizedPlan { plan, dag })
     }
-
-    /// Basic built-in validations
-    fn validate_basic(&self, plan: &Plan) -> Result<(), ValidationError> {
-        // Check for empty plan
-        if plan.steps.is_empty() {
-            return Err(ValidationError::EmptyPlan);
-        }
-
-        // Check for duplicate step IDs
-        let mut seen_ids = std::collections::HashSet::new();
-        for step in &plan.steps {
-            if !seen_ids.insert(&step.id) {
-                return Err(ValidationError::DuplicateStepId(step.id.to_string()));
-            }
-        }
-
-        // Check that all dependencies exist
-        let step_ids: std::collections::HashSet<_> =
-            plan.steps.iter().map(|s| s.id.as_str()).collect();
-        for step in &plan.steps {
-            for dep in &step.depends_on {
-                if !step_ids.contains(dep.as_str()) {
-                    return Err(ValidationError::MissingDependency(
-                        step.id.to_string(),
-                        dep.to_string(),
-                    ));
-                }
-            }
-
-            for binding in &step.io_bindings {
-                let (source_step, source_key) = match parse_step_binding_source(&binding.from) {
-                    Some(parts) => parts,
-                    None => continue,
-                };
-
-                if !step_ids.contains(source_step.as_str()) {
-                    return Err(ValidationError::InvalidIoBinding(
-                        step.id.to_string(),
-                        format!("unknown source step '{}'", source_step),
-                    ));
-                }
-                if source_step.as_str() != step.id.as_str()
-                    && !step
-                        .depends_on
-                        .iter()
-                        .any(|dep| dep.as_str() == source_step.as_str())
-                {
-                    return Err(ValidationError::IoBindingMissingDependency(
-                        step.id.to_string(),
-                        source_step,
-                    ));
-                }
-
-                if let Some(source) = plan.get_step(&source_step) {
-                    if !source.exports.is_empty() && !source.exports.iter().any(|k| k == source_key)
-                    {
-                        return Err(ValidationError::InvalidIoBinding(
-                            step.id.to_string(),
-                            format!(
-                                "source key '{}' not declared in step '{}' exports",
-                                source_key, source.id
-                            ),
-                        ));
-                    }
-                }
-            }
-
-            validate_agent_params(step)?;
-        }
-
-        // Check for unknown actions (if we have a registry)
-        if !self.known_actions.is_empty() {
-            for step in &plan.steps {
-                if step.kind != StepKind::Action {
-                    continue;
-                }
-                if !self.known_actions.contains_key(&step.action) {
-                    return Err(ValidationError::UnknownAction(step.action.clone()));
-                }
-            }
-        }
-
-        // Check for cycles using DFS
-        self.detect_cycles(plan)?;
-
-        Ok(())
-    }
-
-    /// Detect cycles in the dependency graph
-    fn detect_cycles(&self, plan: &Plan) -> Result<(), ValidationError> {
-        use std::collections::{HashMap, HashSet};
-
-        // Build adjacency list
-        let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
-        for step in &plan.steps {
-            adj.entry(step.id.as_str()).or_default();
-            for dep in &step.depends_on {
-                adj.entry(dep.as_str()).or_default().push(step.id.as_str());
-            }
-        }
-
-        // DFS for cycle detection
-        let mut visited = HashSet::new();
-        let mut rec_stack = HashSet::new();
-
-        fn dfs<'a>(
-            node: &'a str,
-            adj: &HashMap<&'a str, Vec<&'a str>>,
-            visited: &mut HashSet<&'a str>,
-            rec_stack: &mut HashSet<&'a str>,
-        ) -> Option<&'a str> {
-            visited.insert(node);
-            rec_stack.insert(node);
-
-            if let Some(neighbors) = adj.get(node) {
-                for &neighbor in neighbors {
-                    if !visited.contains(neighbor) {
-                        if let Some(cycle_node) = dfs(neighbor, adj, visited, rec_stack) {
-                            return Some(cycle_node);
-                        }
-                    } else if rec_stack.contains(neighbor) {
-                        return Some(neighbor);
-                    }
-                }
-            }
-
-            rec_stack.remove(node);
-            None
-        }
-
-        for step in &plan.steps {
-            if !visited.contains(step.id.as_str()) {
-                if let Some(cycle_node) = dfs(step.id.as_str(), &adj, &mut visited, &mut rec_stack)
-                {
-                    return Err(ValidationError::CycleDetected(cycle_node.to_string()));
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Build an execution DAG from a validated plan
-    fn build_dag(&self, plan: &Plan) -> Result<ExecutionDag, NormalizeError> {
-        ExecutionDag::from_plan(plan).map_err(NormalizeError::DagBuild)
-    }
-}
-
-#[derive(Debug, Default, Clone)]
-struct ActionContract {
-    output_keys: Vec<String>,
-}
-
-impl PlanNormalizer {
-    fn apply_implicit_contracts(&self, plan: &mut Plan) {
-        for step in &mut plan.steps {
-            let original_kind = step.kind.clone();
-            let original_depends_on = step.depends_on.clone();
-            let original_exports = step.exports.clone();
-            let original_params = step.params.clone();
-            infer_special_step_kind(step);
-            apply_agent_defaults(step);
-            derive_depends_on_from_bindings(step);
-
-            if step.kind == StepKind::Agent {
-                if let Some(keys) = agent_output_keys(step) {
-                    step.exports = keys;
-                }
-            }
-
-            if let Some(contract) = self.known_actions.get(&step.action) {
-                if !contract.output_keys.is_empty() {
-                    step.exports = contract.output_keys.clone();
-                }
-            }
-
-            if step.kind != original_kind {
-                tracing::debug!(
-                    step_id = %step.id,
-                    action = %step.action,
-                    from_kind = ?original_kind,
-                    to_kind = ?step.kind,
-                    "normalizer inferred step kind"
-                );
-            }
-            if step.depends_on != original_depends_on {
-                tracing::debug!(
-                    step_id = %step.id,
-                    action = %step.action,
-                    depends_on = ?step.depends_on,
-                    "normalizer derived depends_on from io_bindings"
-                );
-            }
-            if step.exports != original_exports {
-                tracing::debug!(
-                    step_id = %step.id,
-                    action = %step.action,
-                    exports = ?step.exports,
-                    "normalizer populated exports from action output schema"
-                );
-            }
-            if step.params != original_params {
-                tracing::debug!(
-                    step_id = %step.id,
-                    action = %step.action,
-                    params = ?step.params,
-                    "normalizer updated step params"
-                );
-            }
-        }
-    }
-}
-
-fn fix_control_flow_dependencies(plan: &mut Plan) {
-    let step_ids: Vec<StepId> = plan.steps.iter().map(|s| s.id.clone()).collect();
-    for i in 0..plan.steps.len() {
-        let step = &plan.steps[i];
-        let is_control = matches!(
-            step.kind,
-            StepKind::Replan | StepKind::WaitUser | StepKind::WaitEvent
-        );
-        if !is_control || !step.depends_on.is_empty() {
-            continue;
-        }
-        let preceding: Vec<StepId> = step_ids[..i].to_vec();
-        if !preceding.is_empty() {
-            tracing::debug!(
-                step_id = %plan.steps[i].id,
-                kind = ?plan.steps[i].kind,
-                deps = ?preceding,
-                "normalizer auto-assigned depends_on for control-flow step"
-            );
-            plan.steps[i].depends_on = preceding;
-        }
-    }
-}
-
-fn infer_special_step_kind(step: &mut crate::types::Step) {
-    if step.kind != StepKind::Action {
-        return;
-    }
-
-    match step.action.as_str() {
-        "wait_user" => step.kind = StepKind::WaitUser,
-        "wait_event" => step.kind = StepKind::WaitEvent,
-        "agent" => step.kind = StepKind::Agent,
-        _ => {}
-    }
-}
-
-fn apply_agent_defaults(step: &mut crate::types::Step) {
-    if step.kind != StepKind::Agent {
-        return;
-    }
-
-    if step.params.is_null() {
-        step.params = Value::Object(serde_json::Map::new());
-    }
-
-    if let Some(params) = step.params.as_object_mut() {
-        params
-            .entry("max_iterations".to_string())
-            .or_insert(Value::from(5_u64));
-    }
-}
-
-fn validate_agent_params(step: &crate::types::Step) -> Result<(), ValidationError> {
-    if step.kind != StepKind::Agent {
-        return Ok(());
-    }
-
-    let Some(params) = step.params.as_object() else {
-        return Err(ValidationError::InvalidAgentParams(
-            step.id.to_string(),
-            "params must be an object".to_string(),
-        ));
-    };
-
-    let goal = params.get("goal").and_then(|v| v.as_str()).map(str::trim);
-    if goal.is_none() || goal == Some("") {
-        return Err(ValidationError::InvalidAgentParams(
-            step.id.to_string(),
-            "goal must be a non-empty string".to_string(),
-        ));
-    }
-
-    let Some(allowed_actions) = params.get("allowed_actions").and_then(|v| v.as_array()) else {
-        return Err(ValidationError::InvalidAgentParams(
-            step.id.to_string(),
-            "allowed_actions must be a non-empty string array".to_string(),
-        ));
-    };
-    if allowed_actions.is_empty()
-        || allowed_actions.iter().any(|v| {
-            v.as_str()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .is_none()
-        })
-    {
-        return Err(ValidationError::InvalidAgentParams(
-            step.id.to_string(),
-            "allowed_actions must be a non-empty string array".to_string(),
-        ));
-    }
-
-    let max_iterations = params.get("max_iterations").and_then(|v| v.as_u64());
-    if !(Some(1)..=Some(10)).contains(&max_iterations) {
-        return Err(ValidationError::InvalidAgentParams(
-            step.id.to_string(),
-            "max_iterations must be an integer between 1 and 10".to_string(),
-        ));
-    }
-
-    let Some(output_keys) = params.get("output_keys").and_then(|v| v.as_array()) else {
-        return Err(ValidationError::InvalidAgentParams(
-            step.id.to_string(),
-            "output_keys must be a non-empty string array".to_string(),
-        ));
-    };
-    if output_keys.is_empty()
-        || output_keys.iter().any(|v| {
-            v.as_str()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .is_none()
-        })
-    {
-        return Err(ValidationError::InvalidAgentParams(
-            step.id.to_string(),
-            "output_keys must be a non-empty string array".to_string(),
-        ));
-    }
-
-    Ok(())
-}
-
-fn agent_output_keys(step: &crate::types::Step) -> Option<Vec<String>> {
-    if step.kind != StepKind::Agent {
-        return None;
-    }
-    step.params
-        .get("output_keys")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect::<Vec<_>>()
-        })
-}
-
-fn derive_depends_on_from_bindings(step: &mut crate::types::Step) {
-    for binding in &step.io_bindings {
-        if let Some((source_step, _)) = parse_step_binding_source(&binding.from) {
-            if source_step.as_str() != step.id.as_str()
-                && !step
-                    .depends_on
-                    .iter()
-                    .any(|dep| dep.as_str() == source_step.as_str())
-            {
-                step.depends_on.push(source_step.into());
-            }
-        }
-    }
-}
-
-fn parse_step_binding_source(value: &str) -> Option<(String, &str)> {
-    let (source_step, source_key) = value.split_once('.')?;
-    if source_step.is_empty() || source_key.is_empty() {
-        return None;
-    }
-    Some((source_step.to_string(), source_key))
-}
-
-fn output_keys_from_schema(schema: &serde_json::Value) -> Vec<String> {
-    let Some(schema_obj) = schema.as_object() else {
-        return Vec::new();
-    };
-
-    let required: Vec<String> = schema_obj
-        .get("required")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|item| item.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
-    if !required.is_empty() {
-        return required;
-    }
-
-    schema_obj
-        .get("properties")
-        .and_then(|v| v.as_object())
-        .map(|props| props.keys().cloned().collect())
-        .unwrap_or_default()
 }
 
 impl Default for PlanNormalizer {
@@ -564,7 +188,7 @@ impl Default for PlanNormalizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Step, StepIoBinding};
+    use crate::types::{Step, StepId, StepIoBinding, StepKind};
     use serde_json::json;
 
     #[test]
@@ -708,5 +332,256 @@ mod tests {
             step.exports,
             vec!["summary".to_string(), "next_step".to_string()]
         );
+    }
+
+    #[test]
+    fn test_normalizer_applies_leaf_agent_defaults() {
+        let normalizer = PlanNormalizer::new();
+        let plan = Plan::new(
+            "leaf-defaults",
+            vec![Step::leaf_agent("s1").with_params(json!({
+                "mode": "leaf",
+                "goal": "derive a patch",
+                "output_keys": ["change_spec"]
+            }))],
+        );
+
+        let normalized = normalizer.normalize(plan).expect("normalize");
+        let step = normalized.plan.get_step("s1").expect("s1");
+        assert_eq!(step.kind, StepKind::Agent);
+        assert_eq!(
+            step.params.get("allowed_actions"),
+            Some(&json!(["json_stdout"]))
+        );
+        assert_eq!(step.params.get("max_iterations"), Some(&json!(1)));
+        assert_eq!(step.params.get("result_slot"), Some(&json!("leaf_result")));
+        assert_eq!(
+            step.params
+                .pointer("/output_rules/change_spec/candidates/0/slot"),
+            Some(&json!("leaf_result"))
+        );
+        assert!(step
+            .params
+            .get("goal")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .contains("Use only the provided bound inputs."));
+    }
+
+    #[test]
+    fn test_normalizer_converts_legacy_output_rules_array_for_leaf_agents() {
+        let normalizer = PlanNormalizer::new();
+        let plan = Plan::new(
+            "legacy-output-rules",
+            vec![Step::leaf_agent("s1").with_params(json!({
+                "mode": "leaf",
+                "goal": "derive fill specification",
+                "output_keys": ["fill_specification"],
+                "output_rules": [
+                    {
+                        "slot": "fill_specification",
+                        "candidates": [
+                            {
+                                "slot": "leaf_result",
+                                "path": "fill_specification",
+                                "requires": { "action": "json_stdout" }
+                            }
+                        ]
+                    }
+                ]
+            }))],
+        );
+
+        let normalized = normalizer.normalize(plan).expect("normalize");
+        let step = normalized.plan.get_step("s1").expect("s1");
+        assert_eq!(
+            step.params
+                .pointer("/output_rules/fill_specification/candidates/0/path"),
+            Some(&json!("fill_specification"))
+        );
+    }
+
+    #[test]
+    fn test_normalizer_repairs_malformed_leaf_output_rules_entries() {
+        let normalizer = PlanNormalizer::new();
+        let plan = Plan::new(
+            "malformed-leaf-output-rules",
+            vec![Step::leaf_agent("s1").with_params(json!({
+                "mode": "leaf",
+                "goal": "derive fill specification",
+                "output_keys": ["fill_specification", "excel_path"],
+                "output_rules": {
+                    "fill_specification": "fill_specification",
+                    "excel_path": {
+                        "candidates": [
+                            {
+                                "path": "excel_path"
+                            }
+                        ]
+                    }
+                }
+            }))],
+        );
+
+        let normalized = normalizer.normalize(plan).expect("normalize");
+        let step = normalized.plan.get_step("s1").expect("s1");
+        assert_eq!(
+            step.params
+                .pointer("/output_rules/fill_specification/candidates/0/slot"),
+            Some(&json!("leaf_result"))
+        );
+        assert_eq!(
+            step.params
+                .pointer("/output_rules/excel_path/candidates/0/slot"),
+            Some(&json!("leaf_result"))
+        );
+    }
+
+    #[test]
+    fn test_normalizer_compiles_recipe_steps_before_validation() {
+        let mut normalizer = PlanNormalizer::new();
+        normalizer.register_action("inspect_doc");
+        normalizer.register_action("apply_patch");
+        normalizer.register_action("finalize");
+
+        let plan = Plan::new(
+            "recipe-flow",
+            vec![
+                Step::recipe("r1").with_params(json!({
+                    "stages": [
+                        {
+                            "id": "inspect",
+                            "kind": "action",
+                            "action": "inspect_doc",
+                            "exports": ["view"]
+                        },
+                        {
+                            "id": "derive",
+                            "kind": "agent",
+                            "params": {
+                                "mode": "leaf",
+                                "goal": "derive a patch",
+                                "output_keys": ["change_spec"]
+                            }
+                        },
+                        {
+                            "id": "apply",
+                            "kind": "action",
+                            "action": "apply_patch",
+                            "io_bindings": [
+                                {"from": "derive.change_spec", "to": "patch", "required": true}
+                            ],
+                            "exports": ["updated_path"]
+                        }
+                    ],
+                    "export_from": {
+                        "updated_path": "apply.updated_path"
+                    }
+                })),
+                Step::action("s2", "finalize")
+                    .with_io_bindings(vec![StepIoBinding::required("r1.updated_path", "path")]),
+            ],
+        );
+
+        let normalized = normalizer.normalize(plan).expect("normalize");
+        assert!(normalized.plan.get_step("r1").is_none());
+        let apply = normalized.plan.get_step("r1__apply").expect("apply");
+        assert_eq!(apply.depends_on, vec![StepId::from("r1__derive")]);
+        let finalize = normalized.plan.get_step("s2").expect("s2");
+        assert_eq!(finalize.io_bindings[0].from, "r1__apply.updated_path");
+    }
+
+    #[test]
+    fn test_normalizer_repairs_leaf_agent_with_file_read_actions_to_explore() {
+        let normalizer = PlanNormalizer::new();
+        let plan = Plan::new(
+            "repair-leaf-agent",
+            vec![Step::agent("s1").with_params(json!({
+                "mode": "leaf",
+                "goal": "derive a patch",
+                "allowed_actions": ["file_read", "json_stdout"],
+                "max_iterations": 3,
+                "output_keys": ["change_spec"]
+            }))],
+        );
+
+        let normalized = normalizer.normalize(plan).expect("normalize");
+        let step = normalized.plan.get_step("s1").expect("s1");
+        assert_eq!(step.params.get("mode"), Some(&json!("explore")));
+        assert_eq!(step.params.get("max_iterations"), Some(&json!(3)));
+        assert!(step.params.get("result_slot").is_none());
+    }
+
+    #[test]
+    fn test_normalizer_rejects_leaf_agent_with_shell_actions() {
+        let normalizer = PlanNormalizer::new();
+        let plan = Plan::new(
+            "invalid-leaf-agent",
+            vec![Step::agent("s1").with_params(json!({
+                "mode": "leaf",
+                "goal": "derive a patch",
+                "allowed_actions": ["shell"],
+                "max_iterations": 1,
+                "result_slot": "leaf_result",
+                "output_keys": ["change_spec"]
+            }))],
+        );
+
+        let err = normalizer
+            .normalize(plan)
+            .expect_err("expected validation error");
+        match err {
+            NormalizeError::Validation(ValidationError::InvalidAgentParams(step_id, reason)) => {
+                assert_eq!(step_id, "s1");
+                assert!(reason.contains("json_stdout"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_normalizer_rejects_explore_agent_with_side_effect_sensitive_outputs() {
+        let normalizer = PlanNormalizer::new();
+        let plan = Plan::new(
+            "invalid-explore-agent",
+            vec![Step::agent("s1").with_params(json!({
+                "goal": "inspect and update workbook",
+                "allowed_actions": ["shell", "file_write"],
+                "max_iterations": 5,
+                "output_keys": ["updated_file_path", "summary"],
+                "output_rules": {
+                    "updated_file_path": {
+                        "candidates": [
+                            {
+                                "slot": "fill_result",
+                                "path": "updated_file_path",
+                                "requires": {
+                                    "action": "file_write"
+                                }
+                            }
+                        ]
+                    },
+                    "summary": {
+                        "candidates": [
+                            {
+                                "slot": "fill_result",
+                                "path": "summary"
+                            }
+                        ]
+                    }
+                }
+            }))],
+        );
+
+        let err = normalizer
+            .normalize(plan)
+            .expect_err("expected validation error");
+        match err {
+            NormalizeError::Validation(ValidationError::InvalidAgentParams(step_id, reason)) => {
+                assert_eq!(step_id, "s1");
+                assert!(reason.contains("side-effect-sensitive outputs"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }

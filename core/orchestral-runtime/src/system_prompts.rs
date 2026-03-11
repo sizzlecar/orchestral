@@ -36,6 +36,7 @@ pub fn render_planner_prompt(
     skill_knowledge: &str,
     conditional_rules: &str,
 ) -> String {
+    let _ = action_catalog;
     render_template(
         planner_template(),
         &[
@@ -65,7 +66,7 @@ mod tests {
         assert!(rendered.contains("env"));
         assert!(rendered.contains("skill block"));
         assert!(rendered.contains("- only for shell"));
-        assert!(rendered.contains("- name: shell"));
+        assert!(!rendered.contains("Action Catalog"));
         assert!(!rendered.contains("{{BASE_PROMPT}}"));
     }
 }

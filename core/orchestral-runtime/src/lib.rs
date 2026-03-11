@@ -15,6 +15,7 @@ mod interpreter;
 mod orchestrator;
 pub mod planner;
 pub mod skill;
+#[cfg(test)]
 mod system_prompts;
 mod thread;
 mod thread_runtime;

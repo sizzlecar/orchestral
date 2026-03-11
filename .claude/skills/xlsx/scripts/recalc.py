@@ -93,6 +93,16 @@ def recalc(filename, timeout=30):
 
     if result.returncode != 0 and result.returncode != 124:  
         error_msg = result.stderr or "Unknown error during recalculation"
+        if (
+            result.returncode in (134, 139)
+            or "Abort trap" in error_msg
+            or "Segmentation fault" in error_msg
+            or "Bus error" in error_msg
+        ):
+            return {
+                "error": "LibreOffice crashed during recalculation",
+                "details": error_msg.strip(),
+            }
         if "Module1" in error_msg or "RecalculateAndSave" not in error_msg:
             return {"error": "LibreOffice macro not configured properly"}
         return {"error": error_msg}

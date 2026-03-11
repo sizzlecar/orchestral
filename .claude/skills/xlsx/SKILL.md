@@ -18,6 +18,8 @@ license: Proprietary. LICENSE.txt has complete terms
 - Study and EXACTLY match existing format, style, and conventions when modifying files
 - Never impose standardized formatting on files with established patterns
 - Existing template conventions ALWAYS override these guidelines
+- For fill/complete tasks, treat placeholder values such as `N/A`, `NA`, `TBD`, `-`, or `待填写` as missing data candidates unless surrounding context clearly marks them as intentional final values
+- In tabular forms, if one row has multiple adjacent placeholder cells under user-entered headers, fill all clearly required fields rather than only one notes/remarks cell
 
 ## Financial models
 
@@ -134,10 +136,12 @@ This applies to ALL calculations - totals, percentages, ratios, differences, etc
 2. **Create/Load**: Create new workbook or load existing file
 3. **Modify**: Add/edit data, formulas, and formatting
 4. **Save**: Write to file
-5. **Recalculate formulas (MANDATORY IF USING FORMULAS)**: Use the scripts/recalc.py script
+5. **Recalculate formulas (MANDATORY IF USING OR CHANGING FORMULAS)**: Use the scripts/recalc.py script
    ```bash
    python scripts/recalc.py output.xlsx
    ```
+   - For plain template filling or value-only edits, do **not** run `scripts/recalc.py` unless you changed formulas or must refresh dependent formula outputs as part of verification.
+   - For mutating scripts, prefer printing one JSON object with the updated path and changed-cell count so downstream verification can reason about the result deterministically.
 6. **Verify and fix any errors**: 
    - The script returns JSON with error details
    - If `status` is `errors_found`, check `error_summary` for specific error types and locations

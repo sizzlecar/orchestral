@@ -22,6 +22,9 @@ use std::collections::HashMap;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::recipe::RecipeTemplate;
+use crate::types::DerivationPolicy;
+
 /// Top-level configuration schema for Orchestral.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OrchestralConfig {
@@ -51,6 +54,8 @@ pub struct OrchestralConfig {
     #[serde(default)]
     pub actions: ActionsConfig,
     #[serde(default)]
+    pub recipes: RecipesConfig,
+    #[serde(default)]
     #[serde(alias = "plugins")]
     pub extensions: ExtensionsConfig,
 }
@@ -74,6 +79,7 @@ impl Default for OrchestralConfig {
             observability: ObservabilityConfig::default(),
             providers: ProvidersConfig::default(),
             actions: ActionsConfig::default(),
+            recipes: RecipesConfig::default(),
             extensions: ExtensionsConfig::default(),
         }
     }
@@ -86,6 +92,10 @@ impl OrchestralConfig {
 
     pub fn actions(&self) -> &ActionsConfig {
         &self.actions
+    }
+
+    pub fn recipes(&self) -> &RecipesConfig {
+        &self.recipes
     }
 
     pub fn extensions(&self) -> &ExtensionsConfig {
@@ -131,6 +141,8 @@ pub struct RuntimeConfig {
     pub concurrency_policy: String,
     #[serde(default = "default_true")]
     pub strict_exports: bool,
+    #[serde(default)]
+    pub reactor: ReactorConfig,
 }
 
 impl Default for RuntimeConfig {
@@ -140,6 +152,27 @@ impl Default for RuntimeConfig {
             auto_cleanup: true,
             concurrency_policy: default_concurrency_policy(),
             strict_exports: true,
+            reactor: ReactorConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReactorConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub default_derivation_policy: DerivationPolicy,
+    #[serde(default = "default_reactor_stage_loop_limit")]
+    pub stage_loop_limit: usize,
+}
+
+impl Default for ReactorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_derivation_policy: DerivationPolicy::Strict,
+            stage_loop_limit: default_reactor_stage_loop_limit(),
         }
     }
 }
@@ -154,6 +187,10 @@ fn default_true() -> bool {
 
 fn default_concurrency_policy() -> String {
     "interrupt_and_start_new".to_string()
+}
+
+fn default_reactor_stage_loop_limit() -> usize {
+    10
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -500,6 +537,12 @@ pub type LocalFilesConfig = LocalBlobsConfig;
 pub type S3FilesConfig = S3BlobsConfig;
 pub type HybridFilesConfig = HybridBlobsConfig;
 pub type FileCatalogConfig = BlobCatalogConfig;
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct RecipesConfig {
+    #[serde(default)]
+    pub templates: Vec<RecipeTemplate>,
+}
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ExtensionsConfig {

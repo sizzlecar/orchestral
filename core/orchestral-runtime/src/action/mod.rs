@@ -9,12 +9,15 @@
 //! Configuration types are provided by `orchestral-config`.
 
 mod builtin;
+mod document;
 mod external;
 mod factory;
 mod loader;
 mod mcp;
 mod providers;
 mod shell_sandbox;
+mod spreadsheet;
+mod structured;
 
 // Re-export core action traits
 pub use orchestral_core::action::{Action, ActionContext, ActionInput, ActionMeta, ActionResult};
@@ -22,7 +25,9 @@ pub use orchestral_core::action::{Action, ActionContext, ActionInput, ActionMeta
 pub use orchestral_core::config::{ActionInterfaceSpec, ActionSpec, ActionsConfig};
 
 pub use builtin::*;
+pub use document::*;
 pub use external::*;
 pub use factory::{ActionBuildError, ActionFactory, DefaultActionFactory};
 pub use loader::{ActionConfigError, ActionRegistryManager, ActionWatcher};
 pub use mcp::build_mcp_action;
+pub use structured::*;

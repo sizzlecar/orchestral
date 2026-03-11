@@ -1,6 +1,8 @@
 mod channel;
 mod cli;
+mod envfile;
 mod runtime;
+mod scenario;
 mod theme;
 mod tui;
 

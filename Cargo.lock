@@ -3359,6 +3359,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "liblzma"
+version = "0.4.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6033b77c21d1f56deeae8014eb9fbe7bdf1765185a6c508b5ca82eeaed7f899"
+dependencies = [
+ "liblzma-sys",
+]
+
+[[package]]
+name = "liblzma-sys"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f2db66f3268487b5033077f266da6777d057949b8f93c8ad82e441df25e6186"
+dependencies = [
+ "cc",
+ "libc",
+ "pkg-config",
+]
+
+[[package]]
 name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4093,7 +4113,9 @@ dependencies = [
  "orchestral-core",
  "orchestral-runtime",
  "ratatui",
+ "serde",
  "serde_json",
+ "serde_yaml",
  "textwrap",
  "thiserror 1.0.69",
  "tokio",
@@ -4224,6 +4246,7 @@ dependencies = [
  "llm",
  "notify",
  "orchestral-core",
+ "quick-xml 0.38.4",
  "reqwest",
  "serde",
  "serde_json",
@@ -4232,9 +4255,11 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tokio-util",
+ "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zip 4.6.1",
 ]
 
 [[package]]
@@ -8495,12 +8520,25 @@ version = "4.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "caa8cd6af31c3b31c6631b8f483848b91589021b28fffe50adada48d4f4d2ed1"
 dependencies = [
+ "aes",
  "arbitrary",
+ "bzip2",
+ "constant_time_eq 0.3.1",
  "crc32fast",
+ "deflate64",
  "flate2",
+ "getrandom 0.3.4",
+ "hmac",
  "indexmap",
+ "liblzma",
  "memchr",
+ "pbkdf2",
+ "ppmd-rust",
+ "sha1",
+ "time",
+ "zeroize",
  "zopfli",
+ "zstd",
 ]
 
 [[package]]

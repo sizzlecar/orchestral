@@ -1,0 +1,23 @@
+version: 1
+name: excel-fill-smoke
+config: ../orchestral.cli.yaml
+timeout_secs: 300
+workspace:
+  copies:
+    - from: ../../docs/绩效考核-2025Q4_副本.xlsx
+      to: docs/绩效考核-2025Q4_运行副本.xlsx
+
+turns:
+  - name: fill-excel
+    input: >
+      docs 目前下有一个excel 你看下内容 把需要填的都填了
+    expect:
+      require_execution_end: true
+      max_approvals: 0
+      max_errors: 0
+    verify:
+      - name: workbook-fill-quality
+        command: ../../.claude/skills/xlsx/.venv/bin/python3
+        args:
+          - validators/verify_perf_review_fill.py
+          - docs/绩效考核-2025Q4_运行副本.xlsx

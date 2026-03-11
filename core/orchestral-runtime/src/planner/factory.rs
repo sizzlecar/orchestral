@@ -21,6 +21,7 @@ use super::llm::{
 pub struct LlmInvocationConfig {
     pub model: String,
     pub temperature: f32,
+    pub max_tokens: u32,
     pub normalize_response: bool,
 }
 
@@ -29,6 +30,7 @@ impl Default for LlmInvocationConfig {
         Self {
             model: "anthropic/claude-sonnet-4.5".to_string(),
             temperature: 0.2,
+            max_tokens: 4096,
             normalize_response: true,
         }
     }
@@ -93,6 +95,9 @@ pub fn build_client_from_backend(
         base_url: backend.endpoint.clone(),
         model: invocation.model.clone(),
         temperature: invocation.temperature,
+        max_tokens: backend
+            .get_config::<u32>("max_tokens")
+            .unwrap_or(invocation.max_tokens),
         normalize_response: invocation.normalize_response,
         timeout_secs: backend.get_config::<u64>("timeout_secs").unwrap_or(60),
     };
@@ -154,6 +159,7 @@ struct GranietLlmClient {
     base_url: Option<String>,
     model: String,
     temperature: f32,
+    max_tokens: u32,
     normalize_response: bool,
     timeout_secs: u64,
 }
@@ -182,6 +188,7 @@ impl LlmClient for GranietLlmClient {
             .backend(self.backend.clone())
             .model(model)
             .temperature(temperature)
+            .max_tokens(self.max_tokens)
             .normalize_response(self.normalize_response);
         if let Some(endpoint) = &self.base_url {
             builder = builder.base_url(endpoint.clone());
@@ -235,6 +242,7 @@ impl LlmClient for GranietLlmClient {
             .backend(self.backend.clone())
             .model(model)
             .temperature(temperature)
+            .max_tokens(self.max_tokens)
             .normalize_response(self.normalize_response);
         for t in tools {
             builder = builder.function(
@@ -310,6 +318,7 @@ impl LlmClient for GranietLlmClient {
             .backend(self.backend.clone())
             .model(model)
             .temperature(temperature)
+            .max_tokens(self.max_tokens)
             .normalize_response(self.normalize_response);
         if let Some(endpoint) = &self.base_url {
             builder = builder.base_url(endpoint.clone());

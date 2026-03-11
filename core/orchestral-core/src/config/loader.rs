@@ -62,6 +62,12 @@ fn validate_config(config: &OrchestralConfig) -> Result<(), ConfigError> {
         ));
     }
 
+    if config.runtime.reactor.stage_loop_limit == 0 {
+        return Err(ConfigError::Invalid(
+            "runtime.reactor.stage_loop_limit must be > 0".to_string(),
+        ));
+    }
+
     if config.context.max_tokens == 0 {
         return Err(ConfigError::Invalid(
             "context.max_tokens must be > 0".to_string(),
@@ -70,6 +76,7 @@ fn validate_config(config: &OrchestralConfig) -> Result<(), ConfigError> {
 
     validate_providers(&config.providers)?;
     validate_actions(&config.actions)?;
+    validate_recipes(config)?;
     validate_extensions(config)?;
     validate_blobs(config)?;
 
@@ -222,6 +229,45 @@ fn validate_extensions(config: &OrchestralConfig) -> Result<(), ConfigError> {
                 "extensions.mcp.servers[{}] must set command or url",
                 spec.name
             )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_recipes(config: &OrchestralConfig) -> Result<(), ConfigError> {
+    let mut seen_names = std::collections::HashSet::new();
+    for template in &config.recipes.templates {
+        if template.name.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "recipes.templates[].name must not be empty".to_string(),
+            ));
+        }
+        if !seen_names.insert(template.name.to_ascii_lowercase()) {
+            return Err(ConfigError::Invalid(format!(
+                "recipes.templates contains duplicate template '{}'",
+                template.name
+            )));
+        }
+        if template.stages.is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "recipes.templates[{}].stages must not be empty",
+                template.name
+            )));
+        }
+        let mut stage_ids = std::collections::HashSet::new();
+        for stage in &template.stages {
+            if stage.id.as_str().trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "recipes.templates[{}].stages[].id must not be empty",
+                    template.name
+                )));
+            }
+            if !stage_ids.insert(stage.id.to_string()) {
+                return Err(ConfigError::Invalid(format!(
+                    "recipes.templates[{}] contains duplicate stage id '{}'",
+                    template.name, stage.id
+                )));
+            }
         }
     }
     Ok(())
@@ -436,5 +482,56 @@ plugins:
         }];
 
         assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_config_accepts_recipe_templates() {
+        let yaml = r#"
+version: 1
+app:
+  name: orchestral
+recipes:
+  templates:
+    - name: fill_sheet
+      stages:
+        - id: inspect
+          kind: action
+          selector:
+            all_of: ["filesystem_read"]
+        - id: derive
+          kind: agent
+          params:
+            mode: leaf
+            goal: derive patch
+            output_keys: ["change_spec"]
+"#;
+        let config: OrchestralConfig = from_str(yaml).expect("parse yaml");
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_config_rejects_duplicate_recipe_templates() {
+        let yaml = r#"
+version: 1
+app:
+  name: orchestral
+recipes:
+  templates:
+    - name: fill_sheet
+      stages:
+        - id: inspect
+          kind: action
+          action: file_read
+    - name: fill_sheet
+      stages:
+        - id: inspect
+          kind: action
+          action: file_read
+"#;
+        let config: OrchestralConfig = from_str(yaml).expect("parse yaml");
+        assert!(matches!(
+            validate_config(&config),
+            Err(ConfigError::Invalid(_))
+        ));
     }
 }

@@ -24,6 +24,7 @@ pub mod interpreter;
 pub mod io;
 pub mod normalizer;
 pub mod planner;
+pub mod recipe;
 pub mod spi;
 pub mod store;
 pub mod types;
@@ -52,12 +53,19 @@ pub mod prelude {
     pub use crate::planner::{
         HistoryItem, PlanError, Planner, PlannerContext, PlannerOutput, PlannerRuntimeInfo,
     };
+    pub use crate::recipe::{
+        ActionSelector, RecipeCompileError, RecipeCompiler, RecipeRegistry, RecipeStageOverride,
+        RecipeStageTemplate, RecipeTemplate, RECIPE_REGISTRY_COMPONENT_KEY,
+    };
     pub use crate::store::{
         EmbeddingStatus, Event, EventStore, Reference, ReferenceStore, ReferenceType, Scope,
         StoreError, TaskStore, WorkingSet,
     };
     pub use crate::types::{
-        Intent, IntentContext, Plan, Step, StepId, StepKind, Task, TaskId, TaskState,
+        ArtifactFamily, ContinuationState, ContinuationStatus, DerivationPolicy, Intent,
+        IntentContext, Plan, ReactorTaskState, SkeletonChoice, SkeletonKind, StageChoice,
+        StageKind, StagePlan, Step, StepId, StepKind, Task, TaskId, TaskState, VerifyDecision,
+        VerifyStatus,
     };
 }
 
@@ -75,7 +83,15 @@ pub use io::{
 };
 pub use normalizer::{NormalizedPlan, PlanNormalizer};
 pub use planner::{Planner, PlannerOutput, PlannerRuntimeInfo};
+pub use recipe::{
+    ActionSelector, RecipeCompileError, RecipeCompiler, RecipeRegistry, RecipeStageOverride,
+    RecipeStageTemplate, RecipeTemplate, RECIPE_REGISTRY_COMPONENT_KEY,
+};
 pub use store::{
     EmbeddingStatus, Event, EventStore, ReferenceStore, StoreError, TaskStore, WorkingSet,
 };
-pub use types::{Intent, Plan, Step, StepId, Task, TaskId, TaskState};
+pub use types::{
+    ArtifactFamily, ContinuationState, ContinuationStatus, DerivationPolicy, Intent, Plan,
+    ReactorTaskState, SkeletonChoice, SkeletonKind, StageChoice, StageKind, StagePlan, Step,
+    StepId, Task, TaskId, TaskState, VerifyDecision, VerifyStatus,
+};
