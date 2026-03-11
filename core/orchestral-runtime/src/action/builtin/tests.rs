@@ -1,4 +1,9 @@
 use super::*;
+use super::shell::ShellAction;
+use super::support::{
+    approval_decision_from_ctx, extract_inline_script_body, requires_destructive_approval,
+    ApprovalDecision,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 

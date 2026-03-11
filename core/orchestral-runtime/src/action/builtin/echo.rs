@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use orchestral_core::action::{Action, ActionContext, ActionInput, ActionMeta, ActionResult};
 use orchestral_core::config::ActionSpec;
 
-use super::config_string;
+use super::support::config_string;
 
 pub(super) struct EchoAction {
     name: String,
