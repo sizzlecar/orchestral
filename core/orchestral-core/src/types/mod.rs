@@ -25,5 +25,5 @@ pub use skeleton::{SkeletonChoice, SkeletonKind};
 pub use stage::{ArtifactFamily, DerivationPolicy, StageKind};
 pub use stage_plan::{StageChoice, StagePlan};
 pub use step::{Step, StepId, StepIoBinding, StepKind};
-pub use task::{ReactorTaskState, Task, TaskId, TaskState, WaitUserReason};
+pub use task::{ReactorFailureState, ReactorTaskState, Task, TaskId, TaskState, WaitUserReason};
 pub use verify::{VerifyDecision, VerifyStatus};

@@ -1,0 +1,36 @@
+version: 1
+name: no-fake-execution-patch-toml
+config: ../orchestral.cli.yaml
+no_mcp: true
+no_skills: true
+timeout_secs: 300
+workspace:
+  copies:
+    - from: ../../fixtures/scenarios/no_fake_execution/config/app.toml
+      to: fixtures/scenarios/no_fake_execution/config/app.toml
+
+turns:
+  - name: patch-toml-port
+    input: >
+      把 fixtures/scenarios/no_fake_execution/config/app.toml 里的 server.port 改成 9090，
+      然后返回最终值。
+    expect:
+      require_execution_end: true
+      max_approvals: 0
+      max_errors: 0
+      persist_not_contains:
+        - "Plan: no actions"
+      assistant_not_contains:
+        - "```shell"
+        - "请告诉我执行结果"
+      execution_mode_contains:
+        - "reactor"
+    verify:
+      - name: verify-toml-port-patched
+        command: /bin/zsh
+        cwd: ../..
+        args:
+          - -lc
+          - >-
+            cargo run -q -p orchestral-cli --example verify_no_fake_execution_toml --
+            "$ORCHESTRAL_SCENARIO_WORKSPACE_DIR/fixtures/scenarios/no_fake_execution/config/app.toml"

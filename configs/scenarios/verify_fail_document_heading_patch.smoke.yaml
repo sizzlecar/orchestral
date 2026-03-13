@@ -1,0 +1,37 @@
+version: 1
+name: verify-fail-document-heading-patch
+config: ../orchestral.cli.yaml
+env_file: ../../fixtures/scenarios/verify_fail_document/test.env
+no_mcp: true
+no_skills: true
+timeout_secs: 300
+workspace:
+  copies:
+    - from: ../../fixtures/scenarios/verify_fail_document/docs/release-note.md
+      to: fixtures/scenarios/verify_fail_document/docs/release-note.md
+
+turns:
+  - name: patch-document-then-fail-verify
+    input: >
+      把 fixtures/scenarios/verify_fail_document/docs/release-note.md 的一级标题补齐。
+    expect:
+      require_execution_end: true
+      execution_status: failed
+      max_approvals: 0
+      max_errors: 0
+      persist_contains:
+        - "Status: failed"
+      execution_mode_contains:
+        - "reactor"
+    verify:
+      - name: document-was-patched-before-verify-failed
+        command: /bin/zsh
+        cwd: ../..
+        args:
+          - -lc
+          - >-
+            ! cmp -s
+            fixtures/scenarios/verify_fail_document/docs/release-note.md
+            "$ORCHESTRAL_SCENARIO_WORKSPACE_DIR/fixtures/scenarios/verify_fail_document/docs/release-note.md"
+            &&
+            grep -q '^# ' "$ORCHESTRAL_SCENARIO_WORKSPACE_DIR/fixtures/scenarios/verify_fail_document/docs/release-note.md"

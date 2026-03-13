@@ -7,6 +7,7 @@ use orchestral_core::action::{Action, ActionContext, ActionInput, ActionMeta, Ac
 use orchestral_core::config::ActionSpec;
 
 use super::super::factory::ActionBuildError;
+use crate::action::test_hooks::forced_verify_failure;
 use super::apply::apply_document_patch;
 use super::assess::assess_document_readiness;
 use super::inspect::inspect_documents;
@@ -367,6 +368,22 @@ impl Action for DocumentVerifyPatchAction {
     }
 
     async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
+        if let Some(verify_decision) = forced_verify_failure(self.name()) {
+            return ActionResult::success_with(
+                [
+                    (
+                        "verify_decision".to_string(),
+                        serde_json::to_value(verify_decision).unwrap_or(Value::Null),
+                    ),
+                    (
+                        "summary".to_string(),
+                        Value::String("Document verification failed.".to_string()),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            );
+        }
         let Some(patch_spec) = input.params.get("patch_spec") else {
             return ActionResult::error("Missing patch_spec for document_verify_patch");
         };

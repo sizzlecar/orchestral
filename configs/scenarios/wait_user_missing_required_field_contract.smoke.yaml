@@ -1,0 +1,38 @@
+version: 1
+name: wait-user-missing-required-field-contract
+config: ../orchestral.cli.yaml
+no_mcp: true
+no_skills: true
+timeout_secs: 300
+workspace:
+  copies:
+    - from: ../../fixtures/scenarios/wait_user_contract/docs/contract.md
+      to: fixtures/scenarios/wait_user_contract/docs/contract.md
+
+turns:
+  - name: wait-for-sign-date
+    input: >
+      帮我把 fixtures/scenarios/wait_user_contract/docs/contract.md 补完整，
+      签约日期填进去，然后导出最终版本。
+    expect:
+      require_execution_end: true
+      execution_status: waiting_user
+      max_approvals: 0
+      max_errors: 0
+      persist_contains:
+        - "签约日期"
+      persist_not_contains:
+        - "```shell"
+        - "请告诉我执行结果"
+      execution_mode_contains:
+        - "reactor"
+    verify:
+      - name: contract-remains-unchanged
+        command: /bin/zsh
+        cwd: ../..
+        args:
+          - -lc
+          - >-
+            cmp -s
+            fixtures/scenarios/wait_user_contract/docs/contract.md
+            "$ORCHESTRAL_SCENARIO_WORKSPACE_DIR/fixtures/scenarios/wait_user_contract/docs/contract.md"

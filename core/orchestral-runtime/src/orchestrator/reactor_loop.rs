@@ -1,4 +1,24 @@
 use super::*;
+use orchestral_core::types::{Plan, ReactorFailureState};
+
+fn should_wait_for_reactor_retry(
+    plan: &Plan,
+    current_stage: StageKind,
+    result: &ExecutionResult,
+) -> bool {
+    let ExecutionResult::Failed { step_id, .. } = result else {
+        return false;
+    };
+    if matches!(
+        current_stage,
+        StageKind::Verify | StageKind::WaitUser | StageKind::Done | StageKind::Failed
+    ) {
+        return false;
+    }
+    plan.get_step(step_id.as_str())
+        .map(|step| matches!(step.kind, StepKind::Action))
+        .unwrap_or(false)
+}
 
 impl Orchestrator {
     pub(super) async fn run_reactor_pipeline(
@@ -29,6 +49,7 @@ impl Orchestrator {
                 derivation_policy: choice.derivation_policy,
                 last_continuation: None,
                 last_verify: None,
+                last_failure: None,
                 verify_required: true,
             });
             reactor_state.skeleton = choice.skeleton;
@@ -153,6 +174,33 @@ impl Orchestrator {
             )
             .await;
 
+            if !matches!(snapshot.result, ExecutionResult::Failed { .. })
+                && reactor_state.last_failure.is_some()
+            {
+                reactor_state.last_failure = None;
+                task.set_reactor_state(reactor_state.clone());
+                self.task_store.save(&task).await?;
+            }
+
+            if should_wait_for_reactor_retry(&plan, choice.current_stage, &snapshot.result) {
+                if let ExecutionResult::Failed { step_id, error } = snapshot.result.clone() {
+                    reactor_state.last_failure = Some(ReactorFailureState {
+                        step_id: step_id.clone(),
+                        error: error.clone(),
+                    });
+                    task.set_reactor_state(reactor_state.clone());
+                    self.task_store.save(&task).await?;
+                    break ExecutionResult::WaitingUser {
+                        step_id,
+                        prompt: format!(
+                            "Step failed: {}. Reply 继续/重试 to retry from the failed step, or provide updated instructions.",
+                            truncate_for_log(&error, 300)
+                        ),
+                        approval: None,
+                    };
+                }
+            }
+
             match snapshot.result.clone() {
                 ExecutionResult::Completed => match choice.current_stage {
                     StageKind::Locate
@@ -185,6 +233,7 @@ impl Orchestrator {
                             "continuation",
                         )?;
                         reactor_state.last_continuation = Some(continuation.clone());
+                        reactor_state.last_failure = None;
                         task.set_reactor_state(reactor_state);
                         self.task_store.save(&task).await?;
                         match continuation.status {
@@ -249,9 +298,11 @@ impl Orchestrator {
                                 derivation_policy: choice.derivation_policy,
                                 last_continuation: None,
                                 last_verify: None,
+                                last_failure: None,
                                 verify_required: true,
                             });
                         updated_reactor_state.last_verify = Some(verify_decision.clone());
+                        updated_reactor_state.last_failure = None;
                         task.set_reactor_state(updated_reactor_state);
                         self.task_store.save(&task).await?;
                         match verify_decision.status {

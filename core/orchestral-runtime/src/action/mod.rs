@@ -18,6 +18,7 @@ mod providers;
 mod shell_sandbox;
 mod spreadsheet;
 mod structured;
+pub(crate) mod test_hooks;
 
 // Re-export core action traits
 pub use orchestral_core::action::{Action, ActionContext, ActionInput, ActionMeta, ActionResult};

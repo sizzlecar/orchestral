@@ -3,11 +3,16 @@ use std::sync::Arc;
 use orchestral_core::executor::ActionPreflightHook;
 use serde_json::Value;
 
+use crate::action::test_hooks::forced_action_failure_reason;
+
 pub(crate) fn default_action_preflight_hook() -> ActionPreflightHook {
     Arc::new(|action_name: &str, params: &Value| action_preflight_error(action_name, params))
 }
 
 pub(super) fn action_preflight_error(action_name: &str, params: &Value) -> Option<String> {
+    if let Some(reason) = forced_action_failure_reason(action_name) {
+        return Some(reason);
+    }
     if action_name != "shell" {
         return None;
     }

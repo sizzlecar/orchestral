@@ -274,8 +274,16 @@ pub struct ReactorTaskState {
     pub last_continuation: Option<ContinuationState>,
     #[serde(default)]
     pub last_verify: Option<VerifyDecision>,
+    #[serde(default)]
+    pub last_failure: Option<ReactorFailureState>,
     #[serde(default = "default_true")]
     pub verify_required: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReactorFailureState {
+    pub step_id: StepId,
+    pub error: String,
 }
 
 fn default_true() -> bool {

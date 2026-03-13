@@ -7,6 +7,7 @@ use orchestral_core::action::{Action, ActionContext, ActionInput, ActionMeta, Ac
 use orchestral_core::config::ActionSpec;
 
 use super::super::factory::ActionBuildError;
+use crate::action::test_hooks::forced_verify_failure;
 use super::apply::apply_patch;
 use super::assess::assess_readiness;
 use super::inspect::inspect_workbook;
@@ -382,6 +383,20 @@ impl Action for SpreadsheetVerifyPatchAction {
     }
 
     async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
+        if let Some(verify_decision) = forced_verify_failure(self.name()) {
+            let summary = format!("Workbook verification failed: {}", verify_decision.reason);
+            return ActionResult::success_with(
+                [
+                    (
+                        "verify_decision".to_string(),
+                        serde_json::to_value(verify_decision).unwrap_or(Value::Null),
+                    ),
+                    ("summary".to_string(), Value::String(summary)),
+                ]
+                .into_iter()
+                .collect(),
+            );
+        }
         let Some(path) = input.params.get("path").and_then(Value::as_str) else {
             return ActionResult::error("Missing path for spreadsheet_verify_patch");
         };
