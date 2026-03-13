@@ -51,7 +51,8 @@ pub mod prelude {
         ValidationError,
     };
     pub use crate::planner::{
-        HistoryItem, PlanError, Planner, PlannerContext, PlannerOutput, PlannerRuntimeInfo,
+        ActionCall, HistoryItem, PlanError, Planner, PlannerContext, PlannerOutput,
+        PlannerRuntimeInfo,
     };
     pub use crate::recipe::{
         ActionSelector, RecipeCompileError, RecipeCompiler, RecipeRegistry, RecipeStageOverride,
@@ -82,7 +83,7 @@ pub use io::{
     BlobHead, BlobId, BlobIoError, BlobMeta, BlobRead, BlobStore, BlobStream, BlobWriteRequest,
 };
 pub use normalizer::{NormalizedPlan, PlanNormalizer};
-pub use planner::{Planner, PlannerOutput, PlannerRuntimeInfo};
+pub use planner::{ActionCall, Planner, PlannerOutput, PlannerRuntimeInfo};
 pub use recipe::{
     ActionSelector, RecipeCompileError, RecipeCompiler, RecipeRegistry, RecipeStageOverride,
     RecipeStageTemplate, RecipeTemplate, RECIPE_REGISTRY_COMPONENT_KEY,

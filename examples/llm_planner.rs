@@ -55,6 +55,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "reactor stage choice"
             );
         }
+        PlannerOutput::ActionCall(call) => {
+            info!(action = %call.action, reason = ?call.reason, "action call");
+        }
     }
 
     Ok(())

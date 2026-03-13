@@ -1,3 +1,4 @@
+mod catalog;
 mod http;
 mod parsing;
 mod prompt;
@@ -257,6 +258,14 @@ impl<C: LlmClient> Planner for LlmPlanner<C> {
                     "planner parsed output"
                 );
             }
+            PlannerOutput::ActionCall(call) => {
+                info!(
+                    output_type = "action_call",
+                    action = %call.action,
+                    reason = ?call.reason,
+                    "planner parsed output"
+                );
+            }
             PlannerOutput::DirectResponse(message) => {
                 info!(
                     output_type = "direct_response",
@@ -339,39 +348,49 @@ mod tests {
             },
         );
 
-        let actions = vec![ActionMeta::new("write_doc", "Write markdown to file")
-            .with_capabilities(["filesystem_write", "side_effect"])
-            .with_roles(["apply", "emit"])
-            .with_input_kinds(["path", "text"])
-            .with_output_kinds(["path"])
-            .with_input_schema(json!({
-                "type":"object",
-                "properties":{
-                    "path":{"type":"string","description":"Target markdown path","example":"guide.md"},
-                    "content":{"type":"string","description":"Markdown content"}
-                },
-                "required":["path","content"]
-            }))
-            .with_output_schema(
-                json!({
+        let actions = vec![
+            ActionMeta::new("write_doc", "Write markdown to file")
+                .with_capabilities(["filesystem_write", "side_effect"])
+                .with_roles(["apply", "emit"])
+                .with_input_kinds(["path", "text"])
+                .with_output_kinds(["path"])
+                .with_input_schema(json!({
                     "type":"object",
                     "properties":{
-                        "path":{"type":"string","description":"Resolved path"},
-                        "bytes":{"type":"integer","description":"Written bytes"}
-                    }
-                }),
-            )];
+                        "path":{"type":"string","description":"Target markdown path","example":"guide.md"},
+                        "content":{"type":"string","description":"Markdown content"}
+                    },
+                    "required":["path","content"]
+                }))
+                .with_output_schema(
+                    json!({
+                        "type":"object",
+                        "properties":{
+                            "path":{"type":"string","description":"Resolved path"},
+                            "bytes":{"type":"integer","description":"Written bytes"}
+                        }
+                    }),
+                ),
+            ActionMeta::new("file_read", "Read a file")
+                .with_capabilities(["filesystem_read"])
+                .with_roles(["inspect", "verify"])
+                .with_input_kinds(["path"])
+                .with_output_kinds(["text"]),
+        ];
         let context = PlannerContext::new(actions, Arc::new(NoopReferenceStore));
         let intent = Intent::new("generate a guide");
         let (system, user) = planner.build_prompt(&intent, &context);
 
         assert!(system.contains("Orchestral Planner"));
-        assert!(system.contains("Execution planning is disabled in this mode."));
+        assert!(system.contains("Reactor pipelines are disabled in this mode."));
+        assert!(system.contains("ACTION_CALL"));
         assert!(!system.contains("Action Catalog"));
+        assert!(user.contains("\"type\":\"ACTION_CALL\""));
         assert!(user.contains("\"type\":\"DIRECT_RESPONSE\""));
         assert!(user.contains("\"type\":\"CLARIFICATION\""));
         assert!(!user.contains("\"type\":\"WORKFLOW\""));
         assert!(!user.contains("\"type\":\"STAGE_CHOICE\""));
+        assert!(user.contains("DIRECT_RESPONSE must never claim to execute commands"));
     }
 
     #[test]
@@ -705,6 +724,20 @@ mod tests {
                 assert_eq!(message, "你好");
             }
             _ => panic!("expected direct_response output"),
+        }
+    }
+
+    #[test]
+    fn test_parse_action_call_output() {
+        let raw = r#"{"type":"ACTION_CALL","action":"file_read","params":{"path":"README.md"},"reason":"read readme"}"#;
+        let parsed = parse_planner_output(raw).expect("parse action call");
+        match parsed {
+            PlannerOutput::ActionCall(call) => {
+                assert_eq!(call.action, "file_read");
+                assert_eq!(call.params["path"], "README.md");
+                assert_eq!(call.reason.as_deref(), Some("read readme"));
+            }
+            _ => panic!("expected action_call output"),
         }
     }
 

@@ -243,7 +243,7 @@ fn handle_runtime(app: &mut App, msg: RuntimeMsg) {
                 .insert(TransientSlot::Status, "Executing...".to_string());
             app.set_dirty();
         }
-        RuntimeMsg::ExecutionStart { total } => {
+        RuntimeMsg::ExecutionStart { total, .. } => {
             let _ = total;
             app.mode = AppMode::Executing;
             app.spinner.enabled = true;

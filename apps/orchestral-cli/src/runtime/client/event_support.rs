@@ -82,7 +82,7 @@ pub(super) fn ui_event_label(event: &UiEvent) -> &'static str {
         UiEvent::ReplanningFailed { .. } => "ReplanningFailed",
         UiEvent::PlanningStarted => "PlanningStarted",
         UiEvent::PlanningCompleted { .. } => "PlanningCompleted",
-        UiEvent::ExecutionStarted => "ExecutionStarted",
+        UiEvent::ExecutionStarted { .. } => "ExecutionStarted",
         UiEvent::ExecutionCompleted { .. } => "ExecutionCompleted",
         UiEvent::StepStarted { .. } => "StepStarted",
         UiEvent::StepCompleted { .. } => "StepCompleted",

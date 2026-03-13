@@ -172,7 +172,11 @@ impl RuntimeClient {
                             })
                             .await;
                     }
-                    UiEvent::PlanningCompleted { step_count, steps } => {
+                    UiEvent::PlanningCompleted {
+                        step_count,
+                        steps,
+                        output_type,
+                    } => {
                         total_steps = step_count.unwrap_or(steps.len());
                         let plan = if steps.is_empty() {
                             "Plan: no actions".to_string()
@@ -188,6 +192,14 @@ impl RuntimeClient {
                         let _ = runtime_tx_events
                             .send(RuntimeMsg::OutputPersist(plan))
                             .await;
+                        if let Some(output_type) = output_type {
+                            let _ = runtime_tx_events
+                                .send(RuntimeMsg::OutputPersist(format!(
+                                    "PlanningOutput: {}",
+                                    output_type
+                                )))
+                                .await;
+                        }
                         let _ = runtime_tx_events
                             .send(RuntimeMsg::OutputTransient {
                                 slot: TransientSlot::Inline,
@@ -196,9 +208,12 @@ impl RuntimeClient {
                             .await;
                         let _ = runtime_tx_events.send(RuntimeMsg::PlanningEnd).await;
                     }
-                    UiEvent::ExecutionStarted => {
+                    UiEvent::ExecutionStarted { execution_mode } => {
                         let _ = runtime_tx_events
-                            .send(RuntimeMsg::ExecutionStart { total: total_steps })
+                            .send(RuntimeMsg::ExecutionStart {
+                                total: total_steps,
+                                execution_mode,
+                            })
                             .await;
                         let _ = runtime_tx_events
                             .send(RuntimeMsg::OutputTransient {
@@ -458,13 +473,25 @@ impl RuntimeClient {
                         let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
                         mark_turn_settled(&mut turn_settled_tx);
                     }
-                    UiEvent::ExecutionCompleted { status } => {
+                    UiEvent::ExecutionCompleted {
+                        status,
+                        execution_mode,
+                    } => {
                         debug!(
                             status = ?status,
+                            execution_mode = ?execution_mode,
                             pending_execution_end = pending_execution_end,
                             assistant_rendered = assistant_rendered,
                             "tui event: execution_completed"
                         );
+                        if let Some(mode) = execution_mode {
+                            let _ = runtime_tx_events
+                                .send(RuntimeMsg::OutputPersist(format!(
+                                    "ExecutionMode: {}",
+                                    mode
+                                )))
+                                .await;
+                        }
                         match status.as_deref() {
                             Some("completed") | Some("clarification") | None => {
                                 pending_execution_end = true;
@@ -521,7 +548,7 @@ impl RuntimeClient {
                             .send(RuntimeMsg::OutputPersist(line))
                             .await;
                     }
-                    UiEvent::AssistantOutput { message } => {
+                    UiEvent::AssistantOutput { message, status } => {
                         let normalized = message.trim().to_string();
                         if normalized.is_empty() {
                             continue;
@@ -560,6 +587,16 @@ impl RuntimeClient {
                         if last_assistant_fingerprint.as_deref() != Some(normalized.as_str()) {
                             last_assistant_fingerprint = Some(normalized.clone());
                             assistant_rendered = true;
+                            if let Some(status) = status.as_deref() {
+                                if status != "completed" {
+                                    let _ = runtime_tx_events
+                                        .send(RuntimeMsg::OutputPersist(format!(
+                                            "Status: {}",
+                                            status
+                                        )))
+                                        .await;
+                                }
+                            }
                             debug!(
                                 line_len = normalized.len(),
                                 "tui action: output_persist from assistant_output"

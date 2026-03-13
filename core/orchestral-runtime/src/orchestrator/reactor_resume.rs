@@ -34,12 +34,15 @@ fn parse_reactor_resume_decision(message: &str) -> ReactorResumeDecision {
         "同意",
         "批准",
         "继续",
+        "重试",
+        "再试",
         "按计划",
         "写回",
         "执行",
         "approve",
         "approved",
         "proceed",
+        "retry",
     ];
     if approve_markers
         .iter()
@@ -83,6 +86,19 @@ pub(super) async fn build_reactor_resume_choice(
 
     match parse_reactor_resume_decision(&resume_text) {
         ReactorResumeDecision::Approve => {
+            if let Some(last_failure) = reactor_state.last_failure.as_ref() {
+                return build_reactor_stage_choice(
+                    reactor_state.skeleton,
+                    reactor_state.artifact_family,
+                    reactor_state.current_stage,
+                    reactor_state.derivation_policy,
+                    Some(reactor_state.current_stage),
+                    Some(format!(
+                        "retrying failed reactor step '{}' after user approval",
+                        last_failure.step_id
+                    )),
+                );
+            }
             if let Some(next_stage) = reactor_state
                 .last_continuation
                 .as_ref()
@@ -102,6 +118,19 @@ pub(super) async fn build_reactor_resume_choice(
             }
         }
         ReactorResumeDecision::Deny => {
+            if reactor_state.last_failure.is_some() {
+                return build_reactor_stage_choice(
+                    reactor_state.skeleton,
+                    reactor_state.artifact_family,
+                    StageKind::WaitUser,
+                    reactor_state.derivation_policy,
+                    Some(StageKind::WaitUser),
+                    Some(
+                        "User declined retrying the failed reactor step. Awaiting updated instructions."
+                            .to_string(),
+                    ),
+                );
+            }
             return build_reactor_stage_choice(
                 reactor_state.skeleton,
                 reactor_state.artifact_family,
@@ -118,7 +147,12 @@ pub(super) async fn build_reactor_resume_choice(
     }
 
     let prompt = format!(
-        "User resumed the waiting reactor task with: {}",
+        "{}: {}",
+        if reactor_state.last_failure.is_some() {
+            "User responded after a recoverable reactor failure"
+        } else {
+            "User resumed the waiting reactor task"
+        },
         truncate_for_log(&resume_text, 600)
     );
     build_reactor_replan_choice(orchestrator, task, &current_choice, &prompt, interaction_id).await
@@ -184,6 +218,12 @@ pub(super) async fn build_reactor_replan_choice(
             false,
         ),
         PlannerOutput::StageChoice(choice) => normalize_reactor_stage_choice(choice),
+        PlannerOutput::ActionCall(call) => {
+            Err(OrchestratorError::Planner(PlanError::Generation(format!(
+                "reactor replan returned action_call unexpectedly: {}",
+                truncate_for_log(&call.action, 200)
+            ))))
+        }
         PlannerOutput::Clarification(question) => build_reactor_stage_choice(
             current_choice.skeleton,
             current_choice.artifact_family,

@@ -22,6 +22,7 @@ pub struct StepOutput {
 pub enum UiEvent {
     AssistantOutput {
         message: String,
+        status: Option<String>,
     },
     AssistantStreamDelta {
         delta: String,
@@ -47,10 +48,14 @@ pub enum UiEvent {
     PlanningCompleted {
         step_count: Option<usize>,
         steps: Vec<StepSummary>,
+        output_type: Option<String>,
     },
-    ExecutionStarted,
+    ExecutionStarted {
+        execution_mode: Option<String>,
+    },
     ExecutionCompleted {
         status: Option<String>,
+        execution_mode: Option<String>,
     },
     StepStarted {
         step_id: String,
@@ -101,6 +106,11 @@ pub fn project_event(event: &Event) -> Option<UiEvent> {
             .and_then(|v| v.as_str())
             .map(|message| UiEvent::AssistantOutput {
                 message: message.to_string(),
+                status: payload
+                    .get("result")
+                    .and_then(|v| v.get("status"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
             }),
         Event::SystemTrace { payload, .. } => {
             let category = payload.get("category")?.as_str()?;
@@ -175,9 +185,22 @@ fn project_lifecycle_event(payload: &Value) -> Option<UiEvent> {
                 .and_then(|m| m.get("steps"))
                 .and_then(parse_step_summaries)
                 .unwrap_or_default();
-            Some(UiEvent::PlanningCompleted { step_count, steps })
+            let output_type = metadata
+                .and_then(|m| m.get("output_type"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            Some(UiEvent::PlanningCompleted {
+                step_count,
+                steps,
+                output_type,
+            })
         }
-        "execution_started" => Some(UiEvent::ExecutionStarted),
+        "execution_started" => Some(UiEvent::ExecutionStarted {
+            execution_mode: metadata
+                .and_then(|m| m.get("execution_mode"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        }),
         "execution_completed" => {
             let status = metadata
                 .and_then(|m| m.get("status"))
@@ -203,7 +226,13 @@ fn project_lifecycle_event(payload: &Value) -> Option<UiEvent> {
                         .map(str::to_string),
                 });
             }
-            Some(UiEvent::ExecutionCompleted { status })
+            Some(UiEvent::ExecutionCompleted {
+                status,
+                execution_mode: metadata
+                    .and_then(|m| m.get("execution_mode"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+            })
         }
         _ => None,
     }

@@ -112,6 +112,8 @@ struct ScenarioTurnSpec {
 struct ScenarioExpect {
     #[serde(default = "default_require_execution_end")]
     require_execution_end: bool,
+    #[serde(default)]
+    execution_status: Option<String>,
     #[serde(default = "default_zero_usize")]
     max_approvals: Option<usize>,
     #[serde(default = "default_zero_usize")]
@@ -128,6 +130,14 @@ struct ScenarioExpect {
     activity_contains: Vec<String>,
     #[serde(default)]
     activity_not_contains: Vec<String>,
+    #[serde(default)]
+    assistant_contains: Vec<String>,
+    #[serde(default)]
+    assistant_not_contains: Vec<String>,
+    #[serde(default)]
+    execution_mode_contains: Vec<String>,
+    #[serde(default)]
+    execution_mode_not_contains: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -214,6 +224,7 @@ struct TurnReport {
     transient_lines: Vec<String>,
     activity_lines: Vec<String>,
     assistant_stream: String,
+    execution_modes: Vec<String>,
     verifications: Vec<VerificationReport>,
     failures: Vec<String>,
     passed: bool,
@@ -669,6 +680,7 @@ fn prepare_scenario(options: ScenarioRunOptions) -> anyhow::Result<PreparedScena
             input,
             expect: ScenarioExpect {
                 require_execution_end: !options.allow_missing_execution_end,
+                execution_status: None,
                 max_approvals: options.max_approvals.or(Some(0)),
                 max_errors: options.max_errors.or(Some(0)),
                 persist_contains: options.persist_contains,
@@ -677,6 +689,10 @@ fn prepare_scenario(options: ScenarioRunOptions) -> anyhow::Result<PreparedScena
                 transient_not_contains: options.transient_not_contains,
                 activity_contains: Vec::new(),
                 activity_not_contains: Vec::new(),
+                assistant_contains: Vec::new(),
+                assistant_not_contains: Vec::new(),
+                execution_mode_contains: Vec::new(),
+                execution_mode_not_contains: Vec::new(),
             },
             verify: Vec::new(),
         }],
@@ -732,6 +748,7 @@ async fn execute_turn(
         transient_lines: Vec::new(),
         activity_lines: Vec::new(),
         assistant_stream: String::new(),
+        execution_modes: Vec::new(),
         verifications: Vec::new(),
         failures: Vec::new(),
         passed: false,
@@ -792,7 +809,14 @@ fn handle_runtime_msg(report: &mut TurnReport, msg: RuntimeMsg) {
     match msg {
         RuntimeMsg::PlanningStart => report.planning_started = true,
         RuntimeMsg::PlanningEnd => report.planning_finished = true,
-        RuntimeMsg::ExecutionStart { .. } => report.execution_started = true,
+        RuntimeMsg::ExecutionStart {
+            execution_mode, ..
+        } => {
+            report.execution_started = true;
+            if let Some(mode) = execution_mode {
+                report.execution_modes.push(mode);
+            }
+        }
         RuntimeMsg::ExecutionProgress { step } => {
             report
                 .transient_lines
@@ -859,7 +883,15 @@ fn evaluate_expectations(report: &mut TurnReport, expect: &ScenarioExpect) {
             .failures
             .push("expected execution to finish, but ExecutionEnd was not observed".to_string());
     }
-    if matches!(report.execution_status.as_deref(), Some("failed")) {
+    if let Some(expected_status) = expect.execution_status.as_deref() {
+        if report.execution_status.as_deref() != Some(expected_status) {
+            report.failures.push(format!(
+                "expected execution status '{}', got '{}'",
+                expected_status,
+                report.execution_status.as_deref().unwrap_or("<none>")
+            ));
+        }
+    } else if matches!(report.execution_status.as_deref(), Some("failed")) {
         report
             .failures
             .push("expected successful execution, but runtime reported Status: failed".to_string());
@@ -917,6 +949,30 @@ fn evaluate_expectations(report: &mut TurnReport, expect: &ScenarioExpect) {
         "activity",
         &report.activity_lines,
         &expect.activity_not_contains,
+        &mut report.failures,
+    );
+    assert_text_contains(
+        "assistant",
+        &report.assistant_stream,
+        &expect.assistant_contains,
+        &mut report.failures,
+    );
+    assert_text_not_contains(
+        "assistant",
+        &report.assistant_stream,
+        &expect.assistant_not_contains,
+        &mut report.failures,
+    );
+    assert_contains(
+        "execution_mode",
+        &report.execution_modes,
+        &expect.execution_mode_contains,
+        &mut report.failures,
+    );
+    assert_not_contains(
+        "execution_mode",
+        &report.execution_modes,
+        &expect.execution_mode_not_contains,
         &mut report.failures,
     );
 }
@@ -1148,6 +1204,30 @@ fn assert_not_contains(
     }
 }
 
+fn assert_text_contains(label: &str, haystack: &str, needles: &[String], failures: &mut Vec<String>) {
+    for needle in needles {
+        if !haystack.contains(needle) {
+            failures.push(format!("expected {} output to contain '{}'", label, needle));
+        }
+    }
+}
+
+fn assert_text_not_contains(
+    label: &str,
+    haystack: &str,
+    needles: &[String],
+    failures: &mut Vec<String>,
+) {
+    for needle in needles {
+        if haystack.contains(needle) {
+            failures.push(format!(
+                "expected {} output not to contain '{}'",
+                label, needle
+            ));
+        }
+    }
+}
+
 fn ensure_log_filter() {
     if std::env::var("RUST_LOG").is_ok() {
         return;
@@ -1345,9 +1425,17 @@ fn remove_empty_dirs(root: &Path) -> anyhow::Result<bool> {
 }
 
 fn parse_status_line(line: &str) -> Option<String> {
-    line.strip_prefix("Status: ")
+    if let Some(status) = line
+        .strip_prefix("Status: ")
         .map(|status| status.trim().to_ascii_lowercase())
         .filter(|status| !status.is_empty())
+    {
+        return Some(status);
+    }
+    if line.starts_with("Need input") || line.starts_with("Waiting: ") {
+        return Some("waiting_user".to_string());
+    }
+    None
 }
 
 fn resolve_report_path(
@@ -1503,12 +1591,14 @@ mod tests {
             transient_lines: vec!["executing".to_string()],
             activity_lines: vec!["inspect".to_string()],
             assistant_stream: String::new(),
+            execution_modes: Vec::new(),
             verifications: Vec::new(),
             failures: Vec::new(),
             passed: false,
         };
         let expect = ScenarioExpect {
             require_execution_end: true,
+            execution_status: None,
             max_approvals: Some(0),
             max_errors: Some(0),
             persist_contains: vec!["plan".to_string()],
@@ -1517,6 +1607,10 @@ mod tests {
             transient_not_contains: vec!["approval".to_string()],
             activity_contains: vec!["inspect".to_string()],
             activity_not_contains: vec!["shell".to_string()],
+            assistant_contains: Vec::new(),
+            assistant_not_contains: Vec::new(),
+            execution_mode_contains: Vec::new(),
+            execution_mode_not_contains: Vec::new(),
         };
 
         evaluate_expectations(&mut report, &expect);
@@ -1548,6 +1642,7 @@ mod tests {
             transient_lines: Vec::new(),
             activity_lines: Vec::new(),
             assistant_stream: String::new(),
+            execution_modes: Vec::new(),
             verifications: Vec::new(),
             failures: Vec::new(),
             passed: false,
@@ -1569,6 +1664,94 @@ mod tests {
             &mut failures,
         );
         assert!(failures.is_empty());
+    }
+
+    #[test]
+    fn test_evaluate_expectations_checks_assistant_and_execution_mode() {
+        let mut report = TurnReport {
+            name: None,
+            input: "hello".to_string(),
+            duration_ms: 0,
+            planning_started: true,
+            planning_finished: true,
+            execution_started: true,
+            execution_finished: true,
+            execution_status: Some("completed".to_string()),
+            timed_out: false,
+            approvals: Vec::new(),
+            errors: Vec::new(),
+            persist_lines: Vec::new(),
+            transient_lines: Vec::new(),
+            activity_lines: Vec::new(),
+            assistant_stream: "updated app.toml successfully".to_string(),
+            execution_modes: vec!["action_call".to_string()],
+            verifications: Vec::new(),
+            failures: Vec::new(),
+            passed: false,
+        };
+        let expect = ScenarioExpect {
+            require_execution_end: true,
+            execution_status: Some("completed".to_string()),
+            max_approvals: Some(0),
+            max_errors: Some(0),
+            persist_contains: Vec::new(),
+            persist_not_contains: Vec::new(),
+            transient_contains: Vec::new(),
+            transient_not_contains: Vec::new(),
+            activity_contains: Vec::new(),
+            activity_not_contains: Vec::new(),
+            assistant_contains: vec!["app.toml".to_string()],
+            assistant_not_contains: vec!["ls -la".to_string()],
+            execution_mode_contains: vec!["action_call".to_string()],
+            execution_mode_not_contains: vec!["direct_response".to_string()],
+        };
+
+        evaluate_expectations(&mut report, &expect);
+        assert!(report.failures.is_empty());
+    }
+
+    #[test]
+    fn test_evaluate_expectations_allows_expected_failed_status() {
+        let mut report = TurnReport {
+            name: None,
+            input: "hello".to_string(),
+            duration_ms: 0,
+            planning_started: true,
+            planning_finished: true,
+            execution_started: true,
+            execution_finished: true,
+            execution_status: Some("failed".to_string()),
+            timed_out: false,
+            approvals: Vec::new(),
+            errors: Vec::new(),
+            persist_lines: vec!["Status: failed".to_string()],
+            transient_lines: Vec::new(),
+            activity_lines: Vec::new(),
+            assistant_stream: String::new(),
+            execution_modes: vec!["reactor".to_string()],
+            verifications: Vec::new(),
+            failures: Vec::new(),
+            passed: false,
+        };
+        let expect = ScenarioExpect {
+            require_execution_end: true,
+            execution_status: Some("failed".to_string()),
+            max_approvals: Some(0),
+            max_errors: Some(0),
+            persist_contains: Vec::new(),
+            persist_not_contains: Vec::new(),
+            transient_contains: Vec::new(),
+            transient_not_contains: Vec::new(),
+            activity_contains: Vec::new(),
+            activity_not_contains: Vec::new(),
+            assistant_contains: Vec::new(),
+            assistant_not_contains: Vec::new(),
+            execution_mode_contains: Vec::new(),
+            execution_mode_not_contains: Vec::new(),
+        };
+
+        evaluate_expectations(&mut report, &expect);
+        assert!(report.failures.is_empty());
     }
 
     #[test]

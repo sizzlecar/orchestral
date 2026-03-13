@@ -127,7 +127,16 @@ async fn run_plain_turn(runtime_client: RuntimeClient, input: String) -> anyhow:
         match msg {
             RuntimeMsg::PlanningStart => println!("Planning..."),
             RuntimeMsg::PlanningEnd => println!("Executing..."),
-            RuntimeMsg::ExecutionStart { total } => println!("Execution started (total={})", total),
+            RuntimeMsg::ExecutionStart {
+                total,
+                execution_mode,
+            } => {
+                if let Some(mode) = execution_mode {
+                    println!("Execution started (total={}, mode={})", total, mode);
+                } else {
+                    println!("Execution started (total={})", total);
+                }
+            }
             RuntimeMsg::ExecutionProgress { step } => println!("Progress step={}", step),
             RuntimeMsg::ExecutionEnd => println!("Execution finished"),
             RuntimeMsg::ActivityStart { .. }

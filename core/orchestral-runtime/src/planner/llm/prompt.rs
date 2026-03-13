@@ -3,11 +3,24 @@ use std::fmt::Write;
 use orchestral_core::planner::{HistoryItem, PlannerContext, SkillInstruction};
 use orchestral_core::types::{DerivationPolicy, Intent};
 
+use super::catalog::build_capability_catalog;
+
+const REACTOR_CONSTITUTION: &str = include_str!("../../prompts/reactor_constitution.md");
+const OUTPUT_CONTRACT: &str = include_str!("../../prompts/output_contract.md");
+const ACTION_CALL_RULES: &str = include_str!("../../prompts/action_call_rules.md");
+
 #[derive(Debug, Clone, Copy, Default)]
 struct ReactorPromptCoverage {
     spreadsheet: bool,
     document: bool,
     structured: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DirectActionCoverage {
+    shell: bool,
+    file_read: bool,
+    http: bool,
 }
 
 pub(super) fn build_reactor_prompt(
@@ -18,6 +31,7 @@ pub(super) fn build_reactor_prompt(
     default_policy: DerivationPolicy,
 ) -> (String, String) {
     let coverage = detect_reactor_prompt_coverage(context);
+    let direct_actions = detect_direct_action_coverage(context);
     let system = build_reactor_system_prompt(base, context, default_policy, coverage);
     let mut user = String::new();
     user.push_str(&format!("Intent:\n{}\n\n", intent.content));
@@ -35,13 +49,15 @@ pub(super) fn build_reactor_prompt(
         DerivationPolicy::Permissive => "permissive",
     };
 
-    user.push_str("Return exactly one JSON object:\n");
+    user.push_str(OUTPUT_CONTRACT);
+    user.push_str("\n\nExamples:\n");
     append_reactor_choice_examples(&mut user, coverage);
+    append_action_call_examples(&mut user, direct_actions);
     user.push_str(r#"{"type":"DIRECT_RESPONSE","message":"..."}"#);
     user.push('\n');
     user.push_str(r#"{"type":"CLARIFICATION","question":"..."}"#);
     user.push_str(
-        "\nRules:\n- JSON only.\n- For supported local artifact work, first pass should prefer SKELETON_CHOICE.\n- Use STAGE_CHOICE when the task already belongs to a skeleton and you are choosing the next stage.\n- For SKELETON_CHOICE, initial_stage should follow the skeleton default unless current evidence clearly requires a later stage.\n- skeleton must be one of the supported skeletons.\n- artifact_family must match a supported family when returning STAGE_CHOICE; for SKELETON_CHOICE it may be omitted if not yet certain.\n- derivation_policy must be \"strict\" or \"permissive\" when returning STAGE_CHOICE.\n",
+        "\nRules:\n- For supported local artifact work, first pass should prefer SKELETON_CHOICE.\n- Use STAGE_CHOICE when the task already belongs to a skeleton and you are choosing the next stage.\n- For SKELETON_CHOICE, initial_stage should follow the skeleton default unless current evidence clearly requires a later stage.\n- skeleton must be one of the supported skeletons.\n- artifact_family must match a supported family when returning STAGE_CHOICE; for SKELETON_CHOICE it may be omitted if not yet certain.\n- derivation_policy must be \"strict\" or \"permissive\" when returning STAGE_CHOICE.\n",
     );
     user.push_str(&format!(
         "- Default derivation_policy is \"{}\" unless the task clearly needs otherwise.\n",
@@ -50,6 +66,11 @@ pub(super) fn build_reactor_prompt(
     user.push_str("- Do not generate a full workflow DAG for supported reactor tasks.\n");
     user.push_str("- Continuation is structural. Prefer explicit wait_user or next_stage_hint over vague narration.\n");
     user.push_str("- Never use assistant narration as a completion signal.\n");
+    for line in ACTION_CALL_RULES.lines() {
+        user.push_str("- ");
+        user.push_str(line);
+        user.push('\n');
+    }
 
     (system, user)
 }
@@ -60,6 +81,7 @@ pub(super) fn build_non_reactor_prompt(
     context: &PlannerContext,
     max_history: usize,
 ) -> (String, String) {
+    let direct_actions = detect_direct_action_coverage(context);
     let system = build_non_reactor_system_prompt(base, context);
     let mut user = String::new();
     user.push_str(&format!("Intent:\n{}\n\n", intent.content));
@@ -72,13 +94,20 @@ pub(super) fn build_non_reactor_prompt(
         user.push('\n');
     }
 
-    user.push_str("Return exactly one JSON object:\n");
+    user.push_str(OUTPUT_CONTRACT);
+    user.push_str("\n\nExamples:\n");
+    append_action_call_examples(&mut user, direct_actions);
     user.push_str(r#"{"type":"DIRECT_RESPONSE","message":"..."}"#);
     user.push('\n');
     user.push_str(r#"{"type":"CLARIFICATION","question":"..."}"#);
     user.push_str(
-        "\nRules:\n- JSON only.\n- Reactor execution is disabled for this planner invocation.\n- Do not emit workflow, plan, recipe, or action topology.\n- If execution is required, ask a clarification instead of inventing an execution graph.\n",
+        "\nRules:\n- Reactor execution is disabled for this planner invocation.\n- Do not emit workflow, plan, recipe, or action topology.\n",
     );
+    for line in ACTION_CALL_RULES.lines() {
+        user.push_str("- ");
+        user.push_str(line);
+        user.push('\n');
+    }
 
     (system, user)
 }
@@ -92,8 +121,13 @@ pub(super) fn build_non_reactor_system_prompt(base: &str, context: &PlannerConte
         out.push_str("\n\n");
     }
     out.push_str("You are Orchestral Planner.\n");
-    out.push_str("Execution planning is disabled in this mode.\n");
-    out.push_str("Return only DIRECT_RESPONSE or CLARIFICATION.\n");
+    out.push_str("Reactor pipelines are disabled in this mode.\n");
+    out.push_str("Return only ACTION_CALL, DIRECT_RESPONSE, or CLARIFICATION.\n");
+    let capability_catalog = build_capability_catalog(&context.available_actions);
+    if !capability_catalog.trim().is_empty() {
+        out.push('\n');
+        out.push_str(&capability_catalog);
+    }
     if !execution_environment.trim().is_empty() {
         out.push('\n');
         out.push_str(&execution_environment);
@@ -150,6 +184,14 @@ fn detect_reactor_prompt_coverage(context: &PlannerContext) -> ReactorPromptCove
     }
 }
 
+fn detect_direct_action_coverage(context: &PlannerContext) -> DirectActionCoverage {
+    DirectActionCoverage {
+        shell: has_action(context, "shell"),
+        file_read: has_action(context, "file_read"),
+        http: has_action(context, "http"),
+    }
+}
+
 fn has_reactor_actions(context: &PlannerContext, names: &[&str]) -> bool {
     names.iter().all(|name| {
         context
@@ -157,6 +199,13 @@ fn has_reactor_actions(context: &PlannerContext, names: &[&str]) -> bool {
             .iter()
             .any(|action| action.name == *name)
     })
+}
+
+fn has_action(context: &PlannerContext, name: &str) -> bool {
+    context
+        .available_actions
+        .iter()
+        .any(|action| action.name == name)
 }
 
 fn append_reactor_choice_examples(buf: &mut String, coverage: ReactorPromptCoverage) {
@@ -216,6 +265,27 @@ fn append_reactor_choice_examples(buf: &mut String, coverage: ReactorPromptCover
     }
 }
 
+fn append_action_call_examples(buf: &mut String, coverage: DirectActionCoverage) {
+    if coverage.shell {
+        buf.push_str(
+            r#"{"type":"ACTION_CALL","action":"shell","params":{"command":"find ./docs -maxdepth 1 -type f"},"reason":"list files under docs"}"#,
+        );
+        buf.push('\n');
+    }
+    if coverage.file_read {
+        buf.push_str(
+            r#"{"type":"ACTION_CALL","action":"file_read","params":{"path":"README.md"},"reason":"read README"}"#,
+        );
+        buf.push('\n');
+    }
+    if coverage.http {
+        buf.push_str(
+            r#"{"type":"ACTION_CALL","action":"http","params":{"method":"GET","url":"https://example.com"},"reason":"fetch a single endpoint"}"#,
+        );
+        buf.push('\n');
+    }
+}
+
 fn select_history_for_prompt(history: &[HistoryItem], max_history: usize) -> Vec<&HistoryItem> {
     if max_history == 0 {
         return Vec::new();
@@ -248,22 +318,14 @@ fn build_reactor_system_prompt(
 ) -> String {
     let execution_environment = build_execution_environment_block(context);
     let skill_knowledge = build_skill_knowledge_block(&context.skill_instructions);
+    let capability_catalog = build_capability_catalog(&context.available_actions);
     let mut out = String::new();
     if !base.trim().is_empty() {
         out.push_str(base.trim());
         out.push_str("\n\n");
     }
 
-    out.push_str("You are Orchestral Reactor Planner.\n");
-    out.push_str("This prompt is a short constitution, not a full execution manual.\n");
-    out.push_str(
-        "Planner decides only skeleton selection, current stage, family hint, and derivation posture.\n",
-    );
-    out.push_str("Runtime owns stage lowering, typed action wiring, continuation handling, and verify gates.\n");
-    out.push_str("Continuation must be explicit. Done may only come from verify success.\n");
-    out.push_str(
-        "Do not design a full end-to-end workflow when skeleton/stage choice is sufficient.\n",
-    );
+    out.push_str(REACTOR_CONSTITUTION);
 
     out.push_str("\nBuilt-in skeleton vocabulary:\n");
     out.push_str("- locate_and_patch\n");
@@ -317,13 +379,16 @@ fn build_reactor_system_prompt(
     out.push('\n');
 
     out.push_str("\nHard rules:\n");
-    out.push_str("- Return JSON only.\n");
     out.push_str("- Prefer SKELETON_CHOICE or STAGE_CHOICE for supported local artifact tasks.\n");
     out.push_str("- For SKELETON_CHOICE, initial_stage should follow the skeleton default unless current evidence clearly requires a later stage.\n");
     out.push_str("- Choose only from current executable coverage unless the user explicitly asks for a different reactor skeleton experiment.\n");
     out.push_str("- Do not emit a full workflow DAG for supported reactor tasks.\n");
     out.push_str("- Treat artifact_family as an adapter hint, not as task shape.\n");
     out.push_str("- Treat verification as the only done gate.\n");
+    if !capability_catalog.trim().is_empty() {
+        out.push('\n');
+        out.push_str(&capability_catalog);
+    }
 
     if !execution_environment.trim().is_empty() {
         out.push('\n');

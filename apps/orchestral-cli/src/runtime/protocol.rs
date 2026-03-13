@@ -18,6 +18,7 @@ pub enum RuntimeMsg {
     PlanningEnd,
     ExecutionStart {
         total: usize,
+        execution_mode: Option<String>,
     },
     ExecutionProgress {
         step: usize,

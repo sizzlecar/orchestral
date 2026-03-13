@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-use orchestral_core::planner::{PlanError, PlannerOutput};
+use orchestral_core::planner::{ActionCall, PlanError, PlannerOutput};
 use orchestral_core::types::{
     ArtifactFamily, DerivationPolicy, SkeletonChoice, SkeletonKind, StageChoice, StageKind,
 };
@@ -26,6 +26,13 @@ enum PlannerJsonOutput {
         derivation_policy: DerivationPolicy,
         #[serde(default)]
         next_stage_hint: Option<StageKind>,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    ActionCall {
+        action: String,
+        #[serde(default)]
+        params: serde_json::Value,
         #[serde(default)]
         reason: Option<String>,
     },
@@ -70,6 +77,15 @@ pub(super) fn parse_planner_output(json: &str) -> Result<PlannerOutput, PlanErro
             stage_goal,
             derivation_policy,
             next_stage_hint,
+            reason,
+        })),
+        PlannerJsonOutput::ActionCall {
+            action,
+            params,
+            reason,
+        } => Ok(PlannerOutput::ActionCall(ActionCall {
+            action,
+            params,
             reason,
         })),
         PlannerJsonOutput::DirectResponse { message } => Ok(PlannerOutput::DirectResponse(message)),

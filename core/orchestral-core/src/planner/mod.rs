@@ -12,6 +12,8 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -20,12 +22,22 @@ use crate::store::ReferenceStore;
 use crate::types::{Intent, SkeletonChoice, StageChoice};
 
 /// Planner output - selects skeleton/stage or responds directly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionCall {
+    pub action: String,
+    pub params: Value,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub enum PlannerOutput {
     /// Select the task skeleton before stage-local execution begins.
     SkeletonChoice(SkeletonChoice),
     /// Select the current reactor stage; runtime lowers it into a small stage-local DAG.
     StageChoice(StageChoice),
+    /// Execute a single direct action without opening a stage pipeline.
+    ActionCall(ActionCall),
     /// Reply directly without executing any workflow.
     DirectResponse(String),
     /// Ask user for clarification and wait for next input.
