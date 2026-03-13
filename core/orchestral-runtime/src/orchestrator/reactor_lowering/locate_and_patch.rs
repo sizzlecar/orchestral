@@ -24,7 +24,9 @@ const REACTOR_DOCUMENT_APPLY_ACTION: &str = "reactor_document_apply_patch";
 const REACTOR_DOCUMENT_VERIFY_ACTION: &str = "reactor_document_verify_patch";
 const REACTOR_STRUCTURED_LOCATE_ACTION: &str = "reactor_structured_locate";
 const REACTOR_STRUCTURED_INSPECT_ACTION: &str = "reactor_structured_inspect";
+const REACTOR_STRUCTURED_DERIVE_ACTION: &str = "reactor_structured_derive_candidates";
 const REACTOR_STRUCTURED_ASSESS_ACTION: &str = "reactor_structured_assess_readiness";
+const REACTOR_STRUCTURED_BUILD_PATCH_ACTION: &str = "reactor_structured_build_patch_spec";
 const REACTOR_STRUCTURED_APPLY_ACTION: &str = "reactor_structured_apply_patch";
 const REACTOR_STRUCTURED_VERIFY_ACTION: &str = "reactor_structured_verify_patch";
 
@@ -132,10 +134,10 @@ impl LocateAndPatchFamilyAdapter {
                 "Derive locate_and_patch spreadsheet candidates. Using user_request, source_path, inspection, and derivation_policy, return JSON with keys patch_candidates and summary. patch_candidates must be an object with keys candidates, unknowns, and assumptions. patch_candidates.candidates.cells must describe candidate fills for patchable cells without modifying the file. permissive policy may propose generic but coherent spreadsheet fill content when structure is clear. strict policy should surface unresolved unknowns through patch_candidates.unknowns. Do not decide continuation here."
             }
             ArtifactFamily::Document => {
-                "Derive locate_and_patch document candidates. Using user_request, source_paths, inspection, and derivation_policy, return JSON with keys patch_candidates and summary. patch_candidates must be an object with keys candidates, unknowns, and assumptions. patch_candidates.candidates.files must be an array. Each file entry should contain path, planned_changes, needs_user_input, and unknowns. summary should be a concise change plan. Do not modify files. Do not decide continuation here."
+                "Derive locate_and_patch document candidates. Using user_request, source_paths, inspection, and derivation_policy, return JSON with keys patch_candidates and summary. patch_candidates must be an object with keys candidates, unknowns, and assumptions. patch_candidates.candidates.files must be an array. Each file entry should contain path, planned_changes, needs_user_input, and unknowns. If the requested document change depends on concrete facts not present in user_request or inspection (for example dates, names, amounts, IDs, addresses, contract numbers, or other business facts), you must record them in unknowns, set needs_user_input=true for that file, and avoid inventing values. summary should be a concise change plan. Do not modify files. Do not decide continuation here."
             }
             ArtifactFamily::Structured => {
-                "Derive locate_and_patch structured patch candidates. Using user_request, source_paths, inspection, and derivation_policy, return JSON with keys patch_candidates and summary. patch_candidates must be an object with keys candidates, unknowns, and assumptions. patch_candidates.candidates.files must be an array directly, not wrapped in another object. Each file entry must contain path, operations, needs_user_input, and unknowns. operations must be an array of JSON Pointer edits shaped as {op, path, value?}. Use op=set when assigning a concrete JSON-compatible value and op=remove when deleting a field. When user_request already states an explicit target path and target value or explicit remove instruction, you must mirror that instruction into operations, set needs_user_input=false for that file, and leave unknowns empty unless the referenced path is ambiguous or missing. strict policy should surface unresolved unknowns instead of guessing target values. Do not modify files. Do not decide continuation here."
+                "Derive locate_and_patch structured patch candidates. Using user_request, source_paths, inspection, and derivation_policy, return JSON with keys patch_candidates and summary. patch_candidates must be an object with keys candidates, unknowns, and assumptions. patch_candidates.candidates.files must be an array directly, not wrapped in another object. Each file entry must contain path, operations, needs_user_input, and unknowns. operations must be an array of JSON Pointer edits shaped as {op, path, value?}. Use op=set when assigning a concrete JSON-compatible value and op=remove when deleting a field. inspection.files[*].field_inventory lists canonical field references with selector, pointer, value_type, summary, and value. Use that inventory as the authoritative path model. When user_request names a dotted selector and it uniquely matches a field_inventory.selector, you must use the corresponding field_inventory.pointer in operations and treat the request as explicit enough. When user_request already states an explicit target path and target value or explicit remove instruction, you must mirror that instruction into operations, set needs_user_input=false for that file, and leave unknowns empty unless the referenced path is ambiguous or missing. strict policy should surface unresolved unknowns instead of guessing target values. Do not modify files. Do not decide continuation here."
             }
             unsupported => unreachable!(
                 "locate_and_patch adapter does not support artifact family {:?}",
@@ -153,7 +155,7 @@ impl LocateAndPatchFamilyAdapter {
                 "Commit stage for locate_and_patch document patching. Using user_request, resume_user_input, source_paths, inspection, patch_candidates, and derivation_policy, return JSON with keys patch_spec and summary. patch_candidates follows the derive envelope with candidates, unknowns, and assumptions. patch_spec must be an object with updates. updates must be an array of {path, content}. Generate complete final markdown/text content for each file that needs changes. Replace TODO placeholders with concrete coherent content, add a top-level title when missing, preserve unaffected content, and if resume_user_input requests a summary/report markdown path include an update for that file too. Do not emit unchanged files."
             }
             ArtifactFamily::Structured => {
-                "Commit stage for locate_and_patch structured patching. Using user_request, source_paths, inspection, and derivation_policy, return JSON with keys patch_spec and summary. Treat the explicit user_request as authoritative for requested field updates and removals. patch_spec must be an object with files and optional summary. files must be an array of {path, operations}. operations must be an array of JSON Pointer edits shaped as {op, path, value?}. Use op=set to assign a concrete JSON-compatible value and op=remove to delete a field. Every explicit user-requested update or removal must appear in patch_spec unless the referenced path is missing or ambiguous in inspection. Preserve unrelated keys and do not emit unchanged files."
+                "Commit stage for locate_and_patch structured patching. Using user_request, source_paths, inspection, and derivation_policy, return JSON with keys patch_spec and summary. Treat the explicit user_request as authoritative for requested field updates and removals. patch_spec must be an object with files and optional summary. files must be an array of {path, operations}. operations must be an array of JSON Pointer edits shaped as {op, path, value?}. Use op=set to assign a concrete JSON-compatible value and op=remove to delete a field. inspection.files[*].field_inventory lists canonical field references with selector and pointer; use those pointers as the source of truth when constructing operations. Every explicit user-requested update or removal must appear in patch_spec unless the referenced path is missing or ambiguous in inspection. Preserve unrelated keys and do not emit unchanged files."
             }
             unsupported => unreachable!(
                 "locate_and_patch adapter does not support artifact family {:?}",
@@ -223,6 +225,30 @@ impl LocateAndPatchFamilyAdapter {
         task: &Task,
         choice: &StageChoice,
     ) -> Result<Plan, OrchestratorError> {
+        if matches!(self.artifact_family, ArtifactFamily::Structured) {
+            let mut plan = Plan::new(
+                choice.stage_goal.clone(),
+                vec![Step::action("reactor_derive", REACTOR_STRUCTURED_DERIVE_ACTION)
+                    .with_exports(vec!["patch_candidates".to_string(), "summary".to_string()])
+                    .with_params(serde_json::json!({
+                        "user_request": task.intent.content,
+                        "inspection": task
+                            .working_set_snapshot
+                            .get("inspection")
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                        "derivation_policy": serde_json::to_value(choice.derivation_policy).map_err(|err| {
+                            OrchestratorError::Planner(PlanError::Generation(format!(
+                                "failed to serialize derivation_policy: {}",
+                                err
+                            )))
+                        })?,
+                    }))],
+            );
+            plan.on_failure = Some(format!("{} derive failed: {{error}}", self.family_label()));
+            return Ok(plan);
+        }
+
         let mut params = serde_json::Map::new();
         params.insert("mode".to_string(), serde_json::json!("leaf"));
         params.insert(
@@ -334,6 +360,36 @@ impl LocateAndPatchFamilyAdapter {
         task: &Task,
         choice: &StageChoice,
     ) -> Result<Plan, OrchestratorError> {
+        if matches!(self.artifact_family, ArtifactFamily::Structured) {
+            let mut plan = Plan::new(
+                choice.stage_goal.clone(),
+                vec![
+                    Step::action("reactor_commit_build_patch_spec", REACTOR_STRUCTURED_BUILD_PATCH_ACTION)
+                        .with_exports(vec!["patch_spec".to_string(), "summary".to_string()])
+                        .with_params(serde_json::json!({
+                            "patch_candidates": task
+                                .working_set_snapshot
+                                .get("patch_candidates")
+                                .cloned()
+                                .unwrap_or(Value::Null),
+                        })),
+                    Step::action("reactor_commit_apply", self.apply_action)
+                        .with_depends_on(vec![StepId::from("reactor_commit_build_patch_spec")])
+                        .with_exports(vec![
+                            "updated_paths".to_string(),
+                            "patch_count".to_string(),
+                            "summary".to_string(),
+                        ])
+                        .with_io_bindings(vec![StepIoBinding::required(
+                            "reactor_commit_build_patch_spec.patch_spec",
+                            "patch_spec",
+                        )]),
+                ],
+            );
+            plan.on_failure = Some(format!("{} commit failed: {{error}}", self.family_label()));
+            return Ok(plan);
+        }
+
         let mut params = serde_json::Map::new();
         params.insert("mode".to_string(), serde_json::json!("leaf"));
         params.insert(

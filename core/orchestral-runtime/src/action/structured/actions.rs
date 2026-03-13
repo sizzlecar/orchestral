@@ -5,8 +5,11 @@ use orchestral_core::action::{Action, ActionContext, ActionInput, ActionMeta, Ac
 use orchestral_core::config::ActionSpec;
 
 use super::super::factory::ActionBuildError;
+use crate::action::test_hooks::forced_verify_failure;
 use super::apply::apply_structured_patch;
 use super::assess::assess_structured_readiness;
+use super::commit::build_structured_patch_spec;
+use super::derive::derive_structured_patch_candidates;
 use super::inspect::inspect_structured_files;
 use super::locate::locate_structured_files;
 use super::verify::verify_structured_patch;
@@ -17,7 +20,9 @@ pub fn build_structured_action(
     let action: Box<dyn Action> = match spec.kind.as_str() {
         "structured_locate" => Box::new(StructuredLocateAction::from_spec(spec)),
         "structured_inspect" => Box::new(StructuredInspectAction::from_spec(spec)),
+        "structured_derive_candidates" => Box::new(StructuredDeriveCandidatesAction::from_spec(spec)),
         "structured_assess_readiness" => Box::new(StructuredAssessReadinessAction::from_spec(spec)),
+        "structured_build_patch_spec" => Box::new(StructuredBuildPatchSpecAction::from_spec(spec)),
         "structured_apply_patch" => Box::new(StructuredApplyPatchAction::from_spec(spec)),
         "structured_verify_patch" => Box::new(StructuredVerifyPatchAction::from_spec(spec)),
         _ => return Ok(None),
@@ -157,6 +162,88 @@ impl Action for StructuredInspectAction {
 }
 
 #[derive(Debug)]
+struct StructuredDeriveCandidatesAction {
+    name: String,
+    description: String,
+}
+
+impl StructuredDeriveCandidatesAction {
+    fn from_spec(spec: &ActionSpec) -> Self {
+        Self {
+            name: spec.name.clone(),
+            description: spec.description_or("Derive structured patch candidates"),
+        }
+    }
+}
+
+#[async_trait]
+impl Action for StructuredDeriveCandidatesAction {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn metadata(&self) -> ActionMeta {
+        ActionMeta::new(self.name(), self.description())
+            .with_capabilities(["pure", "structured_output"])
+            .with_roles(["derive", "emit"])
+            .with_input_kinds(["structured", "text"])
+            .with_output_kinds(["structured"])
+            .with_input_schema(json!({
+                "type": "object",
+                "properties": {
+                    "user_request": { "type": "string" },
+                    "inspection": { "type": "object" },
+                    "derivation_policy": { "type": "string" }
+                },
+                "required": ["user_request", "inspection", "derivation_policy"]
+            }))
+            .with_output_schema(json!({
+                "type": "object",
+                "properties": {
+                    "patch_candidates": { "type": "object" },
+                    "summary": { "type": "string" }
+                },
+                "required": ["patch_candidates", "summary"]
+            }))
+    }
+
+    async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
+        let Some(user_request) = input.params.get("user_request").and_then(Value::as_str) else {
+            return ActionResult::error(
+                "Missing user_request for structured_derive_candidates",
+            );
+        };
+        let Some(inspection) = input.params.get("inspection") else {
+            return ActionResult::error("Missing inspection for structured_derive_candidates");
+        };
+        let Some(raw_policy) = input
+            .params
+            .get("derivation_policy")
+            .and_then(Value::as_str)
+        else {
+            return ActionResult::error(
+                "Missing derivation_policy for structured_derive_candidates",
+            );
+        };
+        match derive_structured_patch_candidates(user_request, inspection, raw_policy) {
+            Ok((patch_candidates, summary)) => ActionResult::success_with(
+                [
+                    ("patch_candidates".to_string(), patch_candidates),
+                    ("summary".to_string(), Value::String(summary)),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            Err(error) => ActionResult::error(error),
+        }
+    }
+}
+
+#[derive(Debug)]
 struct StructuredAssessReadinessAction {
     name: String,
     description: String,
@@ -226,6 +313,74 @@ impl Action for StructuredAssessReadinessAction {
             Ok((continuation, summary)) => ActionResult::success_with(
                 [
                     ("continuation".to_string(), continuation),
+                    ("summary".to_string(), Value::String(summary)),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            Err(error) => ActionResult::error(error),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct StructuredBuildPatchSpecAction {
+    name: String,
+    description: String,
+}
+
+impl StructuredBuildPatchSpecAction {
+    fn from_spec(spec: &ActionSpec) -> Self {
+        Self {
+            name: spec.name.clone(),
+            description: spec.description_or("Build a structured patch spec"),
+        }
+    }
+}
+
+#[async_trait]
+impl Action for StructuredBuildPatchSpecAction {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn metadata(&self) -> ActionMeta {
+        ActionMeta::new(self.name(), self.description())
+            .with_capabilities(["pure", "structured_output"])
+            .with_roles(["derive", "emit"])
+            .with_input_kinds(["structured"])
+            .with_output_kinds(["structured"])
+            .with_input_schema(json!({
+                "type": "object",
+                "properties": {
+                    "patch_candidates": { "type": "object" }
+                },
+                "required": ["patch_candidates"]
+            }))
+            .with_output_schema(json!({
+                "type": "object",
+                "properties": {
+                    "patch_spec": { "type": "object" },
+                    "summary": { "type": "string" }
+                },
+                "required": ["patch_spec", "summary"]
+            }))
+    }
+
+    async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
+        let Some(patch_candidates) = input.params.get("patch_candidates") else {
+            return ActionResult::error(
+                "Missing patch_candidates for structured_build_patch_spec",
+            );
+        };
+        match build_structured_patch_spec(patch_candidates) {
+            Ok((patch_spec, summary)) => ActionResult::success_with(
+                [
+                    ("patch_spec".to_string(), patch_spec),
                     ("summary".to_string(), Value::String(summary)),
                 ]
                 .into_iter()
@@ -346,6 +501,22 @@ impl Action for StructuredVerifyPatchAction {
     }
 
     async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
+        if let Some(verify_decision) = forced_verify_failure(self.name()) {
+            return ActionResult::success_with(
+                [
+                    (
+                        "verify_decision".to_string(),
+                        serde_json::to_value(verify_decision).unwrap_or(Value::Null),
+                    ),
+                    (
+                        "summary".to_string(),
+                        Value::String("Structured verification failed.".to_string()),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            );
+        }
         let Some(patch_spec) = input.params.get("patch_spec") else {
             return ActionResult::error("Missing patch_spec for structured_verify_patch");
         };

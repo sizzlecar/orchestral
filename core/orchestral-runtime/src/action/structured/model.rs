@@ -163,6 +163,12 @@ pub(super) fn summarize_structured_value(value: &Value) -> String {
     }
 }
 
+pub(super) fn build_field_inventory(value: &Value) -> Vec<Value> {
+    let mut out = Vec::new();
+    collect_field_inventory(value, String::new(), String::new(), &mut out);
+    out
+}
+
 pub(super) fn apply_structured_operation(
     target: &mut Value,
     operation: &StructuredPatchOperation,
@@ -328,6 +334,53 @@ fn parse_json_pointer(pointer: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
+fn collect_field_inventory(
+    value: &Value,
+    pointer: String,
+    selector: String,
+    out: &mut Vec<Value>,
+) {
+    if !pointer.is_empty() {
+        out.push(serde_json::json!({
+            "pointer": pointer,
+            "selector": selector,
+            "value_type": type_name(value),
+            "summary": summarize_structured_value(value),
+            "value": value,
+        }));
+    }
+
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                let next_pointer = format!("{}/{}", pointer, escape_json_pointer_segment(key));
+                let next_selector = if selector.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{}.{}", selector, key)
+                };
+                collect_field_inventory(child, next_pointer, next_selector, out);
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                let next_pointer = format!("{}/{}", pointer, index);
+                let next_selector = if selector.is_empty() {
+                    format!("[{}]", index)
+                } else {
+                    format!("{}[{}]", selector, index)
+                };
+                collect_field_inventory(child, next_pointer, next_selector, out);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+fn escape_json_pointer_segment(segment: &str) -> String {
+    segment.replace('~', "~0").replace('/', "~1")
+}
+
 fn parse_array_index(segment: &str) -> Result<usize, String> {
     segment
         .parse::<usize>()
@@ -350,5 +403,37 @@ fn type_name(value: &Value) -> &'static str {
         Value::String(_) => "string",
         Value::Array(_) => "array",
         Value::Object(_) => "object",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::build_field_inventory;
+
+    #[test]
+    fn test_build_field_inventory_includes_selector_and_pointer() {
+        let value = json!({
+            "server": {
+                "port": 8080,
+                "host": "127.0.0.1"
+            }
+        });
+
+        let inventory = build_field_inventory(&value);
+        let port = inventory
+            .iter()
+            .find(|item| item.get("pointer").and_then(|v| v.as_str()) == Some("/server/port"))
+            .expect("port entry");
+        assert_eq!(
+            port.get("selector").and_then(|v| v.as_str()),
+            Some("server.port")
+        );
+        assert_eq!(
+            port.get("value_type").and_then(|v| v.as_str()),
+            Some("number")
+        );
+        assert_eq!(port.get("value"), Some(&json!(8080)));
     }
 }

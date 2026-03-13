@@ -2,7 +2,9 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 
-use super::model::{parse_structured_file, summarize_structured_value, StructuredFormat};
+use super::model::{
+    build_field_inventory, parse_structured_file, summarize_structured_value, StructuredFormat,
+};
 use super::support::{display_path, normalize_path};
 
 pub(super) fn inspect_structured_files(source_paths: &[String]) -> Result<Value, String> {
@@ -26,6 +28,7 @@ pub(super) fn inspect_structured_files(source_paths: &[String]) -> Result<Value,
             "format": format.as_str(),
             "top_level_keys": top_level_keys,
             "summary": summarize_structured_value(&parsed),
+            "field_inventory": build_field_inventory(&parsed),
             "value": parsed,
         }));
     }
