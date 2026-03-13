@@ -172,6 +172,8 @@ struct ScenarioArtifactTurnExpect {
 struct ScenarioVerifySpec {
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    phase: ScenarioVerifyPhase,
     command: String,
     #[serde(default)]
     args: Vec<String>,
@@ -189,6 +191,14 @@ struct ScenarioVerifySpec {
     stderr_contains: Vec<String>,
     #[serde(default)]
     stderr_not_contains: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+enum ScenarioVerifyPhase {
+    #[default]
+    AfterExecution,
+    PostTurn,
 }
 
 #[derive(Debug, Clone)]
@@ -556,7 +566,7 @@ async fn execute_prepared_scenario(
                 .await
                 .with_context(|| format!("initialize runtime client for turn '{}'", turn_label))?,
         };
-        let turn_report = execute_turn(
+        let mut turn_report = execute_turn(
             runtime_client,
             turn.clone(),
             prepared.timeout_secs,
@@ -565,9 +575,6 @@ async fn execute_prepared_scenario(
             &turn_label,
         )
         .await?;
-        if !turn_report.passed {
-            failures.push(format!("{} failed", turn_label));
-        }
         snapshots
             .assistants
             .insert(turn_label.clone(), turn_report.assistant_stream.clone());
@@ -577,6 +584,11 @@ async fn execute_prepared_scenario(
             snapshots
                 .artifacts
                 .insert(turn_label.clone(), captured_artifacts);
+        }
+        run_post_turn_verifications(&mut turn_report, &turn.verify).await;
+        turn_report.passed = turn_report.failures.is_empty();
+        if !turn_report.passed {
+            failures.push(format!("{} failed", turn_label));
         }
         reports.push(turn_report);
     }
@@ -880,8 +892,14 @@ async fn execute_turn(
     }
 
     report.duration_ms = started_at.elapsed().as_millis();
-    if report.execution_finished && !turn.verify.is_empty() {
-        report.verifications = run_verifications(&turn.verify).await;
+    let after_execution_verifications = turn
+        .verify
+        .iter()
+        .filter(|verify| verify.phase == ScenarioVerifyPhase::AfterExecution)
+        .cloned()
+        .collect::<Vec<_>>();
+    if report.execution_finished && !after_execution_verifications.is_empty() {
+        report.verifications = run_verifications(&after_execution_verifications).await;
         for verification in &report.verifications {
             if !verification.passed {
                 let label = verification
@@ -903,6 +921,30 @@ async fn execute_turn(
     );
     report.passed = report.failures.is_empty();
     Ok(report)
+}
+
+async fn run_post_turn_verifications(report: &mut TurnReport, verify: &[ScenarioVerifySpec]) {
+    let post_turn = verify
+        .iter()
+        .filter(|item| item.phase == ScenarioVerifyPhase::PostTurn)
+        .cloned()
+        .collect::<Vec<_>>();
+    if post_turn.is_empty() {
+        return;
+    }
+    let results = run_verifications(&post_turn).await;
+    for verification in &results {
+        if !verification.passed {
+            let label = verification
+                .name
+                .clone()
+                .unwrap_or_else(|| verification.command.clone());
+            report
+                .failures
+                .push(format!("verification '{}' failed", label));
+        }
+    }
+    report.verifications.extend(results);
 }
 
 async fn build_runtime_client(
@@ -1876,7 +1918,7 @@ mod tests {
         run_verification, sanitize_name, PreparedWorkspaceCopy, ScenarioArtifactTextExpect,
         ScenarioArtifactTurnExpect, ScenarioCleanupSession, ScenarioCleanupSpec,
         ScenarioCleanupTarget, ScenarioExpect, ScenarioRunOptions, ScenarioSnapshots,
-        ScenarioVerifySpec, TurnReport,
+        ScenarioVerifyPhase, ScenarioVerifySpec, TurnReport,
     };
     use crate::runtime::PlannerOverrides;
     use std::collections::HashMap;
@@ -2422,6 +2464,7 @@ turns:
     async fn test_run_verification_collects_stdout_assertions() {
         let report = run_verification(&ScenarioVerifySpec {
             name: Some("echo".to_string()),
+            phase: ScenarioVerifyPhase::AfterExecution,
             command: "/bin/echo".to_string(),
             args: vec!["ok".to_string()],
             cwd: None,
