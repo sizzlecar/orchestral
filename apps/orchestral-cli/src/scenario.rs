@@ -56,6 +56,8 @@ struct ScenarioSpec {
     #[serde(default)]
     thread_id: Option<String>,
     #[serde(default)]
+    fresh_thread_per_turn: bool,
+    #[serde(default)]
     no_mcp: bool,
     #[serde(default)]
     no_skills: bool,
@@ -146,12 +148,24 @@ struct ScenarioExpect {
     activity_contains_once: Vec<String>,
     #[serde(default)]
     activity_not_repeated: Vec<String>,
+    #[serde(default)]
+    capture_artifacts: Vec<PathBuf>,
+    #[serde(default)]
+    artifact_matches_turn: Vec<ScenarioArtifactTurnExpect>,
+    #[serde(default)]
+    assistant_matches_turn: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct ScenarioArtifactTextExpect {
     path: PathBuf,
     text: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ScenarioArtifactTurnExpect {
+    path: PathBuf,
+    turn: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -185,6 +199,7 @@ struct PreparedScenario {
     planner_overrides: PlannerOverrides,
     report: Option<PathBuf>,
     thread_id: Option<String>,
+    fresh_thread_per_turn: bool,
     no_mcp: bool,
     no_skills: bool,
     timeout_secs: u64,
@@ -224,6 +239,7 @@ struct ScenarioReport {
 #[derive(Debug, Serialize)]
 struct TurnReport {
     name: Option<String>,
+    thread_id: String,
     input: String,
     duration_ms: u128,
     planning_started: bool,
@@ -260,6 +276,12 @@ struct VerificationReport {
     stderr: String,
     passed: bool,
     failures: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ScenarioSnapshots {
+    assistants: HashMap<String, String>,
+    artifacts: HashMap<String, HashMap<PathBuf, String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -486,42 +508,75 @@ async fn execute_prepared_scenario(
     report_path: PathBuf,
 ) -> anyhow::Result<(ScenarioReport, PathBuf)> {
     let started_at_ms = now_ms();
-    let runtime_client = RuntimeClient::from_config(
-        prepared.config.clone(),
-        prepared.thread_id.clone(),
-        prepared.planner_overrides.clone(),
-    )
-    .await
-    .context("initialize runtime client for scenario")?;
-    let thread_id = runtime_client.thread_id().to_string();
+    let shared_runtime_client = if prepared.fresh_thread_per_turn {
+        None
+    } else {
+        Some(
+            build_runtime_client(prepared, prepared.thread_id.clone())
+                .await
+                .context("initialize runtime client for scenario")?,
+        )
+    };
+    let thread_id = shared_runtime_client
+        .as_ref()
+        .map(|client| client.thread_id().to_string())
+        .unwrap_or_else(|| "fresh-per-turn".to_string());
 
     if prepared.verbose {
-        println!(
-            "Scenario name={} thread_id={} timeout={}s report={}",
-            prepared.name,
-            thread_id,
-            prepared.timeout_secs,
-            report_path.display()
-        );
+        if prepared.fresh_thread_per_turn {
+            println!(
+                "Scenario name={} thread_mode=fresh-per-turn timeout={}s report={}",
+                prepared.name,
+                prepared.timeout_secs,
+                report_path.display()
+            );
+        } else {
+            println!(
+                "Scenario name={} thread_id={} timeout={}s report={}",
+                prepared.name,
+                thread_id,
+                prepared.timeout_secs,
+                report_path.display()
+            );
+        }
     }
 
     let mut reports = Vec::with_capacity(prepared.turns.len());
     let mut failures = Vec::new();
     let workspace_dir = std::env::var_os("ORCHESTRAL_SCENARIO_WORKSPACE_DIR").map(PathBuf::from);
+    let mut snapshots = ScenarioSnapshots::default();
     for (index, turn) in prepared.turns.iter().enumerate() {
+        let turn_label = turn
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("turn-{}", index + 1));
+        let runtime_client = match &shared_runtime_client {
+            Some(client) => client.clone(),
+            None => build_runtime_client(prepared, None)
+                .await
+                .with_context(|| format!("initialize runtime client for turn '{}'", turn_label))?,
+        };
         let turn_report = execute_turn(
-            runtime_client.clone(),
+            runtime_client,
             turn.clone(),
             prepared.timeout_secs,
             workspace_dir.as_deref(),
+            &snapshots,
+            &turn_label,
         )
         .await?;
         if !turn_report.passed {
-            let turn_name = turn
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("turn-{}", index + 1));
-            failures.push(format!("{} failed", turn_name));
+            failures.push(format!("{} failed", turn_label));
+        }
+        snapshots
+            .assistants
+            .insert(turn_label.clone(), turn_report.assistant_stream.clone());
+        let captured_artifacts =
+            capture_turn_artifacts(&turn.expect.capture_artifacts, workspace_dir.as_deref())?;
+        if !captured_artifacts.is_empty() {
+            snapshots
+                .artifacts
+                .insert(turn_label.clone(), captured_artifacts);
         }
         reports.push(turn_report);
     }
@@ -604,6 +659,12 @@ fn prepare_scenario(options: ScenarioRunOptions) -> anyhow::Result<PreparedScena
                 spec_path.display()
             );
         }
+        if spec.fresh_thread_per_turn && (options.thread_id.is_some() || spec.thread_id.is_some()) {
+            bail!(
+                "scenario spec '{}' cannot combine thread_id with fresh_thread_per_turn",
+                spec_path.display()
+            );
+        }
         let base_dir = spec_path.parent().unwrap_or_else(|| Path::new("."));
         spec.env_file = options
             .env_file
@@ -669,6 +730,7 @@ fn prepare_scenario(options: ScenarioRunOptions) -> anyhow::Result<PreparedScena
             planner_overrides,
             report: spec.report,
             thread_id: options.thread_id.or(spec.thread_id),
+            fresh_thread_per_turn: spec.fresh_thread_per_turn,
             no_mcp: options.no_mcp || spec.no_mcp,
             no_skills: options.no_skills || spec.no_skills,
             timeout_secs: spec.timeout_secs.unwrap_or(options.timeout_secs),
@@ -689,6 +751,7 @@ fn prepare_scenario(options: ScenarioRunOptions) -> anyhow::Result<PreparedScena
         planner_overrides: options.planner_overrides,
         report: options.report,
         thread_id: options.thread_id,
+        fresh_thread_per_turn: false,
         no_mcp: options.no_mcp,
         no_skills: options.no_skills,
         timeout_secs: options.timeout_secs,
@@ -717,6 +780,9 @@ fn prepare_scenario(options: ScenarioRunOptions) -> anyhow::Result<PreparedScena
                 artifact_not_contains: Vec::new(),
                 activity_contains_once: Vec::new(),
                 activity_not_repeated: Vec::new(),
+                capture_artifacts: Vec::new(),
+                artifact_matches_turn: Vec::new(),
+                assistant_matches_turn: Vec::new(),
             },
             verify: Vec::new(),
         }],
@@ -750,6 +816,8 @@ async fn execute_turn(
     turn: ScenarioTurnSpec,
     timeout_secs: u64,
     workspace_dir: Option<&Path>,
+    snapshots: &ScenarioSnapshots,
+    turn_label: &str,
 ) -> anyhow::Result<TurnReport> {
     let (tx, mut rx) = mpsc::channel::<RuntimeMsg>(256);
     let input = turn.input.clone();
@@ -759,6 +827,7 @@ async fn execute_turn(
     let started_at = Instant::now();
     let mut report = TurnReport {
         name: turn.name.clone(),
+        thread_id: runtime_client.thread_id().to_string(),
         input: turn.input.clone(),
         duration_ms: 0,
         planning_started: false,
@@ -825,9 +894,27 @@ async fn execute_turn(
             }
         }
     }
-    evaluate_expectations(&mut report, &turn.expect, workspace_dir);
+    evaluate_expectations(
+        &mut report,
+        &turn.expect,
+        workspace_dir,
+        snapshots,
+        turn_label,
+    );
     report.passed = report.failures.is_empty();
     Ok(report)
+}
+
+async fn build_runtime_client(
+    prepared: &PreparedScenario,
+    thread_id_override: Option<String>,
+) -> anyhow::Result<RuntimeClient> {
+    RuntimeClient::from_config(
+        prepared.config.clone(),
+        thread_id_override,
+        prepared.planner_overrides.clone(),
+    )
+    .await
 }
 
 fn handle_runtime_msg(report: &mut TurnReport, msg: RuntimeMsg) {
@@ -907,6 +994,8 @@ fn evaluate_expectations(
     report: &mut TurnReport,
     expect: &ScenarioExpect,
     workspace_dir: Option<&Path>,
+    snapshots: &ScenarioSnapshots,
+    turn_label: &str,
 ) {
     if expect.require_execution_end && !report.execution_finished {
         report
@@ -1031,6 +1120,19 @@ fn evaluate_expectations(
         &expect.activity_not_repeated,
         0,
         1,
+        &mut report.failures,
+    );
+    assert_artifact_matches_turn(
+        &expect.artifact_matches_turn,
+        workspace_dir,
+        snapshots,
+        &mut report.failures,
+    );
+    assert_assistant_matches_turn(
+        &report.assistant_stream,
+        &expect.assistant_matches_turn,
+        snapshots,
+        turn_label,
         &mut report.failures,
     );
 }
@@ -1357,6 +1459,83 @@ fn read_artifact_text(path: &Path, workspace_dir: Option<&Path>) -> anyhow::Resu
     };
     fs::read_to_string(&resolved)
         .with_context(|| format!("read artifact '{}' failed", resolved.display()))
+}
+
+fn capture_turn_artifacts(
+    paths: &[PathBuf],
+    workspace_dir: Option<&Path>,
+) -> anyhow::Result<HashMap<PathBuf, String>> {
+    let mut captured = HashMap::new();
+    for path in paths {
+        let content = read_artifact_text(path, workspace_dir)?;
+        captured.insert(path.clone(), content);
+    }
+    Ok(captured)
+}
+
+fn assert_artifact_matches_turn(
+    expects: &[ScenarioArtifactTurnExpect],
+    workspace_dir: Option<&Path>,
+    snapshots: &ScenarioSnapshots,
+    failures: &mut Vec<String>,
+) {
+    for expect in expects {
+        let Some(turn_artifacts) = snapshots.artifacts.get(&expect.turn) else {
+            failures.push(format!(
+                "expected artifact snapshot for turn '{}' but none was recorded",
+                expect.turn
+            ));
+            continue;
+        };
+        let Some(expected_content) = turn_artifacts.get(&expect.path) else {
+            failures.push(format!(
+                "expected artifact '{}' to be captured for turn '{}'",
+                expect.path.display(),
+                expect.turn
+            ));
+            continue;
+        };
+        match read_artifact_text(&expect.path, workspace_dir) {
+            Ok(actual_content) => {
+                if &actual_content != expected_content {
+                    failures.push(format!(
+                        "expected artifact '{}' to match turn '{}'",
+                        expect.path.display(),
+                        expect.turn
+                    ));
+                }
+            }
+            Err(err) => failures.push(format!(
+                "failed reading artifact '{}' for turn comparison: {}",
+                expect.path.display(),
+                err
+            )),
+        }
+    }
+}
+
+fn assert_assistant_matches_turn(
+    assistant_stream: &str,
+    turn_names: &[String],
+    snapshots: &ScenarioSnapshots,
+    turn_label: &str,
+    failures: &mut Vec<String>,
+) {
+    for turn_name in turn_names {
+        let Some(expected) = snapshots.assistants.get(turn_name) else {
+            failures.push(format!(
+                "expected assistant snapshot for turn '{}' but none was recorded",
+                turn_name
+            ));
+            continue;
+        };
+        if assistant_stream.trim() != expected.trim() {
+            failures.push(format!(
+                "expected assistant output for '{}' to match turn '{}'",
+                turn_label, turn_name
+            ));
+        }
+    }
 }
 
 fn assert_line_occurrence(
@@ -1693,10 +1872,13 @@ fn now_ms() -> u128 {
 mod tests {
     use super::{
         archive_runtime_log, assert_contains, command_looks_like_path, evaluate_expectations,
-        materialize_workspace, parse_status_line, resolve_relative, run_verification,
-        sanitize_name, PreparedWorkspaceCopy, ScenarioArtifactTextExpect, ScenarioCleanupSession,
-        ScenarioCleanupSpec, ScenarioCleanupTarget, ScenarioExpect, ScenarioVerifySpec, TurnReport,
+        materialize_workspace, parse_status_line, prepare_scenario, resolve_relative,
+        run_verification, sanitize_name, PreparedWorkspaceCopy, ScenarioArtifactTextExpect,
+        ScenarioArtifactTurnExpect, ScenarioCleanupSession, ScenarioCleanupSpec,
+        ScenarioCleanupTarget, ScenarioExpect, ScenarioRunOptions, ScenarioSnapshots,
+        ScenarioVerifySpec, TurnReport,
     };
+    use crate::runtime::PlannerOverrides;
     use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1724,9 +1906,57 @@ mod tests {
     }
 
     #[test]
+    fn test_prepare_scenario_rejects_thread_id_with_fresh_thread_per_turn() {
+        let spec_path = std::env::temp_dir().join(format!(
+            "orchestral-scenario-conflict-{}.yaml",
+            super::now_ms()
+        ));
+        fs::write(
+            &spec_path,
+            r#"
+version: 1
+name: conflict
+thread_id: fixed-thread
+fresh_thread_per_turn: true
+turns:
+  - input: hello
+"#,
+        )
+        .expect("write spec");
+
+        let error = prepare_scenario(ScenarioRunOptions {
+            spec: Some(spec_path.clone()),
+            env_file: None,
+            config: None,
+            planner_overrides: PlannerOverrides::default(),
+            report: None,
+            thread_id: None,
+            no_mcp: false,
+            no_skills: false,
+            timeout_secs: 30,
+            verbose: false,
+            input: None,
+            persist_contains: Vec::new(),
+            persist_not_contains: Vec::new(),
+            transient_contains: Vec::new(),
+            transient_not_contains: Vec::new(),
+            max_approvals: None,
+            max_errors: None,
+            allow_missing_execution_end: false,
+        })
+        .expect_err("conflicting thread modes should fail");
+
+        assert!(error
+            .to_string()
+            .contains("cannot combine thread_id with fresh_thread_per_turn"));
+        let _ = fs::remove_file(spec_path);
+    }
+
+    #[test]
     fn test_evaluate_expectations_collects_failures() {
         let mut report = TurnReport {
             name: None,
+            thread_id: "thread-1".to_string(),
             input: "hello".to_string(),
             duration_ms: 0,
             planning_started: true,
@@ -1765,9 +1995,18 @@ mod tests {
             artifact_not_contains: Vec::new(),
             activity_contains_once: Vec::new(),
             activity_not_repeated: Vec::new(),
+            capture_artifacts: Vec::new(),
+            artifact_matches_turn: Vec::new(),
+            assistant_matches_turn: Vec::new(),
         };
 
-        evaluate_expectations(&mut report, &expect, None);
+        evaluate_expectations(
+            &mut report,
+            &expect,
+            None,
+            &ScenarioSnapshots::default(),
+            "turn-1",
+        );
         assert!(report
             .failures
             .iter()
@@ -1782,6 +2021,7 @@ mod tests {
     fn test_evaluate_expectations_fails_on_failed_status() {
         let mut report = TurnReport {
             name: None,
+            thread_id: "thread-1".to_string(),
             input: "hello".to_string(),
             duration_ms: 0,
             planning_started: true,
@@ -1801,7 +2041,13 @@ mod tests {
             failures: Vec::new(),
             passed: false,
         };
-        evaluate_expectations(&mut report, &ScenarioExpect::default(), None);
+        evaluate_expectations(
+            &mut report,
+            &ScenarioExpect::default(),
+            None,
+            &ScenarioSnapshots::default(),
+            "turn-1",
+        );
         assert!(report
             .failures
             .iter()
@@ -1824,6 +2070,7 @@ mod tests {
     fn test_evaluate_expectations_checks_assistant_and_execution_mode() {
         let mut report = TurnReport {
             name: None,
+            thread_id: "thread-1".to_string(),
             input: "hello".to_string(),
             duration_ms: 0,
             planning_started: true,
@@ -1862,9 +2109,18 @@ mod tests {
             artifact_not_contains: Vec::new(),
             activity_contains_once: Vec::new(),
             activity_not_repeated: Vec::new(),
+            capture_artifacts: Vec::new(),
+            artifact_matches_turn: Vec::new(),
+            assistant_matches_turn: Vec::new(),
         };
 
-        evaluate_expectations(&mut report, &expect, None);
+        evaluate_expectations(
+            &mut report,
+            &expect,
+            None,
+            &ScenarioSnapshots::default(),
+            "turn-1",
+        );
         assert!(report.failures.is_empty());
     }
 
@@ -1872,6 +2128,7 @@ mod tests {
     fn test_evaluate_expectations_allows_expected_failed_status() {
         let mut report = TurnReport {
             name: None,
+            thread_id: "thread-1".to_string(),
             input: "hello".to_string(),
             duration_ms: 0,
             planning_started: true,
@@ -1910,9 +2167,18 @@ mod tests {
             artifact_not_contains: Vec::new(),
             activity_contains_once: Vec::new(),
             activity_not_repeated: Vec::new(),
+            capture_artifacts: Vec::new(),
+            artifact_matches_turn: Vec::new(),
+            assistant_matches_turn: Vec::new(),
         };
 
-        evaluate_expectations(&mut report, &expect, None);
+        evaluate_expectations(
+            &mut report,
+            &expect,
+            None,
+            &ScenarioSnapshots::default(),
+            "turn-1",
+        );
         assert!(report.failures.is_empty());
     }
 
@@ -1929,6 +2195,7 @@ mod tests {
 
         let mut report = TurnReport {
             name: None,
+            thread_id: "thread-1".to_string(),
             input: "hello".to_string(),
             duration_ms: 0,
             planning_started: true,
@@ -1973,9 +2240,18 @@ mod tests {
             }],
             activity_contains_once: Vec::new(),
             activity_not_repeated: Vec::new(),
+            capture_artifacts: Vec::new(),
+            artifact_matches_turn: Vec::new(),
+            assistant_matches_turn: Vec::new(),
         };
 
-        evaluate_expectations(&mut report, &expect, Some(root.as_path()));
+        evaluate_expectations(
+            &mut report,
+            &expect,
+            Some(root.as_path()),
+            &ScenarioSnapshots::default(),
+            "turn-1",
+        );
         assert!(report.failures.is_empty());
     }
 
@@ -1983,6 +2259,7 @@ mod tests {
     fn test_evaluate_expectations_checks_activity_occurrence_bounds() {
         let mut report = TurnReport {
             name: None,
+            thread_id: "thread-1".to_string(),
             input: "hello".to_string(),
             duration_ms: 0,
             planning_started: true,
@@ -2031,9 +2308,97 @@ mod tests {
             activity_not_repeated: vec![
                 r#"[start Ran] reactor_commit_apply reactor_spreadsheet_apply_patch"#.to_string(),
             ],
+            capture_artifacts: Vec::new(),
+            artifact_matches_turn: Vec::new(),
+            assistant_matches_turn: Vec::new(),
         };
 
-        evaluate_expectations(&mut report, &expect, None);
+        evaluate_expectations(
+            &mut report,
+            &expect,
+            None,
+            &ScenarioSnapshots::default(),
+            "turn-1",
+        );
+        assert!(report.failures.is_empty());
+    }
+
+    #[test]
+    fn test_evaluate_expectations_checks_turn_snapshots() {
+        let root =
+            std::env::temp_dir().join(format!("orchestral-scenario-snapshot-{}", super::now_ms()));
+        fs::create_dir_all(root.join("fixtures/docs")).expect("create docs dir");
+        fs::write(root.join("fixtures/docs/summary.md"), "stable summary\n")
+            .expect("write artifact");
+
+        let mut snapshots = ScenarioSnapshots::default();
+        snapshots
+            .assistants
+            .insert("run-1".to_string(), "stable reply".to_string());
+        snapshots.artifacts.insert(
+            "run-1".to_string(),
+            HashMap::from([(
+                PathBuf::from("fixtures/docs/summary.md"),
+                "stable summary\n".to_string(),
+            )]),
+        );
+
+        let mut report = TurnReport {
+            name: Some("run-2".to_string()),
+            thread_id: "thread-2".to_string(),
+            input: "hello".to_string(),
+            duration_ms: 0,
+            planning_started: true,
+            planning_finished: true,
+            execution_started: true,
+            execution_finished: true,
+            execution_status: Some("completed".to_string()),
+            timed_out: false,
+            approvals: Vec::new(),
+            errors: Vec::new(),
+            persist_lines: Vec::new(),
+            transient_lines: Vec::new(),
+            activity_lines: Vec::new(),
+            assistant_stream: "stable reply".to_string(),
+            execution_modes: Vec::new(),
+            verifications: Vec::new(),
+            failures: Vec::new(),
+            passed: false,
+        };
+        let expect = ScenarioExpect {
+            require_execution_end: true,
+            execution_status: Some("completed".to_string()),
+            max_approvals: Some(0),
+            max_errors: Some(0),
+            persist_contains: Vec::new(),
+            persist_not_contains: Vec::new(),
+            transient_contains: Vec::new(),
+            transient_not_contains: Vec::new(),
+            activity_contains: Vec::new(),
+            activity_not_contains: Vec::new(),
+            assistant_contains: Vec::new(),
+            assistant_not_contains: Vec::new(),
+            execution_mode_contains: Vec::new(),
+            execution_mode_not_contains: Vec::new(),
+            artifact_contains: Vec::new(),
+            artifact_not_contains: Vec::new(),
+            activity_contains_once: Vec::new(),
+            activity_not_repeated: Vec::new(),
+            capture_artifacts: Vec::new(),
+            artifact_matches_turn: vec![ScenarioArtifactTurnExpect {
+                path: PathBuf::from("fixtures/docs/summary.md"),
+                turn: "run-1".to_string(),
+            }],
+            assistant_matches_turn: vec!["run-1".to_string()],
+        };
+
+        evaluate_expectations(
+            &mut report,
+            &expect,
+            Some(root.as_path()),
+            &snapshots,
+            "run-2",
+        );
         assert!(report.failures.is_empty());
     }
 
