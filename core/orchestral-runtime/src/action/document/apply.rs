@@ -51,8 +51,9 @@ pub(super) fn apply_document_patch(
                     )
                 })?;
             }
-            fs::write(path, report_content.as_bytes())
-                .map_err(|err| format!("write document report '{}' failed: {}", report_path, err))?;
+            fs::write(path, report_content.as_bytes()).map_err(|err| {
+                format!("write document report '{}' failed: {}", report_path, err)
+            })?;
             updated_paths.push(report_path.to_string());
         }
     }

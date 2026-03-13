@@ -119,8 +119,9 @@ mod tests {
             ]
         });
 
-        let exports = apply_document_patch(&patch_spec, Some(report_path.to_string_lossy().as_ref()))
-            .expect("apply document patch");
+        let exports =
+            apply_document_patch(&patch_spec, Some(report_path.to_string_lossy().as_ref()))
+                .expect("apply document patch");
         let report = fs::read_to_string(&report_path).expect("read report");
 
         assert!(report.contains("# Patch Summary"));
@@ -129,7 +130,9 @@ mod tests {
         assert!(exports
             .get("updated_paths")
             .and_then(Value::as_array)
-            .is_some_and(|paths| paths.iter().any(|value| value.as_str() == Some(report_path.to_string_lossy().as_ref()))));
+            .is_some_and(|paths| paths
+                .iter()
+                .any(|value| value.as_str() == Some(report_path.to_string_lossy().as_ref()))));
 
         let _ = fs::remove_dir_all(root);
     }

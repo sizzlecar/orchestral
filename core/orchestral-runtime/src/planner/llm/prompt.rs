@@ -6,8 +6,27 @@ use orchestral_core::types::{DerivationPolicy, Intent};
 use super::catalog::build_capability_catalog;
 
 const REACTOR_CONSTITUTION: &str = include_str!("../../prompts/reactor_constitution.md");
+const NON_REACTOR_CONSTITUTION: &str = include_str!("../../prompts/non_reactor_constitution.md");
 const OUTPUT_CONTRACT: &str = include_str!("../../prompts/output_contract.md");
 const ACTION_CALL_RULES: &str = include_str!("../../prompts/action_call_rules.md");
+const REACTOR_SKELETON_VOCABULARY: &str =
+    include_str!("../../prompts/reactor_skeleton_vocabulary.md");
+const REACTOR_HARD_RULES: &str = include_str!("../../prompts/reactor_hard_rules.md");
+const REACTOR_USER_RULES: &str = include_str!("../../prompts/reactor_user_rules.md");
+const NON_REACTOR_USER_RULES: &str = include_str!("../../prompts/non_reactor_user_rules.md");
+const EXAMPLE_REACTOR_SPREADSHEET: &str =
+    include_str!("../../prompts/examples/reactor_spreadsheet.jsonl");
+const EXAMPLE_REACTOR_DOCUMENT: &str =
+    include_str!("../../prompts/examples/reactor_document.jsonl");
+const EXAMPLE_REACTOR_STRUCTURED: &str =
+    include_str!("../../prompts/examples/reactor_structured.jsonl");
+const EXAMPLE_ACTION_CALL_SHELL: &str =
+    include_str!("../../prompts/examples/action_call_shell.json");
+const EXAMPLE_ACTION_CALL_FILE_READ: &str =
+    include_str!("../../prompts/examples/action_call_file_read.json");
+const EXAMPLE_ACTION_CALL_HTTP: &str = include_str!("../../prompts/examples/action_call_http.json");
+const EXAMPLE_DIRECT_RESPONSE: &str = include_str!("../../prompts/examples/direct_response.json");
+const EXAMPLE_CLARIFICATION: &str = include_str!("../../prompts/examples/clarification.json");
 
 #[derive(Debug, Clone, Copy, Default)]
 struct ReactorPromptCoverage {
@@ -53,24 +72,14 @@ pub(super) fn build_reactor_prompt(
     user.push_str("\n\nExamples:\n");
     append_reactor_choice_examples(&mut user, coverage);
     append_action_call_examples(&mut user, direct_actions);
-    user.push_str(r#"{"type":"DIRECT_RESPONSE","message":"..."}"#);
-    user.push('\n');
-    user.push_str(r#"{"type":"CLARIFICATION","question":"..."}"#);
-    user.push_str(
-        "\nRules:\n- For supported local artifact work, first pass should prefer SKELETON_CHOICE.\n- Use STAGE_CHOICE when the task already belongs to a skeleton and you are choosing the next stage.\n- For SKELETON_CHOICE, initial_stage should follow the skeleton default unless current evidence clearly requires a later stage.\n- skeleton must be one of the supported skeletons.\n- artifact_family must match a supported family when returning STAGE_CHOICE; for SKELETON_CHOICE it may be omitted if not yet certain.\n- derivation_policy must be \"strict\" or \"permissive\" when returning STAGE_CHOICE.\n",
-    );
+    append_example_line(&mut user, EXAMPLE_DIRECT_RESPONSE);
+    append_example_line(&mut user, EXAMPLE_CLARIFICATION);
+    append_rule_block(&mut user, REACTOR_USER_RULES);
     user.push_str(&format!(
         "- Default derivation_policy is \"{}\" unless the task clearly needs otherwise.\n",
         default_policy
     ));
-    user.push_str("- Do not generate a full workflow DAG for supported reactor tasks.\n");
-    user.push_str("- Continuation is structural. Prefer explicit wait_user or next_stage_hint over vague narration.\n");
-    user.push_str("- Never use assistant narration as a completion signal.\n");
-    for line in ACTION_CALL_RULES.lines() {
-        user.push_str("- ");
-        user.push_str(line);
-        user.push('\n');
-    }
+    append_rule_lines(&mut user, ACTION_CALL_RULES);
 
     (system, user)
 }
@@ -97,17 +106,10 @@ pub(super) fn build_non_reactor_prompt(
     user.push_str(OUTPUT_CONTRACT);
     user.push_str("\n\nExamples:\n");
     append_action_call_examples(&mut user, direct_actions);
-    user.push_str(r#"{"type":"DIRECT_RESPONSE","message":"..."}"#);
-    user.push('\n');
-    user.push_str(r#"{"type":"CLARIFICATION","question":"..."}"#);
-    user.push_str(
-        "\nRules:\n- Reactor execution is disabled for this planner invocation.\n- Do not emit workflow, plan, recipe, or action topology.\n",
-    );
-    for line in ACTION_CALL_RULES.lines() {
-        user.push_str("- ");
-        user.push_str(line);
-        user.push('\n');
-    }
+    append_example_line(&mut user, EXAMPLE_DIRECT_RESPONSE);
+    append_example_line(&mut user, EXAMPLE_CLARIFICATION);
+    append_rule_block(&mut user, NON_REACTOR_USER_RULES);
+    append_rule_lines(&mut user, ACTION_CALL_RULES);
 
     (system, user)
 }
@@ -120,9 +122,7 @@ pub(super) fn build_non_reactor_system_prompt(base: &str, context: &PlannerConte
         out.push_str(base.trim());
         out.push_str("\n\n");
     }
-    out.push_str("You are Orchestral Planner.\n");
-    out.push_str("Reactor pipelines are disabled in this mode.\n");
-    out.push_str("Return only ACTION_CALL, DIRECT_RESPONSE, or CLARIFICATION.\n");
+    out.push_str(NON_REACTOR_CONSTITUTION);
     let capability_catalog = build_capability_catalog(&context.available_actions);
     if !capability_catalog.trim().is_empty() {
         out.push('\n');
@@ -210,80 +210,74 @@ fn has_action(context: &PlannerContext, name: &str) -> bool {
 
 fn append_reactor_choice_examples(buf: &mut String, coverage: ReactorPromptCoverage) {
     if coverage.spreadsheet {
-        buf.push_str(
-            r#"{"type":"SKELETON_CHOICE","skeleton":"locate_and_patch","artifact_family":"spreadsheet","initial_stage":"locate","confidence":0.9,"reason":"..."}"#,
-        );
-        buf.push('\n');
-        buf.push_str(
-            r#"{"type":"STAGE_CHOICE","skeleton":"locate_and_patch","artifact_family":"spreadsheet","current_stage":"probe","stage_goal":"inspect workbook structure","derivation_policy":"permissive","next_stage_hint":"derive","reason":"..."}"#,
-        );
-        buf.push('\n');
-        buf.push_str(
-            r#"{"type":"SKELETON_CHOICE","skeleton":"inspect_and_extract","artifact_family":"spreadsheet","initial_stage":"probe","confidence":0.9,"reason":"..."}"#,
-        );
-        buf.push('\n');
-        buf.push_str(
-            r#"{"type":"STAGE_CHOICE","skeleton":"inspect_and_extract","artifact_family":"spreadsheet","current_stage":"probe","stage_goal":"inspect the artifact and collect structured findings","derivation_policy":"permissive","next_stage_hint":"derive","reason":"..."}"#,
-        );
-        buf.push('\n');
+        append_example_lines(buf, EXAMPLE_REACTOR_SPREADSHEET);
     }
     if coverage.document {
-        buf.push_str(
-            r#"{"type":"SKELETON_CHOICE","skeleton":"locate_and_patch","artifact_family":"document","initial_stage":"locate","confidence":0.9,"reason":"..."}"#,
-        );
-        buf.push('\n');
-        buf.push_str(
-            r#"{"type":"STAGE_CHOICE","skeleton":"locate_and_patch","artifact_family":"document","current_stage":"probe","stage_goal":"inspect document structure","derivation_policy":"permissive","next_stage_hint":"derive","reason":"..."}"#,
-        );
-        buf.push('\n');
-        buf.push_str(
-            r#"{"type":"SKELETON_CHOICE","skeleton":"inspect_and_extract","artifact_family":"document","initial_stage":"probe","confidence":0.9,"reason":"..."}"#,
-        );
-        buf.push('\n');
-        buf.push_str(
-            r#"{"type":"STAGE_CHOICE","skeleton":"inspect_and_extract","artifact_family":"document","current_stage":"probe","stage_goal":"inspect the artifact and collect structured findings","derivation_policy":"permissive","next_stage_hint":"derive","reason":"..."}"#,
-        );
-        buf.push('\n');
+        append_example_lines(buf, EXAMPLE_REACTOR_DOCUMENT);
     }
     if coverage.structured {
-        buf.push_str(
-            r#"{"type":"SKELETON_CHOICE","skeleton":"locate_and_patch","artifact_family":"structured","initial_stage":"locate","confidence":0.9,"reason":"..."}"#,
-        );
-        buf.push('\n');
-        buf.push_str(
-            r#"{"type":"STAGE_CHOICE","skeleton":"locate_and_patch","artifact_family":"structured","current_stage":"probe","stage_goal":"inspect structured artifact contents","derivation_policy":"strict","next_stage_hint":"derive","reason":"..."}"#,
-        );
-        buf.push('\n');
-        buf.push_str(
-            r#"{"type":"SKELETON_CHOICE","skeleton":"inspect_and_extract","artifact_family":"structured","initial_stage":"probe","confidence":0.9,"reason":"..."}"#,
-        );
-        buf.push('\n');
-        buf.push_str(
-            r#"{"type":"STAGE_CHOICE","skeleton":"inspect_and_extract","artifact_family":"structured","current_stage":"probe","stage_goal":"inspect the artifact and collect structured findings","derivation_policy":"strict","next_stage_hint":"derive","reason":"..."}"#,
-        );
-        buf.push('\n');
+        append_example_lines(buf, EXAMPLE_REACTOR_STRUCTURED);
     }
 }
 
 fn append_action_call_examples(buf: &mut String, coverage: DirectActionCoverage) {
     if coverage.shell {
-        buf.push_str(
-            r#"{"type":"ACTION_CALL","action":"shell","params":{"command":"find ./docs -maxdepth 1 -type f"},"reason":"list files under docs"}"#,
-        );
-        buf.push('\n');
+        append_example_line(buf, EXAMPLE_ACTION_CALL_SHELL);
     }
     if coverage.file_read {
-        buf.push_str(
-            r#"{"type":"ACTION_CALL","action":"file_read","params":{"path":"README.md"},"reason":"read README"}"#,
-        );
-        buf.push('\n');
+        append_example_line(buf, EXAMPLE_ACTION_CALL_FILE_READ);
     }
     if coverage.http {
-        buf.push_str(
-            r#"{"type":"ACTION_CALL","action":"http","params":{"method":"GET","url":"https://example.com"},"reason":"fetch a single endpoint"}"#,
-        );
+        append_example_line(buf, EXAMPLE_ACTION_CALL_HTTP);
+    }
+}
+
+fn append_rule_block(buf: &mut String, block: &str) {
+    buf.push('\n');
+    buf.push_str(block.trim());
+    buf.push('\n');
+}
+
+fn append_rule_lines(buf: &mut String, block: &str) {
+    for line in block.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        buf.push_str("- ");
+        buf.push_str(line);
         buf.push('\n');
     }
+}
+
+fn append_example_line(buf: &mut String, example: &str) {
+    buf.push_str(example.trim());
+    buf.push('\n');
+}
+
+fn append_example_lines(buf: &mut String, examples: &str) {
+    for line in examples
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        buf.push_str(line);
+        buf.push('\n');
+    }
+}
+
+fn append_reactor_coverage(out: &mut String, artifact_family: &str) {
+    let _ = writeln!(
+        out,
+        "- skeleton=locate_and_patch, artifact_family={}",
+        artifact_family
+    );
+    out.push_str("  covered stage path: locate -> probe -> derive -> assess -> commit -> verify\n");
+    out.push_str("  probe must end with explicit continuation\n");
+    out.push_str("  verify is the done gate\n");
+    let _ = writeln!(
+        out,
+        "- skeleton=inspect_and_extract, artifact_family={}",
+        artifact_family
+    );
+    out.push_str("  covered stage path: probe -> derive -> export -> verify\n");
+    out.push_str("  verify is the done gate\n");
 }
 
 fn select_history_for_prompt(history: &[HistoryItem], max_history: usize) -> Vec<&HistoryItem> {
@@ -327,46 +321,18 @@ fn build_reactor_system_prompt(
 
     out.push_str(REACTOR_CONSTITUTION);
 
-    out.push_str("\nBuilt-in skeleton vocabulary:\n");
-    out.push_str("- locate_and_patch\n");
-    out.push_str("- inspect_and_extract\n");
-    out.push_str("- inspect_and_transform\n");
-    out.push_str("- compare_and_sync\n");
-    out.push_str("- run_and_verify\n");
+    out.push('\n');
+    out.push_str(REACTOR_SKELETON_VOCABULARY);
 
     out.push_str("\nCurrent executable coverage:\n");
     if coverage.spreadsheet {
-        out.push_str("- skeleton=locate_and_patch, artifact_family=spreadsheet\n");
-        out.push_str(
-            "  covered stage path: locate -> probe -> derive -> assess -> commit -> verify\n",
-        );
-        out.push_str("  probe must end with explicit continuation\n");
-        out.push_str("  verify is the done gate\n");
-        out.push_str("- skeleton=inspect_and_extract, artifact_family=spreadsheet\n");
-        out.push_str("  covered stage path: probe -> derive -> export -> verify\n");
-        out.push_str("  verify is the done gate\n");
+        append_reactor_coverage(&mut out, "spreadsheet");
     }
     if coverage.document {
-        out.push_str("- skeleton=locate_and_patch, artifact_family=document\n");
-        out.push_str(
-            "  covered stage path: locate -> probe -> derive -> assess -> commit -> verify\n",
-        );
-        out.push_str("  probe must end with explicit continuation\n");
-        out.push_str("  verify is the done gate\n");
-        out.push_str("- skeleton=inspect_and_extract, artifact_family=document\n");
-        out.push_str("  covered stage path: probe -> derive -> export -> verify\n");
-        out.push_str("  verify is the done gate\n");
+        append_reactor_coverage(&mut out, "document");
     }
     if coverage.structured {
-        out.push_str("- skeleton=locate_and_patch, artifact_family=structured\n");
-        out.push_str(
-            "  covered stage path: locate -> probe -> derive -> assess -> commit -> verify\n",
-        );
-        out.push_str("  probe must end with explicit continuation\n");
-        out.push_str("  verify is the done gate\n");
-        out.push_str("- skeleton=inspect_and_extract, artifact_family=structured\n");
-        out.push_str("  covered stage path: probe -> derive -> export -> verify\n");
-        out.push_str("  verify is the done gate\n");
+        append_reactor_coverage(&mut out, "structured");
     }
     if !coverage.spreadsheet && !coverage.document && !coverage.structured {
         out.push_str("- no executable reactor family coverage detected for this request\n");
@@ -378,13 +344,8 @@ fn build_reactor_system_prompt(
     });
     out.push('\n');
 
-    out.push_str("\nHard rules:\n");
-    out.push_str("- Prefer SKELETON_CHOICE or STAGE_CHOICE for supported local artifact tasks.\n");
-    out.push_str("- For SKELETON_CHOICE, initial_stage should follow the skeleton default unless current evidence clearly requires a later stage.\n");
-    out.push_str("- Choose only from current executable coverage unless the user explicitly asks for a different reactor skeleton experiment.\n");
-    out.push_str("- Do not emit a full workflow DAG for supported reactor tasks.\n");
-    out.push_str("- Treat artifact_family as an adapter hint, not as task shape.\n");
-    out.push_str("- Treat verification as the only done gate.\n");
+    out.push('\n');
+    out.push_str(REACTOR_HARD_RULES);
     if !capability_catalog.trim().is_empty() {
         out.push('\n');
         out.push_str(&capability_catalog);
@@ -489,4 +450,67 @@ fn resolve_python_path(skills: &[SkillInstruction]) -> Option<String> {
         return Some(".venv/bin/python3".to_string());
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use orchestral_core::action::ActionMeta;
+    use orchestral_core::planner::PlannerContext;
+    use orchestral_core::store::InMemoryReferenceStore;
+
+    use super::*;
+
+    fn planner_context(actions: Vec<ActionMeta>) -> PlannerContext {
+        PlannerContext::new(actions, Arc::new(InMemoryReferenceStore::new()))
+    }
+
+    #[test]
+    fn test_reactor_prompt_uses_template_rules_and_examples() {
+        let context = planner_context(vec![
+            ActionMeta::new("reactor_document_locate", "locate"),
+            ActionMeta::new("reactor_document_inspect", "inspect"),
+            ActionMeta::new("reactor_document_assess_readiness", "assess"),
+            ActionMeta::new("reactor_document_apply_patch", "apply"),
+            ActionMeta::new("reactor_document_verify_patch", "verify"),
+            ActionMeta::new("file_read", "read"),
+        ]);
+
+        let (system, user) = build_reactor_prompt(
+            "",
+            &Intent::new("docs 下面有什么文件"),
+            &context,
+            4,
+            DerivationPolicy::Permissive,
+        );
+
+        assert!(system.contains(REACTOR_CONSTITUTION.trim()));
+        assert!(system.contains(REACTOR_SKELETON_VOCABULARY.trim()));
+        assert!(system.contains(REACTOR_HARD_RULES.trim()));
+        assert!(system.contains("artifact_family=document"));
+        assert!(user.contains(REACTOR_USER_RULES.trim()));
+        assert!(user.contains(EXAMPLE_REACTOR_DOCUMENT.lines().next().unwrap_or_default()));
+        assert!(user.contains(EXAMPLE_DIRECT_RESPONSE.trim()));
+        assert!(user.contains(EXAMPLE_CLARIFICATION.trim()));
+        assert!(user.contains(ACTION_CALL_RULES.lines().next().unwrap_or_default()));
+    }
+
+    #[test]
+    fn test_non_reactor_prompt_uses_template_rules_and_examples() {
+        let context = planner_context(vec![
+            ActionMeta::new("shell", "shell"),
+            ActionMeta::new("file_read", "read"),
+        ]);
+
+        let (system, user) =
+            build_non_reactor_prompt("", &Intent::new("列出 docs 文件"), &context, 2);
+
+        assert!(system.contains(NON_REACTOR_CONSTITUTION.trim()));
+        assert!(user.contains(NON_REACTOR_USER_RULES.trim()));
+        assert!(user.contains(EXAMPLE_ACTION_CALL_SHELL.trim()));
+        assert!(user.contains(EXAMPLE_ACTION_CALL_FILE_READ.trim()));
+        assert!(user.contains(EXAMPLE_DIRECT_RESPONSE.trim()));
+        assert!(user.contains(EXAMPLE_CLARIFICATION.trim()));
+    }
 }
