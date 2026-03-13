@@ -29,7 +29,9 @@ pub(super) fn build_structured_patch_spec(
     }
 
     if files.is_empty() {
-        return Err("structured patch candidates did not produce any concrete operations".to_string());
+        return Err(
+            "structured patch candidates did not produce any concrete operations".to_string(),
+        );
     }
 
     let patch_spec = json!({

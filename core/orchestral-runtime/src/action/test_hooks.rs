@@ -98,12 +98,18 @@ mod tests {
 
     #[test]
     fn test_forced_verify_failure_always_matches_action() {
-        std::env::set_var("ORCHESTRAL_TEST_FORCE_VERIFY_FAIL_ALWAYS", "reactor_document_verify_patch");
+        std::env::set_var(
+            "ORCHESTRAL_TEST_FORCE_VERIFY_FAIL_ALWAYS",
+            "reactor_document_verify_patch",
+        );
         let decision = forced_verify_failure("reactor_document_verify_patch");
         std::env::remove_var("ORCHESTRAL_TEST_FORCE_VERIFY_FAIL_ALWAYS");
 
         assert!(decision.is_some());
         let decision = decision.expect("decision");
-        assert_eq!(decision.reason, "forced verify failure for testing: reactor_document_verify_patch");
+        assert_eq!(
+            decision.reason,
+            "forced verify failure for testing: reactor_document_verify_patch"
+        );
     }
 }

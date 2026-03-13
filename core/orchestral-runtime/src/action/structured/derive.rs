@@ -142,7 +142,10 @@ fn derive_file_operations(user_request: &str, file: &StructuredInspectionFile) -
 
     for entry in entries {
         let references = reference_forms(entry);
-        if !references.iter().any(|reference| request_mentions(user_request, reference)) {
+        if !references
+            .iter()
+            .any(|reference| request_mentions(user_request, reference))
+        {
             continue;
         }
         resolution.explicit_reference_found = true;
@@ -209,13 +212,15 @@ fn derive_remove_operation(
         "把 {ref} 删除",
     ];
     if references.iter().any(|reference| {
-        patterns
-            .iter()
-            .any(|pattern| request_contains_pattern(user_request, &pattern.replace("{ref}", reference)))
+        patterns.iter().any(|pattern| {
+            request_contains_pattern(user_request, &pattern.replace("{ref}", reference))
+        })
     }) {
         return Some(json!({
             "op": "remove",
             "path": entry.pointer,
+            "selector": entry.selector,
+            "reason": "explicit remove request",
         }));
     }
     None
@@ -251,6 +256,8 @@ fn derive_set_operation(
                     "op": "set",
                     "path": entry.pointer,
                     "value": value,
+                    "selector": entry.selector,
+                    "reason": "explicit request",
                 })));
             }
         }
@@ -266,8 +273,12 @@ fn parse_requested_value(raw_value: &str, entry: &FieldInventoryEntry) -> Result
     }
 
     if trimmed.starts_with('{') || trimmed.starts_with('[') {
-        return serde_json::from_str(trimmed)
-            .map_err(|err| format!("parse structured value for '{}' failed: {}", entry.selector, err));
+        return serde_json::from_str(trimmed).map_err(|err| {
+            format!(
+                "parse structured value for '{}' failed: {}",
+                entry.selector, err
+            )
+        });
     }
 
     if trimmed.eq_ignore_ascii_case("true") || trimmed == "是" {
@@ -308,28 +319,109 @@ fn clean_value(raw: &str) -> &str {
 }
 
 fn request_mentions(user_request: &str, reference: &str) -> bool {
-    user_request.to_lowercase().contains(&reference.to_lowercase())
+    user_request
+        .to_lowercase()
+        .contains(&reference.to_lowercase())
 }
 
 fn request_contains_pattern(user_request: &str, pattern: &str) -> bool {
-    user_request.to_lowercase().contains(&pattern.to_lowercase())
+    user_request
+        .to_lowercase()
+        .contains(&pattern.to_lowercase())
 }
 
 fn extract_suffix_after_marker<'a>(user_request: &'a str, marker: &str) -> Option<&'a str> {
     let haystack = user_request.to_lowercase();
     let needle = marker.to_lowercase();
     let start = haystack.find(&needle)? + needle.len();
-    let suffix = &user_request[start..];
-    let end = find_value_boundary(suffix).unwrap_or(suffix.len());
-    Some(&suffix[..end])
+    extract_value_slice(&user_request[start..])
 }
 
-fn find_value_boundary(suffix: &str) -> Option<usize> {
-    let boundaries = ["，", ",", "。", ".", "；", ";", "\n", "然后", "并且", "并 ", " and "];
-    boundaries
-        .iter()
-        .filter_map(|boundary| suffix.find(boundary))
-        .min()
+fn extract_value_slice(suffix: &str) -> Option<&str> {
+    let trimmed = suffix.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let start_offset = suffix.len().saturating_sub(trimmed.len());
+    let value_len = match trimmed.chars().next()? {
+        '"' | '\'' | '`' => consume_quoted_literal(trimmed)?,
+        '{' => consume_balanced_literal(trimmed, '{', '}')?,
+        '[' => consume_balanced_literal(trimmed, '[', ']')?,
+        _ => consume_scalar_literal(trimmed),
+    };
+
+    Some(&suffix[start_offset..start_offset + value_len])
+}
+
+fn consume_quoted_literal(input: &str) -> Option<usize> {
+    let quote = input.chars().next()?;
+    let mut escaped = false;
+    for (idx, ch) in input.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == quote {
+            return Some(idx + ch.len_utf8());
+        }
+    }
+    Some(input.len())
+}
+
+fn consume_balanced_literal(input: &str, open: char, close: char) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for (idx, ch) in input.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            _ if ch == open => depth += 1,
+            _ if ch == close => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(idx + ch.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if depth > 0 {
+        Some(input.len())
+    } else {
+        None
+    }
+}
+
+fn consume_scalar_literal(input: &str) -> usize {
+    input
+        .char_indices()
+        .find_map(|(idx, ch)| match ch {
+            ',' | '，' | '。' | '；' | ';' | '\n' | '\r' | '\t' | ' ' => Some(idx),
+            _ => None,
+        })
+        .unwrap_or(input.len())
 }
 
 fn parse_derivation_policy(raw_policy: &str) -> Result<DerivationPolicy, String> {

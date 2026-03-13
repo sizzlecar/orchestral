@@ -7,12 +7,12 @@ use orchestral_core::action::{Action, ActionContext, ActionInput, ActionMeta, Ac
 use orchestral_core::config::ActionSpec;
 
 use super::super::factory::ActionBuildError;
-use crate::action::test_hooks::forced_verify_failure;
 use super::apply::apply_document_patch;
 use super::assess::assess_document_readiness;
 use super::inspect::inspect_documents;
 use super::locate::locate_documents;
 use super::verify::verify_document_patch;
+use crate::action::test_hooks::forced_verify_failure;
 
 pub fn build_document_action(
     spec: &ActionSpec,

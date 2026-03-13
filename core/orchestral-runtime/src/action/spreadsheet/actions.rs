@@ -7,12 +7,12 @@ use orchestral_core::action::{Action, ActionContext, ActionInput, ActionMeta, Ac
 use orchestral_core::config::ActionSpec;
 
 use super::super::factory::ActionBuildError;
-use crate::action::test_hooks::forced_verify_failure;
 use super::apply::apply_patch;
 use super::assess::assess_readiness;
 use super::inspect::inspect_workbook;
 use super::locate::locate_workbook;
 use super::verify::verify_patch;
+use crate::action::test_hooks::forced_verify_failure;
 
 pub fn build_spreadsheet_action(
     spec: &ActionSpec,

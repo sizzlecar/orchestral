@@ -18,6 +18,7 @@ pub(super) fn verify_structured_patch(
 
     let mut checked_paths = Vec::new();
     let mut checked_ops = 0usize;
+    let mut verified_changes = Vec::new();
     for file in &patch_spec.files {
         let path = normalize_path(Path::new(&file.path))?;
         let parsed = parse_structured_file(&path)?;
@@ -66,6 +67,7 @@ pub(super) fn verify_structured_patch(
                             "Structured verify failed.".to_string(),
                         ));
                     }
+                    verified_changes.push(format_verified_change(file.path.as_str(), operation));
                 }
                 "remove" => {
                     if parsed.pointer(&operation.path).is_some() {
@@ -84,6 +86,7 @@ pub(super) fn verify_structured_patch(
                             "Structured verify failed.".to_string(),
                         ));
                     }
+                    verified_changes.push(format_verified_change(file.path.as_str(), operation));
                 }
                 other => {
                     return Err(format!("unsupported structured operation '{}'", other));
@@ -92,6 +95,8 @@ pub(super) fn verify_structured_patch(
         }
     }
 
+    let summary = build_verify_summary(&verified_changes);
+
     Ok((
         VerifyDecision {
             status: VerifyStatus::Passed,
@@ -99,12 +104,54 @@ pub(super) fn verify_structured_patch(
             evidence: json!({
                 "checked_paths": checked_paths,
                 "checked_operations": checked_ops,
+                "verified_changes": verified_changes,
                 "inspection_target_count": inspection
                     .and_then(|value| value.get("target_count"))
                     .cloned()
                     .unwrap_or(Value::Null),
             }),
         },
-        "Structured patch verified.".to_string(),
+        summary,
     ))
+}
+
+fn build_verify_summary(changes: &[String]) -> String {
+    if changes.is_empty() {
+        return "Structured patch verified.".to_string();
+    }
+    let mut summary = format!("Structured patch verified. Changes: {}", changes.join("; "));
+    if !summary.ends_with('.') {
+        summary.push('.');
+    }
+    summary
+}
+
+fn format_verified_change(
+    path: &str,
+    operation: &super::model::StructuredPatchOperation,
+) -> String {
+    let target = operation
+        .selector
+        .as_deref()
+        .unwrap_or(operation.path.as_str());
+    let reason = operation.reason.as_deref().unwrap_or("verified");
+    match operation.op.as_str() {
+        "set" => {
+            let rendered = operation
+                .value
+                .as_ref()
+                .map(render_value)
+                .unwrap_or_else(|| "<missing>".to_string());
+            format!("{} -> set {} = {} ({})", path, target, rendered, reason)
+        }
+        "remove" => format!("{} -> removed {} ({})", path, target, reason),
+        other => format!("{} -> {} {} ({})", path, other, target, reason),
+    }
+}
+
+fn render_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => format!("{:?}", text),
+        other => other.to_string(),
+    }
 }

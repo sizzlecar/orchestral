@@ -118,4 +118,3 @@ fn build_mcp_lines(actions: &[ActionMeta]) -> Vec<String> {
         .map(|action| format!("{}: {}", action.name, action.description))
         .collect()
 }
-

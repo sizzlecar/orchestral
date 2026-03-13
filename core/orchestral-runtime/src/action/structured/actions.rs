@@ -5,7 +5,6 @@ use orchestral_core::action::{Action, ActionContext, ActionInput, ActionMeta, Ac
 use orchestral_core::config::ActionSpec;
 
 use super::super::factory::ActionBuildError;
-use crate::action::test_hooks::forced_verify_failure;
 use super::apply::apply_structured_patch;
 use super::assess::assess_structured_readiness;
 use super::commit::build_structured_patch_spec;
@@ -13,6 +12,7 @@ use super::derive::derive_structured_patch_candidates;
 use super::inspect::inspect_structured_files;
 use super::locate::locate_structured_files;
 use super::verify::verify_structured_patch;
+use crate::action::test_hooks::forced_verify_failure;
 
 pub fn build_structured_action(
     spec: &ActionSpec,
@@ -20,7 +20,9 @@ pub fn build_structured_action(
     let action: Box<dyn Action> = match spec.kind.as_str() {
         "structured_locate" => Box::new(StructuredLocateAction::from_spec(spec)),
         "structured_inspect" => Box::new(StructuredInspectAction::from_spec(spec)),
-        "structured_derive_candidates" => Box::new(StructuredDeriveCandidatesAction::from_spec(spec)),
+        "structured_derive_candidates" => {
+            Box::new(StructuredDeriveCandidatesAction::from_spec(spec))
+        }
         "structured_assess_readiness" => Box::new(StructuredAssessReadinessAction::from_spec(spec)),
         "structured_build_patch_spec" => Box::new(StructuredBuildPatchSpecAction::from_spec(spec)),
         "structured_apply_patch" => Box::new(StructuredApplyPatchAction::from_spec(spec)),
@@ -213,9 +215,7 @@ impl Action for StructuredDeriveCandidatesAction {
 
     async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
         let Some(user_request) = input.params.get("user_request").and_then(Value::as_str) else {
-            return ActionResult::error(
-                "Missing user_request for structured_derive_candidates",
-            );
+            return ActionResult::error("Missing user_request for structured_derive_candidates");
         };
         let Some(inspection) = input.params.get("inspection") else {
             return ActionResult::error("Missing inspection for structured_derive_candidates");
@@ -373,9 +373,7 @@ impl Action for StructuredBuildPatchSpecAction {
 
     async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
         let Some(patch_candidates) = input.params.get("patch_candidates") else {
-            return ActionResult::error(
-                "Missing patch_candidates for structured_build_patch_spec",
-            );
+            return ActionResult::error("Missing patch_candidates for structured_build_patch_spec");
         };
         match build_structured_patch_spec(patch_candidates) {
             Ok((patch_spec, summary)) => ActionResult::success_with(

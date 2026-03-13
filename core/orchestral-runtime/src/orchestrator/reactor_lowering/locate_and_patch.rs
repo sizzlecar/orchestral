@@ -364,15 +364,18 @@ impl LocateAndPatchFamilyAdapter {
             let mut plan = Plan::new(
                 choice.stage_goal.clone(),
                 vec![
-                    Step::action("reactor_commit_build_patch_spec", REACTOR_STRUCTURED_BUILD_PATCH_ACTION)
-                        .with_exports(vec!["patch_spec".to_string(), "summary".to_string()])
-                        .with_params(serde_json::json!({
-                            "patch_candidates": task
-                                .working_set_snapshot
-                                .get("patch_candidates")
-                                .cloned()
-                                .unwrap_or(Value::Null),
-                        })),
+                    Step::action(
+                        "reactor_commit_build_patch_spec",
+                        REACTOR_STRUCTURED_BUILD_PATCH_ACTION,
+                    )
+                    .with_exports(vec!["patch_spec".to_string(), "summary".to_string()])
+                    .with_params(serde_json::json!({
+                        "patch_candidates": task
+                            .working_set_snapshot
+                            .get("patch_candidates")
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    })),
                     Step::action("reactor_commit_apply", self.apply_action)
                         .with_depends_on(vec![StepId::from("reactor_commit_build_patch_spec")])
                         .with_exports(vec![

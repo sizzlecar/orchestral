@@ -54,6 +54,10 @@ pub(super) struct StructuredPatchOperation {
     pub(super) path: String,
     #[serde(default)]
     pub(super) value: Option<Value>,
+    #[serde(default)]
+    pub(super) selector: Option<String>,
+    #[serde(default)]
+    pub(super) reason: Option<String>,
 }
 
 pub(super) fn parse_structured_patch_spec(
@@ -334,12 +338,7 @@ fn parse_json_pointer(pointer: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
-fn collect_field_inventory(
-    value: &Value,
-    pointer: String,
-    selector: String,
-    out: &mut Vec<Value>,
-) {
+fn collect_field_inventory(value: &Value, pointer: String, selector: String, out: &mut Vec<Value>) {
     if !pointer.is_empty() {
         out.push(serde_json::json!({
             "pointer": pointer,
