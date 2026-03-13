@@ -191,7 +191,7 @@ impl InspectAndExtractFamilyAdapter {
                 .with_depends_on(vec![StepId::from("reactor_probe_locate")])
                 .with_exports(vec!["inspection".to_string()])
                 .with_io_bindings(vec![StepIoBinding::required(
-                    &format!("reactor_probe_locate.{}", self.source_snapshot_key()),
+                    format!("reactor_probe_locate.{}", self.source_snapshot_key()),
                     self.inspect_input_key(),
                 )]);
             inspect_step

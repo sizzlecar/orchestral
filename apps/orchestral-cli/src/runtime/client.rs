@@ -9,8 +9,7 @@ use anyhow::Context;
 use tokio::sync::Mutex;
 use tokio::time::Duration;
 
-use orchestral_composition::{ComposedRuntimeAppBuilder, RuntimeTarget};
-use orchestral_runtime::api::{RuntimeApi, RuntimeAppBuilder};
+use orchestral_runtime::api::{DefaultRuntimeAppBuilder, RuntimeApi, RuntimeAppBuilder};
 
 use crate::channel::CliRuntime;
 
@@ -51,8 +50,7 @@ impl RuntimeClient {
         planner_overrides: PlannerOverrides,
     ) -> anyhow::Result<Self> {
         let config = prepare_runtime_config_path(config, &planner_overrides)?;
-        let app_builder: Arc<dyn RuntimeAppBuilder> =
-            Arc::new(ComposedRuntimeAppBuilder::new(RuntimeTarget::Cli));
+        let app_builder: Arc<dyn RuntimeAppBuilder> = Arc::new(DefaultRuntimeAppBuilder);
         let api = Arc::new(
             RuntimeApi::from_config_path_with_builder(config, app_builder)
                 .await

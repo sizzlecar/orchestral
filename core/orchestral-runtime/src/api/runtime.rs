@@ -24,7 +24,7 @@ pub trait RuntimeAppBuilder: Send + Sync {
     async fn build(&self, config_path: PathBuf) -> Result<RuntimeApp, ApiError>;
 }
 
-struct DefaultRuntimeAppBuilder;
+pub struct DefaultRuntimeAppBuilder;
 
 #[async_trait]
 impl RuntimeAppBuilder for DefaultRuntimeAppBuilder {
@@ -32,7 +32,7 @@ impl RuntimeAppBuilder for DefaultRuntimeAppBuilder {
         if config_has_enabled_runtime_extensions(&config_path)? {
             tracing::warn!(
                 "config enables runtime extensions but running with minimal runtime; \
-                 extensions will be ignored. Use ComposedRuntimeAppBuilder for full support."
+                 extensions will be ignored in the slim 1.0 workspace."
             );
         }
         RuntimeApp::from_config_path(config_path)
