@@ -4,13 +4,20 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 
-use super::model::parse_document_updates;
+use super::support::normalize_document_updates;
 
 pub(super) fn apply_document_patch(
     patch_spec: &Value,
     report_path: Option<&str>,
+    inspection: Option<&Value>,
+    patch_candidates: Option<&Value>,
 ) -> Result<HashMap<String, Value>, String> {
-    let updates = parse_document_updates(patch_spec)?;
+    let updates = normalize_document_updates(
+        patch_spec,
+        report_path,
+        inspection,
+        patch_candidates,
+    )?;
     if updates.is_empty() {
         return Err("document patch_spec.updates is empty".to_string());
     }

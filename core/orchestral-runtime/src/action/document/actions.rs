@@ -288,7 +288,9 @@ impl Action for DocumentApplyPatchAction {
                 "type": "object",
                 "properties": {
                     "patch_spec": { "type": "object" },
-                    "report_path": { "type": "string" }
+                    "report_path": { "type": "string" },
+                    "inspection": { "type": "object" },
+                    "patch_candidates": { "type": "object" }
                 },
                 "required": ["patch_spec"]
             }))
@@ -311,7 +313,9 @@ impl Action for DocumentApplyPatchAction {
             return ActionResult::error("Missing patch_spec for document_apply_patch");
         };
         let report_path = input.params.get("report_path").and_then(Value::as_str);
-        match apply_document_patch(patch_spec, report_path) {
+        let inspection = input.params.get("inspection");
+        let patch_candidates = input.params.get("patch_candidates");
+        match apply_document_patch(patch_spec, report_path, inspection, patch_candidates) {
             Ok(exports) => ActionResult::success_with(exports),
             Err(error) => ActionResult::error(error),
         }
@@ -354,6 +358,7 @@ impl Action for DocumentVerifyPatchAction {
                 "properties": {
                     "patch_spec": { "type": "object" },
                     "inspection": { "type": "object" },
+                    "patch_candidates": { "type": "object" },
                     "user_request": { "type": "string" },
                     "resume_user_input": {}
                 },
@@ -397,8 +402,15 @@ impl Action for DocumentVerifyPatchAction {
             .get("user_request")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        let patch_candidates = input.params.get("patch_candidates");
         let resume_user_input = input.params.get("resume_user_input");
-        match verify_document_patch(patch_spec, inspection, user_request, resume_user_input) {
+        match verify_document_patch(
+            patch_spec,
+            inspection,
+            patch_candidates,
+            user_request,
+            resume_user_input,
+        ) {
             Ok((verify_decision, summary)) => ActionResult::success_with(
                 [
                     (

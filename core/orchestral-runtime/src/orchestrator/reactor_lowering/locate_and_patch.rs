@@ -139,7 +139,7 @@ impl LocateAndPatchFamilyAdapter {
                 "Derive locate_and_patch spreadsheet candidates. Using user_request, source_path, inspection, and derivation_policy, return JSON with keys patch_candidates and summary. patch_candidates must be an object with keys candidates, unknowns, and assumptions. patch_candidates.candidates.cells must describe candidate fills for patchable cells without modifying the file. permissive policy may propose generic but coherent spreadsheet fill content when structure is clear. strict policy should surface unresolved unknowns through patch_candidates.unknowns. Do not decide continuation here."
             }
             ArtifactFamily::Document => {
-                "Derive locate_and_patch document candidates. Using user_request, source_paths, inspection, and derivation_policy, return JSON with keys patch_candidates and summary. patch_candidates must be an object with keys candidates, unknowns, and assumptions. patch_candidates.candidates.files must be an array. Each file entry should contain path, planned_changes, needs_user_input, and unknowns. If the requested document change depends on concrete facts not present in user_request or inspection (for example dates, names, amounts, IDs, addresses, contract numbers, or other business facts), you must record them in unknowns, set needs_user_input=true for that file, and avoid inventing values. summary should be a concise change plan. Do not modify files. Do not decide continuation here."
+                "Derive locate_and_patch document candidates. Using user_request, source_paths, inspection, and derivation_policy, return JSON with keys patch_candidates and summary. patch_candidates must be an object with keys candidates, unknowns, and assumptions. patch_candidates.candidates.files must be an array. Each file entry should contain path, planned_changes, needs_user_input, and unknowns. If the requested document change depends on concrete facts not present in user_request or inspection (for example dates, names, amounts, IDs, addresses, contract numbers, or other business facts), you must record them in unknowns, set needs_user_input=true for that file, and avoid inventing values. inspection.files[*].suggested_title provides the canonical filename-derived H1 title. When the requested change is only to add missing top-level titles and no custom wording is requested, you may use suggested_title directly and should not require extra user input just to confirm that title text. summary should be a concise change plan. Do not modify files. Do not decide continuation here."
             }
             ArtifactFamily::Structured => {
                 "Derive locate_and_patch structured patch candidates. Using user_request, source_paths, inspection, and derivation_policy, return JSON with keys patch_candidates and summary. patch_candidates must be an object with keys candidates, unknowns, and assumptions. patch_candidates.candidates.files must be an array directly, not wrapped in another object. Each file entry must contain path, operations, needs_user_input, and unknowns. operations must be an array of JSON Pointer edits shaped as {op, path, value?}. Use op=set when assigning a concrete JSON-compatible value and op=remove when deleting a field. inspection.files[*].field_inventory lists canonical field references with selector, pointer, value_type, summary, and value. Use that inventory as the authoritative path model. When user_request names a dotted selector and it uniquely matches a field_inventory.selector, you must use the corresponding field_inventory.pointer in operations and treat the request as explicit enough. When user_request already states an explicit target path and target value or explicit remove instruction, you must mirror that instruction into operations, set needs_user_input=false for that file, and leave unknowns empty unless the referenced path is ambiguous or missing. strict policy should surface unresolved unknowns instead of guessing target values. Do not modify files. Do not decide continuation here."
@@ -157,7 +157,7 @@ impl LocateAndPatchFamilyAdapter {
                 "Commit stage for locate_and_patch spreadsheet patching. Using user_request, source_path, inspection, patch_candidates, and derivation_policy, return JSON with keys patch_spec and summary. patch_candidates follows the derive envelope with candidates, unknowns, and assumptions. patch_spec must be an object with path and fills. patch_spec.fills must be an array of {cell, value}. Cover every patchable cell listed in inspection.selected_region.patchable_cells unless the cell is already handled by a formula or existing non-empty value. If derivation_policy is permissive, fill any remaining uncovered patchable cells with coherent generic content inferred from row labels and column headers instead of leaving gaps. Do not include unchanged cells. Preserve formulas and workbook structure. When a proposed fill is numeric, emit a numeric JSON value instead of prose."
             }
             ArtifactFamily::Document => {
-                "Commit stage for locate_and_patch document patching. Using user_request, resume_user_input, source_paths, inspection, patch_candidates, and derivation_policy, return JSON with keys patch_spec and summary. patch_candidates follows the derive envelope with candidates, unknowns, and assumptions. patch_spec must be an object with updates. updates must be an array of {path, content}. Generate complete final markdown/text content for each file that needs changes. Replace TODO placeholders with concrete coherent content, add a top-level title when missing, preserve unaffected content, and if resume_user_input requests a summary/report markdown path include an update for that file too. Do not emit unchanged files."
+                "Commit stage for locate_and_patch document patching. Using user_request, resume_user_input, source_paths, inspection, patch_candidates, and derivation_policy, return JSON with keys patch_spec and summary. patch_candidates follows the derive envelope with candidates, unknowns, and assumptions. patch_spec must be an object with updates. updates must be an array of {path, content}. Generate complete final markdown/text content for each file that needs changes. Replace TODO placeholders with concrete coherent content, add a top-level title when missing, preserve unaffected content, and if a file is missing a title and inspection.files[*].suggested_title is present, use that suggested_title by default unless the user asked for custom title wording. If resume_user_input requests a summary/report markdown path include an update for that file too. Do not emit unchanged files."
             }
             ArtifactFamily::Structured => {
                 "Commit stage for locate_and_patch structured patching. Using user_request, source_paths, inspection, and derivation_policy, return JSON with keys patch_spec and summary. Treat the explicit user_request as authoritative for requested field updates and removals. patch_spec must be an object with files and optional summary. files must be an array of {path, operations}. operations must be an array of JSON Pointer edits shaped as {op, path, value?}. Use op=set to assign a concrete JSON-compatible value and op=remove to delete a field. inspection.files[*].field_inventory lists canonical field references with selector and pointer; use those pointers as the source of truth when constructing operations. Every explicit user-requested update or removal must appear in patch_spec unless the referenced path is missing or ambiguous in inspection. Preserve unrelated keys and do not emit unchanged files."
@@ -491,6 +491,16 @@ impl LocateAndPatchFamilyAdapter {
                     "patch_spec",
                 )])
                 .with_params(serde_json::json!({
+                    "inspection": task
+                        .working_set_snapshot
+                        .get("inspection")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                    "patch_candidates": task
+                        .working_set_snapshot
+                        .get("patch_candidates")
+                        .cloned()
+                        .unwrap_or(Value::Null),
                     "report_path": task
                         .working_set_snapshot
                         .get("report_path")
@@ -567,6 +577,13 @@ impl LocateAndPatchFamilyAdapter {
                                 "reactor expected working_set key 'inspection'".to_string(),
                             ))
                         })?,
+                );
+                params.insert(
+                    "patch_candidates".to_string(),
+                    task.working_set_snapshot
+                        .get("patch_candidates")
+                        .cloned()
+                        .unwrap_or(Value::Null),
                 );
                 params.insert(
                     "user_request".to_string(),

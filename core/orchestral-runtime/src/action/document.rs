@@ -18,6 +18,7 @@ mod tests {
 
     use super::apply::apply_document_patch;
     use super::assess::{assess_document_readiness, collect_candidate_unknowns};
+    use super::model::suggested_title_from_stem;
     use super::support::request_requires_confirmation;
 
     #[test]
@@ -94,6 +95,58 @@ mod tests {
     }
 
     #[test]
+    fn test_suggested_title_from_stem_humanizes_file_name() {
+        assert_eq!(
+            suggested_title_from_stem("customer-onboarding"),
+            Some("Customer Onboarding".to_string())
+        );
+        assert_eq!(
+            suggested_title_from_stem("ops_handbook"),
+            Some("Ops Handbook".to_string())
+        );
+    }
+
+    #[test]
+    fn test_assess_document_readiness_allows_filename_derived_titles() {
+        let inspection = json!({
+            "files": [
+                {
+                    "path": "docs/a.md",
+                    "missing_title": true,
+                    "todo_count": 0,
+                    "suggested_title": "A"
+                }
+            ]
+        });
+        let patch_candidates = json!({
+            "candidates": {
+                "files": [
+                    {
+                        "path": "docs/a.md",
+                        "planned_changes": [{"description": "Add a top-level H1 title"}],
+                        "needs_user_input": true,
+                        "unknowns": ["Preferred H1 title text for the document (e.g., 'A' or another name)"]
+                    }
+                ]
+            },
+            "unknowns": ["Exact H1 title wording for each document"],
+            "assumptions": []
+        });
+
+        let (continuation, _summary) = assess_document_readiness(
+            "扫描 docs 下所有 markdown，缺失一级标题的文档使用文件名转成标题补齐。",
+            &inspection,
+            &patch_candidates,
+            "permissive",
+        )
+        .expect("assess");
+        assert_eq!(
+            continuation["status"],
+            Value::String("commit_ready".to_string())
+        );
+    }
+
+    #[test]
     fn test_apply_document_patch_generates_requested_report_when_missing_from_patch_spec() {
         let root = std::env::temp_dir().join(format!(
             "orchestral-document-apply-{}",
@@ -120,7 +173,12 @@ mod tests {
         });
 
         let exports =
-            apply_document_patch(&patch_spec, Some(report_path.to_string_lossy().as_ref()))
+            apply_document_patch(
+                &patch_spec,
+                Some(report_path.to_string_lossy().as_ref()),
+                None,
+                None,
+            )
                 .expect("apply document patch");
         let report = fs::read_to_string(&report_path).expect("read report");
 
@@ -133,6 +191,126 @@ mod tests {
             .is_some_and(|paths| paths
                 .iter()
                 .any(|value| value.as_str() == Some(report_path.to_string_lossy().as_ref()))));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_apply_document_patch_preserves_body_for_auto_title_only_files() {
+        let root = std::env::temp_dir().join(format!(
+            "orchestral-document-auto-title-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("unix time")
+                .as_millis()
+        ));
+        let docs_dir = root.join("docs");
+        fs::create_dir_all(&docs_dir).expect("create docs dir");
+
+        let doc_path = docs_dir.join("customer-onboarding.md");
+        let original = "## Goal\n\nKeep exact body.\n";
+        fs::write(&doc_path, original).expect("write doc");
+
+        let patch_spec = json!({
+            "summary": "Add top-level title.",
+            "updates": [
+                {
+                    "path": doc_path.to_string_lossy(),
+                    "content": "# Customer Onboarding\n\n## Goal\n\nRewritten body.\n"
+                }
+            ]
+        });
+        let inspection = json!({
+            "files": [
+                {
+                    "path": doc_path.to_string_lossy(),
+                    "missing_title": true,
+                    "todo_count": 0,
+                    "suggested_title": "Customer Onboarding",
+                    "content": original
+                }
+            ]
+        });
+        let patch_candidates = json!({
+            "candidates": {
+                "files": [
+                    {
+                        "path": doc_path.to_string_lossy(),
+                        "planned_changes": [{"description": "Add a top-level H1 title"}],
+                        "needs_user_input": false,
+                        "unknowns": []
+                    }
+                ]
+            },
+            "unknowns": [],
+            "assumptions": []
+        });
+
+        apply_document_patch(&patch_spec, None, Some(&inspection), Some(&patch_candidates))
+            .expect("apply document patch");
+        let patched = fs::read_to_string(&doc_path).expect("read patched doc");
+        assert_eq!(patched, "# Customer Onboarding\n\n## Goal\n\nKeep exact body.\n");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_apply_document_patch_ignores_uninspected_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "orchestral-document-ignore-extra-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("unix time")
+                .as_millis()
+        ));
+        let docs_dir = root.join("docs");
+        fs::create_dir_all(&docs_dir).expect("create docs dir");
+
+        let known_path = docs_dir.join("known.md");
+        let unknown_path = docs_dir.join("unknown.md");
+        fs::write(&known_path, "## Body\n").expect("write known");
+
+        let patch_spec = json!({
+            "updates": [
+                {
+                    "path": known_path.to_string_lossy(),
+                    "content": "# Known\n\nrewritten"
+                },
+                {
+                    "path": unknown_path.to_string_lossy(),
+                    "content": "# Unknown\n\nshould not be created"
+                }
+            ]
+        });
+        let inspection = json!({
+            "files": [
+                {
+                    "path": known_path.to_string_lossy(),
+                    "missing_title": true,
+                    "todo_count": 0,
+                    "suggested_title": "Known",
+                    "content": "## Body\n"
+                }
+            ]
+        });
+        let patch_candidates = json!({
+            "candidates": {
+                "files": [
+                    {
+                        "path": known_path.to_string_lossy(),
+                        "planned_changes": [{"description": "Add a top-level H1 title"}],
+                        "needs_user_input": false,
+                        "unknowns": []
+                    }
+                ]
+            },
+            "unknowns": [],
+            "assumptions": []
+        });
+
+        apply_document_patch(&patch_spec, None, Some(&inspection), Some(&patch_candidates))
+            .expect("apply document patch");
+        assert!(!unknown_path.exists());
 
         let _ = fs::remove_dir_all(root);
     }

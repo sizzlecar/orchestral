@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
@@ -24,7 +24,16 @@ pub(super) fn assess_document_readiness(
     }
 
     let summary = synthesize_document_plan_summary(inspection, patch_candidates);
-    let unknowns = collect_candidate_unknowns(patch_candidates);
+    let mut unknowns = collect_candidate_unknowns(patch_candidates);
+    let auto_title_paths = auto_title_candidate_paths(inspection, patch_candidates);
+    if policy == DerivationPolicy::Permissive && !auto_title_paths.is_empty() {
+        unknowns.retain(|item| {
+            !is_title_preference_unknown(item)
+                && !auto_title_paths
+                    .iter()
+                    .any(|path| item == &format!("{} requires additional user input", path))
+        });
+    }
     let needs_confirmation = request_requires_confirmation(user_request);
     let has_any_change = files.iter().any(|file| {
         file.get("missing_title")
@@ -131,6 +140,72 @@ pub(super) fn collect_candidate_unknowns(patch_candidates: &Value) -> Vec<String
     unknowns.sort();
     unknowns.dedup();
     unknowns
+}
+
+fn auto_title_candidate_paths(
+    inspection: &Value,
+    patch_candidates: &Value,
+) -> BTreeSet<String> {
+    let Some(files) = inspection.get("files").and_then(Value::as_array) else {
+        return BTreeSet::new();
+    };
+    let inspection_by_path = files
+        .iter()
+        .filter_map(|file| {
+            let path = file.get("path").and_then(Value::as_str)?;
+            Some((path, file))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let candidate_files = document_candidate_files(patch_candidates);
+    candidate_files
+        .iter()
+        .filter_map(|file| {
+            let path = file.get("path").and_then(Value::as_str)?;
+            let inspection_file = inspection_by_path.get(path)?;
+            let eligible = inspection_file
+                .get("missing_title")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                && inspection_file
+                    .get("suggested_title")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty())
+                && inspection_file
+                    .get("todo_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default()
+                    == 0
+                && file
+                    .get("unknowns")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items.iter()
+                            .all(|item| item.as_str().is_some_and(is_title_preference_unknown))
+                    })
+                    .unwrap_or(true)
+                && file
+                    .get("planned_changes")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        !items.is_empty()
+                            && items.iter().all(|item| {
+                                item.get("description")
+                                    .and_then(Value::as_str)
+                                    .or_else(|| item.as_str())
+                                    .is_some_and(|text| {
+                                        text.contains("title") || text.contains("标题")
+                                    })
+                            })
+                    })
+                    .unwrap_or(false);
+            eligible.then(|| path.to_string())
+        })
+        .collect()
+}
+
+fn is_title_preference_unknown(unknown: &str) -> bool {
+    unknown.contains("Preferred H1 title text") || unknown.contains("Exact H1 title wording")
 }
 
 fn synthesize_document_plan_summary(inspection: &Value, patch_candidates: &Value) -> String {

@@ -63,8 +63,10 @@ pub(super) struct StructuredPatchOperation {
 pub(super) fn parse_structured_patch_spec(
     patch_spec: &Value,
 ) -> Result<StructuredPatchSpec, String> {
-    serde_json::from_value::<StructuredPatchSpec>(patch_spec.clone())
-        .map_err(|err| format!("parse structured patch spec failed: {}", err))
+    let mut spec = serde_json::from_value::<StructuredPatchSpec>(patch_spec.clone())
+        .map_err(|err| format!("parse structured patch spec failed: {}", err))?;
+    normalize_structured_patch_spec(&mut spec)?;
+    Ok(spec)
 }
 
 pub(super) fn parse_structured_file(path: &Path) -> Result<Value, String> {
@@ -188,6 +190,23 @@ pub(super) fn apply_structured_operation(
             set_json_pointer_value(target, &operation.path, value)
         }
         "remove" => remove_json_pointer_value(target, &operation.path),
+        other => Err(format!("unsupported structured operation '{}'", other)),
+    }
+}
+
+fn normalize_structured_patch_spec(spec: &mut StructuredPatchSpec) -> Result<(), String> {
+    for file in &mut spec.files {
+        for operation in &mut file.operations {
+            operation.op = canonical_structured_operation(&operation.op)?;
+        }
+    }
+    Ok(())
+}
+
+fn canonical_structured_operation(raw: &str) -> Result<String, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "set" | "replace" | "add" | "update" => Ok("set".to_string()),
+        "remove" | "delete" | "unset" | "drop" => Ok("remove".to_string()),
         other => Err(format!("unsupported structured operation '{}'", other)),
     }
 }
@@ -409,7 +428,7 @@ fn type_name(value: &Value) -> &'static str {
 mod tests {
     use serde_json::json;
 
-    use super::build_field_inventory;
+    use super::{build_field_inventory, parse_structured_patch_spec};
 
     #[test]
     fn test_build_field_inventory_includes_selector_and_pointer() {
@@ -434,5 +453,25 @@ mod tests {
             Some("number")
         );
         assert_eq!(port.get("value"), Some(&json!(8080)));
+    }
+
+    #[test]
+    fn test_parse_structured_patch_spec_normalizes_operation_aliases() {
+        let spec = parse_structured_patch_spec(&json!({
+            "files": [
+                {
+                    "path": "config/app.toml",
+                    "operations": [
+                        { "op": "replace", "path": "/server/port", "value": 9090 },
+                        { "op": "delete", "path": "/legacy" }
+                    ]
+                }
+            ]
+        }))
+        .expect("patch spec should parse");
+
+        let operations = &spec.files[0].operations;
+        assert_eq!(operations[0].op, "set");
+        assert_eq!(operations[1].op, "remove");
     }
 }
