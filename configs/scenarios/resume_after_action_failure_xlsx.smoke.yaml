@@ -40,6 +40,12 @@ turns:
       activity_contains:
         - "reactor_commit_apply reactor_spreadsheet_apply_patch"
         - "reactor_verify reactor_spreadsheet_verify_patch"
+      activity_contains_once:
+        - "[start Ran] reactor_commit_apply reactor_spreadsheet_apply_patch"
+        - "[start Ran] reactor_verify reactor_spreadsheet_verify_patch"
+      activity_not_repeated:
+        - "[start Ran] reactor_commit_apply reactor_spreadsheet_apply_patch"
+        - "[start Ran] reactor_verify reactor_spreadsheet_verify_patch"
       activity_not_contains:
         - "reactor_locate reactor_spreadsheet_locate"
         - "reactor_probe_inspect reactor_spreadsheet_inspect"
