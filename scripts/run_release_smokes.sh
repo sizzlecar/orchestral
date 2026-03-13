@@ -6,6 +6,7 @@ cd "$ROOT_DIR"
 
 ROUNDS="${1:-${ORCHESTRAL_RELEASE_ROUNDS:-1}}"
 ENV_FILE="${ORCHESTRAL_RELEASE_ENV_FILE:-.env.local}"
+INCLUDE_P2="${ORCHESTRAL_RELEASE_INCLUDE_P2:-0}"
 
 if ! [[ "$ROUNDS" =~ ^[0-9]+$ ]] || [[ "$ROUNDS" -lt 1 ]]; then
   echo "rounds must be a positive integer" >&2
@@ -20,6 +21,13 @@ SPECS=(
   "configs/scenarios/audit_structured_patch_logging_mode.smoke.yaml"
   "configs/scenarios/deterministic_batch_doc_patch.smoke.yaml"
 )
+
+if [[ "$INCLUDE_P2" == "1" ]]; then
+  SPECS+=(
+    "configs/scenarios/incremental_doc_patch_minimal_rework.smoke.yaml"
+    "configs/scenarios/cross_family_unified_runtime.smoke.yaml"
+  )
+fi
 
 for ((round = 1; round <= ROUNDS; round++)); do
   echo "== Release smoke round ${round}/${ROUNDS} =="

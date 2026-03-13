@@ -1,0 +1,11 @@
+service:
+  name: cross-family-demo
+  owner: runtime-team
+
+logging:
+  level: debug
+  pretty: true
+  file_output: null
+
+feature_flags:
+  audit_mode: false
