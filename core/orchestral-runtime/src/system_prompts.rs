@@ -32,11 +32,9 @@ fn render_template(template: &str, bindings: &[(&str, &str)]) -> String {
 pub fn render_planner_prompt(
     base_prompt: &str,
     execution_environment: &str,
-    action_catalog: &str,
     skill_knowledge: &str,
     conditional_rules: &str,
 ) -> String {
-    let _ = action_catalog;
     render_template(
         planner_template(),
         &[
@@ -44,7 +42,6 @@ pub fn render_planner_prompt(
             ("EXECUTION_ENVIRONMENT", execution_environment.trim()),
             ("SKILL_KNOWLEDGE", skill_knowledge.trim()),
             ("CONDITIONAL_RULES", conditional_rules.trim()),
-            ("ACTION_CATALOG", action_catalog.trim()),
         ],
     )
 }
@@ -58,7 +55,6 @@ mod tests {
         let rendered = render_planner_prompt(
             "base",
             "env",
-            "- name: shell",
             "skill block",
             "- only for shell",
         );
