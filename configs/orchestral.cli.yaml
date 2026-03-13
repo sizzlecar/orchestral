@@ -783,3 +783,111 @@ actions:
               type: string
           required: ["verify_decision", "summary"]
       config: {}
+    - name: reactor_codebase_collect_targets
+      kind: codebase_collect_targets
+      description: "Collect explicit mixed-artifact targets for the reactor codebase family"
+      interface:
+        input_schema:
+          type: object
+          properties:
+            user_request:
+              type: string
+          required: ["user_request"]
+        output_schema:
+          type: object
+          properties:
+            instruction_path:
+              type: string
+            instruction_source_paths:
+              type: array
+              items:
+                type: string
+            spreadsheet_path:
+              type: string
+            structured_path:
+              type: string
+            structured_source_paths:
+              type: array
+              items:
+                type: string
+          required:
+            [
+              "instruction_path",
+              "instruction_source_paths",
+              "spreadsheet_path",
+              "structured_path",
+              "structured_source_paths",
+            ]
+      config: {}
+    - name: reactor_codebase_collect_results
+      kind: codebase_collect_results
+      description: "Collect mixed-artifact run results for the reactor codebase family"
+      interface:
+        input_schema:
+          type: object
+          properties:
+            spreadsheet_path:
+              type: string
+            structured_paths:
+              type: array
+              items:
+                type: string
+            execution_summary:
+              type: string
+          required: ["spreadsheet_path", "structured_paths", "execution_summary"]
+        output_schema:
+          type: object
+          properties:
+            collected_result:
+              type: object
+            summary:
+              type: string
+          required: ["collected_result", "summary"]
+      config: {}
+    - name: reactor_codebase_aggregate_verify
+      kind: codebase_aggregate_verify
+      description: "Aggregate mixed-artifact verify results for the reactor codebase family"
+      interface:
+        input_schema:
+          type: object
+          properties:
+            spreadsheet_verify_decision:
+              type: object
+            structured_verify_decision:
+              type: object
+            collected_result:
+              type: object
+          required:
+            [
+              "spreadsheet_verify_decision",
+              "structured_verify_decision",
+              "collected_result",
+            ]
+        output_schema:
+          type: object
+          properties:
+            verify_decision:
+              type: object
+            summary:
+              type: string
+          required: ["verify_decision", "summary"]
+      config: {}
+    - name: reactor_codebase_export_summary
+      kind: codebase_export_summary
+      description: "Export a unified mixed-artifact summary for the reactor codebase family"
+      interface:
+        input_schema:
+          type: object
+          properties:
+            collected_result:
+              type: object
+            verify_decision:
+              type: object
+          required: ["collected_result", "verify_decision"]
+        output_schema:
+          type: object
+          properties:
+            summary:
+              type: string
+          required: ["summary"]
+      config: {}

@@ -1,0 +1,1 @@
+{"type":"SKELETON_CHOICE","skeleton":"run_and_verify","artifact_family":"codebase","initial_stage":"prepare","confidence":0.76,"reason":"The task needs one runtime to inspect an instruction document, update heterogeneous local artifacts, verify them, and then emit a final summary."}

@@ -20,6 +20,8 @@ const EXAMPLE_REACTOR_DOCUMENT: &str =
     include_str!("../../prompts/examples/reactor_document.jsonl");
 const EXAMPLE_REACTOR_STRUCTURED: &str =
     include_str!("../../prompts/examples/reactor_structured.jsonl");
+const EXAMPLE_REACTOR_RUN_AND_VERIFY_CODEBASE: &str =
+    include_str!("../../prompts/examples/reactor_run_and_verify_codebase.jsonl");
 const EXAMPLE_ACTION_CALL_SHELL: &str =
     include_str!("../../prompts/examples/action_call_shell.json");
 const EXAMPLE_ACTION_CALL_FILE_READ: &str =
@@ -33,6 +35,7 @@ struct ReactorPromptCoverage {
     spreadsheet: bool,
     document: bool,
     structured: bool,
+    codebase: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -181,6 +184,26 @@ fn detect_reactor_prompt_coverage(context: &PlannerContext) -> ReactorPromptCove
                 "reactor_structured_verify_patch",
             ],
         ),
+        codebase: has_reactor_actions(
+            context,
+            &[
+                "reactor_codebase_collect_targets",
+                "reactor_codebase_collect_results",
+                "reactor_codebase_aggregate_verify",
+                "reactor_codebase_export_summary",
+            ],
+        ) && has_reactor_actions(
+            context,
+            &[
+                "reactor_document_inspect",
+                "reactor_spreadsheet_inspect",
+                "reactor_spreadsheet_apply_patch",
+                "reactor_spreadsheet_verify_patch",
+                "reactor_structured_inspect",
+                "reactor_structured_apply_patch",
+                "reactor_structured_verify_patch",
+            ],
+        ),
     }
 }
 
@@ -217,6 +240,9 @@ fn append_reactor_choice_examples(buf: &mut String, coverage: ReactorPromptCover
     }
     if coverage.structured {
         append_example_lines(buf, EXAMPLE_REACTOR_STRUCTURED);
+    }
+    if coverage.codebase {
+        append_example_line(buf, EXAMPLE_REACTOR_RUN_AND_VERIFY_CODEBASE);
     }
 }
 
@@ -280,6 +306,15 @@ fn append_reactor_coverage(out: &mut String, artifact_family: &str) {
     out.push_str("  verify is the done gate\n");
 }
 
+fn append_run_and_verify_codebase_coverage(out: &mut String) {
+    out.push_str("- skeleton=run_and_verify, artifact_family=codebase\n");
+    out.push_str(
+        "  covered stage path: prepare -> run -> collect -> verify -> export\n",
+    );
+    out.push_str("  prepare resolves explicit mixed-artifact targets\n");
+    out.push_str("  verify is the done gate\n");
+}
+
 fn select_history_for_prompt(history: &[HistoryItem], max_history: usize) -> Vec<&HistoryItem> {
     if max_history == 0 {
         return Vec::new();
@@ -334,7 +369,10 @@ fn build_reactor_system_prompt(
     if coverage.structured {
         append_reactor_coverage(&mut out, "structured");
     }
-    if !coverage.spreadsheet && !coverage.document && !coverage.structured {
+    if coverage.codebase {
+        append_run_and_verify_codebase_coverage(&mut out);
+    }
+    if !coverage.spreadsheet && !coverage.document && !coverage.structured && !coverage.codebase {
         out.push_str("- no executable reactor family coverage detected for this request\n");
     }
     out.push_str("- default derivation_policy: ");

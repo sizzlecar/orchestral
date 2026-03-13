@@ -60,8 +60,11 @@ impl Orchestrator {
             self.task_store.save(&task).await?;
 
             let stage_plan = match choice.current_stage {
-                StageKind::Locate
+                StageKind::Prepare
+                | StageKind::Locate
                 | StageKind::Probe
+                | StageKind::Run
+                | StageKind::Collect
                 | StageKind::Derive
                 | StageKind::Assess
                 | StageKind::Commit
@@ -122,7 +125,10 @@ impl Orchestrator {
                     };
                 }
                 StageKind::Locate
+                | StageKind::Prepare
                 | StageKind::Probe
+                | StageKind::Run
+                | StageKind::Collect
                 | StageKind::Derive
                 | StageKind::Assess
                 | StageKind::Commit
@@ -203,8 +209,11 @@ impl Orchestrator {
 
             match snapshot.result.clone() {
                 ExecutionResult::Completed => match choice.current_stage {
-                    StageKind::Locate
+                    StageKind::Prepare
+                    | StageKind::Locate
                     | StageKind::Probe
+                    | StageKind::Run
+                    | StageKind::Collect
                     | StageKind::Derive
                     | StageKind::Export
                     | StageKind::Commit => {
