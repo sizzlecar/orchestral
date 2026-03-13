@@ -602,6 +602,9 @@ impl RuntimeClient {
                                 "tui action: output_persist from assistant_output"
                             );
                             let _ = runtime_tx_events
+                                .send(RuntimeMsg::AssistantOutput(normalized.clone()))
+                                .await;
+                            let _ = runtime_tx_events
                                 .send(RuntimeMsg::OutputPersist(normalized))
                                 .await;
                         }

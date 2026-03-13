@@ -41,6 +41,7 @@ pub enum RuntimeMsg {
         failed: bool,
     },
     OutputPersist(String),
+    AssistantOutput(String),
     AssistantDelta {
         chunk: String,
         done: bool,

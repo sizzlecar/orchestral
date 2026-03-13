@@ -150,6 +150,7 @@ async fn run_plain_turn(runtime_client: RuntimeClient, input: String) -> anyhow:
                 println!("{}", line);
                 last_persist_line = Some(trimmed);
             }
+            RuntimeMsg::AssistantOutput(_) => {}
             RuntimeMsg::AssistantDelta { .. } => {}
             RuntimeMsg::OutputTransient { slot, text } => {
                 if matches!(slot, TransientSlot::Status) {

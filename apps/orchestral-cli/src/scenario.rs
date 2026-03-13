@@ -138,6 +138,20 @@ struct ScenarioExpect {
     execution_mode_contains: Vec<String>,
     #[serde(default)]
     execution_mode_not_contains: Vec<String>,
+    #[serde(default)]
+    artifact_contains: Vec<ScenarioArtifactTextExpect>,
+    #[serde(default)]
+    artifact_not_contains: Vec<ScenarioArtifactTextExpect>,
+    #[serde(default)]
+    activity_contains_once: Vec<String>,
+    #[serde(default)]
+    activity_not_repeated: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ScenarioArtifactTextExpect {
+    path: PathBuf,
+    text: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -493,9 +507,15 @@ async fn execute_prepared_scenario(
 
     let mut reports = Vec::with_capacity(prepared.turns.len());
     let mut failures = Vec::new();
+    let workspace_dir = std::env::var_os("ORCHESTRAL_SCENARIO_WORKSPACE_DIR").map(PathBuf::from);
     for (index, turn) in prepared.turns.iter().enumerate() {
-        let turn_report =
-            execute_turn(runtime_client.clone(), turn.clone(), prepared.timeout_secs).await?;
+        let turn_report = execute_turn(
+            runtime_client.clone(),
+            turn.clone(),
+            prepared.timeout_secs,
+            workspace_dir.as_deref(),
+        )
+        .await?;
         if !turn_report.passed {
             let turn_name = turn
                 .name
@@ -693,6 +713,10 @@ fn prepare_scenario(options: ScenarioRunOptions) -> anyhow::Result<PreparedScena
                 assistant_not_contains: Vec::new(),
                 execution_mode_contains: Vec::new(),
                 execution_mode_not_contains: Vec::new(),
+                artifact_contains: Vec::new(),
+                artifact_not_contains: Vec::new(),
+                activity_contains_once: Vec::new(),
+                activity_not_repeated: Vec::new(),
             },
             verify: Vec::new(),
         }],
@@ -725,6 +749,7 @@ async fn execute_turn(
     runtime_client: RuntimeClient,
     turn: ScenarioTurnSpec,
     timeout_secs: u64,
+    workspace_dir: Option<&Path>,
 ) -> anyhow::Result<TurnReport> {
     let (tx, mut rx) = mpsc::channel::<RuntimeMsg>(256);
     let input = turn.input.clone();
@@ -800,7 +825,7 @@ async fn execute_turn(
             }
         }
     }
-    evaluate_expectations(&mut report, &turn.expect);
+    evaluate_expectations(&mut report, &turn.expect, workspace_dir);
     report.passed = report.failures.is_empty();
     Ok(report)
 }
@@ -809,9 +834,7 @@ fn handle_runtime_msg(report: &mut TurnReport, msg: RuntimeMsg) {
     match msg {
         RuntimeMsg::PlanningStart => report.planning_started = true,
         RuntimeMsg::PlanningEnd => report.planning_finished = true,
-        RuntimeMsg::ExecutionStart {
-            execution_mode, ..
-        } => {
+        RuntimeMsg::ExecutionStart { execution_mode, .. } => {
             report.execution_started = true;
             if let Some(mode) = execution_mode {
                 report.execution_modes.push(mode);
@@ -859,6 +882,9 @@ fn handle_runtime_msg(report: &mut TurnReport, msg: RuntimeMsg) {
             }
             report.persist_lines.push(line)
         }
+        RuntimeMsg::AssistantOutput(message) => {
+            report.assistant_stream = message;
+        }
         RuntimeMsg::AssistantDelta { chunk, done } => {
             report.assistant_stream.push_str(&chunk);
             if done {
@@ -877,7 +903,11 @@ fn handle_runtime_msg(report: &mut TurnReport, msg: RuntimeMsg) {
     }
 }
 
-fn evaluate_expectations(report: &mut TurnReport, expect: &ScenarioExpect) {
+fn evaluate_expectations(
+    report: &mut TurnReport,
+    expect: &ScenarioExpect,
+    workspace_dir: Option<&Path>,
+) {
     if expect.require_execution_end && !report.execution_finished {
         report
             .failures
@@ -973,6 +1003,34 @@ fn evaluate_expectations(report: &mut TurnReport, expect: &ScenarioExpect) {
         "execution_mode",
         &report.execution_modes,
         &expect.execution_mode_not_contains,
+        &mut report.failures,
+    );
+    assert_artifact_contains(
+        "artifact",
+        &expect.artifact_contains,
+        workspace_dir,
+        &mut report.failures,
+    );
+    assert_artifact_not_contains(
+        "artifact",
+        &expect.artifact_not_contains,
+        workspace_dir,
+        &mut report.failures,
+    );
+    assert_line_occurrence(
+        "activity",
+        &report.activity_lines,
+        &expect.activity_contains_once,
+        1,
+        1,
+        &mut report.failures,
+    );
+    assert_line_occurrence(
+        "activity",
+        &report.activity_lines,
+        &expect.activity_not_repeated,
+        0,
+        1,
         &mut report.failures,
     );
 }
@@ -1204,7 +1262,12 @@ fn assert_not_contains(
     }
 }
 
-fn assert_text_contains(label: &str, haystack: &str, needles: &[String], failures: &mut Vec<String>) {
+fn assert_text_contains(
+    label: &str,
+    haystack: &str,
+    needles: &[String],
+    failures: &mut Vec<String>,
+) {
     for needle in needles {
         if !haystack.contains(needle) {
             failures.push(format!("expected {} output to contain '{}'", label, needle));
@@ -1223,6 +1286,93 @@ fn assert_text_not_contains(
             failures.push(format!(
                 "expected {} output not to contain '{}'",
                 label, needle
+            ));
+        }
+    }
+}
+
+fn assert_artifact_contains(
+    label: &str,
+    expects: &[ScenarioArtifactTextExpect],
+    workspace_dir: Option<&Path>,
+    failures: &mut Vec<String>,
+) {
+    for expect in expects {
+        match read_artifact_text(&expect.path, workspace_dir) {
+            Ok(content) => {
+                if !content.contains(&expect.text) {
+                    failures.push(format!(
+                        "expected {} '{}' to contain '{}'",
+                        label,
+                        expect.path.display(),
+                        expect.text
+                    ));
+                }
+            }
+            Err(err) => failures.push(format!(
+                "failed reading {} '{}': {}",
+                label,
+                expect.path.display(),
+                err
+            )),
+        }
+    }
+}
+
+fn assert_artifact_not_contains(
+    label: &str,
+    expects: &[ScenarioArtifactTextExpect],
+    workspace_dir: Option<&Path>,
+    failures: &mut Vec<String>,
+) {
+    for expect in expects {
+        match read_artifact_text(&expect.path, workspace_dir) {
+            Ok(content) => {
+                if content.contains(&expect.text) {
+                    failures.push(format!(
+                        "expected {} '{}' to not contain '{}'",
+                        label,
+                        expect.path.display(),
+                        expect.text
+                    ));
+                }
+            }
+            Err(err) => failures.push(format!(
+                "failed reading {} '{}': {}",
+                label,
+                expect.path.display(),
+                err
+            )),
+        }
+    }
+}
+
+fn read_artifact_text(path: &Path, workspace_dir: Option<&Path>) -> anyhow::Result<String> {
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Some(workspace_dir) = workspace_dir {
+        workspace_dir.join(path)
+    } else {
+        path.to_path_buf()
+    };
+    fs::read_to_string(&resolved)
+        .with_context(|| format!("read artifact '{}' failed", resolved.display()))
+}
+
+fn assert_line_occurrence(
+    label: &str,
+    haystack: &[String],
+    needles: &[String],
+    min_count: usize,
+    max_count: usize,
+    failures: &mut Vec<String>,
+) {
+    for needle in needles {
+        let count = haystack.iter().filter(|line| line.contains(needle)).count();
+        if count < min_count || count > max_count {
+            failures.push(format!(
+                "expected {} '{}' occurrence count in [{}..={}] but got {}",
+                label, needle, min_count, max_count, count
             ));
         }
     }
@@ -1544,8 +1694,8 @@ mod tests {
     use super::{
         archive_runtime_log, assert_contains, command_looks_like_path, evaluate_expectations,
         materialize_workspace, parse_status_line, resolve_relative, run_verification,
-        sanitize_name, PreparedWorkspaceCopy, ScenarioCleanupSession, ScenarioCleanupSpec,
-        ScenarioCleanupTarget, ScenarioExpect, ScenarioVerifySpec, TurnReport,
+        sanitize_name, PreparedWorkspaceCopy, ScenarioArtifactTextExpect, ScenarioCleanupSession,
+        ScenarioCleanupSpec, ScenarioCleanupTarget, ScenarioExpect, ScenarioVerifySpec, TurnReport,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -1611,9 +1761,13 @@ mod tests {
             assistant_not_contains: Vec::new(),
             execution_mode_contains: Vec::new(),
             execution_mode_not_contains: Vec::new(),
+            artifact_contains: Vec::new(),
+            artifact_not_contains: Vec::new(),
+            activity_contains_once: Vec::new(),
+            activity_not_repeated: Vec::new(),
         };
 
-        evaluate_expectations(&mut report, &expect);
+        evaluate_expectations(&mut report, &expect, None);
         assert!(report
             .failures
             .iter()
@@ -1647,7 +1801,7 @@ mod tests {
             failures: Vec::new(),
             passed: false,
         };
-        evaluate_expectations(&mut report, &ScenarioExpect::default());
+        evaluate_expectations(&mut report, &ScenarioExpect::default(), None);
         assert!(report
             .failures
             .iter()
@@ -1704,9 +1858,13 @@ mod tests {
             assistant_not_contains: vec!["ls -la".to_string()],
             execution_mode_contains: vec!["action_call".to_string()],
             execution_mode_not_contains: vec!["direct_response".to_string()],
+            artifact_contains: Vec::new(),
+            artifact_not_contains: Vec::new(),
+            activity_contains_once: Vec::new(),
+            activity_not_repeated: Vec::new(),
         };
 
-        evaluate_expectations(&mut report, &expect);
+        evaluate_expectations(&mut report, &expect, None);
         assert!(report.failures.is_empty());
     }
 
@@ -1748,9 +1906,134 @@ mod tests {
             assistant_not_contains: Vec::new(),
             execution_mode_contains: Vec::new(),
             execution_mode_not_contains: Vec::new(),
+            artifact_contains: Vec::new(),
+            artifact_not_contains: Vec::new(),
+            activity_contains_once: Vec::new(),
+            activity_not_repeated: Vec::new(),
         };
 
-        evaluate_expectations(&mut report, &expect);
+        evaluate_expectations(&mut report, &expect, None);
+        assert!(report.failures.is_empty());
+    }
+
+    #[test]
+    fn test_evaluate_expectations_checks_artifact_content() {
+        let root =
+            std::env::temp_dir().join(format!("orchestral-scenario-artifact-{}", super::now_ms()));
+        fs::create_dir_all(root.join("fixtures/config")).expect("create artifact dir");
+        fs::write(
+            root.join("fixtures/config/settings.yaml"),
+            "level: info\npretty: false\n",
+        )
+        .expect("write artifact");
+
+        let mut report = TurnReport {
+            name: None,
+            input: "hello".to_string(),
+            duration_ms: 0,
+            planning_started: true,
+            planning_finished: true,
+            execution_started: true,
+            execution_finished: true,
+            execution_status: Some("completed".to_string()),
+            timed_out: false,
+            approvals: Vec::new(),
+            errors: Vec::new(),
+            persist_lines: Vec::new(),
+            transient_lines: Vec::new(),
+            activity_lines: Vec::new(),
+            assistant_stream: String::new(),
+            execution_modes: Vec::new(),
+            verifications: Vec::new(),
+            failures: Vec::new(),
+            passed: false,
+        };
+        let expect = ScenarioExpect {
+            require_execution_end: true,
+            execution_status: Some("completed".to_string()),
+            max_approvals: Some(0),
+            max_errors: Some(0),
+            persist_contains: Vec::new(),
+            persist_not_contains: Vec::new(),
+            transient_contains: Vec::new(),
+            transient_not_contains: Vec::new(),
+            activity_contains: Vec::new(),
+            activity_not_contains: Vec::new(),
+            assistant_contains: Vec::new(),
+            assistant_not_contains: Vec::new(),
+            execution_mode_contains: Vec::new(),
+            execution_mode_not_contains: Vec::new(),
+            artifact_contains: vec![ScenarioArtifactTextExpect {
+                path: PathBuf::from("fixtures/config/settings.yaml"),
+                text: "level: info".to_string(),
+            }],
+            artifact_not_contains: vec![ScenarioArtifactTextExpect {
+                path: PathBuf::from("fixtures/config/settings.yaml"),
+                text: "debug".to_string(),
+            }],
+            activity_contains_once: Vec::new(),
+            activity_not_repeated: Vec::new(),
+        };
+
+        evaluate_expectations(&mut report, &expect, Some(root.as_path()));
+        assert!(report.failures.is_empty());
+    }
+
+    #[test]
+    fn test_evaluate_expectations_checks_activity_occurrence_bounds() {
+        let mut report = TurnReport {
+            name: None,
+            input: "hello".to_string(),
+            duration_ms: 0,
+            planning_started: true,
+            planning_finished: true,
+            execution_started: true,
+            execution_finished: true,
+            execution_status: Some("completed".to_string()),
+            timed_out: false,
+            approvals: Vec::new(),
+            errors: Vec::new(),
+            persist_lines: Vec::new(),
+            transient_lines: Vec::new(),
+            activity_lines: vec![
+                "[start Ran] reactor_commit_apply reactor_spreadsheet_apply_patch".to_string(),
+                "[item] reactor_commit_apply reactor_spreadsheet_apply_patch | completed"
+                    .to_string(),
+                "[end] reactor_commit_apply reactor_spreadsheet_apply_patch failed=false"
+                    .to_string(),
+            ],
+            assistant_stream: String::new(),
+            execution_modes: Vec::new(),
+            verifications: Vec::new(),
+            failures: Vec::new(),
+            passed: false,
+        };
+        let expect = ScenarioExpect {
+            require_execution_end: true,
+            execution_status: Some("completed".to_string()),
+            max_approvals: Some(0),
+            max_errors: Some(0),
+            persist_contains: Vec::new(),
+            persist_not_contains: Vec::new(),
+            transient_contains: Vec::new(),
+            transient_not_contains: Vec::new(),
+            activity_contains: Vec::new(),
+            activity_not_contains: Vec::new(),
+            assistant_contains: Vec::new(),
+            assistant_not_contains: Vec::new(),
+            execution_mode_contains: Vec::new(),
+            execution_mode_not_contains: Vec::new(),
+            artifact_contains: Vec::new(),
+            artifact_not_contains: Vec::new(),
+            activity_contains_once: vec![
+                r#"[start Ran] reactor_commit_apply reactor_spreadsheet_apply_patch"#.to_string(),
+            ],
+            activity_not_repeated: vec![
+                r#"[start Ran] reactor_commit_apply reactor_spreadsheet_apply_patch"#.to_string(),
+            ],
+        };
+
+        evaluate_expectations(&mut report, &expect, None);
         assert!(report.failures.is_empty());
     }
 

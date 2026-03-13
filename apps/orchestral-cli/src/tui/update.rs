@@ -350,6 +350,9 @@ fn handle_runtime(app: &mut App, msg: RuntimeMsg) {
             );
             app.set_dirty();
         }
+        RuntimeMsg::AssistantOutput(_) => {
+            app.set_dirty();
+        }
         RuntimeMsg::AssistantDelta { chunk, done } => {
             if app.assistant_output_persisted {
                 tracing::debug!(
