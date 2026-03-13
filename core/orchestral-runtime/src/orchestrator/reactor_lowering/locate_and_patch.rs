@@ -77,7 +77,12 @@ impl LocateAndPatchFamilyAdapter {
                 assess_action: REACTOR_DOCUMENT_ASSESS_ACTION,
                 apply_action: REACTOR_DOCUMENT_APPLY_ACTION,
                 verify_action: REACTOR_DOCUMENT_VERIFY_ACTION,
-                locate_export_keys: &["source_paths", "artifact_candidates", "artifact_count"],
+                locate_export_keys: &[
+                    "source_paths",
+                    "artifact_candidates",
+                    "artifact_count",
+                    "report_path",
+                ],
                 verify_complete_message: "Documents updated and verified.",
             }),
             ArtifactFamily::Structured => Some(Self {
@@ -484,7 +489,14 @@ impl LocateAndPatchFamilyAdapter {
                 .with_io_bindings(vec![StepIoBinding::required(
                     "reactor_commit_derive.patch_spec",
                     "patch_spec",
-                )]),
+                )])
+                .with_params(serde_json::json!({
+                    "report_path": task
+                        .working_set_snapshot
+                        .get("report_path")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                })),
             ArtifactFamily::Structured => Step::action("reactor_commit_apply", self.apply_action)
                 .with_depends_on(vec![StepId::from("reactor_commit_derive")])
                 .with_exports(vec![

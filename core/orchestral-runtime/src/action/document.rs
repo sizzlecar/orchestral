@@ -11,8 +11,12 @@ pub use self::actions::build_document_action;
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use serde_json::{json, Value};
 
+    use super::apply::apply_document_patch;
     use super::assess::{assess_document_readiness, collect_candidate_unknowns};
     use super::support::request_requires_confirmation;
 
@@ -87,5 +91,46 @@ mod tests {
         assert!(unknowns.contains(&"docs/a.md requires additional user input".to_string()));
         assert!(unknowns.contains(&"missing owner".to_string()));
         assert!(unknowns.contains(&"missing due date".to_string()));
+    }
+
+    #[test]
+    fn test_apply_document_patch_generates_requested_report_when_missing_from_patch_spec() {
+        let root = std::env::temp_dir().join(format!(
+            "orchestral-document-apply-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("unix time")
+                .as_millis()
+        ));
+        let docs_dir = root.join("docs");
+        let reports_dir = root.join("reports");
+        fs::create_dir_all(&docs_dir).expect("create docs dir");
+        fs::create_dir_all(&reports_dir).expect("create reports dir");
+
+        let doc_path = docs_dir.join("guide.md");
+        let report_path = reports_dir.join("summary.md");
+        let patch_spec = json!({
+            "summary": "Updated missing title.",
+            "updates": [
+                {
+                    "path": doc_path.to_string_lossy(),
+                    "content": "# Guide\n\n## Scope\n\nExample.\n"
+                }
+            ]
+        });
+
+        let exports = apply_document_patch(&patch_spec, Some(report_path.to_string_lossy().as_ref()))
+            .expect("apply document patch");
+        let report = fs::read_to_string(&report_path).expect("read report");
+
+        assert!(report.contains("# Patch Summary"));
+        assert!(report.contains("Updated missing title."));
+        assert!(report.contains("guide.md"));
+        assert!(exports
+            .get("updated_paths")
+            .and_then(Value::as_array)
+            .is_some_and(|paths| paths.iter().any(|value| value.as_str() == Some(report_path.to_string_lossy().as_ref()))));
+
+        let _ = fs::remove_dir_all(root);
     }
 }

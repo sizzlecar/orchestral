@@ -287,7 +287,8 @@ impl Action for DocumentApplyPatchAction {
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
-                    "patch_spec": { "type": "object" }
+                    "patch_spec": { "type": "object" },
+                    "report_path": { "type": "string" }
                 },
                 "required": ["patch_spec"]
             }))
@@ -309,7 +310,8 @@ impl Action for DocumentApplyPatchAction {
         let Some(patch_spec) = input.params.get("patch_spec") else {
             return ActionResult::error("Missing patch_spec for document_apply_patch");
         };
-        match apply_document_patch(patch_spec) {
+        let report_path = input.params.get("report_path").and_then(Value::as_str);
+        match apply_document_patch(patch_spec, report_path) {
             Ok(exports) => ActionResult::success_with(exports),
             Err(error) => ActionResult::error(error),
         }
