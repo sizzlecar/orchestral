@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use orchestral_core::types::PatchCandidatesEnvelope;
 
-use super::model::{DocumentUpdate, parse_document_updates};
+use super::model::{parse_document_updates, DocumentUpdate};
 
 pub(super) fn parse_patch_candidates_envelope(value: &Value) -> Option<PatchCandidatesEnvelope> {
     serde_json::from_value::<PatchCandidatesEnvelope>(value.clone()).ok()
@@ -245,7 +245,7 @@ fn extract_path_like_tokens(input: &str) -> Vec<String> {
         .collect()
 }
 
-fn inspection_file_map<'a>(inspection: &'a Value) -> BTreeMap<String, &'a Value> {
+fn inspection_file_map(inspection: &Value) -> BTreeMap<String, &Value> {
     inspection
         .get("files")
         .and_then(Value::as_array)

@@ -88,25 +88,38 @@ fn verify(baseline_path: &Path, docs_root: &Path, changed_files: &[String]) -> R
     .with_context(|| format!("parse '{}' failed", baseline_path.display()))?;
 
     let changed_set = if changed_files.is_empty() {
-        baseline.changed_files.iter().cloned().collect::<BTreeSet<_>>()
+        baseline
+            .changed_files
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
     } else {
         changed_files.iter().cloned().collect::<BTreeSet<_>>()
     };
 
     for (relative, entry) in &baseline.files {
         let path = docs_root.join(relative);
-        let content =
-            fs::read_to_string(&path).with_context(|| format!("read '{}' failed", path.display()))?;
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("read '{}' failed", path.display()))?;
         let current_modified = modified_nanos(&path)?;
 
         if !content.starts_with("# ") {
-            bail!("expected '{}' to have a top-level title after rerun", relative);
+            bail!(
+                "expected '{}' to have a top-level title after rerun",
+                relative
+            );
         }
         if content.contains("TODO") {
-            bail!("expected '{}' to have no TODO placeholders after rerun", relative);
+            bail!(
+                "expected '{}' to have no TODO placeholders after rerun",
+                relative
+            );
         }
         if content != entry.content {
-            bail!("expected '{}' content to match baseline after rerun", relative);
+            bail!(
+                "expected '{}' content to match baseline after rerun",
+                relative
+            );
         }
 
         let changed = changed_set.contains(relative);

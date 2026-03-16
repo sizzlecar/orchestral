@@ -52,12 +52,7 @@ mod tests {
 
     #[test]
     fn planner_prompt_template_renders_dynamic_fields() {
-        let rendered = render_planner_prompt(
-            "base",
-            "env",
-            "skill block",
-            "- only for shell",
-        );
+        let rendered = render_planner_prompt("base", "env", "skill block", "- only for shell");
         assert!(rendered.contains("base"));
         assert!(rendered.contains("env"));
         assert!(rendered.contains("skill block"));

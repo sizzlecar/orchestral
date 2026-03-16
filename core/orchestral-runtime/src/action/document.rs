@@ -172,14 +172,13 @@ mod tests {
             ]
         });
 
-        let exports =
-            apply_document_patch(
-                &patch_spec,
-                Some(report_path.to_string_lossy().as_ref()),
-                None,
-                None,
-            )
-                .expect("apply document patch");
+        let exports = apply_document_patch(
+            &patch_spec,
+            Some(report_path.to_string_lossy().as_ref()),
+            None,
+            None,
+        )
+        .expect("apply document patch");
         let report = fs::read_to_string(&report_path).expect("read report");
 
         assert!(report.contains("# Patch Summary"));
@@ -246,10 +245,18 @@ mod tests {
             "assumptions": []
         });
 
-        apply_document_patch(&patch_spec, None, Some(&inspection), Some(&patch_candidates))
-            .expect("apply document patch");
+        apply_document_patch(
+            &patch_spec,
+            None,
+            Some(&inspection),
+            Some(&patch_candidates),
+        )
+        .expect("apply document patch");
         let patched = fs::read_to_string(&doc_path).expect("read patched doc");
-        assert_eq!(patched, "# Customer Onboarding\n\n## Goal\n\nKeep exact body.\n");
+        assert_eq!(
+            patched,
+            "# Customer Onboarding\n\n## Goal\n\nKeep exact body.\n"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -308,8 +315,13 @@ mod tests {
             "assumptions": []
         });
 
-        apply_document_patch(&patch_spec, None, Some(&inspection), Some(&patch_candidates))
-            .expect("apply document patch");
+        apply_document_patch(
+            &patch_spec,
+            None,
+            Some(&inspection),
+            Some(&patch_candidates),
+        )
+        .expect("apply document patch");
         assert!(!unknown_path.exists());
 
         let _ = fs::remove_dir_all(root);

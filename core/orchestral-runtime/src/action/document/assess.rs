@@ -142,10 +142,7 @@ pub(super) fn collect_candidate_unknowns(patch_candidates: &Value) -> Vec<String
     unknowns
 }
 
-fn auto_title_candidate_paths(
-    inspection: &Value,
-    patch_candidates: &Value,
-) -> BTreeSet<String> {
+fn auto_title_candidate_paths(inspection: &Value, patch_candidates: &Value) -> BTreeSet<String> {
     let Some(files) = inspection.get("files").and_then(Value::as_array) else {
         return BTreeSet::new();
     };
@@ -180,7 +177,8 @@ fn auto_title_candidate_paths(
                     .get("unknowns")
                     .and_then(Value::as_array)
                     .map(|items| {
-                        items.iter()
+                        items
+                            .iter()
                             .all(|item| item.as_str().is_some_and(is_title_preference_unknown))
                     })
                     .unwrap_or(true)

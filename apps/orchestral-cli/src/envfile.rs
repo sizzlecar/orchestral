@@ -83,10 +83,7 @@ mod tests {
             vec![
                 ("OPENAI_API_KEY".to_string(), "openai-key".to_string()),
                 ("GOOGLE_API_KEY".to_string(), "google-key".to_string()),
-                (
-                    "ANTHROPIC_API_KEY".to_string(),
-                    "anthropic-key".to_string()
-                ),
+                ("ANTHROPIC_API_KEY".to_string(), "anthropic-key".to_string()),
                 (
                     "http_proxy".to_string(),
                     "http://127.0.0.1:41809".to_string()

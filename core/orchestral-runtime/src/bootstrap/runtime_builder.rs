@@ -426,14 +426,21 @@ mod tests {
             ],
             models: vec![
                 model("gpt-4o-mini", "openai", "gpt-4o-mini"),
-                model("claude-sonnet-4-5-openrouter", "openrouter", "anthropic/claude-sonnet-4.5"),
+                model(
+                    "claude-sonnet-4-5-openrouter",
+                    "openrouter",
+                    "anthropic/claude-sonnet-4.5",
+                ),
             ],
             ..ProvidersConfig::default()
         };
 
         let selection = resolve_planner_backend_selection(&config).expect("selection");
         assert_eq!(selection.backend.name, "openai");
-        assert_eq!(selection.profile.as_ref().map(|p| p.name.as_str()), Some("gpt-4o-mini"));
+        assert_eq!(
+            selection.profile.as_ref().map(|p| p.name.as_str()),
+            Some("gpt-4o-mini")
+        );
         assert_eq!(selection.fell_back_from.as_deref(), Some("openrouter"));
 
         clear_key_envs();
@@ -458,7 +465,11 @@ mod tests {
             ],
             models: vec![
                 model("gpt-4o-mini", "openai", "gpt-4o-mini"),
-                model("claude-sonnet-4-5-openrouter", "openrouter", "anthropic/claude-sonnet-4.5"),
+                model(
+                    "claude-sonnet-4-5-openrouter",
+                    "openrouter",
+                    "anthropic/claude-sonnet-4.5",
+                ),
             ],
             ..ProvidersConfig::default()
         };

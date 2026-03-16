@@ -12,12 +12,8 @@ pub(super) fn apply_document_patch(
     inspection: Option<&Value>,
     patch_candidates: Option<&Value>,
 ) -> Result<HashMap<String, Value>, String> {
-    let updates = normalize_document_updates(
-        patch_spec,
-        report_path,
-        inspection,
-        patch_candidates,
-    )?;
+    let updates =
+        normalize_document_updates(patch_spec, report_path, inspection, patch_candidates)?;
     if updates.is_empty() {
         return Err("document patch_spec.updates is empty".to_string());
     }

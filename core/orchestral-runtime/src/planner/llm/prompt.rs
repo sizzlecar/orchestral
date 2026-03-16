@@ -308,9 +308,7 @@ fn append_reactor_coverage(out: &mut String, artifact_family: &str) {
 
 fn append_run_and_verify_codebase_coverage(out: &mut String) {
     out.push_str("- skeleton=run_and_verify, artifact_family=codebase\n");
-    out.push_str(
-        "  covered stage path: prepare -> run -> collect -> verify -> export\n",
-    );
+    out.push_str("  covered stage path: prepare -> run -> collect -> verify -> export\n");
     out.push_str("  prepare resolves explicit mixed-artifact targets\n");
     out.push_str("  verify is the done gate\n");
 }

@@ -251,7 +251,7 @@ fn derive_set_operation(
         for marker in &markers {
             let concrete = marker.replace("{ref}", reference);
             if let Some(raw_value) = extract_suffix_after_marker(user_request, &concrete) {
-                let value = parse_requested_value(&raw_value, entry)?;
+                let value = parse_requested_value(raw_value, entry)?;
                 return Ok(Some(json!({
                     "op": "set",
                     "path": entry.pointer,
