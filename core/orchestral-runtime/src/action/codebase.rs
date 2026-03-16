@@ -146,11 +146,17 @@ impl Action for CodebaseCollectResultsAction {
         else {
             return ActionResult::error("Missing spreadsheet_path for codebase_collect_results");
         };
-        let Some(structured_paths) = input.params.get("structured_paths").and_then(Value::as_array)
+        let Some(structured_paths) = input
+            .params
+            .get("structured_paths")
+            .and_then(Value::as_array)
         else {
             return ActionResult::error("Missing structured_paths for codebase_collect_results");
         };
-        let Some(execution_summary) = input.params.get("execution_summary").and_then(Value::as_str)
+        let Some(execution_summary) = input
+            .params
+            .get("execution_summary")
+            .and_then(Value::as_str)
         else {
             return ActionResult::error("Missing execution_summary for codebase_collect_results");
         };
@@ -437,36 +443,35 @@ fn collect_targets(user_request: &str) -> Result<HashMap<String, Value>, String>
     let structured_path =
         structured_path.ok_or_else(|| "Missing explicit structured file path".to_string())?;
 
-    Ok(
-        [
-            (
-                "instruction_path".to_string(),
-                Value::String(instruction_path.clone()),
-            ),
-            (
-                "instruction_source_paths".to_string(),
-                Value::Array(vec![Value::String(instruction_path)]),
-            ),
-            (
-                "spreadsheet_path".to_string(),
-                Value::String(spreadsheet_path),
-            ),
-            (
-                "structured_path".to_string(),
-                Value::String(structured_path.clone()),
-            ),
-            (
-                "structured_source_paths".to_string(),
-                Value::Array(vec![Value::String(structured_path)]),
-            ),
-        ]
-        .into_iter()
-        .collect(),
-    )
+    Ok([
+        (
+            "instruction_path".to_string(),
+            Value::String(instruction_path.clone()),
+        ),
+        (
+            "instruction_source_paths".to_string(),
+            Value::Array(vec![Value::String(instruction_path)]),
+        ),
+        (
+            "spreadsheet_path".to_string(),
+            Value::String(spreadsheet_path),
+        ),
+        (
+            "structured_path".to_string(),
+            Value::String(structured_path.clone()),
+        ),
+        (
+            "structured_source_paths".to_string(),
+            Value::Array(vec![Value::String(structured_path)]),
+        ),
+    ]
+    .into_iter()
+    .collect())
 }
 
 fn extract_existing_path_tokens(input: &str) -> Result<Vec<String>, String> {
-    let cwd = std::env::current_dir().map_err(|err| format!("resolve current dir failed: {err}"))?;
+    let cwd =
+        std::env::current_dir().map_err(|err| format!("resolve current dir failed: {err}"))?;
     let mut results = Vec::new();
     for token in input.split_whitespace().map(trim_path_token) {
         if token.is_empty() || !looks_like_path_token(&token) {
@@ -489,18 +494,35 @@ fn extract_existing_path_tokens(input: &str) -> Result<Vec<String>, String> {
 
 fn trim_path_token(token: &str) -> String {
     token
+        .trim()
         .trim_matches(|ch: char| {
             matches!(
                 ch,
-                '`' | '"' | '\'' | ',' | '，' | '。' | ';' | '；' | '(' | ')' | '[' | ']'
-                    | '{' | '}' | '<' | '>'
+                '`' | '"'
+                    | '\''
+                    | ','
+                    | '，'
+                    | '。'
+                    | ';'
+                    | '；'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '<'
+                    | '>'
             )
         })
         .to_string()
 }
 
 fn looks_like_path_token(token: &str) -> bool {
-    token.contains('/') || token.contains('.') || token.starts_with("./") || token.starts_with("../")
+    token.contains('/')
+        || token.contains('.')
+        || token.starts_with("./")
+        || token.starts_with("../")
 }
 
 fn display_path(cwd: &Path, path: &Path) -> String {

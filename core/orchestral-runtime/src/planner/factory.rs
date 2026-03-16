@@ -105,26 +105,46 @@ pub fn build_client_from_backend(
 }
 
 fn resolve_api_key(spec: &BackendSpec) -> Result<String, LlmBuildError> {
-    let env_name = spec
-        .api_key_env
-        .clone()
-        .or_else(|| default_api_key_env_for_kind(&spec.kind).map(ToString::to_string))
+    let candidates = api_key_env_candidates(spec);
+    let first = candidates
+        .first()
+        .cloned()
         .ok_or(LlmBuildError::MissingApiKey)?;
-    std::env::var(&env_name).map_err(|_| LlmBuildError::EnvNotFound(env_name.clone()))
+    for env_name in candidates {
+        if let Ok(value) = std::env::var(&env_name) {
+            if !value.trim().is_empty() {
+                return Ok(value);
+            }
+        }
+    }
+    Err(LlmBuildError::EnvNotFound(first))
 }
 
-fn default_api_key_env_for_kind(kind: &str) -> Option<&'static str> {
+fn api_key_env_candidates(spec: &BackendSpec) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(explicit) = spec.api_key_env.as_ref() {
+        candidates.push(explicit.clone());
+    }
+    for fallback in default_api_key_envs_for_kind(&spec.kind) {
+        if !candidates.iter().any(|existing| existing == fallback) {
+            candidates.push(fallback.to_string());
+        }
+    }
+    candidates
+}
+
+fn default_api_key_envs_for_kind(kind: &str) -> &'static [&'static str] {
     match kind.trim().to_ascii_lowercase().as_str() {
-        "openai" => Some("OPENAI_API_KEY"),
-        "google" | "gemini" => Some("GEMINI_API_KEY"),
-        "anthropic" => Some("ANTHROPIC_API_KEY"),
-        "deepseek" => Some("DEEPSEEK_API_KEY"),
-        "groq" => Some("GROQ_API_KEY"),
-        "xai" => Some("XAI_API_KEY"),
-        "mistral" => Some("MISTRAL_API_KEY"),
-        "cohere" => Some("COHERE_API_KEY"),
-        "openrouter" => Some("OPENROUTER_API_KEY"),
-        _ => None,
+        "openai" => &["OPENAI_API_KEY"],
+        "google" | "gemini" => &["GOOGLE_API_KEY", "GEMINI_API_KEY"],
+        "anthropic" | "claude" => &["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"],
+        "deepseek" => &["DEEPSEEK_API_KEY"],
+        "groq" => &["GROQ_API_KEY"],
+        "xai" => &["XAI_API_KEY"],
+        "mistral" => &["MISTRAL_API_KEY"],
+        "cohere" => &["COHERE_API_KEY"],
+        "openrouter" => &["OPENROUTER_API_KEY"],
+        _ => &[],
     }
 }
 
@@ -132,6 +152,7 @@ fn parse_backend(kind: &str) -> Result<LLMBackend, LlmBuildError> {
     let normalized = kind.to_lowercase();
     let mapped = match normalized.as_str() {
         "gemini" => "google",
+        "claude" => "anthropic",
         other => other,
     };
     let allowed = matches!(
@@ -402,7 +423,41 @@ mod tests {
         let backend = make_backend("openai");
         let invocation = LlmInvocationConfig::default();
         std::env::remove_var("TEST_API_KEY");
+        std::env::remove_var("OPENAI_API_KEY");
         let result = build_client_from_backend(&backend, &invocation);
         assert!(matches!(result, Err(LlmBuildError::EnvNotFound(_))));
+    }
+
+    #[test]
+    fn test_google_backend_accepts_google_api_key_alias() {
+        let backend = BackendSpec {
+            name: "google".to_string(),
+            kind: "google".to_string(),
+            endpoint: None,
+            api_key_env: None,
+            config: json!({}),
+        };
+        std::env::remove_var("GEMINI_API_KEY");
+        std::env::set_var("GOOGLE_API_KEY", "google-key");
+        let resolved = resolve_api_key(&backend).expect("google api key");
+        std::env::remove_var("GOOGLE_API_KEY");
+        assert_eq!(resolved, "google-key");
+    }
+
+    #[test]
+    fn test_claude_backend_accepts_claude_api_key_alias() {
+        let backend = BackendSpec {
+            name: "claude".to_string(),
+            kind: "claude".to_string(),
+            endpoint: None,
+            api_key_env: None,
+            config: json!({}),
+        };
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::set_var("CLAUDE_API_KEY", "claude-key");
+        let resolved = resolve_api_key(&backend).expect("claude api key");
+        std::env::remove_var("CLAUDE_API_KEY");
+        assert_eq!(resolved, "claude-key");
+        assert!(parse_backend("claude").is_ok());
     }
 }

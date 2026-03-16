@@ -68,7 +68,9 @@ mod tests {
         let entries = parse_env_entries(
             r#"
             # comment
-            export OPENROUTER_API_KEY="key-123"
+            export OPENAI_API_KEY="openai-key"
+            GOOGLE_API_KEY=google-key
+            ANTHROPIC_API_KEY='anthropic-key'
             http_proxy=http://127.0.0.1:41809
             https_proxy='http://127.0.0.1:41809'
             RUST_LOG=info
@@ -79,7 +81,12 @@ mod tests {
         assert_eq!(
             entries,
             vec![
-                ("OPENROUTER_API_KEY".to_string(), "key-123".to_string()),
+                ("OPENAI_API_KEY".to_string(), "openai-key".to_string()),
+                ("GOOGLE_API_KEY".to_string(), "google-key".to_string()),
+                (
+                    "ANTHROPIC_API_KEY".to_string(),
+                    "anthropic-key".to_string()
+                ),
                 (
                     "http_proxy".to_string(),
                     "http://127.0.0.1:41809".to_string()

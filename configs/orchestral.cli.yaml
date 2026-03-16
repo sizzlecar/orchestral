@@ -16,9 +16,13 @@ runtime:
 
 planner:
   mode: llm
-  # Requires OPENROUTER_API_KEY.
-  backend: openrouter
-  model_profile: claude-opus-4-6
+  # Supported direct provider env vars:
+  # - OPENAI_API_KEY
+  # - GOOGLE_API_KEY (GEMINI_API_KEY also accepted)
+  # - ANTHROPIC_API_KEY (CLAUDE_API_KEY also accepted)
+  # - OPENROUTER_API_KEY
+  backend: openai
+  model_profile: gpt-4o-mini
   max_history: 20
   log_full_prompts: true
   dynamic_model_selection: true
@@ -127,9 +131,29 @@ observability:
   log_file: "logs/orchestral-runtime.log"
 
 providers:
-  default_backend: openrouter
-  default_model: claude-opus-4-6
+  default_backend: openai
+  default_model: gpt-4o-mini
   backends:
+    - name: openai
+      kind: openai
+      api_key_env: OPENAI_API_KEY
+      config:
+        max_tokens: 4096
+        timeout_secs: 120
+    - name: google
+      kind: google
+      api_key_env: GOOGLE_API_KEY
+      config:
+        max_tokens: 4096
+        timeout_secs: 120
+        interpreter_timeout_secs: 8
+    - name: anthropic
+      kind: anthropic
+      api_key_env: ANTHROPIC_API_KEY
+      config:
+        max_tokens: 4096
+        timeout_secs: 120
+        interpreter_timeout_secs: 8
     - name: openrouter
       kind: openrouter
       api_key_env: OPENROUTER_API_KEY
@@ -137,38 +161,10 @@ providers:
       config:
         max_tokens: 4096
         timeout_secs: 120
-    - name: google
-      kind: google
-      api_key_env: GEMINI_API_KEY
-      config:
-        max_tokens: 4096
-        timeout_secs: 120
-        interpreter_timeout_secs: 8
   models:
-    - name: claude-opus-4-6
-      backend: openrouter
-      model: anthropic/claude-opus-4.6
-      temperature: 0.1
-      policy:
-        temperature_min: 0.0
-        temperature_max: 0.7
-    - name: claude-sonnet-4-5
-      backend: openrouter
-      model: anthropic/claude-sonnet-4.5
-      temperature: 0.2
-      policy:
-        temperature_min: 0.0
-        temperature_max: 1.0
-    - name: claude-opus-4-1
-      backend: openrouter
-      model: anthropic/claude-opus-4.1
-      temperature: 0.1
-      policy:
-        temperature_min: 0.0
-        temperature_max: 0.7
-    - name: gemini-3-flash
-      backend: google
-      model: gemini-3.1-pro-preview
+    - name: gpt-4o-mini
+      backend: openai
+      model: gpt-4o-mini
       temperature: 0.2
       policy:
         temperature_min: 0.0
@@ -177,6 +173,44 @@ providers:
       backend: google
       model: gemini-2.5-flash
       temperature: 0.2
+      policy:
+        temperature_min: 0.0
+        temperature_max: 1.0
+    - name: claude-sonnet-4-5
+      backend: anthropic
+      model: claude-sonnet-4-5
+      temperature: 0.2
+      policy:
+        temperature_min: 0.0
+        temperature_max: 1.0
+    - name: gemini-3-flash
+      backend: google
+      model: gemini-3.1-pro-preview
+      temperature: 0.2
+      policy:
+        temperature_min: 0.0
+        temperature_max: 1.0
+    - name: claude-opus-4-6
+      backend: openrouter
+      model: anthropic/claude-opus-4.6
+      temperature: 0.1
+      policy:
+        temperature_min: 0.0
+        temperature_max: 0.7
+    - name: claude-opus-4-1
+      backend: openrouter
+      model: anthropic/claude-opus-4.1
+      temperature: 0.1
+      policy:
+        temperature_min: 0.0
+        temperature_max: 0.7
+    - name: claude-sonnet-4-5-openrouter
+      backend: openrouter
+      model: anthropic/claude-sonnet-4.5
+      temperature: 0.2
+      policy:
+        temperature_min: 0.0
+        temperature_max: 1.0
 actions:
   hot_reload: true
   # Optional: external process action (multi-language extension) example:
@@ -316,7 +350,7 @@ actions:
         # sandbox_linux_bwrap_path: "/usr/bin/bwrap"
         sandbox_writable_roots: ["."]
         env_policy: inherit
-        env_denylist: ["OPENAI_API_KEY", "GEMINI_API_KEY", "HF_TOKEN", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"]
+        env_denylist: ["OPENAI_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_API_KEY", "CLAUDE_API_KEY", "OPENROUTER_API_KEY", "HF_TOKEN", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"]
         blocked_commands: ["mkfs", "shutdown", "reboot", "poweroff"]
     - name: file_read
       kind: file_read

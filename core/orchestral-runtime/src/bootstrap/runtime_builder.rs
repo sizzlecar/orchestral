@@ -19,6 +19,13 @@ use super::BootstrapError;
 
 const MAX_PROMPT_LOG_CHARS: usize = 4_000;
 
+#[derive(Clone)]
+struct PlannerBackendSelection {
+    backend: orchestral_core::config::BackendSpec,
+    profile: Option<orchestral_core::config::ModelProfile>,
+    fell_back_from: Option<String>,
+}
+
 pub(super) fn concurrency_policy_from_name(
     policy: &str,
 ) -> Result<Arc<dyn ConcurrencyPolicy>, BootstrapError> {
@@ -38,39 +45,9 @@ pub(super) fn concurrency_policy_from_name(
 pub(super) fn build_planner(config: &OrchestralConfig) -> Result<Arc<dyn Planner>, BootstrapError> {
     match config.planner.mode.as_str() {
         "llm" => {
-            let backend = if let Some(name) = &config.planner.backend {
-                config
-                    .providers
-                    .get_backend(name)
-                    .ok_or_else(|| BootstrapError::BackendNotFound(name.clone()))?
-            } else if let Some(profile_name) = &config.planner.model_profile {
-                let profile = config
-                    .providers
-                    .get_model(profile_name)
-                    .ok_or_else(|| BootstrapError::ModelProfileNotFound(profile_name.clone()))?;
-                let backend_name = profile
-                    .backend
-                    .clone()
-                    .ok_or(BootstrapError::MissingProviderConfig)?;
-                config
-                    .providers
-                    .get_backend(&backend_name)
-                    .ok_or(BootstrapError::BackendNotFound(backend_name))?
-            } else {
-                config
-                    .providers
-                    .get_default_backend()
-                    .ok_or(BootstrapError::MissingProviderConfig)?
-            };
-
-            let profile =
-                if let Some(profile_name) = &config.planner.model_profile {
-                    Some(config.providers.get_model(profile_name).ok_or_else(|| {
-                        BootstrapError::ModelProfileNotFound(profile_name.clone())
-                    })?)
-                } else {
-                    config.providers.get_default_model()
-                };
+            let selection = resolve_planner_backend_selection(config)?;
+            let backend = selection.backend;
+            let profile = selection.profile;
 
             let model = config
                 .planner
@@ -99,6 +76,14 @@ pub(super) fn build_planner(config: &OrchestralConfig) -> Result<Arc<dyn Planner
             let system_prompt = String::new();
             let prompt_source = "template";
 
+            if let Some(original_backend) = selection.fell_back_from.as_ref() {
+                tracing::warn!(
+                    original_backend = %original_backend,
+                    resolved_backend = %backend.name,
+                    resolved_model = %model,
+                    "planner backend API key missing; fell back to alternate configured backend"
+                );
+            }
             tracing::info!(
                 backend_name = %backend.name,
                 backend_kind = %backend.kind,
@@ -138,39 +123,9 @@ pub(super) fn build_agent_step_executor(
 ) -> Result<Option<Arc<dyn orchestral_core::executor::AgentStepExecutor>>, BootstrapError> {
     match config.planner.mode.as_str() {
         "llm" => {
-            let profile = if let Some(profile_name) = &config.planner.model_profile {
-                Some(config.providers.get_model(profile_name).ok_or_else(|| {
-                    BootstrapError::ModelProfileNotFound(profile_name.to_string())
-                })?)
-            } else {
-                config.providers.get_default_model()
-            };
-
-            let backend = if let Some(profile) = &profile {
-                if let Some(backend_name) = &profile.backend {
-                    config
-                        .providers
-                        .get_backend(backend_name)
-                        .ok_or_else(|| BootstrapError::BackendNotFound(backend_name.to_string()))?
-                } else {
-                    config
-                        .providers
-                        .get_default_backend()
-                        .ok_or(BootstrapError::MissingProviderConfig)?
-                }
-            } else if let Some(backend_name) = &config.planner.backend {
-                config
-                    .providers
-                    .get_backend(backend_name)
-                    .ok_or_else(|| BootstrapError::BackendNotFound(backend_name.to_string()))?
-            } else if let Some(default_provider) = config.providers.get_default() {
-                config
-                    .providers
-                    .get_backend(&default_provider.name)
-                    .ok_or_else(|| BootstrapError::BackendNotFound(default_provider.name.clone()))?
-            } else {
-                return Err(BootstrapError::MissingProviderConfig);
-            };
+            let selection = resolve_planner_backend_selection(config)?;
+            let profile = selection.profile;
+            let backend = selection.backend;
 
             let model = config
                 .planner
@@ -255,6 +210,135 @@ fn truncate_for_log(input: &str, max_chars: usize) -> String {
     preview
 }
 
+fn resolve_planner_backend_selection(
+    config: &OrchestralConfig,
+) -> Result<PlannerBackendSelection, BootstrapError> {
+    let requested_profile = if let Some(profile_name) = &config.planner.model_profile {
+        Some(
+            config
+                .providers
+                .get_model(profile_name)
+                .ok_or_else(|| BootstrapError::ModelProfileNotFound(profile_name.clone()))?,
+        )
+    } else {
+        config.providers.get_default_model()
+    };
+
+    let requested_backend = if let Some(name) = &config.planner.backend {
+        config
+            .providers
+            .get_backend(name)
+            .ok_or_else(|| BootstrapError::BackendNotFound(name.clone()))?
+    } else if let Some(profile) = &requested_profile {
+        let backend_name = profile
+            .backend
+            .clone()
+            .ok_or(BootstrapError::MissingProviderConfig)?;
+        config
+            .providers
+            .get_backend(&backend_name)
+            .ok_or(BootstrapError::BackendNotFound(backend_name))?
+    } else {
+        config
+            .providers
+            .get_default_backend()
+            .ok_or(BootstrapError::MissingProviderConfig)?
+    };
+
+    if backend_has_available_api_key(&requested_backend) {
+        return Ok(PlannerBackendSelection {
+            backend: requested_backend,
+            profile: requested_profile,
+            fell_back_from: None,
+        });
+    }
+
+    if config.planner.model.is_some() {
+        return Ok(PlannerBackendSelection {
+            backend: requested_backend,
+            profile: requested_profile,
+            fell_back_from: None,
+        });
+    }
+
+    if let Some((backend, profile)) =
+        select_fallback_backend_and_profile(config, &requested_backend.name)
+    {
+        return Ok(PlannerBackendSelection {
+            backend,
+            profile,
+            fell_back_from: Some(requested_backend.name),
+        });
+    }
+
+    Ok(PlannerBackendSelection {
+        backend: requested_backend,
+        profile: requested_profile,
+        fell_back_from: None,
+    })
+}
+
+fn backend_has_available_api_key(backend: &orchestral_core::config::BackendSpec) -> bool {
+    if backend.kind.eq_ignore_ascii_case("ollama") {
+        return true;
+    }
+    backend.resolve_api_key().is_ok()
+}
+
+fn select_fallback_backend_and_profile(
+    config: &OrchestralConfig,
+    excluded_backend: &str,
+) -> Option<(
+    orchestral_core::config::BackendSpec,
+    Option<orchestral_core::config::ModelProfile>,
+)> {
+    let mut backends = config.providers.normalized_backends();
+    backends.sort_by_key(|backend| backend_priority(&backend.kind));
+    for backend in backends {
+        if backend.name == excluded_backend || !backend_has_available_api_key(&backend) {
+            continue;
+        }
+        let profile = preferred_model_for_backend(config, &backend.name);
+        if profile.is_some() {
+            return Some((backend, profile));
+        }
+    }
+    None
+}
+
+fn preferred_model_for_backend(
+    config: &OrchestralConfig,
+    backend_name: &str,
+) -> Option<orchestral_core::config::ModelProfile> {
+    if let Some(profile_name) = &config.planner.model_profile {
+        if let Some(profile) = config.providers.get_model(profile_name) {
+            if profile.backend.as_deref() == Some(backend_name) {
+                return Some(profile);
+            }
+        }
+    }
+    if let Some(default_model) = config.providers.get_default_model() {
+        if default_model.backend.as_deref() == Some(backend_name) {
+            return Some(default_model);
+        }
+    }
+    config
+        .providers
+        .normalized_models()
+        .into_iter()
+        .find(|profile| profile.backend.as_deref() == Some(backend_name))
+}
+
+fn backend_priority(kind: &str) -> usize {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "openai" => 0,
+        "google" | "gemini" => 1,
+        "anthropic" | "claude" => 2,
+        "openrouter" => 3,
+        _ => 10,
+    }
+}
+
 struct DeterministicPlanner;
 
 #[async_trait::async_trait]
@@ -269,5 +353,120 @@ impl Planner for DeterministicPlanner {
             "Deterministic planner cannot execute tasks after RFC0310 transition: {}",
             intent.content
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orchestral_core::config::{BackendSpec, ModelPolicy, ModelProfile, ProvidersConfig};
+    use serde_json::json;
+    use std::sync::{Mutex, OnceLock};
+
+    const KEY_ENV_NAMES: &[&str] = &[
+        "OPENAI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GEMINI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_API_KEY",
+        "OPENROUTER_API_KEY",
+    ];
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn clear_key_envs() {
+        for name in KEY_ENV_NAMES {
+            std::env::remove_var(name);
+        }
+    }
+
+    fn backend(name: &str, kind: &str, api_key_env: &str) -> BackendSpec {
+        BackendSpec {
+            name: name.to_string(),
+            kind: kind.to_string(),
+            endpoint: None,
+            api_key_env: Some(api_key_env.to_string()),
+            config: json!({}),
+        }
+    }
+
+    fn model(name: &str, backend: &str, model: &str) -> ModelProfile {
+        ModelProfile {
+            name: name.to_string(),
+            backend: Some(backend.to_string()),
+            model: model.to_string(),
+            temperature: Some(0.2),
+            max_tokens: None,
+            system_prompt: None,
+            policy: ModelPolicy::default(),
+            config: json!({}),
+        }
+    }
+
+    #[test]
+    fn test_resolve_planner_backend_selection_falls_back_to_available_openai() {
+        let _guard = env_lock().lock().expect("env lock");
+        clear_key_envs();
+        std::env::set_var("OPENAI_API_KEY", "openai-key");
+
+        let mut config = OrchestralConfig::default();
+        config.planner.mode = "llm".to_string();
+        config.planner.backend = Some("openrouter".to_string());
+        config.planner.model_profile = None;
+        config.providers = ProvidersConfig {
+            default_backend: Some("openrouter".to_string()),
+            default_model: Some("gpt-4o-mini".to_string()),
+            backends: vec![
+                backend("openrouter", "openrouter", "OPENROUTER_API_KEY"),
+                backend("openai", "openai", "OPENAI_API_KEY"),
+                backend("google", "google", "GOOGLE_API_KEY"),
+            ],
+            models: vec![
+                model("gpt-4o-mini", "openai", "gpt-4o-mini"),
+                model("claude-sonnet-4-5-openrouter", "openrouter", "anthropic/claude-sonnet-4.5"),
+            ],
+            ..ProvidersConfig::default()
+        };
+
+        let selection = resolve_planner_backend_selection(&config).expect("selection");
+        assert_eq!(selection.backend.name, "openai");
+        assert_eq!(selection.profile.as_ref().map(|p| p.name.as_str()), Some("gpt-4o-mini"));
+        assert_eq!(selection.fell_back_from.as_deref(), Some("openrouter"));
+
+        clear_key_envs();
+    }
+
+    #[test]
+    fn test_resolve_planner_backend_selection_prefers_requested_backend_when_key_exists() {
+        let _guard = env_lock().lock().expect("env lock");
+        clear_key_envs();
+        std::env::set_var("OPENROUTER_API_KEY", "or-key");
+        std::env::set_var("OPENAI_API_KEY", "openai-key");
+
+        let mut config = OrchestralConfig::default();
+        config.planner.mode = "llm".to_string();
+        config.planner.backend = Some("openrouter".to_string());
+        config.providers = ProvidersConfig {
+            default_backend: Some("openrouter".to_string()),
+            default_model: Some("claude-sonnet-4-5-openrouter".to_string()),
+            backends: vec![
+                backend("openrouter", "openrouter", "OPENROUTER_API_KEY"),
+                backend("openai", "openai", "OPENAI_API_KEY"),
+            ],
+            models: vec![
+                model("gpt-4o-mini", "openai", "gpt-4o-mini"),
+                model("claude-sonnet-4-5-openrouter", "openrouter", "anthropic/claude-sonnet-4.5"),
+            ],
+            ..ProvidersConfig::default()
+        };
+
+        let selection = resolve_planner_backend_selection(&config).expect("selection");
+        assert_eq!(selection.backend.name, "openrouter");
+        assert!(selection.fell_back_from.is_none());
+
+        clear_key_envs();
     }
 }

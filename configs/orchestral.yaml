@@ -124,7 +124,12 @@ providers:
         timeout_secs: 30
     - name: google
       kind: google
-      api_key_env: GEMINI_API_KEY
+      api_key_env: GOOGLE_API_KEY
+      config:
+        timeout_secs: 60
+    - name: anthropic
+      kind: anthropic
+      api_key_env: ANTHROPIC_API_KEY
       config:
         timeout_secs: 60
   models:
@@ -148,6 +153,13 @@ providers:
     - name: cheap
       backend: google
       model: gemini-1.5-flash
+      temperature: 0.2
+      policy:
+        temperature_min: 0.0
+        temperature_max: 1.0
+    - name: claude
+      backend: anthropic
+      model: claude-sonnet-4-5
       temperature: 0.2
       policy:
         temperature_min: 0.0
