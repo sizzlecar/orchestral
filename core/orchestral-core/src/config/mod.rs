@@ -9,10 +9,7 @@ mod loader;
 mod providers;
 
 pub use actions::{ActionInterfaceSpec, ActionSpec, ActionsConfig};
-pub use loader::{
-    load_actions_config, load_config, load_providers_config, ConfigError, ConfigManager,
-    ConfigWatcher,
-};
+pub use loader::{load_actions_config, load_config, load_providers_config, ConfigError};
 pub use providers::{
     ApiKeyError, BackendSpec, LegacyProviderSpec, ModelPolicy, ModelProfile, ProvidersConfig,
 };
@@ -21,9 +18,6 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 use serde_json::Value;
-
-use crate::recipe::RecipeTemplate;
-use crate::types::DerivationPolicy;
 
 /// Top-level configuration schema for Orchestral.
 #[derive(Debug, Clone, Deserialize)]
@@ -54,8 +48,6 @@ pub struct OrchestralConfig {
     #[serde(default)]
     pub actions: ActionsConfig,
     #[serde(default)]
-    pub recipes: RecipesConfig,
-    #[serde(default)]
     #[serde(alias = "plugins")]
     pub extensions: ExtensionsConfig,
 }
@@ -79,7 +71,6 @@ impl Default for OrchestralConfig {
             observability: ObservabilityConfig::default(),
             providers: ProvidersConfig::default(),
             actions: ActionsConfig::default(),
-            recipes: RecipesConfig::default(),
             extensions: ExtensionsConfig::default(),
         }
     }
@@ -92,10 +83,6 @@ impl OrchestralConfig {
 
     pub fn actions(&self) -> &ActionsConfig {
         &self.actions
-    }
-
-    pub fn recipes(&self) -> &RecipesConfig {
-        &self.recipes
     }
 
     pub fn extensions(&self) -> &ExtensionsConfig {
@@ -141,8 +128,8 @@ pub struct RuntimeConfig {
     pub concurrency_policy: String,
     #[serde(default = "default_true")]
     pub strict_exports: bool,
-    #[serde(default)]
-    pub reactor: ReactorConfig,
+    #[serde(default = "default_max_planner_iterations")]
+    pub max_planner_iterations: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -152,27 +139,7 @@ impl Default for RuntimeConfig {
             auto_cleanup: true,
             concurrency_policy: default_concurrency_policy(),
             strict_exports: true,
-            reactor: ReactorConfig::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ReactorConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub default_derivation_policy: DerivationPolicy,
-    #[serde(default = "default_reactor_stage_loop_limit")]
-    pub stage_loop_limit: usize,
-}
-
-impl Default for ReactorConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            default_derivation_policy: DerivationPolicy::Strict,
-            stage_loop_limit: default_reactor_stage_loop_limit(),
+            max_planner_iterations: default_max_planner_iterations(),
         }
     }
 }
@@ -189,8 +156,8 @@ fn default_concurrency_policy() -> String {
     "interrupt_and_start_new".to_string()
 }
 
-fn default_reactor_stage_loop_limit() -> usize {
-    10
+fn default_max_planner_iterations() -> usize {
+    6
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -296,8 +263,6 @@ pub struct ContextConfig {
     pub max_tokens: usize,
     #[serde(default = "default_true")]
     pub include_history: bool,
-    #[serde(default = "default_true")]
-    pub include_references: bool,
 }
 
 impl Default for ContextConfig {
@@ -306,7 +271,6 @@ impl Default for ContextConfig {
             history_limit: default_history_limit(),
             max_tokens: default_max_tokens(),
             include_history: true,
-            include_references: true,
         }
     }
 }
@@ -360,8 +324,6 @@ pub struct StoresConfig {
     pub event: StoreSpec,
     #[serde(default = "default_task_store_spec")]
     pub task: StoreSpec,
-    #[serde(default = "default_reference_store_spec")]
-    pub reference: StoreSpec,
 }
 
 impl Default for StoresConfig {
@@ -369,7 +331,6 @@ impl Default for StoresConfig {
         Self {
             event: default_event_store_spec(),
             task: default_task_store_spec(),
-            reference: default_reference_store_spec(),
         }
     }
 }
@@ -380,14 +341,6 @@ fn default_event_store_spec() -> StoreSpec {
 
 fn default_task_store_spec() -> StoreSpec {
     StoreSpec::default()
-}
-
-fn default_reference_store_spec() -> StoreSpec {
-    StoreSpec {
-        backend: default_reference_backend(),
-        connection_url: None,
-        key_prefix: None,
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -523,10 +476,6 @@ fn default_store_backend() -> String {
     "sqlite".to_string()
 }
 
-fn default_reference_backend() -> String {
-    "sqlite_vector".to_string()
-}
-
 fn default_blob_catalog_backend() -> String {
     "in_memory".to_string()
 }
@@ -537,12 +486,6 @@ pub type LocalFilesConfig = LocalBlobsConfig;
 pub type S3FilesConfig = S3BlobsConfig;
 pub type HybridFilesConfig = HybridBlobsConfig;
 pub type FileCatalogConfig = BlobCatalogConfig;
-
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct RecipesConfig {
-    #[serde(default)]
-    pub templates: Vec<RecipeTemplate>,
-}
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ExtensionsConfig {

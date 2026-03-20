@@ -131,6 +131,7 @@ impl Action for ShellAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_category("direct")
             .with_capabilities([
                 "filesystem_write",
                 "shell",

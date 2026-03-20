@@ -61,6 +61,7 @@ impl Action for HttpAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_category("direct")
             .with_capabilities(["network_io", "side_effect"])
             .with_roles(["collect", "execute"])
             .with_input_kinds(["request"])

@@ -56,6 +56,7 @@ pub enum UiEvent {
     ExecutionCompleted {
         status: Option<String>,
         execution_mode: Option<String>,
+        agent_loop_continue: bool,
     },
     StepStarted {
         step_id: String,
@@ -206,6 +207,10 @@ fn project_lifecycle_event(payload: &Value) -> Option<UiEvent> {
                 .and_then(|m| m.get("status"))
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
+            let agent_loop_continue = metadata
+                .and_then(|m| m.get("agent_loop_continue"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             if matches!(status.as_deref(), Some("waiting_user" | "waiting_event")) {
                 return Some(UiEvent::InputRequired {
                     prompt: metadata
@@ -232,6 +237,7 @@ fn project_lifecycle_event(payload: &Value) -> Option<UiEvent> {
                     .and_then(|m| m.get("execution_mode"))
                     .and_then(|v| v.as_str())
                     .map(str::to_string),
+                agent_loop_continue,
             })
         }
         _ => None,
@@ -405,6 +411,39 @@ mod tests {
                 assert_eq!(kind, AgentProgressKind::Iteration);
                 assert_eq!(action, None);
                 assert_eq!(message.as_deref(), Some("iteration 2/8"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_project_execution_completed_preserves_agent_loop_continue_flag() {
+        let event = Event::trace(
+            "thread-1",
+            "info",
+            json!({
+                "category": "runtime_lifecycle",
+                "interaction_id": "int-1",
+                "task_id": "task-1",
+                "event_type": "execution_completed",
+                "metadata": {
+                    "status": "failed",
+                    "execution_mode": "mini_plan",
+                    "agent_loop_continue": true
+                }
+            }),
+        );
+
+        let projected = project_event(&event);
+        match projected {
+            Some(UiEvent::ExecutionCompleted {
+                status,
+                execution_mode,
+                agent_loop_continue,
+            }) => {
+                assert_eq!(status.as_deref(), Some("failed"));
+                assert_eq!(execution_mode.as_deref(), Some("mini_plan"));
+                assert!(agent_loop_continue);
             }
             other => panic!("unexpected event: {other:?}"),
         }

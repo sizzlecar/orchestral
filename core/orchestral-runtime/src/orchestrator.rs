@@ -2,15 +2,12 @@
 //!
 //! This bridges the ThreadRuntime (events + concurrency) with core planning/execution.
 
+mod agent_loop;
 mod entry;
 mod execution;
 mod output;
 mod planning;
 mod progress;
-mod reactor_choice;
-mod reactor_loop;
-mod reactor_lowering;
-mod reactor_resume;
 #[cfg(test)]
 mod recovery;
 mod state;
@@ -33,30 +30,23 @@ use orchestral_core::executor::{ExecutionResult, Executor, ExecutorContext};
 use orchestral_core::interpreter::InterpretRequest;
 use orchestral_core::normalizer::{NormalizeError, PlanNormalizer};
 use orchestral_core::planner::{
-    HistoryItem, PlanError, Planner, PlannerContext, PlannerOutput, PlannerRuntimeInfo,
+    HistoryItem, PlanError, Planner, PlannerContext, PlannerLoopContext, PlannerOutput,
+    PlannerRuntimeInfo,
 };
 use orchestral_core::spi::HookRegistry;
-use orchestral_core::store::{
-    Event, InteractionId, ReferenceStore, StoreError, TaskStore, WorkingSet,
-};
+use orchestral_core::store::{Event, InteractionId, StoreError, TaskStore, WorkingSet};
 use orchestral_core::types::{
-    ContinuationState, ContinuationStatus, DerivationPolicy, Intent, IntentContext,
-    ReactorTaskState, StageChoice, StageKind, StepId, StepKind, Task, TaskId, TaskState,
-    VerifyDecision, VerifyStatus, WaitUserReason,
+    Intent, IntentContext, StepId, StepKind, Task, TaskId, TaskState, WaitUserReason,
 };
 use output::{execution_result_metadata, summarize_plan_steps};
 use progress::RuntimeProgressReporter;
-use reactor_choice::{
-    build_reactor_stage_choice, normalize_reactor_stage_choice,
-    resolve_stage_choice_from_skeleton_choice, validate_reactor_stage_choice,
-};
 use state::{
     apply_resume_event_to_working_set, complete_wait_step_for_resume, interaction_state_from_task,
     restore_checkpoint, task_state_from_execution,
 };
 use support::{
     context_window_to_history, drop_current_turn_user_input, event_to_history_item,
-    event_type_label, intent_from_event, payload_to_string, summarize_working_set,
+    event_type_label, intent_from_event, summarize_working_set,
 };
 
 use crate::{HandleEventResult, InteractionState, RuntimeError, ThreadRuntime};
@@ -185,7 +175,6 @@ pub struct Orchestrator {
     pub normalizer: PlanNormalizer,
     pub executor: Executor,
     pub task_store: Arc<dyn TaskStore>,
-    pub reference_store: Arc<dyn ReferenceStore>,
     pub context_builder: Option<Arc<dyn ContextBuilder>>,
     pub config: OrchestratorConfig,
     pub hook_registry: Arc<HookRegistry>,
@@ -201,18 +190,12 @@ pub struct OrchestratorConfig {
     pub context_budget: TokenBudget,
     /// Whether to include history when building context
     pub include_history: bool,
-    /// Whether to include references when building context
-    pub include_references: bool,
     /// Retry once by replanning only the failed subgraph.
     pub auto_replan_once: bool,
     /// Retry once by asking the planner to repair a plan rejected by normalization.
     pub auto_repair_plan_once: bool,
-    /// Enable stage-based reactor flow for supported artifact families.
-    pub reactor_enabled: bool,
-    /// Default derivation policy for newly created reactor tasks.
-    pub reactor_default_derivation_policy: DerivationPolicy,
-    /// Max stages runtime may execute in one turn before failing closed.
-    pub reactor_stage_loop_limit: usize,
+    /// Max planner iterations inside one outer agent loop turn.
+    pub max_planner_iterations: usize,
 }
 
 impl Default for OrchestratorConfig {
@@ -221,12 +204,9 @@ impl Default for OrchestratorConfig {
             history_limit: 50,
             context_budget: TokenBudget::default(),
             include_history: true,
-            include_references: true,
             auto_replan_once: true,
             auto_repair_plan_once: true,
-            reactor_enabled: false,
-            reactor_default_derivation_policy: DerivationPolicy::Strict,
-            reactor_stage_loop_limit: 10,
+            max_planner_iterations: 6,
         }
     }
 }
@@ -239,7 +219,6 @@ impl Orchestrator {
         normalizer: PlanNormalizer,
         executor: Executor,
         task_store: Arc<dyn TaskStore>,
-        reference_store: Arc<dyn ReferenceStore>,
     ) -> Self {
         Self::with_config(
             thread_runtime,
@@ -247,7 +226,6 @@ impl Orchestrator {
             normalizer,
             executor,
             task_store,
-            reference_store,
             OrchestratorConfig::default(),
         )
     }
@@ -259,7 +237,6 @@ impl Orchestrator {
         normalizer: PlanNormalizer,
         executor: Executor,
         task_store: Arc<dyn TaskStore>,
-        reference_store: Arc<dyn ReferenceStore>,
         config: OrchestratorConfig,
     ) -> Self {
         Self {
@@ -268,7 +245,6 @@ impl Orchestrator {
             normalizer,
             executor,
             task_store,
-            reference_store,
             context_builder: None,
             config,
             hook_registry: Arc::new(HookRegistry::new()),

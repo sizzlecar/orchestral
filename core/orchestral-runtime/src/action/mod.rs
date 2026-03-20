@@ -11,7 +11,7 @@
 mod builtin;
 mod codebase;
 mod document;
-mod external;
+
 mod factory;
 mod loader;
 mod mcp;
@@ -29,8 +29,8 @@ pub use orchestral_core::config::{ActionInterfaceSpec, ActionSpec, ActionsConfig
 pub use builtin::*;
 pub use codebase::*;
 pub use document::*;
-pub use external::*;
+
 pub use factory::{ActionBuildError, ActionFactory, DefaultActionFactory};
-pub use loader::{ActionConfigError, ActionRegistryManager, ActionWatcher};
+pub use loader::{ActionConfigError, ActionRegistryManager};
 pub use mcp::build_mcp_action;
 pub use structured::*;

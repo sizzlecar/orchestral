@@ -1,4 +1,0 @@
-{"type":"SKELETON_CHOICE","skeleton":"locate_and_patch","artifact_family":"document","initial_stage":"locate","confidence":0.9,"reason":"..."}
-{"type":"STAGE_CHOICE","skeleton":"locate_and_patch","artifact_family":"document","current_stage":"probe","stage_goal":"inspect document structure","derivation_policy":"permissive","next_stage_hint":"derive","reason":"..."}
-{"type":"SKELETON_CHOICE","skeleton":"inspect_and_extract","artifact_family":"document","initial_stage":"probe","confidence":0.9,"reason":"..."}
-{"type":"STAGE_CHOICE","skeleton":"inspect_and_extract","artifact_family":"document","current_stage":"probe","stage_goal":"inspect the artifact and collect structured findings","derivation_policy":"permissive","next_stage_hint":"derive","reason":"..."}

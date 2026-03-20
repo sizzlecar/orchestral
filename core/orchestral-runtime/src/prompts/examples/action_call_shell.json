@@ -1,1 +1,0 @@
-{"type":"ACTION_CALL","action":"shell","params":{"command":"find ./docs -maxdepth 1 -type f"},"reason":"list files under docs"}

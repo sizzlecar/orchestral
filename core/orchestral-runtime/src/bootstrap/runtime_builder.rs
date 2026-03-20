@@ -106,8 +106,7 @@ pub(super) fn build_planner(config: &OrchestralConfig) -> Result<Arc<dyn Planner
                 max_history: config.planner.max_history,
                 system_prompt,
                 log_full_prompts: config.planner.log_full_prompts,
-                reactor_enabled: config.runtime.reactor.enabled,
-                reactor_default_derivation_policy: config.runtime.reactor.default_derivation_policy,
+                ..LlmPlannerConfig::default()
             };
 
             let planner: LlmPlanner<Arc<dyn LlmClient>> = LlmPlanner::new(client, planner_cfg);
@@ -169,7 +168,6 @@ pub(super) fn build_runtime_component_options(
         json!({
             "event": store_spec_to_json(&config.stores.event),
             "task": store_spec_to_json(&config.stores.task),
-            "reference": store_spec_to_json(&config.stores.reference),
         }),
     );
     options.insert(
@@ -349,7 +347,7 @@ impl Planner for DeterministicPlanner {
         context: &PlannerContext,
     ) -> Result<PlannerOutput, PlanError> {
         let _ = context;
-        Ok(PlannerOutput::DirectResponse(format!(
+        Ok(PlannerOutput::Done(format!(
             "Deterministic planner cannot execute tasks after RFC0310 transition: {}",
             intent.content
         )))

@@ -50,6 +50,7 @@ impl Action for CodebaseCollectTargetsAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_category("codebase")
             .with_capabilities(["filesystem_read", "pure"])
             .with_roles(["collect", "prepare"])
             .with_input_kinds(["text"])
@@ -118,6 +119,7 @@ impl Action for CodebaseCollectResultsAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_category("codebase")
             .with_capabilities(["pure", "structured_output"])
             .with_roles(["collect", "emit"])
             .with_input_kinds(["structured"])
@@ -212,6 +214,7 @@ impl Action for CodebaseAggregateVerifyAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_category("codebase")
             .with_capabilities(["pure", "structured_output"])
             .with_roles(["verify", "control"])
             .with_input_kinds(["structured"])
@@ -274,7 +277,7 @@ impl Action for CodebaseAggregateVerifyAction {
         {
             (
                 VerifyStatus::Passed,
-                "cross-family verification passed".to_string(),
+                "multi-artifact verification passed".to_string(),
             )
         } else if spreadsheet.status != VerifyStatus::Passed {
             (VerifyStatus::Failed, spreadsheet.reason)
@@ -293,12 +296,12 @@ impl Action for CodebaseAggregateVerifyAction {
         };
         let summary = if verify_decision.status == VerifyStatus::Passed {
             if execution_summary.is_empty() {
-                "Cross-family run verified.".to_string()
+                "Multi-artifact run verified.".to_string()
             } else {
-                format!("Cross-family run verified. {}", execution_summary)
+                format!("Multi-artifact run verified. {}", execution_summary)
             }
         } else {
-            format!("Cross-family verify failed: {}", reason)
+            format!("Multi-artifact verify failed: {}", reason)
         };
 
         ActionResult::success_with(
@@ -342,6 +345,7 @@ impl Action for CodebaseExportSummaryAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_category("codebase")
             .with_capabilities(["pure", "structured_output"])
             .with_roles(["emit"])
             .with_input_kinds(["structured"])
@@ -393,9 +397,9 @@ impl Action for CodebaseExportSummaryAction {
 
         let mut summary = String::new();
         if verify_decision.status == VerifyStatus::Passed {
-            summary.push_str("Cross-family run completed and verified.");
+            summary.push_str("Multi-artifact run completed and verified.");
         } else {
-            summary.push_str("Cross-family run failed verification.");
+            summary.push_str("Multi-artifact run failed verification.");
         }
         if !execution_summary.is_empty() {
             summary.push_str("\n\n");

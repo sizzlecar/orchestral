@@ -19,7 +19,7 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 futures-util = { workspace = true }
 bytes = { workspace = true }
-notify = { workspace = true }
+
 
 [dev-dependencies]
 tokio-test = { workspace = true }

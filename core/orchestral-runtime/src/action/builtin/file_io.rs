@@ -49,6 +49,7 @@ impl Action for FileReadAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_category("direct")
             .with_capabilities(["filesystem_read", "read_only", "verification"])
             .with_roles(["inspect", "verify"])
             .with_input_kinds(["path"])
@@ -192,6 +193,7 @@ impl Action for FileWriteAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_category("direct")
             .with_capabilities(["filesystem_write", "side_effect"])
             .with_roles(["apply", "emit"])
             .with_input_kinds(["path", "text"])

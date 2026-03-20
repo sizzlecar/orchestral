@@ -588,41 +588,10 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use async_trait::async_trait;
     use orchestral_core::config::ActionSpec;
-    use orchestral_core::store::{
-        Reference, ReferenceStore, ReferenceType, StoreError, WorkingSet,
-    };
+    use orchestral_core::store::WorkingSet;
     use serde_json::json;
     use tokio::sync::RwLock;
-
-    struct NoopReferenceStore;
-
-    #[async_trait]
-    impl ReferenceStore for NoopReferenceStore {
-        async fn add(&self, _reference: Reference) -> Result<(), StoreError> {
-            Ok(())
-        }
-
-        async fn get(&self, _id: &str) -> Result<Option<Reference>, StoreError> {
-            Ok(None)
-        }
-
-        async fn query_by_type(
-            &self,
-            _ref_type: &ReferenceType,
-        ) -> Result<Vec<Reference>, StoreError> {
-            Ok(Vec::new())
-        }
-
-        async fn query_recent(&self, _limit: usize) -> Result<Vec<Reference>, StoreError> {
-            Ok(Vec::new())
-        }
-
-        async fn delete(&self, _id: &str) -> Result<bool, StoreError> {
-            Ok(false)
-        }
-    }
 
     fn test_ctx() -> ActionContext {
         ActionContext::new(
@@ -630,7 +599,6 @@ mod tests {
             "s1",
             "exec-1",
             Arc::new(RwLock::new(WorkingSet::new())),
-            Arc::new(NoopReferenceStore),
         )
     }
 
@@ -667,6 +635,7 @@ mod tests {
             name: "mcp__bad".to_string(),
             kind: "mcp_server".to_string(),
             description: None,
+            category: None,
             config: json!({
                 "server_name": "bad"
             }),
@@ -685,6 +654,7 @@ mod tests {
             name: "mcp__alpha".to_string(),
             kind: "mcp_server".to_string(),
             description: None,
+            category: None,
             config: json!({
                 "server_name": "alpha",
                 "command": "node",
@@ -728,6 +698,7 @@ mod tests {
             name: "mcp__alpha".to_string(),
             kind: "mcp_server".to_string(),
             description: None,
+            category: None,
             config: json!({
                 "server_name": "alpha",
                 "command": "sh",
@@ -764,6 +735,7 @@ mod tests {
             name: "mcp__alpha".to_string(),
             kind: "mcp_server".to_string(),
             description: None,
+            category: None,
             config: json!({
                 "server_name": "alpha",
                 "command": "sh",

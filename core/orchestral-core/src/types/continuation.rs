@@ -1,7 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-use super::StageKind;
-
 /// Explicit continuation decision emitted by a completed stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -22,8 +20,6 @@ pub struct ContinuationState {
     pub unknowns: Vec<String>,
     #[serde(default)]
     pub assumptions: Vec<String>,
-    #[serde(default)]
-    pub next_stage_hint: Option<StageKind>,
     #[serde(default)]
     pub user_message: Option<String>,
 }

@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 
 use crate::action::{Action, ActionResult, ApprovalRequest};
 use crate::planner::{PlannerRuntimeInfo, SkillInstruction};
-use crate::store::{ReferenceStore, WorkingSet};
+use crate::store::WorkingSet;
 use crate::types::{Step, StepId, TaskId};
 
 /// Action registry for looking up actions by name
@@ -49,8 +49,6 @@ impl Default for ActionRegistry {
 pub struct ExecutorContext {
     /// Working set for inter-step communication
     pub working_set: Arc<RwLock<WorkingSet>>,
-    /// Reference store for historical artifacts
-    pub reference_store: Arc<dyn ReferenceStore>,
     /// Task ID
     pub task_id: TaskId,
     /// Optional execution progress reporter.
@@ -63,15 +61,10 @@ pub struct ExecutorContext {
 
 impl ExecutorContext {
     /// Create a new executor context
-    pub fn new(
-        task_id: impl Into<TaskId>,
-        working_set: Arc<RwLock<WorkingSet>>,
-        reference_store: Arc<dyn ReferenceStore>,
-    ) -> Self {
+    pub fn new(task_id: impl Into<TaskId>, working_set: Arc<RwLock<WorkingSet>>) -> Self {
         Self {
             task_id: task_id.into(),
             working_set,
-            reference_store,
             progress_reporter: None,
             runtime_info: None,
             skill_instructions: Vec::new(),

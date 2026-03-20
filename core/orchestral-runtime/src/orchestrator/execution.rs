@@ -54,9 +54,7 @@ impl Orchestrator {
         let final_result = match run.result {
             ExecutionResult::NeedReplan { step_id, .. } => ExecutionResult::Failed {
                 step_id,
-                error:
-                    "planner-owned workflow continuation has been removed; use reactor continuation instead"
-                        .to_string(),
+                error: "planner-owned workflow continuation has been removed; return a concrete follow-up plan or terminal planner output instead".to_string(),
             },
             other => other,
         };
@@ -125,14 +123,10 @@ impl Orchestrator {
         ));
         let runtime_info = PlannerRuntimeInfo::detect();
         let skill_instructions = self.skill_catalog.build_instructions(&task.intent.content);
-        let exec_ctx = ExecutorContext::new(
-            task.id.clone(),
-            working_set.clone(),
-            self.reference_store.clone(),
-        )
-        .with_progress_reporter(progress_reporter)
-        .with_runtime_info(runtime_info)
-        .with_skill_instructions(skill_instructions);
+        let exec_ctx = ExecutorContext::new(task.id.clone(), working_set.clone())
+            .with_progress_reporter(progress_reporter)
+            .with_runtime_info(runtime_info)
+            .with_skill_instructions(skill_instructions);
         let result = self.executor.execute(&mut dag, &exec_ctx).await;
         tracing::info!(
             interaction_id = %interaction_id,
@@ -180,8 +174,6 @@ impl Orchestrator {
                 query: None,
                 budget: self.config.context_budget.clone(),
                 include_history: self.config.include_history,
-                include_references: self.config.include_references,
-                ref_type_filter: None,
                 tags: Vec::new(),
             };
             let window = builder.build(&request).await?;

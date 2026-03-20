@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use crate::store::{ReferenceStore, WorkingSet};
+use crate::store::WorkingSet;
 use crate::types::{StepId, TaskId};
 
 /// Execution context for actions
@@ -12,7 +12,6 @@ use crate::types::{StepId, TaskId};
 /// Provides access to:
 /// - Task and step identification
 /// - WorkingSet for inter-step communication
-/// - ReferenceStore for historical artifacts (read-only)
 /// - CancellationToken for cooperative cancellation
 #[derive(Clone)]
 pub struct ActionContext {
@@ -25,8 +24,6 @@ pub struct ActionContext {
     pub execution_id: String,
     /// Working set for inter-step communication
     pub working_set: Arc<RwLock<WorkingSet>>,
-    /// Reference store for historical artifacts (read-only access)
-    pub reference_store: Arc<dyn ReferenceStore>,
     /// Cancellation token for cooperative cancellation
     /// Actions should check this periodically and abort if cancelled
     pub cancellation_token: CancellationToken,
@@ -39,14 +36,12 @@ impl ActionContext {
         step_id: impl Into<StepId>,
         execution_id: impl Into<String>,
         working_set: Arc<RwLock<WorkingSet>>,
-        reference_store: Arc<dyn ReferenceStore>,
     ) -> Self {
         Self {
             task_id: task_id.into(),
             step_id: step_id.into(),
             execution_id: execution_id.into(),
             working_set,
-            reference_store,
             cancellation_token: CancellationToken::new(),
         }
     }
@@ -57,7 +52,6 @@ impl ActionContext {
         step_id: impl Into<StepId>,
         execution_id: impl Into<String>,
         working_set: Arc<RwLock<WorkingSet>>,
-        reference_store: Arc<dyn ReferenceStore>,
         cancellation_token: CancellationToken,
     ) -> Self {
         Self {
@@ -65,7 +59,6 @@ impl ActionContext {
             step_id: step_id.into(),
             execution_id: execution_id.into(),
             working_set,
-            reference_store,
             cancellation_token,
         }
     }

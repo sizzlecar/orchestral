@@ -3,18 +3,19 @@ mod http;
 mod parsing;
 mod prompt;
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use orchestral_core::planner::{PlanError, Planner, PlannerContext, PlannerOutput};
-use orchestral_core::types::{DerivationPolicy, Intent};
+use orchestral_core::types::Intent;
 
 pub use self::http::{HttpLlmClient, HttpLlmClientConfig};
-use self::parsing::{extract_json, parse_planner_output};
-use self::prompt::{build_non_reactor_prompt, build_reactor_prompt, truncate_for_log};
+use self::parsing::{extract_json, parse_action_selection, parse_planner_output, ActionSelection};
+use self::prompt::{build_action_selector_prompt, build_planner_prompt, truncate_for_log};
 
 const MAX_PROMPT_LOG_CHARS: usize = 4_000;
 const MAX_LLM_OUTPUT_LOG_CHARS: usize = 8_000;
@@ -123,8 +124,8 @@ pub struct LlmPlannerConfig {
     pub max_history: usize,
     pub system_prompt: String,
     pub log_full_prompts: bool,
-    pub reactor_enabled: bool,
-    pub reactor_default_derivation_policy: DerivationPolicy,
+    pub selector_min_action_count: usize,
+    pub selector_max_actions: usize,
 }
 
 impl Default for LlmPlannerConfig {
@@ -135,8 +136,8 @@ impl Default for LlmPlannerConfig {
             max_history: 20,
             system_prompt: String::new(),
             log_full_prompts: false,
-            reactor_enabled: false,
-            reactor_default_derivation_policy: DerivationPolicy::Strict,
+            selector_min_action_count: 12,
+            selector_max_actions: 12,
         }
     }
 }
@@ -153,23 +154,192 @@ impl<C: LlmClient> LlmPlanner<C> {
     }
 
     fn build_prompt(&self, intent: &Intent, context: &PlannerContext) -> (String, String) {
-        if self.config.reactor_enabled {
-            return build_reactor_prompt(
-                &self.config.system_prompt,
-                intent,
-                context,
-                self.config.max_history,
-                self.config.reactor_default_derivation_policy,
-            );
-        }
-
-        build_non_reactor_prompt(
+        build_planner_prompt(
             &self.config.system_prompt,
             intent,
             context,
             self.config.max_history,
         )
     }
+
+    fn build_selector_prompt(&self, intent: &Intent, context: &PlannerContext) -> (String, String) {
+        build_action_selector_prompt(
+            &self.config.system_prompt,
+            intent,
+            context,
+            self.config.max_history,
+            self.config.selector_max_actions,
+        )
+    }
+
+    fn should_run_action_selector(&self, context: &PlannerContext) -> bool {
+        let action_count = context.available_actions.len();
+        action_count >= self.config.selector_min_action_count
+            && action_count > self.config.selector_max_actions
+    }
+
+    fn apply_selection(
+        &self,
+        context: &PlannerContext,
+        selection: ActionSelection,
+    ) -> Option<ResolvedActionSelection> {
+        let selected = selection
+            .selected_actions
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let blocked = selection
+            .blocked_actions
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+
+        let mut resolved_actions = Vec::new();
+        let mut resolved_selected_names = Vec::new();
+        let mut resolved_blocked_names = Vec::new();
+
+        for action in &context.available_actions {
+            if blocked.contains(&action.name) {
+                resolved_blocked_names.push(action.name.clone());
+                continue;
+            }
+            if selected.contains(&action.name)
+                && resolved_actions.len() < self.config.selector_max_actions
+            {
+                resolved_selected_names.push(action.name.clone());
+                resolved_actions.push(action.clone());
+            }
+        }
+
+        if resolved_actions.is_empty() {
+            return None;
+        }
+
+        if resolved_actions.len() >= context.available_actions.len()
+            && resolved_blocked_names.is_empty()
+        {
+            return None;
+        }
+
+        let filtered_context = PlannerContext {
+            available_actions: resolved_actions,
+            history: context.history.clone(),
+            runtime_info: context.runtime_info.clone(),
+            skill_instructions: context.skill_instructions.clone(),
+            loop_context: context.loop_context.clone(),
+        };
+
+        Some(ResolvedActionSelection {
+            filtered_context,
+            selected_actions: resolved_selected_names,
+            blocked_actions: resolved_blocked_names,
+            reason: selection.reason,
+        })
+    }
+
+    async fn maybe_select_actions(
+        &self,
+        intent: &Intent,
+        context: &PlannerContext,
+    ) -> Result<Option<ResolvedActionSelection>, PlanError> {
+        if !self.should_run_action_selector(context) {
+            return Ok(None);
+        }
+
+        let (system, user) = self.build_selector_prompt(intent, context);
+        info!(
+            model = %self.config.model,
+            temperature = self.config.temperature,
+            action_count = context.available_actions.len(),
+            selector_max_actions = self.config.selector_max_actions,
+            selector_min_action_count = self.config.selector_min_action_count,
+            "action selector request prepared"
+        );
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            if self.config.log_full_prompts {
+                debug!(
+                    system_prompt = %system,
+                    user_prompt = %user,
+                    system_chars = system.chars().count(),
+                    user_chars = user.chars().count(),
+                    "action selector prompts (full)"
+                );
+            } else {
+                debug!(
+                    system_prompt = %truncate_for_log(&system, MAX_PROMPT_LOG_CHARS),
+                    user_prompt = %truncate_for_log(&user, MAX_PROMPT_LOG_CHARS),
+                    system_chars = system.chars().count(),
+                    user_chars = user.chars().count(),
+                    "action selector prompts"
+                );
+            }
+        }
+
+        let request = LlmRequest {
+            system,
+            user,
+            model: self.config.model.clone(),
+            temperature: self.config.temperature,
+        };
+        let output = self
+            .client
+            .complete(request)
+            .await
+            .map_err(|e| PlanError::LlmError(e.to_string()))?;
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(
+                llm_output = %truncate_for_log(&output, MAX_LLM_OUTPUT_LOG_CHARS),
+                "action selector raw llm output"
+            );
+        }
+
+        let json_str = match extract_json(&output) {
+            Some(json) => json,
+            None => {
+                warn!(
+                    "action selector output did not contain JSON; falling back to full action set"
+                );
+                return Ok(None);
+            }
+        };
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(
+                selector_json = %truncate_for_log(&json_str, MAX_LLM_OUTPUT_LOG_CHARS),
+                "action selector extracted json"
+            );
+        }
+
+        let selection = match parse_action_selection(&json_str) {
+            Ok(selection) => selection,
+            Err(error) => {
+                warn!(error = %error, "action selector output was invalid; falling back to full action set");
+                return Ok(None);
+            }
+        };
+
+        let resolved = match self.apply_selection(context, selection) {
+            Some(resolved) => resolved,
+            None => {
+                warn!("action selector did not resolve any narrower action subset; falling back to full action set");
+                return Ok(None);
+            }
+        };
+
+        info!(
+            selected_count = resolved.selected_actions.len(),
+            blocked_count = resolved.blocked_actions.len(),
+            selected_actions = %resolved.selected_actions.join(", "),
+            blocked_actions = %resolved.blocked_actions.join(", "),
+            reason = ?resolved.reason,
+            "action selector resolved actions"
+        );
+        Ok(Some(resolved))
+    }
+}
+
+struct ResolvedActionSelection {
+    filtered_context: PlannerContext,
+    selected_actions: Vec<String>,
+    blocked_actions: Vec<String>,
+    reason: Option<String>,
 }
 
 #[async_trait]
@@ -179,13 +349,19 @@ impl<C: LlmClient> Planner for LlmPlanner<C> {
         intent: &Intent,
         context: &PlannerContext,
     ) -> Result<PlannerOutput, PlanError> {
-        let (system, user) = self.build_prompt(intent, context);
+        let selected_context = self
+            .maybe_select_actions(intent, context)
+            .await?
+            .map(|selection| selection.filtered_context);
+        let planner_context = selected_context.as_ref().unwrap_or(context);
+
+        let (system, user) = self.build_prompt(intent, planner_context);
         info!(
             model = %self.config.model,
             temperature = self.config.temperature,
             intent_len = intent.content.len(),
-            action_count = context.available_actions.len(),
-            history_count = context.history.len(),
+            action_count = planner_context.available_actions.len(),
+            history_count = planner_context.history.len(),
             "planner request prepared"
         );
         if tracing::enabled!(tracing::Level::DEBUG) {
@@ -238,44 +414,32 @@ impl<C: LlmClient> Planner for LlmPlanner<C> {
 
         let output = parse_planner_output(&json_str)?;
         match &output {
-            PlannerOutput::SkeletonChoice(choice) => {
+            PlannerOutput::SingleAction(call) => {
                 info!(
-                    output_type = "skeleton_choice",
-                    skeleton = ?choice.skeleton,
-                    artifact_family = ?choice.artifact_family,
-                    initial_stage = ?choice.initial_stage,
-                    confidence = choice.confidence,
-                    "planner parsed output"
-                );
-            }
-            PlannerOutput::StageChoice(choice) => {
-                info!(
-                    output_type = "stage_choice",
-                    skeleton = ?choice.skeleton,
-                    artifact_family = ?choice.artifact_family,
-                    current_stage = ?choice.current_stage,
-                    derivation_policy = ?choice.derivation_policy,
-                    "planner parsed output"
-                );
-            }
-            PlannerOutput::ActionCall(call) => {
-                info!(
-                    output_type = "action_call",
+                    output_type = "single_action",
                     action = %call.action,
                     reason = ?call.reason,
                     "planner parsed output"
                 );
             }
-            PlannerOutput::DirectResponse(message) => {
+            PlannerOutput::MiniPlan(plan) => {
                 info!(
-                    output_type = "direct_response",
+                    output_type = "mini_plan",
+                    goal = %plan.goal,
+                    step_count = plan.steps.len(),
+                    "planner parsed output"
+                );
+            }
+            PlannerOutput::Done(message) => {
+                info!(
+                    output_type = "done",
                     message = %truncate_for_log(message, MAX_PROMPT_LOG_CHARS),
                     "planner parsed output"
                 );
             }
-            PlannerOutput::Clarification(question) => {
+            PlannerOutput::NeedInput(question) => {
                 info!(
-                    output_type = "clarification",
+                    output_type = "need_input",
                     question = %truncate_for_log(question, MAX_PROMPT_LOG_CHARS),
                     "planner parsed output"
                 );
@@ -300,44 +464,15 @@ impl LlmClient for MockLlmClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
     use orchestral_core::action::ActionMeta;
     use orchestral_core::planner::{PlannerContext, SkillInstruction};
-    use orchestral_core::store::{Reference, ReferenceStore, ReferenceType, StoreError};
-    use orchestral_core::types::{ArtifactFamily, Intent, SkeletonKind, StageKind};
+    use orchestral_core::types::Intent;
     use serde_json::json;
-    use std::sync::Arc;
-
-    struct NoopReferenceStore;
-
-    #[async_trait]
-    impl ReferenceStore for NoopReferenceStore {
-        async fn add(&self, _reference: Reference) -> Result<(), StoreError> {
-            Ok(())
-        }
-
-        async fn get(&self, _id: &str) -> Result<Option<Reference>, StoreError> {
-            Ok(None)
-        }
-
-        async fn query_by_type(
-            &self,
-            _ref_type: &ReferenceType,
-        ) -> Result<Vec<Reference>, StoreError> {
-            Ok(Vec::new())
-        }
-
-        async fn query_recent(&self, _limit: usize) -> Result<Vec<Reference>, StoreError> {
-            Ok(Vec::new())
-        }
-
-        async fn delete(&self, _id: &str) -> Result<bool, StoreError> {
-            Ok(false)
-        }
-    }
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
 
     #[test]
-    fn test_non_reactor_prompt_is_minimal_and_no_workflow() {
+    fn test_planner_prompt_uses_new_output_shapes() {
         let planner = LlmPlanner::new(
             MockLlmClient {
                 response: "{}".to_string(),
@@ -377,24 +512,26 @@ mod tests {
                 .with_input_kinds(["path"])
                 .with_output_kinds(["text"]),
         ];
-        let context = PlannerContext::new(actions, Arc::new(NoopReferenceStore));
+        let context = PlannerContext::new(actions);
         let intent = Intent::new("generate a guide");
         let (system, user) = planner.build_prompt(&intent, &context);
 
         assert!(system.contains("Orchestral Planner"));
-        assert!(system.contains("Reactor pipelines are disabled in this mode."));
-        assert!(system.contains("ACTION_CALL"));
+        assert!(system.contains("Legacy workflow/stage outputs are disabled."));
+        assert!(system.contains("SINGLE_ACTION"));
+        assert!(system.contains("MINI_PLAN"));
         assert!(!system.contains("Action Catalog"));
-        assert!(user.contains("\"type\":\"ACTION_CALL\""));
-        assert!(user.contains("\"type\":\"DIRECT_RESPONSE\""));
-        assert!(user.contains("\"type\":\"CLARIFICATION\""));
+        assert!(user.contains("\"type\":\"SINGLE_ACTION\""));
+        assert!(user.contains("\"type\":\"MINI_PLAN\""));
+        assert!(user.contains("\"type\":\"DONE\""));
+        assert!(user.contains("\"type\":\"NEED_INPUT\""));
         assert!(!user.contains("\"type\":\"WORKFLOW\""));
         assert!(!user.contains("\"type\":\"STAGE_CHOICE\""));
-        assert!(user.contains("DIRECT_RESPONSE must never claim to execute commands"));
+        assert!(user.contains("DONE must never claim to execute commands"));
     }
 
     #[test]
-    fn test_non_reactor_prompt_contains_skill_knowledge() {
+    fn test_planner_prompt_contains_skill_knowledge() {
         let planner = LlmPlanner::new(
             MockLlmClient {
                 response: "{}".to_string(),
@@ -422,8 +559,8 @@ mod tests {
                     "result":{}
                 }
             }))];
-        let context = PlannerContext::new(actions, Arc::new(NoopReferenceStore))
-            .with_skill_instructions(vec![SkillInstruction {
+        let context =
+            PlannerContext::new(actions).with_skill_instructions(vec![SkillInstruction {
                 skill_name: "demo".to_string(),
                 instructions: "Always write then verify.".to_string(),
                 skill_path: Some("skills/demo/SKILL.md".to_string()),
@@ -443,330 +580,205 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_stage_choice_output() {
-        let raw = r#"{
-            "type":"STAGE_CHOICE",
-            "skeleton":"locate_and_patch",
-            "artifact_family":"spreadsheet",
-            "current_stage":"probe",
-            "stage_goal":"inspect workbook structure and assess readiness",
-            "derivation_policy":"permissive",
-            "reason":"spreadsheet task"
-        }"#;
-        let parsed = parse_planner_output(raw).expect("parse stage choice");
+    fn test_parse_done_output() {
+        let raw = r#"{"type":"DONE","message":"你好"}"#;
+        let parsed = parse_planner_output(raw).expect("parse done");
         match parsed {
-            PlannerOutput::StageChoice(choice) => {
-                assert_eq!(choice.skeleton, SkeletonKind::LocateAndPatch);
-                assert_eq!(choice.artifact_family, ArtifactFamily::Spreadsheet);
-                assert_eq!(choice.current_stage, StageKind::Probe);
-                assert_eq!(choice.derivation_policy, DerivationPolicy::Permissive);
-                assert_eq!(choice.reason.as_deref(), Some("spreadsheet task"));
-            }
-            _ => panic!("expected stage choice output"),
-        }
-    }
-
-    #[test]
-    fn test_parse_skeleton_choice_output() {
-        let raw = r#"{
-            "type":"SKELETON_CHOICE",
-            "skeleton":"locate_and_patch",
-            "artifact_family":"spreadsheet",
-            "initial_stage":"probe",
-            "confidence": 1.2,
-            "reason":"spreadsheet task"
-        }"#;
-        let parsed = parse_planner_output(raw).expect("parse skeleton choice");
-        match parsed {
-            PlannerOutput::SkeletonChoice(choice) => {
-                assert_eq!(choice.skeleton, SkeletonKind::LocateAndPatch);
-                assert_eq!(choice.artifact_family, Some(ArtifactFamily::Spreadsheet));
-                assert_eq!(choice.initial_stage, StageKind::Probe);
-                assert_eq!(choice.confidence, 1.0);
-                assert_eq!(choice.reason.as_deref(), Some("spreadsheet task"));
-            }
-            _ => panic!("expected skeleton choice output"),
-        }
-    }
-
-    #[test]
-    fn test_reactor_prompt_is_short_contract_without_action_catalog() {
-        let planner = LlmPlanner::new(
-            MockLlmClient {
-                response: "{}".to_string(),
-            },
-            LlmPlannerConfig {
-                reactor_enabled: true,
-                reactor_default_derivation_policy: DerivationPolicy::Permissive,
-                ..LlmPlannerConfig::default()
-            },
-        );
-
-        let actions = vec![
-            ActionMeta::new("shell", "Run shell command")
-                .with_capabilities(["shell", "filesystem_write", "fallback"])
-                .with_roles(["inspect", "apply", "verify", "execute"]),
-            ActionMeta::new("file_read", "Read file")
-                .with_capabilities(["filesystem_read"])
-                .with_roles(["inspect", "verify"])
-                .with_output_kinds(["text"]),
-            ActionMeta::new("file_write", "Write file")
-                .with_capabilities(["filesystem_write", "side_effect"])
-                .with_roles(["apply", "emit"])
-                .with_input_kinds(["path", "text"])
-                .with_output_kinds(["path"]),
-            ActionMeta::new(
-                "reactor_spreadsheet_locate",
-                "Locate a spreadsheet artifact for the reactor spreadsheet family",
-            ),
-            ActionMeta::new(
-                "reactor_spreadsheet_inspect",
-                "Inspect spreadsheet structure for the reactor spreadsheet family",
-            ),
-            ActionMeta::new(
-                "reactor_spreadsheet_assess_readiness",
-                "Assess whether spreadsheet probe results are ready for commit",
-            ),
-            ActionMeta::new(
-                "reactor_spreadsheet_apply_patch",
-                "Apply a typed spreadsheet patch for the reactor spreadsheet family",
-            ),
-            ActionMeta::new(
-                "reactor_spreadsheet_verify_patch",
-                "Verify a spreadsheet patch for the reactor spreadsheet family",
-            ),
-        ];
-        let context = PlannerContext::new(actions, Arc::new(NoopReferenceStore));
-        let intent = Intent::new("docs 下有个 excel，帮我补全 spreadsheet 内容");
-        let (system, user) = planner.build_prompt(&intent, &context);
-
-        assert!(system.contains("Built-in skeleton vocabulary:"));
-        assert!(system.contains("skeleton=locate_and_patch, artifact_family=spreadsheet"));
-        assert!(!system.contains("Action Catalog:"));
-        assert!(!system.contains("Workflow Fallback Rules:"));
-        assert!(user.contains("\"type\":\"SKELETON_CHOICE\""));
-        assert!(user.contains("\"type\":\"STAGE_CHOICE\""));
-        assert!(!user.contains("\"type\":\"WORKFLOW\""));
-    }
-
-    #[test]
-    fn test_reactor_enabled_always_uses_reactor_prompt() {
-        let planner = LlmPlanner::new(
-            MockLlmClient {
-                response: "{}".to_string(),
-            },
-            LlmPlannerConfig {
-                reactor_enabled: true,
-                reactor_default_derivation_policy: DerivationPolicy::Permissive,
-                ..LlmPlannerConfig::default()
-            },
-        );
-
-        let actions = vec![
-            ActionMeta::new("shell", "Run shell command")
-                .with_capabilities(["shell", "filesystem_write", "fallback"])
-                .with_roles(["inspect", "apply", "verify", "execute"]),
-            ActionMeta::new("file_read", "Read file")
-                .with_capabilities(["filesystem_read"])
-                .with_roles(["inspect", "verify"])
-                .with_output_kinds(["text"]),
-            ActionMeta::new("file_write", "Write file")
-                .with_capabilities(["filesystem_write", "side_effect"])
-                .with_roles(["apply", "emit"])
-                .with_input_kinds(["path", "text"])
-                .with_output_kinds(["path"]),
-            ActionMeta::new(
-                "reactor_spreadsheet_locate",
-                "Locate a spreadsheet artifact for the reactor spreadsheet family",
-            ),
-            ActionMeta::new(
-                "reactor_spreadsheet_inspect",
-                "Inspect spreadsheet structure for the reactor spreadsheet family",
-            ),
-            ActionMeta::new(
-                "reactor_spreadsheet_assess_readiness",
-                "Assess whether spreadsheet probe results are ready for commit",
-            ),
-            ActionMeta::new(
-                "reactor_spreadsheet_apply_patch",
-                "Apply a typed spreadsheet patch for the reactor spreadsheet family",
-            ),
-            ActionMeta::new(
-                "reactor_spreadsheet_verify_patch",
-                "Verify a spreadsheet patch for the reactor spreadsheet family",
-            ),
-        ];
-        let context = PlannerContext::new(actions, Arc::new(NoopReferenceStore));
-        let intent = Intent::new("扫描 markdown 并先给我修改计划");
-        let (system, user) = planner.build_prompt(&intent, &context);
-
-        assert!(system.contains("You are Orchestral Reactor Planner"));
-        assert!(user.contains("\"type\":\"SKELETON_CHOICE\""));
-        assert!(user.contains("\"type\":\"STAGE_CHOICE\""));
-        assert!(!user.contains("\"type\":\"WORKFLOW\""));
-    }
-
-    #[test]
-    fn test_document_intent_uses_reactor_prompt_when_document_family_exists() {
-        let planner = LlmPlanner::new(
-            MockLlmClient {
-                response: "{}".to_string(),
-            },
-            LlmPlannerConfig {
-                reactor_enabled: true,
-                reactor_default_derivation_policy: DerivationPolicy::Permissive,
-                ..LlmPlannerConfig::default()
-            },
-        );
-
-        let actions = vec![
-            ActionMeta::new("shell", "Run shell command")
-                .with_capabilities(["shell", "filesystem_write", "fallback"])
-                .with_roles(["inspect", "apply", "verify", "execute"]),
-            ActionMeta::new("file_read", "Read file")
-                .with_capabilities(["filesystem_read"])
-                .with_roles(["inspect", "verify"])
-                .with_output_kinds(["text"]),
-            ActionMeta::new("file_write", "Write file")
-                .with_capabilities(["filesystem_write", "side_effect"])
-                .with_roles(["apply", "emit"])
-                .with_input_kinds(["path", "text"])
-                .with_output_kinds(["path"]),
-            ActionMeta::new(
-                "reactor_document_locate",
-                "Locate document artifacts for the reactor document family",
-            ),
-            ActionMeta::new(
-                "reactor_document_inspect",
-                "Inspect document structure for the reactor document family",
-            ),
-            ActionMeta::new(
-                "reactor_document_assess_readiness",
-                "Assess whether document probe results are ready for commit",
-            ),
-            ActionMeta::new(
-                "reactor_document_apply_patch",
-                "Apply a typed document patch for the reactor document family",
-            ),
-            ActionMeta::new(
-                "reactor_document_verify_patch",
-                "Verify a document patch for the reactor document family",
-            ),
-        ];
-        let context = PlannerContext::new(actions, Arc::new(NoopReferenceStore));
-        let intent = Intent::new("扫描 docs 下所有 markdown，补全 TODO 和缺失标题");
-        let (system, user) = planner.build_prompt(&intent, &context);
-
-        assert!(system.contains("You are Orchestral Reactor Planner"));
-        assert!(system.contains("artifact_family=document"));
-        assert!(user.contains("\"artifact_family\":\"document\""));
-    }
-
-    #[test]
-    fn test_structured_intent_uses_reactor_prompt_when_structured_family_exists() {
-        let planner = LlmPlanner::new(
-            MockLlmClient {
-                response: "{}".to_string(),
-            },
-            LlmPlannerConfig {
-                reactor_enabled: true,
-                reactor_default_derivation_policy: DerivationPolicy::Strict,
-                ..LlmPlannerConfig::default()
-            },
-        );
-
-        let actions = vec![
-            ActionMeta::new("file_read", "Read file")
-                .with_capabilities(["filesystem_read"])
-                .with_roles(["inspect", "verify"])
-                .with_output_kinds(["text"]),
-            ActionMeta::new("file_write", "Write file")
-                .with_capabilities(["filesystem_write", "side_effect"])
-                .with_roles(["apply", "emit"])
-                .with_input_kinds(["path", "text"])
-                .with_output_kinds(["path"]),
-            ActionMeta::new(
-                "reactor_structured_locate",
-                "Locate structured artifacts for the reactor structured family",
-            ),
-            ActionMeta::new(
-                "reactor_structured_inspect",
-                "Inspect structured artifact contents for the reactor structured family",
-            ),
-            ActionMeta::new(
-                "reactor_structured_assess_readiness",
-                "Assess whether structured probe results are ready for commit",
-            ),
-            ActionMeta::new(
-                "reactor_structured_apply_patch",
-                "Apply a typed structured patch for the reactor structured family",
-            ),
-            ActionMeta::new(
-                "reactor_structured_verify_patch",
-                "Verify a structured patch for the reactor structured family",
-            ),
-        ];
-        let context = PlannerContext::new(actions, Arc::new(NoopReferenceStore));
-        let intent = Intent::new("修改 config/app.json 里的 service.port 和 owner");
-        let (system, user) = planner.build_prompt(&intent, &context);
-
-        assert!(system.contains("artifact_family=structured"));
-        assert!(user.contains("\"artifact_family\":\"structured\""));
-        assert!(user.contains("\"derivation_policy\":\"strict\""));
-    }
-
-    #[test]
-    fn test_parse_direct_response_output() {
-        let raw = r#"{"type":"DIRECT_RESPONSE","message":"你好"}"#;
-        let parsed = parse_planner_output(raw).expect("parse direct response");
-        match parsed {
-            PlannerOutput::DirectResponse(message) => {
+            PlannerOutput::Done(message) => {
                 assert_eq!(message, "你好");
             }
-            _ => panic!("expected direct_response output"),
+            _ => panic!("expected done output"),
         }
     }
 
     #[test]
-    fn test_parse_action_call_output() {
-        let raw = r#"{"type":"ACTION_CALL","action":"file_read","params":{"path":"README.md"},"reason":"read readme"}"#;
-        let parsed = parse_planner_output(raw).expect("parse action call");
+    fn test_parse_single_action_output() {
+        let raw = r#"{"type":"SINGLE_ACTION","action":"file_read","params":{"path":"README.md"},"reason":"read readme"}"#;
+        let parsed = parse_planner_output(raw).expect("parse single action");
         match parsed {
-            PlannerOutput::ActionCall(call) => {
+            PlannerOutput::SingleAction(call) => {
                 assert_eq!(call.action, "file_read");
                 assert_eq!(call.params["path"], "README.md");
                 assert_eq!(call.reason.as_deref(), Some("read readme"));
             }
-            _ => panic!("expected action_call output"),
+            _ => panic!("expected single_action output"),
         }
     }
 
     #[test]
-    fn test_parse_clarification_output() {
-        let raw = r#"{"type":"CLARIFICATION","question":"请提供文件路径"}"#;
-        let parsed = parse_planner_output(raw).expect("parse clarification");
+    fn test_parse_need_input_output() {
+        let raw = r#"{"type":"NEED_INPUT","question":"请提供文件路径"}"#;
+        let parsed = parse_planner_output(raw).expect("parse need_input");
         match parsed {
-            PlannerOutput::Clarification(question) => {
+            PlannerOutput::NeedInput(question) => {
                 assert_eq!(question, "请提供文件路径");
             }
-            _ => panic!("expected clarification output"),
+            _ => panic!("expected need_input output"),
+        }
+    }
+
+    #[test]
+    fn test_parse_legacy_output_aliases() {
+        let done = parse_planner_output(r#"{"type":"DIRECT_RESPONSE","message":"ok"}"#)
+            .expect("legacy direct_response");
+        match done {
+            PlannerOutput::Done(message) => assert_eq!(message, "ok"),
+            _ => panic!("expected done output"),
+        }
+
+        let single_action = parse_planner_output(
+            r#"{"type":"ACTION_CALL","action":"file_read","params":{"path":"README.md"}}"#,
+        )
+        .expect("legacy action_call");
+        match single_action {
+            PlannerOutput::SingleAction(call) => assert_eq!(call.action, "file_read"),
+            _ => panic!("expected single_action output"),
+        }
+
+        let need_input =
+            parse_planner_output(r#"{"type":"CLARIFICATION","question":"missing path"}"#)
+                .expect("legacy clarification");
+        match need_input {
+            PlannerOutput::NeedInput(question) => assert_eq!(question, "missing path"),
+            _ => panic!("expected need_input output"),
+        }
+    }
+
+    #[test]
+    fn test_parse_mini_plan_output() {
+        let raw = r#"{
+            "type":"MINI_PLAN",
+            "goal":"inspect then summarize",
+            "steps":[
+                {"id":"list_docs","action":"shell","params":{"command":"find ./docs -maxdepth 1 -type f"}},
+                {"id":"read_readme","action":"file_read","depends_on":["list_docs"],"params":{"path":"README.md"}}
+            ],
+            "on_complete":"{{read_readme.content}}"
+        }"#;
+        let parsed = parse_planner_output(raw).expect("parse mini plan");
+        match parsed {
+            PlannerOutput::MiniPlan(plan) => {
+                assert_eq!(plan.goal, "inspect then summarize");
+                assert_eq!(plan.steps.len(), 2);
+                assert_eq!(plan.steps[1].depends_on.len(), 1);
+                assert_eq!(plan.on_complete.as_deref(), Some("{{read_readme.content}}"));
+            }
+            _ => panic!("expected mini_plan output"),
         }
     }
 
     #[test]
     fn test_extract_json_ignores_non_json_braces() {
-        let raw = r#"Preface {not json} -> {"type":"DIRECT_RESPONSE","message":"ok"} trailing"#;
+        let raw = r#"Preface {not json} -> {"type":"DONE","message":"ok"} trailing"#;
         let json = extract_json(raw).expect("json");
-        assert_eq!(json, r#"{"type":"DIRECT_RESPONSE","message":"ok"}"#);
+        assert_eq!(json, r#"{"type":"DONE","message":"ok"}"#);
     }
 
     #[test]
     fn test_extract_json_handles_braces_inside_strings() {
-        let raw = r#"noise {"type":"DIRECT_RESPONSE","message":"value with } brace"} end"#;
+        let raw = r#"noise {"type":"DONE","message":"value with } brace"} end"#;
         let json = extract_json(raw).expect("json");
-        assert_eq!(
-            json,
-            r#"{"type":"DIRECT_RESPONSE","message":"value with } brace"}"#
+        assert_eq!(json, r#"{"type":"DONE","message":"value with } brace"}"#);
+    }
+
+    #[test]
+    fn test_parse_action_selection_output() {
+        let raw = r#"{"selected_actions":["file_read","file_write"],"blocked_actions":["shell"],"reason":"typed actions are enough"}"#;
+        let parsed = parse_action_selection(raw).expect("parse action selection");
+
+        assert_eq!(parsed.selected_actions, vec!["file_read", "file_write"]);
+        assert_eq!(parsed.blocked_actions, vec!["shell"]);
+        assert_eq!(parsed.reason.as_deref(), Some("typed actions are enough"));
+    }
+
+    struct RecordingMockLlmClient {
+        responses: Mutex<VecDeque<String>>,
+        requests: Mutex<Vec<LlmRequest>>,
+    }
+
+    #[async_trait]
+    impl LlmClient for RecordingMockLlmClient {
+        async fn complete(&self, request: LlmRequest) -> Result<String, LlmError> {
+            self.requests.lock().expect("requests lock").push(request);
+            self.responses
+                .lock()
+                .expect("responses lock")
+                .pop_front()
+                .ok_or_else(|| LlmError::Response("no queued mock response".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_llm_planner_uses_selector_filtered_actions() {
+        let planner = LlmPlanner::new(
+            RecordingMockLlmClient {
+                responses: Mutex::new(VecDeque::from(vec![
+                    r#"{"selected_actions":["file_read","file_write"],"blocked_actions":["shell"],"reason":"typed file actions are sufficient"}"#.to_string(),
+                    r#"{"type":"DONE","message":"ok"}"#.to_string(),
+                ])),
+                requests: Mutex::new(Vec::new()),
+            },
+            LlmPlannerConfig {
+                selector_min_action_count: 1,
+                selector_max_actions: 2,
+                ..LlmPlannerConfig::default()
+            },
         );
+
+        let context = PlannerContext::new(vec![
+            ActionMeta::new("shell", "shell"),
+            ActionMeta::new("file_read", "read"),
+            ActionMeta::new("file_write", "write"),
+        ]);
+        let result = planner
+            .plan(&Intent::new("read and write the file safely"), &context)
+            .await
+            .expect("planner result");
+
+        match result {
+            PlannerOutput::Done(message) => assert_eq!(message, "ok"),
+            other => panic!("expected done output, got {:?}", other),
+        }
+
+        let requests = planner.client.requests.lock().expect("requests lock");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].system.contains("Orchestral Action Selector."));
+        assert!(requests[1].system.contains("- file_read: read"));
+        assert!(requests[1].system.contains("- file_write: write"));
+        assert!(!requests[1].system.contains("- shell: shell"));
+    }
+
+    #[tokio::test]
+    async fn test_llm_planner_falls_back_when_selector_returns_unknown_actions() {
+        let planner = LlmPlanner::new(
+            RecordingMockLlmClient {
+                responses: Mutex::new(VecDeque::from(vec![
+                    r#"{"selected_actions":["unknown_action"],"blocked_actions":[],"reason":"bad output"}"#.to_string(),
+                    r#"{"type":"DONE","message":"ok"}"#.to_string(),
+                ])),
+                requests: Mutex::new(Vec::new()),
+            },
+            LlmPlannerConfig {
+                selector_min_action_count: 1,
+                selector_max_actions: 1,
+                ..LlmPlannerConfig::default()
+            },
+        );
+
+        planner
+            .plan(
+                &Intent::new("inspect the workspace"),
+                &PlannerContext::new(vec![
+                    ActionMeta::new("shell", "shell"),
+                    ActionMeta::new("file_read", "read"),
+                ]),
+            )
+            .await
+            .expect("planner result");
+
+        let requests = planner.client.requests.lock().expect("requests lock");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].system.contains("- shell: shell"));
+        assert!(requests[1].system.contains("- file_read: read"));
     }
 }

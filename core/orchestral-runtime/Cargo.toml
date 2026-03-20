@@ -22,7 +22,6 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }
-notify = { workspace = true }
 reqwest = { workspace = true }
 llm_sdk = { package = "llm", version = "1.3.6", default-features = false, features = ["openai", "google", "anthropic", "openrouter"] }
 quick-xml = "0.38.4"

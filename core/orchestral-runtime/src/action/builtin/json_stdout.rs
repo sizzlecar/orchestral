@@ -42,6 +42,7 @@ impl Action for JsonStdoutAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_category("utility")
             .with_capabilities(["pure", "structured_output"])
             .with_roles(["emit"])
             .with_input_kinds(["structured"])

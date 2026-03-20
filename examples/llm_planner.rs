@@ -1,7 +1,6 @@
 //! LLM planner example (mock client)
 
 use orchestral_core::prelude::*;
-use orchestral_core::store::InMemoryReferenceStore;
 use orchestral_runtime::planner::{LlmPlanner, LlmPlannerConfig, MockLlmClient};
 use tracing::info;
 
@@ -16,47 +15,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let intent = Intent::new("Echo a message");
 
     let available_actions = vec![ActionMeta::new("echo", "Echoes the input back as output")];
-    let reference_store = std::sync::Arc::new(InMemoryReferenceStore::new());
-    let context = PlannerContext::new(available_actions, reference_store);
+    let context = PlannerContext::new(available_actions);
 
-    let response = r#"{"type":"SKELETON_CHOICE","skeleton":"inspect_and_extract","initial_stage":"probe","confidence":0.9,"reason":"example output"}"#;
+    let response =
+        r#"{"type":"SINGLE_ACTION","action":"echo","params":{"input":"hello"},"reason":"example"}"#;
 
     let planner = LlmPlanner::new(
         MockLlmClient {
             response: response.to_string(),
         },
-        LlmPlannerConfig {
-            reactor_enabled: true,
-            ..LlmPlannerConfig::default()
-        },
+        LlmPlannerConfig::default(),
     );
 
     let output = planner.plan(&intent, &context).await?;
     match output {
-        PlannerOutput::SkeletonChoice(choice) => {
-            info!(
-                skeleton = ?choice.skeleton,
-                initial_stage = ?choice.initial_stage,
-                confidence = choice.confidence,
-                "skeleton chosen"
-            );
+        PlannerOutput::SingleAction(call) => {
+            info!(action = %call.action, reason = ?call.reason, "single action");
         }
-        PlannerOutput::DirectResponse(message) => {
-            info!(%message, "direct response");
+        PlannerOutput::MiniPlan(plan) => {
+            info!(goal = %plan.goal, step_count = plan.steps.len(), "mini plan");
         }
-        PlannerOutput::Clarification(question) => {
-            info!(%question, "clarification required");
+        PlannerOutput::Done(message) => {
+            info!(%message, "done");
         }
-        PlannerOutput::StageChoice(choice) => {
-            info!(
-                skeleton = ?choice.skeleton,
-                artifact_family = ?choice.artifact_family,
-                current_stage = ?choice.current_stage,
-                "reactor stage choice"
-            );
-        }
-        PlannerOutput::ActionCall(call) => {
-            info!(action = %call.action, reason = ?call.reason, "action call");
+        PlannerOutput::NeedInput(question) => {
+            info!(%question, "need input");
         }
     }
 

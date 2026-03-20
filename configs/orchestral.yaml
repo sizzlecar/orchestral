@@ -9,6 +9,7 @@ runtime:
   auto_cleanup: true
   concurrency_policy: interrupt_and_start_new
   strict_exports: true
+  max_planner_iterations: 6
 
 planner:
   mode: deterministic

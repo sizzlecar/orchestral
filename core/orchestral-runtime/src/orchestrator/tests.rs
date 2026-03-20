@@ -1,13 +1,26 @@
+use std::collections::VecDeque;
+use std::fs;
+use std::sync::Mutex;
+
 use super::output::resolve_plan_response_template;
 use super::recovery::{
     affected_subgraph_steps, build_normalization_repair_intent, locate_normalization_repair_target,
     locate_recovery_cut_step, NormalizeRepairMode, NormalizeRepairTarget,
 };
 use super::*;
+use crate::action::{ActionFactory, DefaultActionFactory};
+use crate::thread::Thread;
+use async_trait::async_trait;
 use orchestral_core::executor::{ExecutionDag, ExecutionProgressEvent, ExecutionProgressReporter};
 use orchestral_core::normalizer::ValidationError;
-use orchestral_core::store::{BroadcastEventBus, EventBus, EventStore, InMemoryEventStore};
+use orchestral_core::planner::{
+    PlanError, Planner, PlannerLoopContext, PlannerOutput, SingleAction,
+};
+use orchestral_core::store::{
+    BroadcastEventBus, EventBus, EventStore, InMemoryEventStore, InMemoryTaskStore, TaskStore,
+};
 use orchestral_core::types::{Plan, Step, StepId, StepIoBinding, StepKind};
+use orchestral_core::{action::extract_meta, config::ActionSpec};
 use serde_json::json;
 
 #[test]
@@ -471,4 +484,284 @@ fn test_resolve_plan_response_template_uses_scoped_summary_fallback() {
         resolve_plan_response_template(&plan, &ExecutionResult::Completed, &ws).expect("msg");
 
     assert_eq!(resolved, "Done\n\nSheet 2025-Q2: 28 rows");
+}
+
+#[derive(Debug)]
+struct SequencePlanner {
+    outputs: Mutex<VecDeque<PlannerOutput>>,
+    seen_loop_contexts: Mutex<Vec<Option<PlannerLoopContext>>>,
+}
+
+impl SequencePlanner {
+    fn new(outputs: Vec<PlannerOutput>) -> Self {
+        Self {
+            outputs: Mutex::new(outputs.into()),
+            seen_loop_contexts: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn seen_loop_contexts(&self) -> Vec<Option<PlannerLoopContext>> {
+        self.seen_loop_contexts
+            .lock()
+            .expect("loop contexts")
+            .clone()
+    }
+}
+
+#[async_trait]
+impl Planner for SequencePlanner {
+    async fn plan(
+        &self,
+        _intent: &Intent,
+        context: &PlannerContext,
+    ) -> Result<PlannerOutput, PlanError> {
+        self.seen_loop_contexts
+            .lock()
+            .expect("loop contexts")
+            .push(context.loop_context.clone());
+        self.outputs
+            .lock()
+            .expect("outputs")
+            .pop_front()
+            .ok_or_else(|| PlanError::Generation("planner output queue exhausted".to_string()))
+    }
+}
+
+fn build_test_orchestrator(
+    planner: Arc<SequencePlanner>,
+    max_planner_iterations: usize,
+) -> (
+    Orchestrator,
+    Arc<InMemoryTaskStore>,
+    Arc<InMemoryEventStore>,
+) {
+    let event_store = Arc::new(InMemoryEventStore::new());
+    let task_store = Arc::new(InMemoryTaskStore::new());
+    let thread_runtime = ThreadRuntime::new(Thread::new(), event_store.clone());
+
+    let action_spec = ActionSpec {
+        name: "file_read".to_string(),
+        kind: "file_read".to_string(),
+        description: Some("Read a file".to_string()),
+        category: None,
+        config: json!({}),
+        interface: None,
+    };
+    let action = DefaultActionFactory::new()
+        .build(&action_spec)
+        .expect("build file_read");
+    let action_meta = extract_meta(action.as_ref());
+
+    let mut inner_registry = orchestral_core::executor::ActionRegistry::new();
+    inner_registry.register(action);
+    let registry = Arc::new(RwLock::new(inner_registry));
+    let executor = Executor::with_registry(registry);
+
+    let mut normalizer = PlanNormalizer::new();
+    normalizer.register_action_meta(&action_meta);
+
+    let orchestrator = Orchestrator::with_config(
+        thread_runtime,
+        planner,
+        normalizer,
+        executor,
+        task_store.clone() as Arc<dyn TaskStore>,
+        OrchestratorConfig {
+            max_planner_iterations,
+            ..OrchestratorConfig::default()
+        },
+    );
+    (orchestrator, task_store, event_store)
+}
+
+fn write_test_file(name: &str, content: &str) -> std::path::PathBuf {
+    let root = std::env::current_dir()
+        .expect("cwd")
+        .join("target")
+        .join("agent-loop-tests");
+    fs::create_dir_all(&root).expect("create test dir");
+    let path = root.join(format!("{}-{}.txt", name, uuid::Uuid::new_v4()));
+    fs::write(&path, content).expect("write test file");
+    path
+}
+
+#[tokio::test]
+async fn test_orchestrator_agent_loop_replans_after_completed_single_action() {
+    let path = write_test_file("agent-loop-complete", "hello from loop\n");
+    let planner = Arc::new(SequencePlanner::new(vec![
+        PlannerOutput::SingleAction(SingleAction {
+            action: "file_read".to_string(),
+            params: json!({"path": path.to_string_lossy()}),
+            reason: Some("read file".to_string()),
+        }),
+        PlannerOutput::Done("final answer".to_string()),
+    ]));
+    let (orchestrator, task_store, event_store) = build_test_orchestrator(planner.clone(), 4);
+    let thread_id = orchestrator.thread_runtime.thread_id().await;
+
+    let result = orchestrator
+        .handle_event(Event::user_input(
+            thread_id.as_str(),
+            "int-1",
+            json!({"text":"读取文件后给出结论"}),
+        ))
+        .await
+        .expect("handle event");
+
+    let (task_id, execution_result) = match result {
+        OrchestratorResult::Started {
+            task_id, result, ..
+        } => (task_id, result),
+        other => panic!("unexpected orchestrator result: {:?}", other),
+    };
+    assert!(matches!(execution_result, ExecutionResult::Completed));
+
+    let task = task_store
+        .load(task_id.as_str())
+        .await
+        .expect("load task")
+        .expect("task exists");
+    assert!(matches!(task.state, TaskState::Done));
+    assert_eq!(
+        task.working_set_snapshot.get("single_action.content"),
+        Some(&json!("hello from loop\n"))
+    );
+
+    let loop_contexts = planner.seen_loop_contexts();
+    assert_eq!(loop_contexts.len(), 2);
+    assert!(loop_contexts[0].is_none());
+    let second = loop_contexts[1].clone().expect("second loop context");
+    assert_eq!(second.iteration, 2);
+    assert!(second
+        .recent_observations
+        .iter()
+        .any(|item| item.contains("result=completed")));
+    assert!(second
+        .working_set_preview
+        .as_deref()
+        .is_some_and(|preview| preview.contains("single_action.content")));
+
+    let events = event_store
+        .query_by_thread(thread_id.as_str())
+        .await
+        .expect("query events");
+    let assistant_messages = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::AssistantOutput { payload, .. } => {
+                payload.get("message").and_then(Value::as_str)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(assistant_messages, vec!["final answer"]);
+
+    let _ = fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn test_orchestrator_agent_loop_replans_after_failed_action_and_returns_need_input() {
+    let missing_path = std::env::current_dir()
+        .expect("cwd")
+        .join("target")
+        .join("agent-loop-tests")
+        .join(format!("missing-{}.txt", uuid::Uuid::new_v4()));
+    let planner = Arc::new(SequencePlanner::new(vec![
+        PlannerOutput::SingleAction(SingleAction {
+            action: "file_read".to_string(),
+            params: json!({"path": missing_path.to_string_lossy()}),
+            reason: Some("try missing file".to_string()),
+        }),
+        PlannerOutput::NeedInput("请提供正确的文件路径".to_string()),
+    ]));
+    let (orchestrator, task_store, _event_store) = build_test_orchestrator(planner.clone(), 4);
+    let thread_id = orchestrator.thread_runtime.thread_id().await;
+
+    let result = orchestrator
+        .handle_event(Event::user_input(
+            thread_id.as_str(),
+            "int-1",
+            json!({"text":"先尝试读文件，失败后问我要路径"}),
+        ))
+        .await
+        .expect("handle event");
+
+    let (task_id, execution_result) = match result {
+        OrchestratorResult::Started {
+            task_id, result, ..
+        } => (task_id, result),
+        other => panic!("unexpected orchestrator result: {:?}", other),
+    };
+    assert!(matches!(
+        execution_result,
+        ExecutionResult::WaitingUser { .. }
+    ));
+
+    let task = task_store
+        .load(task_id.as_str())
+        .await
+        .expect("load task")
+        .expect("task exists");
+    assert!(matches!(task.state, TaskState::WaitingUser { .. }));
+    assert!(task.plan.is_none());
+
+    let loop_contexts = planner.seen_loop_contexts();
+    assert_eq!(loop_contexts.len(), 2);
+    let second = loop_contexts[1].clone().expect("second loop context");
+    assert!(second
+        .recent_observations
+        .iter()
+        .any(|item| item.contains("result=failed")));
+}
+
+#[tokio::test]
+async fn test_orchestrator_agent_loop_enforces_iteration_limit_after_completed_execution() {
+    let path = write_test_file("agent-loop-limit", "limit\n");
+    let planner = Arc::new(SequencePlanner::new(vec![PlannerOutput::SingleAction(
+        SingleAction {
+            action: "file_read".to_string(),
+            params: json!({"path": path.to_string_lossy()}),
+            reason: Some("read file once".to_string()),
+        },
+    )]));
+    let (orchestrator, task_store, _event_store) = build_test_orchestrator(planner, 1);
+    let thread_id = orchestrator.thread_runtime.thread_id().await;
+
+    let result = orchestrator
+        .handle_event(Event::user_input(
+            thread_id.as_str(),
+            "int-1",
+            json!({"text":"读完后如果没结束就报错"}),
+        ))
+        .await
+        .expect("handle event");
+
+    let (task_id, execution_result) = match result {
+        OrchestratorResult::Started {
+            task_id, result, ..
+        } => (task_id, result),
+        other => panic!("unexpected orchestrator result: {:?}", other),
+    };
+    match execution_result {
+        ExecutionResult::Failed { step_id, error } => {
+            assert_eq!(step_id.as_str(), "planner");
+            assert!(error.contains("planner iteration limit reached"));
+        }
+        other => panic!("expected failed result, got {:?}", other),
+    }
+
+    let task = task_store
+        .load(task_id.as_str())
+        .await
+        .expect("load task")
+        .expect("task exists");
+    assert!(matches!(
+        task.state,
+        TaskState::Failed {
+            recoverable: false,
+            ..
+        }
+    ));
+
+    let _ = fs::remove_file(path);
 }

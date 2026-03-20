@@ -50,6 +50,8 @@ pub struct ActionMeta {
     pub name: String,
     /// Action description
     pub description: String,
+    /// Optional action grouping/category for planner UX and reporting.
+    pub category: Option<String>,
     /// JSON schema for fully resolved input payload.
     pub input_schema: serde_json::Value,
     /// JSON schema for action output payload.
@@ -70,6 +72,7 @@ impl ActionMeta {
         Self {
             name: name.into(),
             description: description.into(),
+            category: None,
             input_schema: serde_json::Value::Null,
             output_schema: serde_json::Value::Null,
             capabilities: Vec::new(),
@@ -77,6 +80,17 @@ impl ActionMeta {
             input_kinds: Vec::new(),
             output_kinds: Vec::new(),
         }
+    }
+
+    /// Set action category/grouping metadata.
+    pub fn with_category(mut self, category: impl Into<String>) -> Self {
+        let category = category.into();
+        if category.trim().is_empty() {
+            self.category = None;
+        } else {
+            self.category = Some(category);
+        }
+        self
     }
 
     /// Set input schema.

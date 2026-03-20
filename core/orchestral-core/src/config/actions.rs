@@ -41,6 +41,9 @@ pub struct ActionSpec {
     /// Optional description.
     #[serde(default)]
     pub description: Option<String>,
+    /// Optional grouping/category label for planner UX and reporting.
+    #[serde(default)]
+    pub category: Option<String>,
     /// Action-specific configuration.
     #[serde(default)]
     pub config: Value,

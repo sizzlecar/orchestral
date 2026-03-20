@@ -7,37 +7,12 @@ use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use orchestral_core::action::{Action, ActionContext, ActionInput, ActionResult};
-use orchestral_core::store::{Reference, ReferenceStore, ReferenceType, StoreError, WorkingSet};
+use orchestral_core::store::WorkingSet;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
-struct NoopReferenceStore;
 static TEST_PATH_COUNTER: AtomicU64 = AtomicU64::new(1);
-
-#[async_trait]
-impl ReferenceStore for NoopReferenceStore {
-    async fn add(&self, _reference: Reference) -> Result<(), StoreError> {
-        Ok(())
-    }
-
-    async fn get(&self, _id: &str) -> Result<Option<Reference>, StoreError> {
-        Ok(None)
-    }
-
-    async fn query_by_type(&self, _ref_type: &ReferenceType) -> Result<Vec<Reference>, StoreError> {
-        Ok(Vec::new())
-    }
-
-    async fn query_recent(&self, _limit: usize) -> Result<Vec<Reference>, StoreError> {
-        Ok(Vec::new())
-    }
-
-    async fn delete(&self, _id: &str) -> Result<bool, StoreError> {
-        Ok(false)
-    }
-}
 
 fn test_ctx() -> ActionContext {
     ActionContext::new(
@@ -45,7 +20,6 @@ fn test_ctx() -> ActionContext {
         "s1",
         "exec-1",
         Arc::new(RwLock::new(WorkingSet::new())),
-        Arc::new(NoopReferenceStore),
     )
 }
 
@@ -184,6 +158,7 @@ fn test_file_write_allows_new_file_under_workspace_roots() {
             name: "file_write".to_string(),
             kind: "file_write".to_string(),
             description: None,
+            category: None,
             config: json!({
                 "sandbox_mode": "workspace_write",
                 "sandbox_writable_roots": ["."],
@@ -227,6 +202,7 @@ fn test_shell_rejects_expression_without_explicit_shell_mode() {
             name: "shell".to_string(),
             kind: "shell".to_string(),
             description: None,
+            category: None,
             config: json!({}),
             interface: None,
         };
@@ -251,6 +227,7 @@ fn test_shell_blocks_command_by_policy() {
             name: "shell".to_string(),
             kind: "shell".to_string(),
             description: None,
+            category: None,
             config: json!({
                 "blocked_commands": ["echo"]
             }),
@@ -278,6 +255,7 @@ fn test_shell_blocks_expression_when_contains_blocked_command() {
             name: "shell".to_string(),
             kind: "shell".to_string(),
             description: None,
+            category: None,
             config: json!({
                 "allow_shell_expression": true,
                 "blocked_commands": ["rm"]
@@ -306,6 +284,7 @@ fn test_shell_blocks_expression_when_contains_disallowed_command() {
             name: "shell".to_string(),
             kind: "shell".to_string(),
             description: None,
+            category: None,
             config: json!({
                 "allow_shell_expression": true,
                 "allowed_commands": ["echo"]
@@ -338,6 +317,7 @@ fn test_shell_minimal_env_hides_secret_vars() {
             name: "shell".to_string(),
             kind: "shell".to_string(),
             description: None,
+            category: None,
             config: json!({
                 "sandbox_mode": "none",
                 "env_policy": "minimal"
@@ -376,6 +356,7 @@ fn test_shell_non_zero_exit_is_error_by_default() {
             name: "shell".to_string(),
             kind: "shell".to_string(),
             description: None,
+            category: None,
             config: json!({
                 "sandbox_mode": "none"
             }),
@@ -407,6 +388,7 @@ fn test_shell_can_allow_non_zero_exit() {
             name: "shell".to_string(),
             kind: "shell".to_string(),
             description: None,
+            category: None,
             config: json!({
                 "sandbox_mode": "none",
                 "fail_on_non_zero": false
@@ -443,6 +425,7 @@ fn test_file_read_respects_size_limit_and_truncate() {
             name: "file_read".to_string(),
             kind: "file_read".to_string(),
             description: None,
+            category: None,
             config: json!({
                 "sandbox_mode": "workspace_write",
                 "sandbox_writable_roots": ["."],
@@ -496,6 +479,7 @@ fn test_file_write_rejects_in_read_only_mode() {
             name: "file_write".to_string(),
             kind: "file_write".to_string(),
             description: None,
+            category: None,
             config: json!({
                 "sandbox_mode": "read_only",
                 "sandbox_writable_roots": ["."]
@@ -525,6 +509,7 @@ fn test_file_write_rejects_empty_content_by_default() {
             name: "file_write".to_string(),
             kind: "file_write".to_string(),
             description: None,
+            category: None,
             config: json!({
                 "sandbox_mode": "workspace_write",
                 "sandbox_writable_roots": ["."],
@@ -556,6 +541,7 @@ fn test_file_write_allows_empty_content_with_opt_in() {
             name: "file_write".to_string(),
             kind: "file_write".to_string(),
             description: None,
+            category: None,
             config: json!({
                 "sandbox_mode": "workspace_write",
                 "sandbox_writable_roots": ["."],
@@ -599,6 +585,7 @@ fn test_file_read_rejects_path_outside_workspace_roots() {
             name: "file_read".to_string(),
             kind: "file_read".to_string(),
             description: None,
+            category: None,
             config: json!({
                 "sandbox_mode": "workspace_write",
                 "sandbox_writable_roots": ["target"]
@@ -632,6 +619,7 @@ fn test_file_read_trims_whitespace_around_path() {
             name: "file_read".to_string(),
             kind: "file_read".to_string(),
             description: None,
+            category: None,
             config: json!({
                 "sandbox_mode": "workspace_write",
                 "sandbox_writable_roots": ["."]

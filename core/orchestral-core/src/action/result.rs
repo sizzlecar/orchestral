@@ -16,7 +16,7 @@ pub struct ApprovalRequest {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ActionResult {
     /// Execution succeeded
-    /// exports can be empty (side-effect only / only updates ReferenceStore)
+    /// exports can be empty (side-effect only)
     Success {
         /// Output values to export to WorkingSet
         #[serde(default)]
