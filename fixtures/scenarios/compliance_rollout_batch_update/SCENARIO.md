@@ -202,4 +202,4 @@ It should show:
 
 If Orchestral wins this scenario, the message should be:
 
-"It is not winning because it has a special file-format tool. It is winning because the runtime is better at large-scale, cross-family, verify-gated repo updates."
+"It is not winning because it has a special file-format tool. It is winning because the runtime is better at large-scale, multi-artifact, verify-gated repo updates."

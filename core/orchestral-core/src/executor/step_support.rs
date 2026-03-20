@@ -48,10 +48,35 @@ fn resolve_param_templates_inner(
             if !text.contains("{{") {
                 return Ok(());
             }
-            *text = render_param_template(text, ws, root)?;
+            if let Some(key) = exact_template_placeholder(text) {
+                let value = ws
+                    .get_task(key)
+                    .or_else(|| lookup_template_value(root, key))
+                    .ok_or_else(|| format!("missing template value '{}'", key))?;
+                *params = value.clone();
+            } else {
+                *text = render_param_template(text, ws, root)?;
+            }
             Ok(())
         }
         _ => Ok(()),
+    }
+}
+
+fn exact_template_placeholder(template: &str) -> Option<&str> {
+    let trimmed = template.trim();
+    if !trimmed.starts_with("{{") || !trimmed.ends_with("}}") {
+        return None;
+    }
+    if trimmed[2..trimmed.len() - 2].contains("{{") || trimmed[2..trimmed.len() - 2].contains("}}")
+    {
+        return None;
+    }
+    let key = trimmed[2..trimmed.len() - 2].trim();
+    if key.is_empty() {
+        None
+    } else {
+        Some(key)
     }
 }
 

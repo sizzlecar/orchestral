@@ -355,7 +355,7 @@ fn candidate_has_noop_plan(candidate: &Value) -> bool {
         .unwrap_or(false)
 }
 
-fn prepend_h1_title(title: &str, content: &str) -> String {
+pub(super) fn prepend_h1_title(title: &str, content: &str) -> String {
     if content.is_empty() {
         format!("# {}\n", title.trim())
     } else {

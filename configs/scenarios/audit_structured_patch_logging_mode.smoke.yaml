@@ -21,8 +21,6 @@ turns:
       require_execution_end: true
       max_approvals: 0
       max_errors: 0
-      execution_mode_contains:
-        - "reactor"
       assistant_contains:
         - "logging.level"
         - "logging.pretty"

@@ -1,6 +1,8 @@
 mod actions;
 mod apply;
 mod assess;
+mod commit;
+mod derive;
 mod inspect;
 mod locate;
 mod model;
@@ -18,6 +20,8 @@ mod tests {
 
     use super::apply::apply_document_patch;
     use super::assess::{assess_document_readiness, collect_candidate_unknowns};
+    use super::commit::build_document_patch_spec;
+    use super::derive::derive_document_patch_candidates;
     use super::model::suggested_title_from_stem;
     use super::support::request_requires_confirmation;
 
@@ -67,10 +71,9 @@ mod tests {
             continuation["status"],
             Value::String("wait_user".to_string())
         );
-        assert_eq!(
-            continuation["next_stage_hint"],
-            Value::String("commit".to_string())
-        );
+        assert!(continuation["user_message"]
+            .as_str()
+            .is_some_and(|message| message.contains("回复“确认”后我会按这个计划写回。")));
     }
 
     #[test]
@@ -143,6 +146,125 @@ mod tests {
         assert_eq!(
             continuation["status"],
             Value::String("commit_ready".to_string())
+        );
+    }
+
+    #[test]
+    fn test_derive_document_patch_candidates_supports_filename_policy_alias() {
+        let inspection = json!({
+            "files": [
+                {
+                    "path": "docs/customer-onboarding.md",
+                    "file_name": "customer-onboarding.md",
+                    "missing_title": true,
+                    "suggested_title": "Customer Onboarding",
+                    "todo_count": 0
+                },
+                {
+                    "path": "docs/ops-handbook.md",
+                    "file_name": "ops-handbook.md",
+                    "missing_title": false,
+                    "suggested_title": "Ops Handbook",
+                    "todo_count": 0
+                }
+            ]
+        });
+
+        let (patch_candidates, summary) = derive_document_patch_candidates(
+            "扫描 docs 下所有 markdown，缺失一级标题的文档使用文件名转成标题补齐。",
+            &inspection,
+            "filename_to_h1",
+        )
+        .expect("derive document patch candidates");
+
+        assert!(summary.contains("Derived document patch candidates"));
+        let files = patch_candidates
+            .pointer("/candidates/files")
+            .and_then(Value::as_array)
+            .expect("candidate files");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["path"], json!("docs/customer-onboarding.md"));
+        assert_eq!(
+            files[0]["planned_changes"][0]["title"],
+            json!("Customer Onboarding")
+        );
+    }
+
+    #[test]
+    fn test_derive_document_patch_candidates_accepts_unknown_policy_alias() {
+        let inspection = json!({
+            "files": [
+                {
+                    "path": "docs/customer-onboarding.md",
+                    "file_name": "customer-onboarding.md",
+                    "missing_title": true,
+                    "suggested_title": "Customer Onboarding",
+                    "todo_count": 0
+                }
+            ]
+        });
+
+        let (patch_candidates, _summary) = derive_document_patch_candidates(
+            "补齐缺失标题",
+            &inspection,
+            "add_missing_h1_from_filename",
+        )
+        .expect("derive document patch candidates");
+
+        let files = patch_candidates
+            .pointer("/candidates/files")
+            .and_then(Value::as_array)
+            .expect("candidate files");
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0]["planned_changes"][0]["title"],
+            json!("Customer Onboarding")
+        );
+    }
+
+    #[test]
+    fn test_build_document_patch_spec_generates_updates_from_candidates() {
+        let inspection = json!({
+            "files": [
+                {
+                    "path": "docs/customer-onboarding.md",
+                    "content": "## Goal\n\nBody\n",
+                    "missing_title": true,
+                    "suggested_title": "Customer Onboarding"
+                }
+            ]
+        });
+        let patch_candidates = json!({
+            "candidates": {
+                "files": [
+                    {
+                        "path": "docs/customer-onboarding.md",
+                        "planned_changes": [
+                            {
+                                "type": "add_title",
+                                "title": "Customer Onboarding"
+                            }
+                        ],
+                        "needs_user_input": false,
+                        "unknowns": []
+                    }
+                ]
+            },
+            "unknowns": [],
+            "assumptions": []
+        });
+
+        let (patch_spec, summary) =
+            build_document_patch_spec(&patch_candidates, &inspection).expect("build patch spec");
+
+        assert!(summary.contains("Prepared document patch"));
+        assert_eq!(
+            patch_spec["updates"][0]["path"],
+            json!("docs/customer-onboarding.md")
+        );
+        assert_eq!(
+            patch_spec["updates"][0]["content"],
+            json!("# Customer Onboarding\n\n## Goal\n\nBody\n")
         );
     }
 

@@ -59,6 +59,7 @@ impl Action for StructuredLocateAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_category("structured")
             .with_capabilities(["filesystem_read"])
             .with_roles(["collect", "inspect"])
             .with_input_kinds(["path", "text"])
@@ -68,8 +69,7 @@ impl Action for StructuredLocateAction {
                 "properties": {
                     "source_root": { "type": "string" },
                     "user_request": { "type": "string" }
-                },
-                "required": ["source_root", "user_request"]
+                }
             }))
             .with_output_schema(json!({
                 "type": "object",
@@ -127,6 +127,7 @@ impl Action for StructuredInspectAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_category("structured")
             .with_capabilities(["filesystem_read"])
             .with_roles(["inspect", "verify"])
             .with_input_kinds(["path"])
@@ -190,6 +191,7 @@ impl Action for StructuredDeriveCandidatesAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_category("structured")
             .with_capabilities(["pure", "structured_output"])
             .with_roles(["derive", "emit"])
             .with_input_kinds(["structured", "text"])
@@ -270,6 +272,7 @@ impl Action for StructuredAssessReadinessAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_category("structured")
             .with_capabilities(["pure", "structured_output"])
             .with_roles(["verify", "control"])
             .with_input_kinds(["structured"])
@@ -350,6 +353,7 @@ impl Action for StructuredBuildPatchSpecAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_category("structured")
             .with_capabilities(["pure", "structured_output"])
             .with_roles(["derive", "emit"])
             .with_input_kinds(["structured"])
@@ -416,6 +420,7 @@ impl Action for StructuredApplyPatchAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_category("structured")
             .with_capabilities(["filesystem_read", "filesystem_write", "side_effect"])
             .with_roles(["apply", "execute"])
             .with_input_kinds(["structured"])
@@ -476,6 +481,7 @@ impl Action for StructuredVerifyPatchAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_category("structured")
             .with_capabilities(["filesystem_read"])
             .with_roles(["verify"])
             .with_input_kinds(["structured"])

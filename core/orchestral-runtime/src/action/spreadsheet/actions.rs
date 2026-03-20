@@ -57,6 +57,7 @@ impl Action for SpreadsheetLocateAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_category("spreadsheet")
             .with_capabilities(["filesystem_read"])
             .with_roles(["collect", "inspect"])
             .with_input_kinds(["path", "text"])
@@ -66,8 +67,7 @@ impl Action for SpreadsheetLocateAction {
                 "properties": {
                     "source_root": { "type": "string" },
                     "user_request": { "type": "string" }
-                },
-                "required": ["source_root", "user_request"]
+                }
             }))
             .with_output_schema(json!({
                 "type": "object",
@@ -125,6 +125,7 @@ impl Action for SpreadsheetInspectAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_category("spreadsheet")
             .with_capabilities(["filesystem_read"])
             .with_roles(["inspect", "verify"])
             .with_input_kinds(["path"])
@@ -183,6 +184,7 @@ impl Action for SpreadsheetAssessReadinessAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_category("spreadsheet")
             .with_capabilities(["pure", "structured_output"])
             .with_roles(["verify", "control"])
             .with_input_kinds(["structured"])
@@ -265,6 +267,7 @@ impl Action for SpreadsheetApplyPatchAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_category("spreadsheet")
             .with_capabilities(["filesystem_read", "filesystem_write", "side_effect"])
             .with_roles(["apply", "execute"])
             .with_input_kinds(["path", "structured"])
@@ -359,6 +362,7 @@ impl Action for SpreadsheetVerifyPatchAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_category("spreadsheet")
             .with_capabilities(["filesystem_read"])
             .with_roles(["verify"])
             .with_input_kinds(["path", "structured"])

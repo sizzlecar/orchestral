@@ -18,7 +18,8 @@ turns:
       max_approvals: 0
       max_errors: 0
       execution_mode_contains:
-        - "action_call"
+        - "single_action"
+        - "done"
       assistant_contains:
         - "Demo Readme"
         - "file_read action-call execution"

@@ -19,10 +19,8 @@ turns:
       require_execution_end: true
       max_approvals: 0
       max_errors: 0
-      execution_mode_contains:
-        - "reactor"
       activity_contains:
-        - "reactor_commit_apply reactor_document_apply_patch"
+        - "document_apply_patch"
       artifact_contains:
         - path: fixtures/scenarios/incremental_doc_patch/docs/customer-onboarding.md
           text: "# Customer Onboarding"
@@ -59,10 +57,8 @@ turns:
       require_execution_end: true
       max_approvals: 0
       max_errors: 0
-      execution_mode_contains:
-        - "reactor"
       activity_contains:
-        - "reactor_commit_apply reactor_document_apply_patch"
+        - "document_apply_patch"
       artifact_matches_turn:
         - path: fixtures/scenarios/incremental_doc_patch/docs/ops-handbook.md
           turn: run-1

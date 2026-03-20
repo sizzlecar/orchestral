@@ -9,10 +9,7 @@ runtime:
   auto_cleanup: true
   concurrency_policy: interrupt_and_start_new
   strict_exports: true
-  reactor:
-    enabled: true
-    default_derivation_policy: permissive
-    stage_loop_limit: 10
+  max_planner_iterations: 6
 
 planner:
   mode: llm
@@ -427,9 +424,9 @@ actions:
         sandbox_writable_roots: ["."]
         create_dirs: true
         max_write_bytes: 524288
-    - name: reactor_spreadsheet_locate
+    - name: spreadsheet_locate
       kind: spreadsheet_locate
-      description: "Locate a spreadsheet artifact for the reactor spreadsheet family"
+      description: "Locate a spreadsheet artifact "
       interface:
         input_schema:
           type: object
@@ -438,7 +435,6 @@ actions:
               type: string
             user_request:
               type: string
-          required: ["source_root", "user_request"]
         output_schema:
           type: object
           properties:
@@ -452,9 +448,9 @@ actions:
               type: integer
           required: ["source_path", "artifact_candidates", "artifact_count"]
       config: {}
-    - name: reactor_spreadsheet_inspect
+    - name: spreadsheet_inspect
       kind: spreadsheet_inspect
-      description: "Inspect spreadsheet structure for the reactor spreadsheet family"
+      description: "Inspect spreadsheet structure "
       interface:
         input_schema:
           type: object
@@ -469,7 +465,7 @@ actions:
               type: object
           required: ["inspection"]
       config: {}
-    - name: reactor_spreadsheet_assess_readiness
+    - name: spreadsheet_assess_readiness
       kind: spreadsheet_assess_readiness
       description: "Assess whether spreadsheet probe results are ready for commit"
       interface:
@@ -491,9 +487,9 @@ actions:
               type: string
           required: ["continuation", "summary"]
       config: {}
-    - name: reactor_spreadsheet_apply_patch
+    - name: spreadsheet_apply_patch
       kind: spreadsheet_apply_patch
-      description: "Apply a typed spreadsheet patch for the reactor spreadsheet family"
+      description: "Apply a typed spreadsheet patch "
       interface:
         input_schema:
           type: object
@@ -518,9 +514,9 @@ actions:
               type: string
           required: ["updated_file_path", "patch_count", "summary"]
       config: {}
-    - name: reactor_spreadsheet_verify_patch
+    - name: spreadsheet_verify_patch
       kind: spreadsheet_verify_patch
-      description: "Verify a spreadsheet patch for the reactor spreadsheet family"
+      description: "Verify a spreadsheet patch "
       interface:
         input_schema:
           type: object
@@ -542,9 +538,9 @@ actions:
           required: ["verify_decision", "summary"]
       config:
         default_validator_path: "configs/scenarios/validators/verify_perf_review_fill.py"
-    - name: reactor_document_locate
+    - name: document_locate
       kind: document_locate
-      description: "Locate document artifacts for the reactor document family"
+      description: "Locate document artifacts "
       interface:
         input_schema:
           type: object
@@ -553,11 +549,14 @@ actions:
               type: string
             user_request:
               type: string
-          required: ["source_root", "user_request"]
         output_schema:
           type: object
           properties:
             source_paths:
+              type: array
+              items:
+                type: string
+            documents:
               type: array
               items:
                 type: string
@@ -571,18 +570,43 @@ actions:
               type: string
           required: ["source_paths", "artifact_candidates", "artifact_count"]
       config: {}
-    - name: reactor_document_inspect
+    - name: document_inspect
       kind: document_inspect
-      description: "Inspect document structure for the reactor document family"
+      description: "Inspect document structure "
       interface:
         input_schema:
           type: object
           properties:
             source_paths:
-              type: array
-              items:
-                type: string
-          required: ["source_paths"]
+              oneOf:
+                - type: array
+                  items:
+                    type: string
+                - type: string
+            documents:
+              oneOf:
+                - type: array
+                  items:
+                    type: string
+                - type: string
+            source_path:
+              oneOf:
+                - type: string
+                - type: array
+                  items:
+                    type: string
+            path:
+              oneOf:
+                - type: string
+                - type: array
+                  items:
+                    type: string
+            document:
+              oneOf:
+                - type: string
+                - type: array
+                  items:
+                    type: string
         output_schema:
           type: object
           properties:
@@ -590,7 +614,51 @@ actions:
               type: object
           required: ["inspection"]
       config: {}
-    - name: reactor_document_assess_readiness
+    - name: document_derive_candidates
+      kind: document_derive_candidates
+      description: "Derive typed document patch candidates from document inspection"
+      interface:
+        input_schema:
+          type: object
+          properties:
+            user_request:
+              type: string
+            inspection:
+              type: object
+            derivation_policy:
+              type: string
+          required: ["user_request", "inspection", "derivation_policy"]
+        output_schema:
+          type: object
+          properties:
+            patch_candidates:
+              type: object
+            summary:
+              type: string
+          required: ["patch_candidates", "summary"]
+      config: {}
+    - name: document_build_patch_spec
+      kind: document_build_patch_spec
+      description: "Build a typed document patch spec from document patch candidates"
+      interface:
+        input_schema:
+          type: object
+          properties:
+            patch_candidates:
+              type: object
+            inspection:
+              type: object
+          required: ["patch_candidates", "inspection"]
+        output_schema:
+          type: object
+          properties:
+            patch_spec:
+              type: object
+            summary:
+              type: string
+          required: ["patch_spec", "summary"]
+      config: {}
+    - name: document_assess_readiness
       kind: document_assess_readiness
       description: "Assess whether document probe results are ready for commit"
       interface:
@@ -615,9 +683,9 @@ actions:
               type: string
           required: ["continuation", "summary"]
       config: {}
-    - name: reactor_document_apply_patch
+    - name: document_apply_patch
       kind: document_apply_patch
-      description: "Apply a typed document patch for the reactor document family"
+      description: "Apply a typed document patch "
       interface:
         input_schema:
           type: object
@@ -638,9 +706,9 @@ actions:
               type: string
           required: ["updated_paths", "patch_count", "summary"]
       config: {}
-    - name: reactor_document_verify_patch
+    - name: document_verify_patch
       kind: document_verify_patch
-      description: "Verify a document patch for the reactor document family"
+      description: "Verify a document patch "
       interface:
         input_schema:
           type: object
@@ -662,9 +730,9 @@ actions:
               type: string
           required: ["verify_decision", "summary"]
       config: {}
-    - name: reactor_structured_locate
+    - name: structured_locate
       kind: structured_locate
-      description: "Locate structured artifacts for the reactor structured family"
+      description: "Locate structured artifacts "
       interface:
         input_schema:
           type: object
@@ -673,7 +741,6 @@ actions:
               type: string
             user_request:
               type: string
-          required: ["source_root", "user_request"]
         output_schema:
           type: object
           properties:
@@ -689,9 +756,9 @@ actions:
               type: integer
           required: ["source_paths", "artifact_candidates", "artifact_count"]
       config: {}
-    - name: reactor_structured_inspect
+    - name: structured_inspect
       kind: structured_inspect
-      description: "Inspect structured artifact contents for the reactor structured family"
+      description: "Inspect structured artifact contents "
       interface:
         input_schema:
           type: object
@@ -708,7 +775,7 @@ actions:
               type: object
           required: ["inspection"]
       config: {}
-    - name: reactor_structured_derive_candidates
+    - name: structured_derive_candidates
       kind: structured_derive_candidates
       description: "Derive typed structured patch candidates from explicit user requests"
       interface:
@@ -731,7 +798,7 @@ actions:
               type: string
           required: ["patch_candidates", "summary"]
       config: {}
-    - name: reactor_structured_assess_readiness
+    - name: structured_assess_readiness
       kind: structured_assess_readiness
       description: "Assess whether structured probe results are ready for commit"
       interface:
@@ -754,7 +821,7 @@ actions:
               type: string
           required: ["continuation", "summary"]
       config: {}
-    - name: reactor_structured_build_patch_spec
+    - name: structured_build_patch_spec
       kind: structured_build_patch_spec
       description: "Build a typed structured patch spec from structured patch candidates"
       interface:
@@ -773,9 +840,9 @@ actions:
               type: string
           required: ["patch_spec", "summary"]
       config: {}
-    - name: reactor_structured_apply_patch
+    - name: structured_apply_patch
       kind: structured_apply_patch
-      description: "Apply a typed structured patch for the reactor structured family"
+      description: "Apply a typed structured patch "
       interface:
         input_schema:
           type: object
@@ -796,9 +863,9 @@ actions:
               type: string
           required: ["updated_paths", "patch_count", "summary"]
       config: {}
-    - name: reactor_structured_verify_patch
+    - name: structured_verify_patch
       kind: structured_verify_patch
-      description: "Verify a structured patch for the reactor structured family"
+      description: "Verify a structured patch "
       interface:
         input_schema:
           type: object
@@ -817,9 +884,9 @@ actions:
               type: string
           required: ["verify_decision", "summary"]
       config: {}
-    - name: reactor_codebase_collect_targets
+    - name: codebase_collect_targets
       kind: codebase_collect_targets
-      description: "Collect explicit mixed-artifact targets for the reactor codebase family"
+      description: "Collect explicit mixed-artifact targets "
       interface:
         input_schema:
           type: object
@@ -846,16 +913,16 @@ actions:
                 type: string
           required:
             [
-              "instruction_path",
-              "instruction_source_paths",
-              "spreadsheet_path",
-              "structured_path",
-              "structured_source_paths",
+ "instruction_path",
+ "instruction_source_paths",
+ "spreadsheet_path",
+ "structured_path",
+ "structured_source_paths",
             ]
       config: {}
-    - name: reactor_codebase_collect_results
+    - name: codebase_collect_results
       kind: codebase_collect_results
-      description: "Collect mixed-artifact run results for the reactor codebase family"
+      description: "Collect mixed-artifact run results "
       interface:
         input_schema:
           type: object
@@ -878,9 +945,9 @@ actions:
               type: string
           required: ["collected_result", "summary"]
       config: {}
-    - name: reactor_codebase_aggregate_verify
+    - name: codebase_aggregate_verify
       kind: codebase_aggregate_verify
-      description: "Aggregate mixed-artifact verify results for the reactor codebase family"
+      description: "Aggregate mixed-artifact verify results "
       interface:
         input_schema:
           type: object
@@ -893,9 +960,9 @@ actions:
               type: object
           required:
             [
-              "spreadsheet_verify_decision",
-              "structured_verify_decision",
-              "collected_result",
+ "spreadsheet_verify_decision",
+ "structured_verify_decision",
+ "collected_result",
             ]
         output_schema:
           type: object
@@ -906,9 +973,9 @@ actions:
               type: string
           required: ["verify_decision", "summary"]
       config: {}
-    - name: reactor_codebase_export_summary
+    - name: codebase_export_summary
       kind: codebase_export_summary
-      description: "Export a unified mixed-artifact summary for the reactor codebase family"
+      description: "Export a unified mixed-artifact summary "
       interface:
         input_schema:
           type: object

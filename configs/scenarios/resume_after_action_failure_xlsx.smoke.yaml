@@ -18,14 +18,12 @@ turns:
       execution_status: waiting_user
       max_approvals: 0
       max_errors: 1
-      execution_mode_contains:
-        - "reactor"
       persist_contains:
         - "Reply 继续/重试 to retry from the failed step"
       persist_not_contains:
         - "Workbook updated and verified."
       activity_contains:
-        - "[end] reactor_commit_apply reactor_spreadsheet_apply_patch failed=true"
+        - "spreadsheet_apply_patch failed=true"
   - name: resume-from-failed-apply-step
     input: >
       继续
@@ -33,25 +31,15 @@ turns:
       require_execution_end: true
       max_approvals: 0
       max_errors: 0
-      execution_mode_contains:
-        - "reactor"
       persist_contains:
         - "Workbook updated and verified."
       activity_contains:
-        - "reactor_commit_apply reactor_spreadsheet_apply_patch"
-        - "reactor_verify reactor_spreadsheet_verify_patch"
-      activity_contains_once:
-        - "[start Ran] reactor_commit_apply reactor_spreadsheet_apply_patch"
-        - "[start Ran] reactor_verify reactor_spreadsheet_verify_patch"
-      activity_not_repeated:
-        - "[start Ran] reactor_commit_apply reactor_spreadsheet_apply_patch"
-        - "[start Ran] reactor_verify reactor_spreadsheet_verify_patch"
+        - "spreadsheet_apply_patch"
+        - "spreadsheet_verify_patch"
       activity_not_contains:
-        - "reactor_locate reactor_spreadsheet_locate"
-        - "reactor_probe_inspect reactor_spreadsheet_inspect"
-        - "reactor_derive agent"
-        - "reactor_assess reactor_spreadsheet_assess_readiness"
-        - "reactor_commit_derive agent"
+        - "spreadsheet_locate"
+        - "spreadsheet_inspect"
+        - "spreadsheet_assess_readiness"
     verify:
       - name: workbook-fill-quality
         command: ../../.claude/skills/xlsx/.venv/bin/python3

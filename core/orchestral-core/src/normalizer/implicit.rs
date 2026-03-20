@@ -17,6 +17,7 @@ impl PlanNormalizer {
             infer_special_step_kind(step);
             super::agent::apply_agent_defaults(step);
             derive_depends_on_from_bindings(step);
+            derive_depends_on_from_param_templates(step);
 
             if step.kind == StepKind::Agent {
                 if let Some(keys) = agent_output_keys(step) {
@@ -44,7 +45,7 @@ impl PlanNormalizer {
                     step_id = %step.id,
                     action = %step.action,
                     depends_on = ?step.depends_on,
-                    "normalizer derived depends_on from io_bindings"
+                    "normalizer derived depends_on from io_bindings/templates"
                 );
             }
             if step.exports != original_exports {
@@ -105,17 +106,74 @@ fn infer_special_step_kind(step: &mut Step) {
 }
 
 fn derive_depends_on_from_bindings(step: &mut Step) {
-    for binding in &step.io_bindings {
-        if let Some((source_step, _)) = parse_step_binding_source(&binding.from) {
-            if source_step.as_str() != step.id.as_str()
-                && !step
-                    .depends_on
-                    .iter()
-                    .any(|dep| dep.as_str() == source_step.as_str())
-            {
-                step.depends_on.push(source_step.into());
+    let refs = step
+        .io_bindings
+        .iter()
+        .filter_map(|binding| {
+            parse_step_binding_source(&binding.from).map(|(source_step, _)| source_step)
+        })
+        .collect::<Vec<_>>();
+    for source_step in refs {
+        add_dependency(step, source_step);
+    }
+}
+
+fn derive_depends_on_from_param_templates(step: &mut Step) {
+    for reference in template_step_references(&step.params) {
+        add_dependency(step, reference);
+    }
+}
+
+fn add_dependency(step: &mut Step, source_step: String) {
+    if source_step.as_str() != step.id.as_str()
+        && !step
+            .depends_on
+            .iter()
+            .any(|dep| dep.as_str() == source_step.as_str())
+    {
+        step.depends_on.push(source_step.into());
+    }
+}
+
+fn template_step_references(value: &serde_json::Value) -> Vec<String> {
+    let mut refs = Vec::new();
+    collect_template_step_references(value, &mut refs);
+    refs
+}
+
+fn collect_template_step_references(value: &serde_json::Value, refs: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for value in map.values() {
+                collect_template_step_references(value, refs);
             }
         }
+        serde_json::Value::Array(items) => {
+            for value in items {
+                collect_template_step_references(value, refs);
+            }
+        }
+        serde_json::Value::String(text) => {
+            collect_template_refs_from_string(text, refs);
+        }
+        _ => {}
+    }
+}
+
+fn collect_template_refs_from_string(text: &str, refs: &mut Vec<String>) {
+    let mut rest = text;
+    while let Some(start) = rest.find("{{") {
+        let after_start = &rest[start + 2..];
+        let Some(end) = after_start.find("}}") else {
+            return;
+        };
+        let key = after_start[..end].trim();
+        if let Some((source_step, _)) = parse_step_binding_source(key) {
+            if !refs.iter().any(|existing| existing == &source_step) {
+                refs.push(source_step);
+            }
+        }
+        rest = &after_start[end + 2..];
     }
 }
 

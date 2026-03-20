@@ -23,8 +23,6 @@ turns:
       assistant_not_contains:
         - "```shell"
         - "请告诉我执行结果"
-      execution_mode_contains:
-        - "reactor"
       artifact_contains:
         - path: fixtures/scenarios/no_fake_execution/config/app.toml
           text: "port = 9090"

@@ -2,9 +2,14 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 
-use orchestral_core::types::{
-    ContinuationState, ContinuationStatus, DerivationPolicy, PatchCandidatesEnvelope, StageKind,
-};
+use orchestral_core::types::{ContinuationState, ContinuationStatus, PatchCandidatesEnvelope};
+
+/// Derivation policy for spreadsheet assessment (local enum replacing the removed core type).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DerivationPolicy {
+    Strict,
+    Permissive,
+}
 
 pub(super) fn assess_readiness(
     inspection: &Value,
@@ -35,7 +40,6 @@ pub(super) fn assess_readiness(
             reason: "selected spreadsheet region has no patchable cells".to_string(),
             unknowns: Vec::new(),
             assumptions: Vec::new(),
-            next_stage_hint: Some(StageKind::Done),
             user_message: None,
         };
         return Ok((
@@ -88,7 +92,6 @@ pub(super) fn assess_readiness(
             ),
             unknowns,
             assumptions,
-            next_stage_hint: Some(StageKind::Commit),
             user_message: None,
         };
         return Ok((
@@ -113,7 +116,6 @@ pub(super) fn assess_readiness(
             ),
             unknowns,
             assumptions,
-            next_stage_hint: Some(StageKind::Commit),
             user_message: None,
         };
         return Ok((
@@ -147,7 +149,6 @@ pub(super) fn assess_readiness(
         reason: user_message.clone(),
         unknowns,
         assumptions,
-        next_stage_hint: Some(StageKind::WaitUser),
         user_message: Some(user_message.clone()),
     };
     Ok((

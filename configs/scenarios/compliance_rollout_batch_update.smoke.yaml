@@ -24,10 +24,8 @@ turns:
       require_execution_end: true
       max_approvals: 0
       max_errors: 0
-      execution_mode_contains:
-        - "reactor"
       activity_contains:
-        - "reactor_commit_apply reactor_document_apply_patch"
+        - "document_apply_patch"
       artifact_contains:
         - path: fixtures/scenarios/compliance_rollout_batch_update/runbooks/release-rollout.md
           text: "# Release Rollout"
@@ -64,10 +62,8 @@ turns:
       require_execution_end: true
       max_approvals: 0
       max_errors: 0
-      execution_mode_contains:
-        - "reactor"
       activity_contains:
-        - "reactor_commit_apply reactor_document_apply_patch"
+        - "document_apply_patch"
       artifact_contains:
         - path: fixtures/scenarios/compliance_rollout_batch_update/customer-guides/tenant-logging.md
           text: "/var/log/tenant.log"

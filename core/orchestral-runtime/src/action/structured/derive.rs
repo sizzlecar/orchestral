@@ -1,7 +1,14 @@
 use serde::Deserialize;
 use serde_json::{json, Number, Value};
 
-use orchestral_core::types::{DerivationPolicy, PatchCandidatesEnvelope};
+use orchestral_core::types::PatchCandidatesEnvelope;
+
+/// Derivation policy for structured derive (local enum replacing the removed core type).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DerivationPolicy {
+    Strict,
+    Permissive,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 struct StructuredInspection {

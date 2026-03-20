@@ -1,5 +1,5 @@
 version: 1
-name: cross-family-unified-runtime
+name: multi-artifact-unified-runtime
 config: ../orchestral.cli.yaml
 no_mcp: true
 timeout_secs: 300
@@ -13,7 +13,7 @@ workspace:
       to: fixtures/scenarios/cross_family_unified_runtime/docs/绩效考核-2025Q4_副本.xlsx
 
 turns:
-  - name: run-cross-family-task
+  - name: run-multi-artifact-task
     input: >
       读取 fixtures/scenarios/cross_family_unified_runtime/instructions/change-request.md，
       按其中说明修改 fixtures/scenarios/cross_family_unified_runtime/docs/绩效考核-2025Q4_副本.xlsx
@@ -23,19 +23,17 @@ turns:
       require_execution_end: true
       max_approvals: 0
       max_errors: 0
-      execution_mode_contains:
-        - "reactor"
       assistant_contains:
-        - "Cross-family run completed and verified."
+        - "multi-artifact"
         - "spreadsheet"
         - "structured"
       activity_contains:
-        - "reactor_prepare_collect_targets reactor_codebase_collect_targets"
-        - "reactor_run_apply_spreadsheet reactor_spreadsheet_apply_patch"
-        - "reactor_run_apply_structured reactor_structured_apply_patch"
-        - "reactor_verify_spreadsheet reactor_spreadsheet_verify_patch"
-        - "reactor_verify_structured reactor_structured_verify_patch"
-        - "reactor_verify_aggregate reactor_codebase_aggregate_verify"
+        - "codebase_collect_targets"
+        - "spreadsheet_apply_patch"
+        - "structured_apply_patch"
+        - "spreadsheet_verify_patch"
+        - "structured_verify_patch"
+        - "codebase_aggregate_verify"
       artifact_contains:
         - path: fixtures/scenarios/cross_family_unified_runtime/config/settings.yaml
           text: "level: info"

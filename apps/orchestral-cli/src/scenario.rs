@@ -2127,7 +2127,7 @@ turns:
             transient_lines: Vec::new(),
             activity_lines: Vec::new(),
             assistant_stream: "updated app.toml successfully".to_string(),
-            execution_modes: vec!["action_call".to_string()],
+            execution_modes: vec!["single_action".to_string()],
             verifications: Vec::new(),
             failures: Vec::new(),
             passed: false,
@@ -2145,8 +2145,8 @@ turns:
             activity_not_contains: Vec::new(),
             assistant_contains: vec!["app.toml".to_string()],
             assistant_not_contains: vec!["ls -la".to_string()],
-            execution_mode_contains: vec!["action_call".to_string()],
-            execution_mode_not_contains: vec!["direct_response".to_string()],
+            execution_mode_contains: vec!["single_action".to_string()],
+            execution_mode_not_contains: vec!["done".to_string()],
             artifact_contains: Vec::new(),
             artifact_not_contains: Vec::new(),
             activity_contains_once: Vec::new(),
@@ -2315,11 +2315,9 @@ turns:
             persist_lines: Vec::new(),
             transient_lines: Vec::new(),
             activity_lines: vec![
-                "[start Ran] reactor_commit_apply reactor_spreadsheet_apply_patch".to_string(),
-                "[item] reactor_commit_apply reactor_spreadsheet_apply_patch | completed"
-                    .to_string(),
-                "[end] reactor_commit_apply reactor_spreadsheet_apply_patch failed=false"
-                    .to_string(),
+                "[start Ran] apply_patch spreadsheet_apply_patch".to_string(),
+                "[item] apply_patch spreadsheet_apply_patch | completed".to_string(),
+                "[end] apply_patch spreadsheet_apply_patch failed=false".to_string(),
             ],
             assistant_stream: String::new(),
             execution_modes: Vec::new(),
@@ -2345,10 +2343,10 @@ turns:
             artifact_contains: Vec::new(),
             artifact_not_contains: Vec::new(),
             activity_contains_once: vec![
-                r#"[start Ran] reactor_commit_apply reactor_spreadsheet_apply_patch"#.to_string(),
+                r#"[start Ran] apply_patch spreadsheet_apply_patch"#.to_string()
             ],
             activity_not_repeated: vec![
-                r#"[start Ran] reactor_commit_apply reactor_spreadsheet_apply_patch"#.to_string(),
+                r#"[start Ran] apply_patch spreadsheet_apply_patch"#.to_string()
             ],
             capture_artifacts: Vec::new(),
             artifact_matches_turn: Vec::new(),

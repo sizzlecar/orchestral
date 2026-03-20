@@ -1,5 +1,5 @@
 service:
-  name: cross-family-demo
+  name: multi-artifact-demo
   owner: runtime-team
 
 logging:

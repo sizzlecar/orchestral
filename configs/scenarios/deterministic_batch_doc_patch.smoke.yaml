@@ -23,10 +23,8 @@ turns:
       require_execution_end: true
       max_approvals: 0
       max_errors: 0
-      execution_mode_contains:
-        - "reactor"
       activity_contains:
-        - "reactor_commit_apply reactor_document_apply_patch"
+        - "document_apply_patch"
       artifact_contains:
         - path: fixtures/scenarios/deterministic_doc_patch/docs/customer-onboarding.md
           text: "# Customer Onboarding"
@@ -47,10 +45,8 @@ turns:
       require_execution_end: true
       max_approvals: 0
       max_errors: 0
-      execution_mode_contains:
-        - "reactor"
       activity_not_contains:
-        - "reactor_commit_apply reactor_document_apply_patch"
+        - "document_apply_patch"
       artifact_matches_turn:
         - path: fixtures/scenarios/deterministic_doc_patch/docs/customer-onboarding.md
           turn: run-1
@@ -73,10 +69,8 @@ turns:
       require_execution_end: true
       max_approvals: 0
       max_errors: 0
-      execution_mode_contains:
-        - "reactor"
       activity_not_contains:
-        - "reactor_commit_apply reactor_document_apply_patch"
+        - "document_apply_patch"
       artifact_matches_turn:
         - path: fixtures/scenarios/deterministic_doc_patch/docs/customer-onboarding.md
           turn: run-1

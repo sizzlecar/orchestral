@@ -21,8 +21,6 @@ turns:
       max_errors: 0
       persist_contains:
         - "Status: failed"
-      execution_mode_contains:
-        - "reactor"
     verify:
       - name: document-was-patched-before-verify-failed
         command: /bin/zsh

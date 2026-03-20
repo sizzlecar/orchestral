@@ -2,7 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
-use orchestral_core::types::{ContinuationState, ContinuationStatus, DerivationPolicy, StageKind};
+use orchestral_core::types::{ContinuationState, ContinuationStatus};
+
+/// Derivation policy for document assessment (local enum replacing the removed core type).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DerivationPolicy {
+    Strict,
+    Permissive,
+}
 
 use super::support::{
     document_candidate_files, parse_patch_candidates_envelope, request_requires_confirmation,
@@ -52,15 +59,9 @@ pub(super) fn assess_document_readiness(
             reason: "document inspection found no missing titles or TODO placeholders".to_string(),
             unknowns: Vec::new(),
             assumptions: Vec::new(),
-            next_stage_hint: Some(StageKind::Verify),
             user_message: Some("未发现需要写回的文档改动。".to_string()),
         }
     } else if needs_confirmation {
-        let next_stage_hint = if unknowns.is_empty() || policy == DerivationPolicy::Permissive {
-            StageKind::Commit
-        } else {
-            StageKind::Probe
-        };
         let mut user_message = format!("{}\n\n回复“确认”后我会按这个计划写回。", summary);
         if !unknowns.is_empty() {
             user_message.push_str(&format!("\n仍有待确认信息：{}。", unknowns.join("；")));
@@ -74,7 +75,6 @@ pub(super) fn assess_document_readiness(
             },
             unknowns: unknowns.clone(),
             assumptions: Vec::new(),
-            next_stage_hint: Some(next_stage_hint),
             user_message: Some(user_message),
         }
     } else if !unknowns.is_empty() {
@@ -83,7 +83,6 @@ pub(super) fn assess_document_readiness(
             reason: "bounded derivation reported unresolved document unknowns".to_string(),
             unknowns: unknowns.clone(),
             assumptions: Vec::new(),
-            next_stage_hint: Some(StageKind::Probe),
             user_message: Some(format!(
                 "{}\n\n仍有待确认信息：{}。",
                 summary,
@@ -96,7 +95,6 @@ pub(super) fn assess_document_readiness(
             reason: "document probe gathered enough structure to derive a typed patch".to_string(),
             unknowns: Vec::new(),
             assumptions: Vec::new(),
-            next_stage_hint: Some(StageKind::Commit),
             user_message: None,
         }
     };
@@ -274,9 +272,17 @@ fn synthesize_document_plan_summary(inspection: &Value, patch_candidates: &Value
 }
 
 fn parse_derivation_policy(raw_policy: &str) -> Result<DerivationPolicy, String> {
-    match raw_policy {
+    match raw_policy.trim().to_ascii_lowercase().as_str() {
         "strict" => Ok(DerivationPolicy::Strict),
-        "permissive" => Ok(DerivationPolicy::Permissive),
-        other => Err(format!("unsupported derivation_policy '{}'", other)),
+        "" | "permissive" | "filename_to_h1" | "markdown_h1_from_filename" => {
+            Ok(DerivationPolicy::Permissive)
+        }
+        other => {
+            tracing::debug!(
+                derivation_policy = other,
+                "document_assess_readiness defaulting unknown derivation_policy to permissive"
+            );
+            Ok(DerivationPolicy::Permissive)
+        }
     }
 }
