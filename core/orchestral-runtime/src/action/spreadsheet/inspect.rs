@@ -15,6 +15,7 @@ pub(super) fn inspect_workbook(path: &std::path::Path) -> Result<Value, String> 
         "sheet_path": workbook.sheet_path,
         "max_row": workbook.max_row,
         "max_column": workbook.max_col,
+        "max_column_letter": column_letter(workbook.max_col),
         "candidate_regions": regions,
         "selected_region": selected,
         "patchable_cell_count": selected.get("patchable_cells").and_then(Value::as_array).map(|v| v.len()).unwrap_or(0),
