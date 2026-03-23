@@ -57,7 +57,10 @@ pub(super) fn generate_default_patch_candidates(inspection: &Value) -> Option<Va
             let Some(cell_ref) = missing.get("cell").and_then(Value::as_str) else {
                 continue;
             };
-            let header = missing.get("header").and_then(Value::as_str).unwrap_or_default();
+            let header = missing
+                .get("header")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let Some(value) = derive_default_fill_value(header, row_label) else {
                 continue;
             };
@@ -115,7 +118,8 @@ fn derive_default_fill_value(header: &str, row_label: &str) -> Option<Value> {
     if header.contains("自评") || header.contains("评分") || normalized.contains("score") {
         return Some(json!(90));
     }
-    if header.contains("预期目标") || normalized.contains("target") || normalized.contains("goal") {
+    if header.contains("预期目标") || normalized.contains("target") || normalized.contains("goal")
+    {
         return Some(Value::String(format!(
             "按计划推进{}相关工作，达成既定目标。",
             row_label
@@ -131,7 +135,8 @@ fn derive_default_fill_value(header: &str, row_label: &str) -> Option<Value> {
             row_label
         )));
     }
-    if header.contains("备注") || normalized.contains("remark") || normalized.contains("comment") {
+    if header.contains("备注") || normalized.contains("remark") || normalized.contains("comment")
+    {
         return Some(Value::String("按标准完成，建议继续保持。".to_string()));
     }
 

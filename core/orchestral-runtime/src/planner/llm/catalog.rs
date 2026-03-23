@@ -88,7 +88,9 @@ fn summarize_schema_fields(schema: &serde_json::Value) -> Vec<String> {
     names.sort();
     names
         .into_iter()
-        .map(|name| summarize_schema_field(&name, &properties[&name], required.contains(name.as_str())))
+        .map(|name| {
+            summarize_schema_field(&name, &properties[&name], required.contains(name.as_str()))
+        })
         .collect()
 }
 
@@ -127,7 +129,9 @@ fn summarize_schema_field(name: &str, schema: &serde_json::Value, required: bool
 }
 
 fn summarize_object_shape(schema: &serde_json::Value) -> Option<String> {
-    let properties = schema.get("properties").and_then(|value| value.as_object())?;
+    let properties = schema
+        .get("properties")
+        .and_then(|value| value.as_object())?;
     if properties.is_empty() {
         return None;
     }

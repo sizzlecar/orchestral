@@ -246,9 +246,9 @@ fn canonical_binding_keys(snapshot: &HashMap<String, Value>) -> Vec<String> {
 
     fn has_more_specific_alias(snapshot: &HashMap<String, Value>, key: &str) -> bool {
         !key.contains('.')
-            && snapshot
-                .keys()
-                .any(|candidate| candidate.contains('.') && candidate.ends_with(&format!(".{}", key)))
+            && snapshot.keys().any(|candidate| {
+                candidate.contains('.') && candidate.ends_with(&format!(".{}", key))
+            })
     }
 
     let mut top_level_keys = snapshot.keys().cloned().collect::<Vec<_>>();
@@ -271,10 +271,7 @@ fn canonical_binding_keys(snapshot: &HashMap<String, Value>) -> Vec<String> {
     bindings
 }
 
-fn lookup_binding_value<'a>(
-    snapshot: &'a HashMap<String, Value>,
-    key: &str,
-) -> Option<&'a Value> {
+fn lookup_binding_value<'a>(snapshot: &'a HashMap<String, Value>, key: &str) -> Option<&'a Value> {
     if let Some(value) = snapshot.get(key) {
         return Some(value);
     }
@@ -351,7 +348,11 @@ pub(super) fn summarize_binding_shapes(snapshot: &HashMap<String, Value>) -> Vec
         .into_iter()
         .filter_map(|key| {
             let value = lookup_binding_value(snapshot, &key)?;
-            Some(format!("{{{{{}}}}} -> {}", key, summarize_value_shape(value)))
+            Some(format!(
+                "{{{{{}}}}} -> {}",
+                key,
+                summarize_value_shape(value)
+            ))
         })
         .take(MAX_BINDING_SHAPES)
         .collect()
@@ -404,8 +405,9 @@ mod tests {
         assert!(shapes.contains(
             &"{{assess.continuation}} -> object {fills, patch_spec, status}".to_string()
         ));
-        assert!(shapes
-            .contains(&"{{assess.continuation.patch_spec}} -> object {fills}".to_string()));
+        assert!(
+            shapes.contains(&"{{assess.continuation.patch_spec}} -> object {fills}".to_string())
+        );
         assert!(shapes
             .contains(&"{{assess.continuation.fills}} -> array<object {cell, value}>".to_string()));
     }

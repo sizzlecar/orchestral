@@ -53,7 +53,10 @@ mod tests {
             continuation["status"],
             Value::String("commit_ready".to_string())
         );
-        assert_eq!(continuation["fills"].as_array().map(|items| items.len()), Some(2));
+        assert_eq!(
+            continuation["fills"].as_array().map(|items| items.len()),
+            Some(2)
+        );
         assert_eq!(
             continuation["patch_spec"]["fills"]
                 .as_array()
@@ -120,12 +123,9 @@ mod tests {
             }
         });
 
-        let (patch_candidates, summary) = derive_spreadsheet_patch_candidates(
-            "把需要填的都填了",
-            &inspection,
-            "permissive",
-        )
-        .expect("derive");
+        let (patch_candidates, summary) =
+            derive_spreadsheet_patch_candidates("把需要填的都填了", &inspection, "permissive")
+                .expect("derive");
         let cells = patch_candidates["candidates"]["cells"]
             .as_array()
             .expect("cells");

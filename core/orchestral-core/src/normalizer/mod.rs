@@ -225,10 +225,12 @@ mod tests {
 
         let plan = Plan::new(
             "apply spreadsheet patch from prior iteration state",
-            vec![Step::action("single_action", "spreadsheet_apply_patch").with_params(json!({
-                "path": "{{locate.source_path}}",
-                "patch_spec": "{{assess.continuation.patch_spec}}"
-            }))],
+            vec![
+                Step::action("single_action", "spreadsheet_apply_patch").with_params(json!({
+                    "path": "{{locate.source_path}}",
+                    "patch_spec": "{{assess.continuation.patch_spec}}"
+                })),
+            ],
         );
 
         let normalized = normalizer.normalize(plan).expect("normalize");

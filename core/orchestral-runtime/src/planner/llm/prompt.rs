@@ -273,7 +273,9 @@ fn summarize_schema_fields(schema: &serde_json::Value) -> Vec<String> {
     names.sort();
     names
         .into_iter()
-        .map(|name| summarize_schema_field(&name, &properties[&name], required.contains(name.as_str())))
+        .map(|name| {
+            summarize_schema_field(&name, &properties[&name], required.contains(name.as_str()))
+        })
         .collect()
 }
 
@@ -312,7 +314,9 @@ fn summarize_schema_field(name: &str, schema: &serde_json::Value, required: bool
 }
 
 fn summarize_object_shape(schema: &serde_json::Value) -> Option<String> {
-    let properties = schema.get("properties").and_then(|value| value.as_object())?;
+    let properties = schema
+        .get("properties")
+        .and_then(|value| value.as_object())?;
     if properties.is_empty() {
         return None;
     }
@@ -420,7 +424,11 @@ fn build_skill_knowledge_block(skills: &[SkillInstruction]) -> String {
 
     fn compact_skill_lines(instructions: &str) -> Vec<String> {
         let mut selected = Vec::new();
-        for line in instructions.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        for line in instructions
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
             if line.starts_with("summary:")
                 || line.starts_with("scripts:")
                 || (selected.is_empty() && !line.starts_with("keywords:") && !line.starts_with('-'))

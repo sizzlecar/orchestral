@@ -16,7 +16,11 @@ pub(super) fn resolve_patch_spec_value<'a>(patch_spec: &'a Value) -> Result<&'a 
     }
 
     if let Some(continuation) = patch_spec.get("continuation") {
-        if continuation.get("fills").and_then(Value::as_array).is_some() {
+        if continuation
+            .get("fills")
+            .and_then(Value::as_array)
+            .is_some()
+        {
             tracing::debug!("spreadsheet patch_spec resolved from continuation envelope");
             return Ok(continuation);
         }
