@@ -1,8 +1,10 @@
 use std::collections::HashSet;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use orchestral_core::types::{ContinuationState, ContinuationStatus, PatchCandidatesEnvelope};
+
+use super::derive::generate_default_patch_candidates;
 
 /// Derivation policy for spreadsheet assessment (local enum replacing the removed core type).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,10 +18,16 @@ pub(super) fn assess_readiness(
     patch_candidates: &Value,
     raw_policy: &str,
 ) -> Result<(Value, String), String> {
-    let derivation_policy = match raw_policy {
+    let derivation_policy = match raw_policy.trim().to_ascii_lowercase().as_str() {
         "strict" => DerivationPolicy::Strict,
-        "permissive" => DerivationPolicy::Permissive,
-        other => return Err(format!("unsupported derivation_policy '{}'", other)),
+        "" | "permissive" => DerivationPolicy::Permissive,
+        other => {
+            tracing::debug!(
+                derivation_policy = other,
+                "spreadsheet_assess_readiness defaulting unknown derivation_policy to permissive"
+            );
+            DerivationPolicy::Permissive
+        }
     };
 
     let patchable_cells = inspection
@@ -27,6 +35,14 @@ pub(super) fn assess_readiness(
         .and_then(|value| value.get("patchable_cells"))
         .and_then(Value::as_array)
         .ok_or_else(|| "inspection.selected_region.patchable_cells must be an array".to_string())?;
+    let generated_patch_candidates = if has_candidate_cells(patch_candidates) {
+        None
+    } else {
+        generate_default_patch_candidates(inspection)
+    };
+    let patch_candidates = generated_patch_candidates
+        .as_ref()
+        .unwrap_or(patch_candidates);
     let patchable_refs = patchable_cells
         .iter()
         .filter_map(|cell| cell.get("cell").and_then(Value::as_str))
@@ -50,7 +66,7 @@ pub(super) fn assess_readiness(
 
     let mut covered_refs = HashSet::new();
     let mut placeholder_refs = Vec::new();
-    for candidate in candidate_cells {
+    for candidate in &candidate_cells {
         let cell_ref = candidate
             .get("cell")
             .and_then(Value::as_str)
@@ -81,6 +97,7 @@ pub(super) fn assess_readiness(
         .as_ref()
         .map(|value| value.assumptions.clone())
         .unwrap_or_else(|| extract_string_array_field(patch_candidates, "assumptions"));
+    let fills = build_fill_spec(&candidate_cells, &patchable_refs);
 
     if matches!(derivation_policy, DerivationPolicy::Permissive) && !covered_refs.is_empty() {
         let continuation = ContinuationState {
@@ -95,7 +112,7 @@ pub(super) fn assess_readiness(
             user_message: None,
         };
         return Ok((
-            serde_json::to_value(continuation).map_err(|err| err.to_string())?,
+            continuation_with_fills(continuation, fills).map_err(|err| err.to_string())?,
             format!(
                 "Spreadsheet probe ready for permissive commit with {} candidate fills and {} patchable cells.",
                 covered_refs.len(),
@@ -119,7 +136,7 @@ pub(super) fn assess_readiness(
             user_message: None,
         };
         return Ok((
-            serde_json::to_value(continuation).map_err(|err| err.to_string())?,
+            continuation_with_fills(continuation, fills).map_err(|err| err.to_string())?,
             format!(
                 "Spreadsheet probe ready for strict commit with {} candidate fills.",
                 covered_refs.len()
@@ -157,6 +174,10 @@ pub(super) fn assess_readiness(
     ))
 }
 
+fn has_candidate_cells(patch_candidates: &Value) -> bool {
+    !extract_spreadsheet_candidate_cells(patch_candidates).is_empty()
+}
+
 fn extract_spreadsheet_candidate_cells(patch_candidates: &Value) -> Vec<Value> {
     match patch_candidates {
         Value::Array(items) => items.clone(),
@@ -182,6 +203,49 @@ fn extract_spreadsheet_candidate_cells(patch_candidates: &Value) -> Vec<Value> {
 
 fn parse_patch_candidates_envelope(value: &Value) -> Option<PatchCandidatesEnvelope> {
     serde_json::from_value::<PatchCandidatesEnvelope>(value.clone()).ok()
+}
+
+fn continuation_with_fills(
+    continuation: ContinuationState,
+    fills: Vec<Value>,
+) -> Result<Value, serde_json::Error> {
+    let mut value = serde_json::to_value(continuation)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("fills".to_string(), Value::Array(fills.clone()));
+        object.insert("patch_spec".to_string(), json!({ "fills": fills }));
+    }
+    Ok(value)
+}
+
+fn build_fill_spec(candidate_cells: &[Value], patchable_refs: &HashSet<String>) -> Vec<Value> {
+    candidate_cells
+        .iter()
+        .filter_map(|candidate| {
+            let cell_ref = candidate.get("cell").and_then(Value::as_str)?;
+            if !patchable_refs.contains(cell_ref) {
+                return None;
+            }
+            let proposed_action = candidate
+                .get("proposed_action")
+                .and_then(Value::as_str)
+                .unwrap_or("fill");
+            if proposed_action != "fill" {
+                return None;
+            }
+            let value = candidate
+                .get("proposed_value")
+                .or_else(|| candidate.get("suggested_value"))
+                .or_else(|| candidate.get("value"))?
+                .clone();
+            match &value {
+                Value::String(text) if text.trim().is_empty() => None,
+                _ => Some(json!({
+                    "cell": cell_ref,
+                    "value": value,
+                })),
+            }
+        })
+        .collect()
 }
 
 fn extract_string_array_field(value: &Value, key: &str) -> Vec<String> {

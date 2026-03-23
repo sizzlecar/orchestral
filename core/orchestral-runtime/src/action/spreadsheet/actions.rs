@@ -9,6 +9,7 @@ use orchestral_core::config::ActionSpec;
 use super::super::factory::ActionBuildError;
 use super::apply::apply_patch;
 use super::assess::assess_readiness;
+use super::derive::derive_spreadsheet_patch_candidates;
 use super::inspect::inspect_workbook;
 use super::locate::locate_workbook;
 use super::verify::verify_patch;
@@ -20,6 +21,9 @@ pub fn build_spreadsheet_action(
     let action: Box<dyn Action> = match spec.kind.as_str() {
         "spreadsheet_locate" => Box::new(SpreadsheetLocateAction::from_spec(spec)),
         "spreadsheet_inspect" => Box::new(SpreadsheetInspectAction::from_spec(spec)),
+        "spreadsheet_derive_candidates" => {
+            Box::new(SpreadsheetDeriveCandidatesAction::from_spec(spec))
+        }
         "spreadsheet_assess_readiness" => {
             Box::new(SpreadsheetAssessReadinessAction::from_spec(spec))
         }
@@ -59,9 +63,8 @@ impl Action for SpreadsheetLocateAction {
         ActionMeta::new(self.name(), self.description())
             .with_category("spreadsheet")
             .with_capabilities(["filesystem_read"])
-            .with_roles(["collect", "inspect"])
-            .with_input_kinds(["path", "text"])
-            .with_output_kinds(["path", "structured"])
+            .with_input_kinds(["workspace.path", "intent.request"])
+            .with_output_kinds(["spreadsheet.location"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
@@ -127,9 +130,8 @@ impl Action for SpreadsheetInspectAction {
         ActionMeta::new(self.name(), self.description())
             .with_category("spreadsheet")
             .with_capabilities(["filesystem_read"])
-            .with_roles(["inspect", "verify"])
-            .with_input_kinds(["path"])
-            .with_output_kinds(["structured"])
+            .with_input_kinds(["spreadsheet.location"])
+            .with_output_kinds(["spreadsheet.inspection"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
@@ -152,6 +154,114 @@ impl Action for SpreadsheetInspectAction {
         };
         match inspect_workbook(Path::new(path)) {
             Ok(inspection) => ActionResult::success_with_one("inspection", inspection),
+            Err(error) => ActionResult::error(error),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SpreadsheetDeriveCandidatesAction {
+    name: String,
+    description: String,
+}
+
+impl SpreadsheetDeriveCandidatesAction {
+    fn from_spec(spec: &ActionSpec) -> Self {
+        Self {
+            name: spec.name.clone(),
+            description: spec.description_or("Derive spreadsheet patch candidates"),
+        }
+    }
+}
+
+#[async_trait]
+impl Action for SpreadsheetDeriveCandidatesAction {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn metadata(&self) -> ActionMeta {
+        ActionMeta::new(self.name(), self.description())
+            .with_category("spreadsheet")
+            .with_capabilities(["pure", "structured_output"])
+            .with_input_kinds(["spreadsheet.inspection", "intent.request"])
+            .with_output_kinds(["spreadsheet.patch_candidates"])
+            .with_input_schema(json!({
+                "type": "object",
+                "properties": {
+                    "user_request": { "type": "string" },
+                    "inspection": { "type": "object" },
+                    "derivation_policy": {
+                        "type": "string",
+                        "enum": ["strict", "permissive"],
+                        "description": "Strict keeps placeholder-sensitive review. Permissive allows generic workbook autofill heuristics."
+                    }
+                },
+                "required": ["user_request", "inspection", "derivation_policy"]
+            }))
+            .with_output_schema(json!({
+                "type": "object",
+                "properties": {
+                    "patch_candidates": {
+                        "type": "object",
+                        "properties": {
+                            "candidates": {
+                                "type": "object",
+                                "properties": {
+                                    "cells": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "cell": { "type": "string" },
+                                                "header": { "type": "string" },
+                                                "proposed_action": { "type": "string" },
+                                                "proposed_value": {}
+                                            },
+                                            "required": ["cell", "proposed_action", "proposed_value"]
+                                        }
+                                    }
+                                }
+                            },
+                            "unknowns": { "type": "array", "items": { "type": "string" } },
+                            "assumptions": { "type": "array", "items": { "type": "string" } }
+                        }
+                    },
+                    "summary": { "type": "string" }
+                },
+                "required": ["patch_candidates", "summary"]
+            }))
+    }
+
+    async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
+        let Some(user_request) = input.params.get("user_request").and_then(Value::as_str) else {
+            return ActionResult::error("Missing user_request for spreadsheet_derive_candidates");
+        };
+        let Some(inspection) = input.params.get("inspection") else {
+            return ActionResult::error("Missing inspection for spreadsheet_derive_candidates");
+        };
+        let Some(raw_policy) = input
+            .params
+            .get("derivation_policy")
+            .and_then(Value::as_str)
+        else {
+            return ActionResult::error(
+                "Missing derivation_policy for spreadsheet_derive_candidates",
+            );
+        };
+        match derive_spreadsheet_patch_candidates(user_request, inspection, raw_policy) {
+            Ok((patch_candidates, summary)) => ActionResult::success_with(
+                [
+                    ("patch_candidates".to_string(), patch_candidates),
+                    ("summary".to_string(), Value::String(summary)),
+                ]
+                .into_iter()
+                .collect(),
+            ),
             Err(error) => ActionResult::error(error),
         }
     }
@@ -186,22 +296,78 @@ impl Action for SpreadsheetAssessReadinessAction {
         ActionMeta::new(self.name(), self.description())
             .with_category("spreadsheet")
             .with_capabilities(["pure", "structured_output"])
-            .with_roles(["verify", "control"])
-            .with_input_kinds(["structured"])
-            .with_output_kinds(["structured"])
+            .with_input_kinds(["spreadsheet.inspection", "spreadsheet.patch_candidates"])
+            .with_output_kinds(["spreadsheet.continuation", "spreadsheet.patch_spec"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
                     "inspection": { "type": "object" },
                     "patch_candidates": {},
-                    "derivation_policy": { "type": "string" }
+                    "derivation_policy": {
+                        "type": "string",
+                        "enum": ["strict", "permissive"],
+                        "description": "Strict requires complete non-placeholder coverage. Permissive allows commit-ready continuation when concrete fills exist."
+                    }
                 },
                 "required": ["inspection", "patch_candidates", "derivation_policy"]
             }))
             .with_output_schema(json!({
                 "type": "object",
                 "properties": {
-                    "continuation": { "type": "object" },
+                    "patch_spec": {
+                        "type": "object",
+                        "properties": {
+                            "fills": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "cell": { "type": "string" },
+                                        "value": {}
+                                    },
+                                    "required": ["cell", "value"]
+                                }
+                            }
+                        }
+                    },
+                    "continuation": {
+                        "type": "object",
+                        "description": "Continuation decision. When status is commit_ready, this object also carries patch_spec-compatible fills[] and patch_spec.fills[].",
+                        "properties": {
+                            "status": { "type": "string" },
+                            "reason": { "type": "string" },
+                            "unknowns": { "type": "array", "items": { "type": "string" } },
+                            "assumptions": { "type": "array", "items": { "type": "string" } },
+                            "user_message": { "type": ["string", "null"] },
+                            "fills": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "cell": { "type": "string" },
+                                        "value": {}
+                                    },
+                                    "required": ["cell", "value"]
+                                }
+                            },
+                            "patch_spec": {
+                                "type": "object",
+                                "properties": {
+                                    "fills": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "cell": { "type": "string" },
+                                                "value": {}
+                                            },
+                                            "required": ["cell", "value"]
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
                     "summary": { "type": "string" }
                 },
                 "required": ["continuation", "summary"]
@@ -227,14 +393,19 @@ impl Action for SpreadsheetAssessReadinessAction {
             );
         };
         match assess_readiness(inspection, patch_candidates, raw_policy) {
-            Ok((continuation, summary)) => ActionResult::success_with(
-                [
+            Ok((continuation, summary)) => {
+                let patch_spec = continuation.get("patch_spec").cloned();
+                let mut exports = [
                     ("continuation".to_string(), continuation),
                     ("summary".to_string(), Value::String(summary)),
                 ]
                 .into_iter()
-                .collect(),
-            ),
+                .collect::<std::collections::HashMap<_, _>>();
+                if let Some(patch_spec) = patch_spec {
+                    exports.insert("patch_spec".to_string(), patch_spec);
+                }
+                ActionResult::success_with(exports)
+            }
             Err(error) => ActionResult::error(error),
         }
     }
@@ -269,14 +440,30 @@ impl Action for SpreadsheetApplyPatchAction {
         ActionMeta::new(self.name(), self.description())
             .with_category("spreadsheet")
             .with_capabilities(["filesystem_read", "filesystem_write", "side_effect"])
-            .with_roles(["apply", "execute"])
-            .with_input_kinds(["path", "structured"])
-            .with_output_kinds(["path", "structured"])
+            .with_input_kinds(["spreadsheet.location", "spreadsheet.patch_spec"])
+            .with_output_kinds(["spreadsheet.apply_result", "workspace.path"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
-                    "patch_spec": { "type": "object" }
+                    "patch_spec": {
+                        "type": "object",
+                        "description": "Spreadsheet patch spec. Use fills[] with cell/value pairs.",
+                        "properties": {
+                            "fills": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "cell": { "type": "string" },
+                                        "value": {}
+                                    },
+                                    "required": ["cell", "value"]
+                                }
+                            }
+                        },
+                        "required": ["fills"]
+                    }
                 },
                 "required": ["path", "patch_spec"]
             }))
@@ -364,14 +551,30 @@ impl Action for SpreadsheetVerifyPatchAction {
         ActionMeta::new(self.name(), self.description())
             .with_category("spreadsheet")
             .with_capabilities(["filesystem_read"])
-            .with_roles(["verify"])
-            .with_input_kinds(["path", "structured"])
-            .with_output_kinds(["structured"])
+            .with_input_kinds(["spreadsheet.location", "spreadsheet.patch_spec"])
+            .with_output_kinds(["spreadsheet.verify_decision"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
-                    "patch_spec": { "type": "object" },
+                    "patch_spec": {
+                        "type": "object",
+                        "description": "Spreadsheet patch spec. Use fills[] with cell/value pairs.",
+                        "properties": {
+                            "fills": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "cell": { "type": "string" },
+                                        "value": {}
+                                    },
+                                    "required": ["cell", "value"]
+                                }
+                            }
+                        },
+                        "required": ["fills"]
+                    },
                     "validator_path": { "type": "string" }
                 },
                 "required": ["path"]
@@ -437,6 +640,82 @@ impl Action for SpreadsheetVerifyPatchAction {
                 )
             }
             Err(error) => ActionResult::error(error),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use orchestral_core::store::WorkingSet;
+    use tokio::sync::RwLock;
+
+    use super::*;
+
+    fn test_ctx() -> ActionContext {
+        ActionContext::new(
+            "task-1",
+            "s1",
+            "exec-1",
+            Arc::new(RwLock::new(WorkingSet::new())),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_spreadsheet_assess_action_exports_top_level_patch_spec() {
+        let action = SpreadsheetAssessReadinessAction {
+            name: "spreadsheet_assess_readiness".to_string(),
+            description: "Assess spreadsheet probe readiness".to_string(),
+        };
+        let result = action
+            .run(
+                ActionInput::with_params(json!({
+                    "derivation_policy": "permissive",
+                    "inspection": {
+                        "selected_region": {
+                            "patchable_cells": [
+                                { "cell": "F5" },
+                                { "cell": "H5" }
+                            ]
+                        }
+                    },
+                    "patch_candidates": {
+                        "candidates": {
+                            "cells": [
+                                {
+                                    "cell": "F5",
+                                    "proposed_action": "fill",
+                                    "proposed_value": "按计划推进工作业绩相关工作，达成既定目标。"
+                                },
+                                {
+                                    "cell": "H5",
+                                    "proposed_action": "fill",
+                                    "proposed_value": 90
+                                }
+                            ]
+                        }
+                    }
+                })),
+                test_ctx(),
+            )
+            .await;
+
+        match result {
+            ActionResult::Success { exports } => {
+                let patch_spec = exports.get("patch_spec").expect("patch_spec export");
+                assert_eq!(
+                    patch_spec["fills"].as_array().map(|items| items.len()),
+                    Some(2)
+                );
+                assert_eq!(
+                    exports["continuation"]["patch_spec"]["fills"]
+                        .as_array()
+                        .map(|items| items.len()),
+                    Some(2)
+                );
+            }
+            other => panic!("unexpected result: {other:?}"),
         }
     }
 }

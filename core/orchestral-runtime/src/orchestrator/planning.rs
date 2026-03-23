@@ -13,7 +13,7 @@ impl Orchestrator {
         mut task: Task,
     ) -> Result<OrchestratorResult, OrchestratorError> {
         let turn_started_at = Instant::now();
-        let actions = self.available_actions().await;
+        let all_actions = self.available_actions().await;
         let mut history = self
             .history_for_planner(interaction_id.as_str(), task.id.as_str())
             .await?;
@@ -23,6 +23,7 @@ impl Orchestrator {
         let mut loop_state = AgentLoopState::default();
 
         for iteration in 1..=self.config.max_planner_iterations {
+            let available_actions = filter_actions_for_planner_iteration(&all_actions, &task);
             self.emit_lifecycle_event(
                 "planning_started",
                 Some(interaction_id.as_str()),
@@ -31,7 +32,7 @@ impl Orchestrator {
                 serde_json::json!({
                     "iteration": iteration,
                     "max_iterations": self.config.max_planner_iterations,
-                    "available_actions": actions.len(),
+                    "available_actions": available_actions.len(),
                     "history_items": history.len(),
                     "observation_count": loop_state.observation_count(),
                 }),
@@ -42,13 +43,14 @@ impl Orchestrator {
                 task_id = %task.id,
                 iteration = iteration,
                 max_iterations = self.config.max_planner_iterations,
-                available_actions = actions.len(),
+                available_actions = available_actions.len(),
                 history_items = history.len(),
                 observation_count = loop_state.observation_count(),
                 "orchestrator planner iteration started"
             );
 
-            let mut context = PlannerContext::with_history(actions.clone(), history.clone())
+            let mut context =
+                PlannerContext::with_history(available_actions, history.clone())
                 .with_runtime_info(runtime_info.clone())
                 .with_skill_instructions(skill_instructions.clone());
             if let Some(loop_context) =
@@ -740,6 +742,52 @@ fn single_action_on_complete_template(action: &str) -> Option<String> {
     }
 }
 
+fn filter_actions_for_planner_iteration(
+    actions: &[ActionMeta],
+    task: &Task,
+) -> Vec<ActionMeta> {
+    if !has_ready_spreadsheet_fills(&task.working_set_snapshot) {
+        return actions.to_vec();
+    }
+
+    let filtered = actions
+        .iter()
+        .filter(|meta| {
+            matches!(meta.category.as_deref(), Some("spreadsheet") | Some("utility"))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if filtered.is_empty() {
+        actions.to_vec()
+    } else {
+        filtered
+    }
+}
+
+fn has_ready_spreadsheet_fills(snapshot: &std::collections::HashMap<String, Value>) -> bool {
+    let source_path = snapshot
+        .get("source_path")
+        .or_else(|| snapshot.get("locate.source_path"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !(source_path.ends_with(".xlsx") || source_path.ends_with(".xlsm")) {
+        return false;
+    }
+
+    ["continuation", "assess.continuation", "patch_spec", "build.patch_spec"]
+        .into_iter()
+        .filter_map(|key| snapshot.get(key))
+        .any(|value| {
+            value
+                .get("fills")
+                .and_then(Value::as_array)
+                .map(|fills| !fills.is_empty())
+                .unwrap_or(false)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -821,6 +869,58 @@ mod tests {
         assert_eq!(
             prepared.on_failure.as_deref(),
             Some("Plan failed: {{error}}")
+        );
+    }
+
+    #[test]
+    fn test_filter_actions_for_planner_iteration_prefers_spreadsheet_actions_once_fills_ready() {
+        let actions = vec![
+            ActionMeta::new("spreadsheet_apply_patch", "apply").with_category("spreadsheet"),
+            ActionMeta::new("spreadsheet_verify_patch", "verify").with_category("spreadsheet"),
+            ActionMeta::new("json_stdout", "emit").with_category("utility"),
+            ActionMeta::new("structured_build_patch_spec", "build").with_category("structured"),
+            ActionMeta::new("shell", "shell").with_category("direct"),
+        ];
+        let mut task = Task::new(orchestral_core::types::Intent::new("fill workbook"));
+        task.working_set_snapshot.insert(
+            "source_path".to_string(),
+            json!("docs/perf-review.xlsx"),
+        );
+        task.working_set_snapshot.insert(
+            "continuation".to_string(),
+            json!({
+                "status": "commit_ready",
+                "fills": [{ "cell": "F5", "value": "done" }]
+            }),
+        );
+
+        let filtered = filter_actions_for_planner_iteration(&actions, &task);
+        let names = filtered
+            .iter()
+            .map(|action| action.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec!["spreadsheet_apply_patch", "spreadsheet_verify_patch", "json_stdout"]
+        );
+    }
+
+    #[test]
+    fn test_filter_actions_for_planner_iteration_keeps_original_actions_without_ready_fills() {
+        let actions = vec![
+            ActionMeta::new("spreadsheet_apply_patch", "apply").with_category("spreadsheet"),
+            ActionMeta::new("structured_build_patch_spec", "build").with_category("structured"),
+        ];
+        let task = Task::new(orchestral_core::types::Intent::new("fill workbook"));
+
+        let filtered = filter_actions_for_planner_iteration(&actions, &task);
+        let names = filtered
+            .iter()
+            .map(|action| action.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec!["spreadsheet_apply_patch", "structured_build_patch_spec"]
         );
     }
 }

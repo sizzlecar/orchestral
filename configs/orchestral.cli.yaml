@@ -465,6 +465,30 @@ actions:
               type: object
           required: ["inspection"]
       config: {}
+    - name: spreadsheet_derive_candidates
+      kind: spreadsheet_derive_candidates
+      description: "Derive spreadsheet patch candidates"
+      interface:
+        input_schema:
+          type: object
+          properties:
+            user_request:
+              type: string
+            inspection:
+              type: object
+            derivation_policy:
+              type: string
+              enum: ["strict", "permissive"]
+          required: ["user_request", "inspection", "derivation_policy"]
+        output_schema:
+          type: object
+          properties:
+            patch_candidates:
+              type: object
+            summary:
+              type: string
+          required: ["patch_candidates", "summary"]
+      config: {}
     - name: spreadsheet_assess_readiness
       kind: spreadsheet_assess_readiness
       description: "Assess whether spreadsheet probe results are ready for commit"
