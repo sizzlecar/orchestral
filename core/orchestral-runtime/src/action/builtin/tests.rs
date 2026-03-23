@@ -132,6 +132,26 @@ fn test_requires_destructive_approval_for_find_without_delete() {
 }
 
 #[test]
+fn test_requires_destructive_approval_does_not_flag_git_log_shell_expression() {
+    assert!(!requires_destructive_approval(
+        true,
+        "git",
+        "git log --oneline -20",
+        &[],
+    ));
+}
+
+#[test]
+fn test_requires_destructive_approval_flags_git_reset_shell_expression() {
+    assert!(requires_destructive_approval(
+        true,
+        "git",
+        "git reset --hard HEAD~1",
+        &[],
+    ));
+}
+
+#[test]
 fn test_extract_inline_script_body_detects_python_c_and_shell_c() {
     let python_args = vec![
         "-c".to_string(),
