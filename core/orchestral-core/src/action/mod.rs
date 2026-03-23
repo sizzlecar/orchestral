@@ -58,8 +58,6 @@ pub struct ActionMeta {
     pub output_schema: serde_json::Value,
     /// Semantic capability tags used by planner/runtime guardrails.
     pub capabilities: Vec<String>,
-    /// Semantic workflow roles used by recipe lowering.
-    pub roles: Vec<String>,
     /// Abstract artifact/input kinds this action can consume.
     pub input_kinds: Vec<String>,
     /// Abstract artifact/output kinds this action can produce.
@@ -76,7 +74,6 @@ impl ActionMeta {
             input_schema: serde_json::Value::Null,
             output_schema: serde_json::Value::Null,
             capabilities: Vec::new(),
-            roles: Vec::new(),
             input_kinds: Vec::new(),
             output_kinds: Vec::new(),
         }
@@ -126,26 +123,6 @@ impl ActionMeta {
         self
     }
 
-    /// Add one workflow role.
-    pub fn with_role(mut self, role: impl Into<String>) -> Self {
-        self.roles.push(role.into());
-        self.roles.sort();
-        self.roles.dedup();
-        self
-    }
-
-    /// Add multiple workflow roles.
-    pub fn with_roles<I, S>(mut self, roles: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.roles.extend(roles.into_iter().map(Into::into));
-        self.roles.sort();
-        self.roles.dedup();
-        self
-    }
-
     /// Add multiple supported input kinds.
     pub fn with_input_kinds<I, S>(mut self, kinds: I) -> Self
     where
@@ -173,11 +150,6 @@ impl ActionMeta {
     /// Check whether this action advertises a capability.
     pub fn has_capability(&self, capability: &str) -> bool {
         self.capabilities.iter().any(|item| item == capability)
-    }
-
-    /// Check whether this action advertises a workflow role.
-    pub fn has_role(&self, role: &str) -> bool {
-        self.roles.iter().any(|item| item == role)
     }
 
     /// Check whether this action can consume the given abstract input kind.

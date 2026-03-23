@@ -37,7 +37,6 @@ impl Action for EchoAction {
         ActionMeta::new(self.name(), self.description())
             .with_category("utility")
             .with_capability("pure")
-            .with_roles(["emit"])
             .with_input_kinds(["text"])
             .with_output_kinds(["text"])
             .with_input_schema(json!({

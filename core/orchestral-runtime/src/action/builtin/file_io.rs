@@ -51,9 +51,8 @@ impl Action for FileReadAction {
         ActionMeta::new(self.name(), self.description())
             .with_category("direct")
             .with_capabilities(["filesystem_read", "read_only", "verification"])
-            .with_roles(["inspect", "verify"])
-            .with_input_kinds(["path"])
-            .with_output_kinds(["text", "path"])
+            .with_input_kinds(["workspace.path"])
+            .with_output_kinds(["workspace.path", "workspace.text_file"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
@@ -195,9 +194,8 @@ impl Action for FileWriteAction {
         ActionMeta::new(self.name(), self.description())
             .with_category("direct")
             .with_capabilities(["filesystem_write", "side_effect"])
-            .with_roles(["apply", "emit"])
-            .with_input_kinds(["path", "text"])
-            .with_output_kinds(["path"])
+            .with_input_kinds(["workspace.path", "workspace.text"])
+            .with_output_kinds(["workspace.path"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {

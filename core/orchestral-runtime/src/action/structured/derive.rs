@@ -432,9 +432,15 @@ fn consume_scalar_literal(input: &str) -> usize {
 }
 
 fn parse_derivation_policy(raw_policy: &str) -> Result<DerivationPolicy, String> {
-    match raw_policy {
+    match raw_policy.trim().to_ascii_lowercase().as_str() {
         "strict" => Ok(DerivationPolicy::Strict),
-        "permissive" => Ok(DerivationPolicy::Permissive),
-        other => Err(format!("unsupported derivation_policy '{}'", other)),
+        "" | "permissive" => Ok(DerivationPolicy::Permissive),
+        other => {
+            tracing::debug!(
+                derivation_policy = other,
+                "structured_derive_candidates defaulting unknown derivation_policy to permissive"
+            );
+            Ok(DerivationPolicy::Permissive)
+        }
     }
 }

@@ -31,6 +31,10 @@ Rules:
 - Only choose from the listed action names.
 - Prefer typed and narrow actions over generic shell commands when both can solve the current step.
 - Prefer staying within one typed artifact category when that category already provides collect/inspect/derive/apply/verify coverage.
+- Verify coverage from the listed actions and schema contracts; do not assume missing stages exist.
+- When a schema field lists allowed enum values, use only those enum values.
+- Do not mix derive/build actions from one typed category with apply/verify actions from another unless their `patch_spec` contracts explicitly match.
+- Do not select `file_read` for binary artifacts such as `.xlsx`, `.xlsm`, `.docx`, or `.pdf`.
 - Keep enough actions for the planner to inspect, apply, and verify in the same iteration if needed.
 - Select no more than the requested maximum number of actions.
 - Use blocked_actions for actions that should stay out of the planner prompt for this iteration."#;
@@ -239,14 +243,11 @@ fn build_action_selector_catalog(actions: &[ActionMeta]) -> String {
         if !action.capabilities.is_empty() {
             let _ = writeln!(out, "  capabilities: {}", action.capabilities.join(", "));
         }
-        if !action.roles.is_empty() {
-            let _ = writeln!(out, "  roles: {}", action.roles.join(", "));
-        }
         if !action.input_kinds.is_empty() {
-            let _ = writeln!(out, "  input_kinds: {}", action.input_kinds.join(", "));
+            let _ = writeln!(out, "  consumes: {}", action.input_kinds.join(", "));
         }
         if !action.output_kinds.is_empty() {
-            let _ = writeln!(out, "  output_kinds: {}", action.output_kinds.join(", "));
+            let _ = writeln!(out, "  produces: {}", action.output_kinds.join(", "));
         }
 
         let input_fields = summarize_schema_fields(&action.input_schema);
@@ -272,14 +273,68 @@ fn summarize_schema_fields(schema: &serde_json::Value) -> Vec<String> {
     names.sort();
     names
         .into_iter()
+        .map(|name| summarize_schema_field(&name, &properties[&name], required.contains(name.as_str())))
+        .collect()
+}
+
+fn summarize_schema_field(name: &str, schema: &serde_json::Value, required: bool) -> String {
+    let mut label = if required {
+        format!("{} (required)", name)
+    } else {
+        name.to_string()
+    };
+    let mut hints = Vec::new();
+
+    if let Some(values) = schema.get("enum").and_then(|value| value.as_array()) {
+        let items = values
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        if !items.is_empty() {
+            hints.push(format!("enum: {}", items.join(" | ")));
+        }
+    }
+
+    if let Some(shape) = summarize_object_shape(schema) {
+        hints.push(format!("shape: {}", shape));
+    }
+
+    if let Some(description) = schema.get("description").and_then(|value| value.as_str()) {
+        if description.to_ascii_lowercase().contains("utf-8") {
+            hints.push("UTF-8 text".to_string());
+        }
+    }
+
+    if !hints.is_empty() {
+        label.push_str(&format!(" [{}]", hints.join("; ")));
+    }
+    label
+}
+
+fn summarize_object_shape(schema: &serde_json::Value) -> Option<String> {
+    let properties = schema.get("properties").and_then(|value| value.as_object())?;
+    if properties.is_empty() {
+        return None;
+    }
+    let required = schema_required_fields(schema);
+    let mut names = properties.keys().cloned().collect::<Vec<_>>();
+    names.sort();
+    if names.len() > 4 {
+        names.truncate(4);
+        names.push("...".to_string());
+    }
+    let summary = names
+        .into_iter()
         .map(|name| {
             if required.contains(name.as_str()) {
-                format!("{} (required)", name)
+                format!("{}*", name)
             } else {
                 name
             }
         })
-        .collect()
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("{{{}}}", summary))
 }
 
 fn schema_required_fields(schema: &serde_json::Value) -> BTreeSet<&str> {
@@ -305,6 +360,18 @@ fn build_loop_context_block(loop_context: &PlannerLoopContext) -> String {
             "- completed_step_ids: {}",
             loop_context.completed_step_ids.join(", ")
         );
+    }
+    if !loop_context.available_bindings.is_empty() {
+        out.push_str("Available Bindings:\n");
+        for binding in &loop_context.available_bindings {
+            let _ = writeln!(out, "- {}", binding);
+        }
+    }
+    if !loop_context.binding_shapes.is_empty() {
+        out.push_str("Binding Shapes:\n");
+        for shape in &loop_context.binding_shapes {
+            let _ = writeln!(out, "- {}", shape);
+        }
     }
     if !loop_context.recent_observations.is_empty() {
         out.push_str("Recent Observations:\n");
@@ -351,18 +418,30 @@ fn build_skill_knowledge_block(skills: &[SkillInstruction]) -> String {
         return String::new();
     }
 
+    fn compact_skill_lines(instructions: &str) -> Vec<String> {
+        let mut selected = Vec::new();
+        for line in instructions.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            if line.starts_with("summary:")
+                || line.starts_with("scripts:")
+                || (selected.is_empty() && !line.starts_with("keywords:") && !line.starts_with('-'))
+            {
+                selected.push(line.to_string());
+            }
+            if selected.len() >= 2 {
+                break;
+            }
+        }
+        selected
+    }
+
     let mut out = String::new();
     out.push_str("Activated Skills:\n");
     out.push_str(
-        "Only execute scripts that are listed under scripts discovered or verified at runtime; never invent script filenames.\n",
+        "Treat skills as optional execution hints. Prefer registered actions when they already satisfy the task. Only execute scripts that are listed under scripts discovered or verified at runtime; never invent script filenames.\n",
     );
     for skill in skills {
         let _ = writeln!(out, "- {}", skill.skill_name);
-        for line in skill.instructions.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
+        for line in compact_skill_lines(&skill.instructions) {
             let _ = writeln!(out, "  {}", line);
         }
         if let Some(path) = &skill.skill_path {
@@ -474,6 +553,8 @@ mod tests {
                 max_iterations: 6,
                 recent_observations: vec!["iteration 1 completed shell and captured stdout".into()],
                 completed_step_ids: vec!["single_action".into()],
+                available_bindings: vec!["{{single_action.stdout}}".into()],
+                binding_shapes: vec!["{{single_action.stdout}} -> string".into()],
                 working_set_preview: Some("  single_action.stdout: \"README.md\"".into()),
             },
         );
@@ -483,6 +564,10 @@ mod tests {
 
         assert!(user.contains("Observed Execution State:"));
         assert!(user.contains("iteration: 2/6"));
+        assert!(user.contains("Available Bindings:"));
+        assert!(user.contains("{{single_action.stdout}}"));
+        assert!(user.contains("Binding Shapes:"));
+        assert!(user.contains("{{single_action.stdout}} -> string"));
         assert!(user.contains("iteration 1 completed shell and captured stdout"));
         assert!(user.contains("single_action.stdout"));
     }
@@ -493,13 +578,12 @@ mod tests {
             ActionMeta::new("file_write", "Write markdown to file")
                 .with_category("document")
                 .with_capabilities(["filesystem_write", "side_effect"])
-                .with_roles(["apply", "emit"])
                 .with_input_kinds(["path", "text"])
                 .with_output_kinds(["path"])
                 .with_input_schema(json!({
                     "type":"object",
                     "properties":{
-                        "content":{"type":"string"},
+                        "content":{"type":"string","description":"File content as UTF-8 text."},
                         "path":{"type":"string"}
                     },
                     "required":["path","content"]
@@ -508,19 +592,21 @@ mod tests {
                     "type":"object",
                     "properties":{
                         "bytes":{"type":"integer"},
-                        "path":{"type":"string"}
+                        "path":{"type":"string"},
+                        "mode":{"type":"string","enum":["strict","permissive"]}
                     }
                 })),
             ActionMeta::new("shell", "Run a shell command")
                 .with_category("direct")
-                .with_capabilities(["filesystem_read", "shell"])
-                .with_roles(["collect", "inspect"]),
+                .with_capabilities(["filesystem_read", "shell"]),
         ])
         .with_loop_context(PlannerLoopContext {
             iteration: 3,
             max_iterations: 6,
             recent_observations: vec!["iteration 2 produced markdown diagnostics".into()],
             completed_step_ids: vec!["inspect_docs".into()],
+            available_bindings: vec!["{{diagnostics.count}}".into()],
+            binding_shapes: vec!["{{diagnostics.count}} -> number".into()],
             working_set_preview: Some("  diagnostics.count: 4".into()),
         });
 
@@ -539,10 +625,12 @@ mod tests {
         assert!(user.contains("- file_write: Write markdown to file"));
         assert!(user.contains("category: document"));
         assert!(user.contains("capabilities: filesystem_write, side_effect"));
-        assert!(user.contains("roles: apply, emit"));
-        assert!(user.contains("input_kinds: path, text"));
-        assert!(user.contains("output_kinds: path"));
-        assert!(user.contains("input_fields: content (required), path (required)"));
-        assert!(user.contains("output_fields: bytes, path"));
+        assert!(user.contains("consumes: path, text"));
+        assert!(user.contains("produces: path"));
+        assert!(user.contains("input_fields: content (required) [UTF-8 text], path (required)"));
+        assert!(user.contains("output_fields: bytes, mode [enum: strict | permissive], path"));
+        assert!(user.contains("Available Bindings:"));
+        assert!(user.contains("Binding Shapes:"));
+        assert!(user.contains("{{diagnostics.count}}"));
     }
 }

@@ -62,9 +62,8 @@ impl Action for DocumentLocateAction {
         ActionMeta::new(self.name(), self.description())
             .with_category("document")
             .with_capabilities(["filesystem_read"])
-            .with_roles(["collect", "inspect"])
-            .with_input_kinds(["path", "text"])
-            .with_output_kinds(["path", "structured"])
+            .with_input_kinds(["workspace.path", "intent.request"])
+            .with_output_kinds(["document.location", "document.source_paths"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
@@ -141,9 +140,8 @@ impl Action for DocumentInspectAction {
         ActionMeta::new(self.name(), self.description())
             .with_category("document")
             .with_capabilities(["filesystem_read"])
-            .with_roles(["inspect", "verify"])
-            .with_input_kinds(["path", "structured"])
-            .with_output_kinds(["structured"])
+            .with_input_kinds(["document.location", "document.source_paths"])
+            .with_output_kinds(["document.inspection"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
@@ -420,15 +418,22 @@ impl Action for DocumentAssessReadinessAction {
         ActionMeta::new(self.name(), self.description())
             .with_category("document")
             .with_capabilities(["pure", "structured_output"])
-            .with_roles(["verify", "control"])
-            .with_input_kinds(["structured"])
-            .with_output_kinds(["structured"])
+            .with_input_kinds([
+                "document.inspection",
+                "document.patch_candidates",
+                "intent.request",
+            ])
+            .with_output_kinds(["document.continuation"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
                     "inspection": { "type": "object" },
                     "patch_candidates": { "type": "object" },
-                    "derivation_policy": { "type": "string" },
+                    "derivation_policy": {
+                        "type": "string",
+                        "enum": ["strict", "permissive", "filename_to_h1", "markdown_h1_from_filename"],
+                        "description": "Document derivation strictness. filename_to_h1 aliases permissive title derivation from file names."
+                    },
                     "user_request": { "type": "string" }
                 },
                 "required": ["inspection", "patch_candidates", "derivation_policy", "user_request"]
@@ -436,7 +441,16 @@ impl Action for DocumentAssessReadinessAction {
             .with_output_schema(json!({
                 "type": "object",
                 "properties": {
-                    "continuation": { "type": "object" },
+                    "continuation": {
+                        "type": "object",
+                        "properties": {
+                            "status": { "type": "string" },
+                            "reason": { "type": "string" },
+                            "unknowns": { "type": "array", "items": { "type": "string" } },
+                            "assumptions": { "type": "array", "items": { "type": "string" } },
+                            "user_message": { "type": ["string", "null"] }
+                        }
+                    },
                     "summary": { "type": "string" }
                 },
                 "required": ["continuation", "summary"]
@@ -505,15 +519,18 @@ impl Action for DocumentDeriveCandidatesAction {
         ActionMeta::new(self.name(), self.description())
             .with_category("document")
             .with_capabilities(["pure", "structured_output"])
-            .with_roles(["derive", "emit"])
-            .with_input_kinds(["structured", "text"])
-            .with_output_kinds(["structured"])
+            .with_input_kinds(["document.inspection", "intent.request"])
+            .with_output_kinds(["document.patch_candidates"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
                     "user_request": { "type": "string" },
                     "inspection": { "type": "object" },
-                    "derivation_policy": { "type": "string" }
+                    "derivation_policy": {
+                        "type": "string",
+                        "enum": ["strict", "permissive", "filename_to_h1", "markdown_h1_from_filename"],
+                        "description": "Document derivation strictness. filename_to_h1 aliases permissive title derivation from file names."
+                    }
                 },
                 "required": ["user_request", "inspection", "derivation_policy"]
             }))
@@ -584,9 +601,8 @@ impl Action for DocumentBuildPatchSpecAction {
         ActionMeta::new(self.name(), self.description())
             .with_category("document")
             .with_capabilities(["pure", "structured_output"])
-            .with_roles(["derive", "emit"])
-            .with_input_kinds(["structured"])
-            .with_output_kinds(["structured"])
+            .with_input_kinds(["document.inspection", "document.patch_candidates"])
+            .with_output_kinds(["document.patch_spec"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
@@ -598,7 +614,24 @@ impl Action for DocumentBuildPatchSpecAction {
             .with_output_schema(json!({
                 "type": "object",
                 "properties": {
-                    "patch_spec": { "type": "object" },
+                    "patch_spec": {
+                        "type": "object",
+                        "properties": {
+                            "updates": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "path": { "type": "string" },
+                                        "content": { "type": "string" }
+                                    },
+                                    "required": ["path", "content"]
+                                }
+                            },
+                            "summary": { "type": "string" }
+                        },
+                        "required": ["updates"]
+                    },
                     "summary": { "type": "string" }
                 },
                 "required": ["patch_spec", "summary"]
@@ -655,13 +688,30 @@ impl Action for DocumentApplyPatchAction {
         ActionMeta::new(self.name(), self.description())
             .with_category("document")
             .with_capabilities(["filesystem_write", "side_effect"])
-            .with_roles(["apply", "execute"])
-            .with_input_kinds(["structured"])
-            .with_output_kinds(["path", "structured"])
+            .with_input_kinds(["document.patch_spec"])
+            .with_output_kinds(["document.apply_result", "workspace.path"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
-                    "patch_spec": { "type": "object" },
+                    "patch_spec": {
+                        "type": "object",
+                        "description": "Document patch spec. Use updates[] with full rewritten file content.",
+                        "properties": {
+                            "updates": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "path": { "type": "string" },
+                                        "content": { "type": "string" }
+                                    },
+                                    "required": ["path", "content"]
+                                }
+                            },
+                            "summary": { "type": "string" }
+                        },
+                        "required": ["updates"]
+                    },
                     "report_path": { "type": "string" },
                     "inspection": { "type": "object" },
                     "patch_candidates": { "type": "object" }
@@ -725,13 +775,34 @@ impl Action for DocumentVerifyPatchAction {
         ActionMeta::new(self.name(), self.description())
             .with_category("document")
             .with_capabilities(["filesystem_read"])
-            .with_roles(["verify"])
-            .with_input_kinds(["structured"])
-            .with_output_kinds(["structured"])
+            .with_input_kinds([
+                "document.inspection",
+                "document.patch_spec",
+                "intent.request",
+            ])
+            .with_output_kinds(["document.verify_decision"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
-                    "patch_spec": { "type": "object" },
+                    "patch_spec": {
+                        "type": "object",
+                        "description": "Document patch spec. Use updates[] with full rewritten file content.",
+                        "properties": {
+                            "updates": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "path": { "type": "string" },
+                                        "content": { "type": "string" }
+                                    },
+                                    "required": ["path", "content"]
+                                }
+                            },
+                            "summary": { "type": "string" }
+                        },
+                        "required": ["updates"]
+                    },
                     "inspection": { "type": "object" },
                     "patch_candidates": { "type": "object" },
                     "user_request": { "type": "string" },

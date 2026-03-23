@@ -107,6 +107,8 @@ pub struct PlannerLoopContext {
     pub max_iterations: usize,
     pub recent_observations: Vec<String>,
     pub completed_step_ids: Vec<String>,
+    pub available_bindings: Vec<String>,
+    pub binding_shapes: Vec<String>,
     pub working_set_preview: Option<String>,
 }
 

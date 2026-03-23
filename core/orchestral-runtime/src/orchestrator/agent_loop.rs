@@ -1,4 +1,5 @@
 use super::*;
+use crate::orchestrator::support::{summarize_available_bindings, summarize_binding_shapes};
 use orchestral_core::types::Plan;
 
 const MAX_RECENT_OBSERVATIONS: usize = 4;
@@ -7,6 +8,8 @@ const MAX_RECENT_OBSERVATIONS: usize = 4;
 pub(super) struct AgentLoopState {
     recent_observations: Vec<String>,
     completed_step_ids: Vec<String>,
+    available_bindings: Vec<String>,
+    binding_shapes: Vec<String>,
     working_set_preview: Option<String>,
 }
 
@@ -18,6 +21,8 @@ impl AgentLoopState {
     ) -> Option<PlannerLoopContext> {
         if self.recent_observations.is_empty()
             && self.completed_step_ids.is_empty()
+            && self.available_bindings.is_empty()
+            && self.binding_shapes.is_empty()
             && self.working_set_preview.is_none()
         {
             return None;
@@ -28,6 +33,8 @@ impl AgentLoopState {
             max_iterations,
             recent_observations: self.recent_observations.clone(),
             completed_step_ids: self.completed_step_ids.clone(),
+            available_bindings: self.available_bindings.clone(),
+            binding_shapes: self.binding_shapes.clone(),
             working_set_preview: self.working_set_preview.clone(),
         })
     }
@@ -53,6 +60,8 @@ impl AgentLoopState {
             .iter()
             .map(|id| id.to_string())
             .collect();
+        self.available_bindings = summarize_available_bindings(&task.working_set_snapshot);
+        self.binding_shapes = summarize_binding_shapes(&task.working_set_snapshot);
         let preview = summarize_working_set(&task.working_set_snapshot);
         self.working_set_preview = if preview.trim().is_empty() || preview == "(empty)" {
             None

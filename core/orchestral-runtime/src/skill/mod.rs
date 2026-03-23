@@ -105,11 +105,14 @@ fn score_skill(intent: &str, entry: &SkillEntry) -> usize {
 
     let raw_intent = intent.to_ascii_lowercase();
     let intent_tokens = expand_token_aliases(&tokenize(intent));
-    let name_tokens = expand_token_aliases(&tokenize(&entry.name));
-    let description_tokens = expand_token_aliases(&tokenize(&entry.description));
+    let name_tokens = meaningful_tokens(expand_token_aliases(&tokenize(&entry.name)));
+    let description_tokens = meaningful_tokens(expand_token_aliases(&tokenize(&entry.description)));
     let keyword_tokens = expand_token_aliases(&extract_skill_keywords(entry));
 
     let mut score = 0usize;
+    let name_overlap = overlap_count(&intent_tokens, &name_tokens);
+    let description_overlap = overlap_count(&intent_tokens, &description_tokens);
+    let keyword_overlap = overlap_count(&intent_tokens, &keyword_tokens);
     let normalized_name = normalize_text(&entry.name);
     if !normalized_name.is_empty() {
         let exact_name = format!(" {} ", normalized_name);
@@ -121,15 +124,22 @@ fn score_skill(intent: &str, entry: &SkillEntry) -> usize {
         }
     }
 
-    score += overlap_score(&intent_tokens, &name_tokens, 80);
-    score += overlap_score(&intent_tokens, &description_tokens, 18);
-    score += overlap_score(&intent_tokens, &keyword_tokens, 10);
+    score += name_overlap * 80;
+    score += description_overlap * 18;
+    if score > 0 {
+        score += keyword_overlap * 10;
+    }
 
     if score >= MIN_SKILL_MATCH_SCORE {
         score
     } else {
         0
     }
+}
+
+fn meaningful_tokens(mut tokens: BTreeSet<String>) -> BTreeSet<String> {
+    tokens.retain(|token| !is_generic_skill_token(token));
+    tokens
 }
 
 fn build_skill_card(entry: &SkillEntry) -> String {
@@ -316,12 +326,8 @@ fn truncate_card(mut card: String, max_chars: usize) -> String {
     truncated
 }
 
-fn overlap_score(
-    intent_tokens: &BTreeSet<String>,
-    skill_tokens: &BTreeSet<String>,
-    weight: usize,
-) -> usize {
-    intent_tokens.intersection(skill_tokens).count() * weight
+fn overlap_count(intent_tokens: &BTreeSet<String>, skill_tokens: &BTreeSet<String>) -> usize {
+    intent_tokens.intersection(skill_tokens).count()
 }
 
 fn tokenize(text: &str) -> BTreeSet<String> {
@@ -409,6 +415,8 @@ fn is_generic_skill_token(token: &str) -> bool {
         token,
         "skill"
             | "skills"
+            | "doc"
+            | "docs"
             | "this"
             | "that"
             | "with"
@@ -543,6 +551,49 @@ mod tests {
         );
 
         let instructions = catalog.build_instructions("docs 下面有个 excel，把需要填的都填了");
+        assert_eq!(instructions.len(), 1);
+        assert_eq!(instructions[0].skill_name, "xlsx");
+    }
+
+    #[test]
+    fn test_build_instructions_does_not_match_generic_docs_skill_for_excel_intent() {
+        let catalog = SkillCatalog::new(
+            vec![SkillEntry {
+                name: "openai-docs".to_string(),
+                description: "Use when the user asks how to build with OpenAI products or APIs"
+                    .to_string(),
+                instructions: "# OpenAI Docs\n- Search official docs\n".to_string(),
+                source_path: PathBuf::from("/tmp/openai-docs/SKILL.md"),
+                scripts_dir: None,
+                venv_python: None,
+            }],
+            3,
+        );
+
+        assert!(catalog
+            .build_instructions("docs 目录下有一个excel，帮我填一下")
+            .is_empty());
+    }
+
+    #[test]
+    fn test_build_instructions_requires_name_or_description_relevance_for_keyword_matches() {
+        let catalog = SkillCatalog::new(
+            vec![
+                SkillEntry {
+                    name: "skill-creator".to_string(),
+                    description: "Guide for creating effective skills".to_string(),
+                    instructions: "# Workflow\n- Tool integrations\n- Domain expertise\n"
+                        .to_string(),
+                    source_path: PathBuf::from("/tmp/skill-creator/SKILL.md"),
+                    scripts_dir: None,
+                    venv_python: None,
+                },
+                make_skill("xlsx", "spreadsheet workbook editing and formula repair"),
+            ],
+            3,
+        );
+
+        let instructions = catalog.build_instructions("请把 excel 表格里的空白都填上");
         assert_eq!(instructions.len(), 1);
         assert_eq!(instructions[0].skill_name, "xlsx");
     }

@@ -52,7 +52,6 @@ impl Action for CodebaseCollectTargetsAction {
         ActionMeta::new(self.name(), self.description())
             .with_category("codebase")
             .with_capabilities(["filesystem_read", "pure"])
-            .with_roles(["collect", "prepare"])
             .with_input_kinds(["text"])
             .with_output_kinds(["path", "structured"])
             .with_input_schema(json!({
@@ -121,7 +120,6 @@ impl Action for CodebaseCollectResultsAction {
         ActionMeta::new(self.name(), self.description())
             .with_category("codebase")
             .with_capabilities(["pure", "structured_output"])
-            .with_roles(["collect", "emit"])
             .with_input_kinds(["structured"])
             .with_output_kinds(["structured"])
             .with_input_schema(json!({
@@ -216,7 +214,6 @@ impl Action for CodebaseAggregateVerifyAction {
         ActionMeta::new(self.name(), self.description())
             .with_category("codebase")
             .with_capabilities(["pure", "structured_output"])
-            .with_roles(["verify", "control"])
             .with_input_kinds(["structured"])
             .with_output_kinds(["structured"])
             .with_input_schema(json!({
@@ -347,7 +344,6 @@ impl Action for CodebaseExportSummaryAction {
         ActionMeta::new(self.name(), self.description())
             .with_category("codebase")
             .with_capabilities(["pure", "structured_output"])
-            .with_roles(["emit"])
             .with_input_kinds(["structured"])
             .with_output_kinds(["structured", "text"])
             .with_input_schema(json!({

@@ -61,9 +61,8 @@ impl Action for StructuredLocateAction {
         ActionMeta::new(self.name(), self.description())
             .with_category("structured")
             .with_capabilities(["filesystem_read"])
-            .with_roles(["collect", "inspect"])
-            .with_input_kinds(["path", "text"])
-            .with_output_kinds(["path", "structured"])
+            .with_input_kinds(["workspace.path", "intent.request"])
+            .with_output_kinds(["structured.location", "structured.source_paths"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
@@ -129,9 +128,8 @@ impl Action for StructuredInspectAction {
         ActionMeta::new(self.name(), self.description())
             .with_category("structured")
             .with_capabilities(["filesystem_read"])
-            .with_roles(["inspect", "verify"])
-            .with_input_kinds(["path"])
-            .with_output_kinds(["structured"])
+            .with_input_kinds(["structured.location", "structured.source_paths"])
+            .with_output_kinds(["structured.inspection"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
@@ -193,15 +191,18 @@ impl Action for StructuredDeriveCandidatesAction {
         ActionMeta::new(self.name(), self.description())
             .with_category("structured")
             .with_capabilities(["pure", "structured_output"])
-            .with_roles(["derive", "emit"])
-            .with_input_kinds(["structured", "text"])
-            .with_output_kinds(["structured"])
+            .with_input_kinds(["structured.inspection", "intent.request"])
+            .with_output_kinds(["structured.patch_candidates"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
                     "user_request": { "type": "string" },
                     "inspection": { "type": "object" },
-                    "derivation_policy": { "type": "string" }
+                    "derivation_policy": {
+                        "type": "string",
+                        "enum": ["strict", "permissive"],
+                        "description": "Strict waits when unknowns remain. Permissive allows partial concrete operations."
+                    }
                 },
                 "required": ["user_request", "inspection", "derivation_policy"]
             }))
@@ -274,22 +275,34 @@ impl Action for StructuredAssessReadinessAction {
         ActionMeta::new(self.name(), self.description())
             .with_category("structured")
             .with_capabilities(["pure", "structured_output"])
-            .with_roles(["verify", "control"])
-            .with_input_kinds(["structured"])
-            .with_output_kinds(["structured"])
+            .with_input_kinds(["structured.inspection", "structured.patch_candidates"])
+            .with_output_kinds(["structured.continuation"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
                     "inspection": { "type": "object" },
                     "patch_candidates": { "type": "object" },
-                    "derivation_policy": { "type": "string" }
+                    "derivation_policy": {
+                        "type": "string",
+                        "enum": ["strict", "permissive"],
+                        "description": "Strict waits when unknowns remain. Permissive allows commit-ready continuation when concrete operations exist."
+                    }
                 },
                 "required": ["inspection", "patch_candidates", "derivation_policy"]
             }))
             .with_output_schema(json!({
                 "type": "object",
                 "properties": {
-                    "continuation": { "type": "object" },
+                    "continuation": {
+                        "type": "object",
+                        "properties": {
+                            "status": { "type": "string" },
+                            "reason": { "type": "string" },
+                            "unknowns": { "type": "array", "items": { "type": "string" } },
+                            "assumptions": { "type": "array", "items": { "type": "string" } },
+                            "user_message": { "type": ["string", "null"] }
+                        }
+                    },
                     "summary": { "type": "string" }
                 },
                 "required": ["continuation", "summary"]
@@ -355,9 +368,8 @@ impl Action for StructuredBuildPatchSpecAction {
         ActionMeta::new(self.name(), self.description())
             .with_category("structured")
             .with_capabilities(["pure", "structured_output"])
-            .with_roles(["derive", "emit"])
-            .with_input_kinds(["structured"])
-            .with_output_kinds(["structured"])
+            .with_input_kinds(["structured.patch_candidates"])
+            .with_output_kinds(["structured.patch_spec"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
@@ -368,7 +380,27 @@ impl Action for StructuredBuildPatchSpecAction {
             .with_output_schema(json!({
                 "type": "object",
                 "properties": {
-                    "patch_spec": { "type": "object" },
+                    "patch_spec": {
+                        "type": "object",
+                        "properties": {
+                            "files": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "path": { "type": "string" },
+                                        "operations": {
+                                            "type": "array",
+                                            "items": { "type": "object" }
+                                        }
+                                    },
+                                    "required": ["path", "operations"]
+                                }
+                            },
+                            "summary": { "type": "string" }
+                        },
+                        "required": ["files"]
+                    },
                     "summary": { "type": "string" }
                 },
                 "required": ["patch_spec", "summary"]
@@ -422,13 +454,33 @@ impl Action for StructuredApplyPatchAction {
         ActionMeta::new(self.name(), self.description())
             .with_category("structured")
             .with_capabilities(["filesystem_read", "filesystem_write", "side_effect"])
-            .with_roles(["apply", "execute"])
-            .with_input_kinds(["structured"])
-            .with_output_kinds(["path", "structured"])
+            .with_input_kinds(["structured.patch_spec"])
+            .with_output_kinds(["structured.apply_result", "workspace.path"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
-                    "patch_spec": { "type": "object" }
+                    "patch_spec": {
+                        "type": "object",
+                        "description": "Structured patch spec. Use files[].operations from structured_build_patch_spec output.",
+                        "properties": {
+                            "files": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "path": { "type": "string" },
+                                        "operations": {
+                                            "type": "array",
+                                            "items": { "type": "object" }
+                                        }
+                                    },
+                                    "required": ["path", "operations"]
+                                }
+                            },
+                            "summary": { "type": "string" }
+                        },
+                        "required": ["files"]
+                    }
                 },
                 "required": ["patch_spec"]
             }))
@@ -483,13 +535,33 @@ impl Action for StructuredVerifyPatchAction {
         ActionMeta::new(self.name(), self.description())
             .with_category("structured")
             .with_capabilities(["filesystem_read"])
-            .with_roles(["verify"])
-            .with_input_kinds(["structured"])
-            .with_output_kinds(["structured"])
+            .with_input_kinds(["structured.inspection", "structured.patch_spec"])
+            .with_output_kinds(["structured.verify_decision"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
-                    "patch_spec": { "type": "object" },
+                    "patch_spec": {
+                        "type": "object",
+                        "description": "Structured patch spec. Use files[].operations from structured_build_patch_spec output.",
+                        "properties": {
+                            "files": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "path": { "type": "string" },
+                                        "operations": {
+                                            "type": "array",
+                                            "items": { "type": "object" }
+                                        }
+                                    },
+                                    "required": ["path", "operations"]
+                                }
+                            },
+                            "summary": { "type": "string" }
+                        },
+                        "required": ["files"]
+                    },
                     "inspection": { "type": "object" }
                 },
                 "required": ["patch_spec"]

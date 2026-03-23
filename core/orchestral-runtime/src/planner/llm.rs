@@ -486,7 +486,6 @@ mod tests {
         let actions = vec![
             ActionMeta::new("write_doc", "Write markdown to file")
                 .with_capabilities(["filesystem_write", "side_effect"])
-                .with_roles(["apply", "emit"])
                 .with_input_kinds(["path", "text"])
                 .with_output_kinds(["path"])
                 .with_input_schema(json!({
@@ -508,7 +507,6 @@ mod tests {
                 ),
             ActionMeta::new("file_read", "Read a file")
                 .with_capabilities(["filesystem_read"])
-                .with_roles(["inspect", "verify"])
                 .with_input_kinds(["path"])
                 .with_output_kinds(["text"]),
         ];
@@ -541,7 +539,6 @@ mod tests {
 
         let actions = vec![ActionMeta::new("mcp__alpha", "Call MCP server alpha")
             .with_capabilities(["mcp", "side_effect"])
-            .with_roles(["execute"])
             .with_input_kinds(["structured"])
             .with_output_kinds(["structured"])
             .with_input_schema(json!({
