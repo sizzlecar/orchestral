@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-pub(super) fn resolve_patch_spec_value<'a>(patch_spec: &'a Value) -> Result<&'a Value, String> {
+pub(super) fn resolve_patch_spec_value(patch_spec: &Value) -> Result<&Value, String> {
     if patch_spec.get("fills").and_then(Value::as_array).is_some() {
         return Ok(patch_spec);
     }

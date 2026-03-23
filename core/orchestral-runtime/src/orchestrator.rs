@@ -19,7 +19,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::sync::RwLock;
 
@@ -65,63 +64,6 @@ fn truncate_for_log(input: &str, max_chars: usize) -> String {
 
 fn truncate_debug_for_log(value: &impl std::fmt::Debug, max_chars: usize) -> String {
     truncate_for_log(&format!("{:?}", value), max_chars)
-}
-
-fn parse_working_set_value<T: DeserializeOwned>(
-    snapshot: &HashMap<String, Value>,
-    key: &str,
-) -> Result<T, OrchestratorError> {
-    let value = snapshot.get(key).ok_or_else(|| {
-        OrchestratorError::Planner(PlanError::Generation(format!(
-            "reactor expected working_set key '{}'",
-            key
-        )))
-    })?;
-    serde_json::from_value::<T>(value.clone()).map_err(|err| {
-        OrchestratorError::Planner(PlanError::Generation(format!(
-            "reactor failed to parse working_set key '{}': {}",
-            key, err
-        )))
-    })
-}
-
-fn require_working_set_string(
-    snapshot: &HashMap<String, Value>,
-    key: &str,
-) -> Result<String, OrchestratorError> {
-    snapshot
-        .get(key)
-        .and_then(|value| value.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| {
-            OrchestratorError::Planner(PlanError::Generation(format!(
-                "reactor expected string working_set key '{}'",
-                key
-            )))
-        })
-}
-
-fn require_working_set_string_array(
-    snapshot: &HashMap<String, Value>,
-    key: &str,
-) -> Result<Vec<String>, OrchestratorError> {
-    snapshot
-        .get(key)
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .filter(|items| !items.is_empty())
-        .ok_or_else(|| {
-            OrchestratorError::Planner(PlanError::Generation(format!(
-                "reactor expected string array working_set key '{}'",
-                key
-            )))
-        })
 }
 
 /// Orchestrator result for a handled event

@@ -76,7 +76,7 @@ pub(super) fn assess_readiness(
             .get("proposed_action")
             .and_then(Value::as_str)
             .unwrap_or("fill");
-        let proposed_value = candidate_value_text(&candidate).unwrap_or_default();
+        let proposed_value = candidate_value_text(candidate).unwrap_or_default();
         if proposed_action != "fill" || proposed_value.trim().is_empty() {
             continue;
         }
