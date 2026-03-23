@@ -1,6 +1,7 @@
 use super::agent_loop::{
     agent_loop_iteration_limit_error, should_continue_agent_loop, AgentLoopState,
 };
+use super::output::render_output_template;
 use super::*;
 use orchestral_core::planner::SingleAction;
 use orchestral_core::types::{Plan, Step, StepKind};
@@ -49,8 +50,7 @@ impl Orchestrator {
                 "orchestrator planner iteration started"
             );
 
-            let mut context =
-                PlannerContext::with_history(available_actions, history.clone())
+            let mut context = PlannerContext::with_history(available_actions, history.clone())
                 .with_runtime_info(runtime_info.clone())
                 .with_skill_instructions(skill_instructions.clone());
             if let Some(loop_context) =
@@ -471,6 +471,7 @@ impl Orchestrator {
         message: String,
         turn_started_at: Instant,
     ) -> Result<OrchestratorResult, OrchestratorError> {
+        let message = materialize_done_message(&task, &message)?;
         self.emit_lifecycle_event(
             "planning_completed",
             Some(interaction_id.as_str()),
@@ -645,6 +646,40 @@ fn planner_result_response(
     }
 }
 
+fn materialize_done_message(task: &Task, message: &str) -> Result<String, OrchestratorError> {
+    if !message.contains("{{") {
+        return Ok(message.to_string());
+    }
+
+    let rendered = render_output_template(
+        message,
+        &task.working_set_snapshot,
+        std::iter::empty::<(String, Value)>(),
+    )
+    .map_err(|err| {
+        tracing::warn!(
+            task_id = %task.id,
+            raw_message = %truncate_for_log(message, 400),
+            error = %err,
+            "planner done message template resolution failed"
+        );
+        OrchestratorError::Planner(PlanError::Generation(format!(
+            "DONE.message template resolution failed: {err}"
+        )))
+    })?;
+
+    if rendered != message {
+        tracing::info!(
+            task_id = %task.id,
+            raw_message = %truncate_for_log(message, 400),
+            rendered_message = %truncate_for_log(&rendered, 400),
+            "planner done message materialized from working set bindings"
+        );
+    }
+
+    Ok(rendered)
+}
+
 fn validate_single_action<'a>(
     call: &SingleAction,
     available_actions: &'a [ActionMeta],
@@ -742,10 +777,7 @@ fn single_action_on_complete_template(action: &str) -> Option<String> {
     }
 }
 
-fn filter_actions_for_planner_iteration(
-    actions: &[ActionMeta],
-    task: &Task,
-) -> Vec<ActionMeta> {
+fn filter_actions_for_planner_iteration(actions: &[ActionMeta], task: &Task) -> Vec<ActionMeta> {
     if !has_ready_spreadsheet_fills(&task.working_set_snapshot) {
         return actions.to_vec();
     }
@@ -753,7 +785,10 @@ fn filter_actions_for_planner_iteration(
     let filtered = actions
         .iter()
         .filter(|meta| {
-            matches!(meta.category.as_deref(), Some("spreadsheet") | Some("utility"))
+            matches!(
+                meta.category.as_deref(),
+                Some("spreadsheet") | Some("utility")
+            )
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -776,16 +811,21 @@ fn has_ready_spreadsheet_fills(snapshot: &std::collections::HashMap<String, Valu
         return false;
     }
 
-    ["continuation", "assess.continuation", "patch_spec", "build.patch_spec"]
-        .into_iter()
-        .filter_map(|key| snapshot.get(key))
-        .any(|value| {
-            value
-                .get("fills")
-                .and_then(Value::as_array)
-                .map(|fills| !fills.is_empty())
-                .unwrap_or(false)
-        })
+    [
+        "continuation",
+        "assess.continuation",
+        "patch_spec",
+        "build.patch_spec",
+    ]
+    .into_iter()
+    .filter_map(|key| snapshot.get(key))
+    .any(|value| {
+        value
+            .get("fills")
+            .and_then(Value::as_array)
+            .map(|fills| !fills.is_empty())
+            .unwrap_or(false)
+    })
 }
 
 #[cfg(test)]
@@ -882,10 +922,8 @@ mod tests {
             ActionMeta::new("shell", "shell").with_category("direct"),
         ];
         let mut task = Task::new(orchestral_core::types::Intent::new("fill workbook"));
-        task.working_set_snapshot.insert(
-            "source_path".to_string(),
-            json!("docs/perf-review.xlsx"),
-        );
+        task.working_set_snapshot
+            .insert("source_path".to_string(), json!("docs/perf-review.xlsx"));
         task.working_set_snapshot.insert(
             "continuation".to_string(),
             json!({
@@ -901,7 +939,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             names,
-            vec!["spreadsheet_apply_patch", "spreadsheet_verify_patch", "json_stdout"]
+            vec![
+                "spreadsheet_apply_patch",
+                "spreadsheet_verify_patch",
+                "json_stdout"
+            ]
         );
     }
 
@@ -922,5 +964,41 @@ mod tests {
             names,
             vec!["spreadsheet_apply_patch", "structured_build_patch_spec"]
         );
+    }
+
+    #[test]
+    fn test_materialize_done_message_renders_working_set_placeholders() {
+        let mut task = Task::new(orchestral_core::types::Intent::new("inspect workbook"));
+        task.working_set_snapshot.insert(
+            "inspect_spreadsheet.inspection.selected_region.row_count".to_string(),
+            json!(7),
+        );
+        task.working_set_snapshot.insert(
+            "inspect_spreadsheet.inspection.max_column".to_string(),
+            json!(11),
+        );
+
+        let rendered = materialize_done_message(
+            &task,
+            "共有 {{inspect_spreadsheet.inspection.selected_region.row_count}} 行，最大列 {{inspect_spreadsheet.inspection.max_column}}。",
+        )
+        .expect("done message should resolve");
+
+        assert_eq!(rendered, "共有 7 行，最大列 11。");
+    }
+
+    #[test]
+    fn test_materialize_done_message_rejects_missing_placeholders() {
+        let task = Task::new(orchestral_core::types::Intent::new("inspect workbook"));
+
+        let err = materialize_done_message(
+            &task,
+            "共有 {{inspect_spreadsheet.inspection.selected_region.row_count}} 行。",
+        )
+        .expect_err("missing binding should fail");
+
+        assert!(err
+            .to_string()
+            .contains("DONE.message template resolution failed"));
     }
 }

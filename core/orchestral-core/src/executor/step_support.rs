@@ -26,6 +26,13 @@ pub(super) fn resolve_param_templates(params: &mut Value, ws: &WorkingSet) -> Re
     resolve_param_templates_inner(params, ws, &root_snapshot)
 }
 
+pub fn render_working_set_template(template: &str, ws: &WorkingSet) -> Result<String, String> {
+    if !template.contains("{{") {
+        return Ok(template.to_string());
+    }
+    render_param_template(template, ws, &Value::Null)
+}
+
 fn resolve_param_templates_inner(
     params: &mut Value,
     ws: &WorkingSet,
@@ -344,5 +351,30 @@ mod tests {
                 "summary": "Spreadsheet probe ready for commit."
             })
         );
+    }
+
+    #[test]
+    fn test_render_working_set_template_renders_nested_scalar_bindings() {
+        let mut ws = WorkingSet::new();
+        ws.set_task("inspect.selected_region.row_count", json!(7));
+        ws.set_task("inspect.max_column", json!(11));
+
+        let rendered = render_working_set_template(
+            "共有 {{inspect.selected_region.row_count}} 行，最大列 {{inspect.max_column}}。",
+            &ws,
+        )
+        .expect("template should resolve");
+
+        assert_eq!(rendered, "共有 7 行，最大列 11。");
+    }
+
+    #[test]
+    fn test_render_working_set_template_errors_on_missing_binding() {
+        let ws = WorkingSet::new();
+
+        let err = render_working_set_template("缺少 {{inspect.selected_region.row_count}}", &ws)
+            .expect_err("missing binding should fail");
+
+        assert!(err.contains("missing template value"));
     }
 }

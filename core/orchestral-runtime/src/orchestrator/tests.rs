@@ -486,6 +486,28 @@ fn test_resolve_plan_response_template_uses_scoped_summary_fallback() {
     assert_eq!(resolved, "Done\n\nSheet 2025-Q2: 28 rows");
 }
 
+#[test]
+fn test_resolve_plan_response_template_materializes_nested_bindings() {
+    let mut plan = Plan::new("goal", vec![]);
+    plan.on_complete = Some(
+        "共有 {{inspect_spreadsheet.inspection.selected_region.row_count}} 行，最大列 {{inspect_spreadsheet.inspection.max_column}}。".to_string(),
+    );
+    let mut ws = HashMap::new();
+    ws.insert(
+        "inspect_spreadsheet.inspection.selected_region.row_count".to_string(),
+        json!(7),
+    );
+    ws.insert(
+        "inspect_spreadsheet.inspection.max_column".to_string(),
+        json!(11),
+    );
+
+    let resolved =
+        resolve_plan_response_template(&plan, &ExecutionResult::Completed, &ws).expect("msg");
+
+    assert_eq!(resolved, "共有 7 行，最大列 11。");
+}
+
 #[derive(Debug)]
 struct SequencePlanner {
     outputs: Mutex<VecDeque<PlannerOutput>>,
@@ -655,6 +677,55 @@ async fn test_orchestrator_agent_loop_replans_after_completed_single_action() {
         })
         .collect::<Vec<_>>();
     assert_eq!(assistant_messages, vec!["final answer"]);
+
+    let _ = fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn test_orchestrator_agent_loop_materializes_done_message_templates() {
+    let path = write_test_file("agent-loop-done-template", "hello from template\n");
+    let planner = Arc::new(SequencePlanner::new(vec![
+        PlannerOutput::SingleAction(SingleAction {
+            action: "file_read".to_string(),
+            params: json!({"path": path.to_string_lossy()}),
+            reason: Some("read file".to_string()),
+        }),
+        PlannerOutput::Done("文件内容：{{single_action.content}}".to_string()),
+    ]));
+    let (orchestrator, _task_store, event_store) = build_test_orchestrator(planner, 4);
+    let thread_id = orchestrator.thread_runtime.thread_id().await;
+
+    let result = orchestrator
+        .handle_event(Event::user_input(
+            thread_id.as_str(),
+            "int-1",
+            json!({"text":"读取文件后输出内容"}),
+        ))
+        .await
+        .expect("handle event");
+
+    assert!(matches!(
+        result,
+        OrchestratorResult::Started {
+            result: ExecutionResult::Completed,
+            ..
+        }
+    ));
+
+    let events = event_store
+        .query_by_thread(thread_id.as_str())
+        .await
+        .expect("query events");
+    let assistant_messages = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::AssistantOutput { payload, .. } => {
+                payload.get("message").and_then(Value::as_str)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(assistant_messages, vec!["文件内容：hello from template\n"]);
 
     let _ = fs::remove_file(path);
 }

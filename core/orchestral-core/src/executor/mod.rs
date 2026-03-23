@@ -35,6 +35,7 @@ use self::progress::{
     build_step_completion_metadata, build_step_start_metadata, choose_terminal_result,
     report_progress,
 };
+pub use self::step_support::render_working_set_template;
 use self::step_support::{bind_param_value, resolve_param_templates, validate_declared_exports};
 
 const DEFAULT_MAX_RETRY_ATTEMPTS: u32 = 3;

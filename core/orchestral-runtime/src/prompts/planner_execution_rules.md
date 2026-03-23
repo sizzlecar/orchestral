@@ -15,6 +15,8 @@ Do not repeat already completed work unless the observation shows a failure or a
 Use exact input/output field names from the capability catalog; do not invent alternate field names.
 When Available Bindings are listed from prior iterations, reference only those exact bindings; do not invent missing whole-step bindings.
 When passing an array or object exported by a previous step into a later param, bind the whole value with `{{step_id.field_name}}`.
+When DONE needs exact values from prior steps, it may reference exact Available Bindings with `{{step_id.field_name}}`.
+In DONE.message, prefer display-ready scalar bindings over whole objects or arrays.
 DONE must never claim to execute commands.
 DONE must never ask the user to approve execution.
 DONE must never show shell snippets as if execution has already started.
