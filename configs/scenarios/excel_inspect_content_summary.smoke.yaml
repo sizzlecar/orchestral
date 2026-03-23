@@ -1,0 +1,28 @@
+version: 1
+name: excel-inspect-content-summary-smoke
+config: ../orchestral.cli.runtime.override.yaml
+no_mcp: true
+timeout_secs: 300
+workspace:
+  copies:
+    - from: ../../docs/绩效考核-2025Q4_副本.xlsx
+      to: docs/绩效考核-2025Q4_运行副本.xlsx
+
+turns:
+  - name: inspect-excel-content
+    input: >
+      docs 目录下应该有个excel 帮我看下里面 什么内容
+    expect:
+      require_execution_end: true
+      max_approvals: 0
+      max_errors: 0
+      assistant_contains:
+        - "Excel"
+      assistant_not_contains:
+        - "{{"
+      activity_contains:
+        - "spreadsheet_locate"
+        - "spreadsheet_inspect"
+      activity_not_contains:
+        - "spreadsheet_apply_patch"
+        - "spreadsheet_verify_patch"

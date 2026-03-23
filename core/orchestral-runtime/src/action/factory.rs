@@ -4,11 +4,12 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use orchestral_core::action::{Action, ActionContext, ActionInput, ActionMeta, ActionResult};
-use orchestral_core::config::{ActionInterfaceSpec, ActionSpec};
+use orchestral_core::config::ActionSpec;
 
 use super::builtin::build_builtin_action;
+use super::codebase::build_codebase_action;
 use super::document::build_document_action;
-use super::external::build_external_action;
+
 use super::mcp::build_mcp_action;
 use super::spreadsheet::build_spreadsheet_action;
 use super::structured::build_structured_action;
@@ -44,43 +45,29 @@ impl Default for DefaultActionFactory {
 
 impl ActionFactory for DefaultActionFactory {
     fn build(&self, spec: &ActionSpec) -> Result<Arc<dyn Action>, ActionBuildError> {
-        match build_builtin_action(spec) {
-            Some(action) => {
-                let action: Arc<dyn Action> = Arc::from(action);
-                Ok(Arc::new(ConfiguredAction::new(action, spec)))
-            }
-            None => match build_spreadsheet_action(spec)? {
-                Some(action) => {
-                    let action: Arc<dyn Action> = Arc::from(action);
-                    Ok(Arc::new(ConfiguredAction::new(action, spec)))
-                }
-                None => match build_document_action(spec)? {
-                    Some(action) => {
-                        let action: Arc<dyn Action> = Arc::from(action);
-                        Ok(Arc::new(ConfiguredAction::new(action, spec)))
-                    }
-                    None => match build_external_action(spec)? {
-                        Some(action) => {
-                            let action: Arc<dyn Action> = Arc::from(action);
-                            Ok(Arc::new(ConfiguredAction::new(action, spec)))
-                        }
-                        None => match build_structured_action(spec)? {
-                            Some(action) => {
-                                let action: Arc<dyn Action> = Arc::from(action);
-                                Ok(Arc::new(ConfiguredAction::new(action, spec)))
-                            }
-                            None => match build_mcp_action(spec)? {
-                                Some(action) => {
-                                    let action: Arc<dyn Action> = Arc::from(action);
-                                    Ok(Arc::new(ConfiguredAction::new(action, spec)))
-                                }
-                                None => Err(ActionBuildError::UnknownKind(spec.kind.clone())),
-                            },
-                        },
-                    },
-                },
-            },
+        let wrap = |action: Arc<dyn Action>| -> Result<Arc<dyn Action>, ActionBuildError> {
+            Ok(Arc::new(ConfiguredAction::new(action, spec)))
+        };
+
+        if let Some(a) = build_builtin_action(spec) {
+            return wrap(Arc::from(a));
         }
+        if let Some(a) = build_spreadsheet_action(spec)? {
+            return wrap(Arc::from(a));
+        }
+        if let Some(a) = build_document_action(spec)? {
+            return wrap(Arc::from(a));
+        }
+        if let Some(a) = build_structured_action(spec)? {
+            return wrap(Arc::from(a));
+        }
+        if let Some(a) = build_codebase_action(spec)? {
+            return wrap(Arc::from(a));
+        }
+        if let Some(a) = build_mcp_action(spec)? {
+            return wrap(Arc::from(a));
+        }
+        Err(ActionBuildError::UnknownKind(spec.kind.clone()))
     }
 }
 
@@ -91,7 +78,7 @@ struct ConfiguredAction {
 
 impl ConfiguredAction {
     fn new(inner: Arc<dyn Action>, spec: &ActionSpec) -> Self {
-        let metadata = merge_action_metadata(inner.metadata(), spec.interface.as_ref());
+        let metadata = merge_action_metadata(inner.metadata(), spec);
         Self { inner, metadata }
     }
 }
@@ -115,17 +102,20 @@ impl Action for ConfiguredAction {
     }
 }
 
-fn merge_action_metadata(base: ActionMeta, interface: Option<&ActionInterfaceSpec>) -> ActionMeta {
-    let Some(interface) = interface else {
-        return base;
-    };
-
+fn merge_action_metadata(base: ActionMeta, spec: &ActionSpec) -> ActionMeta {
     let mut merged = base;
-    if !interface.input_schema.is_null() {
-        merged.input_schema = interface.input_schema.clone();
+    if let Some(category) = &spec.category {
+        if !category.trim().is_empty() {
+            merged.category = Some(category.clone());
+        }
     }
-    if !interface.output_schema.is_null() {
-        merged.output_schema = interface.output_schema.clone();
+    if let Some(interface) = spec.interface.as_ref() {
+        if !interface.input_schema.is_null() {
+            merged.input_schema = interface.input_schema.clone();
+        }
+        if !interface.output_schema.is_null() {
+            merged.output_schema = interface.output_schema.clone();
+        }
     }
     merged
 }
@@ -133,6 +123,7 @@ fn merge_action_metadata(base: ActionMeta, interface: Option<&ActionInterfaceSpe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orchestral_core::config::ActionInterfaceSpec;
     use serde_json::json;
 
     #[test]
@@ -144,9 +135,18 @@ mod tests {
             input_schema: json!({"type":"object","properties":{"message":{"type":"string"}}}),
             output_schema: json!({"type":"object","properties":{"result":{"type":"string"}}}),
         };
+        let spec = ActionSpec {
+            name: "echo".to_string(),
+            kind: "echo".to_string(),
+            description: None,
+            category: Some("direct".to_string()),
+            config: json!({}),
+            interface: Some(interface.clone()),
+        };
 
-        let merged = merge_action_metadata(base, Some(&interface));
+        let merged = merge_action_metadata(base, &spec);
         assert_eq!(merged.input_schema, interface.input_schema);
         assert_eq!(merged.output_schema, interface.output_schema);
+        assert_eq!(merged.category.as_deref(), Some("direct"));
     }
 }

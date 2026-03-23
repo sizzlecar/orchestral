@@ -4,7 +4,7 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::Mutex;
 
 use orchestral_core::action::{Action, ActionMeta};
-use orchestral_core::store::{InMemoryReferenceStore, WorkingSet};
+use orchestral_core::store::WorkingSet;
 use orchestral_core::types::{Step, TaskId};
 
 struct SequenceLlmClient {
@@ -106,7 +106,6 @@ fn test_ctx() -> ExecutorContext {
     ExecutorContext::new(
         TaskId::from("task-1"),
         Arc::new(RwLock::new(WorkingSet::new())),
-        Arc::new(InMemoryReferenceStore::new()),
     )
 }
 
@@ -352,7 +351,6 @@ fn test_agent_prompt_includes_execution_environment() {
     let ctx = ExecutorContext::new(
         TaskId::from("task-1"),
         Arc::new(RwLock::new(WorkingSet::new())),
-        Arc::new(InMemoryReferenceStore::new()),
     )
     .with_runtime_info(PlannerRuntimeInfo {
         os: "macos".to_string(),
@@ -384,7 +382,6 @@ fn test_agent_prompt_includes_skill_knowledge() {
     let ctx = ExecutorContext::new(
         TaskId::from("task-1"),
         Arc::new(RwLock::new(WorkingSet::new())),
-        Arc::new(InMemoryReferenceStore::new()),
     )
     .with_skill_instructions(vec![SkillInstruction {
         skill_name: "tabular".to_string(),
@@ -418,7 +415,6 @@ fn test_agent_prompt_adds_spreadsheet_binary_rules() {
     let ctx = ExecutorContext::new(
         TaskId::from("task-1"),
         Arc::new(RwLock::new(WorkingSet::new())),
-        Arc::new(InMemoryReferenceStore::new()),
     )
     .with_skill_instructions(vec![SkillInstruction {
         skill_name: "xlsx".to_string(),

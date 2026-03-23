@@ -1,4 +1,6 @@
 use super::*;
+use orchestral_core::executor::render_working_set_template;
+use orchestral_core::store::WorkingSet;
 
 impl Orchestrator {
     pub(super) async fn emit_lifecycle_event(
@@ -227,6 +229,22 @@ pub(super) fn execution_result_metadata(result: &ExecutionResult) -> Value {
     }
 }
 
+pub(super) fn render_output_template<I>(
+    template: &str,
+    working_set: &HashMap<String, Value>,
+    extra_bindings: I,
+) -> Result<String, String>
+where
+    I: IntoIterator<Item = (String, Value)>,
+{
+    let mut ws = WorkingSet::new();
+    ws.import_task_data(working_set.clone());
+    for (key, value) in extra_bindings {
+        ws.set_task(key, value);
+    }
+    render_working_set_template(template, &ws)
+}
+
 pub(super) fn resolve_plan_response_template(
     plan: &orchestral_core::types::Plan,
     result: &ExecutionResult,
@@ -239,15 +257,16 @@ pub(super) fn resolve_plan_response_template(
     }?;
 
     let is_completed = matches!(result, ExecutionResult::Completed);
-    let mut resolved = template.to_string();
-    for (key, value) in working_set {
-        let placeholder = format!("{{{{{}}}}}", key);
-        let replacement = value_to_template_replacement(value);
-        resolved = resolved.replace(&placeholder, &replacement);
-    }
-    if let ExecutionResult::Failed { error, .. } = result {
-        resolved = resolved.replace("{{error}}", error);
-    }
+    let mut resolved = match result {
+        ExecutionResult::Failed { error, .. } => render_output_template(
+            template,
+            working_set,
+            std::iter::once(("error".to_string(), Value::String(error.clone()))),
+        )
+        .ok()?,
+        _ => render_output_template(template, working_set, std::iter::empty::<(String, Value)>())
+            .ok()?,
+    };
     if is_completed && !template_contains_summary_placeholder(template) {
         if let Some(summary) = best_summary_from_working_set(working_set) {
             if !summary.trim().is_empty() && !resolved.contains(&summary) {

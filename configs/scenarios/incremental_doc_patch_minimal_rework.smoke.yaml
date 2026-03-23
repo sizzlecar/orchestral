@@ -1,0 +1,78 @@
+version: 1
+name: incremental-doc-patch-minimal-rework
+config: ../orchestral.cli.yaml
+no_mcp: true
+no_skills: true
+timeout_secs: 300
+fresh_thread_per_turn: true
+workspace:
+  copies:
+    - from: ../../fixtures/scenarios/incremental_doc_patch/docs
+      to: fixtures/scenarios/incremental_doc_patch/docs
+
+turns:
+  - name: run-1
+    input: >
+      扫描 fixtures/scenarios/incremental_doc_patch/docs 下所有 markdown，
+      缺失一级标题的文档使用文件名转成标题补齐。
+    expect:
+      require_execution_end: true
+      max_approvals: 0
+      max_errors: 0
+      activity_contains:
+        - "document_apply_patch"
+      artifact_contains:
+        - path: fixtures/scenarios/incremental_doc_patch/docs/customer-onboarding.md
+          text: "# Customer Onboarding"
+        - path: fixtures/scenarios/incremental_doc_patch/docs/release-checklist.md
+          text: "# Release Checklist"
+        - path: fixtures/scenarios/incremental_doc_patch/docs/ops-handbook.md
+          text: "# Ops Handbook"
+        - path: fixtures/scenarios/incremental_doc_patch/docs/support-playbook.md
+          text: "# Support Playbook"
+      capture_artifacts:
+        - fixtures/scenarios/incremental_doc_patch/docs/customer-onboarding.md
+        - fixtures/scenarios/incremental_doc_patch/docs/release-checklist.md
+        - fixtures/scenarios/incremental_doc_patch/docs/ops-handbook.md
+        - fixtures/scenarios/incremental_doc_patch/docs/support-playbook.md
+    verify:
+      - name: snapshot-and-perturb-two-files
+        phase: post_turn
+        command: /bin/zsh
+        cwd: ../..
+        args:
+          - -lc
+          - >-
+            cargo run -q -p orchestral-cli --example verify_incremental_doc_patch -- prepare
+            "$ORCHESTRAL_SCENARIO_WORKSPACE_DIR/.state/incremental-doc-baseline.json"
+            "$ORCHESTRAL_SCENARIO_WORKSPACE_DIR/fixtures/scenarios/incremental_doc_patch/docs"
+            customer-onboarding.md
+            release-checklist.md
+
+  - name: run-2
+    input: >
+      扫描 fixtures/scenarios/incremental_doc_patch/docs 下所有 markdown，
+      缺失一级标题的文档使用文件名转成标题补齐。
+    expect:
+      require_execution_end: true
+      max_approvals: 0
+      max_errors: 0
+      activity_contains:
+        - "document_apply_patch"
+      artifact_matches_turn:
+        - path: fixtures/scenarios/incremental_doc_patch/docs/ops-handbook.md
+          turn: run-1
+        - path: fixtures/scenarios/incremental_doc_patch/docs/support-playbook.md
+          turn: run-1
+    verify:
+      - name: verify-minimal-rework
+        command: /bin/zsh
+        cwd: ../..
+        args:
+          - -lc
+          - >-
+            cargo run -q -p orchestral-cli --example verify_incremental_doc_patch -- verify
+            "$ORCHESTRAL_SCENARIO_WORKSPACE_DIR/.state/incremental-doc-baseline.json"
+            "$ORCHESTRAL_SCENARIO_WORKSPACE_DIR/fixtures/scenarios/incremental_doc_patch/docs"
+            customer-onboarding.md
+            release-checklist.md

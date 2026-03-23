@@ -10,10 +10,7 @@ use std::fmt;
 
 use crate::action::ApprovalRequest;
 
-use super::{
-    ArtifactFamily, ContinuationState, DerivationPolicy, Intent, Plan, SkeletonKind, StageKind,
-    StepId, VerifyDecision,
-};
+use super::{Intent, Plan, StepId};
 
 /// Strongly-typed Task ID.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -168,9 +165,6 @@ pub struct Task {
     /// Task-scope working set snapshot for resume
     #[serde(default)]
     pub working_set_snapshot: HashMap<String, Value>,
-    /// Optional reactor-mode stage state.
-    #[serde(default)]
-    pub reactor: Option<ReactorTaskState>,
     /// Creation timestamp
     pub created_at: DateTime<Utc>,
     /// Last update timestamp
@@ -188,7 +182,6 @@ impl Task {
             state: TaskState::Planning,
             completed_step_ids: Vec::new(),
             working_set_snapshot: HashMap::new(),
-            reactor: None,
             created_at: now,
             updated_at: now,
         }
@@ -257,29 +250,6 @@ impl Task {
         self.working_set_snapshot = working_set_snapshot;
         self.updated_at = Utc::now();
     }
-
-    pub fn set_reactor_state(&mut self, reactor: ReactorTaskState) {
-        self.reactor = Some(reactor);
-        self.updated_at = Utc::now();
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReactorTaskState {
-    pub skeleton: SkeletonKind,
-    pub artifact_family: ArtifactFamily,
-    pub current_stage: StageKind,
-    pub derivation_policy: DerivationPolicy,
-    #[serde(default)]
-    pub last_continuation: Option<ContinuationState>,
-    #[serde(default)]
-    pub last_verify: Option<VerifyDecision>,
-    #[serde(default = "default_true")]
-    pub verify_required: bool,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 #[cfg(test)]

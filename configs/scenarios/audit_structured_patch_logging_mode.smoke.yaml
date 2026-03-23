@@ -1,0 +1,42 @@
+version: 1
+name: audit-structured-patch-logging-mode
+config: ../orchestral.cli.yaml
+no_mcp: true
+no_skills: true
+timeout_secs: 300
+workspace:
+  copies:
+    - from: ../../fixtures/scenarios/audit_structured/settings.yaml
+      to: fixtures/scenarios/audit_structured/settings.yaml
+
+turns:
+  - name: patch-logging-config-with-audit-summary
+    input: >
+      直接修改 fixtures/scenarios/audit_structured/settings.yaml：
+      把 logging.level 改成 info，
+      把 logging.pretty 改成 false，
+      把 logging.file_output 改成 "/var/log/app.log"，
+      按 production logging 模式统一，并说明改了什么。
+    expect:
+      require_execution_end: true
+      max_approvals: 0
+      max_errors: 0
+      assistant_contains:
+        - "logging.level"
+        - "logging.pretty"
+        - "logging.file_output"
+        - "explicit request"
+      artifact_contains:
+        - path: fixtures/scenarios/audit_structured/settings.yaml
+          text: "level: info"
+        - path: fixtures/scenarios/audit_structured/settings.yaml
+          text: "pretty: false"
+        - path: fixtures/scenarios/audit_structured/settings.yaml
+          text: "file_output: /var/log/app.log"
+      artifact_not_contains:
+        - path: fixtures/scenarios/audit_structured/settings.yaml
+          text: "level: debug"
+        - path: fixtures/scenarios/audit_structured/settings.yaml
+          text: "pretty: true"
+        - path: fixtures/scenarios/audit_structured/settings.yaml
+          text: "file_output: null"

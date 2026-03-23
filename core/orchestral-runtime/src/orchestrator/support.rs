@@ -216,3 +216,199 @@ pub(super) fn summarize_working_set(snapshot: &HashMap<String, Value>) -> String
 
     output
 }
+
+fn canonical_binding_keys(snapshot: &HashMap<String, Value>) -> Vec<String> {
+    const MAX_NESTED_DEPTH: usize = 3;
+
+    fn collect_nested_object_paths(
+        value: &Value,
+        prefix: &str,
+        depth: usize,
+        out: &mut Vec<String>,
+    ) {
+        if depth == 0 {
+            return;
+        }
+        let Some(object) = value.as_object() else {
+            return;
+        };
+
+        let mut keys = object.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        for key in keys {
+            let nested = format!("{}.{}", prefix, key);
+            out.push(nested.clone());
+            if let Some(next) = object.get(&key) {
+                collect_nested_object_paths(next, &nested, depth.saturating_sub(1), out);
+            }
+        }
+    }
+
+    fn has_more_specific_alias(snapshot: &HashMap<String, Value>, key: &str) -> bool {
+        !key.contains('.')
+            && snapshot.keys().any(|candidate| {
+                candidate.contains('.') && candidate.ends_with(&format!(".{}", key))
+            })
+    }
+
+    let mut top_level_keys = snapshot.keys().cloned().collect::<Vec<_>>();
+    top_level_keys.sort();
+    top_level_keys.dedup();
+
+    let mut bindings = Vec::new();
+    for key in top_level_keys {
+        if key.trim().is_empty() || has_more_specific_alias(snapshot, &key) {
+            continue;
+        }
+        bindings.push(key.clone());
+        if let Some(value) = snapshot.get(&key) {
+            collect_nested_object_paths(value, &key, MAX_NESTED_DEPTH, &mut bindings);
+        }
+    }
+
+    bindings.sort();
+    bindings.dedup();
+    bindings
+}
+
+fn lookup_binding_value<'a>(snapshot: &'a HashMap<String, Value>, key: &str) -> Option<&'a Value> {
+    if let Some(value) = snapshot.get(key) {
+        return Some(value);
+    }
+
+    let segments = key.split('.').collect::<Vec<_>>();
+    if segments.len() < 2 {
+        return None;
+    }
+
+    for split in (1..segments.len()).rev() {
+        let prefix = segments[..split].join(".");
+        let Some(mut current) = snapshot.get(&prefix) else {
+            continue;
+        };
+        let mut resolved = true;
+        for segment in &segments[split..] {
+            let Some(object) = current.as_object() else {
+                resolved = false;
+                break;
+            };
+            let Some(next) = object.get(*segment) else {
+                resolved = false;
+                break;
+            };
+            current = next;
+        }
+        if resolved {
+            return Some(current);
+        }
+    }
+
+    None
+}
+
+fn summarize_value_shape(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(_) => "boolean".to_string(),
+        Value::Number(_) => "number".to_string(),
+        Value::String(_) => "string".to_string(),
+        Value::Array(items) => {
+            let item_shape = items
+                .first()
+                .map(summarize_value_shape)
+                .unwrap_or_else(|| "unknown".to_string());
+            format!("array<{}>", item_shape)
+        }
+        Value::Object(map) => {
+            let mut keys = map.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            if keys.len() > 4 {
+                keys.truncate(4);
+                keys.push("...".to_string());
+            }
+            format!("object {{{}}}", keys.join(", "))
+        }
+    }
+}
+
+pub(super) fn summarize_available_bindings(snapshot: &HashMap<String, Value>) -> Vec<String> {
+    const MAX_BINDINGS: usize = 32;
+
+    canonical_binding_keys(snapshot)
+        .into_iter()
+        .take(MAX_BINDINGS)
+        .map(|key| format!("{{{{{}}}}}", key))
+        .collect()
+}
+
+pub(super) fn summarize_binding_shapes(snapshot: &HashMap<String, Value>) -> Vec<String> {
+    const MAX_BINDING_SHAPES: usize = 16;
+
+    canonical_binding_keys(snapshot)
+        .into_iter()
+        .filter_map(|key| {
+            let value = lookup_binding_value(snapshot, &key)?;
+            Some(format!(
+                "{{{{{}}}}} -> {}",
+                key,
+                summarize_value_shape(value)
+            ))
+        })
+        .take(MAX_BINDING_SHAPES)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_summarize_available_bindings_prefers_step_scoped_aliases_and_nested_paths() {
+        let snapshot = HashMap::from([
+            ("continuation".to_string(), json!({"status":"commit_ready"})),
+            (
+                "assess.continuation".to_string(),
+                json!({
+                    "status": "commit_ready",
+                    "fills": [{"cell": "F5", "value": 90}],
+                    "patch_spec": {"fills": [{"cell": "F5", "value": 90}]}
+                }),
+            ),
+            ("source_path".to_string(), json!("docs/report.xlsx")),
+            ("locate.source_path".to_string(), json!("docs/report.xlsx")),
+        ]);
+
+        let bindings = summarize_available_bindings(&snapshot);
+
+        assert!(bindings.contains(&"{{assess.continuation}}".to_string()));
+        assert!(bindings.contains(&"{{assess.continuation.fills}}".to_string()));
+        assert!(bindings.contains(&"{{assess.continuation.patch_spec}}".to_string()));
+        assert!(bindings.contains(&"{{locate.source_path}}".to_string()));
+        assert!(!bindings.contains(&"{{continuation}}".to_string()));
+        assert!(!bindings.contains(&"{{source_path}}".to_string()));
+    }
+
+    #[test]
+    fn test_summarize_binding_shapes_includes_nested_contract_hints() {
+        let snapshot = HashMap::from([(
+            "assess.continuation".to_string(),
+            json!({
+                "status": "commit_ready",
+                "fills": [{"cell": "F5", "value": 90}],
+                "patch_spec": {"fills": [{"cell": "F5", "value": 90}]}
+            }),
+        )]);
+
+        let shapes = summarize_binding_shapes(&snapshot);
+
+        assert!(shapes.contains(
+            &"{{assess.continuation}} -> object {fills, patch_spec, status}".to_string()
+        ));
+        assert!(
+            shapes.contains(&"{{assess.continuation.patch_spec}} -> object {fills}".to_string())
+        );
+        assert!(shapes
+            .contains(&"{{assess.continuation.fills}} -> array<object {cell, value}>".to_string()));
+    }
+}

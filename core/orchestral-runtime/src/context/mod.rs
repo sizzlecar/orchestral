@@ -12,42 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use orchestral_core::store::{
-    Event, EventStore, Reference, ReferenceStore, ReferenceType, StoreError,
-};
-
-/// Metadata key for summary reference ID
-pub const META_SUMMARY_REF: &str = "orchestral.summary_ref";
-/// Metadata key for source reference IDs
-pub const META_SOURCE_IDS: &str = "orchestral.source_ids";
-/// Metadata key for tags
-pub const META_TAGS: &str = "orchestral.tags";
-
-/// How to reference artifact content
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ContentSource {
-    /// Inline text content
-    InlineText { text: String },
-    /// Reference by ID (stored in ReferenceStore)
-    Reference { ref_id: String },
-    /// External URL
-    ExternalUrl { url: String },
-}
-
-/// Unified context artifact abstraction
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContextArtifact {
-    pub id: String,
-    pub ref_type: ReferenceType,
-    pub source: ContentSource,
-    #[serde(default)]
-    pub summary_id: Option<String>,
-    #[serde(default)]
-    pub source_ids: Vec<String>,
-    #[serde(default)]
-    pub metadata: HashMap<String, Value>,
-}
+use orchestral_core::store::{Event, EventStore, StoreError};
 
 /// A single context slice included in a context window
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,10 +90,6 @@ pub struct ContextRequest {
     #[serde(default)]
     pub include_history: bool,
     #[serde(default)]
-    pub include_references: bool,
-    #[serde(default)]
-    pub ref_type_filter: Option<Vec<ReferenceType>>,
-    #[serde(default)]
     pub tags: Vec<String>,
 }
 
@@ -141,8 +102,6 @@ impl ContextRequest {
             query: None,
             budget: TokenBudget::default(),
             include_history: true,
-            include_references: true,
-            ref_type_filter: None,
             tags: Vec::new(),
         }
     }
@@ -153,19 +112,11 @@ impl ContextRequest {
 pub struct ContextBuilderConfig {
     /// Max events to include (0 = all)
     pub history_limit: usize,
-    /// Max references to include (0 = all)
-    pub reference_limit: usize,
-    /// Whether to include summary references when available
-    pub include_summaries: bool,
 }
 
 impl Default for ContextBuilderConfig {
     fn default() -> Self {
-        Self {
-            history_limit: 50,
-            reference_limit: 20,
-            include_summaries: true,
-        }
+        Self { history_limit: 50 }
     }
 }
 
@@ -202,23 +153,6 @@ pub trait ThreadSummarizer: Send + Sync {
     ) -> Result<ThreadSummary, ContextError>;
 }
 
-/// Result of embedding a reference artifact.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmbeddedReference {
-    pub reference_id: String,
-    pub model: String,
-    pub vector: Vec<f32>,
-}
-
-/// Pluggable artifact embedding strategy.
-#[async_trait]
-pub trait ArtifactEmbedder: Send + Sync {
-    async fn embed_reference(
-        &self,
-        reference: &Reference,
-    ) -> Result<EmbeddedReference, ContextError>;
-}
-
 /// Context builder trait
 #[async_trait]
 pub trait ContextBuilder: Send + Sync {
@@ -228,27 +162,20 @@ pub trait ContextBuilder: Send + Sync {
 /// Basic context builder (rule-based, no LLM summarization)
 pub struct BasicContextBuilder {
     event_store: Arc<dyn EventStore>,
-    reference_store: Arc<dyn ReferenceStore>,
     config: ContextBuilderConfig,
 }
 
 impl BasicContextBuilder {
-    pub fn new(event_store: Arc<dyn EventStore>, reference_store: Arc<dyn ReferenceStore>) -> Self {
+    pub fn new(event_store: Arc<dyn EventStore>) -> Self {
         Self {
             event_store,
-            reference_store,
             config: ContextBuilderConfig::default(),
         }
     }
 
-    pub fn with_config(
-        event_store: Arc<dyn EventStore>,
-        reference_store: Arc<dyn ReferenceStore>,
-        config: ContextBuilderConfig,
-    ) -> Self {
+    pub fn with_config(event_store: Arc<dyn EventStore>, config: ContextBuilderConfig) -> Self {
         Self {
             event_store,
-            reference_store,
             config,
         }
     }
@@ -278,30 +205,6 @@ impl ContextBuilder for BasicContextBuilder {
             for event in events {
                 if let Some(slice) = event_to_slice(&event) {
                     push_slice_with_budget(&mut window, slice, SliceBucket::Core);
-                }
-            }
-        }
-
-        if request.include_references {
-            let references = if self.config.reference_limit == 0 {
-                self.reference_store
-                    .query_recent_by_thread(&request.thread_id, usize::MAX)
-                    .await?
-            } else {
-                self.reference_store
-                    .query_recent_by_thread(&request.thread_id, self.config.reference_limit)
-                    .await?
-            };
-
-            for reference in references {
-                if !matches_ref_type(&reference, request.ref_type_filter.as_ref()) {
-                    continue;
-                }
-                if !matches_tags(&reference, &request.tags) {
-                    continue;
-                }
-                if let Some(slice) = reference_to_slice(&reference, self.config.include_summaries) {
-                    push_slice_with_budget(&mut window, slice, SliceBucket::Optional);
                 }
             }
         }
@@ -356,53 +259,6 @@ fn event_to_slice(event: &Event) -> Option<ContextSlice> {
     }
 }
 
-fn reference_to_slice(reference: &Reference, include_summary: bool) -> Option<ContextSlice> {
-    let mut attachments = Vec::new();
-    let content = if include_summary {
-        if let Some(summary) = reference
-            .metadata
-            .get(META_SUMMARY_REF)
-            .and_then(|v| v.as_str())
-        {
-            format!("summary_ref:{}", summary)
-        } else {
-            reference_content_as_string(reference)
-        }
-    } else {
-        reference_content_as_string(reference)
-    };
-
-    match reference.ref_type {
-        ReferenceType::Image
-        | ReferenceType::Document
-        | ReferenceType::Binary
-        | ReferenceType::Code
-        | ReferenceType::Table
-        | ReferenceType::Audio
-        | ReferenceType::Video
-        | ReferenceType::Custom(_)
-        | ReferenceType::Text => {
-            attachments.push(reference.id.clone());
-        }
-    }
-
-    Some(ContextSlice {
-        role: "system".to_string(),
-        content,
-        attachments,
-        weight: 0.5,
-        metadata: reference.metadata.clone(),
-        timestamp: Some(reference.created_at),
-    })
-}
-
-fn reference_content_as_string(reference: &Reference) -> String {
-    match reference.content.as_str() {
-        Some(s) => s.to_string(),
-        None => reference.content.to_string(),
-    }
-}
-
 fn payload_to_string(payload: &Value) -> String {
     if let Some(s) = payload.as_str() {
         return s.to_string();
@@ -415,37 +271,10 @@ fn payload_to_string(payload: &Value) -> String {
     payload.to_string()
 }
 
-fn matches_ref_type(reference: &Reference, filter: Option<&Vec<ReferenceType>>) -> bool {
-    match filter {
-        None => true,
-        Some(list) => list.iter().any(|t| t == &reference.ref_type),
-    }
-}
-
-fn matches_tags(reference: &Reference, tags: &[String]) -> bool {
-    if tags.is_empty() {
-        return true;
-    }
-    if !reference.tags.is_empty() {
-        return tags.iter().all(|t| reference.tags.contains(t));
-    }
-    let ref_tags = reference
-        .metadata
-        .get(META_TAGS)
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    tags.iter().all(|t| ref_tags.contains(t))
-}
-
 #[derive(Copy, Clone)]
 enum SliceBucket {
     Core,
+    #[allow(dead_code)]
     Optional,
 }
 
@@ -473,15 +302,12 @@ fn estimate_slice_tokens(slice: &ContextSlice) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orchestral_core::store::{
-        Event, InMemoryEventStore, InMemoryReferenceStore, Reference, ReferenceType,
-    };
+    use orchestral_core::store::{Event, InMemoryEventStore};
     use serde_json::json;
 
     fn make_builder() -> BasicContextBuilder {
         let event_store = Arc::new(InMemoryEventStore::new());
-        let reference_store = Arc::new(InMemoryReferenceStore::new());
-        BasicContextBuilder::new(event_store, reference_store)
+        BasicContextBuilder::new(event_store)
     }
 
     #[test]
@@ -509,8 +335,6 @@ mod tests {
 
             let mut request = ContextRequest::new("thread-1");
             request.budget = TokenBudget::new(12);
-            request.include_references = false;
-
             let window = builder.build(&request).await.expect("build context");
             assert_eq!(window.core.len(), 2);
             assert_eq!(window.deferred.len(), 0);
@@ -519,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn test_context_budget_defers_optional_when_overflow() {
+    fn test_context_budget_defers_core_when_overflow() {
         tokio_test::block_on(async {
             let builder = make_builder();
             builder
@@ -530,29 +354,23 @@ mod tests {
                     json!("12345678901234567890"),
                 ))
                 .await
-                .expect("append event");
-
-            let mut reference = Reference::new(
-                "thread-2",
-                ReferenceType::Text,
-                json!("abcdefghijklmnopqrstuvwxyz"),
-            );
-            reference.id = "ref-1".to_string();
+                .expect("append event 1");
             builder
-                .reference_store
-                .add(reference)
+                .event_store
+                .append(Event::user_input(
+                    "thread-2",
+                    "i-2",
+                    json!("abcdefghijklmnopqrstuvwxyz"),
+                ))
                 .await
-                .expect("add reference");
+                .expect("append event 2");
 
             let mut request = ContextRequest::new("thread-2");
             request.budget = TokenBudget::new(8);
-            request.include_references = true;
 
             let window = builder.build(&request).await.expect("build context");
             assert_eq!(window.core.len(), 1);
-            assert_eq!(window.optional.len(), 0);
             assert_eq!(window.deferred.len(), 1);
-            assert_eq!(window.deferred[0].attachments, vec!["ref-1".to_string()]);
         });
     }
 }

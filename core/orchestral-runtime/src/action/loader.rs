@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -22,8 +21,6 @@ pub enum ActionConfigError {
     Config(#[from] ConfigError),
     #[error("build error: {0}")]
     Build(#[from] ActionBuildError),
-    #[error("notify error: {0}")]
-    Notify(#[from] notify::Error),
 }
 
 /// Loads action specs and maintains a live registry
@@ -90,38 +87,6 @@ impl ActionRegistryManager {
         log_registered_actions(&effective);
         Ok(count)
     }
-
-    pub fn start_watching(self: &Arc<Self>) -> Result<ActionWatcher, ActionConfigError> {
-        let manager = Arc::clone(self);
-        let handle = tokio::runtime::Handle::current();
-
-        let mut watcher: RecommendedWatcher =
-            notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-                if let Ok(event) = res {
-                    if matches!(
-                        event.kind,
-                        EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
-                    ) {
-                        let manager = Arc::clone(&manager);
-                        handle.spawn(async move {
-                            if let Err(e) = manager.load().await {
-                                tracing::error!("Action reload failed: {}", e);
-                            } else {
-                                tracing::info!("Actions reloaded from config");
-                            }
-                        });
-                    }
-                }
-            })?;
-
-        watcher.watch(&self.path, RecursiveMode::NonRecursive)?;
-        Ok(ActionWatcher { _watcher: watcher })
-    }
-}
-
-/// Keeps file watcher alive
-pub struct ActionWatcher {
-    _watcher: RecommendedWatcher,
 }
 
 fn log_registered_actions(actions: &HashMap<String, (ActionRegistrationSpec, ActionMeta)>) {
@@ -142,11 +107,13 @@ fn log_registered_actions(actions: &HashMap<String, (ActionRegistrationSpec, Act
         } else {
             metadata.capabilities.join(",")
         };
+        let category = metadata.category.as_deref().unwrap_or("-");
 
         tracing::info!(
             source = registration.source.as_str(),
             name = %spec.name,
             kind = %spec.kind,
+            category = %category,
             desc = %description,
             capabilities = %capabilities,
             input = %input,

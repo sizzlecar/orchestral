@@ -1,6 +1,8 @@
 mod actions;
 mod apply;
 mod assess;
+mod commit;
+mod derive;
 mod inspect;
 mod locate;
 mod model;
@@ -11,10 +13,16 @@ pub use self::actions::build_structured_action;
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use serde_json::{json, Value};
 
     use super::assess::assess_structured_readiness;
+    use super::commit::build_structured_patch_spec;
+    use super::derive::derive_structured_patch_candidates;
     use super::model::{json_to_toml_value, remove_json_pointer_value, set_json_pointer_value};
+    use super::verify::verify_structured_patch;
 
     #[test]
     fn test_assess_structured_readiness_accepts_enveloped_candidates() {
@@ -117,5 +125,160 @@ mod tests {
         assert!(rendered.contains("owner = \"platform-team\""));
         assert!(rendered.contains("[service]"));
         assert!(rendered.contains("enabled = true"));
+    }
+
+    #[test]
+    fn test_derive_structured_patch_candidates_resolves_explicit_set_request() {
+        let inspection = json!({
+            "files": [
+                {
+                    "path": "config/app.toml",
+                    "field_inventory": [
+                        {
+                            "pointer": "/server/port",
+                            "selector": "server.port",
+                            "value_type": "number",
+                            "value": 8080
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let (patch_candidates, summary) = derive_structured_patch_candidates(
+            "把 config/app.toml 里的 server.port 改成 9090，然后返回最终值。",
+            &inspection,
+            "strict",
+        )
+        .expect("derive");
+        let files = patch_candidates
+            .get("candidates")
+            .and_then(|value| value.get("files"))
+            .and_then(Value::as_array)
+            .expect("candidate files");
+        assert_eq!(files.len(), 1);
+        let operations = files[0]
+            .get("operations")
+            .and_then(Value::as_array)
+            .expect("operations");
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0]["op"], Value::String("set".to_string()));
+        assert_eq!(
+            operations[0]["path"],
+            Value::String("/server/port".to_string())
+        );
+        assert_eq!(operations[0]["value"], json!(9090));
+        assert_eq!(operations[0]["selector"], json!("server.port"));
+        assert_eq!(operations[0]["reason"], json!("explicit request"));
+        assert!(summary.contains("Derived"));
+    }
+
+    #[test]
+    fn test_build_structured_patch_spec_from_candidates() {
+        let patch_candidates = json!({
+            "candidates": {
+                "files": [
+                    {
+                        "path": "config/app.toml",
+                        "operations": [
+                            {
+                                "op": "set",
+                                "path": "/server/port",
+                                "value": 9090
+                            }
+                        ],
+                        "needs_user_input": false,
+                        "unknowns": []
+                    }
+                ]
+            },
+            "unknowns": [],
+            "assumptions": []
+        });
+
+        let (patch_spec, summary) =
+            build_structured_patch_spec(&patch_candidates).expect("build patch spec");
+        assert_eq!(patch_spec["files"][0]["path"], json!("config/app.toml"));
+        assert_eq!(
+            patch_spec["files"][0]["operations"][0]["path"],
+            json!("/server/port")
+        );
+        assert!(summary.contains("Prepared structured patch"));
+    }
+
+    #[test]
+    fn test_derive_structured_patch_candidates_keeps_quoted_path_values() {
+        let inspection = json!({
+            "files": [
+                {
+                    "path": "config/settings.yaml",
+                    "field_inventory": [
+                        {
+                            "pointer": "/logging/file_output",
+                            "selector": "logging.file_output",
+                            "value_type": "string",
+                            "value": null
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let (patch_candidates, _) = derive_structured_patch_candidates(
+            "把 logging.file_output 改成 \"/var/log/app.log\"，并说明改了什么。",
+            &inspection,
+            "strict",
+        )
+        .expect("derive");
+        let operation = &patch_candidates["candidates"]["files"][0]["operations"][0];
+        assert_eq!(operation["path"], json!("/logging/file_output"));
+        assert_eq!(operation["value"], json!("/var/log/app.log"));
+    }
+
+    #[test]
+    fn test_verify_structured_patch_emits_audit_summary() {
+        let patch_spec = json!({
+            "files": [
+                {
+                    "path": "config/settings.yaml",
+                    "operations": [
+                        {
+                            "op": "set",
+                            "path": "/logging/level",
+                            "selector": "logging.level",
+                            "reason": "explicit request",
+                            "value": "info"
+                        }
+                    ]
+                }
+            ]
+        });
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_millis();
+        let root = std::env::temp_dir().join(format!("orchestral-structured-verify-{}", unique));
+        fs::create_dir_all(root.join("config")).expect("create config dir");
+        fs::write(
+            root.join("config/settings.yaml"),
+            "logging:\n  level: info\n",
+        )
+        .expect("write yaml");
+        let patch_spec = json!({
+            "files": [
+                {
+                    "path": root.join("config/settings.yaml").display().to_string(),
+                    "operations": patch_spec["files"][0]["operations"].clone()
+                }
+            ]
+        });
+
+        let (decision, summary) = verify_structured_patch(&patch_spec, None).expect("verify");
+        assert_eq!(
+            decision.status,
+            orchestral_core::types::VerifyStatus::Passed
+        );
+        assert!(summary.contains("logging.level"));
+        assert!(summary.contains("explicit request"));
     }
 }

@@ -175,6 +175,7 @@ fn collect_mcp_action_registration_specs(
                 name: action_name,
                 kind: "mcp_server".to_string(),
                 description: Some(description),
+                category: None,
                 config: json!({
                     "server_name": name,
                     "command": server.command,
@@ -530,6 +531,7 @@ mod tests {
             name: "mcp__alpha".to_string(),
             kind: "echo".to_string(),
             description: Some("explicit override".to_string()),
+            category: None,
             config: json!({"prefix":"Echo: "}),
             interface: None,
         }];
@@ -574,6 +576,7 @@ mod tests {
             name: "echo_demo".to_string(),
             kind: "echo".to_string(),
             description: Some("explicit action".to_string()),
+            category: None,
             config: json!({"prefix":"Echo: "}),
             interface: None,
         }];

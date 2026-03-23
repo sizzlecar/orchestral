@@ -1,0 +1,48 @@
+version: 1
+name: resume-after-action-failure-xlsx
+config: ../orchestral.cli.yaml
+env_file: ../../fixtures/scenarios/resume_after_failure/test.env
+no_mcp: true
+timeout_secs: 300
+workspace:
+  copies:
+    - from: ../../docs/绩效考核-2025Q4_副本.xlsx
+      to: docs/绩效考核-2025Q4_运行副本.xlsx
+
+turns:
+  - name: fail-once-during-commit-apply
+    input: >
+      用 xlsx skill 看 docs 目前下的 excel 内容，把需要填的都填了。
+    expect:
+      require_execution_end: true
+      execution_status: waiting_user
+      max_approvals: 0
+      max_errors: 1
+      persist_contains:
+        - "Reply 继续/重试 to retry from the failed step"
+      persist_not_contains:
+        - "Workbook updated and verified."
+      activity_contains:
+        - "spreadsheet_apply_patch failed=true"
+  - name: resume-from-failed-apply-step
+    input: >
+      继续
+    expect:
+      require_execution_end: true
+      max_approvals: 0
+      max_errors: 0
+      persist_contains:
+        - "Workbook updated and verified."
+      activity_contains:
+        - "spreadsheet_apply_patch"
+        - "spreadsheet_verify_patch"
+      activity_not_contains:
+        - "spreadsheet_locate"
+        - "spreadsheet_inspect"
+        - "spreadsheet_assess_readiness"
+    verify:
+      - name: workbook-fill-quality
+        command: ../../.claude/skills/xlsx/.venv/bin/python3
+        args:
+          - validators/verify_perf_review_fill.py
+          - docs/绩效考核-2025Q4_运行副本.xlsx

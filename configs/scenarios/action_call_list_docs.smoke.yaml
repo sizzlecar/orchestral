@@ -1,0 +1,31 @@
+version: 1
+name: action-call-list-docs
+config: ../orchestral.cli.yaml
+no_mcp: true
+no_skills: true
+timeout_secs: 180
+workspace:
+  copies:
+    - from: ../../fixtures/scenarios/action_call_list_docs/docs
+      to: docs
+
+turns:
+  - name: list-docs-dir
+    input: >
+      docs下面有什么文件
+    expect:
+      require_execution_end: true
+      max_approvals: 0
+      max_errors: 0
+      execution_mode_contains:
+        - "single_action"
+        - "done"
+      assistant_contains:
+        - "alpha.md"
+        - "beta.txt"
+      assistant_not_contains:
+        - "```shell"
+        - "请告诉我执行结果"
+        - "请确认"
+      persist_not_contains:
+        - "Plan: no actions"

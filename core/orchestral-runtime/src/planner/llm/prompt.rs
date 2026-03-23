@@ -1,24 +1,60 @@
+use std::collections::BTreeSet;
 use std::fmt::Write;
 
-use orchestral_core::planner::{HistoryItem, PlannerContext, SkillInstruction};
-use orchestral_core::types::{DerivationPolicy, Intent};
+use orchestral_core::action::ActionMeta;
+use orchestral_core::planner::{HistoryItem, PlannerContext, PlannerLoopContext, SkillInstruction};
+use orchestral_core::types::Intent;
+
+use super::catalog::build_capability_catalog;
+
+const PLANNER_CONSTITUTION: &str = include_str!("../../prompts/planner_constitution.md");
+const OUTPUT_CONTRACT: &str = include_str!("../../prompts/output_contract.md");
+const PLANNER_EXECUTION_RULES: &str = include_str!("../../prompts/planner_execution_rules.md");
+const PLANNER_USER_RULES: &str = include_str!("../../prompts/planner_user_rules.md");
+const EXAMPLE_SINGLE_ACTION_SHELL: &str =
+    include_str!("../../prompts/examples/single_action_shell.json");
+const EXAMPLE_SINGLE_ACTION_FILE_READ: &str =
+    include_str!("../../prompts/examples/single_action_file_read.json");
+const EXAMPLE_SINGLE_ACTION_FILE_WRITE: &str =
+    include_str!("../../prompts/examples/single_action_file_write.json");
+const EXAMPLE_SINGLE_ACTION_HTTP: &str =
+    include_str!("../../prompts/examples/single_action_http.json");
+const EXAMPLE_MINI_PLAN: &str = include_str!("../../prompts/examples/mini_plan.json");
+const EXAMPLE_DONE: &str = include_str!("../../prompts/examples/done.json");
+const EXAMPLE_NEED_INPUT: &str = include_str!("../../prompts/examples/need_input.json");
+const ACTION_SELECTOR_RULES: &str = r#"You are the Orchestral Action Selector.
+Choose the smallest safe action subset for the next planner iteration.
+Return JSON only with this shape:
+{"selected_actions":["file_read"],"blocked_actions":["shell"],"reason":"typed file actions are sufficient"}
+
+Rules:
+- Only choose from the listed action names.
+- Prefer typed and narrow actions over generic shell commands when both can solve the current step.
+- Prefer staying within one typed artifact category when that category already provides collect/inspect/derive/apply/verify coverage.
+- Verify coverage from the listed actions and schema contracts; do not assume missing stages exist.
+- When a schema field lists allowed enum values, use only those enum values.
+- Do not mix derive/build actions from one typed category with apply/verify actions from another unless their `patch_spec` contracts explicitly match.
+- Do not select `file_read` for binary artifacts such as `.xlsx`, `.xlsm`, `.docx`, or `.pdf`.
+- Keep enough actions for the planner to inspect, apply, and verify in the same iteration if needed.
+- Select no more than the requested maximum number of actions.
+- Use blocked_actions for actions that should stay out of the planner prompt for this iteration."#;
 
 #[derive(Debug, Clone, Copy, Default)]
-struct ReactorPromptCoverage {
-    spreadsheet: bool,
-    document: bool,
-    structured: bool,
+struct SingleActionCoverage {
+    shell: bool,
+    file_read: bool,
+    file_write: bool,
+    http: bool,
 }
 
-pub(super) fn build_reactor_prompt(
+pub(super) fn build_planner_prompt(
     base: &str,
     intent: &Intent,
     context: &PlannerContext,
     max_history: usize,
-    default_policy: DerivationPolicy,
 ) -> (String, String) {
-    let coverage = detect_reactor_prompt_coverage(context);
-    let system = build_reactor_system_prompt(base, context, default_policy, coverage);
+    let single_action_coverage = detect_single_action_coverage(context);
+    let system = build_planner_system_prompt(base, context);
     let mut user = String::new();
     user.push_str(&format!("Intent:\n{}\n\n", intent.content));
 
@@ -30,39 +66,41 @@ pub(super) fn build_reactor_prompt(
         user.push('\n');
     }
 
-    let default_policy = match default_policy {
-        DerivationPolicy::Strict => "strict",
-        DerivationPolicy::Permissive => "permissive",
-    };
+    if let Some(loop_context) = &context.loop_context {
+        let block = build_loop_context_block(loop_context);
+        if !block.is_empty() {
+            user.push_str(&block);
+            user.push('\n');
+        }
+    }
 
-    user.push_str("Return exactly one JSON object:\n");
-    append_reactor_choice_examples(&mut user, coverage);
-    user.push_str(r#"{"type":"DIRECT_RESPONSE","message":"..."}"#);
-    user.push('\n');
-    user.push_str(r#"{"type":"CLARIFICATION","question":"..."}"#);
-    user.push_str(
-        "\nRules:\n- JSON only.\n- For supported local artifact work, first pass should prefer SKELETON_CHOICE.\n- Use STAGE_CHOICE when the task already belongs to a skeleton and you are choosing the next stage.\n- For SKELETON_CHOICE, initial_stage should follow the skeleton default unless current evidence clearly requires a later stage.\n- skeleton must be one of the supported skeletons.\n- artifact_family must match a supported family when returning STAGE_CHOICE; for SKELETON_CHOICE it may be omitted if not yet certain.\n- derivation_policy must be \"strict\" or \"permissive\" when returning STAGE_CHOICE.\n",
-    );
-    user.push_str(&format!(
-        "- Default derivation_policy is \"{}\" unless the task clearly needs otherwise.\n",
-        default_policy
-    ));
-    user.push_str("- Do not generate a full workflow DAG for supported reactor tasks.\n");
-    user.push_str("- Continuation is structural. Prefer explicit wait_user or next_stage_hint over vague narration.\n");
-    user.push_str("- Never use assistant narration as a completion signal.\n");
+    user.push_str(OUTPUT_CONTRACT);
+    user.push_str("\n\nExamples:\n");
+    append_single_action_examples(&mut user, single_action_coverage);
+    append_example_line(&mut user, EXAMPLE_MINI_PLAN);
+    append_example_line(&mut user, EXAMPLE_DONE);
+    append_example_line(&mut user, EXAMPLE_NEED_INPUT);
+    append_rule_block(&mut user, PLANNER_USER_RULES);
+    append_rule_lines(&mut user, PLANNER_EXECUTION_RULES);
 
     (system, user)
 }
 
-pub(super) fn build_non_reactor_prompt(
+pub(super) fn build_action_selector_prompt(
     base: &str,
     intent: &Intent,
     context: &PlannerContext,
     max_history: usize,
+    max_selected_actions: usize,
 ) -> (String, String) {
-    let system = build_non_reactor_system_prompt(base, context);
+    let system = build_action_selector_system_prompt(base, context);
     let mut user = String::new();
-    user.push_str(&format!("Intent:\n{}\n\n", intent.content));
+    let _ = writeln!(
+        user,
+        "Select the smallest safe action subset for the next planner iteration."
+    );
+    let _ = writeln!(user, "Maximum selected actions: {}", max_selected_actions);
+    let _ = writeln!(user, "\nIntent:\n{}\n", intent.content);
 
     if !context.history.is_empty() {
         user.push_str("History:\n");
@@ -72,18 +110,25 @@ pub(super) fn build_non_reactor_prompt(
         user.push('\n');
     }
 
-    user.push_str("Return exactly one JSON object:\n");
-    user.push_str(r#"{"type":"DIRECT_RESPONSE","message":"..."}"#);
-    user.push('\n');
-    user.push_str(r#"{"type":"CLARIFICATION","question":"..."}"#);
-    user.push_str(
-        "\nRules:\n- JSON only.\n- Reactor execution is disabled for this planner invocation.\n- Do not emit workflow, plan, recipe, or action topology.\n- If execution is required, ask a clarification instead of inventing an execution graph.\n",
-    );
+    if let Some(loop_context) = &context.loop_context {
+        let block = build_loop_context_block(loop_context);
+        if !block.is_empty() {
+            user.push_str(&block);
+            user.push('\n');
+        }
+    }
+
+    let action_catalog = build_action_selector_catalog(&context.available_actions);
+    if !action_catalog.is_empty() {
+        user.push_str("Available Actions:\n");
+        user.push_str(&action_catalog);
+    }
+    user.push_str("\nReturn JSON only.\n");
 
     (system, user)
 }
 
-pub(super) fn build_non_reactor_system_prompt(base: &str, context: &PlannerContext) -> String {
+pub(super) fn build_planner_system_prompt(base: &str, context: &PlannerContext) -> String {
     let execution_environment = build_execution_environment_block(context);
     let skill_knowledge = build_skill_knowledge_block(&context.skill_instructions);
     let mut out = String::new();
@@ -91,9 +136,32 @@ pub(super) fn build_non_reactor_system_prompt(base: &str, context: &PlannerConte
         out.push_str(base.trim());
         out.push_str("\n\n");
     }
-    out.push_str("You are Orchestral Planner.\n");
-    out.push_str("Execution planning is disabled in this mode.\n");
-    out.push_str("Return only DIRECT_RESPONSE or CLARIFICATION.\n");
+    out.push_str(PLANNER_CONSTITUTION);
+    let capability_catalog = build_capability_catalog(&context.available_actions);
+    if !capability_catalog.trim().is_empty() {
+        out.push('\n');
+        out.push_str(&capability_catalog);
+    }
+    if !execution_environment.trim().is_empty() {
+        out.push('\n');
+        out.push_str(&execution_environment);
+    }
+    if !skill_knowledge.trim().is_empty() {
+        out.push('\n');
+        out.push_str(&skill_knowledge);
+    }
+    out
+}
+
+fn build_action_selector_system_prompt(base: &str, context: &PlannerContext) -> String {
+    let execution_environment = build_execution_environment_block(context);
+    let skill_knowledge = build_skill_knowledge_block(&context.skill_instructions);
+    let mut out = String::new();
+    if !base.trim().is_empty() {
+        out.push_str(base.trim());
+        out.push_str("\n\n");
+    }
+    out.push_str(ACTION_SELECTOR_RULES.trim());
     if !execution_environment.trim().is_empty() {
         out.push('\n');
         out.push_str(&execution_environment);
@@ -115,81 +183,214 @@ pub(super) fn truncate_for_log(input: &str, max_chars: usize) -> String {
     preview
 }
 
-fn detect_reactor_prompt_coverage(context: &PlannerContext) -> ReactorPromptCoverage {
-    ReactorPromptCoverage {
-        spreadsheet: has_reactor_actions(
-            context,
-            &[
-                "reactor_spreadsheet_locate",
-                "reactor_spreadsheet_inspect",
-                "reactor_spreadsheet_assess_readiness",
-                "reactor_spreadsheet_apply_patch",
-                "reactor_spreadsheet_verify_patch",
-            ],
-        ),
-        document: has_reactor_actions(
-            context,
-            &[
-                "reactor_document_locate",
-                "reactor_document_inspect",
-                "reactor_document_assess_readiness",
-                "reactor_document_apply_patch",
-                "reactor_document_verify_patch",
-            ],
-        ),
-        structured: has_reactor_actions(
-            context,
-            &[
-                "reactor_structured_locate",
-                "reactor_structured_inspect",
-                "reactor_structured_assess_readiness",
-                "reactor_structured_apply_patch",
-                "reactor_structured_verify_patch",
-            ],
-        ),
+fn detect_single_action_coverage(context: &PlannerContext) -> SingleActionCoverage {
+    SingleActionCoverage {
+        shell: has_action(context, "shell"),
+        file_read: has_action(context, "file_read"),
+        file_write: has_action(context, "file_write"),
+        http: has_action(context, "http"),
     }
 }
 
-fn has_reactor_actions(context: &PlannerContext, names: &[&str]) -> bool {
-    names.iter().all(|name| {
-        context
-            .available_actions
+fn has_action(context: &PlannerContext, name: &str) -> bool {
+    context
+        .available_actions
+        .iter()
+        .any(|action| action.name == name)
+}
+
+fn append_single_action_examples(buf: &mut String, coverage: SingleActionCoverage) {
+    if coverage.shell {
+        append_example_line(buf, EXAMPLE_SINGLE_ACTION_SHELL);
+    }
+    if coverage.file_read {
+        append_example_line(buf, EXAMPLE_SINGLE_ACTION_FILE_READ);
+    }
+    if coverage.file_write {
+        append_example_line(buf, EXAMPLE_SINGLE_ACTION_FILE_WRITE);
+    }
+    if coverage.http {
+        append_example_line(buf, EXAMPLE_SINGLE_ACTION_HTTP);
+    }
+}
+
+fn append_rule_block(buf: &mut String, block: &str) {
+    buf.push('\n');
+    buf.push_str(block.trim());
+    buf.push('\n');
+}
+
+fn append_rule_lines(buf: &mut String, block: &str) {
+    for line in block.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        buf.push_str("- ");
+        buf.push_str(line);
+        buf.push('\n');
+    }
+}
+
+fn append_example_line(buf: &mut String, example: &str) {
+    buf.push_str(example.trim());
+    buf.push('\n');
+}
+
+fn build_action_selector_catalog(actions: &[ActionMeta]) -> String {
+    let mut out = String::new();
+    for action in actions {
+        let _ = writeln!(out, "- {}: {}", action.name, action.description);
+        if let Some(category) = action.category.as_deref() {
+            let _ = writeln!(out, "  category: {}", category);
+        }
+        if !action.capabilities.is_empty() {
+            let _ = writeln!(out, "  capabilities: {}", action.capabilities.join(", "));
+        }
+        if !action.input_kinds.is_empty() {
+            let _ = writeln!(out, "  consumes: {}", action.input_kinds.join(", "));
+        }
+        if !action.output_kinds.is_empty() {
+            let _ = writeln!(out, "  produces: {}", action.output_kinds.join(", "));
+        }
+
+        let input_fields = summarize_schema_fields(&action.input_schema);
+        if !input_fields.is_empty() {
+            let _ = writeln!(out, "  input_fields: {}", input_fields.join(", "));
+        }
+
+        let output_fields = summarize_schema_fields(&action.output_schema);
+        if !output_fields.is_empty() {
+            let _ = writeln!(out, "  output_fields: {}", output_fields.join(", "));
+        }
+    }
+    out
+}
+
+fn summarize_schema_fields(schema: &serde_json::Value) -> Vec<String> {
+    let properties = match schema.get("properties").and_then(|value| value.as_object()) {
+        Some(properties) => properties,
+        None => return Vec::new(),
+    };
+    let required = schema_required_fields(schema);
+    let mut names = properties.keys().cloned().collect::<Vec<_>>();
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| {
+            summarize_schema_field(&name, &properties[&name], required.contains(name.as_str()))
+        })
+        .collect()
+}
+
+fn summarize_schema_field(name: &str, schema: &serde_json::Value, required: bool) -> String {
+    let mut label = if required {
+        format!("{} (required)", name)
+    } else {
+        name.to_string()
+    };
+    let mut hints = Vec::new();
+
+    if let Some(values) = schema.get("enum").and_then(|value| value.as_array()) {
+        let items = values
             .iter()
-            .any(|action| action.name == *name)
-    })
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        if !items.is_empty() {
+            hints.push(format!("enum: {}", items.join(" | ")));
+        }
+    }
+
+    if let Some(shape) = summarize_object_shape(schema) {
+        hints.push(format!("shape: {}", shape));
+    }
+
+    if let Some(description) = schema.get("description").and_then(|value| value.as_str()) {
+        if description.to_ascii_lowercase().contains("utf-8") {
+            hints.push("UTF-8 text".to_string());
+        }
+    }
+
+    if !hints.is_empty() {
+        label.push_str(&format!(" [{}]", hints.join("; ")));
+    }
+    label
 }
 
-fn append_reactor_choice_examples(buf: &mut String, coverage: ReactorPromptCoverage) {
-    if coverage.spreadsheet {
-        buf.push_str(
-            r#"{"type":"SKELETON_CHOICE","skeleton":"locate_and_patch","artifact_family":"spreadsheet","initial_stage":"locate","confidence":0.9,"reason":"..."}"#,
-        );
-        buf.push('\n');
-        buf.push_str(
-            r#"{"type":"STAGE_CHOICE","skeleton":"locate_and_patch","artifact_family":"spreadsheet","current_stage":"probe","stage_goal":"inspect workbook structure","derivation_policy":"permissive","next_stage_hint":"derive","reason":"..."}"#,
-        );
-        buf.push('\n');
+fn summarize_object_shape(schema: &serde_json::Value) -> Option<String> {
+    let properties = schema
+        .get("properties")
+        .and_then(|value| value.as_object())?;
+    if properties.is_empty() {
+        return None;
     }
-    if coverage.document {
-        buf.push_str(
-            r#"{"type":"SKELETON_CHOICE","skeleton":"locate_and_patch","artifact_family":"document","initial_stage":"locate","confidence":0.9,"reason":"..."}"#,
-        );
-        buf.push('\n');
-        buf.push_str(
-            r#"{"type":"STAGE_CHOICE","skeleton":"locate_and_patch","artifact_family":"document","current_stage":"probe","stage_goal":"inspect document structure","derivation_policy":"permissive","next_stage_hint":"derive","reason":"..."}"#,
-        );
-        buf.push('\n');
+    let required = schema_required_fields(schema);
+    let mut names = properties.keys().cloned().collect::<Vec<_>>();
+    names.sort();
+    if names.len() > 4 {
+        names.truncate(4);
+        names.push("...".to_string());
     }
-    if coverage.structured {
-        buf.push_str(
-            r#"{"type":"SKELETON_CHOICE","skeleton":"locate_and_patch","artifact_family":"structured","initial_stage":"locate","confidence":0.9,"reason":"..."}"#,
+    let summary = names
+        .into_iter()
+        .map(|name| {
+            if required.contains(name.as_str()) {
+                format!("{}*", name)
+            } else {
+                name
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("{{{}}}", summary))
+}
+
+fn schema_required_fields(schema: &serde_json::Value) -> BTreeSet<&str> {
+    schema
+        .get("required")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str())
+        .collect()
+}
+
+fn build_loop_context_block(loop_context: &PlannerLoopContext) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Observed Execution State:\n- iteration: {}/{}",
+        loop_context.iteration, loop_context.max_iterations
+    );
+    if !loop_context.completed_step_ids.is_empty() {
+        let _ = writeln!(
+            out,
+            "- completed_step_ids: {}",
+            loop_context.completed_step_ids.join(", ")
         );
-        buf.push('\n');
-        buf.push_str(
-            r#"{"type":"STAGE_CHOICE","skeleton":"locate_and_patch","artifact_family":"structured","current_stage":"probe","stage_goal":"inspect structured artifact contents","derivation_policy":"strict","next_stage_hint":"derive","reason":"..."}"#,
-        );
-        buf.push('\n');
     }
+    if !loop_context.available_bindings.is_empty() {
+        out.push_str("Available Bindings:\n");
+        for binding in &loop_context.available_bindings {
+            let _ = writeln!(out, "- {}", binding);
+        }
+    }
+    if !loop_context.binding_shapes.is_empty() {
+        out.push_str("Binding Shapes:\n");
+        for shape in &loop_context.binding_shapes {
+            let _ = writeln!(out, "- {}", shape);
+        }
+    }
+    if !loop_context.recent_observations.is_empty() {
+        out.push_str("Recent Observations:\n");
+        for item in &loop_context.recent_observations {
+            let _ = writeln!(out, "- {}", item);
+        }
+    }
+    if let Some(preview) = &loop_context.working_set_preview {
+        if !preview.trim().is_empty() {
+            out.push_str("Working Set Snapshot:\n");
+            out.push_str(preview.trim());
+            out.push('\n');
+        }
+    }
+    out
 }
 
 fn select_history_for_prompt(history: &[HistoryItem], max_history: usize) -> Vec<&HistoryItem> {
@@ -216,110 +417,39 @@ fn select_history_for_prompt(history: &[HistoryItem], max_history: usize) -> Vec
     selected
 }
 
-fn build_reactor_system_prompt(
-    base: &str,
-    context: &PlannerContext,
-    default_policy: DerivationPolicy,
-    coverage: ReactorPromptCoverage,
-) -> String {
-    let execution_environment = build_execution_environment_block(context);
-    let skill_knowledge = build_skill_knowledge_block(&context.skill_instructions);
-    let mut out = String::new();
-    if !base.trim().is_empty() {
-        out.push_str(base.trim());
-        out.push_str("\n\n");
-    }
-
-    out.push_str("You are Orchestral Reactor Planner.\n");
-    out.push_str("This prompt is a short constitution, not a full execution manual.\n");
-    out.push_str(
-        "Planner decides only skeleton selection, current stage, family hint, and derivation posture.\n",
-    );
-    out.push_str("Runtime owns stage lowering, typed action wiring, continuation handling, and verify gates.\n");
-    out.push_str("Continuation must be explicit. Done may only come from verify success.\n");
-    out.push_str(
-        "Do not design a full end-to-end workflow when skeleton/stage choice is sufficient.\n",
-    );
-
-    out.push_str("\nBuilt-in skeleton vocabulary:\n");
-    out.push_str("- locate_and_patch\n");
-    out.push_str("- inspect_and_extract\n");
-    out.push_str("- inspect_and_transform\n");
-    out.push_str("- compare_and_sync\n");
-    out.push_str("- run_and_verify\n");
-
-    out.push_str("\nCurrent executable coverage:\n");
-    if coverage.spreadsheet {
-        out.push_str("- skeleton=locate_and_patch, artifact_family=spreadsheet\n");
-        out.push_str(
-            "  covered stage path: locate -> probe -> derive -> assess -> commit -> verify\n",
-        );
-        out.push_str("  probe must end with explicit continuation\n");
-        out.push_str("  verify is the done gate\n");
-    }
-    if coverage.document {
-        out.push_str("- skeleton=locate_and_patch, artifact_family=document\n");
-        out.push_str(
-            "  covered stage path: locate -> probe -> derive -> assess -> commit -> verify\n",
-        );
-        out.push_str("  probe must end with explicit continuation\n");
-        out.push_str("  verify is the done gate\n");
-    }
-    if coverage.structured {
-        out.push_str("- skeleton=locate_and_patch, artifact_family=structured\n");
-        out.push_str(
-            "  covered stage path: locate -> probe -> derive -> assess -> commit -> verify\n",
-        );
-        out.push_str("  probe must end with explicit continuation\n");
-        out.push_str("  verify is the done gate\n");
-    }
-    if !coverage.spreadsheet && !coverage.document && !coverage.structured {
-        out.push_str("- no executable reactor family coverage detected for this request\n");
-    }
-    out.push_str("- default derivation_policy: ");
-    out.push_str(match default_policy {
-        DerivationPolicy::Strict => "strict",
-        DerivationPolicy::Permissive => "permissive",
-    });
-    out.push('\n');
-
-    out.push_str("\nHard rules:\n");
-    out.push_str("- Return JSON only.\n");
-    out.push_str("- Prefer SKELETON_CHOICE or STAGE_CHOICE for supported local artifact tasks.\n");
-    out.push_str("- For SKELETON_CHOICE, initial_stage should follow the skeleton default unless current evidence clearly requires a later stage.\n");
-    out.push_str("- Choose only from current executable coverage unless the user explicitly asks for a different reactor skeleton experiment.\n");
-    out.push_str("- Do not emit a full workflow DAG for supported reactor tasks.\n");
-    out.push_str("- Treat artifact_family as an adapter hint, not as task shape.\n");
-    out.push_str("- Treat verification as the only done gate.\n");
-
-    if !execution_environment.trim().is_empty() {
-        out.push('\n');
-        out.push_str(&execution_environment);
-    }
-    if !skill_knowledge.trim().is_empty() {
-        out.push('\n');
-        out.push_str(&skill_knowledge);
-    }
-    out
-}
-
 fn build_skill_knowledge_block(skills: &[SkillInstruction]) -> String {
     if skills.is_empty() {
         return String::new();
     }
 
+    fn compact_skill_lines(instructions: &str) -> Vec<String> {
+        let mut selected = Vec::new();
+        for line in instructions
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            if line.starts_with("summary:")
+                || line.starts_with("scripts:")
+                || (selected.is_empty() && !line.starts_with("keywords:") && !line.starts_with('-'))
+            {
+                selected.push(line.to_string());
+            }
+            if selected.len() >= 2 {
+                break;
+            }
+        }
+        selected
+    }
+
     let mut out = String::new();
     out.push_str("Activated Skills:\n");
     out.push_str(
-        "Only execute scripts that are listed under scripts discovered or verified at runtime; never invent script filenames.\n",
+        "Treat skills as optional execution hints. Prefer registered actions when they already satisfy the task. Only execute scripts that are listed under scripts discovered or verified at runtime; never invent script filenames.\n",
     );
     for skill in skills {
         let _ = writeln!(out, "- {}", skill.skill_name);
-        for line in skill.instructions.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
+        for line in compact_skill_lines(&skill.instructions) {
             let _ = writeln!(out, "  {}", line);
         }
         if let Some(path) = &skill.skill_path {
@@ -391,4 +521,124 @@ fn resolve_python_path(skills: &[SkillInstruction]) -> Option<String> {
         return Some(".venv/bin/python3".to_string());
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use orchestral_core::action::ActionMeta;
+    use orchestral_core::planner::{PlannerContext, PlannerLoopContext};
+    use serde_json::json;
+
+    use super::*;
+
+    fn planner_context(actions: Vec<ActionMeta>) -> PlannerContext {
+        PlannerContext::new(actions)
+    }
+
+    #[test]
+    fn test_planner_prompt_uses_template_rules_and_examples() {
+        let context = planner_context(vec![
+            ActionMeta::new("shell", "shell"),
+            ActionMeta::new("file_read", "read"),
+        ]);
+
+        let (system, user) = build_planner_prompt("", &Intent::new("列出 docs 文件"), &context, 2);
+
+        assert!(system.contains(PLANNER_CONSTITUTION.trim()));
+        assert!(user.contains(PLANNER_USER_RULES.trim()));
+        assert!(user.contains(EXAMPLE_SINGLE_ACTION_SHELL.trim()));
+        assert!(user.contains(EXAMPLE_SINGLE_ACTION_FILE_READ.trim()));
+        assert!(user.contains(EXAMPLE_MINI_PLAN.trim()));
+        assert!(user.contains(EXAMPLE_DONE.trim()));
+        assert!(user.contains(EXAMPLE_NEED_INPUT.trim()));
+    }
+
+    #[test]
+    fn test_planner_prompt_includes_observed_execution_state() {
+        let context = planner_context(vec![ActionMeta::new("shell", "shell")]).with_loop_context(
+            PlannerLoopContext {
+                iteration: 2,
+                max_iterations: 6,
+                recent_observations: vec!["iteration 1 completed shell and captured stdout".into()],
+                completed_step_ids: vec!["single_action".into()],
+                available_bindings: vec!["{{single_action.stdout}}".into()],
+                binding_shapes: vec!["{{single_action.stdout}} -> string".into()],
+                working_set_preview: Some("  single_action.stdout: \"README.md\"".into()),
+            },
+        );
+
+        let (_system, user) =
+            build_planner_prompt("", &Intent::new("继续检查结果然后回复"), &context, 2);
+
+        assert!(user.contains("Observed Execution State:"));
+        assert!(user.contains("iteration: 2/6"));
+        assert!(user.contains("Available Bindings:"));
+        assert!(user.contains("{{single_action.stdout}}"));
+        assert!(user.contains("Binding Shapes:"));
+        assert!(user.contains("{{single_action.stdout}} -> string"));
+        assert!(user.contains("iteration 1 completed shell and captured stdout"));
+        assert!(user.contains("single_action.stdout"));
+    }
+
+    #[test]
+    fn test_action_selector_prompt_includes_action_metadata() {
+        let context = planner_context(vec![
+            ActionMeta::new("file_write", "Write markdown to file")
+                .with_category("document")
+                .with_capabilities(["filesystem_write", "side_effect"])
+                .with_input_kinds(["path", "text"])
+                .with_output_kinds(["path"])
+                .with_input_schema(json!({
+                    "type":"object",
+                    "properties":{
+                        "content":{"type":"string","description":"File content as UTF-8 text."},
+                        "path":{"type":"string"}
+                    },
+                    "required":["path","content"]
+                }))
+                .with_output_schema(json!({
+                    "type":"object",
+                    "properties":{
+                        "bytes":{"type":"integer"},
+                        "path":{"type":"string"},
+                        "mode":{"type":"string","enum":["strict","permissive"]}
+                    }
+                })),
+            ActionMeta::new("shell", "Run a shell command")
+                .with_category("direct")
+                .with_capabilities(["filesystem_read", "shell"]),
+        ])
+        .with_loop_context(PlannerLoopContext {
+            iteration: 3,
+            max_iterations: 6,
+            recent_observations: vec!["iteration 2 produced markdown diagnostics".into()],
+            completed_step_ids: vec!["inspect_docs".into()],
+            available_bindings: vec!["{{diagnostics.count}}".into()],
+            binding_shapes: vec!["{{diagnostics.count}} -> number".into()],
+            working_set_preview: Some("  diagnostics.count: 4".into()),
+        });
+
+        let (system, user) = build_action_selector_prompt(
+            "Base policy.",
+            &Intent::new("补齐 markdown 标题"),
+            &context,
+            3,
+            4,
+        );
+
+        assert!(system.contains("Base policy."));
+        assert!(system.contains("Orchestral Action Selector."));
+        assert!(user.contains("Maximum selected actions: 4"));
+        assert!(user.contains("Observed Execution State:"));
+        assert!(user.contains("- file_write: Write markdown to file"));
+        assert!(user.contains("category: document"));
+        assert!(user.contains("capabilities: filesystem_write, side_effect"));
+        assert!(user.contains("consumes: path, text"));
+        assert!(user.contains("produces: path"));
+        assert!(user.contains("input_fields: content (required) [UTF-8 text], path (required)"));
+        assert!(user.contains("output_fields: bytes, mode [enum: strict | permissive], path"));
+        assert!(user.contains("Available Bindings:"));
+        assert!(user.contains("Binding Shapes:"));
+        assert!(user.contains("{{diagnostics.count}}"));
+    }
 }

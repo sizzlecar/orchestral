@@ -7,7 +7,7 @@ use tracing::{debug, warn};
 
 use orchestral_runtime::api::SubmitStatus;
 
-use crate::runtime::event_projection::{project_event, AgentProgressKind, UiEvent};
+use crate::runtime::event_projection::{project_event, AgentProgressKind, StepSummary, UiEvent};
 use crate::runtime::protocol::{RuntimeMsg, TransientSlot};
 
 use super::event_support::{
@@ -18,6 +18,36 @@ use super::event_support::{
 use super::{
     RuntimeClient, FORWARD_DRAIN_IDLE_TIMEOUT, TURN_SETTLE_GRACE_TIMEOUT, TURN_SETTLE_TIMEOUT,
 };
+
+fn render_plan_summary(steps: &[StepSummary], output_type: Option<&str>) -> String {
+    if !steps.is_empty() {
+        let actions = steps
+            .iter()
+            .take(4)
+            .map(|s| format!("{}:{}", s.id, s.action))
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        return format!("Plan: {}", actions);
+    }
+
+    match output_type {
+        Some("done") => "Plan: done".to_string(),
+        Some("need_input") => "Plan: need_input".to_string(),
+        Some(other) => format!("Plan: {}", other),
+        None => "Plan: no actions".to_string(),
+    }
+}
+
+fn should_render_terminal_execution_status(
+    status: Option<&str>,
+    agent_loop_continue: bool,
+) -> bool {
+    if agent_loop_continue {
+        return false;
+    }
+
+    !matches!(status, Some("completed") | Some("clarification") | None)
+}
 
 impl RuntimeClient {
     pub async fn submit_input(
@@ -172,22 +202,24 @@ impl RuntimeClient {
                             })
                             .await;
                     }
-                    UiEvent::PlanningCompleted { step_count, steps } => {
+                    UiEvent::PlanningCompleted {
+                        step_count,
+                        steps,
+                        output_type,
+                    } => {
                         total_steps = step_count.unwrap_or(steps.len());
-                        let plan = if steps.is_empty() {
-                            "Plan: no actions".to_string()
-                        } else {
-                            let actions = steps
-                                .iter()
-                                .take(4)
-                                .map(|s| format!("{}:{}", s.id, s.action))
-                                .collect::<Vec<_>>()
-                                .join(" -> ");
-                            format!("Plan: {}", actions)
-                        };
+                        let plan = render_plan_summary(&steps, output_type.as_deref());
                         let _ = runtime_tx_events
                             .send(RuntimeMsg::OutputPersist(plan))
                             .await;
+                        if let Some(output_type) = output_type {
+                            let _ = runtime_tx_events
+                                .send(RuntimeMsg::OutputPersist(format!(
+                                    "PlanningOutput: {}",
+                                    output_type
+                                )))
+                                .await;
+                        }
                         let _ = runtime_tx_events
                             .send(RuntimeMsg::OutputTransient {
                                 slot: TransientSlot::Inline,
@@ -196,9 +228,12 @@ impl RuntimeClient {
                             .await;
                         let _ = runtime_tx_events.send(RuntimeMsg::PlanningEnd).await;
                     }
-                    UiEvent::ExecutionStarted => {
+                    UiEvent::ExecutionStarted { execution_mode } => {
                         let _ = runtime_tx_events
-                            .send(RuntimeMsg::ExecutionStart { total: total_steps })
+                            .send(RuntimeMsg::ExecutionStart {
+                                total: total_steps,
+                                execution_mode,
+                            })
                             .await;
                         let _ = runtime_tx_events
                             .send(RuntimeMsg::OutputTransient {
@@ -458,25 +493,43 @@ impl RuntimeClient {
                         let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
                         mark_turn_settled(&mut turn_settled_tx);
                     }
-                    UiEvent::ExecutionCompleted { status } => {
+                    UiEvent::ExecutionCompleted {
+                        status,
+                        execution_mode,
+                        agent_loop_continue,
+                    } => {
                         debug!(
                             status = ?status,
+                            execution_mode = ?execution_mode,
+                            agent_loop_continue = agent_loop_continue,
                             pending_execution_end = pending_execution_end,
                             assistant_rendered = assistant_rendered,
                             "tui event: execution_completed"
                         );
-                        match status.as_deref() {
-                            Some("completed") | Some("clarification") | None => {
-                                pending_execution_end = true;
-                            }
-                            Some(other) => {
-                                let _ = runtime_tx_events
-                                    .send(RuntimeMsg::OutputPersist(format!("Status: {}", other)))
-                                    .await;
-                                pending_execution_end = false;
-                                let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
-                                mark_turn_settled(&mut turn_settled_tx);
-                            }
+                        if let Some(mode) = execution_mode {
+                            let _ = runtime_tx_events
+                                .send(RuntimeMsg::OutputPersist(format!(
+                                    "ExecutionMode: {}",
+                                    mode
+                                )))
+                                .await;
+                        }
+                        if agent_loop_continue {
+                            pending_execution_end = false;
+                            continue;
+                        }
+                        if should_render_terminal_execution_status(status.as_deref(), false) {
+                            let _ = runtime_tx_events
+                                .send(RuntimeMsg::OutputPersist(format!(
+                                    "Status: {}",
+                                    status.as_deref().unwrap_or("unknown")
+                                )))
+                                .await;
+                            pending_execution_end = false;
+                            let _ = runtime_tx_events.send(RuntimeMsg::ExecutionEnd).await;
+                            mark_turn_settled(&mut turn_settled_tx);
+                        } else {
+                            pending_execution_end = true;
                         }
                     }
                     UiEvent::TaskFailed { message } => {
@@ -521,7 +574,7 @@ impl RuntimeClient {
                             .send(RuntimeMsg::OutputPersist(line))
                             .await;
                     }
-                    UiEvent::AssistantOutput { message } => {
+                    UiEvent::AssistantOutput { message, status } => {
                         let normalized = message.trim().to_string();
                         if normalized.is_empty() {
                             continue;
@@ -560,10 +613,23 @@ impl RuntimeClient {
                         if last_assistant_fingerprint.as_deref() != Some(normalized.as_str()) {
                             last_assistant_fingerprint = Some(normalized.clone());
                             assistant_rendered = true;
+                            if let Some(status) = status.as_deref() {
+                                if status != "completed" {
+                                    let _ = runtime_tx_events
+                                        .send(RuntimeMsg::OutputPersist(format!(
+                                            "Status: {}",
+                                            status
+                                        )))
+                                        .await;
+                                }
+                            }
                             debug!(
                                 line_len = normalized.len(),
                                 "tui action: output_persist from assistant_output"
                             );
+                            let _ = runtime_tx_events
+                                .send(RuntimeMsg::AssistantOutput(normalized.clone()))
+                                .await;
                             let _ = runtime_tx_events
                                 .send(RuntimeMsg::OutputPersist(normalized))
                                 .await;
@@ -777,5 +843,54 @@ impl RuntimeClient {
                 text: "Interrupt requested".to_string(),
             })
             .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{render_plan_summary, should_render_terminal_execution_status};
+    use crate::runtime::event_projection::StepSummary;
+
+    #[test]
+    fn test_render_plan_summary_formats_steps() {
+        let plan = render_plan_summary(
+            &[StepSummary {
+                id: "single_action".to_string(),
+                action: "file_read".to_string(),
+            }],
+            Some("single_action"),
+        );
+
+        assert_eq!(plan, "Plan: single_action:file_read");
+    }
+
+    #[test]
+    fn test_render_plan_summary_uses_done_output_type_for_empty_steps() {
+        let plan = render_plan_summary(&[], Some("done"));
+
+        assert_eq!(plan, "Plan: done");
+    }
+
+    #[test]
+    fn test_render_plan_summary_uses_need_input_output_type_for_empty_steps() {
+        let plan = render_plan_summary(&[], Some("need_input"));
+
+        assert_eq!(plan, "Plan: need_input");
+    }
+
+    #[test]
+    fn test_should_render_terminal_execution_status_ignores_recoverable_failure() {
+        assert!(!should_render_terminal_execution_status(
+            Some("failed"),
+            true
+        ));
+    }
+
+    #[test]
+    fn test_should_render_terminal_execution_status_keeps_terminal_failure() {
+        assert!(should_render_terminal_execution_status(
+            Some("failed"),
+            false
+        ));
     }
 }

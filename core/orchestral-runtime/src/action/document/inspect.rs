@@ -22,6 +22,7 @@ pub(super) fn inspect_documents(source_paths: &[String]) -> Result<Value, String
             "path": path,
             "file_name": file_info.file_name,
             "stem": file_info.stem,
+            "suggested_title": file_info.suggested_title,
             "title": file_info.title,
             "missing_title": file_info.missing_title,
             "todo_count": file_info.todo_count,

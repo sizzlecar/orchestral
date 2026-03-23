@@ -44,6 +44,13 @@
 - Runtime manages Thread/Interaction lifecycle and concurrency decisions.
 - Stores persist events and task/reference state; Actions encapsulate side effects.
 
+## Development Principles
+- Fix failures at the right abstraction level. When a smoke or regression test exposes a gap, prefer improving the relevant contract, typed model, family adapter, or runtime state flow instead of adding narrow test-specific hacks.
+- Do not hardcode fixture details into prompts, planner rules, derivation instructions, or runtime heuristics just to make a scenario pass. Tests must validate general capability, not teach the system the answer.
+- Do not special-case one user wording if the underlying family/model is underspecified. Strengthen typed inspection output, canonical field/path resolution, continuation semantics, or verify contracts first.
+- Prompt changes must stay generic. Never embed scenario filenames, expected values, fixture paths, or smoke-specific examples that leak the target test outcome.
+- Prefer durable fixes that improve multiple scenarios at once. If a change only helps one fixture and does not improve the shared architecture, treat it as a likely wrong direction.
+
 ## Extension & Dependency Rules
 - Keep dependency direction strict: `crates/orchestral-runtime` depends on contracts only, and must not depend on concrete implementations under `plugins/`.
 - Keep `crates/` clean: core/runtime crates define domain models, traits, lifecycle contracts, and minimal in-memory defaults only.

@@ -1,8 +1,15 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
-use orchestral_core::types::{ContinuationState, ContinuationStatus, DerivationPolicy, StageKind};
+use orchestral_core::types::{ContinuationState, ContinuationStatus};
+
+/// Derivation policy for document assessment (local enum replacing the removed core type).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DerivationPolicy {
+    Strict,
+    Permissive,
+}
 
 use super::support::{
     document_candidate_files, parse_patch_candidates_envelope, request_requires_confirmation,
@@ -24,7 +31,16 @@ pub(super) fn assess_document_readiness(
     }
 
     let summary = synthesize_document_plan_summary(inspection, patch_candidates);
-    let unknowns = collect_candidate_unknowns(patch_candidates);
+    let mut unknowns = collect_candidate_unknowns(patch_candidates);
+    let auto_title_paths = auto_title_candidate_paths(inspection, patch_candidates);
+    if policy == DerivationPolicy::Permissive && !auto_title_paths.is_empty() {
+        unknowns.retain(|item| {
+            !is_title_preference_unknown(item)
+                && !auto_title_paths
+                    .iter()
+                    .any(|path| item == &format!("{} requires additional user input", path))
+        });
+    }
     let needs_confirmation = request_requires_confirmation(user_request);
     let has_any_change = files.iter().any(|file| {
         file.get("missing_title")
@@ -43,15 +59,9 @@ pub(super) fn assess_document_readiness(
             reason: "document inspection found no missing titles or TODO placeholders".to_string(),
             unknowns: Vec::new(),
             assumptions: Vec::new(),
-            next_stage_hint: Some(StageKind::Verify),
             user_message: Some("未发现需要写回的文档改动。".to_string()),
         }
     } else if needs_confirmation {
-        let next_stage_hint = if unknowns.is_empty() || policy == DerivationPolicy::Permissive {
-            StageKind::Commit
-        } else {
-            StageKind::Probe
-        };
         let mut user_message = format!("{}\n\n回复“确认”后我会按这个计划写回。", summary);
         if !unknowns.is_empty() {
             user_message.push_str(&format!("\n仍有待确认信息：{}。", unknowns.join("；")));
@@ -65,7 +75,6 @@ pub(super) fn assess_document_readiness(
             },
             unknowns: unknowns.clone(),
             assumptions: Vec::new(),
-            next_stage_hint: Some(next_stage_hint),
             user_message: Some(user_message),
         }
     } else if !unknowns.is_empty() {
@@ -74,7 +83,6 @@ pub(super) fn assess_document_readiness(
             reason: "bounded derivation reported unresolved document unknowns".to_string(),
             unknowns: unknowns.clone(),
             assumptions: Vec::new(),
-            next_stage_hint: Some(StageKind::Probe),
             user_message: Some(format!(
                 "{}\n\n仍有待确认信息：{}。",
                 summary,
@@ -87,7 +95,6 @@ pub(super) fn assess_document_readiness(
             reason: "document probe gathered enough structure to derive a typed patch".to_string(),
             unknowns: Vec::new(),
             assumptions: Vec::new(),
-            next_stage_hint: Some(StageKind::Commit),
             user_message: None,
         }
     };
@@ -131,6 +138,70 @@ pub(super) fn collect_candidate_unknowns(patch_candidates: &Value) -> Vec<String
     unknowns.sort();
     unknowns.dedup();
     unknowns
+}
+
+fn auto_title_candidate_paths(inspection: &Value, patch_candidates: &Value) -> BTreeSet<String> {
+    let Some(files) = inspection.get("files").and_then(Value::as_array) else {
+        return BTreeSet::new();
+    };
+    let inspection_by_path = files
+        .iter()
+        .filter_map(|file| {
+            let path = file.get("path").and_then(Value::as_str)?;
+            Some((path, file))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let candidate_files = document_candidate_files(patch_candidates);
+    candidate_files
+        .iter()
+        .filter_map(|file| {
+            let path = file.get("path").and_then(Value::as_str)?;
+            let inspection_file = inspection_by_path.get(path)?;
+            let eligible = inspection_file
+                .get("missing_title")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                && inspection_file
+                    .get("suggested_title")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty())
+                && inspection_file
+                    .get("todo_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default()
+                    == 0
+                && file
+                    .get("unknowns")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .all(|item| item.as_str().is_some_and(is_title_preference_unknown))
+                    })
+                    .unwrap_or(true)
+                && file
+                    .get("planned_changes")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        !items.is_empty()
+                            && items.iter().all(|item| {
+                                item.get("description")
+                                    .and_then(Value::as_str)
+                                    .or_else(|| item.as_str())
+                                    .is_some_and(|text| {
+                                        text.contains("title") || text.contains("标题")
+                                    })
+                            })
+                    })
+                    .unwrap_or(false);
+            eligible.then(|| path.to_string())
+        })
+        .collect()
+}
+
+fn is_title_preference_unknown(unknown: &str) -> bool {
+    unknown.contains("Preferred H1 title text") || unknown.contains("Exact H1 title wording")
 }
 
 fn synthesize_document_plan_summary(inspection: &Value, patch_candidates: &Value) -> String {
@@ -201,9 +272,17 @@ fn synthesize_document_plan_summary(inspection: &Value, patch_candidates: &Value
 }
 
 fn parse_derivation_policy(raw_policy: &str) -> Result<DerivationPolicy, String> {
-    match raw_policy {
+    match raw_policy.trim().to_ascii_lowercase().as_str() {
         "strict" => Ok(DerivationPolicy::Strict),
-        "permissive" => Ok(DerivationPolicy::Permissive),
-        other => Err(format!("unsupported derivation_policy '{}'", other)),
+        "" | "permissive" | "filename_to_h1" | "markdown_h1_from_filename" => {
+            Ok(DerivationPolicy::Permissive)
+        }
+        other => {
+            tracing::debug!(
+                derivation_policy = other,
+                "document_assess_readiness defaulting unknown derivation_policy to permissive"
+            );
+            Ok(DerivationPolicy::Permissive)
+        }
     }
 }

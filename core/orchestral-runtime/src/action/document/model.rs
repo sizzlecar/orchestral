@@ -22,6 +22,7 @@ pub(super) fn parse_document_updates(patch_spec: &Value) -> Result<Vec<DocumentU
 pub(super) struct DocumentInspectionSummary {
     pub(super) file_name: String,
     pub(super) stem: String,
+    pub(super) suggested_title: Option<String>,
     pub(super) title: Option<String>,
     pub(super) missing_title: bool,
     pub(super) todo_count: usize,
@@ -78,6 +79,11 @@ pub(super) fn inspect_document_content(path: &Path, content: &str) -> DocumentIn
             .and_then(|value| value.to_str())
             .unwrap_or_default()
             .to_string(),
+        suggested_title: suggested_title_from_stem(
+            path.file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default(),
+        ),
         title,
         missing_title,
         todo_count: todo_lines.len(),
@@ -86,4 +92,28 @@ pub(super) fn inspect_document_content(path: &Path, content: &str) -> DocumentIn
         headings,
         line_count: content.lines().count(),
     }
+}
+
+pub(super) fn suggested_title_from_stem(stem: &str) -> Option<String> {
+    let words = stem
+        .split(|ch: char| matches!(ch, '-' | '_' | '.' | '/' | '\\') || ch.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .map(title_case_word)
+        .collect::<Vec<_>>();
+    if words.is_empty() {
+        None
+    } else {
+        Some(words.join(" "))
+    }
+}
+
+fn title_case_word(word: &str) -> String {
+    let mut chars = word.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut out = String::new();
+    out.extend(first.to_uppercase());
+    out.push_str(&chars.as_str().to_ascii_lowercase());
+    out
 }

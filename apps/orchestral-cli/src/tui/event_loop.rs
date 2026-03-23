@@ -264,6 +264,7 @@ fn runtime_msg_label(msg: &crate::runtime::RuntimeMsg) -> &'static str {
         RuntimeMsg::ActivityItem { .. } => "ActivityItem",
         RuntimeMsg::ActivityEnd { .. } => "ActivityEnd",
         RuntimeMsg::OutputPersist(_) => "OutputPersist",
+        RuntimeMsg::AssistantOutput(_) => "AssistantOutput",
         RuntimeMsg::AssistantDelta { .. } => "AssistantDelta",
         RuntimeMsg::OutputTransient { .. } => "OutputTransient",
         RuntimeMsg::ApprovalRequested { .. } => "ApprovalRequested",

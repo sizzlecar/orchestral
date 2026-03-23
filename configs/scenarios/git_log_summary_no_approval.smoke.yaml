@@ -1,0 +1,24 @@
+version: 1
+name: git-log-summary-no-approval-smoke
+config: ../orchestral.cli.runtime.override.yaml
+no_mcp: true
+timeout_secs: 300
+
+turns:
+  - name: summarize-git-log
+    input: |
+      看看当前项目最近的提交记录 总结一下
+    expect:
+      require_execution_end: true
+      max_approvals: 0
+      max_errors: 0
+      activity_contains:
+        - shell
+      persist_not_contains:
+        - Approval required
+        - Operation not permitted
+        - /dev/null
+      assistant_not_contains:
+        - Approval required
+        - Operation not permitted
+        - /dev/null

@@ -11,7 +11,7 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 
 use crate::io::BlobStore;
-use crate::store::{EventStore, InteractionId, ReferenceStore, TaskStore, ThreadId};
+use crate::store::{EventStore, InteractionId, TaskStore, ThreadId};
 use crate::types::{StepId, TaskId};
 
 pub type SharedComponent = Arc<dyn Any + Send + Sync>;
@@ -71,7 +71,6 @@ pub struct RuntimeHookContext {
 pub struct StoreBundle {
     pub event_store: Arc<dyn EventStore>,
     pub task_store: Arc<dyn TaskStore>,
-    pub reference_store: Arc<dyn ReferenceStore>,
 }
 
 #[derive(Default)]

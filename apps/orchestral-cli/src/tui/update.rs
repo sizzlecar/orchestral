@@ -243,7 +243,7 @@ fn handle_runtime(app: &mut App, msg: RuntimeMsg) {
                 .insert(TransientSlot::Status, "Executing...".to_string());
             app.set_dirty();
         }
-        RuntimeMsg::ExecutionStart { total } => {
+        RuntimeMsg::ExecutionStart { total, .. } => {
             let _ = total;
             app.mode = AppMode::Executing;
             app.spinner.enabled = true;
@@ -348,6 +348,9 @@ fn handle_runtime(app: &mut App, msg: RuntimeMsg) {
                 history_len = app.history.len(),
                 "tui update: OutputPersist pushed to history"
             );
+            app.set_dirty();
+        }
+        RuntimeMsg::AssistantOutput(_) => {
             app.set_dirty();
         }
         RuntimeMsg::AssistantDelta { chunk, done } => {

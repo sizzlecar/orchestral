@@ -97,7 +97,6 @@ pub async fn execute_action_with_registry_with_options(
         step_id.clone(),
         execution_id.to_string(),
         ctx.working_set.clone(),
-        ctx.reference_store.clone(),
     );
 
     let result = action.run(input, action_ctx).await;

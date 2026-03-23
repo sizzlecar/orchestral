@@ -1,40 +1,44 @@
 use serde::Deserialize;
 
-use orchestral_core::planner::{PlanError, PlannerOutput};
-use orchestral_core::types::{
-    ArtifactFamily, DerivationPolicy, SkeletonChoice, SkeletonKind, StageChoice, StageKind,
-};
+use orchestral_core::planner::{PlanError, PlannerOutput, SingleAction};
+use orchestral_core::types::Plan;
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+pub(super) struct ActionSelection {
+    #[serde(default, alias = "actions")]
+    pub selected_actions: Vec<String>,
+    #[serde(default)]
+    pub blocked_actions: Vec<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+#[serde(tag = "type")]
 enum PlannerJsonOutput {
-    SkeletonChoice {
-        skeleton: SkeletonKind,
+    #[serde(rename = "SINGLE_ACTION", alias = "ACTION_CALL")]
+    SingleAction {
+        action: String,
         #[serde(default)]
-        artifact_family: Option<ArtifactFamily>,
-        initial_stage: StageKind,
-        #[serde(default = "default_confidence")]
-        confidence: f32,
+        params: serde_json::Value,
         #[serde(default)]
         reason: Option<String>,
     },
-    StageChoice {
-        skeleton: SkeletonKind,
-        artifact_family: ArtifactFamily,
-        current_stage: StageKind,
-        stage_goal: String,
-        derivation_policy: DerivationPolicy,
+    #[serde(rename = "MINI_PLAN")]
+    MiniPlan {
+        goal: String,
+        steps: Vec<orchestral_core::types::Step>,
         #[serde(default)]
-        next_stage_hint: Option<StageKind>,
+        confidence: Option<f32>,
         #[serde(default)]
-        reason: Option<String>,
+        on_complete: Option<String>,
+        #[serde(default)]
+        on_failure: Option<String>,
     },
-    DirectResponse {
-        message: String,
-    },
-    Clarification {
-        question: String,
-    },
+    #[serde(rename = "DONE", alias = "DIRECT_RESPONSE")]
+    Done { message: String },
+    #[serde(rename = "NEED_INPUT", alias = "CLARIFICATION")]
+    NeedInput { question: String },
 }
 
 pub(super) fn parse_planner_output(json: &str) -> Result<PlannerOutput, PlanError> {
@@ -42,39 +46,36 @@ pub(super) fn parse_planner_output(json: &str) -> Result<PlannerOutput, PlanErro
         .map_err(|e| PlanError::Generation(format!("Invalid planner output JSON: {}", e)))?;
 
     match parsed {
-        PlannerJsonOutput::SkeletonChoice {
-            skeleton,
-            artifact_family,
-            initial_stage,
+        PlannerJsonOutput::SingleAction {
+            action,
+            params,
+            reason,
+        } => Ok(PlannerOutput::SingleAction(SingleAction {
+            action,
+            params,
+            reason,
+        })),
+        PlannerJsonOutput::MiniPlan {
+            goal,
+            steps,
             confidence,
-            reason,
-        } => Ok(PlannerOutput::SkeletonChoice(SkeletonChoice {
-            skeleton,
-            artifact_family,
-            initial_stage,
-            confidence: confidence.clamp(0.0, 1.0),
-            reason,
+            on_complete,
+            on_failure,
+        } => Ok(PlannerOutput::MiniPlan(Plan {
+            goal,
+            steps,
+            confidence,
+            on_complete,
+            on_failure,
         })),
-        PlannerJsonOutput::StageChoice {
-            skeleton,
-            artifact_family,
-            current_stage,
-            stage_goal,
-            derivation_policy,
-            next_stage_hint,
-            reason,
-        } => Ok(PlannerOutput::StageChoice(StageChoice {
-            skeleton,
-            artifact_family,
-            current_stage,
-            stage_goal,
-            derivation_policy,
-            next_stage_hint,
-            reason,
-        })),
-        PlannerJsonOutput::DirectResponse { message } => Ok(PlannerOutput::DirectResponse(message)),
-        PlannerJsonOutput::Clarification { question } => Ok(PlannerOutput::Clarification(question)),
+        PlannerJsonOutput::Done { message } => Ok(PlannerOutput::Done(message)),
+        PlannerJsonOutput::NeedInput { question } => Ok(PlannerOutput::NeedInput(question)),
     }
+}
+
+pub(super) fn parse_action_selection(json: &str) -> Result<ActionSelection, PlanError> {
+    serde_json::from_str::<ActionSelection>(json)
+        .map_err(|e| PlanError::Generation(format!("Invalid action selector output JSON: {}", e)))
 }
 
 pub(super) fn extract_json(text: &str) -> Option<String> {
@@ -93,10 +94,6 @@ pub(super) fn extract_json(text: &str) -> Option<String> {
         }
     }
     None
-}
-
-fn default_confidence() -> f32 {
-    1.0
 }
 
 fn find_json_object_end(text: &str, start: usize) -> Option<usize> {

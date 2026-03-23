@@ -6,16 +6,23 @@ use serde_json::{json, Value};
 
 use orchestral_core::types::{VerifyDecision, VerifyStatus};
 
-use super::model::{inspect_document_content, parse_document_updates};
-use super::support::requested_report_path;
+use super::model::inspect_document_content;
+use super::support::{normalize_document_updates, requested_report_path};
 
 pub(super) fn verify_document_patch(
     patch_spec: &Value,
     inspection: &Value,
+    patch_candidates: Option<&Value>,
     user_request: &str,
     resume_user_input: Option<&Value>,
 ) -> Result<(VerifyDecision, String), String> {
-    let updates = parse_document_updates(patch_spec)?;
+    let report_path = requested_report_path(user_request, resume_user_input);
+    let updates = normalize_document_updates(
+        patch_spec,
+        report_path.as_deref(),
+        Some(inspection),
+        patch_candidates,
+    )?;
     if updates.is_empty() {
         return Err("document verify received empty patch_spec.updates".to_string());
     }
@@ -95,7 +102,7 @@ pub(super) fn verify_document_patch(
         }
     }
 
-    if let Some(report_path) = requested_report_path(user_request, resume_user_input) {
+    if let Some(report_path) = report_path {
         let content = fs::read_to_string(&report_path)
             .map_err(|err| format!("read report '{}' failed: {}", report_path, err))?;
         if content.trim().is_empty() || content.contains("Pending run.") {

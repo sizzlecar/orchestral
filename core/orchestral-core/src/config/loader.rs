@@ -1,12 +1,9 @@
 //! Configuration loading and hot-reload support.
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::Path;
 
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use thiserror::Error;
-use tokio::sync::RwLock;
 
 use super::{ActionsConfig, OrchestralConfig, ProvidersConfig};
 
@@ -17,8 +14,6 @@ pub enum ConfigError {
     Io(#[from] std::io::Error),
     #[error("YAML parse error: {0}")]
     Parse(#[from] serde_yaml::Error),
-    #[error("File watch error: {0}")]
-    Notify(#[from] notify::Error),
     #[error("Invalid config: {0}")]
     Invalid(String),
 }
@@ -62,9 +57,9 @@ fn validate_config(config: &OrchestralConfig) -> Result<(), ConfigError> {
         ));
     }
 
-    if config.runtime.reactor.stage_loop_limit == 0 {
+    if config.runtime.max_planner_iterations == 0 {
         return Err(ConfigError::Invalid(
-            "runtime.reactor.stage_loop_limit must be > 0".to_string(),
+            "runtime.max_planner_iterations must be > 0".to_string(),
         ));
     }
 
@@ -76,7 +71,6 @@ fn validate_config(config: &OrchestralConfig) -> Result<(), ConfigError> {
 
     validate_providers(&config.providers)?;
     validate_actions(&config.actions)?;
-    validate_recipes(config)?;
     validate_extensions(config)?;
     validate_blobs(config)?;
 
@@ -234,45 +228,6 @@ fn validate_extensions(config: &OrchestralConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn validate_recipes(config: &OrchestralConfig) -> Result<(), ConfigError> {
-    let mut seen_names = std::collections::HashSet::new();
-    for template in &config.recipes.templates {
-        if template.name.trim().is_empty() {
-            return Err(ConfigError::Invalid(
-                "recipes.templates[].name must not be empty".to_string(),
-            ));
-        }
-        if !seen_names.insert(template.name.to_ascii_lowercase()) {
-            return Err(ConfigError::Invalid(format!(
-                "recipes.templates contains duplicate template '{}'",
-                template.name
-            )));
-        }
-        if template.stages.is_empty() {
-            return Err(ConfigError::Invalid(format!(
-                "recipes.templates[{}].stages must not be empty",
-                template.name
-            )));
-        }
-        let mut stage_ids = std::collections::HashSet::new();
-        for stage in &template.stages {
-            if stage.id.as_str().trim().is_empty() {
-                return Err(ConfigError::Invalid(format!(
-                    "recipes.templates[{}].stages[].id must not be empty",
-                    template.name
-                )));
-            }
-            if !stage_ids.insert(stage.id.to_string()) {
-                return Err(ConfigError::Invalid(format!(
-                    "recipes.templates[{}] contains duplicate stage id '{}'",
-                    template.name, stage.id
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
 fn validate_blobs(config: &OrchestralConfig) -> Result<(), ConfigError> {
     let mode = config.blobs.mode.trim().to_ascii_lowercase();
     let write_to_s3 = config
@@ -318,68 +273,6 @@ fn validate_blobs(config: &OrchestralConfig) -> Result<(), ConfigError> {
     }
 
     Ok(())
-}
-
-/// Manages unified configuration with hot-reload support.
-pub struct ConfigManager {
-    path: PathBuf,
-    config: Arc<RwLock<OrchestralConfig>>,
-}
-
-impl ConfigManager {
-    /// Create a new config manager.
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self {
-            path: path.into(),
-            config: Arc::new(RwLock::new(OrchestralConfig::default())),
-        }
-    }
-
-    /// Get a reference to the current config.
-    pub fn config(&self) -> Arc<RwLock<OrchestralConfig>> {
-        self.config.clone()
-    }
-
-    /// Load configuration from file.
-    pub async fn load(&self) -> Result<(), ConfigError> {
-        let config = load_config(&self.path)?;
-        let mut current = self.config.write().await;
-        *current = config;
-        Ok(())
-    }
-
-    /// Start watching for config file changes.
-    pub fn start_watching(self: &Arc<Self>) -> Result<ConfigWatcher, ConfigError> {
-        let manager = Arc::clone(self);
-        let handle = tokio::runtime::Handle::current();
-
-        let mut watcher: RecommendedWatcher =
-            notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-                if let Ok(event) = res {
-                    if matches!(
-                        event.kind,
-                        EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
-                    ) {
-                        let manager = Arc::clone(&manager);
-                        handle.spawn(async move {
-                            if let Err(e) = manager.load().await {
-                                tracing::error!("Failed to reload config: {}", e);
-                            } else {
-                                tracing::info!("Config reloaded successfully");
-                            }
-                        });
-                    }
-                }
-            })?;
-
-        watcher.watch(&self.path, RecursiveMode::NonRecursive)?;
-        Ok(ConfigWatcher { _watcher: watcher })
-    }
-}
-
-/// Keeps the file watcher alive.
-pub struct ConfigWatcher {
-    _watcher: RecommendedWatcher,
 }
 
 #[cfg(test)]
@@ -463,6 +356,17 @@ plugins:
     }
 
     #[test]
+    fn test_validate_config_rejects_zero_max_planner_iterations() {
+        let mut config = OrchestralConfig::default();
+        config.runtime.max_planner_iterations = 0;
+        assert!(matches!(
+            validate_config(&config),
+            Err(ConfigError::Invalid(message))
+            if message.contains("runtime.max_planner_iterations must be > 0")
+        ));
+    }
+
+    #[test]
     fn test_validate_config_accepts_mcp_server_with_command() {
         let mut config = OrchestralConfig::default();
         config.extensions.mcp.servers = vec![McpServerSpec {
@@ -510,7 +414,7 @@ recipes:
     }
 
     #[test]
-    fn test_validate_config_rejects_duplicate_recipe_templates() {
+    fn test_validate_config_ignores_legacy_duplicate_recipe_templates() {
         let yaml = r#"
 version: 1
 app:
@@ -529,9 +433,6 @@ recipes:
           action: file_read
 "#;
         let config: OrchestralConfig = from_str(yaml).expect("parse yaml");
-        assert!(matches!(
-            validate_config(&config),
-            Err(ConfigError::Invalid(_))
-        ));
+        assert!(validate_config(&config).is_ok());
     }
 }

@@ -1,0 +1,56 @@
+version: 1
+name: multi-artifact-unified-runtime
+config: ../orchestral.cli.yaml
+no_mcp: true
+timeout_secs: 300
+workspace:
+  copies:
+    - from: ../../fixtures/scenarios/cross_family_unified_runtime/instructions/change-request.md
+      to: fixtures/scenarios/cross_family_unified_runtime/instructions/change-request.md
+    - from: ../../fixtures/scenarios/cross_family_unified_runtime/config/settings.yaml
+      to: fixtures/scenarios/cross_family_unified_runtime/config/settings.yaml
+    - from: ../../fixtures/scenarios/cross_family_unified_runtime/docs/绩效考核-2025Q4_副本.xlsx
+      to: fixtures/scenarios/cross_family_unified_runtime/docs/绩效考核-2025Q4_副本.xlsx
+
+turns:
+  - name: run-multi-artifact-task
+    input: >
+      读取 fixtures/scenarios/cross_family_unified_runtime/instructions/change-request.md，
+      按其中说明修改 fixtures/scenarios/cross_family_unified_runtime/docs/绩效考核-2025Q4_副本.xlsx
+      和 fixtures/scenarios/cross_family_unified_runtime/config/settings.yaml，
+      最后给出执行摘要。
+    expect:
+      require_execution_end: true
+      max_approvals: 0
+      max_errors: 0
+      assistant_contains:
+        - "multi-artifact"
+        - "spreadsheet"
+        - "structured"
+      activity_contains:
+        - "codebase_collect_targets"
+        - "spreadsheet_apply_patch"
+        - "structured_apply_patch"
+        - "spreadsheet_verify_patch"
+        - "structured_verify_patch"
+        - "codebase_aggregate_verify"
+      artifact_contains:
+        - path: fixtures/scenarios/cross_family_unified_runtime/config/settings.yaml
+          text: "level: info"
+        - path: fixtures/scenarios/cross_family_unified_runtime/config/settings.yaml
+          text: "pretty: false"
+        - path: fixtures/scenarios/cross_family_unified_runtime/config/settings.yaml
+          text: "file_output: /var/log/app.log"
+      artifact_not_contains:
+        - path: fixtures/scenarios/cross_family_unified_runtime/config/settings.yaml
+          text: "level: debug"
+        - path: fixtures/scenarios/cross_family_unified_runtime/config/settings.yaml
+          text: "pretty: true"
+        - path: fixtures/scenarios/cross_family_unified_runtime/config/settings.yaml
+          text: "file_output: null"
+    verify:
+      - name: workbook-fill-quality
+        command: ../../.claude/skills/xlsx/.venv/bin/python3
+        args:
+          - validators/verify_perf_review_fill.py
+          - fixtures/scenarios/cross_family_unified_runtime/docs/绩效考核-2025Q4_副本.xlsx

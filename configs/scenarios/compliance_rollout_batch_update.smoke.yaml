@@ -1,0 +1,86 @@
+version: 1
+name: compliance-rollout-batch-update
+config: ../orchestral.cli.yaml
+no_mcp: true
+no_skills: true
+timeout_secs: 300
+fresh_thread_per_turn: true
+workspace:
+  copies:
+    - from: ../../fixtures/scenarios/compliance_rollout_batch_update
+      to: fixtures/scenarios/compliance_rollout_batch_update
+
+turns:
+  - name: run-1
+    input: >
+      Read fixtures/scenarios/compliance_rollout_batch_update/instructions/compliance-change-request.md
+      Then update all markdown files under
+      fixtures/scenarios/compliance_rollout_batch_update/runbooks and
+      fixtures/scenarios/compliance_rollout_batch_update/customer-guides according to that request.
+      Write the actual changed-file summary to
+      fixtures/scenarios/compliance_rollout_batch_update/reports/compliance-rollout-summary.md
+      Do not rewrite already compliant files.
+    expect:
+      require_execution_end: true
+      max_approvals: 0
+      max_errors: 0
+      activity_contains:
+        - "document_apply_patch"
+      artifact_contains:
+        - path: fixtures/scenarios/compliance_rollout_batch_update/runbooks/release-rollout.md
+          text: "# Release Rollout"
+        - path: fixtures/scenarios/compliance_rollout_batch_update/customer-guides/tenant-logging.md
+          text: "# Tenant Logging"
+        - path: fixtures/scenarios/compliance_rollout_batch_update/customer-guides/legacy-logging-guide.md
+          text: "audit-review@company.example"
+        - path: fixtures/scenarios/compliance_rollout_batch_update/reports/compliance-rollout-summary.md
+          text: "## Runbooks"
+        - path: fixtures/scenarios/compliance_rollout_batch_update/reports/compliance-rollout-summary.md
+          text: "## Customer Guides"
+    verify:
+      - name: verify-round-1-and-snapshot
+        phase: post_turn
+        command: /bin/zsh
+        cwd: ../..
+        args:
+          - -lc
+          - >-
+            cargo run -q -p orchestral-cli --example verify_compliance_rollout -- prepare
+            "$ORCHESTRAL_SCENARIO_WORKSPACE_DIR/.state/compliance-rollout-baseline.json"
+            "$ORCHESTRAL_SCENARIO_WORKSPACE_DIR/fixtures/scenarios/compliance_rollout_batch_update"
+
+  - name: run-2
+    input: >
+      Read fixtures/scenarios/compliance_rollout_batch_update/instructions/compliance-followup.md
+      Continue from the current workspace state.
+      Update markdown files under fixtures/scenarios/compliance_rollout_batch_update/runbooks and
+      fixtures/scenarios/compliance_rollout_batch_update/customer-guides when the follow-up requires it.
+      Only apply the follow-up changes that are explicitly requested there and update
+      fixtures/scenarios/compliance_rollout_batch_update/reports/compliance-rollout-summary.md
+      so that it reflects only this follow-up round.
+    expect:
+      require_execution_end: true
+      max_approvals: 0
+      max_errors: 0
+      activity_contains:
+        - "document_apply_patch"
+      artifact_contains:
+        - path: fixtures/scenarios/compliance_rollout_batch_update/customer-guides/tenant-logging.md
+          text: "/var/log/tenant.log"
+        - path: fixtures/scenarios/compliance_rollout_batch_update/customer-guides/legacy-logging-guide.md
+          text: "legacy-compliance@company.example"
+      artifact_not_contains:
+        - path: fixtures/scenarios/compliance_rollout_batch_update/runbooks/sandbox-drill.md
+          text: "## Audit Readiness"
+        - path: fixtures/scenarios/compliance_rollout_batch_update/customer-guides/release-faq.md
+          text: "## Audit Readiness"
+    verify:
+      - name: verify-round-2-minimal-rework
+        command: /bin/zsh
+        cwd: ../..
+        args:
+          - -lc
+          - >-
+            cargo run -q -p orchestral-cli --example verify_compliance_rollout -- verify
+            "$ORCHESTRAL_SCENARIO_WORKSPACE_DIR/.state/compliance-rollout-baseline.json"
+            "$ORCHESTRAL_SCENARIO_WORKSPACE_DIR/fixtures/scenarios/compliance_rollout_batch_update"

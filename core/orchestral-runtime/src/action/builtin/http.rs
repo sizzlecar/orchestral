@@ -61,10 +61,10 @@ impl Action for HttpAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_category("direct")
             .with_capabilities(["network_io", "side_effect"])
-            .with_roles(["collect", "execute"])
-            .with_input_kinds(["request"])
-            .with_output_kinds(["response", "text"])
+            .with_input_kinds(["network.request"])
+            .with_output_kinds(["network.response", "text"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {

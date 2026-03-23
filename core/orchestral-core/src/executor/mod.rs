@@ -35,6 +35,7 @@ use self::progress::{
     build_step_completion_metadata, build_step_start_metadata, choose_terminal_result,
     report_progress,
 };
+pub use self::step_support::render_working_set_template;
 use self::step_support::{bind_param_value, resolve_param_templates, validate_declared_exports};
 
 const DEFAULT_MAX_RETRY_ATTEMPTS: u32 = 3;
@@ -156,36 +157,8 @@ mod tests {
     use tokio::time::{sleep, Duration};
 
     use crate::action::{Action, ActionContext, ActionInput, ActionMeta, ActionResult};
-    use crate::store::{Reference, ReferenceStore, ReferenceType, StoreError, WorkingSet};
+    use crate::store::WorkingSet;
     use crate::types::{Plan, Step, StepId, StepIoBinding};
-
-    struct NoopReferenceStore;
-
-    #[async_trait]
-    impl ReferenceStore for NoopReferenceStore {
-        async fn add(&self, _reference: Reference) -> Result<(), StoreError> {
-            Ok(())
-        }
-
-        async fn get(&self, _id: &str) -> Result<Option<Reference>, StoreError> {
-            Ok(None)
-        }
-
-        async fn query_by_type(
-            &self,
-            _ref_type: &ReferenceType,
-        ) -> Result<Vec<Reference>, StoreError> {
-            Ok(Vec::new())
-        }
-
-        async fn query_recent(&self, _limit: usize) -> Result<Vec<Reference>, StoreError> {
-            Ok(Vec::new())
-        }
-
-        async fn delete(&self, _id: &str) -> Result<bool, StoreError> {
-            Ok(false)
-        }
-    }
 
     struct CollectProgressReporter {
         events: Arc<RwLock<Vec<ExecutionProgressEvent>>>,
@@ -413,8 +386,7 @@ mod tests {
             );
             let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
             let working_set = Arc::new(RwLock::new(WorkingSet::new()));
-            let ctx =
-                ExecutorContext::new("task-1", working_set.clone(), Arc::new(NoopReferenceStore));
+            let ctx = ExecutorContext::new("task-1", working_set.clone());
 
             let result = executor.execute(&mut dag, &ctx).await;
             assert!(matches!(result, ExecutionResult::Completed));
@@ -441,11 +413,7 @@ mod tests {
                     .with_exports(vec!["written".to_string()])],
             );
             let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
-            let ctx = ExecutorContext::new(
-                "task-1",
-                Arc::new(RwLock::new(WorkingSet::new())),
-                Arc::new(NoopReferenceStore),
-            );
+            let ctx = ExecutorContext::new("task-1", Arc::new(RwLock::new(WorkingSet::new())));
 
             let result = executor.execute(&mut dag, &ctx).await;
             match result {
@@ -470,7 +438,8 @@ mod tests {
                     .with_params(json!({
                         "path": "{{artifact.path}}",
                         "message": "open {{artifact.path}}",
-                        "payload": "{{artifact.meta}}"
+                        "payload": "{{artifact.meta}}",
+                        "paths": "{{artifact.paths}}"
                     }))
                     .with_exports(vec!["params".to_string()])],
             );
@@ -480,8 +449,9 @@ mod tests {
                 let mut guard = ws.write().await;
                 guard.set_task("artifact.path", json!("docs/sample.xlsx"));
                 guard.set_task("artifact.meta", json!({"rows": 3}));
+                guard.set_task("artifact.paths", json!(["docs/a.md", "docs/b.md"]));
             }
-            let ctx = ExecutorContext::new("task-1", ws.clone(), Arc::new(NoopReferenceStore));
+            let ctx = ExecutorContext::new("task-1", ws.clone());
 
             let result = executor.execute(&mut dag, &ctx).await;
             assert!(matches!(result, ExecutionResult::Completed));
@@ -490,7 +460,8 @@ mod tests {
             let params = ws.get_task("s1.params").expect("params export");
             assert_eq!(params["path"], json!("docs/sample.xlsx"));
             assert_eq!(params["message"], json!("open docs/sample.xlsx"));
-            assert_eq!(params["payload"], json!("{\"rows\":3}"));
+            assert_eq!(params["payload"], json!({"rows": 3}));
+            assert_eq!(params["paths"], json!(["docs/a.md", "docs/b.md"]));
         });
     }
 
@@ -504,10 +475,14 @@ mod tests {
             let plan = Plan::new(
                 "io-bound template params",
                 vec![Step::action("s1", "echo_params")
-                    .with_io_bindings(vec![StepIoBinding::required("artifact.path", "file_path")])
+                    .with_io_bindings(vec![
+                        StepIoBinding::required("artifact.path", "file_path"),
+                        StepIoBinding::required("artifact.paths", "source_paths"),
+                    ])
                     .with_params(json!({
                         "path": "{{file_path}}",
-                        "message": "open {{file_path}}"
+                        "message": "open {{file_path}}",
+                        "sources": "{{source_paths}}"
                     }))
                     .with_exports(vec!["params".to_string()])],
             );
@@ -516,8 +491,9 @@ mod tests {
             {
                 let mut guard = ws.write().await;
                 guard.set_task("artifact.path", json!("docs/sample.xlsx"));
+                guard.set_task("artifact.paths", json!(["docs/a.md", "docs/b.md"]));
             }
-            let ctx = ExecutorContext::new("task-1", ws.clone(), Arc::new(NoopReferenceStore));
+            let ctx = ExecutorContext::new("task-1", ws.clone());
 
             let result = executor.execute(&mut dag, &ctx).await;
             assert!(matches!(result, ExecutionResult::Completed));
@@ -526,6 +502,7 @@ mod tests {
             let params = ws.get_task("s1.params").expect("params export");
             assert_eq!(params["path"], json!("docs/sample.xlsx"));
             assert_eq!(params["message"], json!("open docs/sample.xlsx"));
+            assert_eq!(params["sources"], json!(["docs/a.md", "docs/b.md"]));
         });
     }
 
@@ -544,11 +521,7 @@ mod tests {
                 vec![Step::action("s1", "produce").with_exports(vec!["result".to_string()])],
             );
             let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
-            let ctx = ExecutorContext::new(
-                "task-1",
-                Arc::new(RwLock::new(WorkingSet::new())),
-                Arc::new(NoopReferenceStore),
-            );
+            let ctx = ExecutorContext::new("task-1", Arc::new(RwLock::new(WorkingSet::new())));
 
             let result = executor.execute(&mut dag, &ctx).await;
             match result {
@@ -584,11 +557,7 @@ mod tests {
                 }))],
             );
             let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
-            let ctx = ExecutorContext::new(
-                "task-1",
-                Arc::new(RwLock::new(WorkingSet::new())),
-                Arc::new(NoopReferenceStore),
-            );
+            let ctx = ExecutorContext::new("task-1", Arc::new(RwLock::new(WorkingSet::new())));
 
             let result = executor.execute(&mut dag, &ctx).await;
             match result {
@@ -617,11 +586,7 @@ mod tests {
 
             let plan = Plan::new("preflight deny", vec![Step::action("s1", "noop")]);
             let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
-            let ctx = ExecutorContext::new(
-                "task-1",
-                Arc::new(RwLock::new(WorkingSet::new())),
-                Arc::new(NoopReferenceStore),
-            );
+            let ctx = ExecutorContext::new("task-1", Arc::new(RwLock::new(WorkingSet::new())));
 
             let result = executor.execute(&mut dag, &ctx).await;
             match result {
@@ -660,11 +625,7 @@ mod tests {
                 vec![Step::action("s1", "typed_output")],
             );
             let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
-            let ctx = ExecutorContext::new(
-                "task-1",
-                Arc::new(RwLock::new(WorkingSet::new())),
-                Arc::new(NoopReferenceStore),
-            );
+            let ctx = ExecutorContext::new("task-1", Arc::new(RwLock::new(WorkingSet::new())));
 
             let result = executor.execute(&mut dag, &ctx).await;
             match result {
@@ -693,12 +654,8 @@ mod tests {
             let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
             let reporter = Arc::new(CollectProgressReporter::new());
             let events_ref = reporter.events.clone();
-            let ctx = ExecutorContext::new(
-                "task-1",
-                Arc::new(RwLock::new(WorkingSet::new())),
-                Arc::new(NoopReferenceStore),
-            )
-            .with_progress_reporter(reporter);
+            let ctx = ExecutorContext::new("task-1", Arc::new(RwLock::new(WorkingSet::new())))
+                .with_progress_reporter(reporter);
 
             let result = executor.execute(&mut dag, &ctx).await;
             assert!(matches!(result, ExecutionResult::Completed));
@@ -738,11 +695,7 @@ mod tests {
                 ],
             );
             let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
-            let ctx = ExecutorContext::new(
-                "task-1",
-                Arc::new(RwLock::new(WorkingSet::new())),
-                Arc::new(NoopReferenceStore),
-            );
+            let ctx = ExecutorContext::new("task-1", Arc::new(RwLock::new(WorkingSet::new())));
 
             let result = executor.execute(&mut dag, &ctx).await;
             assert!(matches!(result, ExecutionResult::Completed));
@@ -769,11 +722,7 @@ mod tests {
                 ],
             );
             let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
-            let ctx = ExecutorContext::new(
-                "task-1",
-                Arc::new(RwLock::new(WorkingSet::new())),
-                Arc::new(NoopReferenceStore),
-            );
+            let ctx = ExecutorContext::new("task-1", Arc::new(RwLock::new(WorkingSet::new())));
 
             let result = executor.execute(&mut dag, &ctx).await;
             assert!(matches!(result, ExecutionResult::Completed));
@@ -804,8 +753,7 @@ mod tests {
             );
             let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
             let working_set = Arc::new(RwLock::new(WorkingSet::new()));
-            let ctx =
-                ExecutorContext::new("task-1", working_set.clone(), Arc::new(NoopReferenceStore));
+            let ctx = ExecutorContext::new("task-1", working_set.clone());
 
             let result = executor.execute(&mut dag, &ctx).await;
             assert!(matches!(result, ExecutionResult::Completed));
@@ -838,11 +786,7 @@ mod tests {
                 vec![Step::action("s1", "flaky_retry").with_exports(vec!["ok".to_string()])],
             );
             let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
-            let ctx = ExecutorContext::new(
-                "task-1",
-                Arc::new(RwLock::new(WorkingSet::new())),
-                Arc::new(NoopReferenceStore),
-            );
+            let ctx = ExecutorContext::new("task-1", Arc::new(RwLock::new(WorkingSet::new())));
 
             let result = executor.execute(&mut dag, &ctx).await;
             match result {
@@ -870,11 +814,7 @@ mod tests {
                 }))],
             );
             let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
-            let ctx = ExecutorContext::new(
-                "task-1",
-                Arc::new(RwLock::new(WorkingSet::new())),
-                Arc::new(NoopReferenceStore),
-            );
+            let ctx = ExecutorContext::new("task-1", Arc::new(RwLock::new(WorkingSet::new())));
 
             let result = executor.execute(&mut dag, &ctx).await;
             match result {
@@ -906,7 +846,7 @@ mod tests {
             );
             let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
             let ws = Arc::new(RwLock::new(WorkingSet::new()));
-            let ctx = ExecutorContext::new("task-1", ws.clone(), Arc::new(NoopReferenceStore));
+            let ctx = ExecutorContext::new("task-1", ws.clone());
 
             let result = executor.execute(&mut dag, &ctx).await;
             assert!(matches!(result, ExecutionResult::Completed));

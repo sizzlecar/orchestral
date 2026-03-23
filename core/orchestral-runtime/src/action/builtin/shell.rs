@@ -131,6 +131,7 @@ impl Action for ShellAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_category("direct")
             .with_capabilities([
                 "filesystem_write",
                 "shell",
@@ -138,9 +139,8 @@ impl Action for ShellAction {
                 "verification",
                 "fallback",
             ])
-            .with_roles(["inspect", "apply", "execute", "verify"])
-            .with_input_kinds(["command", "path", "text"])
-            .with_output_kinds(["process_result", "text"])
+            .with_input_kinds(["workspace.command", "workspace.path", "workspace.text"])
+            .with_output_kinds(["process.result", "text"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {

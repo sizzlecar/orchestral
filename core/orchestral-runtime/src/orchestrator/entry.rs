@@ -136,11 +136,6 @@ impl Orchestrator {
                 .run_planning_pipeline(interaction_id, "merged", new_task)
                 .await;
         }
-        if task.reactor.is_some() {
-            return self
-                .resume_reactor_waiting_interaction(interaction_id, task, event)
-                .await;
-        }
         task.start_executing();
         self.task_store.save(&task).await?;
 

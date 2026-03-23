@@ -172,11 +172,19 @@ pub struct BackendSpec {
 impl BackendSpec {
     /// Resolve the API key from environment variable.
     pub fn resolve_api_key(&self) -> Result<String, ApiKeyError> {
-        let env_name = self
-            .api_key_env
-            .as_ref()
+        let candidates = self.api_key_env_candidates();
+        let first = candidates
+            .first()
+            .cloned()
             .ok_or(ApiKeyError::NotConfigured)?;
-        std::env::var(env_name).map_err(|_| ApiKeyError::EnvNotFound(env_name.clone()))
+        for env_name in candidates {
+            if let Ok(value) = std::env::var(&env_name) {
+                if !value.trim().is_empty() {
+                    return Ok(value);
+                }
+            }
+        }
+        Err(ApiKeyError::EnvNotFound(first))
     }
 
     /// Read backend config value as typed object.
@@ -184,6 +192,29 @@ impl BackendSpec {
         self.config
             .get(key)
             .and_then(|v| serde_json::from_value(v.clone()).ok())
+    }
+
+    fn api_key_env_candidates(&self) -> Vec<String> {
+        let mut candidates = Vec::new();
+        if let Some(explicit) = self.api_key_env.as_ref() {
+            candidates.push(explicit.clone());
+        }
+        for fallback in default_api_key_envs_for_kind(&self.kind) {
+            if !candidates.iter().any(|existing| existing == fallback) {
+                candidates.push(fallback.to_string());
+            }
+        }
+        candidates
+    }
+}
+
+fn default_api_key_envs_for_kind(kind: &str) -> &'static [&'static str] {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "openai" => &["OPENAI_API_KEY"],
+        "google" | "gemini" => &["GOOGLE_API_KEY", "GEMINI_API_KEY"],
+        "anthropic" | "claude" => &["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"],
+        "openrouter" => &["OPENROUTER_API_KEY"],
+        _ => &[],
     }
 }
 

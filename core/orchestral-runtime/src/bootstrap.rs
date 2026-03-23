@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::action::{
-    ActionConfigError, ActionFactory, ActionRegistryManager, ActionWatcher, DefaultActionFactory,
+    ActionConfigError, ActionFactory, ActionRegistryManager, DefaultActionFactory,
 };
 use crate::agent::default_action_preflight_hook;
 use crate::context::{BasicContextBuilder, TokenBudget};
@@ -20,7 +20,7 @@ use crate::planner::LlmBuildError;
 use crate::skill::discovery::discover_skills;
 use crate::skill::SkillCatalog;
 use orchestral_core::action::extract_meta;
-use orchestral_core::config::{ConfigError, ConfigManager};
+use orchestral_core::config::{load_config, ConfigError};
 use orchestral_core::executor::Executor;
 use orchestral_core::io::{BlobIoError, BlobStore};
 use orchestral_core::normalizer::PlanNormalizer;
@@ -28,15 +28,12 @@ use orchestral_core::spi::{
     ComponentRegistry, HookRegistry, RuntimeBuildRequest, RuntimeComponentFactory, SpiError,
     SpiMeta, StoreBundle,
 };
-use orchestral_core::store::{
-    InMemoryEventStore, InMemoryReferenceStore, InMemoryTaskStore, StoreError,
-};
+use orchestral_core::store::{InMemoryEventStore, InMemoryTaskStore, StoreError};
 
 use crate::orchestrator::OrchestratorConfig;
 use crate::{Orchestrator, Thread, ThreadRuntime, ThreadRuntimeConfig};
 
 pub use self::blob_store::InMemoryBlobStore;
-use self::components::{extract_recipe_registry_component, register_recipe_templates};
 use self::observability::init_tracing_if_needed;
 use self::runtime_builder::{
     build_agent_step_executor, build_planner, build_runtime_component_options,
@@ -77,9 +74,7 @@ pub struct RuntimeApp {
     pub orchestrator: Orchestrator,
     pub blob_store: Arc<dyn BlobStore>,
     pub hook_registry: Arc<HookRegistry>,
-    pub config_manager: Arc<ConfigManager>,
     pub action_registry_manager: Arc<ActionRegistryManager>,
-    _action_watcher: Option<ActionWatcher>,
 }
 
 static TRACING_INIT: OnceLock<()> = OnceLock::new();
@@ -94,7 +89,6 @@ impl RuntimeComponentFactory for DefaultRuntimeComponentFactory {
             .with_stores(StoreBundle {
                 event_store: Arc::new(InMemoryEventStore::new()),
                 task_store: Arc::new(InMemoryTaskStore::new()),
-                reference_store: Arc::new(InMemoryReferenceStore::new()),
             })
             .with_blob_store(Arc::new(InMemoryBlobStore::default())))
     }
@@ -136,9 +130,7 @@ impl RuntimeApp {
         action_factory: Arc<dyn ActionFactory>,
     ) -> Result<Self, BootstrapError> {
         let path = path.into();
-        let config_manager = Arc::new(ConfigManager::new(path.clone()));
-        config_manager.load().await?;
-        let config = config_manager.config().read().await.clone();
+        let config = load_config(&path)?;
         init_tracing_if_needed(&TRACING_INIT, &config.observability);
         let build_request = RuntimeBuildRequest {
             meta: SpiMeta::runtime_defaults(env!("CARGO_PKG_VERSION")),
@@ -147,13 +139,11 @@ impl RuntimeApp {
             options: build_runtime_component_options(&config),
         };
         let components = component_factory.build(&build_request).await?;
-        let recipe_registry = extract_recipe_registry_component(&components)?;
         let stores = components.stores.unwrap_or_else(|| {
             tracing::warn!("component factory missing stores; fallback to in-memory stores");
             StoreBundle {
                 event_store: Arc::new(InMemoryEventStore::new()),
                 task_store: Arc::new(InMemoryTaskStore::new()),
-                reference_store: Arc::new(InMemoryReferenceStore::new()),
             }
         });
         let blob_store: Arc<dyn BlobStore> = components.blob_store.unwrap_or_else(|| {
@@ -179,11 +169,6 @@ impl RuntimeApp {
         let action_registry_manager =
             Arc::new(ActionRegistryManager::new(path.clone(), action_factory));
         action_registry_manager.load().await?;
-        let action_watcher = if config.actions.hot_reload {
-            Some(action_registry_manager.start_watching()?)
-        } else {
-            None
-        };
 
         let executor = Executor::with_registry(action_registry_manager.registry())
             .with_action_preflight_hook(default_action_preflight_hook())
@@ -211,23 +196,15 @@ impl RuntimeApp {
                 }
             }
         }
-        register_recipe_templates(&mut normalizer, &config, recipe_registry.as_deref());
-
-        let context_builder = Arc::new(BasicContextBuilder::new(
-            stores.event_store.clone(),
-            stores.reference_store.clone(),
-        ));
+        let context_builder = Arc::new(BasicContextBuilder::new(stores.event_store.clone()));
 
         let orchestrator_cfg = OrchestratorConfig {
             history_limit: config.context.history_limit,
             context_budget: TokenBudget::new(config.context.max_tokens),
             include_history: config.context.include_history,
-            include_references: config.context.include_references,
             auto_replan_once: true,
             auto_repair_plan_once: true,
-            reactor_enabled: config.runtime.reactor.enabled,
-            reactor_default_derivation_policy: config.runtime.reactor.default_derivation_policy,
-            reactor_stage_loop_limit: config.runtime.reactor.stage_loop_limit,
+            max_planner_iterations: config.runtime.max_planner_iterations,
         };
 
         let orchestrator = Orchestrator::with_config(
@@ -236,7 +213,6 @@ impl RuntimeApp {
             normalizer,
             executor,
             stores.task_store,
-            stores.reference_store,
             orchestrator_cfg,
         )
         .with_context_builder(context_builder)
@@ -247,9 +223,7 @@ impl RuntimeApp {
             orchestrator,
             blob_store,
             hook_registry,
-            config_manager,
             action_registry_manager,
-            _action_watcher: action_watcher,
         })
     }
 }
@@ -258,13 +232,8 @@ impl RuntimeApp {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use orchestral_core::action::ActionMeta;
     use orchestral_core::config::OrchestralConfig;
     use orchestral_core::io::BlobWriteRequest;
-    use orchestral_core::recipe::{ActionSelector, RecipeStageTemplate, RecipeTemplate};
-    use orchestral_core::recipe::{RecipeRegistry, RECIPE_REGISTRY_COMPONENT_KEY};
-    use orchestral_core::types::{Plan, Step, StepIoBinding, StepKind};
-    use serde_json::{json, Value};
 
     #[tokio::test]
     async fn test_default_component_factory_builds_min_runtime_components() {
@@ -315,164 +284,5 @@ mod tests {
             }
             other => panic!("expected UnsupportedConcurrencyPolicy, got {}", other),
         }
-    }
-
-    #[test]
-    fn test_register_recipe_templates_from_config_and_component_registry() {
-        let mut normalizer = PlanNormalizer::new();
-        normalizer.register_action_meta(
-            &ActionMeta::new("file_read", "file_read").with_capabilities(["filesystem_read"]),
-        );
-        normalizer.register_action_meta(
-            &ActionMeta::new("file_write", "file_write").with_capabilities(["filesystem_write"]),
-        );
-        normalizer.register_action("custom_verify");
-
-        let mut config = OrchestralConfig::default();
-        config.recipes.templates.push(
-            RecipeTemplate::new(
-                "config_fill",
-                vec![
-                    RecipeStageTemplate {
-                        id: "inspect".into(),
-                        kind: StepKind::Action,
-                        action: Some("file_read".to_string()),
-                        selector: None,
-                        depends_on: Vec::new(),
-                        exports: vec!["content".to_string()],
-                        io_bindings: Vec::new(),
-                        params: Value::Null,
-                        verify_with: None,
-                    },
-                    RecipeStageTemplate {
-                        id: "derive".into(),
-                        kind: StepKind::Agent,
-                        action: None,
-                        selector: None,
-                        depends_on: vec!["inspect".into()],
-                        exports: Vec::new(),
-                        io_bindings: vec![StepIoBinding::required(
-                            "inspect.content",
-                            "source_content",
-                        )],
-                        params: json!({
-                            "mode": "leaf",
-                            "goal": "derive patch",
-                            "output_keys": ["change_spec"]
-                        }),
-                        verify_with: None,
-                    },
-                ],
-            )
-            .with_export_from(std::collections::HashMap::from([(
-                "change_spec".to_string(),
-                "derive.change_spec".to_string(),
-            )])),
-        );
-
-        let mut registry = RecipeRegistry::new();
-        registry.register(
-            RecipeTemplate::new(
-                "component_fill",
-                vec![
-                    RecipeStageTemplate {
-                        id: "inspect".into(),
-                        kind: StepKind::Action,
-                        action: None,
-                        selector: Some(ActionSelector::default().with_all_of(["filesystem_read"])),
-                        depends_on: Vec::new(),
-                        exports: vec!["content".to_string()],
-                        io_bindings: Vec::new(),
-                        params: Value::Null,
-                        verify_with: None,
-                    },
-                    RecipeStageTemplate {
-                        id: "apply".into(),
-                        kind: StepKind::Action,
-                        action: None,
-                        selector: Some(ActionSelector::default().with_all_of(["filesystem_write"])),
-                        depends_on: vec!["inspect".into()],
-                        exports: vec!["path".to_string()],
-                        io_bindings: vec![StepIoBinding::required("inspect.content", "content")],
-                        params: Value::Null,
-                        verify_with: None,
-                    },
-                    RecipeStageTemplate {
-                        id: "verify".into(),
-                        kind: StepKind::Action,
-                        action: Some("custom_verify".to_string()),
-                        selector: None,
-                        depends_on: vec!["apply".into()],
-                        exports: vec!["verified".to_string()],
-                        io_bindings: vec![StepIoBinding::required("apply.path", "path")],
-                        params: Value::Null,
-                        verify_with: None,
-                    },
-                ],
-            )
-            .with_export_from(std::collections::HashMap::from([(
-                "verified".to_string(),
-                "verify.verified".to_string(),
-            )])),
-        );
-
-        register_recipe_templates(&mut normalizer, &config, Some(&registry));
-
-        let config_plan = Plan::new(
-            "config recipe",
-            vec![Step::recipe("r1").with_params(json!({
-                "template": "config_fill"
-            }))],
-        );
-        let normalized = normalizer
-            .normalize(config_plan)
-            .expect("normalize config recipe");
-        assert!(normalized.plan.get_step("r1__inspect").is_some());
-        assert!(normalized.plan.get_step("r1__derive").is_some());
-
-        let component_plan = Plan::new(
-            "component recipe",
-            vec![Step::recipe("r2").with_params(json!({
-                "template": "component_fill"
-            }))],
-        );
-        let normalized = normalizer
-            .normalize(component_plan)
-            .expect("normalize component recipe");
-        assert_eq!(
-            normalized
-                .plan
-                .get_step("r2__inspect")
-                .map(|step| step.action.as_str()),
-            Some("file_read")
-        );
-        assert_eq!(
-            normalized
-                .plan
-                .get_step("r2__apply")
-                .map(|step| step.action.as_str()),
-            Some("file_write")
-        );
-        assert_eq!(
-            normalized
-                .plan
-                .get_step("r2__verify")
-                .map(|step| step.action.as_str()),
-            Some("custom_verify")
-        );
-    }
-
-    #[test]
-    fn test_extract_recipe_registry_component_downcasts_named_component() {
-        let mut components = ComponentRegistry::new();
-        components.insert_named_component(
-            RECIPE_REGISTRY_COMPONENT_KEY,
-            Arc::new(RecipeRegistry::default()),
-        );
-
-        let registry = extract_recipe_registry_component(&components)
-            .expect("extract")
-            .expect("registry");
-        assert!(registry.get("inspect_derive_apply_verify").is_some());
     }
 }

@@ -1,6 +1,13 @@
 use serde_json::Value;
 
-use orchestral_core::types::{ContinuationState, ContinuationStatus, DerivationPolicy, StageKind};
+use orchestral_core::types::{ContinuationState, ContinuationStatus};
+
+/// Derivation policy for structured assessment (local enum replacing the removed core type).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DerivationPolicy {
+    Strict,
+    Permissive,
+}
 
 use super::support::{
     extract_assumptions, extract_unknowns, parse_patch_candidates_envelope,
@@ -64,7 +71,6 @@ pub(super) fn assess_structured_readiness(
             reason: "structured inspection found no required changes".to_string(),
             unknowns: Vec::new(),
             assumptions,
-            next_stage_hint: Some(StageKind::Done),
             user_message: None,
         };
         return Ok((
@@ -85,7 +91,6 @@ pub(super) fn assess_structured_readiness(
             reason: user_message.clone(),
             unknowns,
             assumptions,
-            next_stage_hint: Some(StageKind::WaitUser),
             user_message: Some(user_message.clone()),
         };
         return Ok((
@@ -103,7 +108,6 @@ pub(super) fn assess_structured_readiness(
         ),
         unknowns: Vec::new(),
         assumptions,
-        next_stage_hint: Some(StageKind::Commit),
         user_message: None,
     };
     Ok((
@@ -116,9 +120,15 @@ pub(super) fn assess_structured_readiness(
 }
 
 fn parse_derivation_policy(raw_policy: &str) -> Result<DerivationPolicy, String> {
-    match raw_policy {
+    match raw_policy.trim().to_ascii_lowercase().as_str() {
         "strict" => Ok(DerivationPolicy::Strict),
-        "permissive" => Ok(DerivationPolicy::Permissive),
-        other => Err(format!("unsupported derivation_policy '{}'", other)),
+        "" | "permissive" => Ok(DerivationPolicy::Permissive),
+        other => {
+            tracing::debug!(
+                derivation_policy = other,
+                "structured_assess_readiness defaulting unknown derivation_policy to permissive"
+            );
+            Ok(DerivationPolicy::Permissive)
+        }
     }
 }

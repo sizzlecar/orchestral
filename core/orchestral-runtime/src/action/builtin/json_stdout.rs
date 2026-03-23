@@ -42,10 +42,10 @@ impl Action for JsonStdoutAction {
 
     fn metadata(&self) -> ActionMeta {
         ActionMeta::new(self.name(), self.description())
+            .with_category("utility")
             .with_capabilities(["pure", "structured_output"])
-            .with_roles(["emit"])
-            .with_input_kinds(["structured"])
-            .with_output_kinds(["structured", "text"])
+            .with_input_kinds(["runtime.payload"])
+            .with_output_kinds(["runtime.stdout_json", "text"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {

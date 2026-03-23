@@ -53,13 +53,14 @@ fn generate_default_config() -> anyhow::Result<PathBuf> {
         .with_context(|| format!("create default config dir '{}' failed", dir.display()))?;
     let path = dir.join(GENERATED_CONFIG_FILE);
 
+    let desired = embedded_default_config();
     let needs_write = match fs::read_to_string(&path) {
-        Ok(existing) => existing != embedded_default_config(),
+        Ok(existing) => existing != desired,
         Err(_) => true,
     };
 
     if needs_write {
-        fs::write(&path, embedded_default_config())
+        fs::write(&path, desired)
             .with_context(|| format!("write generated config '{}' failed", path.display()))?;
     }
 
@@ -170,8 +171,10 @@ fn set_yaml_key(map: &mut Mapping, key: &str, value: YamlValue) {
     map.insert(YamlValue::String(key.to_string()), value);
 }
 
-pub(super) fn embedded_default_config() -> &'static str {
-    r#"version: 1
+pub(super) fn embedded_default_config() -> String {
+    let (planner_backend, planner_model_profile) = detect_default_llm_profile();
+    format!(
+        r#"version: 1
 
 app:
   name: orchestral-cli
@@ -182,11 +185,12 @@ runtime:
   auto_cleanup: true
   concurrency_policy: interrupt_and_start_new
   strict_exports: true
+  max_planner_iterations: 6
 
 planner:
   mode: llm
-  backend: openrouter
-  model_profile: claude-sonnet-4-5
+  backend: {planner_backend}
+  model_profile: {planner_model_profile}
   max_history: 20
   dynamic_model_selection: true
 
@@ -208,9 +212,24 @@ extensions:
     auto_discover: true
 
 providers:
-  default_backend: openrouter
-  default_model: claude-sonnet-4-5
+  default_backend: {planner_backend}
+  default_model: {planner_model_profile}
   backends:
+    - name: openai
+      kind: openai
+      api_key_env: OPENAI_API_KEY
+      config:
+        timeout_secs: 60
+    - name: google
+      kind: google
+      api_key_env: GOOGLE_API_KEY
+      config:
+        timeout_secs: 60
+    - name: anthropic
+      kind: anthropic
+      api_key_env: ANTHROPIC_API_KEY
+      config:
+        timeout_secs: 60
     - name: openrouter
       kind: openrouter
       api_key_env: OPENROUTER_API_KEY
@@ -218,7 +237,19 @@ providers:
       config:
         timeout_secs: 60
   models:
+    - name: gpt-4o-mini
+      backend: openai
+      model: gpt-4o-mini
+      temperature: 0.2
+    - name: gemini-2.5-flash
+      backend: google
+      model: gemini-2.5-flash
+      temperature: 0.2
     - name: claude-sonnet-4-5
+      backend: anthropic
+      model: claude-sonnet-4-5
+      temperature: 0.2
+    - name: claude-sonnet-4-5-openrouter
       backend: openrouter
       model: anthropic/claude-sonnet-4.5
       temperature: 0.2
@@ -291,4 +322,100 @@ actions:
       config:
         root_dir: "."
 "#
+    )
+}
+
+fn detect_default_llm_profile() -> (&'static str, &'static str) {
+    if has_env("OPENAI_API_KEY") {
+        ("openai", "gpt-4o-mini")
+    } else if has_any_env(&["GOOGLE_API_KEY", "GEMINI_API_KEY"]) {
+        ("google", "gemini-2.5-flash")
+    } else if has_any_env(&["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"]) {
+        ("anthropic", "claude-sonnet-4-5")
+    } else if has_env("OPENROUTER_API_KEY") {
+        ("openrouter", "claude-sonnet-4-5-openrouter")
+    } else {
+        ("openai", "gpt-4o-mini")
+    }
+}
+
+fn has_any_env(names: &[&str]) -> bool {
+    names.iter().any(|name| has_env(name))
+}
+
+fn has_env(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    const KEY_ENV_NAMES: &[&str] = &[
+        "OPENAI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GEMINI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_API_KEY",
+        "OPENROUTER_API_KEY",
+    ];
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn clear_key_envs() {
+        for name in KEY_ENV_NAMES {
+            std::env::remove_var(name);
+        }
+    }
+
+    #[test]
+    fn test_detect_default_llm_profile_prefers_openai_over_other_keys() {
+        let _guard = env_lock().lock().expect("env lock");
+        clear_key_envs();
+        std::env::set_var("OPENAI_API_KEY", "openai");
+        std::env::set_var("GOOGLE_API_KEY", "google");
+        std::env::set_var("ANTHROPIC_API_KEY", "anthropic");
+        std::env::set_var("OPENROUTER_API_KEY", "openrouter");
+
+        assert_eq!(detect_default_llm_profile(), ("openai", "gpt-4o-mini"));
+
+        clear_key_envs();
+    }
+
+    #[test]
+    fn test_detect_default_llm_profile_accepts_google_and_claude_aliases() {
+        let _guard = env_lock().lock().expect("env lock");
+        clear_key_envs();
+        std::env::set_var("GEMINI_API_KEY", "gemini");
+        assert_eq!(detect_default_llm_profile(), ("google", "gemini-2.5-flash"));
+
+        clear_key_envs();
+        std::env::set_var("CLAUDE_API_KEY", "claude");
+        assert_eq!(
+            detect_default_llm_profile(),
+            ("anthropic", "claude-sonnet-4-5")
+        );
+
+        clear_key_envs();
+    }
+
+    #[test]
+    fn test_detect_default_llm_profile_falls_back_to_openrouter_then_openai_default() {
+        let _guard = env_lock().lock().expect("env lock");
+        clear_key_envs();
+        std::env::set_var("OPENROUTER_API_KEY", "openrouter");
+        assert_eq!(
+            detect_default_llm_profile(),
+            ("openrouter", "claude-sonnet-4-5-openrouter")
+        );
+
+        clear_key_envs();
+        assert_eq!(detect_default_llm_profile(), ("openai", "gpt-4o-mini"));
+    }
 }

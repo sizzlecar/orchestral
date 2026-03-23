@@ -215,7 +215,7 @@ pub(super) fn requires_destructive_approval(
     args: &[String],
 ) -> bool {
     let destructive = [
-        "rm", "rmdir", "mv", "chmod", "chown", "truncate", "dd", "mkfs", "fdisk", "git",
+        "rm", "rmdir", "mv", "chmod", "chown", "truncate", "dd", "mkfs", "fdisk",
     ];
 
     if use_shell {
@@ -230,13 +230,25 @@ pub(super) fn requires_destructive_approval(
         if tokens.contains("git") && tokens.contains("reset") {
             return true;
         }
+        if tokens.contains("git")
+            && (tokens.contains("clean")
+                || tokens.contains("checkout")
+                || tokens.contains("restore"))
+        {
+            return true;
+        }
         return destructive.iter().any(|cmd| tokens.contains(*cmd));
     }
 
     if command_name == "git" {
         return args
             .first()
-            .map(|s| s.eq_ignore_ascii_case("reset"))
+            .map(|s| {
+                s.eq_ignore_ascii_case("reset")
+                    || s.eq_ignore_ascii_case("clean")
+                    || s.eq_ignore_ascii_case("checkout")
+                    || s.eq_ignore_ascii_case("restore")
+            })
             .unwrap_or(false);
     }
     if command_name == "find" {

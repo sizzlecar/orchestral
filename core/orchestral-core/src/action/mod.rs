@@ -50,14 +50,14 @@ pub struct ActionMeta {
     pub name: String,
     /// Action description
     pub description: String,
+    /// Optional action grouping/category for planner UX and reporting.
+    pub category: Option<String>,
     /// JSON schema for fully resolved input payload.
     pub input_schema: serde_json::Value,
     /// JSON schema for action output payload.
     pub output_schema: serde_json::Value,
     /// Semantic capability tags used by planner/runtime guardrails.
     pub capabilities: Vec<String>,
-    /// Semantic workflow roles used by recipe lowering.
-    pub roles: Vec<String>,
     /// Abstract artifact/input kinds this action can consume.
     pub input_kinds: Vec<String>,
     /// Abstract artifact/output kinds this action can produce.
@@ -70,13 +70,24 @@ impl ActionMeta {
         Self {
             name: name.into(),
             description: description.into(),
+            category: None,
             input_schema: serde_json::Value::Null,
             output_schema: serde_json::Value::Null,
             capabilities: Vec::new(),
-            roles: Vec::new(),
             input_kinds: Vec::new(),
             output_kinds: Vec::new(),
         }
+    }
+
+    /// Set action category/grouping metadata.
+    pub fn with_category(mut self, category: impl Into<String>) -> Self {
+        let category = category.into();
+        if category.trim().is_empty() {
+            self.category = None;
+        } else {
+            self.category = Some(category);
+        }
+        self
     }
 
     /// Set input schema.
@@ -112,26 +123,6 @@ impl ActionMeta {
         self
     }
 
-    /// Add one workflow role.
-    pub fn with_role(mut self, role: impl Into<String>) -> Self {
-        self.roles.push(role.into());
-        self.roles.sort();
-        self.roles.dedup();
-        self
-    }
-
-    /// Add multiple workflow roles.
-    pub fn with_roles<I, S>(mut self, roles: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.roles.extend(roles.into_iter().map(Into::into));
-        self.roles.sort();
-        self.roles.dedup();
-        self
-    }
-
     /// Add multiple supported input kinds.
     pub fn with_input_kinds<I, S>(mut self, kinds: I) -> Self
     where
@@ -159,11 +150,6 @@ impl ActionMeta {
     /// Check whether this action advertises a capability.
     pub fn has_capability(&self, capability: &str) -> bool {
         self.capabilities.iter().any(|item| item == capability)
-    }
-
-    /// Check whether this action advertises a workflow role.
-    pub fn has_role(&self, role: &str) -> bool {
-        self.roles.iter().any(|item| item == role)
     }
 
     /// Check whether this action can consume the given abstract input kind.

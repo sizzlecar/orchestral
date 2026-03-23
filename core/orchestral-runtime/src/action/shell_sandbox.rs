@@ -298,6 +298,8 @@ fn build_macos_profile(cwd: &Path, policy: &ShellSandboxPolicy) -> String {
     profile.push_str("(allow process*)\n");
     profile.push_str("(allow sysctl-read)\n");
     profile.push_str("(allow file-read*)\n");
+    profile.push_str("(allow file-read* (literal \"/dev/null\"))\n");
+    profile.push_str("(allow file-write* (literal \"/dev/null\"))\n");
     if policy.allow_network {
         profile.push_str("(allow network*)\n");
     }
@@ -454,6 +456,7 @@ mod tests {
         let profile = build_macos_profile(&cwd, &policy);
         assert!(profile.contains("file-write*"));
         assert!(profile.contains("(deny default)"));
+        assert!(profile.contains("(literal \"/dev/null\")"));
     }
 
     #[test]

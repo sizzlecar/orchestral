@@ -17,7 +17,6 @@ use thiserror::Error;
 
 use crate::action::ActionMeta;
 use crate::executor::ExecutionDag;
-use crate::recipe::{RecipeCompileError, RecipeCompiler, RecipeTemplate};
 use crate::types::Plan;
 
 use self::implicit::{fix_control_flow_dependencies, output_keys_from_schema, ActionContract};
@@ -63,9 +62,6 @@ pub enum FixError {
 /// Normalization errors
 #[derive(Debug, Error)]
 pub enum NormalizeError {
-    #[error("recipe compile failed: {0}")]
-    RecipeCompile(#[from] RecipeCompileError),
-
     #[error("Validation failed: {0}")]
     Validation(#[from] ValidationError),
 
@@ -102,7 +98,6 @@ pub struct NormalizedPlan {
 pub struct PlanNormalizer {
     validators: Vec<Box<dyn PlanValidator>>,
     fixers: Vec<Box<dyn PlanFixer>>,
-    recipe_compiler: RecipeCompiler,
     /// Known action contracts keyed by action name.
     known_actions: std::collections::HashMap<String, ActionContract>,
 }
@@ -113,7 +108,6 @@ impl PlanNormalizer {
         Self {
             validators: Vec::new(),
             fixers: Vec::new(),
-            recipe_compiler: RecipeCompiler::new(),
             known_actions: std::collections::HashMap::new(),
         }
     }
@@ -131,27 +125,18 @@ impl PlanNormalizer {
     /// Register a known action
     pub fn register_action(&mut self, name: impl Into<String>) {
         let name = name.into();
-        self.recipe_compiler.register_action(name.clone());
         self.known_actions.entry(name).or_default();
     }
 
     /// Register a known action with metadata-derived contract.
     pub fn register_action_meta(&mut self, meta: &ActionMeta) {
-        self.recipe_compiler.register_action_meta(meta);
         let output_keys = output_keys_from_schema(&meta.output_schema);
         self.known_actions
             .insert(meta.name.clone(), ActionContract { output_keys });
     }
 
-    /// Register a reusable recipe template.
-    pub fn register_recipe_template(&mut self, template: RecipeTemplate) {
-        self.recipe_compiler.register_template(template);
-    }
-
     /// Normalize a plan
     pub fn normalize(&self, mut plan: Plan) -> Result<NormalizedPlan, NormalizeError> {
-        self.recipe_compiler.compile(&mut plan)?;
-
         // Step 1: Run fixers (they may fix issues before validation)
         for fixer in &self.fixers {
             fixer.fix(&mut plan)?;
@@ -188,7 +173,7 @@ impl Default for PlanNormalizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Step, StepId, StepIoBinding, StepKind};
+    use crate::types::{Step, StepIoBinding, StepKind};
     use serde_json::json;
 
     #[test]
@@ -209,6 +194,51 @@ mod tests {
         let normalized = normalizer.normalize(plan).expect("normalize");
         let step2 = normalized.plan.get_step("s2").expect("s2");
         assert_eq!(step2.depends_on, vec![crate::types::StepId::from("s1")]);
+    }
+
+    #[test]
+    fn test_normalizer_derives_depends_on_from_param_templates() {
+        let mut normalizer = PlanNormalizer::new();
+        normalizer.register_action("produce");
+        normalizer.register_action("consume");
+
+        let plan = Plan::new(
+            "derive deps from templates",
+            vec![
+                Step::action("s1", "produce"),
+                Step::action("s2", "consume").with_params(json!({
+                    "source_paths": "{{s1.source_paths}}",
+                    "message": "process {{s1.summary}}"
+                })),
+            ],
+        );
+
+        let normalized = normalizer.normalize(plan).expect("normalize");
+        let step2 = normalized.plan.get_step("s2").expect("s2");
+        assert_eq!(step2.depends_on, vec![crate::types::StepId::from("s1")]);
+    }
+
+    #[test]
+    fn test_normalizer_allows_external_working_set_template_refs_without_dependencies() {
+        let mut normalizer = PlanNormalizer::new();
+        normalizer.register_action("spreadsheet_apply_patch");
+
+        let plan = Plan::new(
+            "apply spreadsheet patch from prior iteration state",
+            vec![
+                Step::action("single_action", "spreadsheet_apply_patch").with_params(json!({
+                    "path": "{{locate.source_path}}",
+                    "patch_spec": "{{assess.continuation.patch_spec}}"
+                })),
+            ],
+        );
+
+        let normalized = normalizer.normalize(plan).expect("normalize");
+        let step = normalized
+            .plan
+            .get_step("single_action")
+            .expect("single_action");
+        assert!(step.depends_on.is_empty());
     }
 
     #[test]
@@ -435,60 +465,6 @@ mod tests {
                 .pointer("/output_rules/excel_path/candidates/0/slot"),
             Some(&json!("leaf_result"))
         );
-    }
-
-    #[test]
-    fn test_normalizer_compiles_recipe_steps_before_validation() {
-        let mut normalizer = PlanNormalizer::new();
-        normalizer.register_action("inspect_doc");
-        normalizer.register_action("apply_patch");
-        normalizer.register_action("finalize");
-
-        let plan = Plan::new(
-            "recipe-flow",
-            vec![
-                Step::recipe("r1").with_params(json!({
-                    "stages": [
-                        {
-                            "id": "inspect",
-                            "kind": "action",
-                            "action": "inspect_doc",
-                            "exports": ["view"]
-                        },
-                        {
-                            "id": "derive",
-                            "kind": "agent",
-                            "params": {
-                                "mode": "leaf",
-                                "goal": "derive a patch",
-                                "output_keys": ["change_spec"]
-                            }
-                        },
-                        {
-                            "id": "apply",
-                            "kind": "action",
-                            "action": "apply_patch",
-                            "io_bindings": [
-                                {"from": "derive.change_spec", "to": "patch", "required": true}
-                            ],
-                            "exports": ["updated_path"]
-                        }
-                    ],
-                    "export_from": {
-                        "updated_path": "apply.updated_path"
-                    }
-                })),
-                Step::action("s2", "finalize")
-                    .with_io_bindings(vec![StepIoBinding::required("r1.updated_path", "path")]),
-            ],
-        );
-
-        let normalized = normalizer.normalize(plan).expect("normalize");
-        assert!(normalized.plan.get_step("r1").is_none());
-        let apply = normalized.plan.get_step("r1__apply").expect("apply");
-        assert_eq!(apply.depends_on, vec![StepId::from("r1__derive")]);
-        let finalize = normalized.plan.get_step("s2").expect("s2");
-        assert_eq!(finalize.io_bindings[0].from, "r1__apply.updated_path");
     }
 
     #[test]

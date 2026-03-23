@@ -6,15 +6,6 @@ members = [
     "core/orchestral-runtime",
     "core/orchestral",
 
-    # Platform (Tier 2 - optional, depends on core)
-    "platform/orchestral-stores-backends",
-    "platform/orchestral-files",
-    "platform/orchestral-infra",
-    "platform/orchestral-composition",
-    "platform/orchestral-extension-host",
-    "platform/orchestral-docs-assistant",
-    "platform/orchestral-server",
-
     # Apps
     "apps/orchestral-cli",
 
@@ -49,38 +40,17 @@ thiserror = "1"
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-notify = "6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Utilities
 uuid = { version = "1", features = ["v4", "serde"] }
-redis = { version = "0.27", features = ["aio", "tokio-comp"] }
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "mysql", "sqlite", "chrono", "json", "uuid"] }
 futures-util = "0.3"
 bytes = "1"
-kreuzberg = { version = "4.2.0", default-features = false, features = [
-    "tokio-runtime",
-    "office",
-    "excel",
-    "email",
-    "html",
-    "xml",
-    "archives",
-] }
 
 # Internal crates - Core
 orchestral = { path = "core/orchestral" }
 orchestral-core = { path = "core/orchestral-core" }
 orchestral-runtime = { path = "core/orchestral-runtime" }
-
-# Internal crates - Platform
-orchestral-stores-backends = { path = "platform/orchestral-stores-backends" }
-orchestral-files = { path = "platform/orchestral-files" }
-orchestral-infra = { path = "platform/orchestral-infra" }
-orchestral-composition = { path = "platform/orchestral-composition" }
-orchestral-extension-host = { path = "platform/orchestral-extension-host" }
-orchestral-docs-assistant = { path = "platform/orchestral-docs-assistant" }
-orchestral-server = { path = "platform/orchestral-server" }
 
 [workspace.dependencies.tokio-test]
 version = "0.4"

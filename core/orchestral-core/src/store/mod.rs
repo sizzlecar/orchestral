@@ -3,7 +3,6 @@
 //! This module provides storage abstractions and default in-memory implementations:
 //! - EventStore: append-only fact journal
 //! - WorkingSet: Scoped KV data container for inter-step communication
-//! - ReferenceStore: Historical artifact storage (async trait)
 //! - TaskStore: Task persistence (async trait)
 //! - EventBus: realtime event fan-out abstraction
 //!
@@ -12,20 +11,14 @@
 pub mod event_bus;
 mod event_store;
 mod memory_event;
-mod memory_reference;
 mod memory_task;
-mod reference_store;
 mod task_store;
 mod working_set;
 
 pub use event_bus::{BroadcastEventBus, EventBus};
 pub use event_store::{Event, EventStore, InteractionId, ThreadId};
 pub use memory_event::InMemoryEventStore;
-pub use memory_reference::InMemoryReferenceStore;
 pub use memory_task::InMemoryTaskStore;
-pub use reference_store::{
-    EmbeddingStatus, Reference, ReferenceMatch, ReferenceStore, ReferenceType,
-};
 pub use task_store::TaskStore;
 pub use working_set::{Scope, WorkingSet};
 

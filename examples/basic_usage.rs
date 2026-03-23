@@ -14,7 +14,7 @@ use tokio::sync::RwLock;
 
 // Import from orchestral crates
 use orchestral_core::prelude::*;
-use orchestral_core::store::{Event, EventStore, InMemoryEventStore, InMemoryReferenceStore};
+use orchestral_core::store::{Event, EventStore, InMemoryEventStore};
 use orchestral_runtime::{
     ConcurrencyDecision, ConcurrencyPolicy, HandleEventResult, RunningState, Thread, ThreadRuntime,
 };
@@ -69,7 +69,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create stores
     let event_store: Arc<dyn EventStore> = Arc::new(InMemoryEventStore::new());
-    let reference_store: Arc<dyn ReferenceStore> = Arc::new(InMemoryReferenceStore::new());
 
     // Create a Thread (context world)
     let thread = Thread::new();
@@ -153,7 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create executor context
     let working_set = Arc::new(RwLock::new(WorkingSet::new()));
-    let exec_ctx = ExecutorContext::new("task-1", working_set.clone(), reference_store);
+    let exec_ctx = ExecutorContext::new("task-1", working_set.clone());
 
     // Execute the plan
     let mut dag = normalized.dag;

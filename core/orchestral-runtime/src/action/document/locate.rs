@@ -67,6 +67,15 @@ pub(super) fn locate_documents(
         ),
     );
     exports.insert(
+        "documents".to_string(),
+        Value::Array(
+            sources
+                .iter()
+                .map(|path| Value::String(display_path(path)))
+                .collect(),
+        ),
+    );
+    exports.insert(
         "artifact_candidates".to_string(),
         Value::Array(
             sources

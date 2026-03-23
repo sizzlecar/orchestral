@@ -12,24 +12,35 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use std::sync::Arc;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 
 use crate::action::ActionMeta;
-use crate::store::ReferenceStore;
-use crate::types::{Intent, SkeletonChoice, StageChoice};
+use crate::types::{Intent, Plan};
 
-/// Planner output - selects skeleton/stage or responds directly.
+/// Planner single-action output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SingleAction {
+    pub action: String,
+    pub params: Value,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Legacy alias preserved while call sites migrate.
+pub type ActionCall = SingleAction;
+
 #[derive(Debug, Clone)]
 pub enum PlannerOutput {
-    /// Select the task skeleton before stage-local execution begins.
-    SkeletonChoice(SkeletonChoice),
-    /// Select the current reactor stage; runtime lowers it into a small stage-local DAG.
-    StageChoice(StageChoice),
-    /// Reply directly without executing any workflow.
-    DirectResponse(String),
-    /// Ask user for clarification and wait for next input.
-    Clarification(String),
+    /// Execute a single direct action.
+    SingleAction(SingleAction),
+    /// Execute a small concrete DAG in one planner turn.
+    MiniPlan(Plan),
+    /// Reply directly w    ithout executing any plan.
+    Done(String),
+    /// Ask user for missing input and wait for the next turn.
+    NeedInput(String),
 }
 
 /// Planner errors
@@ -70,13 +81,12 @@ pub struct PlannerContext {
     pub available_actions: Vec<ActionMeta>,
     /// Conversation/interaction history
     pub history: Vec<HistoryItem>,
-    /// Reference store for querying historical artifacts and user preferences
-    /// Read-only access
-    pub reference_store: Arc<dyn ReferenceStore>,
     /// Runtime host information for platform-aware planning.
     pub runtime_info: PlannerRuntimeInfo,
     /// Activated skill instructions for this planning turn.
     pub skill_instructions: Vec<SkillInstruction>,
+    /// Observed execution state from prior planner iterations in the same turn.
+    pub loop_context: Option<PlannerLoopContext>,
 }
 
 /// Matched skill instruction attached to planner context.
@@ -90,33 +100,38 @@ pub struct SkillInstruction {
     pub venv_python: Option<String>,
 }
 
+/// Agent-loop execution state surfaced back into the planner.
+#[derive(Debug, Clone, Default)]
+pub struct PlannerLoopContext {
+    pub iteration: usize,
+    pub max_iterations: usize,
+    pub recent_observations: Vec<String>,
+    pub completed_step_ids: Vec<String>,
+    pub available_bindings: Vec<String>,
+    pub binding_shapes: Vec<String>,
+    pub working_set_preview: Option<String>,
+}
+
 impl PlannerContext {
     /// Create a new planner context
-    pub fn new(
-        available_actions: Vec<ActionMeta>,
-        reference_store: Arc<dyn ReferenceStore>,
-    ) -> Self {
+    pub fn new(available_actions: Vec<ActionMeta>) -> Self {
         Self {
             available_actions,
             history: Vec::new(),
-            reference_store,
             runtime_info: PlannerRuntimeInfo::default(),
             skill_instructions: Vec::new(),
+            loop_context: None,
         }
     }
 
     /// Create context with history
-    pub fn with_history(
-        available_actions: Vec<ActionMeta>,
-        history: Vec<HistoryItem>,
-        reference_store: Arc<dyn ReferenceStore>,
-    ) -> Self {
+    pub fn with_history(available_actions: Vec<ActionMeta>, history: Vec<HistoryItem>) -> Self {
         Self {
             available_actions,
             history,
-            reference_store,
             runtime_info: PlannerRuntimeInfo::default(),
             skill_instructions: Vec::new(),
+            loop_context: None,
         }
     }
 
@@ -129,6 +144,12 @@ impl PlannerContext {
     /// Attach matched skill instructions.
     pub fn with_skill_instructions(mut self, skills: Vec<SkillInstruction>) -> Self {
         self.skill_instructions = skills;
+        self
+    }
+
+    /// Attach agent-loop execution context from earlier iterations.
+    pub fn with_loop_context(mut self, loop_context: PlannerLoopContext) -> Self {
+        self.loop_context = Some(loop_context);
         self
     }
 
