@@ -214,7 +214,9 @@ pub(super) fn requires_destructive_approval(
     command: &str,
     args: &[String],
 ) -> bool {
-    let destructive = ["rm", "rmdir", "mv", "chmod", "chown", "truncate", "dd", "mkfs", "fdisk"];
+    let destructive = [
+        "rm", "rmdir", "mv", "chmod", "chown", "truncate", "dd", "mkfs", "fdisk",
+    ];
 
     if use_shell {
         let tokens = expression_command_tokens(command);
@@ -229,7 +231,9 @@ pub(super) fn requires_destructive_approval(
             return true;
         }
         if tokens.contains("git")
-            && (tokens.contains("clean") || tokens.contains("checkout") || tokens.contains("restore"))
+            && (tokens.contains("clean")
+                || tokens.contains("checkout")
+                || tokens.contains("restore"))
         {
             return true;
         }
