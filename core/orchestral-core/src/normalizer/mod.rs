@@ -219,6 +219,27 @@ mod tests {
     }
 
     #[test]
+    fn test_normalizer_allows_external_working_set_template_refs_without_dependencies() {
+        let mut normalizer = PlanNormalizer::new();
+        normalizer.register_action("spreadsheet_apply_patch");
+
+        let plan = Plan::new(
+            "apply spreadsheet patch from prior iteration state",
+            vec![Step::action("single_action", "spreadsheet_apply_patch").with_params(json!({
+                "path": "{{locate.source_path}}",
+                "patch_spec": "{{assess.continuation.patch_spec}}"
+            }))],
+        );
+
+        let normalized = normalizer.normalize(plan).expect("normalize");
+        let step = normalized
+            .plan
+            .get_step("single_action")
+            .expect("single_action");
+        assert!(step.depends_on.is_empty());
+    }
+
+    #[test]
     fn test_normalizer_populates_exports_from_action_output_schema() {
         let mut normalizer = PlanNormalizer::new();
         normalizer.register_action_meta(&ActionMeta::new("write_doc", "write").with_output_schema(

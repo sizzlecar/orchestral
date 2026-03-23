@@ -3,10 +3,11 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::model::{load_xlsx_model, save_xlsx_model};
-use super::support::{display_path, parse_cell_ref};
+use super::support::{display_path, parse_cell_ref, resolve_patch_spec_value};
 
 pub(super) fn apply_patch(path: &Path, patch_spec: &Value) -> Result<(String, usize), String> {
     let mut workbook = load_xlsx_model(path)?;
+    let patch_spec = resolve_patch_spec_value(patch_spec)?;
     let fills = patch_spec
         .get("fills")
         .and_then(Value::as_array)

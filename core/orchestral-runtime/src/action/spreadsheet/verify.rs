@@ -6,7 +6,8 @@ use serde_json::{json, Value};
 use super::inspect::{cell_display_text, inspect_workbook};
 use super::model::load_xlsx_model;
 use super::support::{
-    normalize_path, parse_cell_ref, resolve_project_path, resolve_validator_python,
+    normalize_path, parse_cell_ref, resolve_patch_spec_value, resolve_project_path,
+    resolve_validator_python,
 };
 
 pub(super) fn verify_patch(
@@ -154,6 +155,7 @@ fn run_external_validator(workbook_path: &Path, validator_path: &str) -> Result<
 
 fn verify_patch_against_spec(path: &Path, patch_spec: &Value) -> Result<Value, String> {
     let workbook = load_xlsx_model(path)?;
+    let patch_spec = resolve_patch_spec_value(patch_spec)?;
     let fills = patch_spec
         .get("fills")
         .and_then(Value::as_array)

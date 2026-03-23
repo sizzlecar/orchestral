@@ -1,5 +1,39 @@
 use std::path::{Path, PathBuf};
 
+use serde_json::Value;
+
+pub(super) fn resolve_patch_spec_value<'a>(patch_spec: &'a Value) -> Result<&'a Value, String> {
+    if patch_spec.get("fills").and_then(Value::as_array).is_some() {
+        return Ok(patch_spec);
+    }
+
+    if let Some(nested) = patch_spec
+        .get("patch_spec")
+        .filter(|value| value.get("fills").and_then(Value::as_array).is_some())
+    {
+        tracing::debug!("spreadsheet patch_spec resolved from nested patch_spec envelope");
+        return Ok(nested);
+    }
+
+    if let Some(continuation) = patch_spec.get("continuation") {
+        if continuation.get("fills").and_then(Value::as_array).is_some() {
+            tracing::debug!("spreadsheet patch_spec resolved from continuation envelope");
+            return Ok(continuation);
+        }
+        if let Some(nested) = continuation
+            .get("patch_spec")
+            .filter(|value| value.get("fills").and_then(Value::as_array).is_some())
+        {
+            tracing::debug!(
+                "spreadsheet patch_spec resolved from continuation.patch_spec envelope"
+            );
+            return Ok(nested);
+        }
+    }
+
+    Err("patch_spec.fills must be an array".to_string())
+}
+
 pub(super) fn parse_cell_ref(cell_ref: &str) -> Result<(u32, u32), String> {
     let mut letters = String::new();
     let mut digits = String::new();
@@ -109,4 +143,37 @@ pub(super) fn xml_escape_attr(input: &str) -> String {
     xml_escape_text(input)
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::resolve_patch_spec_value;
+
+    #[test]
+    fn test_resolve_patch_spec_value_accepts_direct_fills_array() {
+        let patch_spec = json!({
+            "fills": [{ "cell": "F5", "value": "done" }]
+        });
+
+        let resolved = resolve_patch_spec_value(&patch_spec).expect("direct spec");
+        assert_eq!(resolved["fills"][0]["cell"], json!("F5"));
+    }
+
+    #[test]
+    fn test_resolve_patch_spec_value_accepts_continuation_patch_spec_envelope() {
+        let patch_spec = json!({
+            "continuation": {
+                "status": "commit_ready",
+                "patch_spec": {
+                    "fills": [{ "cell": "F5", "value": "done" }]
+                }
+            },
+            "summary": "ready"
+        });
+
+        let resolved = resolve_patch_spec_value(&patch_spec).expect("continuation envelope");
+        assert_eq!(resolved["fills"][0]["cell"], json!("F5"));
+    }
 }
