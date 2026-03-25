@@ -1,0 +1,34 @@
+version: 1
+name: sales-report-pipeline
+config: ../orchestral.cli.runtime.override.yaml
+timeout_secs: 300
+workspace:
+  copies:
+    - from: ../../fixtures/scenarios/sales_report/mock_sales_api.sh
+      to: mock_sales_api.sh
+    - from: ../../fixtures/scenarios/sales_report/.mcp.json
+      to: .mcp.json
+    - from: ../../fixtures/scenarios/sales_report/quarterly_report_template.xlsx
+      to: quarterly_report_template.xlsx
+    - from: ../../fixtures/scenarios/sales_report/budget.yaml
+      to: budget.yaml
+
+turns:
+  - name: generate-q4-report
+    input: >
+      Generate the Q4 sales report:
+      1. Query actual sales data from the sales-api (quarter=Q4)
+      2. Fill the quarterly_report_template.xlsx with actual numbers, completion percentages, and status
+      3. Write a markdown summary to report.md comparing actuals vs budget from budget.yaml
+      Include totals and highlight regions that exceeded or missed targets.
+    expect:
+      require_execution_end: true
+      max_approvals: 0
+      max_errors: 2
+      activity_contains:
+        - "tool_lookup"
+        - "mcp__sales-api__query_sales_data"
+      assistant_contains:
+        - "North America"
+      persist_not_contains:
+        - "Plan: no actions"
