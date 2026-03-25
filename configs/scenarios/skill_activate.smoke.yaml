@@ -1,0 +1,22 @@
+version: 1
+name: skill-activate-smoke
+config: ../orchestral.cli.runtime.override.yaml
+no_mcp: true
+timeout_secs: 180
+
+turns:
+  - name: activate-xlsx-skill
+    input: >
+      I need to work with a spreadsheet. First check what skills are available,
+      then load the xlsx skill instructions so you know how to handle Excel files.
+      After loading the skill, tell me the key rules from the instructions.
+    expect:
+      require_execution_end: true
+      max_approvals: 0
+      max_errors: 0
+      activity_contains:
+        - "skill_activate"
+      assistant_contains:
+        - "xlsx"
+      persist_not_contains:
+        - "Plan: no actions"
