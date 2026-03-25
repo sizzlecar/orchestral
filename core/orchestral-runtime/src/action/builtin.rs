@@ -4,6 +4,7 @@ mod http;
 mod json_stdout;
 mod shell;
 mod support;
+pub(crate) mod tool_lookup;
 
 use orchestral_core::action::Action;
 use orchestral_core::config::ActionSpec;

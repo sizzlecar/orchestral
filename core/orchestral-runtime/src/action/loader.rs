@@ -7,11 +7,15 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 
 use orchestral_core::action::ActionMeta;
-use orchestral_core::config::{load_config, ConfigError, OrchestralConfig};
+use orchestral_core::config::{
+    load_config, ActionInterfaceSpec, ActionSpec, ConfigError, OrchestralConfig,
+};
 use orchestral_core::executor::ActionRegistry;
 
+use super::builtin::tool_lookup::ToolLookupAction;
 use super::builtin::JsonStdoutAction;
 use super::factory::{ActionBuildError, ActionFactory};
+use super::mcp::probe_mcp_server_tools;
 use super::providers::{collect_action_registration_specs, ActionRegistrationSpec};
 
 /// Action config errors
@@ -61,9 +65,91 @@ impl ActionRegistryManager {
         &self,
         specs: Vec<ActionRegistrationSpec>,
     ) -> Result<usize, ActionConfigError> {
+        // Separate MCP server specs (to probe) from regular specs.
+        let mut regular_specs = Vec::new();
+        let mut mcp_server_specs = Vec::new();
+        for registration in specs {
+            if registration.spec.kind == "mcp_server" {
+                mcp_server_specs.push(registration);
+            } else {
+                regular_specs.push(registration);
+            }
+        }
+
+        // Probe MCP servers to discover per-tool specs.
+        let mut tool_specs = Vec::new();
+        for server_reg in &mcp_server_specs {
+            let server_name = server_reg.spec.name.clone();
+            match probe_mcp_server_tools(&server_reg.spec).await {
+                Ok(tools) => {
+                    tracing::info!(
+                        server = %server_name,
+                        tool_count = tools.len(),
+                        "MCP server probed successfully"
+                    );
+                    for tool in tools {
+                        let action_name =
+                            format!("{}__{}", server_name, sanitize_tool_name(&tool.name));
+                        let mut config = server_reg.spec.config.clone();
+                        if let Some(obj) = config.as_object_mut() {
+                            obj.insert("tool_name".to_string(), Value::String(tool.name.clone()));
+                            obj.insert("tool_input_schema".to_string(), tool.input_schema.clone());
+                        }
+                        tool_specs.push(ActionRegistrationSpec {
+                            source: server_reg.source,
+                            spec: ActionSpec {
+                                name: action_name,
+                                kind: "mcp_tool".to_string(),
+                                description: if tool.description.is_empty() {
+                                    Some(format!("MCP tool '{}'", tool.name))
+                                } else {
+                                    Some(tool.description.clone())
+                                },
+                                category: None,
+                                config,
+                                interface: Some(ActionInterfaceSpec {
+                                    input_schema: tool.input_schema,
+                                    output_schema: serde_json::json!({
+                                        "type": "object",
+                                        "properties": { "result": {} },
+                                        "required": ["result"]
+                                    }),
+                                }),
+                            },
+                        });
+                    }
+                }
+                Err(err) => {
+                    let required = server_reg
+                        .spec
+                        .config
+                        .get("required")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if required {
+                        return Err(ActionConfigError::Build(ActionBuildError::InvalidConfig(
+                            format!(
+                                "required MCP server '{}' probe failed: {}",
+                                server_name, err
+                            ),
+                        )));
+                    }
+                    tracing::warn!(
+                        server = %server_name,
+                        error = %err,
+                        "MCP server probe failed, skipping"
+                    );
+                }
+            }
+        }
+
+        // Build and register all actions.
         let mut registry = ActionRegistry::new();
         let mut effective: HashMap<String, (ActionRegistrationSpec, ActionMeta)> = HashMap::new();
-        for registration in specs {
+
+        // Register regular actions + MCP tool actions (skip raw mcp_server specs).
+        let all_specs = regular_specs.into_iter().chain(tool_specs);
+        for registration in all_specs {
             let name = registration.spec.name.clone();
             match self.factory.build(&registration.spec) {
                 Ok(action) => {
@@ -78,6 +164,7 @@ impl ActionRegistryManager {
             }
         }
         registry.register(Arc::new(JsonStdoutAction::internal()));
+        registry.register(Arc::new(ToolLookupAction::new(self.registry.clone())));
 
         let mut current = self.registry.write().await;
         *current = registry;
@@ -175,6 +262,24 @@ fn summarize_schema(schema: &Value) -> String {
     let serialized =
         serde_json::to_string(schema).unwrap_or_else(|_| "<invalid_schema>".to_string());
     trim_chars(serialized, 180)
+}
+
+fn sanitize_tool_name(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.chars().all(|c| c == '_') {
+        "tool".to_string()
+    } else {
+        sanitized
+    }
 }
 
 fn trim_chars(value: String, max_chars: usize) -> String {
