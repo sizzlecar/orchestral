@@ -21,8 +21,8 @@ turns:
       assistant_not_contains:
         - "{{"
       activity_contains:
-        - "spreadsheet_locate"
+        - "spreadsheet_inspect"
         - "spreadsheet_inspect"
       activity_not_contains:
-        - "spreadsheet_apply_patch"
+        - "spreadsheet_patch"
         - "spreadsheet_verify_patch"

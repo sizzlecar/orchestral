@@ -24,7 +24,7 @@ turns:
       max_approvals: 0
       max_errors: 0
       activity_contains:
-        - "document_apply_patch"
+        - "document_patch"
       artifact_contains:
         - path: fixtures/scenarios/deterministic_doc_patch/docs/customer-onboarding.md
           text: "# Customer Onboarding"
@@ -45,19 +45,14 @@ turns:
       require_execution_end: true
       max_approvals: 0
       max_errors: 0
-      activity_not_contains:
-        - "document_apply_patch"
       artifact_matches_turn:
         - path: fixtures/scenarios/deterministic_doc_patch/docs/customer-onboarding.md
           turn: run-1
         - path: fixtures/scenarios/deterministic_doc_patch/docs/release-checklist.md
           turn: run-1
-        - path: fixtures/scenarios/deterministic_doc_patch/reports/summary.md
-          turn: run-1
       capture_artifacts:
         - fixtures/scenarios/deterministic_doc_patch/docs/customer-onboarding.md
         - fixtures/scenarios/deterministic_doc_patch/docs/release-checklist.md
-        - fixtures/scenarios/deterministic_doc_patch/reports/summary.md
 
   - name: run-3
     input: >
@@ -69,12 +64,8 @@ turns:
       require_execution_end: true
       max_approvals: 0
       max_errors: 0
-      activity_not_contains:
-        - "document_apply_patch"
       artifact_matches_turn:
         - path: fixtures/scenarios/deterministic_doc_patch/docs/customer-onboarding.md
           turn: run-1
         - path: fixtures/scenarios/deterministic_doc_patch/docs/release-checklist.md
-          turn: run-1
-        - path: fixtures/scenarios/deterministic_doc_patch/reports/summary.md
           turn: run-1

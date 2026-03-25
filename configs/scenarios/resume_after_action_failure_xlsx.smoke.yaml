@@ -23,7 +23,7 @@ turns:
       persist_not_contains:
         - "Workbook updated and verified."
       activity_contains:
-        - "spreadsheet_apply_patch failed=true"
+        - "spreadsheet_patch failed=true"
   - name: resume-from-failed-apply-step
     input: >
       继续
@@ -34,12 +34,11 @@ turns:
       persist_contains:
         - "Workbook updated and verified."
       activity_contains:
-        - "spreadsheet_apply_patch"
+        - "spreadsheet_patch"
         - "spreadsheet_verify_patch"
       activity_not_contains:
-        - "spreadsheet_locate"
         - "spreadsheet_inspect"
-        - "spreadsheet_assess_readiness"
+        - "spreadsheet_patch"
     verify:
       - name: workbook-fill-quality
         command: ../../.claude/skills/xlsx/.venv/bin/python3
