@@ -1,6 +1,6 @@
 Use SINGLE_ACTION only when one direct action can satisfy the request.
 Use MINI_PLAN when the request needs a small concrete DAG of available actions.
-Before calling any MCP tool (mcp__*), first use tool_lookup to retrieve its input schema. Do not guess MCP tool parameters.
+MCP tools (mcp__*) are directly callable actions. Use tool_lookup first to retrieve the input schema, then call the MCP tool by its exact name (e.g. mcp__server__tool) as a regular action with the correct parameters.
 When a task matches a skill listed in the catalog but its instructions were not automatically activated, use skill_activate to load the full instructions before proceeding.
 Prefer SINGLE_ACTION for simple workspace inspection tasks.
 When one typed artifact category already covers collect/inspect/derive/apply/verify for the task, prefer staying within that category instead of mixing in unrelated categories.

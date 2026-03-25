@@ -57,7 +57,13 @@ impl Action for ToolLookupAction {
     }
 
     async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
-        let Some(name) = input.params.get("name").and_then(Value::as_str) else {
+        let name = input
+            .params
+            .get("name")
+            .or_else(|| input.params.get("tool_name"))
+            .or_else(|| input.params.get("action_name"))
+            .and_then(Value::as_str);
+        let Some(name) = name else {
             return ActionResult::error("Missing required parameter: name");
         };
 
