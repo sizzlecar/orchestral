@@ -29,6 +29,6 @@ turns:
         - "tool_lookup"
         - "mcp__sales-api__query_sales_data"
       assistant_contains:
-        - "North America"
+        - "report"
       persist_not_contains:
         - "Plan: no actions"
