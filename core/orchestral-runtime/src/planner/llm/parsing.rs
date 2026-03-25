@@ -16,7 +16,7 @@ pub(super) struct ActionSelection {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 enum PlannerJsonOutput {
-    #[serde(rename = "SINGLE_ACTION", alias = "ACTION_CALL")]
+    #[serde(rename = "SINGLE_ACTION")]
     SingleAction {
         action: String,
         #[serde(default)]
@@ -35,9 +35,9 @@ enum PlannerJsonOutput {
         #[serde(default)]
         on_failure: Option<String>,
     },
-    #[serde(rename = "DONE", alias = "DIRECT_RESPONSE")]
+    #[serde(rename = "DONE")]
     Done { message: String },
-    #[serde(rename = "NEED_INPUT", alias = "CLARIFICATION")]
+    #[serde(rename = "NEED_INPUT")]
     NeedInput { question: String },
 }
 

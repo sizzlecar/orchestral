@@ -268,10 +268,10 @@ Completed immutable steps: {}\n\
 Affected step summary:\n{}\n\
 Rules:\n\
 - {}\n\
-- Materialize side effects in explicit action or recipe stages.\n\
+- Materialize side effects in explicit action stages.\n\
 - Never return an explore agent that owns outputs with output_rules candidates.requires.action.\n\
 - If local reasoning is needed, use kind=agent with params.mode=\"leaf\" and let runtime materialize outputs from json_stdout evidence.\n\
-- Prefer kind=recipe for multi-stage repairs. A good generic shape is inspect/collect -> derive leaf -> apply/emit -> verify.\n\
+- For multi-stage repairs, a good generic shape is inspect/collect -> derive leaf -> apply/emit -> verify.\n\
 - If shell is the only applicable mutable tool, use shell in explicit action stages and verify the outcome explicitly.\n",
         current_plan.goal,
         original.content,

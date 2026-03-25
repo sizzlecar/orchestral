@@ -70,17 +70,12 @@ pub enum StepKind {
     /// Normal Action execution
     #[default]
     Action,
-    /// Macro step lowered into a concrete action DAG before validation/execution.
-    Recipe,
     /// Wait for user input
     WaitUser,
     /// Wait for external event
     WaitEvent,
     /// System built-in step (e.g., resolve_reference)
     System,
-    /// Pause execution and re-invoke the Planner with the current WorkingSet
-    /// so it can generate continuation steps based on intermediate results.
-    Replan,
     /// Constrained internal LLM loop for iterative local exploration.
     Agent,
 }
@@ -187,19 +182,6 @@ impl Step {
         }
     }
 
-    /// Create a replan step that pauses execution and re-invokes the Planner.
-    pub fn replan(id: impl Into<StepId>) -> Self {
-        Self {
-            id: id.into(),
-            action: "replan".to_string(),
-            kind: StepKind::Replan,
-            depends_on: Vec::new(),
-            exports: Vec::new(),
-            io_bindings: Vec::new(),
-            params: Value::Null,
-        }
-    }
-
     /// Create an agent step.
     pub fn agent(id: impl Into<StepId>) -> Self {
         Self {
@@ -225,19 +207,6 @@ impl Step {
             params: json!({
                 "mode": "leaf"
             }),
-        }
-    }
-
-    /// Create a recipe step that will be compiled into concrete steps.
-    pub fn recipe(id: impl Into<StepId>) -> Self {
-        Self {
-            id: id.into(),
-            action: "recipe".to_string(),
-            kind: StepKind::Recipe,
-            depends_on: Vec::new(),
-            exports: Vec::new(),
-            io_bindings: Vec::new(),
-            params: Value::Null,
         }
     }
 

@@ -79,11 +79,6 @@ impl Executor {
                     node.step.action.clone(),
                     node.step.params.clone(),
                 )),
-                StepKind::Replan => Some((
-                    StepKind::Replan,
-                    node.step.action.clone(),
-                    node.step.params.clone(),
-                )),
                 _ => None,
             });
             if let Some((kind, action, params)) = wait_data {
@@ -127,26 +122,6 @@ impl Executor {
                                 .get("event_type")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("unknown")
-                                .to_string(),
-                        })
-                    }
-                    StepKind::Replan => {
-                        report_progress(
-                            ctx,
-                            ExecutionProgressEvent::new(
-                                ctx.task_id.clone(),
-                                Some(step_id.clone().into()),
-                                Some(action),
-                                "step_need_replan",
-                            ),
-                        )
-                        .await;
-                        Some(ExecutionResult::NeedReplan {
-                            step_id: step_id.clone().into(),
-                            prompt: params
-                                .get("prompt")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("Continue planning based on intermediate results")
                                 .to_string(),
                         })
                     }
