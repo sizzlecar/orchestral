@@ -224,6 +224,7 @@ impl<C: LlmClient> LlmPlanner<C> {
             history: context.history.clone(),
             runtime_info: context.runtime_info.clone(),
             skill_instructions: context.skill_instructions.clone(),
+            skill_summaries: context.skill_summaries.clone(),
             loop_context: context.loop_context.clone(),
         };
 

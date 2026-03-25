@@ -2,13 +2,16 @@ use std::fmt::Write;
 
 use orchestral_core::action::ActionMeta;
 
-pub(super) fn build_capability_catalog(actions: &[ActionMeta]) -> String {
+pub(super) fn build_capability_catalog(
+    actions: &[ActionMeta],
+    skill_summaries: &[(&str, &str)],
+) -> String {
     let mut out = String::new();
 
     let action_lines = build_action_lines(actions);
     let mcp_lines = build_mcp_lines(actions);
 
-    if action_lines.is_empty() && mcp_lines.is_empty() {
+    if action_lines.is_empty() && mcp_lines.is_empty() && skill_summaries.is_empty() {
         return out;
     }
 
@@ -25,6 +28,19 @@ pub(super) fn build_capability_catalog(actions: &[ActionMeta]) -> String {
         out.push_str("MCP Tools (use tool_lookup to get full input schema before calling):\n");
         for line in mcp_lines {
             let _ = writeln!(out, "- {}", line);
+        }
+    }
+
+    if !skill_summaries.is_empty() {
+        out.push_str("Skills (use skill_activate to load full instructions before executing):\n");
+        let mut sorted: Vec<_> = skill_summaries.to_vec();
+        sorted.sort_by_key(|(name, _)| *name);
+        for (name, description) in sorted {
+            if description.is_empty() {
+                let _ = writeln!(out, "- {}", name);
+            } else {
+                let _ = writeln!(out, "- {}: {}", name, description);
+            }
         }
     }
 
@@ -172,48 +188,51 @@ mod tests {
 
     #[test]
     fn test_build_capability_catalog_groups_by_category() {
-        let catalog = build_capability_catalog(&[
-            ActionMeta::new("file_read", "Read a file")
-                .with_category("direct")
-                .with_input_kinds(["workspace.path"])
-                .with_output_kinds(["workspace.text_file"])
-                .with_input_schema(serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "path": { "type": "string" }
-                    },
-                    "required": ["path"]
-                }))
-                .with_output_schema(serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "content": { "type": "string" }
-                    },
-                    "required": ["content"]
-                })),
-            ActionMeta::new("document_apply_patch", "Apply document patch")
-                .with_category("document")
-                .with_input_kinds(["document.patch_spec"])
-                .with_output_kinds(["document.apply_result"])
-                .with_input_schema(serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "patch_spec": { "type": "object" }
-                    },
-                    "required": ["patch_spec"]
-                }))
-                .with_output_schema(serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "updated_paths": {
-                            "type": "array",
-                            "items": { "type": "string" }
-                        }
-                    },
-                    "required": ["updated_paths"]
-                })),
-            ActionMeta::new("mcp__demo", "Call MCP").with_capability("mcp"),
-        ]);
+        let catalog = build_capability_catalog(
+            &[
+                ActionMeta::new("file_read", "Read a file")
+                    .with_category("direct")
+                    .with_input_kinds(["workspace.path"])
+                    .with_output_kinds(["workspace.text_file"])
+                    .with_input_schema(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" }
+                        },
+                        "required": ["path"]
+                    }))
+                    .with_output_schema(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "content": { "type": "string" }
+                        },
+                        "required": ["content"]
+                    })),
+                ActionMeta::new("document_apply_patch", "Apply document patch")
+                    .with_category("document")
+                    .with_input_kinds(["document.patch_spec"])
+                    .with_output_kinds(["document.apply_result"])
+                    .with_input_schema(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "patch_spec": { "type": "object" }
+                        },
+                        "required": ["patch_spec"]
+                    }))
+                    .with_output_schema(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "updated_paths": {
+                                "type": "array",
+                                "items": { "type": "string" }
+                            }
+                        },
+                        "required": ["updated_paths"]
+                    })),
+                ActionMeta::new("mcp__demo", "Call MCP").with_capability("mcp"),
+            ],
+            &[("xlsx", "Spreadsheet automation")],
+        );
 
         assert!(catalog.contains("Actions:"));
         assert!(catalog.contains("file_read [direct]: Read a file"));
@@ -228,5 +247,8 @@ mod tests {
         assert!(catalog.contains("output_fields: updated_paths (required)"));
         assert!(catalog
             .contains("MCP Tools (use tool_lookup to get full input schema before calling):"));
+        assert!(catalog
+            .contains("Skills (use skill_activate to load full instructions before executing):"));
+        assert!(catalog.contains("- xlsx: Spreadsheet automation"));
     }
 }

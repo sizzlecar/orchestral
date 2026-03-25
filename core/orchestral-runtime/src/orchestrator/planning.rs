@@ -50,9 +50,16 @@ impl Orchestrator {
                 "orchestrator planner iteration started"
             );
 
+            let skill_summaries: Vec<(String, String)> = self
+                .skill_catalog
+                .summaries()
+                .iter()
+                .map(|(n, d)| (n.to_string(), d.to_string()))
+                .collect();
             let mut context = PlannerContext::with_history(available_actions, history.clone())
                 .with_runtime_info(runtime_info.clone())
-                .with_skill_instructions(skill_instructions.clone());
+                .with_skill_instructions(skill_instructions.clone())
+                .with_skill_summaries(skill_summaries);
             if let Some(loop_context) =
                 loop_state.planner_loop_context(iteration, self.config.max_planner_iterations)
             {

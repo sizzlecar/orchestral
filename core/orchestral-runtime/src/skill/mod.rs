@@ -46,6 +46,39 @@ impl SkillCatalog {
         self.entries.iter().take(self.max_active).collect()
     }
 
+    /// Reload entries from filesystem (hot update).
+    pub fn reload(&mut self, entries: Vec<SkillEntry>) {
+        self.entries = entries;
+    }
+
+    /// Return all skill names and descriptions for the planner catalog.
+    pub fn summaries(&self) -> Vec<(&str, &str)> {
+        self.entries
+            .iter()
+            .map(|e| (e.name.as_str(), e.description.as_str()))
+            .collect()
+    }
+
+    /// Look up a skill by exact name and return its full instructions.
+    pub fn get_instructions(&self, name: &str) -> Option<SkillInstruction> {
+        self.entries
+            .iter()
+            .find(|e| e.name == name)
+            .map(|entry| SkillInstruction {
+                skill_name: entry.name.clone(),
+                instructions: entry.instructions.clone(),
+                skill_path: Some(entry.source_path.to_string_lossy().to_string()),
+                scripts_dir: entry
+                    .scripts_dir
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string()),
+                venv_python: entry
+                    .venv_python
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string()),
+            })
+    }
+
     pub fn build_instructions(&self, intent: &str) -> Vec<SkillInstruction> {
         self.matched_entries(intent)
             .into_iter()
