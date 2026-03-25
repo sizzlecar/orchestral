@@ -166,8 +166,16 @@ impl RuntimeApp {
             runtime_cfg,
         );
 
-        let action_registry_manager =
-            Arc::new(ActionRegistryManager::new(path.clone(), action_factory));
+        let skill_entries = discover_skills(&config, &path)?;
+        let skill_catalog = Arc::new(SkillCatalog::new(
+            skill_entries,
+            config.extensions.skill.max_active_skills,
+        ));
+
+        let action_registry_manager = Arc::new(
+            ActionRegistryManager::new(path.clone(), action_factory)
+                .with_skill_catalog(skill_catalog.clone()),
+        );
         action_registry_manager.load().await?;
 
         let executor = Executor::with_registry(action_registry_manager.registry())
@@ -179,11 +187,6 @@ impl RuntimeApp {
             executor
         };
         let planner = build_planner(&config)?;
-        let skill_entries = discover_skills(&config, &path)?;
-        let skill_catalog = Arc::new(SkillCatalog::new(
-            skill_entries,
-            config.extensions.skill.max_active_skills,
-        ));
 
         let mut normalizer = PlanNormalizer::new();
         {

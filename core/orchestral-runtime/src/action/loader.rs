@@ -12,11 +12,13 @@ use orchestral_core::config::{
 };
 use orchestral_core::executor::ActionRegistry;
 
+use super::builtin::skill_activate::SkillActivateAction;
 use super::builtin::tool_lookup::ToolLookupAction;
 use super::builtin::JsonStdoutAction;
 use super::factory::{ActionBuildError, ActionFactory};
 use super::mcp::probe_mcp_server_tools;
 use super::providers::{collect_action_registration_specs, ActionRegistrationSpec};
+use crate::skill::SkillCatalog;
 
 /// Action config errors
 #[derive(Debug, Error)]
@@ -32,6 +34,7 @@ pub struct ActionRegistryManager {
     path: PathBuf,
     registry: Arc<RwLock<ActionRegistry>>,
     factory: Arc<dyn ActionFactory>,
+    skill_catalog: Option<Arc<SkillCatalog>>,
 }
 
 impl ActionRegistryManager {
@@ -40,7 +43,13 @@ impl ActionRegistryManager {
             path: path.into(),
             registry: Arc::new(RwLock::new(ActionRegistry::new())),
             factory,
+            skill_catalog: None,
         }
+    }
+
+    pub fn with_skill_catalog(mut self, catalog: Arc<SkillCatalog>) -> Self {
+        self.skill_catalog = Some(catalog);
+        self
     }
 
     pub fn registry(&self) -> Arc<RwLock<ActionRegistry>> {
@@ -165,6 +174,9 @@ impl ActionRegistryManager {
         }
         registry.register(Arc::new(JsonStdoutAction::internal()));
         registry.register(Arc::new(ToolLookupAction::new(self.registry.clone())));
+        if let Some(catalog) = &self.skill_catalog {
+            registry.register(Arc::new(SkillActivateAction::new(catalog.clone())));
+        }
 
         let mut current = self.registry.write().await;
         *current = registry;

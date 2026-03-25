@@ -3,6 +3,7 @@ mod file_io;
 mod http;
 mod json_stdout;
 mod shell;
+pub(crate) mod skill_activate;
 mod support;
 pub(crate) mod tool_lookup;
 
