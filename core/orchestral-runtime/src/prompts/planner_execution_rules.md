@@ -1,7 +1,6 @@
 Use SINGLE_ACTION only when one direct action can satisfy the request.
-SINGLE_ACTION must never target mcp__* actions.
 Use MINI_PLAN when the request needs a small concrete DAG of available actions.
-MINI_PLAN must never target mcp__* actions.
+Before calling any MCP tool (mcp__*), first use tool_lookup to retrieve its input schema. Do not guess MCP tool parameters.
 Prefer SINGLE_ACTION for simple workspace inspection tasks.
 When one typed artifact category already covers collect/inspect/derive/apply/verify for the task, prefer staying within that category instead of mixing in unrelated categories.
 Verify that the selected actions actually cover the needed schema contracts; do not infer missing derive/build/apply/verify stages.

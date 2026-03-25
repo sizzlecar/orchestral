@@ -22,7 +22,7 @@ pub(super) fn build_capability_catalog(actions: &[ActionMeta]) -> String {
     }
 
     if !mcp_lines.is_empty() {
-        out.push_str("MCP Tools:\n");
+        out.push_str("MCP Tools (use tool_lookup to get full input schema before calling):\n");
         for line in mcp_lines {
             let _ = writeln!(out, "- {}", line);
         }
@@ -226,6 +226,7 @@ mod tests {
         assert!(catalog.contains("output_fields: content (required)"));
         assert!(catalog.contains("input_fields: patch_spec (required)"));
         assert!(catalog.contains("output_fields: updated_paths (required)"));
-        assert!(catalog.contains("MCP Tools:"));
+        assert!(catalog
+            .contains("MCP Tools (use tool_lookup to get full input schema before calling):"));
     }
 }

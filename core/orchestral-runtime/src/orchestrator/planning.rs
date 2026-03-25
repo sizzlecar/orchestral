@@ -743,19 +743,12 @@ fn validate_and_prepare_mini_plan(
             ))));
         }
 
-        let Some(action_meta) = available_actions
+        if !available_actions
             .iter()
-            .find(|meta| meta.name == step.action)
-        else {
+            .any(|meta| meta.name == step.action)
+        {
             return Err(OrchestratorError::Planner(PlanError::Generation(format!(
                 "mini_plan references unavailable action '{}'",
-                step.action
-            ))));
-        };
-
-        if action_meta.has_capability("mcp") || step.action.starts_with("mcp__") {
-            return Err(OrchestratorError::Planner(PlanError::Generation(format!(
-                "mini_plan does not allow MCP action '{}'",
                 step.action
             ))));
         }
@@ -888,13 +881,14 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_and_prepare_mini_plan_rejects_mcp_actions() {
-        let plan = Plan::new("call tools", vec![Step::action("s1", "mcp__alpha")]);
-        let available = vec![ActionMeta::new("mcp__alpha", "call tool").with_capabilities(["mcp"])];
-        let err = validate_and_prepare_mini_plan(plan, &available).expect_err("should reject mcp");
-        assert!(err
-            .to_string()
-            .contains("mini_plan does not allow MCP action"));
+    fn test_validate_and_prepare_mini_plan_accepts_mcp_actions() {
+        let plan = Plan::new("call tools", vec![Step::action("s1", "mcp__mock__greet")]);
+        let available =
+            vec![ActionMeta::new("mcp__mock__greet", "greet").with_capabilities(["mcp"])];
+        let prepared =
+            validate_and_prepare_mini_plan(plan, &available).expect("should accept mcp tool");
+        assert_eq!(prepared.steps.len(), 1);
+        assert_eq!(prepared.steps[0].action, "mcp__mock__greet");
     }
 
     #[test]
