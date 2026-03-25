@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum ContinuationStatus {
     CommitReady,
-    NeedReplan,
     WaitUser,
     Done,
     Failed,

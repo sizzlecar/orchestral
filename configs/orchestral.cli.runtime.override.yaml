@@ -402,9 +402,9 @@ actions:
       - .
       create_dirs: true
       max_write_bytes: 524288
-  - name: spreadsheet_locate
-    kind: spreadsheet_locate
-    description: 'Locate a spreadsheet artifact '
+  - name: spreadsheet_inspect
+    kind: spreadsheet_inspect
+    description: Locate and inspect spreadsheet structure
     interface:
       input_schema:
         type: object
@@ -413,10 +413,16 @@ actions:
             type: string
           user_request:
             type: string
+          path:
+            type: string
       output_schema:
         type: object
         properties:
+          inspection:
+            type: object
           source_path:
+            type: string
+          path:
             type: string
           artifact_candidates:
             type: array
@@ -425,101 +431,32 @@ actions:
           artifact_count:
             type: integer
         required:
+        - inspection
         - source_path
-        - artifact_candidates
-        - artifact_count
     config: {}
-  - name: spreadsheet_inspect
-    kind: spreadsheet_inspect
-    description: 'Inspect spreadsheet structure '
+  - name: spreadsheet_patch
+    kind: spreadsheet_patch
+    description: Derive, assess, and apply a spreadsheet patch
     interface:
       input_schema:
         type: object
         properties:
           path:
             type: string
-        required:
-        - path
-      output_schema:
-        type: object
-        properties:
           inspection:
             type: object
-        required:
-        - inspection
-    config: {}
-  - name: spreadsheet_derive_candidates
-    kind: spreadsheet_derive_candidates
-    description: Derive spreadsheet patch candidates
-    interface:
-      input_schema:
-        type: object
-        properties:
           user_request:
             type: string
-          inspection:
-            type: object
           derivation_policy:
             type: string
             enum:
             - strict
             - permissive
         required:
-        - user_request
-        - inspection
-        - derivation_policy
-      output_schema:
-        type: object
-        properties:
-          patch_candidates:
-            type: object
-          summary:
-            type: string
-        required:
-        - patch_candidates
-        - summary
-    config: {}
-  - name: spreadsheet_assess_readiness
-    kind: spreadsheet_assess_readiness
-    description: Assess whether spreadsheet probe results are ready for commit
-    interface:
-      input_schema:
-        type: object
-        properties:
-          inspection:
-            type: object
-          patch_candidates: {}
-          derivation_policy:
-            type: string
-        required:
-        - inspection
-        - patch_candidates
-        - derivation_policy
-      output_schema:
-        type: object
-        properties:
-          continuation:
-            type: object
-          summary:
-            type: string
-        required:
-        - continuation
-        - summary
-    config: {}
-  - name: spreadsheet_apply_patch
-    kind: spreadsheet_apply_patch
-    description: 'Apply a typed spreadsheet patch '
-    interface:
-      input_schema:
-        type: object
-        properties:
-          path:
-            type: string
-          patch_spec:
-            type: object
-        required:
         - path
-        - patch_spec
+        - inspection
+        - user_request
+        - derivation_policy
       output_schema:
         type: object
         properties:
@@ -529,8 +466,8 @@ actions:
             type: integer
           cells_filled:
             type: integer
-          result:
-            type: string
+          patch_spec:
+            type: object
           summary:
             type: string
         required:
@@ -540,7 +477,7 @@ actions:
     config: {}
   - name: spreadsheet_verify_patch
     kind: spreadsheet_verify_patch
-    description: 'Verify a spreadsheet patch '
+    description: Verify a spreadsheet patch
     interface:
       input_schema:
         type: object
@@ -565,9 +502,9 @@ actions:
         - summary
     config:
       default_validator_path: configs/scenarios/validators/verify_perf_review_fill.py
-  - name: document_locate
-    kind: document_locate
-    description: 'Locate document artifacts '
+  - name: document_inspect
+    kind: document_inspect
+    description: Locate and inspect document artifacts
     interface:
       input_schema:
         type: object
@@ -576,9 +513,17 @@ actions:
             type: string
           user_request:
             type: string
+          source_paths:
+            oneOf:
+            - type: array
+              items:
+                type: string
+            - type: string
       output_schema:
         type: object
         properties:
+          inspection:
+            type: object
           source_paths:
             type: array
             items:
@@ -596,150 +541,33 @@ actions:
           report_path:
             type: string
         required:
+        - inspection
         - source_paths
-        - artifact_candidates
-        - artifact_count
     config: {}
-  - name: document_inspect
-    kind: document_inspect
-    description: 'Inspect document structure '
+  - name: document_patch
+    kind: document_patch
+    description: Derive, assess, and apply a document patch
     interface:
       input_schema:
-        type: object
-        properties:
-          source_paths:
-            oneOf:
-            - type: array
-              items:
-                type: string
-            - type: string
-          documents:
-            oneOf:
-            - type: array
-              items:
-                type: string
-            - type: string
-          source_path:
-            oneOf:
-            - type: string
-            - type: array
-              items:
-                type: string
-          path:
-            oneOf:
-            - type: string
-            - type: array
-              items:
-                type: string
-          document:
-            oneOf:
-            - type: string
-            - type: array
-              items:
-                type: string
-      output_schema:
         type: object
         properties:
           inspection:
             type: object
-        required:
-        - inspection
-    config: {}
-  - name: document_derive_candidates
-    kind: document_derive_candidates
-    description: Derive typed document patch candidates from document inspection
-    interface:
-      input_schema:
-        type: object
-        properties:
           user_request:
             type: string
-          inspection:
-            type: object
           derivation_policy:
             type: string
+            enum:
+            - strict
+            - permissive
+            - filename_to_h1
+            - markdown_h1_from_filename
+          report_path:
+            type: string
         required:
+        - inspection
         - user_request
-        - inspection
         - derivation_policy
-      output_schema:
-        type: object
-        properties:
-          patch_candidates:
-            type: object
-          summary:
-            type: string
-        required:
-        - patch_candidates
-        - summary
-    config: {}
-  - name: document_build_patch_spec
-    kind: document_build_patch_spec
-    description: Build a typed document patch spec from document patch candidates
-    interface:
-      input_schema:
-        type: object
-        properties:
-          patch_candidates:
-            type: object
-          inspection:
-            type: object
-        required:
-        - patch_candidates
-        - inspection
-      output_schema:
-        type: object
-        properties:
-          patch_spec:
-            type: object
-          summary:
-            type: string
-        required:
-        - patch_spec
-        - summary
-    config: {}
-  - name: document_assess_readiness
-    kind: document_assess_readiness
-    description: Assess whether document probe results are ready for commit
-    interface:
-      input_schema:
-        type: object
-        properties:
-          inspection:
-            type: object
-          patch_candidates:
-            type: object
-          derivation_policy:
-            type: string
-          user_request:
-            type: string
-        required:
-        - inspection
-        - patch_candidates
-        - derivation_policy
-        - user_request
-      output_schema:
-        type: object
-        properties:
-          continuation:
-            type: object
-          summary:
-            type: string
-        required:
-        - continuation
-        - summary
-    config: {}
-  - name: document_apply_patch
-    kind: document_apply_patch
-    description: 'Apply a typed document patch '
-    interface:
-      input_schema:
-        type: object
-        properties:
-          patch_spec:
-            type: object
-        required:
-        - patch_spec
       output_schema:
         type: object
         properties:
@@ -749,6 +577,8 @@ actions:
               type: string
           patch_count:
             type: integer
+          patch_spec:
+            type: object
           summary:
             type: string
         required:
@@ -758,7 +588,7 @@ actions:
     config: {}
   - name: document_verify_patch
     kind: document_verify_patch
-    description: 'Verify a document patch '
+    description: Verify a document patch
     interface:
       input_schema:
         type: object
@@ -785,9 +615,9 @@ actions:
         - verify_decision
         - summary
     config: {}
-  - name: structured_locate
-    kind: structured_locate
-    description: 'Locate structured artifacts '
+  - name: structured_inspect
+    kind: structured_inspect
+    description: Locate and inspect structured artifact files
     interface:
       input_schema:
         type: object
@@ -796,9 +626,15 @@ actions:
             type: string
           user_request:
             type: string
+          source_paths:
+            type: array
+            items:
+              type: string
       output_schema:
         type: object
         properties:
+          inspection:
+            type: object
           source_paths:
             type: array
             items:
@@ -810,120 +646,29 @@ actions:
           artifact_count:
             type: integer
         required:
+        - inspection
         - source_paths
-        - artifact_candidates
-        - artifact_count
     config: {}
-  - name: structured_inspect
-    kind: structured_inspect
-    description: 'Inspect structured artifact contents '
+  - name: structured_patch
+    kind: structured_patch
+    description: Derive, assess, and apply a structured patch
     interface:
       input_schema:
-        type: object
-        properties:
-          source_paths:
-            type: array
-            items:
-              type: string
-        required:
-        - source_paths
-      output_schema:
         type: object
         properties:
           inspection:
             type: object
-        required:
-        - inspection
-    config: {}
-  - name: structured_derive_candidates
-    kind: structured_derive_candidates
-    description: Derive typed structured patch candidates from explicit user requests
-    interface:
-      input_schema:
-        type: object
-        properties:
           user_request:
             type: string
-          inspection:
-            type: object
           derivation_policy:
             type: string
+            enum:
+            - strict
+            - permissive
         required:
+        - inspection
         - user_request
-        - inspection
         - derivation_policy
-      output_schema:
-        type: object
-        properties:
-          patch_candidates:
-            type: object
-          summary:
-            type: string
-        required:
-        - patch_candidates
-        - summary
-    config: {}
-  - name: structured_assess_readiness
-    kind: structured_assess_readiness
-    description: Assess whether structured probe results are ready for commit
-    interface:
-      input_schema:
-        type: object
-        properties:
-          inspection:
-            type: object
-          patch_candidates:
-            type: object
-          derivation_policy:
-            type: string
-        required:
-        - inspection
-        - patch_candidates
-        - derivation_policy
-      output_schema:
-        type: object
-        properties:
-          continuation:
-            type: object
-          summary:
-            type: string
-        required:
-        - continuation
-        - summary
-    config: {}
-  - name: structured_build_patch_spec
-    kind: structured_build_patch_spec
-    description: Build a typed structured patch spec from structured patch candidates
-    interface:
-      input_schema:
-        type: object
-        properties:
-          patch_candidates:
-            type: object
-        required:
-        - patch_candidates
-      output_schema:
-        type: object
-        properties:
-          patch_spec:
-            type: object
-          summary:
-            type: string
-        required:
-        - patch_spec
-        - summary
-    config: {}
-  - name: structured_apply_patch
-    kind: structured_apply_patch
-    description: 'Apply a typed structured patch '
-    interface:
-      input_schema:
-        type: object
-        properties:
-          patch_spec:
-            type: object
-        required:
-        - patch_spec
       output_schema:
         type: object
         properties:
@@ -933,6 +678,8 @@ actions:
               type: string
           patch_count:
             type: integer
+          patch_spec:
+            type: object
           summary:
             type: string
         required:
@@ -942,7 +689,7 @@ actions:
     config: {}
   - name: structured_verify_patch
     kind: structured_verify_patch
-    description: 'Verify a structured patch '
+    description: Verify a structured patch
     interface:
       input_schema:
         type: object
@@ -962,120 +709,5 @@ actions:
             type: string
         required:
         - verify_decision
-        - summary
-    config: {}
-  - name: codebase_collect_targets
-    kind: codebase_collect_targets
-    description: 'Collect explicit mixed-artifact targets '
-    interface:
-      input_schema:
-        type: object
-        properties:
-          user_request:
-            type: string
-        required:
-        - user_request
-      output_schema:
-        type: object
-        properties:
-          instruction_path:
-            type: string
-          instruction_source_paths:
-            type: array
-            items:
-              type: string
-          spreadsheet_path:
-            type: string
-          structured_path:
-            type: string
-          structured_source_paths:
-            type: array
-            items:
-              type: string
-        required:
-        - instruction_path
-        - instruction_source_paths
-        - spreadsheet_path
-        - structured_path
-        - structured_source_paths
-    config: {}
-  - name: codebase_collect_results
-    kind: codebase_collect_results
-    description: 'Collect mixed-artifact run results '
-    interface:
-      input_schema:
-        type: object
-        properties:
-          spreadsheet_path:
-            type: string
-          structured_paths:
-            type: array
-            items:
-              type: string
-          execution_summary:
-            type: string
-        required:
-        - spreadsheet_path
-        - structured_paths
-        - execution_summary
-      output_schema:
-        type: object
-        properties:
-          collected_result:
-            type: object
-          summary:
-            type: string
-        required:
-        - collected_result
-        - summary
-    config: {}
-  - name: codebase_aggregate_verify
-    kind: codebase_aggregate_verify
-    description: 'Aggregate mixed-artifact verify results '
-    interface:
-      input_schema:
-        type: object
-        properties:
-          spreadsheet_verify_decision:
-            type: object
-          structured_verify_decision:
-            type: object
-          collected_result:
-            type: object
-        required:
-        - spreadsheet_verify_decision
-        - structured_verify_decision
-        - collected_result
-      output_schema:
-        type: object
-        properties:
-          verify_decision:
-            type: object
-          summary:
-            type: string
-        required:
-        - verify_decision
-        - summary
-    config: {}
-  - name: codebase_export_summary
-    kind: codebase_export_summary
-    description: 'Export a unified mixed-artifact summary '
-    interface:
-      input_schema:
-        type: object
-        properties:
-          collected_result:
-            type: object
-          verify_decision:
-            type: object
-        required:
-        - collected_result
-        - verify_decision
-      output_schema:
-        type: object
-        properties:
-          summary:
-            type: string
-        required:
         - summary
     config: {}

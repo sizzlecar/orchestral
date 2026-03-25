@@ -83,8 +83,10 @@ pub struct PlannerContext {
     pub history: Vec<HistoryItem>,
     /// Runtime host information for platform-aware planning.
     pub runtime_info: PlannerRuntimeInfo,
-    /// Activated skill instructions for this planning turn.
+    /// Activated skill instructions for this planning turn (keyword-matched).
     pub skill_instructions: Vec<SkillInstruction>,
+    /// All available skill names and descriptions for the planner catalog.
+    pub skill_summaries: Vec<(String, String)>,
     /// Observed execution state from prior planner iterations in the same turn.
     pub loop_context: Option<PlannerLoopContext>,
 }
@@ -120,6 +122,7 @@ impl PlannerContext {
             history: Vec::new(),
             runtime_info: PlannerRuntimeInfo::default(),
             skill_instructions: Vec::new(),
+            skill_summaries: Vec::new(),
             loop_context: None,
         }
     }
@@ -131,6 +134,7 @@ impl PlannerContext {
             history,
             runtime_info: PlannerRuntimeInfo::default(),
             skill_instructions: Vec::new(),
+            skill_summaries: Vec::new(),
             loop_context: None,
         }
     }
@@ -144,6 +148,12 @@ impl PlannerContext {
     /// Attach matched skill instructions.
     pub fn with_skill_instructions(mut self, skills: Vec<SkillInstruction>) -> Self {
         self.skill_instructions = skills;
+        self
+    }
+
+    /// Attach all skill summaries for the planner catalog.
+    pub fn with_skill_summaries(mut self, summaries: Vec<(String, String)>) -> Self {
+        self.skill_summaries = summaries;
         self
     }
 

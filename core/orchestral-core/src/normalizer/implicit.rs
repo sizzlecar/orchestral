@@ -77,10 +77,7 @@ pub(super) fn fix_control_flow_dependencies(plan: &mut Plan) {
     let step_ids: Vec<StepId> = plan.steps.iter().map(|s| s.id.clone()).collect();
     for i in 0..plan.steps.len() {
         let step = &plan.steps[i];
-        let is_control = matches!(
-            step.kind,
-            StepKind::Replan | StepKind::WaitUser | StepKind::WaitEvent
-        );
+        let is_control = matches!(step.kind, StepKind::WaitUser | StepKind::WaitEvent);
         if !is_control || !step.depends_on.is_empty() {
             continue;
         }

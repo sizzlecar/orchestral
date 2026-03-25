@@ -1,0 +1,27 @@
+version: 1
+name: mcp-tool-lookup-smoke
+config: ../orchestral.cli.runtime.override.yaml
+no_skills: true
+timeout_secs: 180
+workspace:
+  copies:
+    - from: ../../fixtures/scenarios/mcp_tool_lookup/mock_mcp_server.sh
+      to: mock_mcp_server.sh
+    - from: ../../fixtures/scenarios/mcp_tool_lookup/.mcp.json
+      to: .mcp.json
+
+turns:
+  - name: greet-via-mcp
+    input: >
+      Use the mock MCP greet tool to greet "Alice"
+    expect:
+      require_execution_end: true
+      max_approvals: 0
+      max_errors: 0
+      activity_contains:
+        - "tool_lookup"
+        - "mcp__mock__greet"
+      assistant_contains:
+        - "Alice"
+      persist_not_contains:
+        - "Plan: no actions"

@@ -323,9 +323,6 @@ fn execution_status(result: &ExecutionResult) -> String {
             step_id,
             event_type,
         } => format!("waiting_event at {} for {}", step_id, event_type),
-        ExecutionResult::NeedReplan { step_id, prompt } => {
-            format!("need_replan at {}: {}", step_id, truncate(prompt, 600))
-        }
     }
 }
 

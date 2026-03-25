@@ -25,7 +25,7 @@ turns:
       max_approvals: 0
       max_errors: 0
       activity_contains:
-        - "document_apply_patch"
+        - "document_patch"
       artifact_contains:
         - path: fixtures/scenarios/compliance_rollout_batch_update/runbooks/release-rollout.md
           text: "# Release Rollout"
@@ -63,7 +63,7 @@ turns:
       max_approvals: 0
       max_errors: 0
       activity_contains:
-        - "document_apply_patch"
+        - "document_patch"
       artifact_contains:
         - path: fixtures/scenarios/compliance_rollout_batch_update/customer-guides/tenant-logging.md
           text: "/var/log/tenant.log"

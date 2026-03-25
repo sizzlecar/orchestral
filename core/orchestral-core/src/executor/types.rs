@@ -105,9 +105,6 @@ pub enum ExecutionResult {
     },
     /// Waiting for external event
     WaitingEvent { step_id: StepId, event_type: String },
-    /// Execution paused at a replan step; the Orchestrator should re-invoke the
-    /// Planner with the current WorkingSet and append continuation steps.
-    NeedReplan { step_id: StepId, prompt: String },
 }
 
 /// Realtime execution progress event.

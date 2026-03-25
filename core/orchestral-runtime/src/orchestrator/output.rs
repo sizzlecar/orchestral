@@ -221,11 +221,6 @@ pub(super) fn execution_result_metadata(result: &ExecutionResult) -> Value {
             "step_id": step_id,
             "event_type": event_type,
         }),
-        ExecutionResult::NeedReplan { step_id, prompt } => serde_json::json!({
-            "status": "need_replan",
-            "step_id": step_id,
-            "prompt": truncate_for_log(prompt, 400),
-        }),
     }
 }
 
@@ -349,12 +344,6 @@ fn noop_interpret_sync(request: &InterpretRequest) -> String {
             format!(
                 "Waiting for '{}' at step '{}' ({}/{} steps done).",
                 event_type, step_id, completed, total
-            )
-        }
-        ExecutionResult::NeedReplan { step_id, prompt } => {
-            format!(
-                "Replanning at step '{}' ({}/{} steps done): {}",
-                step_id, completed, total, prompt
             )
         }
     }

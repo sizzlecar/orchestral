@@ -22,7 +22,6 @@ pub(super) fn task_state_from_execution(result: &ExecutionResult) -> TaskState {
         ExecutionResult::WaitingEvent { event_type, .. } => TaskState::WaitingEvent {
             event_type: event_type.clone(),
         },
-        ExecutionResult::NeedReplan { .. } => TaskState::Executing,
     }
 }
 

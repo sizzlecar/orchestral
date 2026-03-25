@@ -7,7 +7,6 @@ use orchestral_core::action::{Action, ActionContext, ActionInput, ActionMeta, Ac
 use orchestral_core::config::ActionSpec;
 
 use super::builtin::build_builtin_action;
-use super::codebase::build_codebase_action;
 use super::document::build_document_action;
 
 use super::mcp::build_mcp_action;
@@ -59,9 +58,6 @@ impl ActionFactory for DefaultActionFactory {
             return wrap(Arc::from(a));
         }
         if let Some(a) = build_structured_action(spec)? {
-            return wrap(Arc::from(a));
-        }
-        if let Some(a) = build_codebase_action(spec)? {
             return wrap(Arc::from(a));
         }
         if let Some(a) = build_mcp_action(spec)? {

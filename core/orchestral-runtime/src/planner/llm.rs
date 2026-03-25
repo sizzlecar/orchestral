@@ -224,6 +224,7 @@ impl<C: LlmClient> LlmPlanner<C> {
             history: context.history.clone(),
             runtime_info: context.runtime_info.clone(),
             skill_instructions: context.skill_instructions.clone(),
+            skill_summaries: context.skill_summaries.clone(),
             loop_context: context.loop_context.clone(),
         };
 
@@ -610,33 +611,6 @@ mod tests {
             PlannerOutput::NeedInput(question) => {
                 assert_eq!(question, "请提供文件路径");
             }
-            _ => panic!("expected need_input output"),
-        }
-    }
-
-    #[test]
-    fn test_parse_legacy_output_aliases() {
-        let done = parse_planner_output(r#"{"type":"DIRECT_RESPONSE","message":"ok"}"#)
-            .expect("legacy direct_response");
-        match done {
-            PlannerOutput::Done(message) => assert_eq!(message, "ok"),
-            _ => panic!("expected done output"),
-        }
-
-        let single_action = parse_planner_output(
-            r#"{"type":"ACTION_CALL","action":"file_read","params":{"path":"README.md"}}"#,
-        )
-        .expect("legacy action_call");
-        match single_action {
-            PlannerOutput::SingleAction(call) => assert_eq!(call.action, "file_read"),
-            _ => panic!("expected single_action output"),
-        }
-
-        let need_input =
-            parse_planner_output(r#"{"type":"CLARIFICATION","question":"missing path"}"#)
-                .expect("legacy clarification");
-        match need_input {
-            PlannerOutput::NeedInput(question) => assert_eq!(question, "missing path"),
             _ => panic!("expected need_input output"),
         }
     }

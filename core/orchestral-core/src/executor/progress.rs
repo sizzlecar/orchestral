@@ -156,8 +156,7 @@ pub(super) fn choose_terminal_result(
     candidate: ExecutionResult,
 ) {
     let rank = |result: &ExecutionResult| match result {
-        ExecutionResult::Failed { .. } => 4,
-        ExecutionResult::NeedReplan { .. } => 3,
+        ExecutionResult::Failed { .. } => 3,
         ExecutionResult::WaitingUser { .. } => 2,
         ExecutionResult::WaitingEvent { .. } => 1,
         ExecutionResult::Completed => 0,

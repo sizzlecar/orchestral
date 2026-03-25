@@ -143,13 +143,6 @@ fn build_iteration_observation(
                 step_id, event_type
             ));
         }
-        ExecutionResult::NeedReplan { step_id, prompt } => {
-            observation.push_str(&format!(
-                "; result=need_replan at {}: {}",
-                step_id,
-                truncate_for_log(prompt, 240)
-            ));
-        }
     }
     observation
 }

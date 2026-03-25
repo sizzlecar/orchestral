@@ -137,7 +137,12 @@ pub(super) fn build_planner_system_prompt(base: &str, context: &PlannerContext) 
         out.push_str("\n\n");
     }
     out.push_str(PLANNER_CONSTITUTION);
-    let capability_catalog = build_capability_catalog(&context.available_actions);
+    let skill_refs: Vec<(&str, &str)> = context
+        .skill_summaries
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_str()))
+        .collect();
+    let capability_catalog = build_capability_catalog(&context.available_actions, &skill_refs);
     if !capability_catalog.trim().is_empty() {
         out.push('\n');
         out.push_str(&capability_catalog);

@@ -21,95 +21,17 @@ pub fn build_document_action(
     spec: &ActionSpec,
 ) -> Result<Option<Box<dyn Action>>, ActionBuildError> {
     let action: Box<dyn Action> = match spec.kind.as_str() {
-        "document_locate" => Box::new(DocumentLocateAction::from_spec(spec)),
         "document_inspect" => Box::new(DocumentInspectAction::from_spec(spec)),
-        "document_derive_candidates" => Box::new(DocumentDeriveCandidatesAction::from_spec(spec)),
-        "document_build_patch_spec" => Box::new(DocumentBuildPatchSpecAction::from_spec(spec)),
-        "document_assess_readiness" => Box::new(DocumentAssessReadinessAction::from_spec(spec)),
-        "document_apply_patch" => Box::new(DocumentApplyPatchAction::from_spec(spec)),
+        "document_patch" => Box::new(DocumentPatchAction::from_spec(spec)),
         "document_verify_patch" => Box::new(DocumentVerifyPatchAction::from_spec(spec)),
         _ => return Ok(None),
     };
     Ok(Some(action))
 }
 
-#[derive(Debug)]
-struct DocumentLocateAction {
-    name: String,
-    description: String,
-}
-
-impl DocumentLocateAction {
-    fn from_spec(spec: &ActionSpec) -> Self {
-        Self {
-            name: spec.name.clone(),
-            description: spec.description_or("Locate document artifacts"),
-        }
-    }
-}
-
-#[async_trait]
-impl Action for DocumentLocateAction {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn description(&self) -> &str {
-        &self.description
-    }
-
-    fn metadata(&self) -> ActionMeta {
-        ActionMeta::new(self.name(), self.description())
-            .with_category("document")
-            .with_capabilities(["filesystem_read"])
-            .with_input_kinds(["workspace.path", "intent.request"])
-            .with_output_kinds(["document.location", "document.source_paths"])
-            .with_input_schema(json!({
-                "type": "object",
-                "properties": {
-                    "source_root": { "type": "string" },
-                    "user_request": { "type": "string" }
-                }
-            }))
-            .with_output_schema(json!({
-                "type": "object",
-                "properties": {
-                    "source_paths": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    },
-                    "documents": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    },
-                    "artifact_candidates": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    },
-                    "artifact_count": { "type": "integer" },
-                    "report_path": { "type": "string" }
-                },
-                "required": ["source_paths", "artifact_candidates", "artifact_count"]
-            }))
-    }
-
-    async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
-        let source_root = input
-            .params
-            .get("source_root")
-            .and_then(Value::as_str)
-            .unwrap_or(".");
-        let user_request = input
-            .params
-            .get("user_request")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        match locate_documents(Path::new(source_root), user_request) {
-            Ok(exports) => ActionResult::success_with(exports),
-            Err(error) => ActionResult::error(error),
-        }
-    }
-}
+// ---------------------------------------------------------------------------
+// document_inspect  (locate + inspect)
+// ---------------------------------------------------------------------------
 
 #[derive(Debug)]
 struct DocumentInspectAction {
@@ -121,7 +43,7 @@ impl DocumentInspectAction {
     fn from_spec(spec: &ActionSpec) -> Self {
         Self {
             name: spec.name.clone(),
-            description: spec.description_or("Inspect document structure"),
+            description: spec.description_or("Locate and inspect document artifacts"),
         }
     }
 }
@@ -140,39 +62,17 @@ impl Action for DocumentInspectAction {
         ActionMeta::new(self.name(), self.description())
             .with_category("document")
             .with_capabilities(["filesystem_read"])
-            .with_input_kinds(["document.location", "document.source_paths"])
-            .with_output_kinds(["document.inspection"])
+            .with_input_kinds(["workspace.path", "intent.request"])
+            .with_output_kinds(["document.inspection", "document.source_paths"])
             .with_input_schema(json!({
                 "type": "object",
                 "properties": {
+                    "source_root": { "type": "string", "description": "Directory to scan for documents" },
+                    "user_request": { "type": "string" },
                     "source_paths": {
                         "oneOf": [
                             { "type": "array", "items": { "type": "string" } },
                             { "type": "string" }
-                        ]
-                    },
-                    "documents": {
-                        "oneOf": [
-                            { "type": "array", "items": { "type": "string" } },
-                            { "type": "string" }
-                        ]
-                    },
-                    "source_path": {
-                        "oneOf": [
-                            { "type": "string" },
-                            { "type": "array", "items": { "type": "string" } }
-                        ]
-                    },
-                    "path": {
-                        "oneOf": [
-                            { "type": "string" },
-                            { "type": "array", "items": { "type": "string" } }
-                        ]
-                    },
-                    "document": {
-                        "oneOf": [
-                            { "type": "string" },
-                            { "type": "array", "items": { "type": "string" } }
                         ]
                     }
                 }
@@ -180,44 +80,361 @@ impl Action for DocumentInspectAction {
             .with_output_schema(json!({
                 "type": "object",
                 "properties": {
-                    "inspection": { "type": "object" }
+                    "inspection": { "type": "object" },
+                    "source_paths": { "type": "array", "items": { "type": "string" } },
+                    "documents": { "type": "array", "items": { "type": "string" } },
+                    "artifact_candidates": { "type": "array", "items": { "type": "string" } },
+                    "artifact_count": { "type": "integer" },
+                    "report_path": { "type": "string" }
                 },
-                "required": ["inspection"]
+                "required": ["inspection", "source_paths"]
             }))
     }
 
     async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
-        let (source_paths, source_field) = match resolve_document_source_paths(&input.params) {
-            Ok(result) => result,
+        // If explicit source paths are provided, use them directly (inspect-only).
+        // Otherwise, locate first then inspect.
+        let (source_paths, locate_exports) =
+            if let Ok((paths, _field)) = resolve_document_source_paths(&input.params) {
+                (paths, None)
+            } else {
+                let source_root = input
+                    .params
+                    .get("source_root")
+                    .and_then(Value::as_str)
+                    .unwrap_or(".");
+                let user_request = input
+                    .params
+                    .get("user_request")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                match locate_documents(Path::new(source_root), user_request) {
+                    Ok(exports) => {
+                        let paths = exports
+                            .get("source_paths")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        (paths, Some(exports))
+                    }
+                    Err(error) => return ActionResult::error(error),
+                }
+            };
+
+        if source_paths.is_empty() {
+            return ActionResult::error(
+                "No document source paths found. Provide source_root or source_paths.",
+            );
+        }
+
+        let inspection = match inspect_documents(&source_paths) {
+            Ok(v) => v,
             Err(error) => return ActionResult::error(error),
         };
-        tracing::debug!(
-            action = %self.name,
-            source_field,
-            source_count = source_paths.len(),
-            "document_inspect resolved source paths"
-        );
-        match inspect_documents(&source_paths) {
-            Ok(inspection) => ActionResult::success_with_one("inspection", inspection),
+
+        let mut exports = locate_exports.unwrap_or_default();
+        if !exports.contains_key("source_paths") {
+            let paths_val: Vec<Value> = source_paths
+                .iter()
+                .map(|s| Value::String(s.clone()))
+                .collect();
+            exports.insert("source_paths".to_string(), Value::Array(paths_val.clone()));
+            exports.insert("documents".to_string(), Value::Array(paths_val.clone()));
+            exports.insert(
+                "artifact_candidates".to_string(),
+                Value::Array(paths_val.clone()),
+            );
+            exports.insert(
+                "artifact_count".to_string(),
+                Value::Number(paths_val.len().into()),
+            );
+        }
+        exports.insert("inspection".to_string(), inspection);
+
+        ActionResult::success_with(exports)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// document_patch  (derive + assess + build_patch_spec + apply)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct DocumentPatchAction {
+    name: String,
+    description: String,
+}
+
+impl DocumentPatchAction {
+    fn from_spec(spec: &ActionSpec) -> Self {
+        Self {
+            name: spec.name.clone(),
+            description: spec.description_or("Derive, assess, and apply a document patch"),
+        }
+    }
+}
+
+#[async_trait]
+impl Action for DocumentPatchAction {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn metadata(&self) -> ActionMeta {
+        ActionMeta::new(self.name(), self.description())
+            .with_category("document")
+            .with_capabilities(["filesystem_write", "side_effect"])
+            .with_input_kinds([
+                "document.inspection",
+                "intent.request",
+            ])
+            .with_output_kinds(["document.apply_result", "document.patch_spec", "workspace.path"])
+            .with_input_schema(json!({
+                "type": "object",
+                "properties": {
+                    "inspection": { "type": "object" },
+                    "user_request": { "type": "string" },
+                    "derivation_policy": {
+                        "type": "string",
+                        "enum": ["strict", "permissive", "filename_to_h1", "markdown_h1_from_filename"]
+                    },
+                    "report_path": { "type": "string" }
+                },
+                "required": ["inspection", "user_request", "derivation_policy"]
+            }))
+            .with_output_schema(json!({
+                "type": "object",
+                "properties": {
+                    "updated_paths": { "type": "array", "items": { "type": "string" } },
+                    "patch_count": { "type": "integer" },
+                    "patch_spec": { "type": "object" },
+                    "summary": { "type": "string" }
+                },
+                "required": ["updated_paths", "patch_count", "summary"]
+            }))
+    }
+
+    async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
+        let Some(inspection) = input.params.get("inspection") else {
+            return ActionResult::error("Missing inspection for document_patch");
+        };
+        let Some(user_request) = input.params.get("user_request").and_then(Value::as_str) else {
+            return ActionResult::error("Missing user_request for document_patch");
+        };
+        let Some(raw_policy) = input
+            .params
+            .get("derivation_policy")
+            .and_then(Value::as_str)
+        else {
+            return ActionResult::error("Missing derivation_policy for document_patch");
+        };
+        let report_path = input.params.get("report_path").and_then(Value::as_str);
+
+        // Step 1: derive candidates
+        let (patch_candidates, _derive_summary) =
+            match derive_document_patch_candidates(user_request, inspection, raw_policy) {
+                Ok(v) => v,
+                Err(error) => return ActionResult::error(error),
+            };
+
+        // Step 2: assess readiness
+        let (continuation, _assess_summary) = match assess_document_readiness(
+            user_request,
+            inspection,
+            &patch_candidates,
+            raw_policy,
+        ) {
+            Ok(v) => v,
+            Err(error) => return ActionResult::error(error),
+        };
+
+        let status = continuation
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("failed");
+
+        match status {
+            "wait_user" => {
+                let message = continuation
+                    .get("user_message")
+                    .and_then(Value::as_str)
+                    .or_else(|| continuation.get("reason").and_then(Value::as_str))
+                    .unwrap_or("Need user input before proceeding")
+                    .to_string();
+                return ActionResult::need_clarification(message);
+            }
+            "done" => {
+                let reason = continuation
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("No changes needed");
+                return ActionResult::success_with(
+                    [
+                        ("updated_paths".to_string(), Value::Array(Vec::new())),
+                        ("patch_count".to_string(), Value::Number(0.into())),
+                        ("summary".to_string(), Value::String(reason.to_string())),
+                    ]
+                    .into_iter()
+                    .collect(),
+                );
+            }
+            "commit_ready" => { /* continue to build + apply */ }
+            other => {
+                return ActionResult::error(format!(
+                    "Unexpected continuation status from assess: {}",
+                    other
+                ));
+            }
+        }
+
+        // Step 3: build patch spec
+        let (patch_spec, _build_summary) =
+            match build_document_patch_spec(&patch_candidates, inspection) {
+                Ok(v) => v,
+                Err(error) => return ActionResult::error(error),
+            };
+
+        // Step 4: apply patch
+        let mut exports = match apply_document_patch(
+            &patch_spec,
+            report_path,
+            Some(inspection),
+            Some(&patch_candidates),
+        ) {
+            Ok(v) => v,
+            Err(error) => return ActionResult::error(error),
+        };
+
+        exports.insert("patch_spec".to_string(), patch_spec);
+
+        ActionResult::success_with(exports)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// document_verify_patch  (unchanged)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct DocumentVerifyPatchAction {
+    name: String,
+    description: String,
+}
+
+impl DocumentVerifyPatchAction {
+    fn from_spec(spec: &ActionSpec) -> Self {
+        Self {
+            name: spec.name.clone(),
+            description: spec.description_or("Verify a document patch"),
+        }
+    }
+}
+
+#[async_trait]
+impl Action for DocumentVerifyPatchAction {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn metadata(&self) -> ActionMeta {
+        ActionMeta::new(self.name(), self.description())
+            .with_category("document")
+            .with_capabilities(["filesystem_read"])
+            .with_input_kinds([
+                "document.inspection",
+                "document.patch_spec",
+                "intent.request",
+            ])
+            .with_output_kinds(["document.verify_decision"])
+            .with_input_schema(json!({
+                "type": "object",
+                "properties": {
+                    "patch_spec": { "type": "object" },
+                    "inspection": { "type": "object" },
+                    "patch_candidates": { "type": "object" },
+                    "user_request": { "type": "string" },
+                    "resume_user_input": {}
+                },
+                "required": ["patch_spec", "inspection", "user_request"]
+            }))
+            .with_output_schema(json!({
+                "type": "object",
+                "properties": {
+                    "summary": { "type": "string" },
+                    "verify_decision": { "type": "object" }
+                },
+                "required": ["summary", "verify_decision"]
+            }))
+    }
+
+    async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
+        if let Some(verify_decision) = forced_verify_failure(self.name()) {
+            return ActionResult::success_with(
+                [
+                    (
+                        "verify_decision".to_string(),
+                        serde_json::to_value(verify_decision).unwrap_or(Value::Null),
+                    ),
+                    (
+                        "summary".to_string(),
+                        Value::String("Document verification failed.".to_string()),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            );
+        }
+        let Some(patch_spec) = input.params.get("patch_spec") else {
+            return ActionResult::error("Missing patch_spec for document_verify_patch");
+        };
+        let Some(inspection) = input.params.get("inspection") else {
+            return ActionResult::error("Missing inspection for document_verify_patch");
+        };
+        let user_request = input
+            .params
+            .get("user_request")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let patch_candidates = input.params.get("patch_candidates");
+        let resume_user_input = input.params.get("resume_user_input");
+        match verify_document_patch(
+            patch_spec,
+            inspection,
+            patch_candidates,
+            user_request,
+            resume_user_input,
+        ) {
+            Ok((verify_decision, summary)) => ActionResult::success_with(
+                [
+                    (
+                        "verify_decision".to_string(),
+                        serde_json::to_value(verify_decision).unwrap_or(Value::Null),
+                    ),
+                    ("summary".to_string(), Value::String(summary)),
+                ]
+                .into_iter()
+                .collect(),
+            ),
             Err(error) => ActionResult::error(error),
         }
     }
 }
 
-#[derive(Debug)]
-struct DocumentAssessReadinessAction {
-    name: String,
-    description: String,
-}
-
-impl DocumentAssessReadinessAction {
-    fn from_spec(spec: &ActionSpec) -> Self {
-        Self {
-            name: spec.name.clone(),
-            description: spec.description_or("Assess document probe readiness"),
-        }
-    }
-}
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 const DOCUMENT_SOURCE_FIELDS: [&str; 5] = [
     "source_paths",
@@ -402,473 +619,43 @@ mod tests {
             let _ = fs::remove_dir_all(dir);
         });
     }
-}
 
-#[async_trait]
-impl Action for DocumentAssessReadinessAction {
-    fn name(&self) -> &str {
-        &self.name
-    }
+    #[test]
+    fn test_document_inspect_with_source_root() {
+        tokio_test::block_on(async {
+            let dir = temp_test_dir("document-inspect-root");
+            fs::write(dir.join("readme.md"), "hello\n").expect("write markdown");
 
-    fn description(&self) -> &str {
-        &self.description
-    }
+            let action = DocumentInspectAction::from_spec(&ActionSpec {
+                name: "document_inspect".to_string(),
+                kind: "document_inspect".to_string(),
+                description: None,
+                category: None,
+                config: Value::Null,
+                interface: None,
+            });
+            let result = action
+                .run(
+                    ActionInput::with_params(json!({
+                        "source_root": dir.to_string_lossy().to_string()
+                    })),
+                    test_action_context(),
+                )
+                .await;
 
-    fn metadata(&self) -> ActionMeta {
-        ActionMeta::new(self.name(), self.description())
-            .with_category("document")
-            .with_capabilities(["pure", "structured_output"])
-            .with_input_kinds([
-                "document.inspection",
-                "document.patch_candidates",
-                "intent.request",
-            ])
-            .with_output_kinds(["document.continuation"])
-            .with_input_schema(json!({
-                "type": "object",
-                "properties": {
-                    "inspection": { "type": "object" },
-                    "patch_candidates": { "type": "object" },
-                    "derivation_policy": {
-                        "type": "string",
-                        "enum": ["strict", "permissive", "filename_to_h1", "markdown_h1_from_filename"],
-                        "description": "Document derivation strictness. filename_to_h1 aliases permissive title derivation from file names."
-                    },
-                    "user_request": { "type": "string" }
-                },
-                "required": ["inspection", "patch_candidates", "derivation_policy", "user_request"]
-            }))
-            .with_output_schema(json!({
-                "type": "object",
-                "properties": {
-                    "continuation": {
-                        "type": "object",
-                        "properties": {
-                            "status": { "type": "string" },
-                            "reason": { "type": "string" },
-                            "unknowns": { "type": "array", "items": { "type": "string" } },
-                            "assumptions": { "type": "array", "items": { "type": "string" } },
-                            "user_message": { "type": ["string", "null"] }
-                        }
-                    },
-                    "summary": { "type": "string" }
-                },
-                "required": ["continuation", "summary"]
-            }))
-    }
+            match result {
+                ActionResult::Success { exports } => {
+                    assert!(exports.contains_key("inspection"));
+                    assert!(exports.contains_key("source_paths"));
+                    assert!(
+                        exports.contains_key("report_path")
+                            || exports.contains_key("artifact_count")
+                    );
+                }
+                other => panic!("expected success, got {:?}", other),
+            }
 
-    async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
-        let Some(inspection) = input.params.get("inspection") else {
-            return ActionResult::error("Missing inspection for document_assess_readiness");
-        };
-        let Some(patch_candidates) = input.params.get("patch_candidates") else {
-            return ActionResult::error("Missing patch_candidates for document_assess_readiness");
-        };
-        let Some(raw_policy) = input
-            .params
-            .get("derivation_policy")
-            .and_then(Value::as_str)
-        else {
-            return ActionResult::error("Missing derivation_policy for document_assess_readiness");
-        };
-        let user_request = input
-            .params
-            .get("user_request")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        match assess_document_readiness(user_request, inspection, patch_candidates, raw_policy) {
-            Ok((continuation, summary)) => ActionResult::success_with(
-                [
-                    ("continuation".to_string(), continuation),
-                    ("summary".to_string(), Value::String(summary)),
-                ]
-                .into_iter()
-                .collect(),
-            ),
-            Err(error) => ActionResult::error(error),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct DocumentDeriveCandidatesAction {
-    name: String,
-    description: String,
-}
-
-impl DocumentDeriveCandidatesAction {
-    fn from_spec(spec: &ActionSpec) -> Self {
-        Self {
-            name: spec.name.clone(),
-            description: spec.description_or("Derive document patch candidates"),
-        }
-    }
-}
-
-#[async_trait]
-impl Action for DocumentDeriveCandidatesAction {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn description(&self) -> &str {
-        &self.description
-    }
-
-    fn metadata(&self) -> ActionMeta {
-        ActionMeta::new(self.name(), self.description())
-            .with_category("document")
-            .with_capabilities(["pure", "structured_output"])
-            .with_input_kinds(["document.inspection", "intent.request"])
-            .with_output_kinds(["document.patch_candidates"])
-            .with_input_schema(json!({
-                "type": "object",
-                "properties": {
-                    "user_request": { "type": "string" },
-                    "inspection": { "type": "object" },
-                    "derivation_policy": {
-                        "type": "string",
-                        "enum": ["strict", "permissive", "filename_to_h1", "markdown_h1_from_filename"],
-                        "description": "Document derivation strictness. filename_to_h1 aliases permissive title derivation from file names."
-                    }
-                },
-                "required": ["user_request", "inspection", "derivation_policy"]
-            }))
-            .with_output_schema(json!({
-                "type": "object",
-                "properties": {
-                    "patch_candidates": { "type": "object" },
-                    "summary": { "type": "string" }
-                },
-                "required": ["patch_candidates", "summary"]
-            }))
-    }
-
-    async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
-        let Some(user_request) = input.params.get("user_request").and_then(Value::as_str) else {
-            return ActionResult::error("Missing user_request for document_derive_candidates");
-        };
-        let Some(inspection) = input.params.get("inspection") else {
-            return ActionResult::error("Missing inspection for document_derive_candidates");
-        };
-        let Some(raw_policy) = input
-            .params
-            .get("derivation_policy")
-            .and_then(Value::as_str)
-        else {
-            return ActionResult::error("Missing derivation_policy for document_derive_candidates");
-        };
-        match derive_document_patch_candidates(user_request, inspection, raw_policy) {
-            Ok((patch_candidates, summary)) => ActionResult::success_with(
-                [
-                    ("patch_candidates".to_string(), patch_candidates),
-                    ("summary".to_string(), Value::String(summary)),
-                ]
-                .into_iter()
-                .collect(),
-            ),
-            Err(error) => ActionResult::error(error),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct DocumentBuildPatchSpecAction {
-    name: String,
-    description: String,
-}
-
-impl DocumentBuildPatchSpecAction {
-    fn from_spec(spec: &ActionSpec) -> Self {
-        Self {
-            name: spec.name.clone(),
-            description: spec.description_or("Build a typed document patch spec"),
-        }
-    }
-}
-
-#[async_trait]
-impl Action for DocumentBuildPatchSpecAction {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn description(&self) -> &str {
-        &self.description
-    }
-
-    fn metadata(&self) -> ActionMeta {
-        ActionMeta::new(self.name(), self.description())
-            .with_category("document")
-            .with_capabilities(["pure", "structured_output"])
-            .with_input_kinds(["document.inspection", "document.patch_candidates"])
-            .with_output_kinds(["document.patch_spec"])
-            .with_input_schema(json!({
-                "type": "object",
-                "properties": {
-                    "patch_candidates": { "type": "object" },
-                    "inspection": { "type": "object" }
-                },
-                "required": ["patch_candidates", "inspection"]
-            }))
-            .with_output_schema(json!({
-                "type": "object",
-                "properties": {
-                    "patch_spec": {
-                        "type": "object",
-                        "properties": {
-                            "updates": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "path": { "type": "string" },
-                                        "content": { "type": "string" }
-                                    },
-                                    "required": ["path", "content"]
-                                }
-                            },
-                            "summary": { "type": "string" }
-                        },
-                        "required": ["updates"]
-                    },
-                    "summary": { "type": "string" }
-                },
-                "required": ["patch_spec", "summary"]
-            }))
-    }
-
-    async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
-        let Some(patch_candidates) = input.params.get("patch_candidates") else {
-            return ActionResult::error("Missing patch_candidates for document_build_patch_spec");
-        };
-        let Some(inspection) = input.params.get("inspection") else {
-            return ActionResult::error("Missing inspection for document_build_patch_spec");
-        };
-        match build_document_patch_spec(patch_candidates, inspection) {
-            Ok((patch_spec, summary)) => ActionResult::success_with(
-                [
-                    ("patch_spec".to_string(), patch_spec),
-                    ("summary".to_string(), Value::String(summary)),
-                ]
-                .into_iter()
-                .collect(),
-            ),
-            Err(error) => ActionResult::error(error),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct DocumentApplyPatchAction {
-    name: String,
-    description: String,
-}
-
-impl DocumentApplyPatchAction {
-    fn from_spec(spec: &ActionSpec) -> Self {
-        Self {
-            name: spec.name.clone(),
-            description: spec.description_or("Apply a document patch"),
-        }
-    }
-}
-
-#[async_trait]
-impl Action for DocumentApplyPatchAction {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn description(&self) -> &str {
-        &self.description
-    }
-
-    fn metadata(&self) -> ActionMeta {
-        ActionMeta::new(self.name(), self.description())
-            .with_category("document")
-            .with_capabilities(["filesystem_write", "side_effect"])
-            .with_input_kinds(["document.patch_spec"])
-            .with_output_kinds(["document.apply_result", "workspace.path"])
-            .with_input_schema(json!({
-                "type": "object",
-                "properties": {
-                    "patch_spec": {
-                        "type": "object",
-                        "description": "Document patch spec. Use updates[] with full rewritten file content.",
-                        "properties": {
-                            "updates": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "path": { "type": "string" },
-                                        "content": { "type": "string" }
-                                    },
-                                    "required": ["path", "content"]
-                                }
-                            },
-                            "summary": { "type": "string" }
-                        },
-                        "required": ["updates"]
-                    },
-                    "report_path": { "type": "string" },
-                    "inspection": { "type": "object" },
-                    "patch_candidates": { "type": "object" }
-                },
-                "required": ["patch_spec"]
-            }))
-            .with_output_schema(json!({
-                "type": "object",
-                "properties": {
-                    "updated_paths": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    },
-                    "patch_count": { "type": "integer" },
-                    "summary": { "type": "string" }
-                },
-                "required": ["updated_paths", "patch_count", "summary"]
-            }))
-    }
-
-    async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
-        let Some(patch_spec) = input.params.get("patch_spec") else {
-            return ActionResult::error("Missing patch_spec for document_apply_patch");
-        };
-        let report_path = input.params.get("report_path").and_then(Value::as_str);
-        let inspection = input.params.get("inspection");
-        let patch_candidates = input.params.get("patch_candidates");
-        match apply_document_patch(patch_spec, report_path, inspection, patch_candidates) {
-            Ok(exports) => ActionResult::success_with(exports),
-            Err(error) => ActionResult::error(error),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct DocumentVerifyPatchAction {
-    name: String,
-    description: String,
-}
-
-impl DocumentVerifyPatchAction {
-    fn from_spec(spec: &ActionSpec) -> Self {
-        Self {
-            name: spec.name.clone(),
-            description: spec.description_or("Verify a document patch"),
-        }
-    }
-}
-
-#[async_trait]
-impl Action for DocumentVerifyPatchAction {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn description(&self) -> &str {
-        &self.description
-    }
-
-    fn metadata(&self) -> ActionMeta {
-        ActionMeta::new(self.name(), self.description())
-            .with_category("document")
-            .with_capabilities(["filesystem_read"])
-            .with_input_kinds([
-                "document.inspection",
-                "document.patch_spec",
-                "intent.request",
-            ])
-            .with_output_kinds(["document.verify_decision"])
-            .with_input_schema(json!({
-                "type": "object",
-                "properties": {
-                    "patch_spec": {
-                        "type": "object",
-                        "description": "Document patch spec. Use updates[] with full rewritten file content.",
-                        "properties": {
-                            "updates": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "path": { "type": "string" },
-                                        "content": { "type": "string" }
-                                    },
-                                    "required": ["path", "content"]
-                                }
-                            },
-                            "summary": { "type": "string" }
-                        },
-                        "required": ["updates"]
-                    },
-                    "inspection": { "type": "object" },
-                    "patch_candidates": { "type": "object" },
-                    "user_request": { "type": "string" },
-                    "resume_user_input": {}
-                },
-                "required": ["patch_spec", "inspection", "user_request"]
-            }))
-            .with_output_schema(json!({
-                "type": "object",
-                "properties": {
-                    "summary": { "type": "string" },
-                    "verify_decision": { "type": "object" }
-                },
-                "required": ["summary", "verify_decision"]
-            }))
-    }
-
-    async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
-        if let Some(verify_decision) = forced_verify_failure(self.name()) {
-            return ActionResult::success_with(
-                [
-                    (
-                        "verify_decision".to_string(),
-                        serde_json::to_value(verify_decision).unwrap_or(Value::Null),
-                    ),
-                    (
-                        "summary".to_string(),
-                        Value::String("Document verification failed.".to_string()),
-                    ),
-                ]
-                .into_iter()
-                .collect(),
-            );
-        }
-        let Some(patch_spec) = input.params.get("patch_spec") else {
-            return ActionResult::error("Missing patch_spec for document_verify_patch");
-        };
-        let Some(inspection) = input.params.get("inspection") else {
-            return ActionResult::error("Missing inspection for document_verify_patch");
-        };
-        let user_request = input
-            .params
-            .get("user_request")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let patch_candidates = input.params.get("patch_candidates");
-        let resume_user_input = input.params.get("resume_user_input");
-        match verify_document_patch(
-            patch_spec,
-            inspection,
-            patch_candidates,
-            user_request,
-            resume_user_input,
-        ) {
-            Ok((verify_decision, summary)) => ActionResult::success_with(
-                [
-                    (
-                        "verify_decision".to_string(),
-                        serde_json::to_value(verify_decision).unwrap_or(Value::Null),
-                    ),
-                    ("summary".to_string(), Value::String(summary)),
-                ]
-                .into_iter()
-                .collect(),
-            ),
-            Err(error) => ActionResult::error(error),
-        }
+            let _ = fs::remove_dir_all(dir);
+        });
     }
 }

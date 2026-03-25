@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "mock": {
+      "command": "sh",
+      "args": ["mock_mcp_server.sh"]
+    }
+  }
+}

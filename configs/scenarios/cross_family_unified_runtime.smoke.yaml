@@ -28,12 +28,10 @@ turns:
         - "spreadsheet"
         - "structured"
       activity_contains:
-        - "codebase_collect_targets"
-        - "spreadsheet_apply_patch"
-        - "structured_apply_patch"
+        - "spreadsheet_patch"
+        - "structured_patch"
         - "spreadsheet_verify_patch"
         - "structured_verify_patch"
-        - "codebase_aggregate_verify"
       artifact_contains:
         - path: fixtures/scenarios/cross_family_unified_runtime/config/settings.yaml
           text: "level: info"

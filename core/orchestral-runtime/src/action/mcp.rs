@@ -47,8 +47,86 @@ pub fn build_mcp_action(spec: &ActionSpec) -> Result<Option<Box<dyn Action>>, Ac
             let action = McpServerAction::from_spec(spec)?;
             Ok(Some(Box::new(action)))
         }
+        "mcp_tool" => {
+            let action = McpToolAction::from_spec(spec)?;
+            Ok(Some(Box::new(action)))
+        }
         _ => Ok(None),
     }
+}
+
+/// Probe an MCP server for its tool list. Returns (name, description, inputSchema) per tool.
+/// Used at startup to register per-tool actions.
+pub async fn probe_mcp_server_tools(config: &ActionSpec) -> Result<Vec<McpToolDescriptor>, String> {
+    let server = McpServerAction::from_spec(config)
+        .map_err(|e| format!("failed to build MCP server for probing: {}", e))?;
+
+    let result = if server.config.command.is_some() {
+        let mut session = StdioMcpSession::connect(
+            server
+                .config
+                .command
+                .as_deref()
+                .ok_or_else(|| "missing command".to_string())?,
+            &server.config.args,
+            &server.config.env,
+            server.startup_timeout(),
+        )
+        .await?;
+        session.initialize().await?;
+        let result = session.request("tools/list", json!({})).await?;
+        let _ = session.shutdown().await;
+        result
+    } else {
+        server
+            .http_request("tools/list", json!({}), server.io_timeout())
+            .await?
+    };
+
+    let tools = result
+        .get("tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut descriptors = Vec::new();
+    for tool in tools {
+        let Some(name) = tool.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        if !server.allows_tool(&name) {
+            continue;
+        }
+        let description = tool
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let input_schema = tool
+            .get("inputSchema")
+            .cloned()
+            .unwrap_or(json!({"type": "object"}));
+        descriptors.push(McpToolDescriptor {
+            name,
+            description,
+            input_schema,
+        });
+    }
+    descriptors.sort_by(|a, b| a.name.cmp(&b.name));
+    descriptors.dedup_by(|a, b| a.name == b.name);
+    Ok(descriptors)
+}
+
+/// Descriptor for a single MCP tool discovered via tools/list.
+#[derive(Debug, Clone)]
+pub struct McpToolDescriptor {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
 }
 
 struct McpServerAction {
@@ -391,6 +469,184 @@ impl Action for McpServerAction {
     }
 }
 
+// ---------------------------------------------------------------------------
+// McpToolAction — single-tool action (one per MCP tool, registered at startup)
+// ---------------------------------------------------------------------------
+
+struct McpToolAction {
+    /// Action name: mcp__<server>__<tool>
+    name: String,
+    /// Human-readable description from MCP tools/list
+    description: String,
+    /// Server connection config (reused from McpServerAction)
+    config: McpServerActionConfig,
+    /// The specific MCP tool name to invoke
+    tool_name: String,
+    /// Input schema from MCP tools/list
+    input_schema: Value,
+}
+
+impl McpToolAction {
+    fn from_spec(spec: &ActionSpec) -> Result<Self, ActionBuildError> {
+        let config: McpServerActionConfig =
+            serde_json::from_value(spec.config.clone()).map_err(|err| {
+                ActionBuildError::InvalidConfig(format!(
+                    "action '{}' invalid mcp_tool config: {}",
+                    spec.name, err
+                ))
+            })?;
+
+        let tool_name = spec
+            .config
+            .get("tool_name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+
+        let input_schema = spec
+            .config
+            .get("tool_input_schema")
+            .cloned()
+            .unwrap_or(json!({"type": "object"}));
+
+        Ok(Self {
+            name: spec.name.clone(),
+            description: spec.description_or("Invoke an MCP tool"),
+            config,
+            tool_name,
+            input_schema,
+        })
+    }
+
+    fn io_timeout(&self) -> Duration {
+        Duration::from_millis(self.config.tool_timeout_ms.unwrap_or(20_000))
+    }
+
+    fn startup_timeout(&self) -> Duration {
+        Duration::from_millis(self.config.startup_timeout_ms.unwrap_or(15_000))
+    }
+
+    async fn invoke(&self, arguments: Value) -> Result<Value, String> {
+        if self.config.command.is_some() {
+            let mut session = StdioMcpSession::connect(
+                self.config
+                    .command
+                    .as_deref()
+                    .ok_or_else(|| "missing command".to_string())?,
+                &self.config.args,
+                &self.config.env,
+                self.startup_timeout(),
+            )
+            .await?;
+            session.initialize().await?;
+            let params = json!({ "name": self.tool_name, "arguments": arguments });
+            let result = timeout(self.io_timeout(), session.request("tools/call", params))
+                .await
+                .map_err(|_| {
+                    format!(
+                        "mcp call timed out for server '{}' tool '{}'",
+                        self.config.server_name, self.tool_name
+                    )
+                })??;
+            let _ = session.shutdown().await;
+            Ok(result)
+        } else {
+            let url = self
+                .config
+                .url
+                .as_deref()
+                .ok_or_else(|| "missing url".to_string())?;
+            let client = reqwest::Client::new();
+            let mut headers = HeaderMap::new();
+            for (key, value) in &self.config.headers {
+                if let (Ok(name), Ok(value)) = (
+                    HeaderName::from_bytes(key.as_bytes()),
+                    HeaderValue::from_str(value),
+                ) {
+                    headers.insert(name, value);
+                }
+            }
+            if let Some(env_var) = &self.config.bearer_token_env_var {
+                if let Ok(token) = std::env::var(env_var) {
+                    let auth = format!("Bearer {}", token);
+                    if let Ok(value) = HeaderValue::from_str(&auth) {
+                        headers.insert(AUTHORIZATION, value);
+                    }
+                }
+            }
+            let payload = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": self.tool_name, "arguments": arguments },
+            });
+            let send = client.post(url).headers(headers).json(&payload).send();
+            let response = timeout(self.io_timeout(), send)
+                .await
+                .map_err(|_| format!("mcp http request timed out to {}", url))?
+                .map_err(|err| format!("mcp http request failed: {}", err))?;
+
+            let status = response.status();
+            if !status.is_success() {
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "<unavailable>".to_string());
+                return Err(format!(
+                    "mcp http request failed with status {}: {}",
+                    status,
+                    truncate_text(&body, 800)
+                ));
+            }
+            let value: Value = response
+                .json()
+                .await
+                .map_err(|err| format!("mcp http response is not JSON: {}", err))?;
+            if let Some(error) = value.get("error") {
+                return Err(format!("mcp rpc error: {}", error));
+            }
+            Ok(value.get("result").cloned().unwrap_or(Value::Null))
+        }
+    }
+}
+
+#[async_trait]
+impl Action for McpToolAction {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn metadata(&self) -> ActionMeta {
+        ActionMeta::new(self.name(), self.description())
+            .with_capabilities(["mcp", "side_effect", "tool_invocation"])
+            .with_input_schema(self.input_schema.clone())
+            .with_output_schema(json!({
+                "type": "object",
+                "properties": {
+                    "result": {}
+                },
+                "required": ["result"]
+            }))
+    }
+
+    async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
+        // The input params ARE the tool arguments (direct pass-through).
+        let arguments = input.params;
+        match self.invoke(arguments).await {
+            Ok(result) => {
+                let mut exports = HashMap::new();
+                exports.insert("result".to_string(), result);
+                ActionResult::success_with(exports)
+            }
+            Err(err) => ActionResult::error(err),
+        }
+    }
+}
+
 struct StdioMcpSession {
     child: Child,
     stdin: ChildStdin,
@@ -720,6 +976,137 @@ mod tests {
                 assert_eq!(exports.get("tools"), Some(&json!(["tool_a", "tool_b"])));
             }
             other => panic!("expected success result, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_mcp_server_tools_returns_descriptors_with_schemas() {
+        let script = build_mock_mcp_stdio_script(json!({
+            "tools": [
+                {
+                    "name": "create_issue",
+                    "description": "Create a GitHub issue",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "repo": { "type": "string" },
+                            "title": { "type": "string" }
+                        },
+                        "required": ["repo", "title"]
+                    }
+                },
+                {
+                    "name": "list_repos",
+                    "description": "List repositories"
+                }
+            ]
+        }));
+
+        let spec = ActionSpec {
+            name: "mcp__github".to_string(),
+            kind: "mcp_server".to_string(),
+            description: None,
+            category: None,
+            config: json!({
+                "server_name": "github",
+                "command": "sh",
+                "args": ["-c", script],
+            }),
+            interface: None,
+        };
+
+        let tools = probe_mcp_server_tools(&spec).await.expect("probe tools");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].name, "create_issue");
+        assert_eq!(tools[0].description, "Create a GitHub issue");
+        assert!(tools[0].input_schema.get("properties").is_some());
+        assert_eq!(tools[1].name, "list_repos");
+        // list_repos has no inputSchema, should default to {"type": "object"}
+        assert_eq!(tools[1].input_schema, json!({"type": "object"}));
+    }
+
+    #[tokio::test]
+    async fn probe_mcp_server_tools_respects_enabled_disabled_filter() {
+        let script = build_mock_mcp_stdio_script(json!({
+            "tools": [
+                { "name": "allowed_tool", "description": "ok" },
+                { "name": "blocked_tool", "description": "nope" }
+            ]
+        }));
+
+        let spec = ActionSpec {
+            name: "mcp__filtered".to_string(),
+            kind: "mcp_server".to_string(),
+            description: None,
+            category: None,
+            config: json!({
+                "server_name": "filtered",
+                "command": "sh",
+                "args": ["-c", script],
+                "disabled_tools": ["blocked_tool"]
+            }),
+            interface: None,
+        };
+
+        let tools = probe_mcp_server_tools(&spec).await.expect("probe tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "allowed_tool");
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_action_calls_tool_directly() {
+        let script = build_mock_mcp_stdio_script(json!({
+            "content": [{"type": "text", "text": "issue created"}],
+            "is_error": false
+        }));
+
+        let spec = ActionSpec {
+            name: "mcp__github__create_issue".to_string(),
+            kind: "mcp_tool".to_string(),
+            description: Some("Create a GitHub issue".to_string()),
+            category: None,
+            config: json!({
+                "server_name": "github",
+                "command": "sh",
+                "args": ["-c", script],
+                "tool_name": "create_issue",
+                "tool_input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "repo": { "type": "string" },
+                        "title": { "type": "string" }
+                    },
+                    "required": ["repo", "title"]
+                }
+            }),
+            interface: None,
+        };
+
+        let action = McpToolAction::from_spec(&spec).expect("build mcp_tool action");
+        assert_eq!(action.name(), "mcp__github__create_issue");
+        assert_eq!(action.tool_name, "create_issue");
+
+        // Verify metadata uses the tool's input schema
+        let meta = action.metadata();
+        assert!(meta.input_schema.get("properties").is_some());
+        assert!(meta.has_capability("mcp"));
+
+        let result = action
+            .run(
+                ActionInput::with_params(json!({
+                    "repo": "foo/bar",
+                    "title": "Bug report"
+                })),
+                test_ctx(),
+            )
+            .await;
+
+        match result {
+            ActionResult::Success { exports } => {
+                let result_val = exports.get("result").expect("result export");
+                assert!(result_val.get("content").is_some());
+            }
+            other => panic!("expected success, got {:?}", other),
         }
     }
 

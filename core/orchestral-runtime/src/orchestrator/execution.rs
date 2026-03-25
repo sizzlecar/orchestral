@@ -51,13 +51,7 @@ impl Orchestrator {
         task.set_checkpoint(run.completed_step_ids, run.working_set_snapshot);
         self.task_store.save(task).await?;
 
-        let final_result = match run.result {
-            ExecutionResult::NeedReplan { step_id, .. } => ExecutionResult::Failed {
-                step_id,
-                error: "planner-owned workflow continuation has been removed; return a concrete follow-up plan or terminal planner output instead".to_string(),
-            },
-            other => other,
-        };
+        let final_result = run.result;
 
         let new_state = task_state_from_execution(&final_result);
         task.set_state(new_state.clone());
