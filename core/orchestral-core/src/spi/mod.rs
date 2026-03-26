@@ -1,3 +1,5 @@
+pub mod lifecycle;
+
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
