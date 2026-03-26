@@ -37,17 +37,6 @@ cargo run -p orchestral-cli -- scenario \
   --env-file .env.local
 ```
 
-## 和 Claude Code / Codex 的区别
-
-| 能力 | Claude Code / Codex | Orchestral |
-|------|-------------------|------------|
-| 执行模型 | 每轮单次 tool 调用 | 多步 DAG，带依赖关系 |
-| 错误处理 | 失败即报错 | Agent loop：观察 → 重规划 → 重试 |
-| 外部工具 | 内置固定集合 | MCP server 自动发现，per-tool 注册 |
-| 领域知识 | 系统提示词 | Skill：自动匹配 + 按需激活 |
-| 结果校验 | 无 | 类型化 inspect → patch → verify 管道 |
-| 状态 | 无状态 | 跨轮次 checkpoint/resume |
-
 ## 架构
 
 ```

@@ -37,17 +37,6 @@ cargo run -p orchestral-cli -- scenario \
   --env-file .env.local
 ```
 
-## What Makes This Different
-
-| Feature | Claude Code / Codex | Orchestral |
-|---------|-------------------|------------|
-| Execution model | Single tool call per turn | Multi-step DAG with dependencies |
-| Error handling | Fail and report | Agent loop: observe → replan → retry |
-| External tools | Built-in set | MCP servers auto-discovered, per-tool registration |
-| Domain knowledge | System prompt | Skills: auto-matched, on-demand activation |
-| Verification | None | Typed inspect → patch → verify pipelines |
-| State | Stateless | Checkpoint/resume across turns |
-
 ## Architecture
 
 ```
