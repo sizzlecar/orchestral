@@ -11,3 +11,8 @@ pub use orchestral_core as core;
 pub use orchestral_runtime as runtime;
 
 pub use orchestral_core::prelude::*;
+
+// SDK re-exports
+pub use orchestral_runtime::sdk::{
+    Orchestral, OrchestralApp, OrchestralBuilder, RunResult, SdkError,
+};
