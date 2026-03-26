@@ -1,8 +1,14 @@
 # Orchestral
 
-Workflow orchestration for grounded agents — not one-off tool calls, but stateful multi-step pipelines that fetch, transform, verify, and recover automatically.
+Workflow orchestration for grounded agents.
 
 [中文版本](./README.zh-CN.md)
+
+## What It Does
+
+- Orchestrates stateful workflows, not one-off tool calls
+- Executes typed actions with an `agent loop` and `mini-DAG`
+- Replans from real state and verifies before finishing
 
 ## See It Work
 

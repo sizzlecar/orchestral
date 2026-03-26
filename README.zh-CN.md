@@ -1,8 +1,14 @@
 # Orchestral
 
-面向 grounded agent 的流程编排运行时 — 不是单次 tool calling，而是能自动获取、转换、校验、恢复的有状态多步管道。
+面向 grounded agent 的流程编排运行时。
 
 [English Version](./README.md)
+
+## 它能做什么
+
+- 重点是有状态的流程编排，不是单次 tool calling
+- 用 `agent loop` + `mini-DAG` 执行 typed actions
+- 基于真实状态重规划，并在结束前校验结果
 
 ## 看它怎么跑
 
