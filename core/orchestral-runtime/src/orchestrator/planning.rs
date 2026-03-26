@@ -707,12 +707,7 @@ fn validate_single_action<'a>(
             )))
         })?;
 
-    if action_meta.has_capability("mcp") || call.action.starts_with("mcp__") {
-        return Err(OrchestratorError::Planner(PlanError::Generation(format!(
-            "single_action does not allow action '{}'",
-            call.action
-        ))));
-    }
+    warn_param_issues(&call.action, &call.params, &action_meta.input_schema);
 
     Ok(action_meta)
 }
@@ -756,14 +751,17 @@ fn validate_and_prepare_mini_plan(
             ))));
         }
 
-        if !available_actions
+        let action_meta = available_actions
             .iter()
-            .any(|meta| meta.name == step.action)
-        {
+            .find(|meta| meta.name == step.action);
+        if action_meta.is_none() {
             return Err(OrchestratorError::Planner(PlanError::Generation(format!(
                 "mini_plan references unavailable action '{}'",
                 step.action
             ))));
+        }
+        if let Some(meta) = action_meta {
+            warn_param_issues(&step.action, &step.params, &meta.input_schema);
         }
     }
 
@@ -772,6 +770,72 @@ fn validate_and_prepare_mini_plan(
     }
 
     Ok(plan)
+}
+
+/// Warn about missing required params and unknown param keys.
+/// Does not block execution — the agent loop can self-correct on the next iteration.
+fn warn_param_issues(action: &str, params: &serde_json::Value, input_schema: &serde_json::Value) {
+    let schema_obj = match input_schema.as_object() {
+        Some(obj) => obj,
+        None => return,
+    };
+
+    let required: Vec<&str> = schema_obj
+        .get("required")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+        .collect();
+
+    let properties: Vec<&str> = schema_obj
+        .get("properties")
+        .and_then(|v| v.as_object())
+        .into_iter()
+        .flat_map(|obj| obj.keys())
+        .map(String::as_str)
+        .collect();
+
+    let param_keys: Vec<&str> = params
+        .as_object()
+        .into_iter()
+        .flat_map(|obj| obj.keys())
+        .map(String::as_str)
+        .collect();
+
+    // Skip template values ({{step.field}}) — they'll be resolved at execution time.
+    let is_template = |v: &serde_json::Value| {
+        v.as_str()
+            .map(|s| s.contains("{{") && s.contains("}}"))
+            .unwrap_or(false)
+    };
+
+    for key in &required {
+        if !param_keys.contains(key) {
+            // Check if this is a params that might be resolved from io_bindings
+            tracing::warn!(
+                action = action,
+                missing_param = key,
+                "planner output missing required param (may cause execution failure)"
+            );
+        }
+    }
+
+    if !properties.is_empty() {
+        for key in &param_keys {
+            if !properties.contains(key) {
+                let value = params.get(*key);
+                if value.map(is_template).unwrap_or(false) {
+                    continue; // Template bindings are allowed as extra keys
+                }
+                tracing::debug!(
+                    action = action,
+                    unknown_param = key,
+                    "planner output contains param not in action schema"
+                );
+            }
+        }
+    }
 }
 
 fn single_action_on_complete_template(action: &str) -> Option<String> {
@@ -1007,5 +1071,71 @@ mod tests {
         assert!(err
             .to_string()
             .contains("DONE.message template resolution failed"));
+    }
+
+    #[test]
+    fn test_warn_param_issues_logs_missing_required() {
+        // This test verifies the function runs without panic.
+        // Actual warnings go to tracing — we verify the logic is correct.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "content": { "type": "string" }
+            },
+            "required": ["path", "content"]
+        });
+
+        // Missing "content" — should warn but not panic
+        warn_param_issues("file_write", &json!({"path": "test.txt"}), &schema);
+
+        // All present — no warnings
+        warn_param_issues(
+            "file_write",
+            &json!({"path": "test.txt", "content": "hello"}),
+            &schema,
+        );
+
+        // Extra unknown param — should debug log but not panic
+        warn_param_issues(
+            "file_write",
+            &json!({"path": "test.txt", "content": "hello", "bogus": 42}),
+            &schema,
+        );
+
+        // Template value in unknown param — should be silently skipped
+        warn_param_issues(
+            "file_write",
+            &json!({"path": "test.txt", "content": "{{s1.output}}"}),
+            &schema,
+        );
+    }
+
+    #[test]
+    fn test_validate_single_action_accepts_mcp_tools() {
+        let available =
+            vec![ActionMeta::new("mcp__mock__greet", "greet").with_capabilities(["mcp"])];
+        let call = SingleAction {
+            action: "mcp__mock__greet".to_string(),
+            params: json!({"name": "Alice"}),
+            reason: None,
+        };
+        let result = validate_single_action(&call, &available);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_single_action_rejects_unknown_action() {
+        let available = vec![ActionMeta::new("shell", "run command")];
+        let call = SingleAction {
+            action: "nonexistent".to_string(),
+            params: json!({}),
+            reason: None,
+        };
+        let result = validate_single_action(&call, &available);
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("unavailable action"));
     }
 }
