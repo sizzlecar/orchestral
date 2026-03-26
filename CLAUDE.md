@@ -13,9 +13,9 @@ cargo fmt --all                      # Format
 cargo clippy --workspace --all-targets -- -D warnings  # Lint (CI enforces -D warnings)
 ```
 
-Run the CLI: `cargo run -p orchestral-cli -- run` (requires a provider key like `OPENAI_API_KEY`).
+Run the CLI: `cargo run -p orchestral-cli -- run` (requires a provider key like `OPENROUTER_API_KEY`).
 
-Run a scenario smoke test: `cargo run -p orchestral-cli -- scenario configs/scenarios/<name>.smoke.yaml`
+Run a scenario smoke test: `cargo run -p orchestral-cli -- scenario --spec configs/scenarios/<name>.smoke.yaml --env-file .env.local`
 
 Toolchain: Rust 1.91.0 stable (pinned in `rust-toolchain.toml`).
 
@@ -38,7 +38,7 @@ examples/                — Runnable demos.
 ### Core Pipeline: Intent → Plan → Normalize → Execute
 
 1. **Event arrives** → ThreadRuntime routes it, applies ConcurrencyPolicy (Interrupt/Queue/Parallel/Merge)
-2. **Orchestrator** parses event into an Intent, builds PlannerContext (available actions, history, skill instructions, loop context)
+2. **Orchestrator** parses event into an Intent, builds PlannerContext (available actions, history, skill instructions, skill summaries, loop context)
 3. **Agent Loop** (multi-iteration): Planner generates `PlannerOutput` (SingleAction | MiniPlan | Done | NeedInput)
    - If SingleAction/MiniPlan → Normalizer validates DAG + injects implicit steps → Executor runs topologically with parallel scheduling, retry, approval gates
    - Execution result becomes an observation; loop continues if not terminal
@@ -57,9 +57,28 @@ examples/                — Runnable demos.
 | `ContextBuilder` | `orchestral-runtime/src/context/mod.rs` | Assemble context window with token budget |
 | `PlanValidator` / `PlanFixer` | `orchestral-core/src/normalizer/mod.rs` | DAG validation and auto-repair |
 
-### Built-in Action Families (orchestral-runtime/src/action/)
+### Actions
 
-`builtin` (shell, file_read, file_write, json_extract, wait), `document`, `spreadsheet`, `structured`, `codebase`, `mcp`, `skill` — each family has inspect/locate/derive/apply/verify/assess variants.
+Built-in actions in `orchestral-runtime/src/action/`:
+
+- **builtin** — `shell`, `file_read`, `file_write`, `echo`, `http`, `json_stdout`, `tool_lookup`, `skill_activate`
+- **document** — `document_inspect` (locate + inspect), `document_patch` (derive + assess + apply), `document_verify_patch`
+- **structured** — `structured_inspect`, `structured_patch`, `structured_verify_patch`
+- **mcp** — `McpToolAction` per MCP tool, discovered at startup via `tools/list` probe
+
+Spreadsheet operations are handled by the `xlsx` skill (shell + openpyxl), not a built-in action.
+
+### MCP Integration
+
+MCP servers are auto-discovered from `.mcp.json` files. At startup, each server is probed via `tools/list` and every tool is registered as an independent action (`mcp__<server>__<tool>`). The planner catalog shows tool names and descriptions only; the planner calls `tool_lookup` to get the full input schema before invoking an MCP tool.
+
+### Skill System
+
+Skills are SKILL.md files auto-discovered from `.claude/skills/`, `.codex/skills/`, and `skills/` directories (relative to config path and CWD). Discovery uses `canonicalize()` on the config path for stable resolution.
+
+- **Auto-injection** — keyword matching scores skills against the user intent; top matches are injected into the planner prompt
+- **Catalog listing** — all skill names + descriptions appear in the planner's capability catalog
+- **On-demand activation** — planner can call `skill_activate` to load full instructions for any skill not auto-matched
 
 ### Runtime Model
 
@@ -84,8 +103,8 @@ Follow Conventional Commits: `feat(scope):`, `fix(scope):`, `refactor(scope):`, 
 
 ## Configuration
 
-Main config: `configs/orchestral.yaml`. Action config: `configs/orchestral.cli.yaml`. Scenario smoke tests: `configs/scenarios/*.smoke.yaml`.
+Main config: `configs/orchestral.cli.yaml`. Runtime override: `configs/orchestral.cli.runtime.override.yaml`. Scenario smoke tests: `configs/scenarios/*.smoke.yaml`.
 
-Skills are auto-discovered from `.claude/skills/` directories with `SKILL.md` instruction files.
+Skills are auto-discovered from `.claude/skills/` directories with `SKILL.md` instruction files. MCP servers from `.mcp.json` files.
 
-LLM planner prompt templates live in `core/orchestral-runtime/src/planner/llm/` (constitution, rules, JSON examples).
+LLM planner prompt templates live in `core/orchestral-runtime/src/prompts/` (constitution, execution rules, JSON examples).
