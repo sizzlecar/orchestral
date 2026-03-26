@@ -49,6 +49,27 @@ Intent → Planner (LLM) → Normalizer (DAG validation) → Executor (parallel 
 - **Skills** — domain knowledge (SKILL.md files) auto-discovered and injected into planner context; `skill_activate` for on-demand loading
 - **Typed actions** — document inspect/patch/verify, structured config patch/verify, shell, file I/O, HTTP
 
+## SDK
+
+Use Orchestral as a library — register custom actions and lifecycle hooks with a builder API:
+
+```rust
+use orchestral::{Orchestral, core::action::*};
+
+let app = Orchestral::builder()
+    .action(MyCustomAction::new())
+    .hook(MyLoggingHook::new())
+    .planner_backend("openrouter")
+    .planner_model("anthropic/claude-sonnet-4.5")
+    .build()
+    .await?;
+
+let result = app.run("Analyze the data and generate a report").await?;
+println!("{}", result.message);
+```
+
+See [`examples/sdk_quickstart.rs`](examples/sdk_quickstart.rs) and [`examples/sdk_hooks.rs`](examples/sdk_hooks.rs).
+
 ## Quick Start
 
 Rust stable (1.91.0+). Export one provider key:
@@ -76,6 +97,7 @@ apps/orchestral-cli      — CLI + TUI (ratatui)
 - Core orchestration loop working with agent loop + mini-DAG
 - MCP per-tool registration with deferred schema loading
 - Skill auto-discovery and on-demand activation
+- SDK with builder API, lifecycle hooks, and programmatic execution
 - Document and structured config typed pipelines
 - Scenario smoke tests covering core workflows
 

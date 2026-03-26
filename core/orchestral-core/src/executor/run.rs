@@ -4,6 +4,7 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::time::sleep;
 
 use crate::action::ActionResult;
+use crate::spi::lifecycle::{StepContext, StepDecision};
 use crate::types::{Step, StepId, StepKind};
 
 use super::{
@@ -189,6 +190,18 @@ impl Executor {
         ctx: &ExecutorContext,
         terminal_result: &mut Option<ExecutionResult>,
     ) {
+        // Lifecycle hook: after_step
+        if let Some(hooks) = &ctx.lifecycle_hooks {
+            let step_ctx = StepContext::new(
+                ctx.thread_id.clone().unwrap_or_default(),
+                ctx.task_id.to_string(),
+                step_id.clone(),
+                step.action.clone(),
+                ctx.working_set.clone(),
+            );
+            hooks.after_step(&step, &result, &step_ctx).await;
+        }
+
         match result {
             ActionResult::Success { exports } => {
                 if let Err(error) = validate_declared_exports(&step, &exports, self.strict_exports)
@@ -436,6 +449,29 @@ impl Executor {
         execution_id: &str,
         ctx: &ExecutorContext,
     ) -> ActionResult {
+        // Lifecycle hook: before_step
+        if let Some(hooks) = &ctx.lifecycle_hooks {
+            let step_ctx = StepContext::new(
+                ctx.thread_id.clone().unwrap_or_default(),
+                ctx.task_id.to_string(),
+                step.id.to_string(),
+                step.action.clone(),
+                ctx.working_set.clone(),
+            );
+            match hooks.before_step(step, &step_ctx).await {
+                StepDecision::Skip { reason } => {
+                    tracing::info!(
+                        step_id = %step.id,
+                        action = %step.action,
+                        reason = %reason,
+                        "step skipped by lifecycle hook"
+                    );
+                    return ActionResult::error(format!("skipped by hook: {}", reason));
+                }
+                StepDecision::Continue => {}
+            }
+        }
+
         if tracing::enabled!(tracing::Level::DEBUG) {
             tracing::debug!(
                 task_id = %ctx.task_id,
