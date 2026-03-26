@@ -8,6 +8,8 @@ mod runtime_builder;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
+use tokio::sync::RwLock;
+
 use async_trait::async_trait;
 use thiserror::Error;
 
@@ -167,10 +169,10 @@ impl RuntimeApp {
         );
 
         let skill_entries = discover_skills(&config, &path)?;
-        let skill_catalog = Arc::new(SkillCatalog::new(
+        let skill_catalog = Arc::new(RwLock::new(SkillCatalog::new(
             skill_entries,
             config.extensions.skill.max_active_skills,
-        ));
+        )));
 
         let action_registry_manager = Arc::new(
             ActionRegistryManager::new(path.clone(), action_factory)
@@ -220,7 +222,8 @@ impl RuntimeApp {
         )
         .with_context_builder(context_builder)
         .with_hook_registry(hook_registry.clone())
-        .with_skill_catalog(skill_catalog);
+        .with_skill_catalog(skill_catalog)
+        .with_skill_config_path(path.clone());
 
         Ok(Self {
             orchestrator,

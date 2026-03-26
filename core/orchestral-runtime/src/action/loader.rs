@@ -34,7 +34,7 @@ pub struct ActionRegistryManager {
     path: PathBuf,
     registry: Arc<RwLock<ActionRegistry>>,
     factory: Arc<dyn ActionFactory>,
-    skill_catalog: Option<Arc<SkillCatalog>>,
+    skill_catalog: Option<Arc<RwLock<SkillCatalog>>>,
 }
 
 impl ActionRegistryManager {
@@ -47,7 +47,7 @@ impl ActionRegistryManager {
         }
     }
 
-    pub fn with_skill_catalog(mut self, catalog: Arc<SkillCatalog>) -> Self {
+    pub fn with_skill_catalog(mut self, catalog: Arc<RwLock<SkillCatalog>>) -> Self {
         self.skill_catalog = Some(catalog);
         self
     }

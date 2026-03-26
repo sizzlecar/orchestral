@@ -120,7 +120,9 @@ pub struct Orchestrator {
     pub context_builder: Option<Arc<dyn ContextBuilder>>,
     pub config: OrchestratorConfig,
     pub hook_registry: Arc<HookRegistry>,
-    pub skill_catalog: Arc<SkillCatalog>,
+    pub skill_catalog: Arc<RwLock<SkillCatalog>>,
+    /// Config path used for skill re-discovery (hot reload).
+    pub skill_config_path: Option<std::path::PathBuf>,
 }
 
 /// Orchestrator configuration
@@ -190,7 +192,8 @@ impl Orchestrator {
             context_builder: None,
             config,
             hook_registry: Arc::new(HookRegistry::new()),
-            skill_catalog: Arc::new(SkillCatalog::new(Vec::new(), 0)),
+            skill_catalog: Arc::new(RwLock::new(SkillCatalog::new(Vec::new(), 0))),
+            skill_config_path: None,
         }
     }
 
@@ -207,8 +210,14 @@ impl Orchestrator {
     }
 
     /// Attach skill catalog for planner-time instruction injection.
-    pub fn with_skill_catalog(mut self, skill_catalog: Arc<SkillCatalog>) -> Self {
+    pub fn with_skill_catalog(mut self, skill_catalog: Arc<RwLock<SkillCatalog>>) -> Self {
         self.skill_catalog = skill_catalog;
+        self
+    }
+
+    /// Set config path for skill hot-reload discovery.
+    pub fn with_skill_config_path(mut self, path: std::path::PathBuf) -> Self {
+        self.skill_config_path = Some(path);
         self
     }
 }

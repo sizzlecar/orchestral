@@ -660,4 +660,51 @@ mod tests {
             .build_instructions("帮我写一段 rust 单元测试")
             .is_empty());
     }
+
+    #[test]
+    fn test_skill_catalog_reload_updates_entries() {
+        let mut catalog = SkillCatalog::new(vec![make_skill("xlsx", "spreadsheet skill")], 3);
+        assert_eq!(catalog.entries().len(), 1);
+        assert_eq!(catalog.summaries().len(), 1);
+
+        // Reload with new entries
+        catalog.reload(vec![
+            make_skill("xlsx", "spreadsheet skill v2"),
+            make_skill("git", "git operations"),
+        ]);
+        assert_eq!(catalog.entries().len(), 2);
+        assert_eq!(catalog.summaries().len(), 2);
+        assert_eq!(catalog.entries()[0].description, "spreadsheet skill v2");
+
+        // Reload with empty — clears catalog
+        catalog.reload(vec![]);
+        assert!(catalog.entries().is_empty());
+        assert!(catalog.summaries().is_empty());
+    }
+
+    #[test]
+    fn test_skill_catalog_reload_preserves_matching() {
+        let mut catalog = SkillCatalog::new(vec![make_skill("xlsx", "spreadsheet skill")], 3);
+        assert_eq!(catalog.build_instructions("help with spreadsheet").len(), 1);
+
+        // Add a new skill via reload
+        catalog.reload(vec![
+            make_skill("xlsx", "spreadsheet skill"),
+            make_skill("slides", "presentation deck editing"),
+        ]);
+
+        // Old match still works
+        assert_eq!(catalog.build_instructions("help with spreadsheet").len(), 1);
+        // New skill is matchable
+        assert_eq!(
+            catalog
+                .build_instructions("create a presentation deck")
+                .len(),
+            1
+        );
+        assert_eq!(
+            catalog.build_instructions("create a presentation deck")[0].skill_name,
+            "slides"
+        );
+    }
 }
