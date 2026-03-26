@@ -16,7 +16,6 @@ mod loader;
 mod mcp;
 mod providers;
 mod shell_sandbox;
-mod spreadsheet;
 mod structured;
 pub(crate) mod test_hooks;
 

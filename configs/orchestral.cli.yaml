@@ -424,68 +424,7 @@ actions:
         sandbox_writable_roots: ["."]
         create_dirs: true
         max_write_bytes: 524288
-    # --- Spreadsheet (3 actions) ---
-    - name: spreadsheet_inspect
-      kind: spreadsheet_inspect
-      description: "Locate and inspect spreadsheet structure"
-      interface:
-        input_schema:
-          type: object
-          properties:
-            source_root: { type: string }
-            user_request: { type: string }
-            path: { type: string }
-        output_schema:
-          type: object
-          properties:
-            inspection: { type: object }
-            source_path: { type: string }
-            path: { type: string }
-            artifact_candidates: { type: array, items: { type: string } }
-            artifact_count: { type: integer }
-          required: ["inspection", "source_path"]
-      config: {}
-    - name: spreadsheet_patch
-      kind: spreadsheet_patch
-      description: "Derive, assess, and apply a spreadsheet patch"
-      interface:
-        input_schema:
-          type: object
-          properties:
-            path: { type: string }
-            inspection: { type: object }
-            user_request: { type: string }
-            derivation_policy: { type: string, enum: ["strict", "permissive"] }
-          required: ["path", "inspection", "user_request", "derivation_policy"]
-        output_schema:
-          type: object
-          properties:
-            updated_file_path: { type: string }
-            patch_count: { type: integer }
-            cells_filled: { type: integer }
-            patch_spec: { type: object }
-            summary: { type: string }
-          required: ["updated_file_path", "patch_count", "summary"]
-      config: {}
-    - name: spreadsheet_verify_patch
-      kind: spreadsheet_verify_patch
-      description: "Verify a spreadsheet patch"
-      interface:
-        input_schema:
-          type: object
-          properties:
-            path: { type: string }
-            patch_spec: { type: object }
-            validator_path: { type: string }
-          required: ["path"]
-        output_schema:
-          type: object
-          properties:
-            verify_decision: { type: object }
-            summary: { type: string }
-          required: ["verify_decision", "summary"]
-      config:
-        default_validator_path: "configs/scenarios/validators/verify_perf_review_fill.py"
+    # --- Spreadsheet: handled by xlsx skill + shell + openpyxl ---
     # --- Document (3 actions) ---
     - name: document_inspect
       kind: document_inspect

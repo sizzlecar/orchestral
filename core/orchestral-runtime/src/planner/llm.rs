@@ -136,8 +136,8 @@ impl Default for LlmPlannerConfig {
             max_history: 20,
             system_prompt: String::new(),
             log_full_prompts: false,
-            selector_min_action_count: 12,
-            selector_max_actions: 12,
+            selector_min_action_count: 30,
+            selector_max_actions: 30,
         }
     }
 }

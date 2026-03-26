@@ -10,6 +10,7 @@ Do not mix derive/build actions from one typed category with apply/verify action
 For direct workspace file edits, prefer `file_write` over `shell` when the desired content can be written explicitly.
 Avoid shell redirection, heredocs, `mv`-based overwrite flows, or similar file mutation commands when `file_write` can satisfy the request.
 Do not use `file_read` for binary artifacts such as `.xlsx`, `.xlsm`, `.docx`, or `.pdf`; use typed inspection actions instead.
+When you know the exact cell values to fill in a spreadsheet, pass them directly via `fills` parameter to `spreadsheet_patch` (e.g. `fills: [{cell: "C2", value: 1380000}, {cell: "D2", value: "=C2/B2*100"}]`). This skips the heuristic derivation and applies values precisely.
 When Observed Execution State is present, use it to decide whether to continue, recover, ask NEED_INPUT, or return DONE.
 Do not repeat already completed work unless the observation shows a failure or a missing result.
 Use exact input/output field names from the capability catalog; do not invent alternate field names.
