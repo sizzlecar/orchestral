@@ -7,6 +7,7 @@ use tokio::sync::RwLock;
 
 use crate::action::{Action, ActionResult, ApprovalRequest};
 use crate::planner::{PlannerRuntimeInfo, SkillInstruction};
+use crate::spi::lifecycle::LifecycleHookRegistry;
 use crate::store::WorkingSet;
 use crate::types::{Step, StepId, TaskId};
 
@@ -57,6 +58,10 @@ pub struct ExecutorContext {
     pub runtime_info: Option<PlannerRuntimeInfo>,
     /// Activated skill instructions for this execution turn.
     pub skill_instructions: Vec<SkillInstruction>,
+    /// Lifecycle hooks for SDK pipeline observation/interception.
+    pub lifecycle_hooks: Option<Arc<LifecycleHookRegistry>>,
+    /// Thread ID for lifecycle hook context.
+    pub thread_id: Option<String>,
 }
 
 impl ExecutorContext {
@@ -68,6 +73,8 @@ impl ExecutorContext {
             progress_reporter: None,
             runtime_info: None,
             skill_instructions: Vec::new(),
+            lifecycle_hooks: None,
+            thread_id: None,
         }
     }
 

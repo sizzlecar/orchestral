@@ -120,10 +120,13 @@ impl Orchestrator {
             let catalog = self.skill_catalog.read().await;
             catalog.build_instructions(&task.intent.content)
         };
-        let exec_ctx = ExecutorContext::new(task.id.clone(), working_set.clone())
+        let thread_id = self.thread_runtime.thread_id().await.to_string();
+        let mut exec_ctx = ExecutorContext::new(task.id.clone(), working_set.clone())
             .with_progress_reporter(progress_reporter)
             .with_runtime_info(runtime_info)
             .with_skill_instructions(skill_instructions);
+        exec_ctx.lifecycle_hooks = Some(self.lifecycle_hooks.clone());
+        exec_ctx.thread_id = Some(thread_id);
         let result = self.executor.execute(&mut dag, &exec_ctx).await;
         tracing::info!(
             interaction_id = %interaction_id,

@@ -32,6 +32,7 @@ use orchestral_core::planner::{
     HistoryItem, PlanError, Planner, PlannerContext, PlannerLoopContext, PlannerOutput,
     PlannerRuntimeInfo,
 };
+use orchestral_core::spi::lifecycle::LifecycleHookRegistry;
 use orchestral_core::spi::HookRegistry;
 use orchestral_core::store::{Event, InteractionId, StoreError, TaskStore, WorkingSet};
 use orchestral_core::types::{
@@ -120,6 +121,7 @@ pub struct Orchestrator {
     pub context_builder: Option<Arc<dyn ContextBuilder>>,
     pub config: OrchestratorConfig,
     pub hook_registry: Arc<HookRegistry>,
+    pub lifecycle_hooks: Arc<LifecycleHookRegistry>,
     pub skill_catalog: Arc<RwLock<SkillCatalog>>,
     /// Config path used for skill re-discovery (hot reload).
     pub skill_config_path: Option<std::path::PathBuf>,
@@ -192,6 +194,7 @@ impl Orchestrator {
             context_builder: None,
             config,
             hook_registry: Arc::new(HookRegistry::new()),
+            lifecycle_hooks: Arc::new(LifecycleHookRegistry::new()),
             skill_catalog: Arc::new(RwLock::new(SkillCatalog::new(Vec::new(), 0))),
             skill_config_path: None,
         }
@@ -206,6 +209,12 @@ impl Orchestrator {
     /// Attach runtime hook registry.
     pub fn with_hook_registry(mut self, hook_registry: Arc<HookRegistry>) -> Self {
         self.hook_registry = hook_registry;
+        self
+    }
+
+    /// Attach lifecycle hook registry for SDK pipeline hooks.
+    pub fn with_lifecycle_hooks(mut self, hooks: Arc<LifecycleHookRegistry>) -> Self {
+        self.lifecycle_hooks = hooks;
         self
     }
 

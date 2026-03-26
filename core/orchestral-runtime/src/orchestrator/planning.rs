@@ -4,6 +4,7 @@ use super::agent_loop::{
 use super::output::render_output_template;
 use super::*;
 use orchestral_core::planner::SingleAction;
+use orchestral_core::spi::lifecycle::TurnContext;
 use orchestral_core::types::{Plan, Step, StepKind};
 
 impl Orchestrator {
@@ -14,6 +15,14 @@ impl Orchestrator {
         mut task: Task,
     ) -> Result<OrchestratorResult, OrchestratorError> {
         let turn_started_at = Instant::now();
+        let turn_ctx = TurnContext::new(
+            self.thread_runtime.thread_id().await.to_string(),
+            interaction_id.to_string(),
+            task.id.to_string(),
+            task.intent.content.clone(),
+            0,
+        );
+        self.lifecycle_hooks.on_turn_start(&turn_ctx).await;
         let all_actions = self.available_actions().await;
         let mut history = self
             .history_for_planner(interaction_id.as_str(), task.id.as_str())
@@ -322,11 +331,23 @@ impl Orchestrator {
         &self,
         interaction_id: &str,
         task: &mut Task,
-        plan: Plan,
+        mut plan: Plan,
         iteration: usize,
         execution_mode: &str,
         action_name: Option<&str>,
     ) -> Result<ExecutionResult, OrchestratorError> {
+        // Lifecycle hook: on_plan_created (can mutate plan)
+        let turn_ctx = TurnContext::new(
+            self.thread_runtime.thread_id().await.to_string(),
+            interaction_id.to_string(),
+            task.id.to_string(),
+            task.intent.content.clone(),
+            iteration,
+        );
+        self.lifecycle_hooks
+            .on_plan_created(&mut plan, &turn_ctx)
+            .await;
+
         let step_count = plan.steps.len();
         task.completed_step_ids.clear();
         task.set_plan(plan.clone());
@@ -371,6 +392,12 @@ impl Orchestrator {
         let result = self
             .execute_existing_task(task, interaction_id, None)
             .await?;
+
+        // Lifecycle hook: on_execution_complete
+        self.lifecycle_hooks
+            .on_execution_complete(&result, &turn_ctx)
+            .await;
+
         self.emit_lifecycle_event(
             "execution_completed",
             Some(interaction_id),
