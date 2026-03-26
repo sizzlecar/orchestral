@@ -34,6 +34,24 @@ pub struct TurnContext {
     pub iteration: usize,
 }
 
+impl TurnContext {
+    pub fn new(
+        thread_id: impl Into<String>,
+        interaction_id: impl Into<String>,
+        task_id: impl Into<String>,
+        intent: impl Into<String>,
+        iteration: usize,
+    ) -> Self {
+        Self {
+            thread_id: thread_id.into(),
+            interaction_id: interaction_id.into(),
+            task_id: task_id.into(),
+            intent: intent.into(),
+            iteration,
+        }
+    }
+}
+
 /// Context for step-level hooks (before_step, after_step).
 #[non_exhaustive]
 pub struct StepContext {
@@ -42,6 +60,24 @@ pub struct StepContext {
     pub step_id: String,
     pub action: String,
     pub working_set: Arc<RwLock<WorkingSet>>,
+}
+
+impl StepContext {
+    pub fn new(
+        thread_id: impl Into<String>,
+        task_id: impl Into<String>,
+        step_id: impl Into<String>,
+        action: impl Into<String>,
+        working_set: Arc<RwLock<WorkingSet>>,
+    ) -> Self {
+        Self {
+            thread_id: thread_id.into(),
+            task_id: task_id.into(),
+            step_id: step_id.into(),
+            action: action.into(),
+            working_set,
+        }
+    }
 }
 
 impl std::fmt::Debug for StepContext {
