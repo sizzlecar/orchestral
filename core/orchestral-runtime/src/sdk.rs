@@ -92,6 +92,12 @@ impl OrchestralBuilder {
         self
     }
 
+    /// Register a lifecycle hook from an existing Arc (for shared ownership).
+    pub fn hook_arc(mut self, hook: Arc<dyn LifecycleHook>) -> Self {
+        self.lifecycle_hooks.push(hook);
+        self
+    }
+
     /// Set the LLM backend (e.g., "openrouter", "openai", "anthropic").
     pub fn planner_backend(mut self, backend: impl Into<String>) -> Self {
         self.planner_backend = Some(backend.into());
@@ -267,6 +273,12 @@ pub struct OrchestralApp {
     pub orchestrator: Orchestrator,
 }
 
+impl std::fmt::Debug for OrchestralApp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OrchestralApp").finish()
+    }
+}
+
 impl OrchestralApp {
     /// Run a single user input and return the result.
     pub async fn run(&self, input: &str) -> Result<RunResult, SdkError> {
@@ -356,4 +368,143 @@ pub enum SdkError {
     Config(String),
     #[error("runtime error: {0}")]
     Runtime(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orchestral_core::action::{Action, ActionContext, ActionInput, ActionMeta, ActionResult};
+    use orchestral_core::spi::lifecycle::LifecycleHook;
+
+    /// A deterministic action for testing — no LLM needed.
+    struct EchoAction;
+
+    #[async_trait::async_trait]
+    impl Action for EchoAction {
+        fn name(&self) -> &str {
+            "echo"
+        }
+        fn description(&self) -> &str {
+            "Echo input back"
+        }
+        fn metadata(&self) -> ActionMeta {
+            ActionMeta::new("echo", "Echo input back")
+                .with_input_schema(serde_json::json!({
+                    "type": "object",
+                    "properties": { "message": { "type": "string" } },
+                    "required": ["message"]
+                }))
+                .with_output_schema(serde_json::json!({
+                    "type": "object",
+                    "properties": { "result": { "type": "string" } },
+                    "required": ["result"]
+                }))
+        }
+        async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
+            let msg = input
+                .params
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("no message");
+            ActionResult::success_with(std::collections::HashMap::from([(
+                "result".to_string(),
+                Value::String(msg.to_string()),
+            )]))
+        }
+    }
+
+    #[test]
+    fn test_builder_defaults() {
+        let builder = Orchestral::builder();
+        assert_eq!(builder.max_planner_iterations, 6);
+        assert!(builder.custom_actions.is_empty());
+        assert!(builder.lifecycle_hooks.is_empty());
+        assert!(builder.planner_backend.is_none());
+    }
+
+    #[test]
+    fn test_builder_fluent_api() {
+        let builder = Orchestral::builder()
+            .action(EchoAction)
+            .planner_backend("openai")
+            .planner_model("gpt-4o-mini")
+            .planner_api_key_env("OPENAI_API_KEY")
+            .planner_temperature(0.5)
+            .max_planner_iterations(3);
+
+        assert_eq!(builder.custom_actions.len(), 1);
+        assert_eq!(builder.planner_backend.as_deref(), Some("openai"));
+        assert_eq!(builder.planner_model.as_deref(), Some("gpt-4o-mini"));
+        assert_eq!(
+            builder.planner_api_key_env.as_deref(),
+            Some("OPENAI_API_KEY")
+        );
+        assert_eq!(builder.planner_temperature, Some(0.5));
+        assert_eq!(builder.max_planner_iterations, 3);
+    }
+
+    #[test]
+    fn test_builder_with_hooks() {
+        struct TestHook;
+
+        #[async_trait::async_trait]
+        impl LifecycleHook for TestHook {}
+
+        let builder = Orchestral::builder().hook(TestHook).hook(TestHook);
+        assert_eq!(builder.lifecycle_hooks.len(), 2);
+    }
+
+    #[test]
+    fn test_builder_build_fails_with_invalid_backend() {
+        tokio_test::block_on(async {
+            // Use a nonexistent backend kind — should fail
+            let result = Orchestral::builder()
+                .planner_backend("nonexistent_backend_xyz")
+                .planner_api_key_env("__ORCHESTRAL_TEST_NONEXISTENT_KEY__")
+                .build()
+                .await;
+
+            assert!(result.is_err(), "expected error, got Ok");
+        });
+    }
+
+    #[test]
+    fn test_run_result_from_completed() {
+        let result = RunResult::from_orchestrator_result(OrchestratorResult::Started {
+            interaction_id: "i1".into(),
+            task_id: "t1".into(),
+            result: ExecutionResult::Completed,
+        });
+        assert_eq!(result.status, "completed");
+        assert_eq!(result.interaction_id, "i1");
+    }
+
+    #[test]
+    fn test_run_result_from_failed() {
+        let result = RunResult::from_orchestrator_result(OrchestratorResult::Started {
+            interaction_id: "i1".into(),
+            task_id: "t1".into(),
+            result: ExecutionResult::Failed {
+                step_id: "s1".into(),
+                error: "boom".to_string(),
+            },
+        });
+        assert_eq!(result.status, "failed");
+        assert_eq!(result.message, "boom");
+    }
+
+    #[test]
+    fn test_run_result_from_rejected() {
+        let result = RunResult::from_orchestrator_result(OrchestratorResult::Rejected {
+            reason: "too busy".to_string(),
+        });
+        assert_eq!(result.status, "rejected");
+        assert_eq!(result.message, "too busy");
+    }
+
+    #[test]
+    fn test_run_result_from_queued() {
+        let result = RunResult::from_orchestrator_result(OrchestratorResult::Queued);
+        assert_eq!(result.status, "queued");
+    }
 }
