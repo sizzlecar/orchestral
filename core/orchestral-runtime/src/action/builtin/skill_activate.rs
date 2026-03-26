@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use tokio::sync::RwLock;
 
 use orchestral_core::action::{Action, ActionContext, ActionInput, ActionMeta, ActionResult};
 
@@ -11,11 +12,11 @@ use crate::skill::SkillCatalog;
 /// The planner calls this when it sees a relevant skill in the catalog
 /// but the skill wasn't automatically injected via keyword matching.
 pub(crate) struct SkillActivateAction {
-    skill_catalog: Arc<SkillCatalog>,
+    skill_catalog: Arc<RwLock<SkillCatalog>>,
 }
 
 impl SkillActivateAction {
-    pub(crate) fn new(skill_catalog: Arc<SkillCatalog>) -> Self {
+    pub(crate) fn new(skill_catalog: Arc<RwLock<SkillCatalog>>) -> Self {
         Self { skill_catalog }
     }
 }
@@ -62,7 +63,8 @@ impl Action for SkillActivateAction {
             return ActionResult::error("Missing required parameter: name");
         };
 
-        let Some(instruction) = self.skill_catalog.get_instructions(name) else {
+        let catalog = self.skill_catalog.read().await;
+        let Some(instruction) = catalog.get_instructions(name) else {
             return ActionResult::error(format!("Skill '{}' not found in catalog", name));
         };
 
@@ -114,7 +116,7 @@ mod tests {
 
     #[tokio::test]
     async fn skill_activate_returns_full_instructions() {
-        let catalog = Arc::new(SkillCatalog::new(
+        let catalog = Arc::new(RwLock::new(SkillCatalog::new(
             vec![SkillEntry {
                 name: "xlsx".to_string(),
                 description: "Spreadsheet automation".to_string(),
@@ -124,7 +126,7 @@ mod tests {
                 venv_python: Some(PathBuf::from("/tmp/xlsx/.venv/bin/python3")),
             }],
             3,
-        ));
+        )));
 
         let action = SkillActivateAction::new(catalog);
         let result = action
@@ -154,7 +156,7 @@ mod tests {
 
     #[tokio::test]
     async fn skill_activate_returns_error_for_unknown_skill() {
-        let catalog = Arc::new(SkillCatalog::new(vec![], 3));
+        let catalog = Arc::new(RwLock::new(SkillCatalog::new(vec![], 3)));
         let action = SkillActivateAction::new(catalog);
         let result = action
             .run(

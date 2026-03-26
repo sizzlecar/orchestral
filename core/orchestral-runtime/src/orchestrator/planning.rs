@@ -19,7 +19,11 @@ impl Orchestrator {
             .history_for_planner(interaction_id.as_str(), task.id.as_str())
             .await?;
         drop_current_turn_user_input(&mut history, &task.intent.content);
-        let skill_instructions = self.skill_catalog.build_instructions(&task.intent.content);
+        self.try_reload_skills();
+        let skill_instructions = {
+            let catalog = self.skill_catalog.read().await;
+            catalog.build_instructions(&task.intent.content)
+        };
         let runtime_info = PlannerRuntimeInfo::detect();
         let mut loop_state = AgentLoopState::default();
 
@@ -50,12 +54,14 @@ impl Orchestrator {
                 "orchestrator planner iteration started"
             );
 
-            let skill_summaries: Vec<(String, String)> = self
-                .skill_catalog
-                .summaries()
-                .iter()
-                .map(|(n, d)| (n.to_string(), d.to_string()))
-                .collect();
+            let skill_summaries: Vec<(String, String)> = {
+                let catalog = self.skill_catalog.read().await;
+                catalog
+                    .summaries()
+                    .iter()
+                    .map(|(n, d)| (n.to_string(), d.to_string()))
+                    .collect()
+            };
             let mut context = PlannerContext::with_history(available_actions, history.clone())
                 .with_runtime_info(runtime_info.clone())
                 .with_skill_instructions(skill_instructions.clone())

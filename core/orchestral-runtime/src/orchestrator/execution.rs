@@ -116,7 +116,10 @@ impl Orchestrator {
             self.hook_registry.clone(),
         ));
         let runtime_info = PlannerRuntimeInfo::detect();
-        let skill_instructions = self.skill_catalog.build_instructions(&task.intent.content);
+        let skill_instructions = {
+            let catalog = self.skill_catalog.read().await;
+            catalog.build_instructions(&task.intent.content)
+        };
         let exec_ctx = ExecutorContext::new(task.id.clone(), working_set.clone())
             .with_progress_reporter(progress_reporter)
             .with_runtime_info(runtime_info)

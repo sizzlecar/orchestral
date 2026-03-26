@@ -1,4 +1,39 @@
+use crate::skill::discovery::discover_skills;
+
 use super::*;
+
+impl Orchestrator {
+    /// Re-discover skills from filesystem if a config path is set.
+    /// Called before each planning turn for hot reload.
+    pub(super) fn try_reload_skills(&self) {
+        let Some(config_path) = &self.skill_config_path else {
+            return;
+        };
+        let config = match orchestral_core::config::load_config(config_path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(error = %e, "skill hot-reload: config load failed, skipping");
+                return;
+            }
+        };
+        let entries = match discover_skills(&config, config_path) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::debug!(error = %e, "skill hot-reload: discovery failed, skipping");
+                return;
+            }
+        };
+        // Use try_write to avoid blocking — if catalog is locked, skip this reload.
+        if let Ok(mut catalog) = self.skill_catalog.try_write() {
+            let old_count = catalog.entries().len();
+            catalog.reload(entries);
+            let new_count = catalog.entries().len();
+            if old_count != new_count {
+                tracing::info!(old_count, new_count, "skill catalog hot-reloaded");
+            }
+        }
+    }
+}
 
 pub(super) fn intent_from_event(
     event: &Event,
