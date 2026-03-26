@@ -35,8 +35,6 @@ extensions:
   skill:
     enabled: true
     auto_discover: true
-    directories:
-    - /Users/chejinxuan/rust_ws/orchestral/.claude/skills
   runtime:
   - name: builtin.docs_assistant
     enabled: true
