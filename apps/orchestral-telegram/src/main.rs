@@ -1,7 +1,7 @@
 //! Orchestral Telegram Bot Adapter
 //!
 //! Connects Orchestral's SDK to Telegram via Bot API long polling.
-//! Each Telegram chat maps to an Orchestral thread for multi-turn state.
+//! Messages are serialized through a channel to avoid concurrent interaction conflicts.
 //!
 //! ```bash
 //! export TELEGRAM_BOT_TOKEN="123456:ABC-DEF..."
@@ -13,11 +13,16 @@ mod telegram;
 
 use std::sync::Arc;
 
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use orchestral::Orchestral;
 
 use telegram::TelegramClient;
+
+struct ChatMessage {
+    chat_id: i64,
+    text: String,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -53,6 +58,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let me = client.get_me().await?;
     info!("Bot connected: @{} ({})", me.username, me.first_name);
 
+    // Message processing channel — serializes requests to avoid interaction conflicts
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<ChatMessage>(32);
+
+    // Worker: processes messages one at a time
+    let worker_app = app.clone();
+    let worker_client = client.clone();
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            let _ = worker_client.send_chat_action(msg.chat_id, "typing").await;
+
+            match worker_app.run(&msg.text).await {
+                Ok(result) => {
+                    let reply = match result.status.as_str() {
+                        "completed" => result.message.clone(),
+                        "rejected" => "I'm busy, please wait a moment.".to_string(),
+                        _ => format!("{}\n\n[{}]", result.message, result.status),
+                    };
+                    if let Err(e) = worker_client.send_message(msg.chat_id, &reply).await {
+                        error!(chat_id = msg.chat_id, error = %e, "Failed to send reply");
+                    }
+                }
+                Err(e) => {
+                    let reply = format!("Error: {}", e);
+                    let _ = worker_client.send_message(msg.chat_id, &reply).await;
+                }
+            }
+        }
+    });
+
+    // Polling loop: receives messages and sends to worker channel
     let mut offset: i64 = 0;
     info!("Listening for messages...");
 
@@ -88,36 +123,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Handle /start command
             if text == "/start" {
                 let _ = client
-                    .send_message(
-                        chat_id,
-                        "👋 Hi! I'm an Orchestral bot. Send me any task and I'll orchestrate it for you.",
-                    )
+                    .send_message(chat_id, "Hi! I'm an Orchestral bot. Send me any task.")
                     .await;
                 continue;
             }
 
-            // Run through Orchestral
-            let app = app.clone();
-            let client = client.clone();
-            let text = text.clone();
-
-            tokio::spawn(async move {
-                // Send "typing" indicator
-                let _ = client.send_chat_action(chat_id, "typing").await;
-
-                match app.run(&text).await {
-                    Ok(result) => {
-                        let reply = format!("{}\n\n_Status: {}_", result.message, result.status);
-                        if let Err(e) = client.send_message(chat_id, &reply).await {
-                            error!(chat_id, error = %e, "Failed to send reply");
-                        }
-                    }
-                    Err(e) => {
-                        let reply = format!("❌ Error: {}", e);
-                        let _ = client.send_message(chat_id, &reply).await;
-                    }
-                }
-            });
+            // Queue message for processing
+            if tx
+                .try_send(ChatMessage {
+                    chat_id,
+                    text: text.clone(),
+                })
+                .is_err()
+            {
+                warn!(chat_id, "Message queue full, dropping message");
+                let _ = client
+                    .send_message(chat_id, "I'm busy, please try again in a moment.")
+                    .await;
+            }
         }
     }
 }

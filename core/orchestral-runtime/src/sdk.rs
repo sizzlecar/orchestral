@@ -32,7 +32,7 @@ use orchestral_core::spi::lifecycle::{LifecycleHook, LifecycleHookRegistry};
 use orchestral_core::store::{Event, InMemoryEventStore, InMemoryTaskStore};
 
 use crate::action::{ActionRegistryManager, DefaultActionFactory};
-use crate::concurrency::DefaultConcurrencyPolicy;
+use crate::concurrency::{ConcurrencyPolicy, DefaultConcurrencyPolicy};
 use crate::context::{BasicContextBuilder, TokenBudget};
 use crate::orchestrator::OrchestratorConfig;
 use crate::planner::{
@@ -62,6 +62,7 @@ pub struct OrchestralBuilder {
     planner_temperature: Option<f32>,
     max_planner_iterations: usize,
     config_path: Option<PathBuf>,
+    concurrency_policy: Option<Arc<dyn ConcurrencyPolicy>>,
 }
 
 impl Default for OrchestralBuilder {
@@ -75,6 +76,7 @@ impl Default for OrchestralBuilder {
             planner_temperature: None,
             max_planner_iterations: 6,
             config_path: None,
+            concurrency_policy: None,
         }
     }
 }
@@ -125,6 +127,13 @@ impl OrchestralBuilder {
     /// Set the maximum planner iterations per turn (default: 6).
     pub fn max_planner_iterations(mut self, max: usize) -> Self {
         self.max_planner_iterations = max;
+        self
+    }
+
+    /// Set the concurrency policy (default: InterruptAndStartNew).
+    /// Use `QueueConcurrencyPolicy` for chat bots to serialize message processing.
+    pub fn concurrency_policy(mut self, policy: impl ConcurrencyPolicy + 'static) -> Self {
+        self.concurrency_policy = Some(Arc::new(policy));
         self
     }
 
@@ -179,10 +188,13 @@ impl OrchestralBuilder {
         let executor = Executor::with_registry(registry.clone());
 
         // Thread runtime
+        let policy: Arc<dyn ConcurrencyPolicy> = self
+            .concurrency_policy
+            .unwrap_or_else(|| Arc::new(DefaultConcurrencyPolicy));
         let thread_runtime = ThreadRuntime::with_policy_and_config(
             Thread::new(),
             event_store.clone(),
-            Arc::new(DefaultConcurrencyPolicy),
+            policy,
             ThreadRuntimeConfig::default(),
         );
 
@@ -297,8 +309,17 @@ impl OrchestralApp {
             .await
             .map_err(|e| SdkError::Runtime(e.to_string()))?;
 
-        // Extract the actual assistant output from event store
-        let assistant_message = self.last_assistant_output(&thread_id).await;
+        // Extract interaction_id from result to query the correct assistant output
+        let interaction_id = match &result {
+            OrchestratorResult::Started { interaction_id, .. }
+            | OrchestratorResult::Merged { interaction_id, .. } => Some(interaction_id.to_string()),
+            _ => None,
+        };
+        let assistant_message = if let Some(iid) = interaction_id {
+            self.assistant_output_for_interaction(&iid).await
+        } else {
+            None
+        };
 
         Ok(RunResult::from_orchestrator_result(
             result,
@@ -306,18 +327,25 @@ impl OrchestralApp {
         ))
     }
 
-    /// Query the latest AssistantOutput event from the thread's event store.
-    async fn last_assistant_output(&self, _thread_id: &str) -> Option<String> {
+    /// Query the assistant output for a specific interaction.
+    async fn assistant_output_for_interaction(&self, interaction_id: &str) -> Option<String> {
         let events = self
             .orchestrator
             .thread_runtime
-            .query_history(20)
+            .query_history(50)
             .await
             .ok()?;
 
+        // Find the last AssistantOutput belonging to this interaction
         events
             .iter()
             .rev()
+            .filter(|event| {
+                event
+                    .interaction_id()
+                    .map(|id| id == interaction_id)
+                    .unwrap_or(false)
+            })
             .filter_map(|event| match event {
                 Event::AssistantOutput { payload, .. } => {
                     let text = payload

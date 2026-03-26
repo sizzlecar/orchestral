@@ -147,6 +147,22 @@ impl ConcurrencyPolicy for ParallelConcurrencyPolicy {
     }
 }
 
+/// Merge policy: Merge new inputs into the running interaction.
+///
+/// Best for chat bots — new messages join the current conversation turn.
+/// If no interaction is active, starts a new one.
+pub struct MergeConcurrencyPolicy;
+
+impl ConcurrencyPolicy for MergeConcurrencyPolicy {
+    fn decide(&self, running: &RunningState, _new_event: &Event) -> ConcurrencyDecision {
+        if running.is_idle() {
+            ConcurrencyDecision::InterruptAndStartNew
+        } else {
+            ConcurrencyDecision::MergeIntoRunning
+        }
+    }
+}
+
 /// Reject policy: Reject new inputs when busy
 pub struct RejectWhenBusyConcurrencyPolicy;
 

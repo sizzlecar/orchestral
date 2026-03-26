@@ -27,7 +27,26 @@ impl Orchestrator {
 
         let (interaction_id, started_kind) = match &decision {
             HandleEventResult::Started { interaction_id } => (interaction_id.clone(), "started"),
-            HandleEventResult::Merged { interaction_id } => (interaction_id.clone(), "merged"),
+            HandleEventResult::Merged { interaction_id } => {
+                // Event is already persisted to the active interaction by thread_runtime.
+                // Don't start a new pipeline — the running pipeline's agent loop will
+                // see the new message in history on its next iteration.
+                self.emit_lifecycle_event(
+                    "turn_merged",
+                    Some(interaction_id.as_str()),
+                    None,
+                    Some("event merged into active interaction"),
+                    serde_json::json!({
+                        "event_type": event_type_label(&event_clone),
+                    }),
+                )
+                .await;
+                return Ok(OrchestratorResult::Merged {
+                    interaction_id: interaction_id.clone(),
+                    task_id: "".into(), // no new task created
+                    result: ExecutionResult::Completed,
+                });
+            }
             HandleEventResult::Rejected { reason } => {
                 self.emit_lifecycle_event(
                     "turn_rejected",

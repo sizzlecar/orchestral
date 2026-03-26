@@ -25,8 +25,9 @@ pub use bootstrap::{
     BootstrapError, DefaultRuntimeComponentFactory, InMemoryBlobStore, RuntimeApp,
 };
 pub use concurrency::{
-    ConcurrencyDecision, ConcurrencyPolicy, DefaultConcurrencyPolicy, ParallelConcurrencyPolicy,
-    QueueConcurrencyPolicy, RejectWhenBusyConcurrencyPolicy, RunningState,
+    ConcurrencyDecision, ConcurrencyPolicy, DefaultConcurrencyPolicy, MergeConcurrencyPolicy,
+    ParallelConcurrencyPolicy, QueueConcurrencyPolicy, RejectWhenBusyConcurrencyPolicy,
+    RunningState,
 };
 pub use interaction::{Interaction, InteractionId, InteractionState};
 pub use orchestral_core::spi::{
