@@ -18,23 +18,22 @@
 用户: "从 API 查询 Q4 销售数据，用实际数字和公式填充 Excel 模板，
        再写一份 markdown 摘要对比预算。"
 
-Orchestral (3 轮 agent loop, 5 步):
+Orchestral 自动执行:
   ├─ mcp__sales-api__query_sales_data  → 从外部 API 获取实际销售额
   ├─ file_read budget.yaml             → 读取预算目标
-  ├─ mcp__sales-api__query_budget_variance → 计算差异
   ├─ shell (venv python + openpyxl)    → 填充 Excel：数值、公式、状态
   └─ file_write report.md              → 生成对比报告
 ```
 
-Planner 在启动时自动发现 MCP tools（`tool_lookup`），激活 `xlsx` skill 获取 openpyxl 操作指引，并使用 skill 的虚拟环境运行 Python — 全程无需手动配置。
+Planner 在启动时通过 `tool_lookup` 自动发现 MCP tools，激活 `xlsx` skill 获取 openpyxl 操作指引，并使用 skill 的虚拟环境运行 Python。当某一步失败时，agent loop 观察错误并重新规划 — 无需人工介入。
 
-**自己跑一下：**
+**试一下：**
 
 ```bash
 export OPENROUTER_API_KEY="sk-or-..."
+cargo build -p orchestral-cli
 cargo run -p orchestral-cli -- scenario \
-  --spec configs/scenarios/sales_report_pipeline.smoke.yaml \
-  --env-file .env.local
+  --spec configs/scenarios/sales_report_pipeline.smoke.yaml
 ```
 
 ## 架构
@@ -78,8 +77,7 @@ apps/orchestral-cli      — CLI + TUI (ratatui)
 - MCP per-tool 注册 + 延迟 schema 加载
 - Skill 自动发现 + 按需激活
 - 文档和结构化配置的类型化管道
-- 表格操作走 xlsx skill + openpyxl
-- 18 个场景 smoke 测试通过
+- 场景 smoke 测试覆盖核心工作流
 
 ## 许可证
 

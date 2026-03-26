@@ -18,23 +18,22 @@ One user command. Orchestral coordinates an MCP data source, a domain skill, and
 You:  "Query Q4 sales from the API, fill the Excel template with actuals
        and formulas, write a markdown summary comparing to budget."
 
-Orchestral (3 rounds, 5 steps):
+Orchestral automatically:
   ├─ mcp__sales-api__query_sales_data  → fetch actuals from external API
   ├─ file_read budget.yaml             → load budget targets
-  ├─ mcp__sales-api__query_budget_variance → compute variance
   ├─ shell (venv python + openpyxl)    → fill Excel: values, formulas, status
   └─ file_write report.md              → generate comparison report
 ```
 
-The planner discovers MCP tools at startup (`tool_lookup`), activates the `xlsx` skill for openpyxl guidance, and uses the skill's virtual environment to run Python — all without manual wiring.
+The planner discovers MCP tools at startup via `tool_lookup`, activates the `xlsx` skill for openpyxl guidance, and uses the skill's virtual environment to run Python. When a step fails, the agent loop observes the error and replans — no manual intervention needed.
 
-**Run it yourself:**
+**Try it:**
 
 ```bash
 export OPENROUTER_API_KEY="sk-or-..."
+cargo build -p orchestral-cli
 cargo run -p orchestral-cli -- scenario \
-  --spec configs/scenarios/sales_report_pipeline.smoke.yaml \
-  --env-file .env.local
+  --spec configs/scenarios/sales_report_pipeline.smoke.yaml
 ```
 
 ## Architecture
@@ -78,8 +77,7 @@ apps/orchestral-cli      — CLI + TUI (ratatui)
 - MCP per-tool registration with deferred schema loading
 - Skill auto-discovery and on-demand activation
 - Document and structured config typed pipelines
-- Spreadsheet operations via xlsx skill + openpyxl
-- 18 scenario smoke tests passing
+- Scenario smoke tests covering core workflows
 
 ## License
 
