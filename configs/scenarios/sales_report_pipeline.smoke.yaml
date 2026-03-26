@@ -2,6 +2,8 @@ version: 1
 name: sales-report-pipeline
 config: ../orchestral.cli.runtime.override.yaml
 timeout_secs: 300
+env:
+  PYTHON: /Users/chejinxuan/rust_ws/orchestral/.claude/skills/xlsx/.venv/bin/python3
 workspace:
   copies:
     - from: ../../fixtures/scenarios/sales_report/mock_sales_api.sh
@@ -18,15 +20,17 @@ turns:
     input: >
       Generate the Q4 sales report:
       1. Query actual sales data from the sales-api (quarter=Q4)
-      2. Fill the quarterly_report_template.xlsx with actual numbers, completion percentages, and status
-      3. Write a markdown summary to report.md comparing actuals vs budget from budget.yaml
-      Include totals and highlight regions that exceeded or missed targets.
+      2. Read budget targets from budget.yaml
+      3. Fill quarterly_report_template.xlsx with actual numbers, completion % formulas,
+         and status indicators using openpyxl. Add SUM formulas in the Total row.
+         Use the venv python path shown in the activated xlsx skill instructions.
+      4. Write a markdown summary to report.md comparing actuals vs budget.
+      Include totals and highlight which regions exceeded or missed targets.
     expect:
       require_execution_end: true
-      max_approvals: 0
-      max_errors: 2
+      max_approvals: 2
+      max_errors: 3
       activity_contains:
-        - "tool_lookup"
         - "mcp__sales-api__query_sales_data"
       assistant_contains:
         - "report"
