@@ -25,7 +25,7 @@ pub(super) fn build_capability_catalog(
     }
 
     if !mcp_lines.is_empty() {
-        out.push_str("MCP Tools (use tool_lookup to get full input schema before calling):\n");
+        out.push_str("MCP Tools (call tool_lookup first for input schema, then call the tool directly by its exact name):\n");
         for line in mcp_lines {
             let _ = writeln!(out, "- {}", line);
         }
@@ -246,7 +246,7 @@ mod tests {
         assert!(catalog.contains("input_fields: patch_spec (required)"));
         assert!(catalog.contains("output_fields: updated_paths (required)"));
         assert!(catalog
-            .contains("MCP Tools (use tool_lookup to get full input schema before calling):"));
+            .contains("MCP Tools (call tool_lookup first for input schema, then call the tool directly by its exact name):"));
         assert!(catalog
             .contains("Skills (use skill_activate to load full instructions before executing):"));
         assert!(catalog.contains("- xlsx: Spreadsheet automation"));

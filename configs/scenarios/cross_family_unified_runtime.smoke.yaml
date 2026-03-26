@@ -28,9 +28,7 @@ turns:
         - "spreadsheet"
         - "structured"
       activity_contains:
-        - "spreadsheet_patch"
         - "structured_patch"
-        - "spreadsheet_verify_patch"
         - "structured_verify_patch"
       artifact_contains:
         - path: fixtures/scenarios/cross_family_unified_runtime/config/settings.yaml

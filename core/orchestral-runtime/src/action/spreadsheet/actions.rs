@@ -181,6 +181,18 @@ impl Action for SpreadsheetPatchAction {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
+                    "fills": {
+                        "type": "array",
+                        "description": "Direct cell fills. When provided, skips derive/assess and applies immediately.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "cell": { "type": "string" },
+                                "value": {}
+                            },
+                            "required": ["cell", "value"]
+                        }
+                    },
                     "inspection": { "type": "object" },
                     "user_request": { "type": "string" },
                     "derivation_policy": {
@@ -188,7 +200,7 @@ impl Action for SpreadsheetPatchAction {
                         "enum": ["strict", "permissive"]
                     }
                 },
-                "required": ["path", "inspection", "user_request", "derivation_policy"]
+                "required": ["path"]
             }))
             .with_output_schema(json!({
                 "type": "object",
@@ -207,6 +219,35 @@ impl Action for SpreadsheetPatchAction {
         let Some(path) = input.params.get("path").and_then(Value::as_str) else {
             return ActionResult::error("Missing path for spreadsheet_patch");
         };
+
+        // Fast path: if fills are provided directly, skip derive/assess and apply.
+        if let Some(fills) = input.params.get("fills").filter(|v| v.is_array()) {
+            let patch_spec = json!({ "fills": fills });
+            return match apply_patch(std::path::Path::new(path), &patch_spec) {
+                Ok((updated_file_path, patch_count)) => ActionResult::success_with(
+                    [
+                        (
+                            "updated_file_path".to_string(),
+                            Value::String(updated_file_path),
+                        ),
+                        ("patch_count".to_string(), json!(patch_count)),
+                        ("cells_filled".to_string(), json!(patch_count)),
+                        ("patch_spec".to_string(), patch_spec),
+                        (
+                            "summary".to_string(),
+                            Value::String(format!(
+                                "Applied {} spreadsheet fills (direct).",
+                                patch_count
+                            )),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                Err(error) => ActionResult::error(error),
+            };
+        }
+
         let Some(inspection) = input.params.get("inspection") else {
             return ActionResult::error("Missing inspection for spreadsheet_patch");
         };
@@ -221,7 +262,7 @@ impl Action for SpreadsheetPatchAction {
             return ActionResult::error("Missing derivation_policy for spreadsheet_patch");
         };
 
-        // Step 1: derive candidates
+        // Derive path: derive candidates from inspection + user_request
         let (patch_candidates, _derive_summary) =
             match derive_spreadsheet_patch_candidates(user_request, inspection, raw_policy) {
                 Ok(v) => v,

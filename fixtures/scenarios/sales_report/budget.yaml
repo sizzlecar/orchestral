@@ -1,0 +1,18 @@
+fiscal_year: 2024
+quarter: Q4
+budget:
+  regions:
+    - name: North America
+      target: 1200000
+      priority: high
+    - name: Europe
+      target: 850000
+      priority: medium
+    - name: Asia Pacific
+      target: 960000
+      priority: high
+    - name: Latin America
+      target: 420000
+      priority: low
+  total_target: 3430000
+  currency: USD

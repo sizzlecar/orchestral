@@ -10,7 +10,6 @@ use super::builtin::build_builtin_action;
 use super::document::build_document_action;
 
 use super::mcp::build_mcp_action;
-use super::spreadsheet::build_spreadsheet_action;
 use super::structured::build_structured_action;
 
 /// Action factory errors
@@ -49,9 +48,6 @@ impl ActionFactory for DefaultActionFactory {
         };
 
         if let Some(a) = build_builtin_action(spec) {
-            return wrap(Arc::from(a));
-        }
-        if let Some(a) = build_spreadsheet_action(spec)? {
             return wrap(Arc::from(a));
         }
         if let Some(a) = build_document_action(spec)? {

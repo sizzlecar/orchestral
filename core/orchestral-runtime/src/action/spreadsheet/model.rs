@@ -226,12 +226,13 @@ fn resolve_first_sheet(workbook_xml: &str, rels_xml: &str) -> Result<(String, St
                 if id.as_deref() != Some(rid.as_str()) {
                     continue;
                 }
-                let target = attr_value(event, b"Target")
+                let raw_target = attr_value(event, b"Target")
                     .ok_or_else(|| "workbook relationship missing Target".to_string())?;
+                let target = raw_target.trim_start_matches('/');
                 let sheet_path = if target.starts_with("xl/") {
-                    target
+                    target.to_string()
                 } else {
-                    format!("xl/{}", target.trim_start_matches('/'))
+                    format!("xl/{}", target)
                 };
                 return Ok((sheet_name, sheet_path));
             }

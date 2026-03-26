@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "sales-api": {
+      "command": "sh",
+      "args": ["mock_sales_api.sh"]
+    }
+  }
+}

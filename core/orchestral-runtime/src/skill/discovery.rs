@@ -110,7 +110,11 @@ fn discovery_roots(config_path: &Path) -> Vec<PathBuf> {
         roots.push(cwd);
     }
 
-    if let Some(base) = config_path.parent() {
+    // Canonicalize config_path so discovery works regardless of CWD changes.
+    let resolved = config_path
+        .canonicalize()
+        .unwrap_or_else(|_| config_path.to_path_buf());
+    if let Some(base) = resolved.parent() {
         roots.push(base.to_path_buf());
         if let Some(parent) = base.parent() {
             roots.push(parent.to_path_buf());

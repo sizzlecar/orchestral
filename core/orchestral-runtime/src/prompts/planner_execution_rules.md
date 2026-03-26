@@ -1,6 +1,6 @@
 Use SINGLE_ACTION only when one direct action can satisfy the request.
 Use MINI_PLAN when the request needs a small concrete DAG of available actions.
-Before calling any MCP tool (mcp__*), first use tool_lookup to retrieve its input schema. Do not guess MCP tool parameters.
+MCP tools (mcp__*) are directly callable actions. Use tool_lookup first to retrieve the input schema, then call the MCP tool by its exact name (e.g. mcp__server__tool) as a regular action with the correct parameters.
 When a task matches a skill listed in the catalog but its instructions were not automatically activated, use skill_activate to load the full instructions before proceeding.
 Prefer SINGLE_ACTION for simple workspace inspection tasks.
 When one typed artifact category already covers collect/inspect/derive/apply/verify for the task, prefer staying within that category instead of mixing in unrelated categories.
@@ -10,6 +10,7 @@ Do not mix derive/build actions from one typed category with apply/verify action
 For direct workspace file edits, prefer `file_write` over `shell` when the desired content can be written explicitly.
 Avoid shell redirection, heredocs, `mv`-based overwrite flows, or similar file mutation commands when `file_write` can satisfy the request.
 Do not use `file_read` for binary artifacts such as `.xlsx`, `.xlsm`, `.docx`, or `.pdf`; use typed inspection actions instead.
+When you know the exact cell values to fill in a spreadsheet, pass them directly via `fills` parameter to `spreadsheet_patch` (e.g. `fills: [{cell: "C2", value: 1380000}, {cell: "D2", value: "=C2/B2*100"}]`). This skips the heuristic derivation and applies values precisely.
 When Observed Execution State is present, use it to decide whether to continue, recover, ask NEED_INPUT, or return DONE.
 Do not repeat already completed work unless the observation shows a failure or a missing result.
 Use exact input/output field names from the capability catalog; do not invent alternate field names.
