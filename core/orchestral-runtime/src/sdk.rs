@@ -281,12 +281,15 @@ impl std::fmt::Debug for OrchestralApp {
 
 impl OrchestralApp {
     /// Run a single user input and return the result.
+    /// The message field contains the assistant's actual output text.
     pub async fn run(&self, input: &str) -> Result<RunResult, SdkError> {
-        let event = Event::user_input(
-            self.orchestrator.thread_runtime.thread_id().await.as_str(),
-            "",
-            Value::String(input.to_string()),
-        );
+        let thread_id = self
+            .orchestrator
+            .thread_runtime
+            .thread_id()
+            .await
+            .to_string();
+        let event = Event::user_input(thread_id.as_str(), "", Value::String(input.to_string()));
 
         let result = self
             .orchestrator
@@ -294,7 +297,50 @@ impl OrchestralApp {
             .await
             .map_err(|e| SdkError::Runtime(e.to_string()))?;
 
-        Ok(RunResult::from_orchestrator_result(result))
+        // Extract the actual assistant output from event store
+        let assistant_message = self.last_assistant_output(&thread_id).await;
+
+        Ok(RunResult::from_orchestrator_result(
+            result,
+            assistant_message,
+        ))
+    }
+
+    /// Query the latest AssistantOutput event from the thread's event store.
+    async fn last_assistant_output(&self, _thread_id: &str) -> Option<String> {
+        let events = self
+            .orchestrator
+            .thread_runtime
+            .query_history(20)
+            .await
+            .ok()?;
+
+        events
+            .iter()
+            .rev()
+            .filter_map(|event| match event {
+                Event::AssistantOutput { payload, .. } => {
+                    let text = payload
+                        .as_str()
+                        .map(String::from)
+                        .or_else(|| {
+                            payload
+                                .get("content")
+                                .or_else(|| payload.get("message"))
+                                .or_else(|| payload.get("text"))
+                                .and_then(|v| v.as_str())
+                                .map(String::from)
+                        })
+                        .unwrap_or_else(|| payload.to_string());
+                    if text.is_empty() {
+                        None
+                    } else {
+                        Some(text)
+                    }
+                }
+                _ => None,
+            })
+            .next()
     }
 }
 
@@ -308,7 +354,10 @@ pub struct RunResult {
 }
 
 impl RunResult {
-    fn from_orchestrator_result(result: OrchestratorResult) -> Self {
+    fn from_orchestrator_result(
+        result: OrchestratorResult,
+        assistant_message: Option<String>,
+    ) -> Self {
         match result {
             OrchestratorResult::Started {
                 interaction_id,
@@ -323,7 +372,7 @@ impl RunResult {
                 status: execution_result_status(&result),
                 interaction_id: interaction_id.to_string(),
                 task_id: task_id.to_string(),
-                message: execution_result_message(&result),
+                message: assistant_message.unwrap_or_else(|| execution_result_message(&result)),
             },
             OrchestratorResult::Rejected { reason } => Self {
                 status: "rejected".to_string(),
@@ -470,41 +519,64 @@ mod tests {
 
     #[test]
     fn test_run_result_from_completed() {
-        let result = RunResult::from_orchestrator_result(OrchestratorResult::Started {
-            interaction_id: "i1".into(),
-            task_id: "t1".into(),
-            result: ExecutionResult::Completed,
-        });
+        let result = RunResult::from_orchestrator_result(
+            OrchestratorResult::Started {
+                interaction_id: "i1".into(),
+                task_id: "t1".into(),
+                result: ExecutionResult::Completed,
+            },
+            Some("Hello from assistant".to_string()),
+        );
         assert_eq!(result.status, "completed");
         assert_eq!(result.interaction_id, "i1");
+        assert_eq!(result.message, "Hello from assistant");
+    }
+
+    #[test]
+    fn test_run_result_from_completed_no_assistant_output() {
+        let result = RunResult::from_orchestrator_result(
+            OrchestratorResult::Started {
+                interaction_id: "i1".into(),
+                task_id: "t1".into(),
+                result: ExecutionResult::Completed,
+            },
+            None,
+        );
+        assert_eq!(result.message, "Completed");
     }
 
     #[test]
     fn test_run_result_from_failed() {
-        let result = RunResult::from_orchestrator_result(OrchestratorResult::Started {
-            interaction_id: "i1".into(),
-            task_id: "t1".into(),
-            result: ExecutionResult::Failed {
-                step_id: "s1".into(),
-                error: "boom".to_string(),
+        let result = RunResult::from_orchestrator_result(
+            OrchestratorResult::Started {
+                interaction_id: "i1".into(),
+                task_id: "t1".into(),
+                result: ExecutionResult::Failed {
+                    step_id: "s1".into(),
+                    error: "boom".to_string(),
+                },
             },
-        });
+            None,
+        );
         assert_eq!(result.status, "failed");
         assert_eq!(result.message, "boom");
     }
 
     #[test]
     fn test_run_result_from_rejected() {
-        let result = RunResult::from_orchestrator_result(OrchestratorResult::Rejected {
-            reason: "too busy".to_string(),
-        });
+        let result = RunResult::from_orchestrator_result(
+            OrchestratorResult::Rejected {
+                reason: "too busy".to_string(),
+            },
+            None,
+        );
         assert_eq!(result.status, "rejected");
         assert_eq!(result.message, "too busy");
     }
 
     #[test]
     fn test_run_result_from_queued() {
-        let result = RunResult::from_orchestrator_result(OrchestratorResult::Queued);
+        let result = RunResult::from_orchestrator_result(OrchestratorResult::Queued, None);
         assert_eq!(result.status, "queued");
     }
 }

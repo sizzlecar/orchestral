@@ -10,9 +10,20 @@ pub struct TelegramClient {
 
 impl TelegramClient {
     pub fn new(token: &str) -> Self {
+        let mut builder = reqwest::Client::builder();
+        // Support SOCKS5/HTTP proxy via env vars
+        if let Ok(proxy_url) = std::env::var("TELEGRAM_PROXY")
+            .or_else(|_| std::env::var("all_proxy"))
+            .or_else(|_| std::env::var("https_proxy"))
+        {
+            if let Ok(proxy) = reqwest::Proxy::all(&proxy_url) {
+                builder = builder.proxy(proxy);
+                tracing::info!(proxy = %proxy_url, "Telegram client using proxy");
+            }
+        }
         Self {
             token: token.to_string(),
-            http: reqwest::Client::new(),
+            http: builder.build().unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 
