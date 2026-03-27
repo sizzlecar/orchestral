@@ -90,7 +90,20 @@ core/orchestral-core     — Pure abstractions: Intent/Plan/Step, traits, DAG ex
 core/orchestral-runtime  — LLM planners, actions, MCP bridge, skill system
 core/orchestral          — Facade re-exporting core + runtime
 apps/orchestral-cli      — CLI + TUI (ratatui)
+apps/orchestral-telegram — Telegram bot adapter
 ```
+
+## Telegram Bot
+
+Run Orchestral as a Telegram bot — each message goes through the full orchestration pipeline:
+
+```bash
+export TELEGRAM_BOT_TOKEN="your-bot-token"
+export GOOGLE_API_KEY="your-key"  # or OPENAI_API_KEY, ANTHROPIC_API_KEY, etc.
+cargo run -p orchestral-telegram
+```
+
+LLM backend is configurable in code (defaults to Google Gemini). The bot supports file operations, shell commands, and multi-turn conversations.
 
 ## Current Status
 
@@ -98,6 +111,7 @@ apps/orchestral-cli      — CLI + TUI (ratatui)
 - MCP per-tool registration with deferred schema loading
 - Skill auto-discovery and on-demand activation
 - SDK with builder API, lifecycle hooks, and programmatic execution
+- Telegram bot adapter (configurable LLM backend)
 - Document and structured config typed pipelines
 - Scenario smoke tests covering core workflows
 
