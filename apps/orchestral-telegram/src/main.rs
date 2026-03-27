@@ -3,12 +3,36 @@
 //! Connects Orchestral's SDK to Telegram via Bot API long polling.
 //! Messages are serialized through a channel to avoid concurrent interaction conflicts.
 //!
+//! ## Environment Variables
+//!
+//! Required:
+//! - `TELEGRAM_BOT_TOKEN` — Telegram bot token from @BotFather
+//! - One LLM provider key (see below)
+//!
+//! LLM Configuration (all optional, with defaults):
+//! - `ORCHESTRAL_BACKEND` — LLM backend: google, openai, anthropic, openrouter (default: google)
+//! - `ORCHESTRAL_MODEL` — Model name (default: gemini-2.5-flash)
+//! - `ORCHESTRAL_MAX_ITERATIONS` — Agent loop max iterations (default: 6)
+//!
+//! Provider keys (set the one matching your backend):
+//! - `GOOGLE_API_KEY` — for google backend
+//! - `OPENAI_API_KEY` — for openai backend
+//! - `ANTHROPIC_API_KEY` — for anthropic backend
+//! - `OPENROUTER_API_KEY` — for openrouter backend
+//!
+//! Optional:
+//! - `TELEGRAM_PROXY` — SOCKS5/HTTP proxy for Telegram API (e.g., socks5://127.0.0.1:41808)
+//! - `ORCHESTRAL_CONFIG` — Path to orchestral YAML config (default: configs/orchestral.cli.runtime.override.yaml)
+//!
+//! ## Example
+//!
 //! ```bash
 //! export TELEGRAM_BOT_TOKEN="123456:ABC-DEF..."
-//! export OPENROUTER_API_KEY="sk-or-..."
+//! export GOOGLE_API_KEY="AIza..."
 //! cargo run -p orchestral-telegram
 //! ```
 
+mod config;
 mod telegram;
 
 use std::sync::Arc;
@@ -17,6 +41,7 @@ use tracing::{error, info, warn};
 
 use orchestral::Orchestral;
 
+use config::BotConfig;
 use telegram::TelegramClient;
 
 struct ChatMessage {
@@ -32,36 +57,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let bot_token =
-        std::env::var("TELEGRAM_BOT_TOKEN").expect("TELEGRAM_BOT_TOKEN env var required");
-
-    let config_path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "configs/orchestral.cli.runtime.override.yaml".to_string());
+    let cfg = BotConfig::from_env().map_err(|e| format!("Config error: {}", e))?;
 
     info!("Starting Orchestral Telegram bot...");
-    info!("Config: {}", config_path);
+    info!(
+        backend = %cfg.backend,
+        model = %cfg.model,
+        max_iterations = cfg.max_iterations,
+        config = %cfg.config_path,
+        "Configuration"
+    );
 
     let app = Orchestral::builder()
-        .planner_backend("google")
-        .planner_model("gemini-3.1-pro-preview")
-        .max_planner_iterations(6)
-        .config_path(&config_path)
+        .planner_backend(&cfg.backend)
+        .planner_model(&cfg.model)
+        .max_planner_iterations(cfg.max_iterations)
+        .config_path(&cfg.config_path)
         .build()
         .await
         .map_err(|e| format!("Failed to build Orchestral: {}", e))?;
 
     let app = Arc::new(app);
-    let client = TelegramClient::new(&bot_token);
+    let client = TelegramClient::new(&cfg.bot_token);
 
-    // Verify bot token
     let me = client.get_me().await?;
     info!("Bot connected: @{} ({})", me.username, me.first_name);
 
-    // Message processing channel — serializes requests to avoid interaction conflicts
     let (tx, mut rx) = tokio::sync::mpsc::channel::<ChatMessage>(32);
 
-    // Worker: processes messages one at a time
     let worker_app = app.clone();
     let worker_client = client.clone();
     tokio::spawn(async move {
@@ -87,7 +110,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Polling loop: receives messages and sends to worker channel
     let mut offset: i64 = 0;
     info!("Listening for messages...");
 
@@ -120,7 +142,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             info!(chat_id, user, text = text.as_str(), "Received message");
 
-            // Handle /start command
             if text == "/start" {
                 let _ = client
                     .send_message(chat_id, "Hi! I'm an Orchestral bot. Send me any task.")
@@ -128,7 +149,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
 
-            // Queue message for processing
             if tx
                 .try_send(ChatMessage {
                     chat_id,
