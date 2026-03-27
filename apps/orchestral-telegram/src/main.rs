@@ -43,8 +43,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Config: {}", config_path);
 
     let app = Orchestral::builder()
-        .planner_backend("openrouter")
-        .planner_model("anthropic/claude-sonnet-4.5")
+        .planner_backend("google")
+        .planner_model("gemini-3.1-pro-preview")
         .max_planner_iterations(6)
         .config_path(&config_path)
         .build()

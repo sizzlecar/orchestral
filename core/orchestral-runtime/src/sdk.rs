@@ -309,14 +309,14 @@ impl OrchestralApp {
             .await
             .map_err(|e| SdkError::Runtime(e.to_string()))?;
 
-        // Extract interaction_id from result to query the correct assistant output
-        let interaction_id = match &result {
-            OrchestratorResult::Started { interaction_id, .. }
-            | OrchestratorResult::Merged { interaction_id, .. } => Some(interaction_id.to_string()),
+        // Extract task_id to query the correct assistant output for this specific request
+        let task_id = match &result {
+            OrchestratorResult::Started { task_id, .. }
+            | OrchestratorResult::Merged { task_id, .. } => Some(task_id.to_string()),
             _ => None,
         };
-        let assistant_message = if let Some(iid) = interaction_id {
-            self.assistant_output_for_interaction(&iid).await
+        let assistant_message = if let Some(tid) = task_id {
+            self.assistant_output_for_task(&tid).await
         } else {
             None
         };
@@ -327,8 +327,11 @@ impl OrchestralApp {
         ))
     }
 
-    /// Query the assistant output for a specific interaction.
-    async fn assistant_output_for_interaction(&self, interaction_id: &str) -> Option<String> {
+    /// Query the assistant output for a specific task.
+    ///
+    /// AssistantOutput events store task_id inside the payload (not the Event-level
+    /// task_id field), so we match on `payload.task_id`.
+    async fn assistant_output_for_task(&self, task_id: &str) -> Option<String> {
         let events = self
             .orchestrator
             .thread_runtime
@@ -336,29 +339,22 @@ impl OrchestralApp {
             .await
             .ok()?;
 
-        // Find the last AssistantOutput belonging to this interaction
         events
             .iter()
             .rev()
-            .filter(|event| {
-                event
-                    .interaction_id()
-                    .map(|id| id == interaction_id)
-                    .unwrap_or(false)
-            })
             .filter_map(|event| match event {
                 Event::AssistantOutput { payload, .. } => {
+                    // task_id is stored in the payload, not the Event-level field
+                    let event_task_id = payload.get("task_id").and_then(|v| v.as_str())?;
+                    if event_task_id != task_id {
+                        return None;
+                    }
                     let text = payload
-                        .as_str()
+                        .get("message")
+                        .or_else(|| payload.get("content"))
+                        .or_else(|| payload.get("text"))
+                        .and_then(|v| v.as_str())
                         .map(String::from)
-                        .or_else(|| {
-                            payload
-                                .get("content")
-                                .or_else(|| payload.get("message"))
-                                .or_else(|| payload.get("text"))
-                                .and_then(|v| v.as_str())
-                                .map(String::from)
-                        })
                         .unwrap_or_else(|| payload.to_string());
                     if text.is_empty() {
                         None
@@ -451,7 +447,22 @@ pub enum SdkError {
 mod tests {
     use super::*;
     use orchestral_core::action::{Action, ActionContext, ActionInput, ActionMeta, ActionResult};
+    use orchestral_core::planner::{PlanError, Planner, PlannerContext, PlannerOutput};
     use orchestral_core::spi::lifecycle::LifecycleHook;
+    use orchestral_core::types::Intent;
+
+    struct NoopPlanner;
+
+    #[async_trait::async_trait]
+    impl Planner for NoopPlanner {
+        async fn plan(
+            &self,
+            _intent: &Intent,
+            _context: &PlannerContext,
+        ) -> Result<PlannerOutput, PlanError> {
+            Ok(PlannerOutput::Done("noop".to_string()))
+        }
+    }
 
     /// A deterministic action for testing — no LLM needed.
     struct EchoAction;
@@ -606,5 +617,80 @@ mod tests {
     fn test_run_result_from_queued() {
         let result = RunResult::from_orchestrator_result(OrchestratorResult::Queued, None);
         assert_eq!(result.status, "queued");
+    }
+
+    #[tokio::test]
+    async fn test_assistant_output_for_task_matches_by_payload_task_id() {
+        use crate::concurrency::DefaultConcurrencyPolicy;
+        use crate::thread::Thread;
+        use crate::thread_runtime::{ThreadRuntime, ThreadRuntimeConfig};
+        use orchestral_core::store::{EventStore, InMemoryEventStore};
+
+        let event_store = Arc::new(InMemoryEventStore::new());
+
+        // Simulate two AssistantOutput events with different task_ids in payload
+        event_store
+            .append(Event::assistant_output(
+                "thread-1",
+                "interaction-1",
+                serde_json::json!({
+                    "task_id": "task-aaa",
+                    "message": "Response for task A"
+                }),
+            ))
+            .await
+            .unwrap();
+        event_store
+            .append(Event::assistant_output(
+                "thread-1",
+                "interaction-1",
+                serde_json::json!({
+                    "task_id": "task-bbb",
+                    "message": "Response for task B"
+                }),
+            ))
+            .await
+            .unwrap();
+
+        let thread_runtime = ThreadRuntime::with_policy_and_config(
+            Thread::with_id("thread-1"),
+            event_store.clone(),
+            Arc::new(DefaultConcurrencyPolicy),
+            ThreadRuntimeConfig::default(),
+        );
+
+        // Build a minimal OrchestralApp just for testing the query method
+        // We only need thread_runtime to be functional
+        let app = OrchestralApp {
+            orchestrator: crate::Orchestrator::with_config(
+                thread_runtime,
+                Arc::new(NoopPlanner),
+                orchestral_core::normalizer::PlanNormalizer::new(),
+                orchestral_core::executor::Executor::with_registry(Arc::new(
+                    tokio::sync::RwLock::new(orchestral_core::executor::ActionRegistry::new()),
+                )),
+                Arc::new(orchestral_core::store::InMemoryTaskStore::new()),
+                crate::orchestrator::OrchestratorConfig {
+                    history_limit: 50,
+                    context_budget: crate::context::TokenBudget::new(4096),
+                    include_history: true,
+                    auto_replan_once: false,
+                    auto_repair_plan_once: false,
+                    max_planner_iterations: 1,
+                },
+            ),
+        };
+
+        // Query for task-aaa should get "Response for task A"
+        let result_a = app.assistant_output_for_task("task-aaa").await;
+        assert_eq!(result_a, Some("Response for task A".to_string()));
+
+        // Query for task-bbb should get "Response for task B"
+        let result_b = app.assistant_output_for_task("task-bbb").await;
+        assert_eq!(result_b, Some("Response for task B".to_string()));
+
+        // Query for nonexistent task should return None
+        let result_none = app.assistant_output_for_task("task-zzz").await;
+        assert_eq!(result_none, None);
     }
 }
