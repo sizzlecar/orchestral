@@ -1572,6 +1572,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "orchestral-telegram"
+version = "0.1.0"
+dependencies = [
+ "orchestral",
+ "orchestral-core",
+ "orchestral-runtime",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "ordered-float"
 version = "4.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

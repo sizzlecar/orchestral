@@ -8,6 +8,7 @@ members = [
 
     # Apps
     "apps/orchestral-cli",
+    "apps/orchestral-telegram",
 
     # Examples
     "examples",
