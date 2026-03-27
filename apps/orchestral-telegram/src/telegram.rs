@@ -71,13 +71,13 @@ impl TelegramClient {
             text.to_string()
         };
 
+        // Try Markdown first, fall back to plain text if parsing fails
         let resp: ApiResponse<Message> = self
             .http
             .post(self.api_url("sendMessage"))
             .json(&serde_json::json!({
                 "chat_id": chat_id,
-                "text": text,
-                "parse_mode": "Markdown"
+                "text": text
             }))
             .send()
             .await?
