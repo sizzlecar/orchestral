@@ -18,7 +18,10 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/example/orchestral"
+repository = "https://github.com/sizzlecar/orchestral"
+homepage = "https://github.com/sizzlecar/orchestral"
+keywords = ["orchestration", "agent", "workflow", "llm", "dag"]
+categories = ["asynchronous", "command-line-utilities"]
 
 [workspace.dependencies]
 # Async runtime
@@ -50,8 +53,8 @@ bytes = "1"
 
 # Internal crates - Core
 orchestral = { path = "core/orchestral" }
-orchestral-core = { path = "core/orchestral-core" }
-orchestral-runtime = { path = "core/orchestral-runtime" }
+orchestral-core = { path = "core/orchestral-core", version = "0.1.0" }
+orchestral-runtime = { path = "core/orchestral-runtime", version = "0.1.0" }
 
 [workspace.dependencies.tokio-test]
 version = "0.4"
