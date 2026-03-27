@@ -70,17 +70,36 @@ println!("{}", result.message);
 
 See [`examples/sdk_quickstart.rs`](examples/sdk_quickstart.rs) and [`examples/sdk_hooks.rs`](examples/sdk_hooks.rs).
 
-## Quick Start
-
-Rust stable (1.91.0+). Export one provider key:
+## Install
 
 ```bash
-export OPENROUTER_API_KEY="sk-or-..."  # or OPENAI_API_KEY, ANTHROPIC_API_KEY, etc.
+# As a library
+cargo add orchestral
+
+# As a CLI tool
+cargo install orchestral-cli
 ```
 
+## Quick Start
+
+Export one provider key:
+
 ```bash
-cargo build -p orchestral-cli
-cargo run -p orchestral-cli -- run
+export GOOGLE_API_KEY="..."  # or OPENAI_API_KEY, ANTHROPIC_API_KEY, OPENROUTER_API_KEY
+```
+
+CLI:
+```bash
+orchestral-cli run
+```
+
+As a library:
+```rust
+let app = Orchestral::builder()
+    .planner_backend("google")
+    .planner_model("gemini-2.5-flash")
+    .build().await?;
+let result = app.run("read README.md").await?;
 ```
 
 ## Project Structure

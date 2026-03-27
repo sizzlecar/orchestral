@@ -70,17 +70,36 @@ println!("{}", result.message);
 
 参考 [`examples/sdk_quickstart.rs`](examples/sdk_quickstart.rs) 和 [`examples/sdk_hooks.rs`](examples/sdk_hooks.rs)。
 
-## 快速开始
-
-Rust stable (1.91.0+)，导出一个模型密钥：
+## 安装
 
 ```bash
-export OPENROUTER_API_KEY="sk-or-..."  # 或 OPENAI_API_KEY、ANTHROPIC_API_KEY 等
+# 作为库使用
+cargo add orchestral
+
+# 安装 CLI 工具
+cargo install orchestral-cli
 ```
 
+## 快速开始
+
+导出一个模型密钥：
+
 ```bash
-cargo build -p orchestral-cli
-cargo run -p orchestral-cli -- run
+export GOOGLE_API_KEY="..."  # 或 OPENAI_API_KEY、ANTHROPIC_API_KEY、OPENROUTER_API_KEY
+```
+
+CLI：
+```bash
+orchestral-cli run
+```
+
+作为库使用：
+```rust
+let app = Orchestral::builder()
+    .planner_backend("google")
+    .planner_model("gemini-2.5-flash")
+    .build().await?;
+let result = app.run("读取 README.md").await?;
 ```
 
 ## 项目结构
