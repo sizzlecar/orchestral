@@ -1,10 +1,14 @@
 [package]
 name = "orchestral"
-description = "Orchestral runtime facade - re-exports core and runtime for convenient access"
+description = "Workflow orchestration for grounded agents — stateful multi-step pipelines with agent loop, MCP tools, and skills"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 
 [dependencies]
 orchestral-core = { workspace = true }
