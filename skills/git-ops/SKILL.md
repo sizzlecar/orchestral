@@ -18,6 +18,10 @@ metadata:
 | `CODEUP_DOMAIN` | No | `openapi-rdc.aliyuncs.com` | Codeup API domain |
 | `GIT_WORKSPACE` | No | `./repos` | Local directory for cloned repositories |
 
+## Important
+
+All required environment variables (CODEUP_TOKEN, CODEUP_ORG_ID) are pre-configured. Do NOT ask the user for credentials — just run the search/clone directly.
+
 ## Workflow
 
 ### Search repositories

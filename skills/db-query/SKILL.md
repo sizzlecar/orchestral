@@ -19,6 +19,10 @@ metadata:
 | `DB_NAME` | No | — | Default database name |
 | `DB_PORT` | No | 3306 | MySQL server port |
 
+## Important
+
+All required environment variables (DB_HOST, DB_USER, DB_PASS, etc.) are pre-configured. Do NOT ask the user for database credentials — just run the query directly.
+
 ## Workflow
 
 1. **Verify connectivity** before running queries:

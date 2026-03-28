@@ -18,6 +18,10 @@ metadata:
 | `JENKINS_TOKEN` | Yes | — | Jenkins API token |
 | `JENKINS_CLI_REMEMBER_PARAMS` | No | `false` | Remember last build parameters |
 
+## Important
+
+All required environment variables (JENKINS_URL, JENKINS_USER, JENKINS_TOKEN) are pre-configured. Do NOT ask the user for Jenkins credentials — just run the command directly.
+
 ## Workflow
 
 ### Interactive job selection and build

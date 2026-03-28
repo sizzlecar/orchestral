@@ -1,72 +1,65 @@
 ---
 name: code-fix
-description: "Use AI coding assistants (Claude Code or Codex) to analyze error logs and fix bugs in source code. Use when the user asks to fix a bug, investigate an error, or repair code based on logs or stack traces."
-compatibility: "Requires claude CLI or codex CLI installed. At least one must be available on PATH."
+description: "Use AI coding assistants (codex or claude) to analyze error logs and fix bugs in source code. Use when the user asks to fix a bug, investigate an error, or repair code based on logs or stack traces."
+compatibility: "Requires codex CLI or claude CLI on PATH."
 metadata:
   author: orchestral
   version: "0.1.0"
 ---
 
-# AI-Assisted Code Fix Skill
+# AI-Assisted Code Fix
 
-## Tool Detection
+Use `codex` (preferred) or `claude` CLI to fix code based on error information. Do not ask the user for tool preference — detect automatically.
 
-Check which AI coding tool is available (prefer claude, fallback to codex):
-```bash
-if command -v claude &>/dev/null; then
-    AI_TOOL="claude"
-elif command -v codex &>/dev/null; then
-    AI_TOOL="codex"
-else
-    echo "Neither claude nor codex CLI found on PATH"
-    exit 1
-fi
+## Command template
+
+Use the **subprocess** action (not shell — codex needs several minutes). Run in the project root directory:
+
+```json
+{
+  "action": "subprocess",
+  "input": {
+    "command": "cd PROJECT_DIR && codex exec \"Fix this error: ERROR_DESCRIPTION\"",
+    "timeout_secs": 300
+  }
+}
 ```
 
-## Workflow
-
-### Step 1: Prepare Context
-
-Gather the error context before invoking the AI tool:
-- Error log / stack trace (from SLS, file, or user input)
-- Relevant source file paths
-- The repository root directory
-
-### Step 2: Invoke AI Tool
-
-For **Claude Code**:
-```bash
-cd /path/to/repo
-claude --print "Fix the following error:\n\n${ERROR_LOG}\n\nRelevant files: ${FILES}"
+If codex is not available, use claude:
+```json
+{
+  "action": "subprocess",
+  "input": {
+    "command": "cd PROJECT_DIR && claude --print \"Fix this error: ERROR_DESCRIPTION\"",
+    "timeout_secs": 300
+  }
+}
 ```
 
-For **Codex** (non-interactive):
-```bash
-cd /path/to/repo
-codex --quiet "Fix the following error:\n\n${ERROR_LOG}\n\nRelevant files: ${FILES}"
+IMPORTANT: Use `codex exec` (not bare `codex`) and `claude --print` (not bare `claude`) for non-interactive execution. Always use the **subprocess** action, NOT shell — codex/claude need minutes to complete.
+
+## How to determine PROJECT_DIR
+
+- If the user specifies a path, use it directly
+- If the user mentions a service name (e.g. "message-provider"), check common workspace directories:
+  - `~/seekee_ws/quan-SERVICE/`
+  - `./repos/SERVICE/`
+- Use shell to verify the directory exists before running
+
+## How to construct the error prompt
+
+Include ALL of the following in the codex/claude prompt:
+1. The full error message and stack trace
+2. The specific file and line number from the stack trace
+3. Ask it to fix the root cause, not just suppress the error
+
+Example prompt:
 ```
-
-### Step 3: Review Changes
-
-After the AI tool finishes:
-```bash
-cd /path/to/repo
-git diff
+Fix this NullPointerException in FcmRetryService.java:68. The error occurs when processing FCM push results - getMessagingErrorCode() is called on a null exception object. Stack trace: [paste full trace]. Find the root cause and add proper null checks.
 ```
-
-Show the diff to the user for review before any further action.
 
 ## Rules
 
-- ALWAYS show the diff to the user before committing
-- NEVER auto-commit or auto-push AI-generated fixes without user approval
-- If the error involves multiple files, list all relevant files in the prompt
-- Include the full stack trace in the AI prompt — truncated traces lead to wrong fixes
-- If the AI tool fails or produces no changes, report this clearly rather than retrying silently
-
-## Integration with Other Skills
-
-This skill works well in combination with:
-- **sls-query**: Fetch error logs from production/test → feed them to code-fix
-- **git-ops**: Clone the repo first → run code-fix → show diff
-- **jenkins-deploy**: After fix is committed → trigger deployment
+- ALWAYS show the fix summary to the user after codex/claude finishes
+- Do NOT auto-commit without user approval
+- Include the original error context in the prompt so the AI tool has full information

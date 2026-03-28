@@ -34,6 +34,8 @@ use orchestral_core::store::{Event, InMemoryEventStore, InMemoryTaskStore};
 use crate::action::{ActionRegistryManager, DefaultActionFactory};
 use crate::concurrency::{ConcurrencyPolicy, DefaultConcurrencyPolicy};
 use crate::context::{BasicContextBuilder, TokenBudget};
+use crate::skill::discovery::discover_skills;
+use crate::skill::SkillCatalog;
 use crate::orchestrator::OrchestratorConfig;
 use crate::planner::{
     build_client_from_backend, LlmInvocationConfig, LlmPlanner, LlmPlannerConfig,
@@ -156,7 +158,29 @@ impl OrchestralBuilder {
             .config_path
             .clone()
             .unwrap_or_else(|| PathBuf::from("orchestral.yaml"));
-        let registry_manager = ActionRegistryManager::new(config_path.clone(), factory);
+
+        // Discover skills from filesystem
+        let resolved_config_path = config_path
+            .canonicalize()
+            .unwrap_or_else(|_| config_path.clone());
+        let config_for_skills = orchestral_core::config::load_config(&resolved_config_path).ok();
+        let skill_entries = config_for_skills
+            .as_ref()
+            .and_then(|cfg| discover_skills(cfg, &resolved_config_path).ok())
+            .unwrap_or_default();
+        if !skill_entries.is_empty() {
+            tracing::info!(count = skill_entries.len(), "SDK discovered skills");
+        }
+        let skill_catalog = Arc::new(tokio::sync::RwLock::new(SkillCatalog::new(
+            skill_entries,
+            config_for_skills
+                .as_ref()
+                .map(|cfg| cfg.extensions.skill.max_active_skills)
+                .unwrap_or(3),
+        )));
+
+        let registry_manager = ActionRegistryManager::new(config_path.clone(), factory)
+            .with_skill_catalog(skill_catalog.clone());
         // Try to load from config — ignore errors (config may not exist)
         let _ = registry_manager.load().await;
         // Register custom actions
@@ -226,7 +250,8 @@ impl OrchestralBuilder {
             config,
         )
         .with_context_builder(context_builder)
-        .with_lifecycle_hooks(lifecycle_hooks);
+        .with_lifecycle_hooks(lifecycle_hooks)
+        .with_skill_catalog(skill_catalog);
 
         if let Some(path) = &self.config_path {
             orchestrator = orchestrator.with_skill_config_path(path.clone());

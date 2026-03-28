@@ -9,7 +9,7 @@ runtime:
   auto_cleanup: true
   concurrency_policy: interrupt_and_start_new
   strict_exports: true
-  max_planner_iterations: 6
+  max_planner_iterations: 12
 
 planner:
   mode: llm
@@ -169,6 +169,13 @@ providers:
     - name: gemini-2.5-flash
       backend: google
       model: gemini-2.5-flash
+      temperature: 0.2
+      policy:
+        temperature_min: 0.0
+        temperature_max: 1.0
+    - name: gemini-2.5-pro
+      backend: google
+      model: gemini-2.5-pro
       temperature: 0.2
       policy:
         temperature_min: 0.0
@@ -336,13 +343,13 @@ actions:
               description: "Applied environment policy."
           required: ["stdout", "stderr", "status", "timed_out", "stdout_truncated", "stderr_truncated", "sandbox_mode", "sandboxed", "sandbox_backend", "env_policy"]
       config:
-        timeout_ms: 10000
-        fail_on_non_zero: true
-        allow_shell_expression: false
+        timeout_ms: 30000
+        fail_on_non_zero: false
+        allow_shell_expression: true
         max_output_bytes: 65536
-        sandbox_mode: workspace_write
+        sandbox_mode: none
         sandbox_backend: auto
-        sandbox_allow_network: false
+        sandbox_allow_network: true
         # Linux only (optional): explicit bubblewrap executable path.
         # sandbox_linux_bwrap_path: "/usr/bin/bwrap"
         sandbox_writable_roots: ["."]
@@ -424,4 +431,35 @@ actions:
         sandbox_writable_roots: ["."]
         create_dirs: true
         max_write_bytes: 524288
-    # Document and structured operations are handled by skills + shell
+    - name: subprocess
+      kind: subprocess
+      description: "Runs a long-lived subprocess (codex, claude, builds). Timeout up to 10 minutes."
+      interface:
+        input_schema:
+          type: object
+          properties:
+            command:
+              type: string
+              description: "Shell command to execute (runs via sh -c)."
+            cwd:
+              type: string
+              description: "Working directory."
+            timeout_secs:
+              type: integer
+              description: "Timeout in seconds. Default 300 (5 min), max 600 (10 min)."
+          required: ["command"]
+        output_schema:
+          type: object
+          properties:
+            stdout:
+              type: string
+            stderr:
+              type: string
+            status:
+              type: integer
+            timed_out:
+              type: boolean
+            line_count:
+              type: integer
+          required: ["stdout", "stderr", "status", "timed_out"]
+      config: {}
