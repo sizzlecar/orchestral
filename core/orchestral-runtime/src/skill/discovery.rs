@@ -62,6 +62,9 @@ fn parse_skill_file(path: &Path) -> Option<SkillEntry> {
         source_path: path.to_path_buf(),
         scripts_dir,
         venv_python,
+        compatibility: meta.compatibility,
+        license: meta.license,
+        metadata: meta.metadata,
     })
 }
 
@@ -171,12 +174,19 @@ fn collect_skill_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
 struct SkillFrontmatter {
     name: Option<String>,
     description: Option<String>,
+    compatibility: Option<String>,
+    license: Option<String>,
+    metadata: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct SkillFrontmatterRaw {
     name: Option<String>,
     description: Option<String>,
+    compatibility: Option<String>,
+    license: Option<String>,
+    #[serde(default)]
+    metadata: std::collections::HashMap<String, serde_yaml::Value>,
 }
 
 fn parse_skill_frontmatter(content: &str) -> SkillFrontmatter {
@@ -192,6 +202,19 @@ fn parse_skill_frontmatter(content: &str) -> SkillFrontmatter {
         Ok(raw) => SkillFrontmatter {
             name: raw.name,
             description: raw.description,
+            compatibility: raw.compatibility,
+            license: raw.license,
+            metadata: raw
+                .metadata
+                .into_iter()
+                .map(|(k, v)| {
+                    let s = match v {
+                        serde_yaml::Value::String(s) => s,
+                        other => format!("{:?}", other),
+                    };
+                    (k, s)
+                })
+                .collect(),
         },
         Err(_) => SkillFrontmatter::default(),
     }

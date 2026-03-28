@@ -18,6 +18,13 @@ pub struct SkillEntry {
     pub scripts_dir: Option<PathBuf>,
     /// Skill-local virtual-env python binary, auto-detected from `<skill_dir>/.venv/bin/python3`.
     pub venv_python: Option<PathBuf>,
+    /// Free-text compatibility declaration per the Agent Skills open standard.
+    /// Describes system requirements (e.g. "Requires Python 3.10+ and mysql CLI").
+    pub compatibility: Option<String>,
+    /// SPDX license identifier or reference to bundled LICENSE file.
+    pub license: Option<String>,
+    /// Arbitrary key-value metadata (author, version, tags, etc.).
+    pub metadata: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -494,6 +501,9 @@ mod tests {
             source_path: PathBuf::from(format!("/tmp/{name}/SKILL.md")),
             scripts_dir: None,
             venv_python: None,
+            compatibility: None,
+            license: None,
+            metadata: std::collections::HashMap::new(),
         }
     }
 
@@ -551,6 +561,9 @@ mod tests {
                 source_path: PathBuf::from("/tmp/xlsx/SKILL.md"),
                 scripts_dir: Some(PathBuf::from("/tmp/xlsx/scripts")),
                 venv_python: Some(PathBuf::from("/tmp/xlsx/.venv/bin/python3")),
+                compatibility: None,
+                license: None,
+                metadata: std::collections::HashMap::new(),
             }],
             3,
         );
@@ -599,6 +612,9 @@ mod tests {
                 source_path: PathBuf::from("/tmp/openai-docs/SKILL.md"),
                 scripts_dir: None,
                 venv_python: None,
+                compatibility: None,
+                license: None,
+                metadata: std::collections::HashMap::new(),
             }],
             3,
         );
@@ -620,6 +636,9 @@ mod tests {
                     source_path: PathBuf::from("/tmp/skill-creator/SKILL.md"),
                     scripts_dir: None,
                     venv_python: None,
+                    compatibility: None,
+                    license: None,
+                    metadata: std::collections::HashMap::new(),
                 },
                 make_skill("xlsx", "spreadsheet workbook editing and formula repair"),
             ],

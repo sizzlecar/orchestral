@@ -124,6 +124,9 @@ mod tests {
                 source_path: PathBuf::from("/tmp/xlsx/SKILL.md"),
                 scripts_dir: Some(PathBuf::from("/tmp/xlsx/scripts")),
                 venv_python: Some(PathBuf::from("/tmp/xlsx/.venv/bin/python3")),
+                compatibility: None,
+                license: None,
+                metadata: std::collections::HashMap::new(),
             }],
             3,
         )));
