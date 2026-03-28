@@ -39,12 +39,33 @@ metadata:
    - Aggregation: `level: ERROR | SELECT count(*) as cnt, __source__ GROUP BY __source__`
    - Top errors: `level: ERROR | SELECT message, count(*) as cnt GROUP BY message ORDER BY cnt DESC LIMIT 20`
 
+## Environment Variables (additional)
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `SLS_TEST_PROJECT` | No | — | SLS project for test/staging environment |
+| `SLS_PROD_PROJECT` | No | — | SLS project for production environment |
+
 ## Environment Mapping
 
-Map user intent to logstore:
-- "测试环境" / "test" / "staging" → use the test/staging logstore
-- "生产环境" / "production" / "prod" → use the production logstore
+Map user intent to project and logstore:
+- "测试环境" / "test" / "staging" → use `SLS_TEST_PROJECT` (fallback: `SLS_PROJECT`)
+- "生产环境" / "production" / "prod" → use `SLS_PROD_PROJECT` (fallback: `SLS_PROJECT`)
+
+Logstore naming convention (K8s pattern): `<service-name>-logstore-test` or `<service-name>-logstore-prd`
+- When user says "查 ai-provider 的日志" → logstore = `quan-ai-provider-logstore-test` (or `-prd`)
+- When user says "查 auth 的日志" → logstore = `quan-auth-provider-logstore-test` (or `-prd`)
 - Ask the user to specify the logstore if ambiguous
+
+## Log Field Structure
+
+Standard K8s application log fields:
+- `time` — log timestamp
+- `level` — INFO/WARN/ERROR
+- `process` — thread/process info
+- `class` — Java class name
+- `traceID` — distributed trace ID
+- `message` — log message content
 
 ## Output
 
