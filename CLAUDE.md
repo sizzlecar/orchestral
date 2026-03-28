@@ -62,11 +62,9 @@ examples/                — Runnable demos.
 Built-in actions in `orchestral-runtime/src/action/`:
 
 - **builtin** — `shell`, `file_read`, `file_write`, `echo`, `http`, `json_stdout`, `tool_lookup`, `skill_activate`
-- **document** — `document_inspect` (locate + inspect), `document_patch` (derive + assess + apply), `document_verify_patch`
-- **structured** — `structured_inspect`, `structured_patch`, `structured_verify_patch`
 - **mcp** — `McpToolAction` per MCP tool, discovered at startup via `tools/list` probe
 
-Spreadsheet operations are handled by the `xlsx` skill (shell + openpyxl), not a built-in action.
+Document and structured operations are handled by skills (e.g. `xlsx` skill uses shell + openpyxl), not built-in actions.
 
 ### MCP Integration
 

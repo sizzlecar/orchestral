@@ -22,6 +22,8 @@ pub struct SessionRunOptions {
     pub thread_id: Option<String>,
     pub no_mcp: bool,
     pub no_skills: bool,
+    pub mcp_paths: Vec<PathBuf>,
+    pub skill_dirs: Vec<PathBuf>,
     pub initial_input: Option<String>,
     pub script_path: Option<PathBuf>,
     pub once: bool,
@@ -35,6 +37,8 @@ pub async fn run_session(options: SessionRunOptions) -> anyhow::Result<()> {
         thread_id,
         no_mcp,
         no_skills,
+        mcp_paths,
+        skill_dirs,
         initial_input,
         script_path,
         once,
@@ -58,6 +62,22 @@ pub async fn run_session(options: SessionRunOptions) -> anyhow::Result<()> {
     if no_skills {
         std::env::set_var("ORCHESTRAL_DISABLE_SKILLS", "1");
     }
+    if !mcp_paths.is_empty() {
+        let joined = mcp_paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(":");
+        std::env::set_var("ORCHESTRAL_MCP_EXTRA_PATHS", joined);
+    }
+    if !skill_dirs.is_empty() {
+        let joined = skill_dirs
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(":");
+        std::env::set_var("ORCHESTRAL_SKILL_EXTRA_DIRS", joined);
+    }
 
     let runtime_client = RuntimeClient::from_config(config, thread_id, planner_overrides)
         .await
@@ -72,9 +92,30 @@ pub async fn run_session(options: SessionRunOptions) -> anyhow::Result<()> {
     }
 
     let mut app = App::new(0, 0, once);
+
+    // Welcome banner
+    {
+        let info = runtime_client.boot_info();
+        let version = env!("CARGO_PKG_VERSION");
+        app.history.push(format!("  Orchestral CLI v{}", version));
+        app.history.push(format!(
+            "  Model: {} ({})",
+            info.planner_model, info.planner_backend
+        ));
+        app.history.push(format!(
+            "  Actions: {} builtin | Thread: {}",
+            info.action_count,
+            runtime_client.thread_id()
+        ));
+        app.history.push(String::new());
+    }
+
     if verbose {
-        app.history
-            .push(format!("thread_id={}", runtime_client.thread_id()));
+        app.history.push(format!(
+            "  config={}",
+            runtime_client.boot_info().config_source
+        ));
+        app.history.push(String::new());
     }
 
     event_loop::run_tui(app, runtime_client, initial_input).await

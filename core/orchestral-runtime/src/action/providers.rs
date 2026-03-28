@@ -213,7 +213,11 @@ fn candidate_mcp_paths(config: &OrchestralConfig, config_path: &Path) -> Vec<Pat
         candidates.push(home_path.join(".config").join("mcp.json"));
     }
 
-    for custom in &config.extensions.mcp.discover_paths {
+    let extra_paths = extra_paths_from_config_and_env(
+        &config.extensions.mcp.discover_paths,
+        "ORCHESTRAL_MCP_EXTRA_PATHS",
+    );
+    for custom in &extra_paths {
         let path = PathBuf::from(custom);
         if path.is_absolute() {
             candidates.push(path);
@@ -405,6 +409,19 @@ fn sanitize_identifier(raw: &str) -> String {
     } else {
         out
     }
+}
+
+fn extra_paths_from_config_and_env(config_paths: &[String], env_var: &str) -> Vec<String> {
+    let mut paths = config_paths.to_vec();
+    if let Ok(value) = std::env::var(env_var) {
+        for segment in value.split(':') {
+            let trimmed = segment.trim();
+            if !trimmed.is_empty() {
+                paths.push(trimmed.to_string());
+            }
+        }
+    }
+    paths
 }
 
 fn env_disable_flag(var_name: &str) -> bool {
@@ -639,5 +656,31 @@ mod tests {
         std::env::set_var(&key, "0");
         assert!(!env_disable_flag(&key));
         std::env::remove_var(&key);
+    }
+
+    #[test]
+    fn extra_paths_from_config_and_env_merges_sources() {
+        let key = format!("ORCHESTRAL_TEST_EXTRA_{}", std::process::id());
+        std::env::set_var(&key, "/extra/a:/extra/b");
+        let config = vec!["from_config".to_string()];
+        let result = extra_paths_from_config_and_env(&config, &key);
+        assert_eq!(
+            result,
+            vec![
+                "from_config".to_string(),
+                "/extra/a".to_string(),
+                "/extra/b".to_string()
+            ]
+        );
+        std::env::remove_var(&key);
+    }
+
+    #[test]
+    fn extra_paths_from_config_and_env_handles_missing_env() {
+        let key = format!("ORCHESTRAL_TEST_EXTRA_MISSING_{}", std::process::id());
+        std::env::remove_var(&key);
+        let config = vec!["only_config".to_string()];
+        let result = extra_paths_from_config_and_env(&config, &key);
+        assert_eq!(result, vec!["only_config".to_string()]);
     }
 }

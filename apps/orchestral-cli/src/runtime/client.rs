@@ -24,6 +24,16 @@ pub struct RuntimeClient {
     runtime: Arc<CliRuntime>,
     thread_id: String,
     submit_lock: Arc<Mutex<()>>,
+    boot_info: BootInfo,
+}
+
+/// Display info gathered at boot time for the welcome screen.
+#[derive(Debug, Clone)]
+pub struct BootInfo {
+    pub planner_backend: String,
+    pub planner_model: String,
+    pub action_count: usize,
+    pub config_source: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -49,10 +59,11 @@ impl RuntimeClient {
         thread_id_override: Option<String>,
         planner_overrides: PlannerOverrides,
     ) -> anyhow::Result<Self> {
-        let config = prepare_runtime_config_path(config, &planner_overrides)?;
+        let config_path = prepare_runtime_config_path(config, &planner_overrides)?;
+        let boot_info = build_boot_info(&config_path);
         let app_builder: Arc<dyn RuntimeAppBuilder> = Arc::new(DefaultRuntimeAppBuilder);
         let api = Arc::new(
-            RuntimeApi::from_config_path_with_builder(config, app_builder)
+            RuntimeApi::from_config_path_with_builder(config_path, app_builder)
                 .await
                 .context("failed to build runtime api")?,
         );
@@ -63,11 +74,52 @@ impl RuntimeClient {
             thread_id: runtime.thread_id().to_string(),
             runtime: Arc::new(runtime),
             submit_lock: Arc::new(Mutex::new(())),
+            boot_info,
         })
     }
 
     pub fn thread_id(&self) -> &str {
         &self.thread_id
+    }
+
+    pub fn boot_info(&self) -> &BootInfo {
+        &self.boot_info
+    }
+}
+
+fn build_boot_info(config_path: &std::path::Path) -> BootInfo {
+    use orchestral_core::config::load_config;
+
+    let config_source = config_path.display().to_string();
+    match load_config(config_path) {
+        Ok(config) => {
+            let planner_backend = config
+                .planner
+                .backend
+                .clone()
+                .or_else(|| config.providers.default_backend.clone())
+                .unwrap_or_else(|| "default".to_string());
+            let planner_model = config
+                .planner
+                .model_profile
+                .as_ref()
+                .or(config.planner.model.as_ref())
+                .cloned()
+                .unwrap_or_else(|| "default".to_string());
+            let action_count = config.actions.actions.len();
+            BootInfo {
+                planner_backend,
+                planner_model,
+                action_count,
+                config_source,
+            }
+        }
+        Err(_) => BootInfo {
+            planner_backend: "unknown".to_string(),
+            planner_model: "unknown".to_string(),
+            action_count: 0,
+            config_source,
+        },
     }
 }
 
@@ -212,5 +264,29 @@ planner:
             override_path,
             PathBuf::from("configs/orchestral.cli.runtime.override.yaml")
         );
+    }
+
+    #[test]
+    fn test_build_boot_info_reads_config() {
+        // Navigate to workspace root for consistent config loading
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = manifest.parent().unwrap().parent().unwrap();
+        let config_path = workspace_root.join("configs/orchestral.cli.yaml");
+        if !config_path.exists() {
+            return; // skip when running outside workspace
+        }
+        let info = super::build_boot_info(&config_path);
+        assert!(!info.planner_backend.is_empty());
+        assert!(!info.planner_model.is_empty());
+        assert!(info.action_count > 0);
+        assert!(info.config_source.contains("orchestral.cli.yaml"));
+    }
+
+    #[test]
+    fn test_build_boot_info_graceful_on_missing_config() {
+        let info = super::build_boot_info(Path::new("nonexistent.yaml"));
+        assert_eq!(info.planner_backend, "unknown");
+        assert_eq!(info.planner_model, "unknown");
+        assert_eq!(info.action_count, 0);
     }
 }

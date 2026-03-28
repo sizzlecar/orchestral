@@ -14,10 +14,67 @@ pub(super) fn prepare_runtime_config_path(
     planner_overrides: &PlannerOverrides,
 ) -> anyhow::Result<PathBuf> {
     let resolved = resolve_runtime_config_path(explicit)?;
-    if planner_overrides.is_empty() {
+
+    // When no explicit backend/model override, auto-detect from available API keys
+    // so that a checked-in config with backend:openai doesn't break users with only GOOGLE_API_KEY.
+    let effective_overrides =
+        if planner_overrides.backend.is_none() && planner_overrides.model_profile.is_none() {
+            match auto_override_planner_if_needed(&resolved) {
+                Some(auto) => merge_planner_overrides(planner_overrides, &auto),
+                None => planner_overrides.clone(),
+            }
+        } else {
+            planner_overrides.clone()
+        };
+
+    if effective_overrides.is_empty() {
         return Ok(resolved);
     }
-    write_overridden_runtime_config(&resolved, planner_overrides)
+    write_overridden_runtime_config(&resolved, &effective_overrides)
+}
+
+/// If the config's planner backend lacks a usable API key, return overrides
+/// that switch to a backend with an available key.
+fn auto_override_planner_if_needed(config_path: &Path) -> Option<PlannerOverrides> {
+    let config = load_config(config_path).ok()?;
+    let backend_name = config
+        .planner
+        .backend
+        .as_deref()
+        .or(config.providers.default_backend.as_deref())
+        .unwrap_or("openai");
+    let backend_spec = config.providers.get_backend(backend_name)?;
+    let key_env = backend_spec.api_key_env.as_deref().unwrap_or("");
+
+    // If the configured backend has a valid key, nothing to override
+    if !key_env.is_empty() && has_env(key_env) {
+        return None;
+    }
+
+    let (auto_backend, auto_model) = detect_default_llm_profile();
+    // If auto-detect picked the same backend, no point overriding
+    if auto_backend == backend_name {
+        return None;
+    }
+
+    Some(PlannerOverrides {
+        backend: Some(auto_backend.to_string()),
+        model_profile: Some(auto_model.to_string()),
+        model: None,
+        temperature: None,
+    })
+}
+
+fn merge_planner_overrides(base: &PlannerOverrides, auto: &PlannerOverrides) -> PlannerOverrides {
+    PlannerOverrides {
+        backend: base.backend.clone().or_else(|| auto.backend.clone()),
+        model_profile: base
+            .model_profile
+            .clone()
+            .or_else(|| auto.model_profile.clone()),
+        model: base.model.clone().or_else(|| auto.model.clone()),
+        temperature: base.temperature.or(auto.temperature),
+    }
 }
 
 fn resolve_runtime_config_path(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
@@ -257,24 +314,6 @@ providers:
 actions:
   hot_reload: false
   actions:
-    - name: echo
-      kind: echo
-      description: Echo text back.
-      interface:
-        input_schema:
-          type: object
-          properties:
-            message:
-              type: string
-          required: [message]
-        output_schema:
-          type: object
-          properties:
-            result:
-              type: string
-          required: [result]
-      config:
-        prefix: "Echo: "
     - name: shell
       kind: shell
       description: Run a shell command.
@@ -282,60 +321,93 @@ actions:
         input_schema:
           type: object
           properties:
-            command:
-              type: string
-            args:
-              type: array
-              items:
-                type: string
+            command: {{ type: string }}
+            args: {{ type: array, items: {{ type: string }} }}
+            shell: {{ type: boolean }}
           required: [command]
         output_schema:
           type: object
           properties:
-            stdout:
-              type: string
-            stderr:
-              type: string
-            status:
-              type: integer
+            stdout: {{ type: string }}
+            stderr: {{ type: string }}
+            status: {{ type: integer }}
           required: [stdout, stderr, status]
       config:
-        timeout_ms: 10000
+        timeout_ms: 30000
+        sandbox_mode: none
     - name: file_read
       kind: file_read
-      description: Read a file from workspace.
+      description: Read a file from disk.
       interface:
         input_schema:
           type: object
           properties:
-            path:
-              type: string
+            path: {{ type: string }}
           required: [path]
         output_schema:
           type: object
           properties:
-            content:
-              type: string
-            path:
-              type: string
+            content: {{ type: string }}
+            path: {{ type: string }}
+            bytes: {{ type: integer }}
           required: [content, path]
+      config: {{}}
+    - name: file_write
+      kind: file_write
+      description: Write a file to disk.
+      interface:
+        input_schema:
+          type: object
+          properties:
+            path: {{ type: string }}
+            content: {{ type: string }}
+            append: {{ type: boolean }}
+          required: [path, content]
+        output_schema:
+          type: object
+          properties:
+            path: {{ type: string }}
+            bytes: {{ type: integer }}
+          required: [path, bytes]
       config:
-        root_dir: "."
+        create_dirs: true
+    - name: http
+      kind: http
+      description: Perform an HTTP request.
+      interface:
+        input_schema:
+          type: object
+          properties:
+            method: {{ type: string }}
+            url: {{ type: string }}
+            headers: {{ type: object }}
+            body: {{}}
+          required: [url]
+        output_schema:
+          type: object
+          properties:
+            status: {{ type: integer }}
+            body: {{ type: string }}
+          required: [status, body]
+      config:
+        timeout_ms: 10000
 "#
     )
 }
 
 fn detect_default_llm_profile() -> (&'static str, &'static str) {
-    if has_env("OPENAI_API_KEY") {
-        ("openai", "gpt-4o-mini")
-    } else if has_any_env(&["GOOGLE_API_KEY", "GEMINI_API_KEY"]) {
+    // Prefer Google (free tier, widely available) → Anthropic → OpenAI → OpenRouter
+    if has_any_env(&["GOOGLE_API_KEY", "GEMINI_API_KEY"]) {
         ("google", "gemini-2.5-flash")
     } else if has_any_env(&["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"]) {
         ("anthropic", "claude-sonnet-4-5")
+    } else if has_env("OPENAI_API_KEY") {
+        ("openai", "gpt-4o-mini")
     } else if has_env("OPENROUTER_API_KEY") {
         ("openrouter", "claude-sonnet-4-5-openrouter")
     } else {
-        ("openai", "gpt-4o-mini")
+        // No key found — use google as default, will fail with clear error at runtime
+        ("google", "gemini-2.5-flash")
     }
 }
 
@@ -375,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_default_llm_profile_prefers_openai_over_other_keys() {
+    fn test_detect_default_llm_profile_prefers_google_over_other_keys() {
         let _guard = env_lock().lock().expect("env lock");
         clear_key_envs();
         std::env::set_var("OPENAI_API_KEY", "openai");
@@ -383,7 +455,7 @@ mod tests {
         std::env::set_var("ANTHROPIC_API_KEY", "anthropic");
         std::env::set_var("OPENROUTER_API_KEY", "openrouter");
 
-        assert_eq!(detect_default_llm_profile(), ("openai", "gpt-4o-mini"));
+        assert_eq!(detect_default_llm_profile(), ("google", "gemini-2.5-flash"));
 
         clear_key_envs();
     }
@@ -416,6 +488,122 @@ mod tests {
         );
 
         clear_key_envs();
+        // No key → falls back to google (will fail at runtime with clear error)
+        assert_eq!(detect_default_llm_profile(), ("google", "gemini-2.5-flash"));
+    }
+
+    #[test]
+    fn test_embedded_default_config_includes_core_actions() {
+        let config = embedded_default_config();
+        assert!(
+            config.contains("kind: shell"),
+            "should include shell action"
+        );
+        assert!(
+            config.contains("kind: file_read"),
+            "should include file_read action"
+        );
+        assert!(
+            config.contains("kind: file_write"),
+            "should include file_write action"
+        );
+        assert!(config.contains("kind: http"), "should include http action");
+    }
+
+    #[test]
+    fn test_embedded_default_config_excludes_deprecated_actions() {
+        let config = embedded_default_config();
+        assert!(
+            !config.contains("document_inspect"),
+            "should not include deprecated document_inspect"
+        );
+        assert!(
+            !config.contains("structured_inspect"),
+            "should not include deprecated structured_inspect"
+        );
+        assert!(
+            !config.contains("kind: echo"),
+            "should not include removed echo action"
+        );
+    }
+
+    #[test]
+    fn test_embedded_default_config_is_valid_yaml() {
+        let config = embedded_default_config();
+        let parsed: Result<serde_yaml::Value, _> = serde_yaml::from_str(&config);
+        assert!(parsed.is_ok(), "embedded config should be valid YAML");
+    }
+
+    #[test]
+    fn test_detect_default_llm_profile_prefers_anthropic_over_openai() {
+        let _guard = env_lock().lock().expect("env lock");
+        clear_key_envs();
+        std::env::set_var("OPENAI_API_KEY", "openai");
+        std::env::set_var("ANTHROPIC_API_KEY", "anthropic");
+        assert_eq!(
+            detect_default_llm_profile(),
+            ("anthropic", "claude-sonnet-4-5")
+        );
+        clear_key_envs();
+    }
+
+    #[test]
+    fn test_detect_default_llm_profile_openai_only() {
+        let _guard = env_lock().lock().expect("env lock");
+        clear_key_envs();
+        std::env::set_var("OPENAI_API_KEY", "openai");
         assert_eq!(detect_default_llm_profile(), ("openai", "gpt-4o-mini"));
+        clear_key_envs();
+    }
+
+    #[test]
+    fn test_auto_override_planner_switches_backend_when_key_missing() {
+        let _guard = env_lock().lock().expect("env lock");
+        clear_key_envs();
+        // Only Google key available, config says openai
+        std::env::set_var("GOOGLE_API_KEY", "test-google-key");
+
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = manifest.parent().unwrap().parent().unwrap();
+        let config_path = workspace_root.join("configs/orchestral.cli.yaml");
+        if !config_path.exists() {
+            clear_key_envs();
+            return;
+        }
+
+        let result = auto_override_planner_if_needed(&config_path);
+        assert!(
+            result.is_some(),
+            "should auto-override when config backend key is missing"
+        );
+        let overrides = result.unwrap();
+        assert_eq!(overrides.backend.as_deref(), Some("google"));
+        assert_eq!(overrides.model_profile.as_deref(), Some("gemini-2.5-flash"));
+
+        clear_key_envs();
+    }
+
+    #[test]
+    fn test_auto_override_planner_no_override_when_key_present() {
+        let _guard = env_lock().lock().expect("env lock");
+        clear_key_envs();
+        // OpenAI key present, config says openai → no override needed
+        std::env::set_var("OPENAI_API_KEY", "test-openai-key");
+
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = manifest.parent().unwrap().parent().unwrap();
+        let config_path = workspace_root.join("configs/orchestral.cli.yaml");
+        if !config_path.exists() {
+            clear_key_envs();
+            return;
+        }
+
+        let result = auto_override_planner_if_needed(&config_path);
+        assert!(
+            result.is_none(),
+            "should not override when config backend key is present"
+        );
+
+        clear_key_envs();
     }
 }

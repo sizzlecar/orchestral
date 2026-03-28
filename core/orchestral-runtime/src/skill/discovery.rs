@@ -90,7 +90,11 @@ fn candidate_skill_directories(config: &OrchestralConfig, config_path: &Path) ->
         dirs.push(home_path.join(".codex").join("skills"));
     }
 
-    for custom in &config.extensions.skill.directories {
+    let extra_dirs = extra_paths_from_config_and_env(
+        &config.extensions.skill.directories,
+        "ORCHESTRAL_SKILL_EXTRA_DIRS",
+    );
+    for custom in &extra_dirs {
         let path = PathBuf::from(custom);
         if path.is_absolute() {
             dirs.push(path);
@@ -191,6 +195,19 @@ fn parse_skill_frontmatter(content: &str) -> SkillFrontmatter {
         },
         Err(_) => SkillFrontmatter::default(),
     }
+}
+
+fn extra_paths_from_config_and_env(config_paths: &[String], env_var: &str) -> Vec<String> {
+    let mut paths = config_paths.to_vec();
+    if let Ok(value) = std::env::var(env_var) {
+        for segment in value.split(':') {
+            let trimmed = segment.trim();
+            if !trimmed.is_empty() {
+                paths.push(trimmed.to_string());
+            }
+        }
+    }
+    paths
 }
 
 fn env_disable_flag(var_name: &str) -> bool {

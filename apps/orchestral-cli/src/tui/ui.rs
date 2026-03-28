@@ -260,8 +260,7 @@ fn render_modal(frame: &mut Frame, app: &App, theme: &Theme, input_area: Rect) {
 }
 
 fn input_anchored_rect(viewport: Rect, input_area: Rect, desired_height: u16) -> Rect {
-    let max_width = viewport.width.saturating_sub(4).min(110);
-    let width = max_width.max(48);
+    let width = viewport.width;
     let max_height = viewport.height.saturating_sub(2);
     let height = desired_height.clamp(8, max_height.max(8));
     let min_y = viewport.y.saturating_add(1);
@@ -278,7 +277,7 @@ fn input_anchored_rect(viewport: Rect, input_area: Rect, desired_height: u16) ->
         .max(min_y)
         .max(min_for_input.min(max_y));
     Rect {
-        x: viewport.x.saturating_add(2),
+        x: viewport.x,
         y,
         width,
         height,
@@ -286,13 +285,12 @@ fn input_anchored_rect(viewport: Rect, input_area: Rect, desired_height: u16) ->
 }
 
 fn top_anchored_rect(area: Rect, desired_height: u16) -> Rect {
-    let max_width = area.width.saturating_sub(4).min(110);
-    let width = max_width.max(48);
-    let max_height = area.height.saturating_sub(6);
+    let width = area.width;
+    let max_height = area.height.saturating_sub(4);
     let height = desired_height.clamp(8, max_height.max(8));
     Rect {
-        x: area.x.saturating_add(2),
-        y: area.y.saturating_add(2),
+        x: area.x,
+        y: area.y.saturating_add(1),
         width,
         height,
     }
@@ -317,8 +315,8 @@ mod tests {
 
         let modal = input_anchored_rect(viewport, input, 12);
 
-        assert_eq!(modal.x, 2);
-        assert_eq!(modal.width, 110);
+        assert_eq!(modal.x, 0);
+        assert_eq!(modal.width, 120);
         assert_eq!(modal.height, 12);
         assert_eq!(modal.y + modal.height, input.y + input.height);
     }
@@ -332,7 +330,8 @@ mod tests {
 
         // When desired height exceeds available space, the modal clamps to max height
         // and still stays anchored to input bottom if possible.
-        assert_eq!(modal.y, 2);
+        assert_eq!(modal.x, 0);
+        assert_eq!(modal.width, 80);
         assert!(modal.height <= viewport.height.saturating_sub(2));
         assert_eq!(modal.y + modal.height, input.y + input.height);
     }
@@ -342,9 +341,9 @@ mod tests {
         let viewport = Rect::new(0, 0, 120, 40);
         let modal = top_anchored_rect(viewport, 12);
 
-        assert_eq!(modal.x, 2);
-        assert_eq!(modal.y, 2);
-        assert_eq!(modal.width, 110);
+        assert_eq!(modal.x, 0);
+        assert_eq!(modal.y, 1);
+        assert_eq!(modal.width, 120);
         assert_eq!(modal.height, 12);
     }
 

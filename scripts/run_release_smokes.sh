@@ -17,15 +17,13 @@ SPECS=(
   "configs/scenarios/no_fake_execution_patch_toml.smoke.yaml"
   "configs/scenarios/resume_after_action_failure_xlsx.smoke.yaml"
   "configs/scenarios/wait_user_missing_required_field_contract.smoke.yaml"
-  "configs/scenarios/verify_fail_document_heading_patch.smoke.yaml"
-  "configs/scenarios/audit_structured_patch_logging_mode.smoke.yaml"
-  "configs/scenarios/deterministic_batch_doc_patch.smoke.yaml"
+  "configs/scenarios/git_log_summary_no_approval.smoke.yaml"
 )
 
 if [[ "$INCLUDE_P2" == "1" ]]; then
   SPECS+=(
-    "configs/scenarios/incremental_doc_patch_minimal_rework.smoke.yaml"
-    "configs/scenarios/cross_family_unified_runtime.smoke.yaml"
+    "configs/scenarios/skill_implicit_xlsx.smoke.yaml"
+    "configs/scenarios/mcp_tool_lookup.smoke.yaml"
   )
 fi
 

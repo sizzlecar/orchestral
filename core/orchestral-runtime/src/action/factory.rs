@@ -7,10 +7,7 @@ use orchestral_core::action::{Action, ActionContext, ActionInput, ActionMeta, Ac
 use orchestral_core::config::ActionSpec;
 
 use super::builtin::build_builtin_action;
-use super::document::build_document_action;
-
 use super::mcp::build_mcp_action;
-use super::structured::build_structured_action;
 
 /// Action factory errors
 #[derive(Debug, Error)]
@@ -48,12 +45,6 @@ impl ActionFactory for DefaultActionFactory {
         };
 
         if let Some(a) = build_builtin_action(spec) {
-            return wrap(Arc::from(a));
-        }
-        if let Some(a) = build_document_action(spec)? {
-            return wrap(Arc::from(a));
-        }
-        if let Some(a) = build_structured_action(spec)? {
             return wrap(Arc::from(a));
         }
         if let Some(a) = build_mcp_action(spec)? {
@@ -117,6 +108,45 @@ mod tests {
     use super::*;
     use orchestral_core::config::ActionInterfaceSpec;
     use serde_json::json;
+
+    fn make_spec(kind: &str) -> ActionSpec {
+        ActionSpec {
+            name: kind.to_string(),
+            kind: kind.to_string(),
+            description: None,
+            category: None,
+            config: json!({}),
+            interface: None,
+        }
+    }
+
+    #[test]
+    fn test_factory_builds_builtin_actions() {
+        let factory = DefaultActionFactory::new();
+        for kind in &["shell", "file_read", "file_write", "http"] {
+            let result = factory.build(&make_spec(kind));
+            assert!(result.is_ok(), "should build '{}' action", kind);
+        }
+    }
+
+    #[test]
+    fn test_factory_rejects_removed_document_structured_kinds() {
+        let factory = DefaultActionFactory::new();
+        for kind in &[
+            "document_inspect",
+            "document_patch",
+            "document_verify_patch",
+            "structured_inspect",
+            "structured_patch",
+            "structured_verify_patch",
+        ] {
+            match factory.build(&make_spec(kind)) {
+                Err(ActionBuildError::UnknownKind(_)) => {} // expected
+                Err(e) => panic!("'{}' should be UnknownKind, got: {}", kind, e),
+                Ok(_) => panic!("'{}' should be rejected but was built successfully", kind),
+            }
+        }
+    }
 
     #[test]
     fn test_merge_action_metadata_overrides_declared_interface() {
