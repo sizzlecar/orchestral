@@ -2,6 +2,7 @@ mod echo;
 mod file_io;
 mod http;
 mod json_stdout;
+pub(crate) mod session;
 mod shell;
 pub(crate) mod skill_activate;
 mod subprocess;

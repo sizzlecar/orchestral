@@ -12,9 +12,11 @@ use orchestral_core::config::{
 };
 use orchestral_core::executor::ActionRegistry;
 
+use super::builtin::session::SessionAction;
 use super::builtin::skill_activate::SkillActivateAction;
 use super::builtin::tool_lookup::ToolLookupAction;
 use super::builtin::JsonStdoutAction;
+use crate::session::SessionManager;
 use super::factory::{ActionBuildError, ActionFactory};
 use super::mcp::probe_mcp_server_tools;
 use super::providers::{collect_action_registration_specs, ActionRegistrationSpec};
@@ -35,6 +37,7 @@ pub struct ActionRegistryManager {
     registry: Arc<RwLock<ActionRegistry>>,
     factory: Arc<dyn ActionFactory>,
     skill_catalog: Option<Arc<RwLock<SkillCatalog>>>,
+    session_manager: Arc<SessionManager>,
 }
 
 impl ActionRegistryManager {
@@ -43,6 +46,7 @@ impl ActionRegistryManager {
             path: path.into(),
             registry: Arc::new(RwLock::new(ActionRegistry::new())),
             factory,
+            session_manager: Arc::new(SessionManager::new()),
             skill_catalog: None,
         }
     }
@@ -174,6 +178,7 @@ impl ActionRegistryManager {
         }
         registry.register(Arc::new(JsonStdoutAction::internal()));
         registry.register(Arc::new(ToolLookupAction::new(self.registry.clone())));
+        registry.register(Arc::new(SessionAction::new(self.session_manager.clone())));
         if let Some(catalog) = &self.skill_catalog {
             registry.register(Arc::new(SkillActivateAction::new(catalog.clone())));
         }
