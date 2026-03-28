@@ -14,10 +14,68 @@ pub(super) fn prepare_runtime_config_path(
     planner_overrides: &PlannerOverrides,
 ) -> anyhow::Result<PathBuf> {
     let resolved = resolve_runtime_config_path(explicit)?;
-    if planner_overrides.is_empty() {
+
+    // When no explicit backend/model override, auto-detect from available API keys
+    // so that a checked-in config with backend:openai doesn't break users with only GOOGLE_API_KEY.
+    let effective_overrides = if planner_overrides.backend.is_none()
+        && planner_overrides.model_profile.is_none()
+    {
+        match auto_override_planner_if_needed(&resolved) {
+            Some(auto) => merge_planner_overrides(planner_overrides, &auto),
+            None => planner_overrides.clone(),
+        }
+    } else {
+        planner_overrides.clone()
+    };
+
+    if effective_overrides.is_empty() {
         return Ok(resolved);
     }
-    write_overridden_runtime_config(&resolved, planner_overrides)
+    write_overridden_runtime_config(&resolved, &effective_overrides)
+}
+
+/// If the config's planner backend lacks a usable API key, return overrides
+/// that switch to a backend with an available key.
+fn auto_override_planner_if_needed(config_path: &Path) -> Option<PlannerOverrides> {
+    let config = load_config(config_path).ok()?;
+    let backend_name = config
+        .planner
+        .backend
+        .as_deref()
+        .or(config.providers.default_backend.as_deref())
+        .unwrap_or("openai");
+    let backend_spec = config.providers.get_backend(backend_name)?;
+    let key_env = backend_spec.api_key_env.as_deref().unwrap_or("");
+
+    // If the configured backend has a valid key, nothing to override
+    if !key_env.is_empty() && has_env(key_env) {
+        return None;
+    }
+
+    let (auto_backend, auto_model) = detect_default_llm_profile();
+    // If auto-detect picked the same backend, no point overriding
+    if auto_backend == backend_name {
+        return None;
+    }
+
+    Some(PlannerOverrides {
+        backend: Some(auto_backend.to_string()),
+        model_profile: Some(auto_model.to_string()),
+        model: None,
+        temperature: None,
+    })
+}
+
+fn merge_planner_overrides(base: &PlannerOverrides, auto: &PlannerOverrides) -> PlannerOverrides {
+    PlannerOverrides {
+        backend: base.backend.clone().or_else(|| auto.backend.clone()),
+        model_profile: base
+            .model_profile
+            .clone()
+            .or_else(|| auto.model_profile.clone()),
+        model: base.model.clone().or_else(|| auto.model.clone()),
+        temperature: base.temperature.or(auto.temperature),
+    }
 }
 
 fn resolve_runtime_config_path(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
@@ -496,6 +554,57 @@ mod tests {
         clear_key_envs();
         std::env::set_var("OPENAI_API_KEY", "openai");
         assert_eq!(detect_default_llm_profile(), ("openai", "gpt-4o-mini"));
+        clear_key_envs();
+    }
+
+    #[test]
+    fn test_auto_override_planner_switches_backend_when_key_missing() {
+        let _guard = env_lock().lock().expect("env lock");
+        clear_key_envs();
+        // Only Google key available, config says openai
+        std::env::set_var("GOOGLE_API_KEY", "test-google-key");
+
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = manifest.parent().unwrap().parent().unwrap();
+        let config_path = workspace_root.join("configs/orchestral.cli.yaml");
+        if !config_path.exists() {
+            clear_key_envs();
+            return;
+        }
+
+        let result = auto_override_planner_if_needed(&config_path);
+        assert!(
+            result.is_some(),
+            "should auto-override when config backend key is missing"
+        );
+        let overrides = result.unwrap();
+        assert_eq!(overrides.backend.as_deref(), Some("google"));
+        assert_eq!(overrides.model_profile.as_deref(), Some("gemini-2.5-flash"));
+
+        clear_key_envs();
+    }
+
+    #[test]
+    fn test_auto_override_planner_no_override_when_key_present() {
+        let _guard = env_lock().lock().expect("env lock");
+        clear_key_envs();
+        // OpenAI key present, config says openai → no override needed
+        std::env::set_var("OPENAI_API_KEY", "test-openai-key");
+
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = manifest.parent().unwrap().parent().unwrap();
+        let config_path = workspace_root.join("configs/orchestral.cli.yaml");
+        if !config_path.exists() {
+            clear_key_envs();
+            return;
+        }
+
+        let result = auto_override_planner_if_needed(&config_path);
+        assert!(
+            result.is_none(),
+            "should not override when config backend key is present"
+        );
+
         clear_key_envs();
     }
 }
