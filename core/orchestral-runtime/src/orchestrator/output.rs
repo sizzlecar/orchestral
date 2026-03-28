@@ -272,6 +272,11 @@ pub(super) fn resolve_plan_response_template(
             }
         }
     }
+    // Return None for empty resolved templates so the caller falls back to noop_interpret_sync.
+    // This prevents empty AssistantOutput events (e.g. shell commands with no stdout like `rm`).
+    if resolved.trim().is_empty() {
+        return None;
+    }
     Some(resolved)
 }
 
