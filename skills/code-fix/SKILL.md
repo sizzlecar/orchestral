@@ -4,62 +4,48 @@ description: "Use AI coding assistants (codex or claude) to analyze error logs a
 compatibility: "Requires codex CLI or claude CLI on PATH."
 metadata:
   author: orchestral
-  version: "0.1.0"
+  version: "0.2.0"
 ---
 
 # AI-Assisted Code Fix
 
-Use `codex` (preferred) or `claude` CLI to fix code based on error information. Do not ask the user for tool preference — detect automatically.
+Use the **session** action to start a persistent codex session. This keeps codex alive so follow-up questions reuse the same session (no cold start).
 
-## Command template
-
-Use the **subprocess** action (not shell — codex needs several minutes). Run in the project root directory:
+## Step 1: Create a session
 
 ```json
-{
-  "action": "subprocess",
-  "input": {
-    "command": "cd PROJECT_DIR && codex exec \"Fix this error: ERROR_DESCRIPTION\"",
-    "timeout_secs": 300
-  }
-}
+{"action": "session", "input": {"op": "create", "name": "codex", "command": "codex --full-auto", "cwd": "PROJECT_DIR"}}
 ```
 
-If codex is not available, use claude:
+Use `--full-auto` so codex auto-approves file changes without blocking for approval.
+
+## Step 2: Send the error and wait for analysis
+
 ```json
-{
-  "action": "subprocess",
-  "input": {
-    "command": "cd PROJECT_DIR && claude --print \"Fix this error: ERROR_DESCRIPTION\"",
-    "timeout_secs": 300
-  }
-}
+{"action": "session", "input": {"op": "send_and_read", "name": "codex", "input": "Fix this NullPointerException in FcmRetryService.java:68...", "timeout_secs": 120}}
 ```
 
-IMPORTANT: Use `codex exec` (not bare `codex`) and `claude --print` (not bare `claude`) for non-interactive execution. Always use the **subprocess** action, NOT shell — codex/claude need minutes to complete.
+## Step 3: Follow-up (same session, no restart)
+
+```json
+{"action": "session", "input": {"op": "send_and_read", "name": "codex", "input": "The user says try a different approach...", "timeout_secs": 120}}
+```
+
+## Step 4: Close when done
+
+```json
+{"action": "session", "input": {"op": "close", "name": "codex"}}
+```
 
 ## How to determine PROJECT_DIR
 
 - If the user specifies a path, use it directly
-- If the user mentions a service name (e.g. "message-provider"), check common workspace directories:
-  - `~/seekee_ws/quan-SERVICE/`
-  - `./repos/SERVICE/`
-- Use shell to verify the directory exists before running
-
-## How to construct the error prompt
-
-Include ALL of the following in the codex/claude prompt:
-1. The full error message and stack trace
-2. The specific file and line number from the stack trace
-3. Ask it to fix the root cause, not just suppress the error
-
-Example prompt:
-```
-Fix this NullPointerException in FcmRetryService.java:68. The error occurs when processing FCM push results - getMessagingErrorCode() is called on a null exception object. Stack trace: [paste full trace]. Find the root cause and add proper null checks.
-```
+- Common workspace: `~/seekee_ws/quan-SERVICE/`
+- Use shell to verify the directory exists: `ls ~/seekee_ws/ | grep SERVICE`
 
 ## Rules
 
-- ALWAYS show the fix summary to the user after codex/claude finishes
-- Do NOT auto-commit without user approval
-- Include the original error context in the prompt so the AI tool has full information
+- ALWAYS use the **session** action, NEVER use subprocess or shell for codex/claude
+- Reuse existing sessions — check with `{"op": "list"}` before creating a new one
+- Include the full error message and stack trace in the prompt
+- Show codex's response to the user before taking further action
