@@ -17,16 +17,15 @@ pub(super) fn prepare_runtime_config_path(
 
     // When no explicit backend/model override, auto-detect from available API keys
     // so that a checked-in config with backend:openai doesn't break users with only GOOGLE_API_KEY.
-    let effective_overrides = if planner_overrides.backend.is_none()
-        && planner_overrides.model_profile.is_none()
-    {
-        match auto_override_planner_if_needed(&resolved) {
-            Some(auto) => merge_planner_overrides(planner_overrides, &auto),
-            None => planner_overrides.clone(),
-        }
-    } else {
-        planner_overrides.clone()
-    };
+    let effective_overrides =
+        if planner_overrides.backend.is_none() && planner_overrides.model_profile.is_none() {
+            match auto_override_planner_if_needed(&resolved) {
+                Some(auto) => merge_planner_overrides(planner_overrides, &auto),
+                None => planner_overrides.clone(),
+            }
+        } else {
+            planner_overrides.clone()
+        };
 
     if effective_overrides.is_empty() {
         return Ok(resolved);
