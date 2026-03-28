@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/sizzlecar/orchestral"
@@ -53,8 +53,8 @@ bytes = "1"
 
 # Internal crates - Core
 orchestral = { path = "core/orchestral" }
-orchestral-core = { path = "core/orchestral-core", version = "0.1.0" }
-orchestral-runtime = { path = "core/orchestral-runtime", version = "0.1.0" }
+orchestral-core = { path = "core/orchestral-core", version = "0.2.0" }
+orchestral-runtime = { path = "core/orchestral-runtime", version = "0.2.0" }
 
 [workspace.dependencies.tokio-test]
 version = "0.4"
