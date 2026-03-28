@@ -7,7 +7,7 @@ use crate::envfile::load_env_file;
 use crate::runtime::PlannerOverrides;
 
 #[derive(Debug, Parser)]
-#[command(name = "orchestral", about = "Orchestral CLI")]
+#[command(name = "orchestral", about = "Orchestral CLI", version)]
 pub struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -43,6 +43,12 @@ struct RunArgs {
     /// Disable Skill action auto-discovery and registration
     #[arg(long)]
     no_skills: bool,
+    /// Extra MCP discovery file paths (colon-separated or repeated)
+    #[arg(long, value_delimiter = ':')]
+    mcp_path: Vec<PathBuf>,
+    /// Extra skill directories (colon-separated or repeated)
+    #[arg(long, value_delimiter = ':')]
+    skill_dir: Vec<PathBuf>,
     /// Read multi-turn inputs from file (one turn per line; '#' comments supported)
     #[arg(long)]
     script: Option<PathBuf>,
@@ -80,6 +86,10 @@ struct ScenarioArgs {
     no_mcp: bool,
     #[arg(long)]
     no_skills: bool,
+    #[arg(long, value_delimiter = ':')]
+    mcp_path: Vec<PathBuf>,
+    #[arg(long, value_delimiter = ':')]
+    skill_dir: Vec<PathBuf>,
     #[arg(long, default_value_t = 300)]
     timeout_secs: u64,
     #[arg(long)]
@@ -144,6 +154,8 @@ impl Cli {
                     thread_id: args.thread_id,
                     no_mcp: args.no_mcp,
                     no_skills: args.no_skills,
+                    mcp_paths: args.mcp_path,
+                    skill_dirs: args.skill_dir,
                     initial_input,
                     script_path: args.script,
                     once: args.once,
@@ -162,6 +174,8 @@ impl Cli {
                     thread_id: args.thread_id,
                     no_mcp: args.no_mcp,
                     no_skills: args.no_skills,
+                    mcp_paths: args.mcp_path,
+                    skill_dirs: args.skill_dir,
                     timeout_secs: args.timeout_secs,
                     verbose: args.verbose,
                     input: if args.input.is_empty() {
@@ -187,6 +201,8 @@ impl Cli {
                     thread_id: None,
                     no_mcp: false,
                     no_skills: false,
+                    mcp_paths: Vec::new(),
+                    skill_dirs: Vec::new(),
                     initial_input: None,
                     script_path: None,
                     once: false,

@@ -21,6 +21,8 @@ pub struct ScenarioRunOptions {
     pub thread_id: Option<String>,
     pub no_mcp: bool,
     pub no_skills: bool,
+    pub mcp_paths: Vec<PathBuf>,
+    pub skill_dirs: Vec<PathBuf>,
     pub timeout_secs: u64,
     pub verbose: bool,
     pub input: Option<String>,
@@ -212,6 +214,8 @@ struct PreparedScenario {
     fresh_thread_per_turn: bool,
     no_mcp: bool,
     no_skills: bool,
+    mcp_paths: Vec<PathBuf>,
+    skill_dirs: Vec<PathBuf>,
     timeout_secs: u64,
     verbose: bool,
     cleanup: ScenarioCleanupSpec,
@@ -396,7 +400,13 @@ struct ScenarioEnvGuard {
 }
 
 impl ScenarioEnvGuard {
-    fn apply(no_mcp: bool, no_skills: bool, layout: &ScenarioRunLayout) -> anyhow::Result<Self> {
+    fn apply(
+        no_mcp: bool,
+        no_skills: bool,
+        mcp_paths: &[PathBuf],
+        skill_dirs: &[PathBuf],
+        layout: &ScenarioRunLayout,
+    ) -> anyhow::Result<Self> {
         if let Some(parent) = layout.runtime_log_path.parent() {
             fs::create_dir_all(parent).with_context(|| {
                 format!(
@@ -424,6 +434,22 @@ impl ScenarioEnvGuard {
         if no_skills {
             guards.push(EnvVarGuard::set("ORCHESTRAL_DISABLE_SKILLS", "1"));
         }
+        if !mcp_paths.is_empty() {
+            let joined = mcp_paths
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(":");
+            guards.push(EnvVarGuard::set("ORCHESTRAL_MCP_EXTRA_PATHS", joined));
+        }
+        if !skill_dirs.is_empty() {
+            let joined = skill_dirs
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(":");
+            guards.push(EnvVarGuard::set("ORCHESTRAL_SKILL_EXTRA_DIRS", joined));
+        }
 
         Ok(Self { _guards: guards })
     }
@@ -447,7 +473,13 @@ pub async fn run(options: ScenarioRunOptions) -> anyhow::Result<()> {
     )?;
     materialize_workspace(&prepared.workspace_copies, layout.workspace_dir.as_deref())?;
 
-    let env_guard = ScenarioEnvGuard::apply(prepared.no_mcp, prepared.no_skills, &layout)?;
+    let env_guard = ScenarioEnvGuard::apply(
+        prepared.no_mcp,
+        prepared.no_skills,
+        &prepared.mcp_paths,
+        &prepared.skill_dirs,
+        &layout,
+    )?;
     let _cwd_guard = layout
         .workspace_dir
         .as_deref()
@@ -745,6 +777,8 @@ fn prepare_scenario(options: ScenarioRunOptions) -> anyhow::Result<PreparedScena
             fresh_thread_per_turn: spec.fresh_thread_per_turn,
             no_mcp: options.no_mcp || spec.no_mcp,
             no_skills: options.no_skills || spec.no_skills,
+            mcp_paths: options.mcp_paths,
+            skill_dirs: options.skill_dirs,
             timeout_secs: spec.timeout_secs.unwrap_or(options.timeout_secs),
             verbose: options.verbose,
             cleanup: spec.cleanup,
@@ -766,6 +800,8 @@ fn prepare_scenario(options: ScenarioRunOptions) -> anyhow::Result<PreparedScena
         fresh_thread_per_turn: false,
         no_mcp: options.no_mcp,
         no_skills: options.no_skills,
+        mcp_paths: options.mcp_paths,
+        skill_dirs: options.skill_dirs,
         timeout_secs: options.timeout_secs,
         verbose: options.verbose,
         cleanup: ScenarioCleanupSpec::default(),
@@ -1975,6 +2011,8 @@ turns:
             thread_id: None,
             no_mcp: false,
             no_skills: false,
+            mcp_paths: Vec::new(),
+            skill_dirs: Vec::new(),
             timeout_secs: 30,
             verbose: false,
             input: None,

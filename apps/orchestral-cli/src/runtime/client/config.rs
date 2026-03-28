@@ -257,24 +257,6 @@ providers:
 actions:
   hot_reload: false
   actions:
-    - name: echo
-      kind: echo
-      description: Echo text back.
-      interface:
-        input_schema:
-          type: object
-          properties:
-            message:
-              type: string
-          required: [message]
-        output_schema:
-          type: object
-          properties:
-            result:
-              type: string
-          required: [result]
-      config:
-        prefix: "Echo: "
     - name: shell
       kind: shell
       description: Run a shell command.
@@ -282,60 +264,93 @@ actions:
         input_schema:
           type: object
           properties:
-            command:
-              type: string
-            args:
-              type: array
-              items:
-                type: string
+            command: {{ type: string }}
+            args: {{ type: array, items: {{ type: string }} }}
+            shell: {{ type: boolean }}
           required: [command]
         output_schema:
           type: object
           properties:
-            stdout:
-              type: string
-            stderr:
-              type: string
-            status:
-              type: integer
+            stdout: {{ type: string }}
+            stderr: {{ type: string }}
+            status: {{ type: integer }}
           required: [stdout, stderr, status]
       config:
-        timeout_ms: 10000
+        timeout_ms: 30000
+        sandbox_mode: none
     - name: file_read
       kind: file_read
-      description: Read a file from workspace.
+      description: Read a file from disk.
       interface:
         input_schema:
           type: object
           properties:
-            path:
-              type: string
+            path: {{ type: string }}
           required: [path]
         output_schema:
           type: object
           properties:
-            content:
-              type: string
-            path:
-              type: string
+            content: {{ type: string }}
+            path: {{ type: string }}
+            bytes: {{ type: integer }}
           required: [content, path]
+      config: {{}}
+    - name: file_write
+      kind: file_write
+      description: Write a file to disk.
+      interface:
+        input_schema:
+          type: object
+          properties:
+            path: {{ type: string }}
+            content: {{ type: string }}
+            append: {{ type: boolean }}
+          required: [path, content]
+        output_schema:
+          type: object
+          properties:
+            path: {{ type: string }}
+            bytes: {{ type: integer }}
+          required: [path, bytes]
       config:
-        root_dir: "."
+        create_dirs: true
+    - name: http
+      kind: http
+      description: Perform an HTTP request.
+      interface:
+        input_schema:
+          type: object
+          properties:
+            method: {{ type: string }}
+            url: {{ type: string }}
+            headers: {{ type: object }}
+            body: {{}}
+          required: [url]
+        output_schema:
+          type: object
+          properties:
+            status: {{ type: integer }}
+            body: {{ type: string }}
+          required: [status, body]
+      config:
+        timeout_ms: 10000
 "#
     )
 }
 
 fn detect_default_llm_profile() -> (&'static str, &'static str) {
-    if has_env("OPENAI_API_KEY") {
-        ("openai", "gpt-4o-mini")
-    } else if has_any_env(&["GOOGLE_API_KEY", "GEMINI_API_KEY"]) {
+    // Prefer Google (free tier, widely available) → Anthropic → OpenAI → OpenRouter
+    if has_any_env(&["GOOGLE_API_KEY", "GEMINI_API_KEY"]) {
         ("google", "gemini-2.5-flash")
     } else if has_any_env(&["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"]) {
         ("anthropic", "claude-sonnet-4-5")
+    } else if has_env("OPENAI_API_KEY") {
+        ("openai", "gpt-4o-mini")
     } else if has_env("OPENROUTER_API_KEY") {
         ("openrouter", "claude-sonnet-4-5-openrouter")
     } else {
-        ("openai", "gpt-4o-mini")
+        // No key found — use google as default, will fail with clear error at runtime
+        ("google", "gemini-2.5-flash")
     }
 }
 
@@ -375,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_default_llm_profile_prefers_openai_over_other_keys() {
+    fn test_detect_default_llm_profile_prefers_google_over_other_keys() {
         let _guard = env_lock().lock().expect("env lock");
         clear_key_envs();
         std::env::set_var("OPENAI_API_KEY", "openai");
@@ -383,7 +398,7 @@ mod tests {
         std::env::set_var("ANTHROPIC_API_KEY", "anthropic");
         std::env::set_var("OPENROUTER_API_KEY", "openrouter");
 
-        assert_eq!(detect_default_llm_profile(), ("openai", "gpt-4o-mini"));
+        assert_eq!(detect_default_llm_profile(), ("google", "gemini-2.5-flash"));
 
         clear_key_envs();
     }
@@ -416,6 +431,71 @@ mod tests {
         );
 
         clear_key_envs();
+        // No key → falls back to google (will fail at runtime with clear error)
+        assert_eq!(detect_default_llm_profile(), ("google", "gemini-2.5-flash"));
+    }
+
+    #[test]
+    fn test_embedded_default_config_includes_core_actions() {
+        let config = embedded_default_config();
+        assert!(
+            config.contains("kind: shell"),
+            "should include shell action"
+        );
+        assert!(
+            config.contains("kind: file_read"),
+            "should include file_read action"
+        );
+        assert!(
+            config.contains("kind: file_write"),
+            "should include file_write action"
+        );
+        assert!(config.contains("kind: http"), "should include http action");
+    }
+
+    #[test]
+    fn test_embedded_default_config_excludes_deprecated_actions() {
+        let config = embedded_default_config();
+        assert!(
+            !config.contains("document_inspect"),
+            "should not include deprecated document_inspect"
+        );
+        assert!(
+            !config.contains("structured_inspect"),
+            "should not include deprecated structured_inspect"
+        );
+        assert!(
+            !config.contains("kind: echo"),
+            "should not include removed echo action"
+        );
+    }
+
+    #[test]
+    fn test_embedded_default_config_is_valid_yaml() {
+        let config = embedded_default_config();
+        let parsed: Result<serde_yaml::Value, _> = serde_yaml::from_str(&config);
+        assert!(parsed.is_ok(), "embedded config should be valid YAML");
+    }
+
+    #[test]
+    fn test_detect_default_llm_profile_prefers_anthropic_over_openai() {
+        let _guard = env_lock().lock().expect("env lock");
+        clear_key_envs();
+        std::env::set_var("OPENAI_API_KEY", "openai");
+        std::env::set_var("ANTHROPIC_API_KEY", "anthropic");
+        assert_eq!(
+            detect_default_llm_profile(),
+            ("anthropic", "claude-sonnet-4-5")
+        );
+        clear_key_envs();
+    }
+
+    #[test]
+    fn test_detect_default_llm_profile_openai_only() {
+        let _guard = env_lock().lock().expect("env lock");
+        clear_key_envs();
+        std::env::set_var("OPENAI_API_KEY", "openai");
         assert_eq!(detect_default_llm_profile(), ("openai", "gpt-4o-mini"));
+        clear_key_envs();
     }
 }

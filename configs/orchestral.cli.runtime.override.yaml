@@ -10,8 +10,8 @@ runtime:
   max_planner_iterations: 6
 planner:
   mode: llm
-  backend: openrouter
-  model_profile: claude-sonnet-4-5-openrouter
+  backend: google
+  model_profile: gemini-2.5-flash
   max_history: 20
   log_full_prompts: true
   dynamic_model_selection: true
@@ -295,7 +295,7 @@ actions:
       fail_on_non_zero: true
       allow_shell_expression: false
       max_output_bytes: 65536
-      sandbox_mode: none
+      sandbox_mode: workspace_write
       sandbox_backend: auto
       sandbox_allow_network: false
       sandbox_writable_roots:
@@ -325,8 +325,7 @@ actions:
         properties:
           path:
             type: string
-            description: File path to read (must stay under sandbox_writable_roots
-              when sandbox is enabled).
+            description: File path to read (must stay under sandbox_writable_roots when sandbox is enabled).
             example: docs/readme.md
           max_bytes:
             type: integer
@@ -370,8 +369,7 @@ actions:
         properties:
           path:
             type: string
-            description: Target file path to write (must stay under sandbox_writable_roots
-              when sandbox is enabled).
+            description: Target file path to write (must stay under sandbox_writable_roots when sandbox is enabled).
             example: output/google.html
           content:
             type: string
@@ -404,212 +402,3 @@ actions:
       - .
       create_dirs: true
       max_write_bytes: 524288
-  - name: document_inspect
-    kind: document_inspect
-    description: Locate and inspect document artifacts
-    interface:
-      input_schema:
-        type: object
-        properties:
-          source_root:
-            type: string
-          user_request:
-            type: string
-          source_paths:
-            oneOf:
-            - type: array
-              items:
-                type: string
-            - type: string
-      output_schema:
-        type: object
-        properties:
-          inspection:
-            type: object
-          source_paths:
-            type: array
-            items:
-              type: string
-          documents:
-            type: array
-            items:
-              type: string
-          artifact_candidates:
-            type: array
-            items:
-              type: string
-          artifact_count:
-            type: integer
-          report_path:
-            type: string
-        required:
-        - inspection
-        - source_paths
-    config: {}
-  - name: document_patch
-    kind: document_patch
-    description: Derive, assess, and apply a document patch
-    interface:
-      input_schema:
-        type: object
-        properties:
-          inspection:
-            type: object
-          user_request:
-            type: string
-          derivation_policy:
-            type: string
-            enum:
-            - strict
-            - permissive
-            - filename_to_h1
-            - markdown_h1_from_filename
-          report_path:
-            type: string
-        required:
-        - inspection
-        - user_request
-        - derivation_policy
-      output_schema:
-        type: object
-        properties:
-          updated_paths:
-            type: array
-            items:
-              type: string
-          patch_count:
-            type: integer
-          patch_spec:
-            type: object
-          summary:
-            type: string
-        required:
-        - updated_paths
-        - patch_count
-        - summary
-    config: {}
-  - name: document_verify_patch
-    kind: document_verify_patch
-    description: Verify a document patch
-    interface:
-      input_schema:
-        type: object
-        properties:
-          patch_spec:
-            type: object
-          inspection:
-            type: object
-          user_request:
-            type: string
-          resume_user_input: {}
-        required:
-        - patch_spec
-        - inspection
-        - user_request
-      output_schema:
-        type: object
-        properties:
-          verify_decision:
-            type: object
-          summary:
-            type: string
-        required:
-        - verify_decision
-        - summary
-    config: {}
-  - name: structured_inspect
-    kind: structured_inspect
-    description: Locate and inspect structured artifact files
-    interface:
-      input_schema:
-        type: object
-        properties:
-          source_root:
-            type: string
-          user_request:
-            type: string
-          source_paths:
-            type: array
-            items:
-              type: string
-      output_schema:
-        type: object
-        properties:
-          inspection:
-            type: object
-          source_paths:
-            type: array
-            items:
-              type: string
-          artifact_candidates:
-            type: array
-            items:
-              type: string
-          artifact_count:
-            type: integer
-        required:
-        - inspection
-        - source_paths
-    config: {}
-  - name: structured_patch
-    kind: structured_patch
-    description: Derive, assess, and apply a structured patch
-    interface:
-      input_schema:
-        type: object
-        properties:
-          inspection:
-            type: object
-          user_request:
-            type: string
-          derivation_policy:
-            type: string
-            enum:
-            - strict
-            - permissive
-        required:
-        - inspection
-        - user_request
-        - derivation_policy
-      output_schema:
-        type: object
-        properties:
-          updated_paths:
-            type: array
-            items:
-              type: string
-          patch_count:
-            type: integer
-          patch_spec:
-            type: object
-          summary:
-            type: string
-        required:
-        - updated_paths
-        - patch_count
-        - summary
-    config: {}
-  - name: structured_verify_patch
-    kind: structured_verify_patch
-    description: Verify a structured patch
-    interface:
-      input_schema:
-        type: object
-        properties:
-          patch_spec:
-            type: object
-          inspection:
-            type: object
-        required:
-        - patch_spec
-      output_schema:
-        type: object
-        properties:
-          verify_decision:
-            type: object
-          summary:
-            type: string
-        required:
-        - verify_decision
-        - summary
-    config: {}

@@ -1,6 +1,0 @@
-logging:
-  level: debug
-  pretty: true
-  file_output: null
-service:
-  name: orchestral
