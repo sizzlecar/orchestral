@@ -7,3 +7,7 @@
 读取一次请求体，验证签名后，立刻手动释放内存块，只保留原始的 byte[] 数据。然后让 getBody() 每次被调用时再包装返回这些数据。
 
 请用大白话向用户解释。
+
+
+
+claude --resume "consolidate-31-to-17-actions"

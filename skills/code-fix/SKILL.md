@@ -1,6 +1,6 @@
 ---
 name: code-fix
-description: "Use AI coding assistants (codex or claude) to analyze error logs and fix bugs in source code. Use when the user asks to fix a bug, investigate an error, or repair code based on logs or stack traces."
+description: "Use codex or claude to analyze, review, fix, or optimize code. Trigger when the user mentions codex, claude, code review, code fix, bug fix, code analysis, code optimization, or asks to consult an AI coding assistant about any codebase."
 compatibility: "Requires codex CLI or claude CLI on PATH."
 metadata:
   author: orchestral

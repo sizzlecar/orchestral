@@ -507,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_declared_export_fails_step_when_strict() {
+    fn test_missing_declared_export_warns_but_completes_when_strict() {
         tokio_test::block_on(async {
             let mut registry = ActionRegistry::new();
             registry.register(Arc::new(StaticAction::new(
@@ -523,13 +523,14 @@ mod tests {
             let mut dag = ExecutionDag::from_plan(&plan).expect("dag");
             let ctx = ExecutorContext::new("task-1", Arc::new(RwLock::new(WorkingSet::new())));
 
+            // Missing exports now warn instead of failing — planner often guesses
+            // wrong field names, this shouldn't block execution.
             let result = executor.execute(&mut dag, &ctx).await;
-            match result {
-                ExecutionResult::Failed { error, .. } => {
-                    assert!(error.contains("missing declared export"));
-                }
-                _ => panic!("expected failed result"),
-            }
+            assert!(
+                matches!(result, ExecutionResult::Completed),
+                "expected completed, got {:?}",
+                result
+            );
         });
     }
 

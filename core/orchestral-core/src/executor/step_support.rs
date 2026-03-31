@@ -271,12 +271,23 @@ pub(super) fn validate_declared_exports(
     for key in &step.exports {
         match exports.get(key) {
             Some(value) if !value.is_null() => {}
-            Some(_) => return Err(format!("Step '{}' export '{}' is null", step.id, key)),
+            Some(_) => {
+                tracing::warn!(
+                    step_id = %step.id,
+                    export = %key,
+                    "declared export is null, continuing anyway"
+                );
+            }
             None => {
-                return Err(format!(
-                    "Step '{}' missing declared export '{}'",
-                    step.id, key
-                ))
+                // Planner often guesses wrong export field names. Warn instead of failing
+                // so execution can continue — the actual outputs are still available
+                // in the working set under the action's real field names.
+                tracing::warn!(
+                    step_id = %step.id,
+                    export = %key,
+                    actual_keys = ?exports.keys().collect::<Vec<_>>(),
+                    "declared export not found in action output, continuing anyway"
+                );
             }
         }
     }
