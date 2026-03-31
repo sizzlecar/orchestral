@@ -759,17 +759,17 @@ impl StdioMcpSession {
     }
 
     async fn write_frame(&mut self, payload: &Value) -> Result<(), String> {
+        // Use NDJSON (newline-delimited JSON) — compatible with all MCP servers.
         let body = serde_json::to_vec(payload)
             .map_err(|err| format!("serialize mcp payload failed: {}", err))?;
-        let header = format!("Content-Length: {}\r\n\r\n", body.len());
-        self.stdin
-            .write_all(header.as_bytes())
-            .await
-            .map_err(|err| format!("write mcp header failed: {}", err))?;
         self.stdin
             .write_all(&body)
             .await
             .map_err(|err| format!("write mcp payload failed: {}", err))?;
+        self.stdin
+            .write_all(b"\n")
+            .await
+            .map_err(|err| format!("write mcp newline failed: {}", err))?;
         self.stdin
             .flush()
             .await
@@ -777,37 +777,45 @@ impl StdioMcpSession {
     }
 
     async fn read_frame(&mut self) -> Result<Value, String> {
-        let mut content_length: Option<usize> = None;
+        // Auto-detect: NDJSON (line = JSON) or LSP (Content-Length header).
         loop {
             let mut line = String::new();
             let read = self
                 .stdout
                 .read_line(&mut line)
                 .await
-                .map_err(|err| format!("read mcp header failed: {}", err))?;
+                .map_err(|err| format!("read mcp frame failed: {}", err))?;
             if read == 0 {
                 return Err("mcp process closed stdout".to_string());
             }
             let trimmed = line.trim();
             if trimmed.is_empty() {
-                break;
+                continue;
             }
+            // If line starts with '{', it's NDJSON
+            if trimmed.starts_with('{') {
+                return serde_json::from_str::<Value>(trimmed)
+                    .map_err(|err| format!("parse mcp NDJSON failed: {}", err));
+            }
+            // Otherwise treat as Content-Length header (LSP style)
             if let Some((key, value)) = trimmed.split_once(':') {
                 if key.trim().eq_ignore_ascii_case("content-length") {
-                    content_length = value.trim().parse::<usize>().ok();
+                    if let Ok(len) = value.trim().parse::<usize>() {
+                        // Read blank line after headers
+                        let mut blank = String::new();
+                        let _ = self.stdout.read_line(&mut blank).await;
+                        // Read exact body
+                        let mut body = vec![0_u8; len];
+                        self.stdout
+                            .read_exact(&mut body)
+                            .await
+                            .map_err(|err| format!("read mcp payload failed: {}", err))?;
+                        return serde_json::from_slice::<Value>(&body)
+                            .map_err(|err| format!("parse mcp payload failed: {}", err));
+                    }
                 }
             }
         }
-
-        let len = content_length.ok_or_else(|| "missing mcp Content-Length header".to_string())?;
-        let mut body = vec![0_u8; len];
-        self.stdout
-            .read_exact(&mut body)
-            .await
-            .map_err(|err| format!("read mcp payload failed: {}", err))?;
-
-        serde_json::from_slice::<Value>(&body)
-            .map_err(|err| format!("parse mcp payload failed: {}", err))
     }
 }
 

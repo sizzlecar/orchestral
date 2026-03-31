@@ -1,51 +1,39 @@
 ---
 name: code-fix
 description: "Use codex or claude to analyze, review, fix, or optimize code. Trigger when the user mentions codex, claude, code review, code fix, bug fix, code analysis, code optimization, or asks to consult an AI coding assistant about any codebase."
-compatibility: "Requires codex CLI or claude CLI on PATH."
+compatibility: "Requires codex CLI on PATH with MCP server support."
 metadata:
   author: orchestral
-  version: "0.2.0"
+  version: "0.4.0"
 ---
 
 # AI-Assisted Code Fix
 
-Use the **session** action to start a persistent codex session. This keeps codex alive so follow-up questions reuse the same session (no cold start).
+Codex is available as an MCP tool (`mcp__codex`). Use `tool_lookup` to get the full schema, then call it.
 
-## Step 1: Create a session
+## Workflow
 
-```json
-{"action": "session", "input": {"op": "create", "name": "codex", "command": "codex --full-auto", "cwd": "PROJECT_DIR"}}
-```
+1. **First call** — use `codex` tool to start a new session:
+   ```
+   tool: codex
+   arguments: { "prompt": "Review recent commits for bugs", "approval_policy": "full-auto" }
+   ```
+   The response includes a `threadId` for follow-up.
 
-Use `--full-auto` so codex auto-approves file changes without blocking for approval.
+2. **Follow-up** — use `codex-reply` tool with the threadId:
+   ```
+   tool: codex-reply
+   arguments: { "prompt": "Try a different approach", "thread_id": "<threadId from step 1>" }
+   ```
 
-## Step 2: Send the error and wait for analysis
+## How to determine project context
 
-```json
-{"action": "session", "input": {"op": "send_and_read", "name": "codex", "input": "Fix this NullPointerException in FcmRetryService.java:68...", "timeout_secs": 120}}
-```
-
-## Step 3: Follow-up (same session, no restart)
-
-```json
-{"action": "session", "input": {"op": "send_and_read", "name": "codex", "input": "The user says try a different approach...", "timeout_secs": 120}}
-```
-
-## Step 4: Close when done
-
-```json
-{"action": "session", "input": {"op": "close", "name": "codex"}}
-```
-
-## How to determine PROJECT_DIR
-
-- If the user specifies a path, use it directly
-- Common workspace: `~/seekee_ws/quan-SERVICE/`
-- Use shell to verify the directory exists: `ls ~/seekee_ws/ | grep SERVICE`
+- Codex runs in the orchestral project directory by default
+- To analyze a different project, include the path in the prompt: "Look at /Users/.../project and review..."
+- Or use shell to `cd` first and gather context (git log, git diff) before asking codex
 
 ## Rules
 
-- ALWAYS use the **session** action, NEVER use subprocess or shell for codex/claude
-- Reuse existing sessions — check with `{"op": "list"}` before creating a new one
-- Include the full error message and stack trace in the prompt
+- Save the `threadId` from the first codex call for follow-up questions
+- Include full error messages and stack traces in the prompt
 - Show codex's response to the user before taking further action

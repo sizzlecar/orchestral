@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "codex": {
+      "command": "/opt/homebrew/bin/codex",
+      "args": ["mcp-server"],
+      "startup_timeout_ms": 30000
+    }
+  }
+}

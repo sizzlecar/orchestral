@@ -299,8 +299,8 @@ actions:
         - env_policy
     config:
       timeout_ms: 30000
-      fail_on_non_zero: true
-      allow_shell_expression: false
+      fail_on_non_zero: false
+      allow_shell_expression: true
       max_output_bytes: 65536
       sandbox_mode: none
       sandbox_backend: auto
