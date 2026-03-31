@@ -285,7 +285,7 @@ impl OrchestralBuilder {
             kind: backend_kind,
             endpoint: None,
             api_key_env: Some(api_key_env),
-            config: Value::Null,
+            config: serde_json::json!({ "timeout_secs": 120 }),
         };
         let invocation = LlmInvocationConfig {
             model: model.clone(),
