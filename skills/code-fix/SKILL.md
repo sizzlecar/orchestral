@@ -4,42 +4,32 @@ description: "Use codex or claude to analyze, review, fix, or optimize code. Tri
 compatibility: "Requires codex CLI on PATH with MCP server support."
 metadata:
   author: orchestral
-  version: "0.5.0"
+  version: "0.6.0"
 ---
 
 # AI-Assisted Code Fix
 
-## IMPORTANT: Gather context BEFORE calling codex
+Codex is available as MCP tools: `mcp__codex__codex` and `mcp__codex__codex-reply`.
 
-Do NOT let codex scan the whole project — it takes minutes. Instead:
+## Usage
 
-1. **Collect context via shell first**:
-   - `git -C /path/to/project log --oneline -10` — recent commits
-   - `git -C /path/to/project diff HEAD~1` — recent changes
-   - `cat /path/to/File.java` — specific files from error stack traces
-
-2. **Pass the collected text directly in the codex prompt**:
-   ```
-   prompt: "Review this code change and identify issues:\n\n<git diff output>"
-   ```
-
-Codex analyzes provided text in seconds. Scanning a whole project takes 5-10 minutes.
-
-## How to call codex
-
-Call `mcp__codex__codex` with the context in the prompt:
+Call codex with a prompt and **set `cwd` to the project directory**:
 ```json
 {
-  "prompt": "Analyze this error and suggest a fix:\n\nError: NullPointerException at FcmRetryService.java:68\n\nCode:\n<file content>",
+  "prompt": "Review the recent commits and check for bugs",
   "cwd": "/path/to/project"
 }
 ```
 
-For follow-up, use `mcp__codex__codex-reply` with the threadId from the first response.
+For follow-up questions, use `codex-reply` with the `threadId` from the first response. Follow-up calls reuse cached context and are much faster.
 
-## Rules
+## Finding the project directory
 
-- ALWAYS collect context (git diff, file content, error logs) via shell BEFORE calling codex
-- NEVER call codex with just "analyze the project" — always include specific context in the prompt
-- Keep prompt under 10000 chars — truncate large diffs
-- Show codex's response to the user before taking further action
+- Common workspace: `~/seekee_ws/quan-<service>/`
+- Use shell `ls ~/seekee_ws/ | grep <keyword>` to locate
+
+## Notes
+
+- First call to a new project may take several minutes (codex builds context)
+- Subsequent calls via `codex-reply` are fast (cached session)
+- Include error logs and stack traces in the prompt for better analysis
