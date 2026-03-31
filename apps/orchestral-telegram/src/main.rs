@@ -97,28 +97,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let progress_chat_id = msg.chat_id;
             let progress_handle = tokio::spawn(async move {
                 let mut last_status = String::new();
+                let mut typing_interval = tokio::time::interval(std::time::Duration::from_secs(4));
                 loop {
                     tokio::select! {
-                        // Keep typing indicator alive
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(4)) => {
+                        _ = typing_interval.tick() => {
                             let _ = progress_client.send_chat_action(progress_chat_id, "typing").await;
                         }
-                        // Process lifecycle events
                         event = event_rx.recv() => {
                             let Ok(event) = event else { continue };
                             let status = match &event {
                                 orchestral::core::store::Event::SystemTrace { payload, .. } => {
                                     let category = payload.get("category").and_then(|v| v.as_str());
                                     let event_type = payload.get("event_type").and_then(|v| v.as_str());
+                                    let metadata = payload.get("metadata");
                                     match (category, event_type) {
-                                        (Some("runtime_lifecycle"), Some("planning_started")) => Some("Planning...".to_string()),
-                                        (Some("runtime_lifecycle"), Some("execution_started")) => Some("Executing...".to_string()),
+                                        (Some("runtime_lifecycle"), Some("planning_started")) => {
+                                            let iteration = metadata
+                                                .and_then(|m| m.get("iteration"))
+                                                .and_then(|v| v.as_u64())
+                                                .unwrap_or(1);
+                                            if iteration == 1 {
+                                                Some("Thinking...".to_string())
+                                            } else {
+                                                Some(format!("Thinking... (round {})", iteration))
+                                            }
+                                        }
                                         (Some("execution_progress"), Some("step_started")) => {
-                                            let action = payload.get("metadata")
+                                            let action = metadata
                                                 .and_then(|m| m.get("action"))
                                                 .and_then(|v| v.as_str())
                                                 .unwrap_or("action");
-                                            Some(format!("Running {}...", action))
+                                            let label = match action {
+                                                a if a.contains("codex") => "Asking Codex...".to_string(),
+                                                a if a.contains("sls") || a.contains("log") => "Querying logs...".to_string(),
+                                                "shell" => "Running command...".to_string(),
+                                                "file_read" => "Reading file...".to_string(),
+                                                "file_write" => "Writing file...".to_string(),
+                                                "skill_activate" => "Loading skill...".to_string(),
+                                                "tool_lookup" => "Looking up tool...".to_string(),
+                                                _ => format!("Running {}...", action),
+                                            };
+                                            Some(label)
                                         }
                                         _ => None,
                                     }
@@ -128,7 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Some(status) = status {
                                 if status != last_status {
                                     last_status = status.clone();
-                                    let _ = progress_client.send_chat_action(progress_chat_id, "typing").await;
+                                    let _ = progress_client.send_message(progress_chat_id, &status).await;
                                 }
                             }
                         }
@@ -140,9 +159,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(result) => {
                     progress_handle.abort();
                     let reply = match result.status.as_str() {
-                        "completed" => result.message.clone(),
+                        "completed" => clean_response(&result.message),
                         "rejected" => "I'm busy, please wait a moment.".to_string(),
-                        _ => format!("{}\n\n[{}]", result.message, result.status),
+                        _ => format!("{}\n\n[{}]", clean_response(&result.message), result.status),
                     };
                     if let Err(e) = worker_client.send_message(msg.chat_id, &reply).await {
                         error!(chat_id = msg.chat_id, error = %e, "Failed to send reply");
@@ -210,4 +229,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+}
+
+/// Clean up raw response text from MCP/action output.
+/// Extracts actual text content from JSON envelopes and strips artifacts.
+fn clean_response(raw: &str) -> String {
+    let trimmed = raw.trim();
+
+    // Try to extract text from MCP-style JSON: {"content":[{"text":"..."}]}
+    if trimmed.contains(r#""content":[{"text":"#) || trimmed.contains(r#""content": [{"text":"#) {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Some(text) = parsed
+                .get("content")
+                .and_then(|c| c.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|item| item.get("text"))
+                .and_then(|t| t.as_str())
+            {
+                return text.to_string();
+            }
+        }
+    }
+
+    // Try to extract from inline JSON embedded in text
+    if let Some(json_start) = trimmed.find(r#"{"content":[{"text":"#) {
+        let json_part = &trimmed[json_start..];
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_part) {
+            let prefix = trimmed[..json_start].trim();
+            if let Some(text) = parsed
+                .get("content")
+                .and_then(|c| c.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|item| item.get("text"))
+                .and_then(|t| t.as_str())
+            {
+                if prefix.is_empty() {
+                    return text.to_string();
+                }
+                return format!("{}\n\n{}", prefix, text);
+            }
+        }
+    }
+
+    trimmed.to_string()
 }
