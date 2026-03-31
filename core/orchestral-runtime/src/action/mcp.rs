@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -484,6 +485,8 @@ struct McpToolAction {
     tool_name: String,
     /// Input schema from MCP tools/list
     input_schema: Value,
+    /// Persistent stdio session (lazy-initialized, reused across calls)
+    persistent_session: Arc<tokio::sync::Mutex<Option<StdioMcpSession>>>,
 }
 
 impl McpToolAction {
@@ -515,6 +518,7 @@ impl McpToolAction {
             config,
             tool_name,
             input_schema,
+            persistent_session: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
@@ -528,28 +532,48 @@ impl McpToolAction {
 
     async fn invoke(&self, arguments: Value) -> Result<Value, String> {
         if self.config.command.is_some() {
-            let mut session = StdioMcpSession::connect(
-                self.config
-                    .command
-                    .as_deref()
-                    .ok_or_else(|| "missing command".to_string())?,
-                &self.config.args,
-                &self.config.env,
-                self.startup_timeout(),
-            )
-            .await?;
-            session.initialize().await?;
+            let mut guard = self.persistent_session.lock().await;
+
+            // Lazy-initialize: start MCP server once, reuse for all calls
+            if guard.is_none() {
+                tracing::info!(
+                    server = %self.config.server_name,
+                    tool = %self.tool_name,
+                    "Starting persistent MCP stdio session"
+                );
+                let mut session = StdioMcpSession::connect(
+                    self.config
+                        .command
+                        .as_deref()
+                        .ok_or_else(|| "missing command".to_string())?,
+                    &self.config.args,
+                    &self.config.env,
+                    self.startup_timeout(),
+                )
+                .await?;
+                session.initialize().await?;
+                *guard = Some(session);
+            }
+
+            let session = guard.as_mut().unwrap();
             let params = json!({ "name": self.tool_name, "arguments": arguments });
             let result = timeout(self.io_timeout(), session.request("tools/call", params))
                 .await
                 .map_err(|_| {
+                    // Session may be dead after timeout, drop it so next call reconnects
+                    *guard = None;
                     format!(
                         "mcp call timed out for server '{}' tool '{}'",
                         self.config.server_name, self.tool_name
                     )
-                })??;
-            let _ = session.shutdown().await;
-            Ok(result)
+                })?;
+
+            // If request failed, drop session so next call reconnects
+            if result.is_err() {
+                *guard = None;
+            }
+
+            result
         } else {
             let url = self
                 .config
