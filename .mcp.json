@@ -3,7 +3,8 @@
     "codex": {
       "command": "/opt/homebrew/bin/codex",
       "args": ["mcp-server"],
-      "startup_timeout_ms": 30000
+      "startup_timeout_ms": 30000,
+      "tool_timeout_ms": 300000
     }
   }
 }

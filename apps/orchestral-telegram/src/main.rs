@@ -91,8 +91,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         while let Some(msg) = rx.recv().await {
             let _ = worker_client.send_chat_action(msg.chat_id, "typing").await;
 
+            // Subscribe to events for progress feedback
+            let mut event_rx = worker_app.orchestrator.thread_runtime.subscribe_events();
+            let progress_client = worker_client.clone();
+            let progress_chat_id = msg.chat_id;
+            let progress_handle = tokio::spawn(async move {
+                let mut last_status = String::new();
+                loop {
+                    tokio::select! {
+                        // Keep typing indicator alive
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(4)) => {
+                            let _ = progress_client.send_chat_action(progress_chat_id, "typing").await;
+                        }
+                        // Process lifecycle events
+                        event = event_rx.recv() => {
+                            let Ok(event) = event else { continue };
+                            let status = match &event {
+                                orchestral::core::store::Event::SystemTrace { payload, .. } => {
+                                    let category = payload.get("category").and_then(|v| v.as_str());
+                                    let event_type = payload.get("event_type").and_then(|v| v.as_str());
+                                    match (category, event_type) {
+                                        (Some("runtime_lifecycle"), Some("planning_started")) => Some("Planning...".to_string()),
+                                        (Some("runtime_lifecycle"), Some("execution_started")) => Some("Executing...".to_string()),
+                                        (Some("execution_progress"), Some("step_started")) => {
+                                            let action = payload.get("metadata")
+                                                .and_then(|m| m.get("action"))
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("action");
+                                            Some(format!("Running {}...", action))
+                                        }
+                                        _ => None,
+                                    }
+                                }
+                                _ => None,
+                            };
+                            if let Some(status) = status {
+                                if status != last_status {
+                                    last_status = status.clone();
+                                    let _ = progress_client.send_chat_action(progress_chat_id, "typing").await;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
             match worker_app.run(&msg.text).await {
                 Ok(result) => {
+                    progress_handle.abort();
                     let reply = match result.status.as_str() {
                         "completed" => result.message.clone(),
                         "rejected" => "I'm busy, please wait a moment.".to_string(),
@@ -103,6 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(e) => {
+                    progress_handle.abort();
                     let reply = format!("Error: {}", e);
                     let _ = worker_client.send_message(msg.chat_id, &reply).await;
                 }
