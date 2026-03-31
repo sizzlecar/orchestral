@@ -86,6 +86,27 @@ impl TelegramClient {
         resp.into_result()
     }
 
+    pub async fn edit_message(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+    ) -> Result<Message, TelegramError> {
+        let resp: ApiResponse<Message> = self
+            .http
+            .post(self.api_url("editMessageText"))
+            .json(&serde_json::json!({
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": text
+            }))
+            .send()
+            .await?
+            .json()
+            .await?;
+        resp.into_result()
+    }
+
     pub async fn send_chat_action(
         &self,
         chat_id: i64,

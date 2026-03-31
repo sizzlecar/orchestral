@@ -96,7 +96,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let progress_client = worker_client.clone();
             let progress_chat_id = msg.chat_id;
             let progress_handle = tokio::spawn(async move {
-                let mut last_status = String::new();
+                let mut steps: Vec<String> = Vec::new();
+                let mut progress_msg_id: Option<i64> = None;
                 let mut typing_interval = tokio::time::interval(std::time::Duration::from_secs(4));
                 loop {
                     tokio::select! {
@@ -105,7 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         event = event_rx.recv() => {
                             let Ok(event) = event else { continue };
-                            let status = match &event {
+                            let step_label = match &event {
                                 orchestral::core::store::Event::SystemTrace { payload, .. } => {
                                     let category = payload.get("category").and_then(|v| v.as_str());
                                     let event_type = payload.get("event_type").and_then(|v| v.as_str());
@@ -117,27 +118,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 .and_then(|m| m.get("iteration"))
                                                 .and_then(|v| v.as_u64())
                                                 .unwrap_or(1);
-                                            if iteration == 1 {
-                                                Some("Thinking...".to_string())
+                                            if iteration <= 1 {
+                                                Some("\u{1f4ad} Thinking".to_string())
                                             } else {
-                                                Some(format!("Thinking... (round {})", iteration))
+                                                Some(format!("\u{1f4ad} Thinking (round {})", iteration))
                                             }
                                         }
                                         (Some("execution_progress"), _, Some("step_started")) => {
-                                            // action is a top-level field in execution_progress events
                                             let action = payload
                                                 .get("action")
                                                 .and_then(|v| v.as_str())
                                                 .unwrap_or("action");
                                             let label = match action {
-                                                a if a.contains("codex") => "Asking Codex...".to_string(),
-                                                a if a.contains("sls") || a.contains("log") => "Querying logs...".to_string(),
-                                                "shell" => "Running command...".to_string(),
-                                                "file_read" => "Reading file...".to_string(),
-                                                "file_write" => "Writing file...".to_string(),
-                                                "skill_activate" => "Loading skill...".to_string(),
-                                                "tool_lookup" => "Looking up tool...".to_string(),
-                                                _ => format!("Running {}...", action),
+                                                a if a.contains("codex") => "\u{1f916} Asking Codex".to_string(),
+                                                a if a.contains("sls") || a.contains("log") => "\u{1f50d} Querying logs".to_string(),
+                                                "shell" => "\u{2699}\u{fe0f} Running command".to_string(),
+                                                "file_read" => "\u{1f4c4} Reading file".to_string(),
+                                                "file_write" => "\u{270f}\u{fe0f} Writing file".to_string(),
+                                                "skill_activate" => "\u{1f4e6} Loading skill".to_string(),
+                                                "tool_lookup" => "\u{1f50e} Looking up tool".to_string(),
+                                                "http" => "\u{1f310} HTTP request".to_string(),
+                                                _ => format!("\u{25b6}\u{fe0f} {}", action),
                                             };
                                             Some(label)
                                         }
@@ -146,10 +147,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 _ => None,
                             };
-                            if let Some(status) = status {
-                                if status != last_status {
-                                    last_status = status.clone();
-                                    let _ = progress_client.send_message(progress_chat_id, &status).await;
+                            if let Some(label) = step_label {
+                                // Dedupe consecutive identical labels
+                                if steps.last().map(|s| s.as_str()) == Some(label.as_str()) {
+                                    continue;
+                                }
+                                steps.push(label);
+                                let progress_text = steps.join(" \u{2192} ");
+                                // Edit existing progress message or send a new one
+                                if let Some(mid) = progress_msg_id {
+                                    let _ = progress_client.edit_message(progress_chat_id, mid, &progress_text).await;
+                                } else if let Ok(sent) = progress_client.send_message(progress_chat_id, &progress_text).await {
+                                    progress_msg_id = Some(sent.message_id);
                                 }
                             }
                         }
