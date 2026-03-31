@@ -109,9 +109,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 orchestral::core::store::Event::SystemTrace { payload, .. } => {
                                     let category = payload.get("category").and_then(|v| v.as_str());
                                     let event_type = payload.get("event_type").and_then(|v| v.as_str());
+                                    let phase = payload.get("phase").and_then(|v| v.as_str());
                                     let metadata = payload.get("metadata");
-                                    match (category, event_type) {
-                                        (Some("runtime_lifecycle"), Some("planning_started")) => {
+                                    match (category, event_type, phase) {
+                                        (Some("runtime_lifecycle"), Some("planning_started"), _) => {
                                             let iteration = metadata
                                                 .and_then(|m| m.get("iteration"))
                                                 .and_then(|v| v.as_u64())
@@ -122,9 +123,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 Some(format!("Thinking... (round {})", iteration))
                                             }
                                         }
-                                        (Some("execution_progress"), Some("step_started")) => {
-                                            let action = metadata
-                                                .and_then(|m| m.get("action"))
+                                        (Some("execution_progress"), _, Some("step_started")) => {
+                                            // action is a top-level field in execution_progress events
+                                            let action = payload
+                                                .get("action")
                                                 .and_then(|v| v.as_str())
                                                 .unwrap_or("action");
                                             let label = match action {
