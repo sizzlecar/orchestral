@@ -15,21 +15,11 @@ All credentials and configuration are already set as environment variables. Do n
 
 Use `python3` (system Python, NOT .venv). The SDK is already installed globally.
 
-**Step 1: Always start with summary mode** to see error distribution:
 ```
-python3 scripts/sls_query.py --project PROJECT --logstore LOGSTORE --query "QUERY" --from-time="TIME_RANGE" --limit 100 --output summary
-```
-
-**Step 2: Query specific entries** if the user wants details:
-```
-python3 scripts/sls_query.py --project PROJECT --logstore LOGSTORE --query "QUERY" --from-time="TIME_RANGE" --limit 10
+python3 scripts/sls_query.py --project PROJECT --logstore LOGSTORE --query "QUERY" --from-time="TIME_RANGE" --limit 100
 ```
 
-Output options:
-- `--output summary` — grouped error counts (always use first)
-- `--output text` — individual entries with truncated messages (default 300 chars)
-- `--max-chars 500` — adjust truncation length
-- `--max-chars 0` — no truncation (full stack traces, use sparingly)
+Default output is a **summary** (grouped error counts). Add `--output text` only if user asks for specific log entries.
 
 Replace the placeholders as follows:
 
