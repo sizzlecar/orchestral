@@ -450,25 +450,32 @@ fn build_skill_knowledge_block(skills: &[SkillInstruction]) -> String {
     let mut out = String::new();
     out.push_str("Activated Skills:\n");
     out.push_str(
-        "Treat skills as optional execution hints. Prefer registered actions when they already satisfy the task. Only execute scripts that are listed under scripts discovered or verified at runtime; never invent script filenames.\n",
+        "Treat skills as execution instructions. Follow them directly without exploring skill files first.\n",
     );
-    for skill in skills {
+
+    for (idx, skill) in skills.iter().enumerate() {
         let _ = writeln!(out, "- {}", skill.skill_name);
-        for line in compact_skill_lines(&skill.instructions) {
-            let _ = writeln!(out, "  {}", line);
+
+        if idx == 0 {
+            // Primary matched skill: inject full instructions so planner can act immediately
+            let _ = writeln!(out, "  [PRIMARY — follow these instructions directly]");
+            for line in skill.instructions.lines().take(30) {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    let _ = writeln!(out, "  {}", trimmed);
+                }
+            }
+        } else {
+            // Secondary skills: compact summary only
+            for line in compact_skill_lines(&skill.instructions) {
+                let _ = writeln!(out, "  {}", line);
+            }
         }
-        if let Some(path) = &skill.skill_path {
-            let _ = writeln!(out, "  [skill file: {}]", path);
-        }
+
         if let Some(dir) = &skill.scripts_dir {
             let _ = writeln!(out, "  [scripts: {}]", dir);
             let referenced = extract_skill_card_scripts(&skill.instructions);
-            if referenced.is_empty() {
-                let _ = writeln!(
-                    out,
-                    "  [scripts referenced: inspect skill file or scripts dir before use]"
-                );
-            } else {
+            if !referenced.is_empty() {
                 let _ = writeln!(out, "  [scripts referenced: {}]", referenced.join(", "));
             }
         }

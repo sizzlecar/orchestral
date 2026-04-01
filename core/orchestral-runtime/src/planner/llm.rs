@@ -569,10 +569,10 @@ mod tests {
         let (system, _user) = planner.build_prompt(&intent, &context);
 
         assert!(system.contains("Activated Skills:"));
-        assert!(system.contains("never invent script filenames"));
+        assert!(system.contains("follow these instructions directly"));
         assert!(system.contains("- demo"));
         assert!(system.contains("Always write then verify."));
-        assert!(system.contains("[skill file: skills/demo/SKILL.md]"));
+        assert!(system.contains("[PRIMARY"));
         assert!(system.contains("[scripts: .claude/skills/demo/scripts]"));
         assert!(!system.contains("Action Catalog"));
     }
