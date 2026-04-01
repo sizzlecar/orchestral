@@ -33,3 +33,4 @@ logs/
 __pycache__/
 *.py
 .orchestral
+quan-search-bff
