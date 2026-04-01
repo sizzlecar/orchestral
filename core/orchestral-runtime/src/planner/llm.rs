@@ -357,6 +357,11 @@ impl<C: LlmClient> Planner for LlmPlanner<C> {
         let planner_context = selected_context.as_ref().unwrap_or(context);
 
         let (system, user) = self.build_prompt(intent, planner_context);
+        // Temporary: dump first iteration prompt for debugging
+        if context.loop_context.is_none() {
+            let _ = std::fs::write("/tmp/planner_system.txt", &system);
+            let _ = std::fs::write("/tmp/planner_user.txt", &user);
+        }
         info!(
             model = %self.config.model,
             temperature = self.config.temperature,

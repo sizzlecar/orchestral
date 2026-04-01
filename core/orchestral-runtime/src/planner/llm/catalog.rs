@@ -25,14 +25,14 @@ pub(super) fn build_capability_catalog(
     }
 
     if !mcp_lines.is_empty() {
-        out.push_str("MCP Tools (call tool_lookup first for input schema, then call the tool directly by its exact name):\n");
+        out.push_str("MCP Tools (directly callable by exact name):\n");
         for line in mcp_lines {
             let _ = writeln!(out, "- {}", line);
         }
     }
 
     if !skill_summaries.is_empty() {
-        out.push_str("Skills (use skill_activate to load full instructions before executing):\n");
+        out.push_str("Skills (if [PRIMARY] instructions are in Activated Skills section, follow directly; otherwise use skill_activate):\n");
         let mut sorted: Vec<_> = skill_summaries.to_vec();
         sorted.sort_by_key(|(name, _)| *name);
         for (name, description) in sorted {
@@ -246,9 +246,9 @@ mod tests {
         assert!(catalog.contains("input_fields: patch_spec (required)"));
         assert!(catalog.contains("output_fields: updated_paths (required)"));
         assert!(catalog
-            .contains("MCP Tools (call tool_lookup first for input schema, then call the tool directly by its exact name):"));
+            .contains("MCP Tools (directly callable by exact name):"));
         assert!(catalog
-            .contains("Skills (use skill_activate to load full instructions before executing):"));
+            .contains("Skills (if [PRIMARY] instructions are in Activated Skills section, follow directly; otherwise use skill_activate):"));
         assert!(catalog.contains("- xlsx: Spreadsheet automation"));
     }
 }
