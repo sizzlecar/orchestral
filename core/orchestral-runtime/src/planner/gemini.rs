@@ -91,8 +91,8 @@ struct GeminiGenerationConfig {
     temperature: f32,
     #[serde(rename = "maxOutputTokens")]
     max_output_tokens: u32,
-    #[serde(rename = "responseMimeType")]
-    response_mime_type: String,
+    #[serde(rename = "responseMimeType", skip_serializing_if = "Option::is_none")]
+    response_mime_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,7 +153,7 @@ impl LlmClient for GeminiClient {
             generation_config: GeminiGenerationConfig {
                 temperature: request.temperature,
                 max_output_tokens: self.config.max_tokens,
-                response_mime_type: "application/json".to_string(),
+                response_mime_type: None,
             },
         };
 

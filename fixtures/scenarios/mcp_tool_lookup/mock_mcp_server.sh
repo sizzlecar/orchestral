@@ -41,7 +41,8 @@ while IFS= read -r line; do
             send_response "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[{\"name\":\"greet\",\"description\":\"Generate a greeting message for a person\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"Person name\"},\"language\":{\"type\":\"string\",\"enum\":[\"en\",\"zh\"],\"description\":\"Greeting language\"}},\"required\":[\"name\"]}}]}}"
             ;;
         tools/call)
-            person_name=$(printf '%s' "$body" | sed -n 's/.*"name" *: *"\([^"]*\)".*/\1/p' | tail -1)
+            # Extract name from arguments block — match "arguments"..."name":"value"
+            person_name=$(printf '%s' "$body" | sed -n 's/.*"arguments"[^}]*"name" *: *"\([^"]*\)".*/\1/p')
             send_response "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"Hello, ${person_name:-World}!\"}]}}"
             ;;
         *)
