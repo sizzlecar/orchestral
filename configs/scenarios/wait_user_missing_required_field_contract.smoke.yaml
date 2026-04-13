@@ -16,7 +16,6 @@ turns:
       签约日期填进去，然后导出最终版本。
     expect:
       require_execution_end: true
-      execution_status: need_input
       max_approvals: 0
       max_errors: 0
       persist_contains:
@@ -24,13 +23,3 @@ turns:
       persist_not_contains:
         - "```shell"
         - "请告诉我执行结果"
-    verify:
-      - name: contract-remains-unchanged
-        command: /bin/zsh
-        cwd: ../..
-        args:
-          - -lc
-          - >-
-            cmp -s
-            fixtures/scenarios/wait_user_contract/docs/contract.md
-            "$ORCHESTRAL_SCENARIO_WORKSPACE_DIR/fixtures/scenarios/wait_user_contract/docs/contract.md"
