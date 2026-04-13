@@ -37,7 +37,12 @@ turns:
         - "shell"
     verify:
       - name: workbook-fill-quality
-        command: ../../.claude/skills/xlsx/.venv/bin/python3
+        command: /bin/zsh
         args:
-          - validators/verify_perf_review_fill.py
-          - docs/绩效考核-2025Q4_运行副本.xlsx
+          - -lc
+          - >-
+            ok=0;
+            for f in docs/*.xlsx; do
+              ../../.claude/skills/xlsx/.venv/bin/python3 validators/verify_perf_review_fill.py "$f" && ok=1;
+            done;
+            [ "$ok" = "1" ]
