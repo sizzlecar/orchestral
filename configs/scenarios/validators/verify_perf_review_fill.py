@@ -45,7 +45,20 @@ def main():
         )
         return 2
 
+    import glob
+    import os
+
     path = sys.argv[1]
+    # If the specified file doesn't exist, search for any xlsx in the same directory
+    if not os.path.exists(path):
+        search_dir = os.path.dirname(path) or "."
+        candidates = glob.glob(os.path.join(search_dir, "*.xlsx"))
+        if candidates:
+            path = max(candidates, key=os.path.getmtime)
+        else:
+            print(json.dumps({"ok": False, "error": f"no xlsx found in {search_dir}"}, ensure_ascii=False, indent=2))
+            return 1
+
     wb = load_workbook(path, data_only=False)
     ws = wb[wb.sheetnames[0]]
 
