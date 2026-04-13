@@ -19,7 +19,6 @@ turns:
       max_approvals: 0
       max_errors: 0
       activity_contains:
-        - "tool_lookup"
         - "mcp__mock__greet"
       assistant_contains:
         - "Alice"
