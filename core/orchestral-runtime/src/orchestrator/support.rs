@@ -137,10 +137,10 @@ pub(super) fn event_type_label(event: &Event) -> &'static str {
 }
 
 pub(super) fn summarize_working_set(snapshot: &HashMap<String, Value>) -> String {
-    const MAX_WS_SUMMARY_CHARS: usize = 16_000;
-    const LIMIT_STDOUT: usize = 4_000;
-    const LIMIT_STDERR: usize = 1_000;
-    const LIMIT_CONTENT: usize = 4_000;
+    const MAX_WS_SUMMARY_CHARS: usize = 6_000;
+    const LIMIT_STDOUT: usize = 2_000;
+    const LIMIT_STDERR: usize = 500;
+    const LIMIT_CONTENT: usize = 2_000;
     const LIMIT_DEFAULT: usize = 200;
 
     #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]

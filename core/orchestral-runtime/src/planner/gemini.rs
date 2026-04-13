@@ -19,6 +19,8 @@ pub struct GeminiClientConfig {
     pub endpoint: String,
     /// Temperature for generation (0.0 - 2.0).
     pub temperature: f32,
+    /// Maximum output tokens.
+    pub max_tokens: u32,
     /// Request timeout in seconds.
     pub timeout_secs: u64,
 }
@@ -30,6 +32,7 @@ impl Default for GeminiClientConfig {
             model: "gemini-3-flash-preview".to_string(),
             endpoint: "https://generativelanguage.googleapis.com/v1beta".to_string(),
             temperature: 0.2,
+            max_tokens: 8192,
             timeout_secs: 30,
         }
     }
@@ -86,6 +89,10 @@ struct GeminiPart {
 #[derive(Debug, Serialize)]
 struct GeminiGenerationConfig {
     temperature: f32,
+    #[serde(rename = "maxOutputTokens")]
+    max_output_tokens: u32,
+    #[serde(rename = "responseMimeType")]
+    response_mime_type: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -145,6 +152,8 @@ impl LlmClient for GeminiClient {
             },
             generation_config: GeminiGenerationConfig {
                 temperature: request.temperature,
+                max_output_tokens: self.config.max_tokens,
+                response_mime_type: "application/json".to_string(),
             },
         };
 

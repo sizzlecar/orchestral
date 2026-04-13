@@ -7,7 +7,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use llm_sdk::builder::{FunctionBuilder, LLMBackend, LLMBuilder};
-use llm_sdk::chat::{ChatMessage, ToolChoice};
+use llm_sdk::chat::{ChatMessage, StructuredOutputFormat, ToolChoice};
 use thiserror::Error;
 
 use orchestral_core::config::BackendSpec;
@@ -30,7 +30,7 @@ impl Default for LlmInvocationConfig {
         Self {
             model: "anthropic/claude-sonnet-4.5".to_string(),
             temperature: 0.2,
-            max_tokens: 4096,
+            max_tokens: 8192,
             normalize_response: true,
         }
     }
@@ -45,6 +45,8 @@ pub enum LlmBuildError {
     MissingApiKey,
     #[error("environment variable '{0}' not found")]
     EnvNotFound(String),
+    #[error("client config error: {0}")]
+    Config(String),
 }
 
 /// Factory trait for building LLM clients.
@@ -87,19 +89,42 @@ pub fn build_client_from_backend(
     backend: &BackendSpec,
     invocation: &LlmInvocationConfig,
 ) -> Result<Arc<dyn LlmClient>, LlmBuildError> {
-    let backend_kind = parse_backend(&backend.kind)?;
     let api_key = resolve_api_key(backend)?;
+    let max_tokens = backend
+        .get_config::<u32>("max_tokens")
+        .unwrap_or(invocation.max_tokens);
+    let timeout_secs = backend.get_config::<u64>("timeout_secs").unwrap_or(60);
+
+    // Use native Gemini client for Google backend — proper system_instruction
+    // and JSON response mode support.
+    if backend.kind == "google" {
+        let config = super::gemini::GeminiClientConfig {
+            api_key,
+            model: invocation.model.clone(),
+            endpoint: backend
+                .endpoint
+                .clone()
+                .unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1beta".to_string()),
+            temperature: invocation.temperature,
+            max_tokens,
+            timeout_secs,
+        };
+        let client = super::gemini::GeminiClient::new(config)
+            .map_err(|e| LlmBuildError::Config(e.to_string()))?;
+        tracing::info!("planner using native Gemini client with system_instruction + JSON mode");
+        return Ok(Arc::new(client));
+    }
+
+    let backend_kind = parse_backend(&backend.kind)?;
     let client = GranietLlmClient {
         backend: backend_kind,
         api_key: Some(api_key),
         base_url: backend.endpoint.clone(),
         model: invocation.model.clone(),
         temperature: invocation.temperature,
-        max_tokens: backend
-            .get_config::<u32>("max_tokens")
-            .unwrap_or(invocation.max_tokens),
+        max_tokens,
         normalize_response: invocation.normalize_response,
-        timeout_secs: backend.get_config::<u64>("timeout_secs").unwrap_or(60),
+        timeout_secs,
     };
     Ok(Arc::new(client))
 }
@@ -205,12 +230,23 @@ impl LlmClient for GranietLlmClient {
             request.temperature
         };
 
+        tracing::info!(
+            model = %model,
+            max_tokens = self.max_tokens,
+            "planner llm call"
+        );
         let mut builder = LLMBuilder::new()
             .backend(self.backend.clone())
             .model(model)
             .temperature(temperature)
             .max_tokens(self.max_tokens)
-            .normalize_response(self.normalize_response);
+            .normalize_response(self.normalize_response)
+            .schema(StructuredOutputFormat {
+                name: "planner_output".to_string(),
+                description: Some("Planner decision: one of SINGLE_ACTION, MINI_PLAN, DONE, or NEED_INPUT".to_string()),
+                schema: None,
+                strict: None,
+            });
         if let Some(endpoint) = &self.base_url {
             builder = builder.base_url(endpoint.clone());
         }
@@ -223,18 +259,48 @@ impl LlmClient for GranietLlmClient {
             .map_err(|e| LlmError::Http(format!("llm builder error: {}", e)))?;
 
         let messages = vec![ChatMessage::user().content(prompt).build()];
-        let response =
-            tokio::time::timeout(Duration::from_secs(self.timeout_secs), llm.chat(&messages))
-                .await
-                .map_err(|_| {
-                    LlmError::Http(format!("llm chat timeout after {}s", self.timeout_secs))
-                })?
-                .map_err(|e| LlmError::Http(format!("llm chat error: {}", e)))?;
 
-        response
-            .text()
-            .map(|s| s.to_string())
-            .ok_or_else(|| LlmError::Response("llm response had no text".to_string()))
+        // Retry on parse failure: LLM may occasionally produce malformed output.
+        const MAX_RETRIES: usize = 2;
+        let mut last_error = None;
+        for attempt in 0..=MAX_RETRIES {
+            let response = tokio::time::timeout(
+                Duration::from_secs(self.timeout_secs),
+                llm.chat(&messages),
+            )
+            .await
+            .map_err(|_| {
+                LlmError::Http(format!("llm chat timeout after {}s", self.timeout_secs))
+            })?
+            .map_err(|e| LlmError::Http(format!("llm chat error: {}", e)))?;
+
+            let text = match response.text().map(|s| s.to_string()) {
+                Some(t) => t,
+                None => {
+                    last_error = Some("llm response had no text".to_string());
+                    if attempt < MAX_RETRIES {
+                        tracing::warn!(attempt, "planner llm returned empty, retrying");
+                        continue;
+                    }
+                    return Err(LlmError::Response(last_error.unwrap()));
+                }
+            };
+
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let escaped = text.replace('\n', "\\n").replace('\r', "\\r");
+                let preview: String = escaped.chars().take(800).collect();
+                tracing::debug!(
+                    response_text_len = text.len(),
+                    attempt,
+                    "planner llm response: {}", preview
+                );
+            }
+
+            return Ok(text);
+        }
+        Err(LlmError::Response(
+            last_error.unwrap_or_else(|| "planner llm exhausted retries".to_string()),
+        ))
     }
 
     async fn complete_with_tools(

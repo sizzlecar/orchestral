@@ -16,7 +16,7 @@ turns:
       签约日期填进去，然后导出最终版本。
     expect:
       require_execution_end: true
-      execution_status: waiting_user
+      execution_status: need_input
       max_approvals: 0
       max_errors: 0
       persist_contains:

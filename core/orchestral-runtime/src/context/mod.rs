@@ -240,6 +240,12 @@ impl ContextBuilder for BasicContextBuilder {
                 }
             }
 
+            // Layer 1.5: Prune old tool/system outputs outside the tail window.
+            // Outputs >200 chars in the non-tail region are replaced with a short
+            // placeholder. This is a cheap, LLM-free way to reclaim context budget
+            // while preserving recent outputs that the planner is most likely to need.
+            prune_old_tool_outputs(&mut slices);
+
             // Layer 2: FIFO eviction of old system/tool slices when over budget.
             // Keep first 2 + last N slices intact, replace old system slices with traces.
             let total_tokens: usize = slices
@@ -272,6 +278,31 @@ impl ContextBuilder for BasicContextBuilder {
         }
 
         Ok(window)
+    }
+}
+
+/// Replace old system/tool outputs outside the tail window with short placeholders.
+/// Preserves the most recent outputs (tail_keep fraction) since the planner is most
+/// likely to reference them. Outputs ≤200 chars are kept as-is everywhere.
+fn prune_old_tool_outputs(slices: &mut [ContextSlice]) {
+    const PRUNE_THRESHOLD_CHARS: usize = 200;
+    let total = slices.len();
+    if total <= 4 {
+        return;
+    }
+    // Protect the last 1/3 of slices (same ratio used by Layer 2 tail_keep).
+    let tail_keep = (total / 3).max(2);
+    let prune_end = total.saturating_sub(tail_keep);
+
+    for slice in slices.iter_mut().take(prune_end) {
+        if slice.role != "system" {
+            continue;
+        }
+        let char_count = slice.content.chars().count();
+        if char_count > PRUNE_THRESHOLD_CHARS {
+            slice.content = format!("[output cleared, {} chars]", char_count);
+            slice.weight = 0.1;
+        }
     }
 }
 

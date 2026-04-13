@@ -371,7 +371,7 @@ fn test_summarize_working_set_applies_semantic_limits() {
         .strip_prefix("  stdout: \"")
         .and_then(|line| line.strip_suffix('"'))
         .expect("stdout quoted value");
-    assert_eq!(stdout_value.chars().count(), 4_000);
+    assert_eq!(stdout_value.chars().count(), 2_000);
 
     let stderr_line = summary
         .lines()
@@ -381,7 +381,7 @@ fn test_summarize_working_set_applies_semantic_limits() {
         .strip_prefix("  stderr: \"")
         .and_then(|line| line.strip_suffix('"'))
         .expect("stderr quoted value");
-    assert_eq!(stderr_value.chars().count(), 1_000);
+    assert_eq!(stderr_value.chars().count(), 500);
 
     let path_line = summary
         .lines()
@@ -401,7 +401,7 @@ fn test_summarize_working_set_applies_semantic_limits() {
         .strip_prefix("  reader.content: \"")
         .and_then(|line| line.strip_suffix('"'))
         .expect("content quoted value");
-    assert_eq!(content_value.chars().count(), 4_000);
+    assert_eq!(content_value.chars().count(), 2_000);
 }
 
 #[test]

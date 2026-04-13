@@ -8,7 +8,7 @@ pub(super) struct ActionContract {
 }
 
 impl PlanNormalizer {
-    pub(super) fn apply_implicit_contracts(&self, plan: &mut Plan) {
+    pub(super) fn apply_implicit_contracts(&self, plan: &mut Plan, fix_summary: &mut Vec<String>) {
         let known_step_ids = plan
             .steps
             .iter()
@@ -44,14 +44,31 @@ impl PlanNormalizer {
                     to_kind = ?step.kind,
                     "normalizer inferred step kind"
                 );
+                fix_summary.push(format!(
+                    "step {}: kind changed {:?} -> {:?}",
+                    step.id, original_kind, step.kind
+                ));
             }
             if step.depends_on != original_depends_on {
+                let added: Vec<_> = step
+                    .depends_on
+                    .iter()
+                    .filter(|d| !original_depends_on.contains(d))
+                    .map(|d| d.to_string())
+                    .collect();
                 tracing::debug!(
                     step_id = %step.id,
                     action = %step.action,
                     depends_on = ?step.depends_on,
                     "normalizer derived depends_on from io_bindings/templates"
                 );
+                if !added.is_empty() {
+                    fix_summary.push(format!(
+                        "step {}: added depends_on [{}]",
+                        step.id,
+                        added.join(", ")
+                    ));
+                }
             }
             if step.exports != original_exports {
                 tracing::debug!(
@@ -60,6 +77,11 @@ impl PlanNormalizer {
                     exports = ?step.exports,
                     "normalizer populated exports from action output schema"
                 );
+                fix_summary.push(format!(
+                    "step {}: exports set to [{}]",
+                    step.id,
+                    step.exports.join(", ")
+                ));
             }
             if step.params != original_params {
                 tracing::debug!(
@@ -68,12 +90,13 @@ impl PlanNormalizer {
                     params = ?step.params,
                     "normalizer updated step params"
                 );
+                fix_summary.push(format!("step {}: params adjusted", step.id));
             }
         }
     }
 }
 
-pub(super) fn fix_control_flow_dependencies(plan: &mut Plan) {
+pub(super) fn fix_control_flow_dependencies(plan: &mut Plan, fix_summary: &mut Vec<String>) {
     let step_ids: Vec<StepId> = plan.steps.iter().map(|s| s.id.clone()).collect();
     for i in 0..plan.steps.len() {
         let step = &plan.steps[i];
@@ -89,6 +112,10 @@ pub(super) fn fix_control_flow_dependencies(plan: &mut Plan) {
                 deps = ?preceding,
                 "normalizer auto-assigned depends_on for control-flow step"
             );
+            fix_summary.push(format!(
+                "step {}: auto-assigned depends_on for {:?}",
+                plan.steps[i].id, plan.steps[i].kind
+            ));
             plan.steps[i].depends_on = preceding;
         }
     }

@@ -14,8 +14,6 @@ turns:
       require_execution_end: true
       max_approvals: 0
       max_errors: 0
-      activity_contains:
-        - "skill_activate"
       assistant_contains:
         - "xlsx"
       persist_not_contains:

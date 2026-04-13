@@ -92,6 +92,8 @@ pub struct NormalizedPlan {
     pub plan: Plan,
     /// The executable DAG
     pub dag: ExecutionDag,
+    /// Human-readable summary of fixes applied during normalization (empty if none).
+    pub fix_summary: Vec<String>,
 }
 
 /// Plan normalizer - the stability core
@@ -137,17 +139,19 @@ impl PlanNormalizer {
 
     /// Normalize a plan
     pub fn normalize(&self, mut plan: Plan) -> Result<NormalizedPlan, NormalizeError> {
+        let mut fix_summary: Vec<String> = Vec::new();
+
         // Step 1: Run fixers (they may fix issues before validation)
         for fixer in &self.fixers {
             fixer.fix(&mut plan)?;
         }
 
         // Step 2: Apply built-in normalization derived from action contracts.
-        self.apply_implicit_contracts(&mut plan);
+        self.apply_implicit_contracts(&mut plan, &mut fix_summary);
 
         // Step 2.5: Control-flow steps (replan/wait) without explicit depends_on
         // must depend on all preceding steps to avoid premature execution.
-        fix_control_flow_dependencies(&mut plan);
+        fix_control_flow_dependencies(&mut plan, &mut fix_summary);
 
         // Step 3: Run built-in validations
         self.validate_basic(&plan)?;
@@ -160,7 +164,11 @@ impl PlanNormalizer {
         // Step 5: Build the execution DAG
         let dag = self.build_dag(&plan)?;
 
-        Ok(NormalizedPlan { plan, dag })
+        Ok(NormalizedPlan {
+            plan,
+            dag,
+            fix_summary,
+        })
     }
 }
 

@@ -245,8 +245,7 @@ mod tests {
         assert!(catalog.contains("output_fields: content (required)"));
         assert!(catalog.contains("input_fields: patch_spec (required)"));
         assert!(catalog.contains("output_fields: updated_paths (required)"));
-        assert!(catalog
-            .contains("MCP Tools (directly callable by exact name):"));
+        assert!(catalog.contains("MCP Tools (directly callable by exact name):"));
         assert!(catalog
             .contains("Skills (if [PRIMARY] instructions are in Activated Skills section, follow directly; otherwise use skill_activate):"));
         assert!(catalog.contains("- xlsx: Spreadsheet automation"));

@@ -409,6 +409,10 @@ impl Action for ShellAction {
         let stderr_summary = stderr_preview(&stderr, 280);
 
         let mut exports = Map::new();
+        // Trim trailing whitespace from stdout/stderr to prevent newline pollution
+        // in downstream template references (e.g. {{step.stdout}} used as a file path).
+        let stdout = stdout.trim_end().to_string();
+        let stderr = stderr.trim_end().to_string();
         exports.insert("stdout".to_string(), Value::String(stdout));
         exports.insert("stderr".to_string(), Value::String(stderr));
         exports.insert("status".to_string(), Value::Number(status.into()));

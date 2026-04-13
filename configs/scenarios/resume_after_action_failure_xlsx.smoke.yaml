@@ -12,10 +12,10 @@ workspace:
 turns:
   - name: fail-once-during-commit-apply
     input: >
-      用 xlsx skill 看 docs 目前下的 excel 内容，把需要填的都填了。
+      用 xlsx skill 看 docs 目前下的 excel 内容，把需要填的都用合理的示例数据填了，不需要问我具体填什么。
     expect:
       require_execution_end: true
-      execution_status: waiting_user
+      execution_status: need_input
       max_approvals: 0
       max_errors: 1
       persist_contains:

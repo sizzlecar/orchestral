@@ -4,6 +4,8 @@ pub(super) struct PlanExecutionSnapshot {
     pub(super) result: ExecutionResult,
     pub(super) completed_step_ids: Vec<StepId>,
     pub(super) working_set_snapshot: HashMap<String, Value>,
+    /// Summary of normalizer fixes applied to the plan (empty if none).
+    pub(super) normalizer_fixes: Vec<String>,
 }
 
 impl Orchestrator {
@@ -12,7 +14,7 @@ impl Orchestrator {
         task: &mut Task,
         interaction_id: &str,
         resume_event: Option<&Event>,
-    ) -> Result<ExecutionResult, OrchestratorError> {
+    ) -> Result<PlanExecutionSnapshot, OrchestratorError> {
         let initial_plan = task
             .plan
             .clone()
@@ -48,12 +50,13 @@ impl Orchestrator {
             ws_keys = ?run.working_set_snapshot.keys().collect::<Vec<_>>(),
             "orchestrator checkpoint snapshot"
         );
-        task.set_checkpoint(run.completed_step_ids, run.working_set_snapshot);
+        task.set_checkpoint(
+            run.completed_step_ids.clone(),
+            run.working_set_snapshot.clone(),
+        );
         self.task_store.save(task).await?;
 
-        let final_result = run.result;
-
-        let new_state = task_state_from_execution(&final_result);
+        let new_state = task_state_from_execution(&run.result);
         task.set_state(new_state.clone());
         self.task_store.save(task).await?;
         self.thread_runtime
@@ -66,7 +69,7 @@ impl Orchestrator {
             "orchestrator execute_existing_task finished"
         );
 
-        Ok(final_result)
+        Ok(run)
     }
 
     pub(super) async fn execute_plan_once(
@@ -77,6 +80,15 @@ impl Orchestrator {
         resume_event: Option<&Event>,
     ) -> Result<PlanExecutionSnapshot, OrchestratorError> {
         let normalized = self.normalizer.normalize(plan.clone())?;
+        let normalizer_fixes = normalized.fix_summary;
+        if !normalizer_fixes.is_empty() {
+            tracing::info!(
+                interaction_id = %interaction_id,
+                task_id = %task.id,
+                fixes = ?normalizer_fixes,
+                "normalizer applied fixes to plan"
+            );
+        }
         if tracing::enabled!(tracing::Level::DEBUG) {
             tracing::debug!(
                 interaction_id = %interaction_id,
@@ -147,6 +159,7 @@ impl Orchestrator {
             result,
             completed_step_ids,
             working_set_snapshot,
+            normalizer_fixes,
         })
     }
 

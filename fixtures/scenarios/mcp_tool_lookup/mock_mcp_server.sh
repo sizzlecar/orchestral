@@ -1,33 +1,34 @@
 #!/bin/sh
 # Minimal MCP server mock that responds to initialize + tools/list + tools/call.
-# Speaks JSONRPC 2.0 over stdio with Content-Length framing.
+# Supports both NDJSON (one JSON object per line) and Content-Length framing.
 
 send_response() {
     local body="$1"
-    local len=${#body}
-    printf "Content-Length: %d\r\n\r\n%s" "$len" "$body"
+    printf "%s\n" "$body"
 }
 
 # Read and respond to requests in a loop
-request_id=0
-while true; do
-    # Read Content-Length header
-    read -r header_line
-    case "$header_line" in
-        Content-Length:*) ;;
+while IFS= read -r line; do
+    # Skip empty lines and Content-Length headers
+    case "$line" in
+        "") continue ;;
+        Content-Length:*) continue ;;
+    esac
+
+    # Strip trailing \r if present
+    line=$(printf '%s' "$line" | tr -d '\r')
+
+    # Skip non-JSON lines
+    case "$line" in
+        \{*) ;;
         *) continue ;;
     esac
-    content_length=$(echo "$header_line" | sed 's/Content-Length: *//;s/\r//')
 
-    # Read empty line
-    read -r _blank
+    body="$line"
 
-    # Read body
-    body=$(dd bs=1 count="$content_length" 2>/dev/null)
-
-    # Extract method
-    method=$(echo "$body" | sed -n 's/.*"method" *: *"\([^"]*\)".*/\1/p')
-    id=$(echo "$body" | sed -n 's/.*"id" *: *\([0-9]*\).*/\1/p')
+    # Extract method and id with sed
+    method=$(printf '%s' "$body" | sed -n 's/.*"method" *: *"\([^"]*\)".*/\1/p')
+    id=$(printf '%s' "$body" | sed -n 's/.*"id" *: *\([0-9]*\).*/\1/p')
 
     case "$method" in
         initialize)
@@ -40,8 +41,7 @@ while true; do
             send_response "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[{\"name\":\"greet\",\"description\":\"Generate a greeting message for a person\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"Person name\"},\"language\":{\"type\":\"string\",\"enum\":[\"en\",\"zh\"],\"description\":\"Greeting language\"}},\"required\":[\"name\"]}}]}}"
             ;;
         tools/call)
-            # Extract the name argument from the call
-            person_name=$(echo "$body" | sed -n 's/.*"name" *: *"\([^"]*\)".*/\1/p' | tail -1)
+            person_name=$(printf '%s' "$body" | sed -n 's/.*"name" *: *"\([^"]*\)".*/\1/p' | tail -1)
             send_response "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"Hello, ${person_name:-World}!\"}]}}"
             ;;
         *)

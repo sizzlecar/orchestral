@@ -1,6 +1,7 @@
 use super::agent_loop::{
     agent_loop_iteration_limit_error, should_continue_agent_loop, AgentLoopState,
 };
+use super::execution::PlanExecutionSnapshot;
 use super::output::render_output_template;
 use super::*;
 use orchestral_core::planner::SingleAction;
@@ -96,7 +97,7 @@ impl Orchestrator {
                 PlannerOutput::SingleAction(call) => {
                     let action_meta = validate_single_action(&call, &context.available_actions)?;
                     let plan = build_single_action_plan(&task.intent.content, &call);
-                    let result = self
+                    let snapshot = self
                         .execute_planner_plan_iteration(
                             interaction_id.as_str(),
                             &mut task,
@@ -106,6 +107,7 @@ impl Orchestrator {
                             Some(action_meta.name.as_str()),
                         )
                         .await?;
+                    let result = snapshot.result;
 
                     if matches!(
                         result,
@@ -132,6 +134,7 @@ impl Orchestrator {
                             &plan,
                             &result,
                             &task,
+                            &snapshot.normalizer_fixes,
                         );
                         self.prepare_for_next_planner_iteration(interaction_id.as_str(), &mut task)
                             .await?;
@@ -158,6 +161,7 @@ impl Orchestrator {
                             &plan,
                             &result,
                             &task,
+                            &snapshot.normalizer_fixes,
                         );
                         return self
                             .fail_agent_loop_after_completed_execution(
@@ -181,7 +185,7 @@ impl Orchestrator {
                 }
                 PlannerOutput::MiniPlan(plan) => {
                     let plan = validate_and_prepare_mini_plan(plan, &context.available_actions)?;
-                    let result = self
+                    let snapshot = self
                         .execute_planner_plan_iteration(
                             interaction_id.as_str(),
                             &mut task,
@@ -191,6 +195,7 @@ impl Orchestrator {
                             None,
                         )
                         .await?;
+                    let result = snapshot.result;
 
                     if matches!(
                         result,
@@ -211,7 +216,14 @@ impl Orchestrator {
                         iteration,
                         self.config.max_planner_iterations,
                     ) {
-                        loop_state.record_iteration(iteration, "mini_plan", &plan, &result, &task);
+                        loop_state.record_iteration(
+                            iteration,
+                            "mini_plan",
+                            &plan,
+                            &result,
+                            &task,
+                            &snapshot.normalizer_fixes,
+                        );
                         self.prepare_for_next_planner_iteration(interaction_id.as_str(), &mut task)
                             .await?;
                         self.emit_lifecycle_event(
@@ -231,7 +243,14 @@ impl Orchestrator {
                     }
 
                     if matches!(result, ExecutionResult::Completed) {
-                        loop_state.record_iteration(iteration, "mini_plan", &plan, &result, &task);
+                        loop_state.record_iteration(
+                            iteration,
+                            "mini_plan",
+                            &plan,
+                            &result,
+                            &task,
+                            &snapshot.normalizer_fixes,
+                        );
                         return self
                             .fail_agent_loop_after_completed_execution(
                                 interaction_id,
@@ -335,7 +354,7 @@ impl Orchestrator {
         iteration: usize,
         execution_mode: &str,
         action_name: Option<&str>,
-    ) -> Result<ExecutionResult, OrchestratorError> {
+    ) -> Result<PlanExecutionSnapshot, OrchestratorError> {
         // Lifecycle hook: on_plan_created (can mutate plan)
         let turn_ctx = TurnContext::new(
             self.thread_runtime.thread_id().await.to_string(),
@@ -389,13 +408,13 @@ impl Orchestrator {
         )
         .await;
 
-        let result = self
+        let snapshot = self
             .execute_existing_task(task, interaction_id, None)
             .await?;
 
         // Lifecycle hook: on_execution_complete
         self.lifecycle_hooks
-            .on_execution_complete(&result, &turn_ctx)
+            .on_execution_complete(&snapshot.result, &turn_ctx)
             .await;
 
         self.emit_lifecycle_event(
@@ -404,9 +423,9 @@ impl Orchestrator {
             Some(task.id.as_str()),
             Some("execution completed"),
             {
-                let mut meta = execution_result_metadata(&result);
+                let mut meta = execution_result_metadata(&snapshot.result);
                 let continue_agent_loop = should_continue_agent_loop(
-                    &result,
+                    &snapshot.result,
                     iteration,
                     self.config.max_planner_iterations,
                 );
@@ -431,7 +450,7 @@ impl Orchestrator {
             },
         )
         .await;
-        Ok(result)
+        Ok(snapshot)
     }
 
     async fn prepare_for_next_planner_iteration(
@@ -696,17 +715,15 @@ fn materialize_done_message(task: &Task, message: &str) -> Result<String, Orches
         &task.working_set_snapshot,
         std::iter::empty::<(String, Value)>(),
     )
-    .map_err(|err| {
+    .unwrap_or_else(|err| {
         tracing::warn!(
             task_id = %task.id,
             raw_message = %truncate_for_log(message, 400),
             error = %err,
-            "planner done message template resolution failed"
+            "planner done message template resolution failed, using raw message"
         );
-        OrchestratorError::Planner(PlanError::Generation(format!(
-            "DONE.message template resolution failed: {err}"
-        )))
-    })?;
+        message.to_string()
+    });
 
     if rendered != message {
         tracing::info!(
@@ -1086,18 +1103,16 @@ mod tests {
     }
 
     #[test]
-    fn test_materialize_done_message_rejects_missing_placeholders() {
+    fn test_materialize_done_message_falls_back_on_missing_placeholders() {
         let task = Task::new(orchestral_core::types::Intent::new("inspect workbook"));
 
-        let err = materialize_done_message(
+        let rendered = materialize_done_message(
             &task,
             "共有 {{inspect_spreadsheet.inspection.selected_region.row_count}} 行。",
         )
-        .expect_err("missing binding should fail");
+        .expect("missing binding should fall back to raw message");
 
-        assert!(err
-            .to_string()
-            .contains("DONE.message template resolution failed"));
+        assert!(rendered.contains("{{inspect_spreadsheet"));
     }
 
     #[test]

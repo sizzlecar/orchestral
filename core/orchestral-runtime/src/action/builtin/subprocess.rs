@@ -25,7 +25,8 @@ impl SubprocessAction {
     pub(super) fn from_spec(spec: &ActionSpec) -> Self {
         Self {
             name: spec.name.clone(),
-            description: spec.description_or("Runs a long-lived subprocess (e.g. codex, claude, build tools)"),
+            description: spec
+                .description_or("Runs a long-lived subprocess (e.g. codex, claude, build tools)"),
         }
     }
 }
@@ -156,9 +157,7 @@ impl Action for SubprocessAction {
         let (exit_status, timed_out) =
             match timeout(Duration::from_millis(timeout_ms), child.wait()).await {
                 Ok(Ok(status)) => (Some(status), false),
-                Ok(Err(e)) => {
-                    return ActionResult::error(format!("Subprocess wait failed: {}", e))
-                }
+                Ok(Err(e)) => return ActionResult::error(format!("Subprocess wait failed: {}", e)),
                 Err(_) => {
                     info!(
                         action = %self.name,

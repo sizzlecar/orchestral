@@ -166,7 +166,7 @@ impl Orchestrator {
             serde_json::json!({ "resume": true }),
         )
         .await;
-        let result = self
+        let snapshot = self
             .execute_existing_task(&mut task, interaction_id.as_str(), Some(&event))
             .await?;
         self.emit_lifecycle_event(
@@ -174,16 +174,16 @@ impl Orchestrator {
             Some(interaction_id.as_str()),
             Some(task.id.as_str()),
             Some("execution completed"),
-            execution_result_metadata(&result),
+            execution_result_metadata(&snapshot.result),
         )
         .await;
-        self.emit_interpreted_output(interaction_id.as_str(), &task, &result)
+        self.emit_interpreted_output(interaction_id.as_str(), &task, &snapshot.result)
             .await;
 
         Ok(OrchestratorResult::Merged {
             interaction_id,
             task_id: task.id.clone(),
-            result,
+            result: snapshot.result,
         })
     }
 }

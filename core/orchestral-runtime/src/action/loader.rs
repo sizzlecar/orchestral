@@ -16,10 +16,10 @@ use super::builtin::session::SessionAction;
 use super::builtin::skill_activate::SkillActivateAction;
 use super::builtin::tool_lookup::ToolLookupAction;
 use super::builtin::JsonStdoutAction;
-use crate::session::SessionManager;
 use super::factory::{ActionBuildError, ActionFactory};
 use super::mcp::probe_mcp_server_tools;
 use super::providers::{collect_action_registration_specs, ActionRegistrationSpec};
+use crate::session::SessionManager;
 use crate::skill::SkillCatalog;
 
 /// Action config errors

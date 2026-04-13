@@ -2,7 +2,9 @@ use std::collections::BTreeSet;
 use std::fmt::Write;
 
 use orchestral_core::action::ActionMeta;
-use orchestral_core::planner::{HistoryItem, PlannerContext, PlannerLoopContext, SkillInstruction};
+use orchestral_core::planner::{
+    BudgetPressure, HistoryItem, PlannerContext, PlannerLoopContext, SkillInstruction,
+};
 use orchestral_core::types::Intent;
 
 use super::catalog::build_capability_catalog;
@@ -363,6 +365,23 @@ fn build_loop_context_block(loop_context: &PlannerLoopContext) -> String {
         "Observed Execution State:\n- iteration: {}/{}",
         loop_context.iteration, loop_context.max_iterations
     );
+    match &loop_context.budget_pressure {
+        BudgetPressure::Caution { remaining } => {
+            let _ = writeln!(
+                out,
+                "- ⚠ BUDGET CAUTION: Only {} iteration(s) remaining. Consolidate remaining work and avoid exploratory actions.",
+                remaining
+            );
+        }
+        BudgetPressure::Warning { remaining } => {
+            let _ = writeln!(
+                out,
+                "- 🚨 BUDGET CRITICAL: Only {} iteration(s) left. Return DONE with your best answer NOW or NEED_INPUT if blocked. Do NOT plan further actions.",
+                remaining
+            );
+        }
+        BudgetPressure::None => {}
+    }
     if !loop_context.completed_step_ids.is_empty() {
         let _ = writeln!(
             out,
@@ -538,7 +557,7 @@ fn resolve_python_path(skills: &[SkillInstruction]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use orchestral_core::action::ActionMeta;
-    use orchestral_core::planner::{PlannerContext, PlannerLoopContext};
+    use orchestral_core::planner::{BudgetPressure, PlannerContext, PlannerLoopContext};
     use serde_json::json;
 
     use super::*;
@@ -576,6 +595,7 @@ mod tests {
                 available_bindings: vec!["{{single_action.stdout}}".into()],
                 binding_shapes: vec!["{{single_action.stdout}} -> string".into()],
                 working_set_preview: Some("  single_action.stdout: \"README.md\"".into()),
+                budget_pressure: BudgetPressure::None,
             },
         );
 
@@ -628,6 +648,7 @@ mod tests {
             available_bindings: vec!["{{diagnostics.count}}".into()],
             binding_shapes: vec!["{{diagnostics.count}} -> number".into()],
             working_set_preview: Some("  diagnostics.count: 4".into()),
+            budget_pressure: BudgetPressure::None,
         });
 
         let (system, user) = build_action_selector_prompt(

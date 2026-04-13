@@ -1,5 +1,6 @@
 use super::*;
 use crate::orchestrator::support::{summarize_available_bindings, summarize_binding_shapes};
+use orchestral_core::planner::BudgetPressure;
 use orchestral_core::types::Plan;
 
 const MAX_RECENT_OBSERVATIONS: usize = 4;
@@ -36,6 +37,7 @@ impl AgentLoopState {
             available_bindings: self.available_bindings.clone(),
             binding_shapes: self.binding_shapes.clone(),
             working_set_preview: self.working_set_preview.clone(),
+            budget_pressure: BudgetPressure::from_iteration(iteration, max_iterations),
         })
     }
 
@@ -46,9 +48,16 @@ impl AgentLoopState {
         plan: &Plan,
         result: &ExecutionResult,
         task: &Task,
+        normalizer_fixes: &[String],
     ) {
-        let observation =
-            build_iteration_observation(iteration, execution_mode, plan, result, task);
+        let observation = build_iteration_observation(
+            iteration,
+            execution_mode,
+            plan,
+            result,
+            task,
+            normalizer_fixes,
+        );
         self.recent_observations.push(observation);
         if self.recent_observations.len() > MAX_RECENT_OBSERVATIONS {
             let drain = self.recent_observations.len() - MAX_RECENT_OBSERVATIONS;
@@ -100,6 +109,7 @@ fn build_iteration_observation(
     plan: &Plan,
     result: &ExecutionResult,
     task: &Task,
+    normalizer_fixes: &[String],
 ) -> String {
     let mut observation = format!(
         "iteration {} ran {} plan '{}' ({} step(s): {})",
@@ -109,6 +119,12 @@ fn build_iteration_observation(
         plan.steps.len(),
         summarize_plan_actions(plan)
     );
+    if !normalizer_fixes.is_empty() {
+        observation.push_str(&format!(
+            "; normalizer_fixes=[{}]",
+            normalizer_fixes.join("; ")
+        ));
+    }
     match result {
         ExecutionResult::Completed => {
             observation.push_str("; result=completed");

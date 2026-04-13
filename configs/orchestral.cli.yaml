@@ -135,20 +135,20 @@ providers:
       kind: openai
       api_key_env: OPENAI_API_KEY
       config:
-        max_tokens: 4096
+        max_tokens: 16384
         timeout_secs: 120
     - name: google
       kind: google
       api_key_env: GOOGLE_API_KEY
       config:
-        max_tokens: 4096
+        max_tokens: 16384
         timeout_secs: 120
         interpreter_timeout_secs: 8
     - name: anthropic
       kind: anthropic
       api_key_env: ANTHROPIC_API_KEY
       config:
-        max_tokens: 4096
+        max_tokens: 16384
         timeout_secs: 120
         interpreter_timeout_secs: 8
     - name: openrouter
@@ -156,7 +156,7 @@ providers:
       api_key_env: OPENROUTER_API_KEY
       endpoint: https://openrouter.ai/api/v1/
       config:
-        max_tokens: 4096
+        max_tokens: 16384
         timeout_secs: 120
   models:
     - name: gpt-4o-mini

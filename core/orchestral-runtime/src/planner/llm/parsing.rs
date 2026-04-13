@@ -79,21 +79,124 @@ pub(super) fn parse_action_selection(json: &str) -> Result<ActionSelection, Plan
 }
 
 pub(super) fn extract_json(text: &str) -> Option<String> {
+    // First try: extract verbatim JSON object.
+    if let Some(json) = extract_json_verbatim(text) {
+        return Some(json);
+    }
+
+    // Second try: strip markdown code fences and retry.
+    let stripped = strip_markdown_code_fences(text);
+    if stripped != text {
+        if let Some(json) = extract_json_verbatim(&stripped) {
+            return Some(json);
+        }
+    }
+
+    // Third try: apply common LLM JSON repairs and retry.
+    let repaired = repair_json_text(&stripped);
+    if repaired != stripped {
+        if let Some(json) = extract_json_verbatim(&repaired) {
+            return Some(json);
+        }
+    }
+
+    None
+}
+
+fn extract_json_verbatim(text: &str) -> Option<String> {
+    let mut fallback: Option<String> = None;
     for (start, ch) in text.char_indices() {
         if ch != '{' {
             continue;
         }
         if let Some(end) = find_json_object_end(text, start) {
             let candidate = &text[start..=end];
-            if serde_json::from_str::<serde_json::Value>(candidate)
-                .map(|v| v.is_object())
-                .unwrap_or(false)
-            {
-                return Some(candidate.to_string());
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(candidate) {
+                if v.is_object() {
+                    // Prefer objects with a "type" field (planner output envelope)
+                    if v.get("type").is_some() {
+                        return Some(candidate.to_string());
+                    }
+                    if fallback.is_none() {
+                        fallback = Some(candidate.to_string());
+                    }
+                }
             }
         }
     }
-    None
+    fallback
+}
+
+/// Strip markdown code fences (```json ... ``` or ``` ... ```).
+fn strip_markdown_code_fences(text: &str) -> String {
+    let mut result = text.to_string();
+    // Remove opening fence: ```json or ```
+    if let Some(start) = result.find("```") {
+        let fence_end = result[start + 3..]
+            .find('\n')
+            .map(|p| start + 3 + p + 1)
+            .unwrap_or(start + 3);
+        result = format!("{}{}", &result[..start], &result[fence_end..]);
+    }
+    // Remove closing fence
+    if let Some(end) = result.rfind("```") {
+        result = format!("{}{}", &result[..end], &result[end + 3..]);
+    }
+    result
+}
+
+/// Fix common LLM JSON output errors:
+/// - Trailing commas before } or ]
+/// - Single unclosed } or ] at the end
+fn repair_json_text(text: &str) -> String {
+    let mut result = text.to_string();
+
+    // Fix trailing commas: ,} ,] and , <whitespace> } / ]
+    loop {
+        let before = result.clone();
+        result = remove_trailing_commas(&result);
+        if result == before {
+            break;
+        }
+    }
+
+    // Fix unclosed braces/brackets: count opens vs closes
+    let open_braces = result.chars().filter(|&c| c == '{').count();
+    let close_braces = result.chars().filter(|&c| c == '}').count();
+    for _ in 0..open_braces.saturating_sub(close_braces) {
+        result.push('}');
+    }
+    let open_brackets = result.chars().filter(|&c| c == '[').count();
+    let close_brackets = result.chars().filter(|&c| c == ']').count();
+    for _ in 0..open_brackets.saturating_sub(close_brackets) {
+        result.push(']');
+    }
+
+    result
+}
+
+/// Remove trailing commas before closing braces/brackets, including across whitespace.
+fn remove_trailing_commas(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == ',' {
+            // Look ahead past whitespace for } or ]
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if j < chars.len() && (chars[j] == '}' || chars[j] == ']') {
+                // Skip the comma, keep the whitespace and closing bracket
+                i += 1;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
 }
 
 fn find_json_object_end(text: &str, start: usize) -> Option<usize> {

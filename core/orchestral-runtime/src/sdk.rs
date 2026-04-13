@@ -34,12 +34,12 @@ use orchestral_core::store::{Event, InMemoryEventStore, InMemoryTaskStore};
 use crate::action::{ActionRegistryManager, DefaultActionFactory};
 use crate::concurrency::{ConcurrencyPolicy, DefaultConcurrencyPolicy};
 use crate::context::{BasicContextBuilder, TokenBudget};
-use crate::skill::discovery::discover_skills;
-use crate::skill::SkillCatalog;
 use crate::orchestrator::OrchestratorConfig;
 use crate::planner::{
     build_client_from_backend, LlmInvocationConfig, LlmPlanner, LlmPlannerConfig,
 };
+use crate::skill::discovery::discover_skills;
+use crate::skill::SkillCatalog;
 use crate::thread::Thread;
 use crate::thread_runtime::{ThreadRuntime, ThreadRuntimeConfig};
 use crate::{Orchestrator, OrchestratorResult};

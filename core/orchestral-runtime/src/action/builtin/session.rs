@@ -99,12 +99,10 @@ impl Action for SessionAction {
                 };
                 let cwd = params_get_string(params, "cwd");
 
-                match self.session_manager.create(
-                    &name,
-                    &command,
-                    &[],
-                    cwd.as_deref(),
-                ) {
+                match self
+                    .session_manager
+                    .create(&name, &command, &[], cwd.as_deref())
+                {
                     Ok(session_name) => {
                         // Give the process a moment to start
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -112,7 +110,10 @@ impl Action for SessionAction {
                         ActionResult::success_with(HashMap::from([
                             ("session".to_string(), Value::String(session_name)),
                             ("alive".to_string(), Value::Bool(alive)),
-                            ("output".to_string(), Value::String("Session created".to_string())),
+                            (
+                                "output".to_string(),
+                                Value::String("Session created".to_string()),
+                            ),
                         ]))
                     }
                     Err(e) => ActionResult::error(format!("Create session failed: {}", e)),
@@ -177,11 +178,12 @@ impl Action for SessionAction {
                     .unwrap_or(30);
                 let sm = self.session_manager.clone();
                 let name_clone = name.clone();
-                let result =
-                    tokio::task::spawn_blocking(move || sm.send_and_read(&name_clone, &text, timeout))
-                        .await
-                        .map_err(|e| format!("Send+read task failed: {}", e))
-                        .and_then(|r| r);
+                let result = tokio::task::spawn_blocking(move || {
+                    sm.send_and_read(&name_clone, &text, timeout)
+                })
+                .await
+                .map_err(|e| format!("Send+read task failed: {}", e))
+                .and_then(|r| r);
                 match result {
                     Ok(output) => ActionResult::success_with(HashMap::from([
                         ("session".to_string(), Value::String(name)),
@@ -199,7 +201,10 @@ impl Action for SessionAction {
                 match self.session_manager.close(&name) {
                     Ok(()) => ActionResult::success_with(HashMap::from([
                         ("session".to_string(), Value::String(name)),
-                        ("output".to_string(), Value::String("Session closed".to_string())),
+                        (
+                            "output".to_string(),
+                            Value::String("Session closed".to_string()),
+                        ),
                     ])),
                     Err(e) => ActionResult::error(format!("Close failed: {}", e)),
                 }
@@ -208,16 +213,18 @@ impl Action for SessionAction {
             "list" => {
                 let names = self.session_manager.list();
                 ActionResult::success_with(HashMap::from([
-                    ("sessions".to_string(), Value::Array(
-                        names.iter().map(|n| Value::String(n.clone())).collect(),
-                    )),
-                    ("output".to_string(), Value::String(
-                        if names.is_empty() {
+                    (
+                        "sessions".to_string(),
+                        Value::Array(names.iter().map(|n| Value::String(n.clone())).collect()),
+                    ),
+                    (
+                        "output".to_string(),
+                        Value::String(if names.is_empty() {
                             "No active sessions".to_string()
                         } else {
                             format!("Active sessions: {}", names.join(", "))
-                        },
-                    )),
+                        }),
+                    ),
                 ]))
             }
 

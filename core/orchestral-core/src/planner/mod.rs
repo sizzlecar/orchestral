@@ -102,6 +102,36 @@ pub struct SkillInstruction {
     pub venv_python: Option<String>,
 }
 
+/// Budget pressure level injected when the agent loop is nearing its iteration limit.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum BudgetPressure {
+    /// Below 70% — no warning needed.
+    #[default]
+    None,
+    /// 70-89% used — urge the planner to consolidate remaining work.
+    Caution { remaining: usize },
+    /// 90%+ used — demand an immediate final answer.
+    Warning { remaining: usize },
+}
+
+impl BudgetPressure {
+    /// Compute pressure from current iteration (1-based) and max iterations.
+    pub fn from_iteration(iteration: usize, max_iterations: usize) -> Self {
+        if max_iterations == 0 {
+            return Self::None;
+        }
+        let remaining = max_iterations.saturating_sub(iteration);
+        let pct_used = (iteration as f64 / max_iterations as f64 * 100.0) as usize;
+        if pct_used >= 90 {
+            Self::Warning { remaining }
+        } else if pct_used >= 70 {
+            Self::Caution { remaining }
+        } else {
+            Self::None
+        }
+    }
+}
+
 /// Agent-loop execution state surfaced back into the planner.
 #[derive(Debug, Clone, Default)]
 pub struct PlannerLoopContext {
@@ -112,6 +142,8 @@ pub struct PlannerLoopContext {
     pub available_bindings: Vec<String>,
     pub binding_shapes: Vec<String>,
     pub working_set_preview: Option<String>,
+    /// How close the agent loop is to its iteration limit.
+    pub budget_pressure: BudgetPressure,
 }
 
 impl PlannerContext {

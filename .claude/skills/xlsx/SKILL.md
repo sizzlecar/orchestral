@@ -4,6 +4,12 @@ description: "Use this skill any time a spreadsheet file is the primary input or
 license: Proprietary. LICENSE.txt has complete terms
 ---
 
+## Tool Usage
+- **Read/inspect Excel files**: Call `scripts/read_excel.py <file.xlsx> --empty-only` — returns compact JSON with headers and empty cells that need filling. Omit `--empty-only` only when you need full row data. Use `--sheet <name>` for a specific sheet.
+- **Edit Excel files**: Write a Python script using `openpyxl` and run it via `shell` action. Target specific cells identified by `read_excel.py`.
+- **Recalculate formulas**: Call `scripts/recalc.py <file.xlsx>` after modifying formulas.
+- Do NOT call `scripts/office/soffice.py` directly — it is an internal LibreOffice wrapper.
+
 # Requirements for Outputs
 
 ## All Excel files
@@ -73,7 +79,9 @@ A user may ask you to create, edit, or analyze the contents of an .xlsx file. Yo
 
 ## Important Requirements
 
-**LibreOffice Required for Formula Recalculation**: You can assume LibreOffice is installed for recalculating formula values using the `scripts/recalc.py` script. The script automatically configures LibreOffice on first run, including in sandboxed environments where Unix sockets are restricted (handled by `scripts/office/soffice.py`)
+**LibreOffice Required for Formula Recalculation**: You can assume LibreOffice is installed for recalculating formula values using the `scripts/recalc.py` script. The script automatically configures LibreOffice on first run, including in sandboxed environments where Unix sockets are restricted (handled internally by `scripts/office/soffice.py`).
+
+**IMPORTANT**: Do NOT call `scripts/office/soffice.py` directly — it is an internal LibreOffice wrapper used only by `scripts/recalc.py`.
 
 ## Reading and analyzing data
 

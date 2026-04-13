@@ -368,6 +368,9 @@ impl<C: LlmClient> Planner for LlmPlanner<C> {
             intent_len = intent.content.len(),
             action_count = planner_context.available_actions.len(),
             history_count = planner_context.history.len(),
+            system_chars = system.chars().count(),
+            user_chars = user.chars().count(),
+            total_prompt_chars = system.chars().count() + user.chars().count(),
             "planner request prepared"
         );
         if tracing::enabled!(tracing::Level::DEBUG) {
@@ -397,61 +400,98 @@ impl<C: LlmClient> Planner for LlmPlanner<C> {
             model: self.config.model.clone(),
             temperature: self.config.temperature,
         };
-        let output = self
-            .client
-            .complete(request)
-            .await
-            .map_err(|e| PlanError::LlmError(e.to_string()))?;
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            debug!(
-                llm_output = %truncate_for_log(&output, MAX_LLM_OUTPUT_LOG_CHARS),
-                "planner raw llm output"
-            );
-        }
+        // Retry loop: if LLM output fails to parse, retry the call up to 2 times.
+        const MAX_PARSE_RETRIES: usize = 2;
+        let mut last_parse_error: Option<PlanError> = None;
 
-        let json_str = extract_json(&output)
-            .ok_or_else(|| PlanError::Generation("LLM output did not contain JSON".to_string()))?;
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            debug!(
-                plan_json = %truncate_for_log(&json_str, MAX_LLM_OUTPUT_LOG_CHARS),
-                "planner extracted json"
-            );
-        }
+        for parse_attempt in 0..=MAX_PARSE_RETRIES {
+            if parse_attempt > 0 {
+                warn!(
+                    attempt = parse_attempt,
+                    error = ?last_parse_error,
+                    "planner output parse failed, retrying LLM call"
+                );
+            }
+            let raw_output = self
+                .client
+                .complete(request.clone())
+                .await
+                .map_err(|e| PlanError::LlmError(e.to_string()))?;
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                debug!(
+                    llm_output = %truncate_for_log(&raw_output, MAX_LLM_OUTPUT_LOG_CHARS),
+                    attempt = parse_attempt,
+                    "planner raw llm output"
+                );
+            }
 
-        let output = parse_planner_output(&json_str)?;
-        match &output {
-            PlannerOutput::SingleAction(call) => {
-                info!(
-                    output_type = "single_action",
-                    action = %call.action,
-                    reason = ?call.reason,
-                    "planner parsed output"
+            let json_str = match extract_json(&raw_output) {
+                Some(j) => j,
+                None => {
+                    last_parse_error = Some(PlanError::Generation(
+                        "LLM output did not contain JSON".to_string(),
+                    ));
+                    if parse_attempt < MAX_PARSE_RETRIES {
+                        continue;
+                    }
+                    return Err(last_parse_error.unwrap());
+                }
+            };
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                debug!(
+                    plan_json = %truncate_for_log(&json_str, MAX_LLM_OUTPUT_LOG_CHARS),
+                    "planner extracted json"
                 );
             }
-            PlannerOutput::MiniPlan(plan) => {
-                info!(
-                    output_type = "mini_plan",
-                    goal = %plan.goal,
-                    step_count = plan.steps.len(),
-                    "planner parsed output"
-                );
-            }
-            PlannerOutput::Done(message) => {
-                info!(
-                    output_type = "done",
-                    message = %truncate_for_log(message, MAX_PROMPT_LOG_CHARS),
-                    "planner parsed output"
-                );
-            }
-            PlannerOutput::NeedInput(question) => {
-                info!(
-                    output_type = "need_input",
-                    question = %truncate_for_log(question, MAX_PROMPT_LOG_CHARS),
-                    "planner parsed output"
-                );
+
+            match parse_planner_output(&json_str) {
+                Ok(output) => {
+                    match &output {
+                        PlannerOutput::SingleAction(call) => {
+                            info!(
+                                output_type = "single_action",
+                                action = %call.action,
+                                reason = ?call.reason,
+                                "planner parsed output"
+                            );
+                        }
+                        PlannerOutput::MiniPlan(plan) => {
+                            info!(
+                                output_type = "mini_plan",
+                                goal = %plan.goal,
+                                step_count = plan.steps.len(),
+                                "planner parsed output"
+                            );
+                        }
+                        PlannerOutput::Done(message) => {
+                            info!(
+                                output_type = "done",
+                                message = %truncate_for_log(message, MAX_PROMPT_LOG_CHARS),
+                                "planner parsed output"
+                            );
+                        }
+                        PlannerOutput::NeedInput(question) => {
+                            info!(
+                                output_type = "need_input",
+                                question = %truncate_for_log(question, MAX_PROMPT_LOG_CHARS),
+                                "planner parsed output"
+                            );
+                        }
+                    }
+                    return Ok(output);
+                }
+                Err(e) => {
+                    last_parse_error = Some(e);
+                    if parse_attempt < MAX_PARSE_RETRIES {
+                        continue;
+                    }
+                    return Err(last_parse_error.unwrap());
+                }
             }
         }
-        Ok(output)
+        Err(last_parse_error.unwrap_or_else(|| {
+            PlanError::Generation("planner exhausted parse retries".to_string())
+        }))
     }
 }
 

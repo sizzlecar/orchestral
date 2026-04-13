@@ -15,7 +15,7 @@ use crate::channel::CliRuntime;
 
 use self::config::prepare_runtime_config_path;
 
-const TURN_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
+const TURN_SETTLE_TIMEOUT: Duration = Duration::from_secs(120);
 const TURN_SETTLE_GRACE_TIMEOUT: Duration = Duration::from_secs(60);
 const FORWARD_DRAIN_IDLE_TIMEOUT: Duration = Duration::from_millis(120);
 
