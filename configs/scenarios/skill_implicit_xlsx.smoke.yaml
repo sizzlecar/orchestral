@@ -27,12 +27,7 @@ turns:
         - "failed Shell command exited"
     verify:
       - name: workbook-fill-quality
-        command: /bin/zsh
+        command: ../../.claude/skills/xlsx/.venv/bin/python3
         args:
-          - -lc
-          - >-
-            ok=0;
-            for f in docs/*.xlsx; do
-              ../../.claude/skills/xlsx/.venv/bin/python3 validators/verify_perf_review_fill.py "$f" && ok=1;
-            done;
-            [ "$ok" = "1" ]
+          - validators/verify_perf_review_fill.py
+          - docs/绩效考核-2025Q4_运行副本.xlsx
