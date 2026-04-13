@@ -53,12 +53,17 @@ def cell_value_to_json(value):
 
 
 def read_sheet(ws, max_rows: Optional[int] = None):
+    # Collect merged cell ranges so planner knows to skip them
+    merged = [str(r) for r in ws.merged_cells.ranges] if ws.merged_cells else []
+
     result = {
         "name": ws.title,
         "dimensions": ws.dimensions,
         "max_row": ws.max_row,
         "max_column": ws.max_column,
     }
+    if merged:
+        result["merged_cells"] = merged
 
     # Detect header row: first row with multiple non-empty cells
     header_row_idx = None
