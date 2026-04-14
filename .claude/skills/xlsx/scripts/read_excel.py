@@ -186,10 +186,39 @@ def main():
     result = read_excel(args.file, args.sheet, args.max_rows)
 
     if args.empty_only:
+        # Compact text output optimized for LLM consumption
         for sheet in result.get("sheets", []):
-            sheet.pop("rows", None)
-    json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
-    print()
+            rows_data = sheet.get("rows", [])  # keep for context lookup
+            print(f"Sheet: {sheet['name']} ({sheet.get('dimensions', '?')})")
+            if sheet.get("merged_cells"):
+                print(f"Merged: {', '.join(sheet['merged_cells'])}")
+            if sheet.get("headers"):
+                clean_headers = [h.replace('\n', ' ') for h in sheet["headers"]]
+                print(f"Headers (row {sheet.get('header_row', '?')}): {' | '.join(clean_headers)}")
+            if sheet.get("fill_summary"):
+                print("Columns needing fill:")
+                for col_header, count in sheet["fill_summary"].items():
+                    print(f"  {col_header.replace(chr(10), ' ')}: {count} empty cells")
+            if sheet.get("empty_cells"):
+                print("Empty cells to fill:")
+                for entry in sheet["empty_cells"]:
+                    # Show row context (non-empty cells in that row) so planner knows what the row is about
+                    context = ""
+                    matching_rows = [r for r in sheet.get("rows", []) if r["row"] == entry["row"]]
+                    if matching_rows:
+                        ctx_parts = []
+                        for col_letter_key, val in sorted(matching_rows[0]["cells"].items()):
+                            if col_letter_key in entry["cols"]:
+                                continue  # skip empty cols
+                            s = str(val).replace('\n', ' ')[:40]
+                            ctx_parts.append(f"{col_letter_key}={s}")
+                        if ctx_parts:
+                            context = f"  ({', '.join(ctx_parts[:4])})"
+                    print(f"  row {entry['row']}: {', '.join(entry['cols'])}{context}")
+            print(f"Total: {sheet.get('empty_cell_count', 0)} cells to fill")
+    else:
+        json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
+        print()
 
     if "error" in result:
         sys.exit(1)
