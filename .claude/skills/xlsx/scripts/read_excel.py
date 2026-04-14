@@ -85,6 +85,18 @@ def read_sheet(ws, max_rows: Optional[int] = None):
     result["header_row"] = header_row_idx
     result["headers"] = [f"{col}: {name}" for col, name in sorted(headers.items())]
 
+    # Build a set of cells that are inside a merged range but NOT the top-left cell.
+    # These should be skipped in empty-cell reporting since they can't be written to.
+    merged_interior = set()
+    for mr in (ws.merged_cells.ranges if ws.merged_cells else []):
+        first = True
+        for row in range(mr.min_row, mr.max_row + 1):
+            for col in range(mr.min_col, mr.max_col + 1):
+                if first:
+                    first = False
+                    continue
+                merged_interior.add((row, col))
+
     # Read rows
     rows = []
     empty_cells = []
@@ -103,7 +115,7 @@ def read_sheet(ws, max_rows: Optional[int] = None):
             if val is not None:
                 cells[col] = val
                 row_has_data = True
-            else:
+            elif (row_idx, col_idx) not in merged_interior:
                 row_empty_cols.append(col)
 
         if cells:
@@ -122,6 +134,18 @@ def read_sheet(ws, max_rows: Optional[int] = None):
     result["empty_cells"] = empty_cells
     total_empty = sum(len(e["cols"]) for e in empty_cells)
     result["empty_cell_count"] = total_empty
+
+    # Summary: how many empty cells per column (helps planner know what to fill)
+    col_counts = {}
+    for entry in empty_cells:
+        for col in entry["cols"]:
+            col_counts[col] = col_counts.get(col, 0) + 1
+    if col_counts:
+        result["fill_summary"] = {
+            f"{col} ({headers.get(col, '?')})": count
+            for col, count in sorted(col_counts.items())
+        }
+
     return result
 
 
