@@ -1,33 +1,11 @@
 """
-Read Excel file content and output structured JSON.
+Read Excel file content and output structured information.
 
 Usage:
-    python read_excel.py <file> [--sheet <name>] [--max-rows <n>]
+    python read_excel.py <file> [--sheet <name>] [--max-rows <n>] [--empty-only]
 
-Output JSON:
-    {
-      "file": "path.xlsx",
-      "sheets": [
-        {
-          "name": "Sheet1",
-          "dimensions": "A1:K29",
-          "max_row": 29,
-          "max_column": 11,
-          "headers": ["A: Name", "B: Date", ...],
-          "rows": [
-            {"row": 1, "cells": {"A": "value", "B": 123, ...}},
-            ...
-          ],
-          "empty_cells": [
-            {"row": 5, "col": "F", "header": "Score"},
-            ...
-          ]
-        }
-      ]
-    }
-
-empty_cells lists cells that are None/empty in rows that have at least one
-non-empty cell — these are the fill candidates.
+--empty-only outputs a human-readable table view with [空] marking empty cells.
+Without --empty-only, outputs full JSON with all cell data.
 """
 
 import argparse
@@ -53,7 +31,6 @@ def cell_value_to_json(value):
 
 
 def read_sheet(ws, max_rows: Optional[int] = None):
-    # Collect merged cell ranges so planner knows to skip them
     merged = [str(r) for r in ws.merged_cells.ranges] if ws.merged_cells else []
 
     result = {
@@ -65,9 +42,20 @@ def read_sheet(ws, max_rows: Optional[int] = None):
     if merged:
         result["merged_cells"] = merged
 
-    # Detect header row: first row with multiple non-empty cells
+    # Build set of merged-interior cells (non-top-left, cannot be written to)
+    merged_interior = set()
+    for mr in (ws.merged_cells.ranges if ws.merged_cells else []):
+        first = True
+        for row in range(mr.min_row, mr.max_row + 1):
+            for col in range(mr.min_col, mr.max_col + 1):
+                if first:
+                    first = False
+                    continue
+                merged_interior.add((row, col))
+
+    # Detect header row
     header_row_idx = None
-    headers = {}
+    headers = {}  # col_letter -> name
     for row_idx in range(1, min((ws.max_row or 0) + 1, 10)):
         non_empty = 0
         for col_idx in range(1, (ws.max_column or 0) + 1):
@@ -79,74 +67,114 @@ def read_sheet(ws, max_rows: Optional[int] = None):
             for col_idx in range(1, (ws.max_column or 0) + 1):
                 val = ws.cell(row=row_idx, column=col_idx).value
                 if val is not None and str(val).strip():
-                    headers[col_letter(col_idx)] = str(val).strip()
+                    headers[col_letter(col_idx)] = str(val).strip().replace('\n', ' ')
             break
 
     result["header_row"] = header_row_idx
-    result["headers"] = [f"{col}: {name}" for col, name in sorted(headers.items())]
+    result["headers"] = headers
 
-    # Build a set of cells that are inside a merged range but NOT the top-left cell.
-    # These should be skipped in empty-cell reporting since they can't be written to.
-    merged_interior = set()
-    for mr in (ws.merged_cells.ranges if ws.merged_cells else []):
-        first = True
-        for row in range(mr.min_row, mr.max_row + 1):
-            for col in range(mr.min_col, mr.max_col + 1):
-                if first:
-                    first = False
-                    continue
-                merged_interior.add((row, col))
-
-    # Read rows
-    rows = []
-    empty_cells = []
+    # Read all rows
     end_row = ws.max_row or 0
     if max_rows and header_row_idx:
         end_row = min(end_row, header_row_idx + max_rows)
 
+    rows = []
     for row_idx in range(1, end_row + 1):
         cells = {}
-        row_has_data = False
-        row_empty_cols = []
         for col_idx in range(1, (ws.max_column or 0) + 1):
             col = col_letter(col_idx)
-            cell = ws.cell(row=row_idx, column=col_idx)
-            val = cell_value_to_json(cell.value)
-            if val is not None:
-                cells[col] = val
-                row_has_data = True
-            elif (row_idx, col_idx) not in merged_interior:
-                row_empty_cols.append(col)
-
-        if cells:
-            rows.append({"row": row_idx, "cells": cells})
-
-        # Track empty cells in data rows (rows that have some content)
-        if row_has_data and header_row_idx and row_idx > header_row_idx:
-            row_empties = [col for col in row_empty_cols if col in headers]
-            if row_empties:
-                empty_cells.append({
-                    "row": row_idx,
-                    "cols": row_empties,
-                })
+            if (row_idx, col_idx) in merged_interior:
+                cells[col] = "__merged__"
+                continue
+            val = cell_value_to_json(ws.cell(row=row_idx, column=col_idx).value)
+            cells[col] = val
+        rows.append({"row": row_idx, "cells": cells})
 
     result["rows"] = rows
-    result["empty_cells"] = empty_cells
-    total_empty = sum(len(e["cols"]) for e in empty_cells)
-    result["empty_cell_count"] = total_empty
-
-    # Summary: how many empty cells per column (helps planner know what to fill)
-    col_counts = {}
-    for entry in empty_cells:
-        for col in entry["cols"]:
-            col_counts[col] = col_counts.get(col, 0) + 1
-    if col_counts:
-        result["fill_summary"] = {
-            f"{col} ({headers.get(col, '?')})": count
-            for col, count in sorted(col_counts.items())
-        }
-
     return result
+
+
+def format_table(sheet: dict) -> str:
+    """Format sheet data as a human-readable table with [空] for empty cells."""
+    lines = []
+    headers = sheet.get("headers", {})
+    header_row = sheet.get("header_row")
+    rows = sheet.get("rows", [])
+    merged = sheet.get("merged_cells", [])
+
+    lines.append(f"Sheet: {sheet['name']} ({sheet.get('dimensions', '?')})")
+    if merged:
+        lines.append(f"Merged cells (do NOT write to non-top-left): {', '.join(merged)}")
+    lines.append("")
+
+    # Print pre-header rows (title, metadata)
+    for row_data in rows:
+        if header_row and row_data["row"] >= header_row:
+            break
+        vals = [v for v in row_data["cells"].values()
+                if v is not None and v != "__merged__"]
+        if vals:
+            text = str(vals[0]).replace('\n', ' ')[:120]
+            lines.append(text)
+    lines.append("")
+
+    if not headers:
+        lines.append("(no header row detected)")
+        return '\n'.join(lines)
+
+    # Determine columns to show (only those with headers)
+    cols = sorted(headers.keys())
+
+    # Short header names for table
+    short_headers = {}
+    for col, name in headers.items():
+        short = name[:20] if len(name) > 20 else name
+        short_headers[col] = short
+
+    # Build table header
+    col_widths = {}
+    for col in cols:
+        col_widths[col] = max(len(short_headers[col]), 6)
+
+    header_line = "row | " + " | ".join(
+        f"{short_headers[col]:<{col_widths[col]}}" for col in cols
+    )
+    lines.append(header_line)
+    lines.append("-" * len(header_line))
+
+    # Data rows (after header)
+    empty_count = 0
+    for row_data in rows:
+        if header_row and row_data["row"] <= header_row:
+            continue
+        cells = row_data["cells"]
+
+        # Skip rows where all header columns are merged interior
+        all_merged = all(cells.get(col) == "__merged__" for col in cols)
+        if all_merged:
+            continue
+
+        parts = []
+        row_has_empty = False
+        for col in cols:
+            val = cells.get(col)
+            if val is None:
+                parts.append(f"{'[空]':<{col_widths[col]}}")
+                row_has_empty = True
+                empty_count += 1
+            elif val == "__merged__":
+                parts.append(f"{'[合并]':<{col_widths[col]}}")
+            else:
+                s = str(val).replace('\n', ' ')
+                if len(s) > col_widths[col]:
+                    s = s[:col_widths[col] - 2] + ".."
+                parts.append(f"{s:<{col_widths[col]}}")
+
+        lines.append(f"{row_data['row']:>3} | " + " | ".join(parts))
+
+    lines.append("")
+    lines.append(f"Total empty cells (marked [空]): {empty_count}")
+    return '\n'.join(lines)
 
 
 def read_excel(file_path: str, sheet_name: Optional[str] = None, max_rows: Optional[int] = None):
@@ -174,54 +202,31 @@ def read_excel(file_path: str, sheet_name: Optional[str] = None, max_rows: Optio
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Read Excel file content as JSON")
+    parser = argparse.ArgumentParser(description="Read Excel file content")
     parser.add_argument("file", help="Path to .xlsx/.xlsm file")
     parser.add_argument("--sheet", help="Read only this sheet (default: all)")
     parser.add_argument("--max-rows", type=int, default=None,
                         help="Max data rows to read per sheet (default: all)")
     parser.add_argument("--empty-only", action="store_true",
-                        help="Only output headers and empty cells (compact mode for fill tasks)")
+                        help="Table view with [空] marking empty cells")
     args = parser.parse_args()
 
     result = read_excel(args.file, args.sheet, args.max_rows)
 
+    if "error" in result:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        sys.exit(1)
+
     if args.empty_only:
-        # Compact text output optimized for LLM consumption
         for sheet in result.get("sheets", []):
-            rows_data = sheet.get("rows", [])  # keep for context lookup
-            print(f"Sheet: {sheet['name']} ({sheet.get('dimensions', '?')})")
-            if sheet.get("merged_cells"):
-                print(f"Merged: {', '.join(sheet['merged_cells'])}")
-            if sheet.get("headers"):
-                clean_headers = [h.replace('\n', ' ') for h in sheet["headers"]]
-                print(f"Headers (row {sheet.get('header_row', '?')}): {' | '.join(clean_headers)}")
-            if sheet.get("fill_summary"):
-                print("Columns needing fill:")
-                for col_header, count in sheet["fill_summary"].items():
-                    print(f"  {col_header.replace(chr(10), ' ')}: {count} empty cells")
-            if sheet.get("empty_cells"):
-                print("Empty cells to fill:")
-                for entry in sheet["empty_cells"]:
-                    # Show row context (non-empty cells in that row) so planner knows what the row is about
-                    context = ""
-                    matching_rows = [r for r in sheet.get("rows", []) if r["row"] == entry["row"]]
-                    if matching_rows:
-                        ctx_parts = []
-                        for col_letter_key, val in sorted(matching_rows[0]["cells"].items()):
-                            if col_letter_key in entry["cols"]:
-                                continue  # skip empty cols
-                            s = str(val).replace('\n', ' ')[:40]
-                            ctx_parts.append(f"{col_letter_key}={s}")
-                        if ctx_parts:
-                            context = f"  ({', '.join(ctx_parts[:4])})"
-                    print(f"  row {entry['row']}: {', '.join(entry['cols'])}{context}")
-            print(f"Total: {sheet.get('empty_cell_count', 0)} cells to fill")
+            print(format_table(sheet))
     else:
+        # Full JSON output (convert headers dict to list for backward compat)
+        for sheet in result.get("sheets", []):
+            h = sheet.get("headers", {})
+            sheet["headers"] = [f"{col}: {name}" for col, name in sorted(h.items())]
         json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
         print()
-
-    if "error" in result:
-        sys.exit(1)
 
 
 if __name__ == "__main__":
