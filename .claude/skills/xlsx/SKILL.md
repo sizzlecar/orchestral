@@ -5,7 +5,7 @@ license: Proprietary. LICENSE.txt has complete terms
 ---
 
 ## Tool Usage
-- **Read/inspect Excel files**: `scripts/read_excel.py <file.xlsx> --empty-only` — returns headers, merged cells, empty cells with row context. Use the venv python and full scripts path from the `[scripts:]` block in the prompt. Omit `--empty-only` only when you need full row data.
+- **Read/inspect Excel files**: `scripts/read_excel.py <file.xlsx>` — returns a table view of the spreadsheet with all cell values, [空] for empty cells, [合并] for merged interiors. Use the venv python and full scripts path from the `[scripts:]` block in the prompt. Add `--max-rows N` to limit output for very large sheets.
 - **Edit Excel files**: Write a Python script using `openpyxl` and run it via `shell` action. Target specific cells identified by `read_excel.py`. When `merged_cells` are present in the output, skip those ranges — writing to a merged cell raises `AttributeError`. Only write to the top-left cell of a merged range.
 - **Recalculate formulas**: Call `scripts/recalc.py <file.xlsx>` after modifying formulas.
 - Do NOT call `scripts/office/soffice.py` directly — it is an internal LibreOffice wrapper.

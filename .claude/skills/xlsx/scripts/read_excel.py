@@ -1,11 +1,11 @@
 """
-Read Excel file content and output structured information.
+Read Excel file content and output a human-readable table view.
 
 Usage:
-    python read_excel.py <file> [--sheet <name>] [--max-rows <n>] [--empty-only]
+    python read_excel.py <file> [--sheet <name>] [--max-rows <n>]
 
---empty-only outputs a human-readable table view with [空] marking empty cells.
-Without --empty-only, outputs full JSON with all cell data.
+Outputs a table with column-letter-prefixed headers, [空] marking empty cells,
+and [合并] marking the non-top-left interior of merged ranges.
 """
 
 import argparse
@@ -125,11 +125,11 @@ def format_table(sheet: dict) -> str:
     # Determine columns to show (only those with headers)
     cols = sorted(headers.keys())
 
-    # Short header names for table
+    # Short header names with column letter prefix
     short_headers = {}
     for col, name in headers.items():
-        short = name[:20] if len(name) > 20 else name
-        short_headers[col] = short
+        short = name[:18] if len(name) > 18 else name
+        short_headers[col] = f"{col}:{short}"
 
     # Build table header
     col_widths = {}
@@ -207,8 +207,6 @@ def main():
     parser.add_argument("--sheet", help="Read only this sheet (default: all)")
     parser.add_argument("--max-rows", type=int, default=None,
                         help="Max data rows to read per sheet (default: all)")
-    parser.add_argument("--empty-only", action="store_true",
-                        help="Table view with [空] marking empty cells")
     args = parser.parse_args()
 
     result = read_excel(args.file, args.sheet, args.max_rows)
@@ -217,16 +215,8 @@ def main():
         print(json.dumps(result, ensure_ascii=False, indent=2))
         sys.exit(1)
 
-    if args.empty_only:
-        for sheet in result.get("sheets", []):
-            print(format_table(sheet))
-    else:
-        # Full JSON output (convert headers dict to list for backward compat)
-        for sheet in result.get("sheets", []):
-            h = sheet.get("headers", {})
-            sheet["headers"] = [f"{col}: {name}" for col, name in sorted(h.items())]
-        json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
-        print()
+    for sheet in result.get("sheets", []):
+        print(format_table(sheet))
 
 
 if __name__ == "__main__":
