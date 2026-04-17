@@ -126,7 +126,13 @@ struct GeminiErrorDetail {
 #[async_trait]
 impl LlmClient for GeminiClient {
     async fn complete(&self, request: LlmRequest) -> Result<String, LlmError> {
-        let url = self.build_url(&request.model);
+        let model = if request.model.trim().is_empty() {
+            &self.config.model
+        } else {
+            &request.model
+        };
+        tracing::info!(model = %model, max_tokens = self.config.max_tokens, "gemini native llm call");
+        let url = self.build_url(model);
 
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
