@@ -98,9 +98,14 @@ pub fn build_client_from_backend(
     // Use native Gemini client for Google backend — proper system_instruction
     // and JSON response mode support.
     if backend.kind == "google" {
+        // TODO: remove hardcode after config override issue is resolved
+        let model_override = std::env::var("ORCHESTRAL_PLANNER_MODEL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| invocation.model.clone());
         let config = super::gemini::GeminiClientConfig {
             api_key,
-            model: invocation.model.clone(),
+            model: model_override,
             endpoint: backend
                 .endpoint
                 .clone()
@@ -243,7 +248,10 @@ impl LlmClient for GranietLlmClient {
             .normalize_response(self.normalize_response)
             .schema(StructuredOutputFormat {
                 name: "planner_output".to_string(),
-                description: Some("Planner decision: one of SINGLE_ACTION, MINI_PLAN, DONE, or NEED_INPUT".to_string()),
+                description: Some(
+                    "Planner decision: one of SINGLE_ACTION, MINI_PLAN, DONE, or NEED_INPUT"
+                        .to_string(),
+                ),
                 schema: None,
                 strict: None,
             });
@@ -264,15 +272,13 @@ impl LlmClient for GranietLlmClient {
         const MAX_RETRIES: usize = 2;
         let mut last_error = None;
         for attempt in 0..=MAX_RETRIES {
-            let response = tokio::time::timeout(
-                Duration::from_secs(self.timeout_secs),
-                llm.chat(&messages),
-            )
-            .await
-            .map_err(|_| {
-                LlmError::Http(format!("llm chat timeout after {}s", self.timeout_secs))
-            })?
-            .map_err(|e| LlmError::Http(format!("llm chat error: {}", e)))?;
+            let response =
+                tokio::time::timeout(Duration::from_secs(self.timeout_secs), llm.chat(&messages))
+                    .await
+                    .map_err(|_| {
+                        LlmError::Http(format!("llm chat timeout after {}s", self.timeout_secs))
+                    })?
+                    .map_err(|e| LlmError::Http(format!("llm chat error: {}", e)))?;
 
             let text = match response.text().map(|s| s.to_string()) {
                 Some(t) => t,
@@ -292,15 +298,16 @@ impl LlmClient for GranietLlmClient {
                 tracing::debug!(
                     response_text_len = text.len(),
                     attempt,
-                    "planner llm response: {}", preview
+                    "planner llm response: {}",
+                    preview
                 );
             }
 
             return Ok(text);
         }
-        Err(LlmError::Response(
-            last_error.unwrap_or_else(|| "planner llm exhausted retries".to_string()),
-        ))
+        Err(LlmError::Response(last_error.unwrap_or_else(|| {
+            "planner llm exhausted retries".to_string()
+        })))
     }
 
     async fn complete_with_tools(
