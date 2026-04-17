@@ -561,7 +561,6 @@ mod tests {
         let (system, user) = planner.build_prompt(&intent, &context);
 
         assert!(system.contains("Orchestral Planner"));
-        assert!(system.contains("Legacy workflow/stage outputs are disabled."));
         assert!(system.contains("SINGLE_ACTION"));
         assert!(system.contains("MINI_PLAN"));
         assert!(!system.contains("Action Catalog"));

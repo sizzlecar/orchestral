@@ -31,13 +31,10 @@ Return JSON only with this shape:
 
 Rules:
 - Only choose from the listed action names.
-- Prefer typed and narrow actions over generic shell commands when both can solve the current step.
-- Prefer staying within one typed artifact category when that category already provides collect/inspect/derive/apply/verify coverage.
-- Verify coverage from the listed actions and schema contracts; do not assume missing stages exist.
+- Prefer narrow, purpose-built actions over generic shell commands when both can solve the current step.
+- Verify the chosen subset actually covers what the task needs; do not include actions the task will not use.
 - When a schema field lists allowed enum values, use only those enum values.
-- Do not mix derive/build actions from one typed category with apply/verify actions from another unless their `patch_spec` contracts explicitly match.
 - Do not select `file_read` for binary artifacts such as `.xlsx`, `.xlsm`, `.docx`, or `.pdf`.
-- Keep enough actions for the planner to inspect, apply, and verify in the same iteration if needed.
 - Select no more than the requested maximum number of actions.
 - Use blocked_actions for actions that should stay out of the planner prompt for this iteration."#;
 

@@ -18,5 +18,3 @@ Convergence:
 - Each iteration should make measurable progress toward DONE. Avoid exploratory actions when you already have enough information.
 - When budget pressure warnings appear, obey them strictly — consolidate or finish.
 - Prefer the smallest output shape that advances the task.
-
-Legacy workflow/stage outputs are disabled.
