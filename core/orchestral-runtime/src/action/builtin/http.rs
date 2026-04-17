@@ -178,7 +178,7 @@ impl Action for HttpAction {
     }
 }
 
-fn headers_from_value(value: &Value) -> HashMap<String, String> {
+pub(super) fn headers_from_value(value: &Value) -> HashMap<String, String> {
     value
         .as_object()
         .map(|obj| {
@@ -189,7 +189,7 @@ fn headers_from_value(value: &Value) -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
-fn merge_headers(
+pub(super) fn merge_headers(
     defaults: &HashMap<String, String>,
     overrides: &HashMap<String, String>,
 ) -> HeaderMap {

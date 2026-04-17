@@ -175,3 +175,136 @@ impl ConcurrencyPolicy for RejectWhenBusyConcurrencyPolicy {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn event() -> Event {
+        Event::user_input("t1", "i1", json!({}))
+    }
+
+    fn busy() -> RunningState {
+        RunningState {
+            active_count: 1,
+            is_processing: true,
+            is_waiting_user: false,
+            is_waiting_event: false,
+        }
+    }
+
+    #[test]
+    fn running_state_idle_and_active_flags() {
+        let idle = RunningState::new();
+        assert!(idle.is_idle());
+        assert!(!idle.has_active());
+
+        let running = busy();
+        assert!(!running.is_idle());
+        assert!(running.has_active());
+    }
+
+    #[test]
+    fn default_policy_always_interrupts() {
+        let policy = DefaultConcurrencyPolicy;
+        assert_eq!(
+            policy.decide(&RunningState::new(), &event()),
+            ConcurrencyDecision::InterruptAndStartNew
+        );
+        assert_eq!(
+            policy.decide(&busy(), &event()),
+            ConcurrencyDecision::InterruptAndStartNew
+        );
+    }
+
+    #[test]
+    fn queue_policy_rejects_when_busy_with_explicit_reason() {
+        let policy = QueueConcurrencyPolicy;
+        assert_eq!(
+            policy.decide(&RunningState::new(), &event()),
+            ConcurrencyDecision::InterruptAndStartNew
+        );
+        match policy.decide(&busy(), &event()) {
+            ConcurrencyDecision::Reject { reason } => {
+                assert!(
+                    reason.to_lowercase().contains("queue"),
+                    "reason should mention queue placeholder, got: {reason}"
+                );
+            }
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parallel_policy_admits_until_cap_then_rejects() {
+        let policy = ParallelConcurrencyPolicy::new(2);
+        let one_running = RunningState {
+            active_count: 1,
+            is_processing: true,
+            is_waiting_user: false,
+            is_waiting_event: false,
+        };
+        assert_eq!(
+            policy.decide(&one_running, &event()),
+            ConcurrencyDecision::Parallel
+        );
+
+        let at_cap = RunningState {
+            active_count: 2,
+            is_processing: true,
+            is_waiting_user: false,
+            is_waiting_event: false,
+        };
+        match policy.decide(&at_cap, &event()) {
+            ConcurrencyDecision::Reject { reason } => {
+                assert!(
+                    reason.contains('2'),
+                    "reason should show cap, got: {reason}"
+                );
+            }
+            other => panic!("expected Reject at cap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parallel_policy_default_cap_is_four() {
+        let policy = ParallelConcurrencyPolicy::default();
+        assert_eq!(policy.max_parallel, 4);
+    }
+
+    #[test]
+    fn merge_policy_merges_only_when_busy() {
+        let policy = MergeConcurrencyPolicy;
+        assert_eq!(
+            policy.decide(&RunningState::new(), &event()),
+            ConcurrencyDecision::InterruptAndStartNew
+        );
+        assert_eq!(
+            policy.decide(&busy(), &event()),
+            ConcurrencyDecision::MergeIntoRunning
+        );
+    }
+
+    #[test]
+    fn reject_when_busy_policy_idle_interrupts_busy_rejects() {
+        let policy = RejectWhenBusyConcurrencyPolicy;
+        assert_eq!(
+            policy.decide(&RunningState::new(), &event()),
+            ConcurrencyDecision::InterruptAndStartNew
+        );
+        assert!(matches!(
+            policy.decide(&busy(), &event()),
+            ConcurrencyDecision::Reject { .. }
+        ));
+    }
+
+    #[test]
+    fn reject_helper_preserves_custom_reason() {
+        let decision = ConcurrencyDecision::reject("custom reason");
+        match decision {
+            ConcurrencyDecision::Reject { reason } => assert_eq!(reason, "custom reason"),
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+}

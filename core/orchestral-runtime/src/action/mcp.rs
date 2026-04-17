@@ -890,6 +890,22 @@ mod tests {
     }
 
     fn build_mock_mcp_stdio_script(second_result: Value) -> String {
+        build_mock_mcp_stdio_script_with(json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": second_result
+        }))
+    }
+
+    fn build_mock_mcp_stdio_error_script(error_body: Value) -> String {
+        build_mock_mcp_stdio_script_with(json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "error": error_body,
+        }))
+    }
+
+    fn build_mock_mcp_stdio_script_with(second_payload: Value) -> String {
         let init_payload = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -901,12 +917,7 @@ mod tests {
             }
         })
         .to_string();
-        let second_payload = json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "result": second_result
-        })
-        .to_string();
+        let second_payload = second_payload.to_string();
         format!(
             "printf 'Content-Length: {}\\r\\n\\r\\n{}'; printf 'Content-Length: {}\\r\\n\\r\\n{}'; cat >/dev/null",
             init_payload.len(),
@@ -1190,5 +1201,198 @@ mod tests {
             }
             other => panic!("expected success result, got {:?}", other),
         }
+    }
+
+    // --- Error propagation tests ---
+
+    #[tokio::test]
+    async fn tool_call_surfaces_jsonrpc_error_as_action_error() {
+        let script = build_mock_mcp_stdio_error_script(json!({
+            "code": -32000,
+            "message": "upstream refused the request"
+        }));
+
+        let spec = ActionSpec {
+            name: "mcp__alpha".to_string(),
+            kind: "mcp_server".to_string(),
+            description: None,
+            category: None,
+            config: json!({
+                "server_name": "alpha",
+                "command": "sh",
+                "args": ["-c", script],
+                "enabled_tools": ["ping"]
+            }),
+            interface: None,
+        };
+        let action = McpServerAction::from_spec(&spec).expect("build action");
+        let result = action
+            .run(
+                ActionInput::with_params(json!({
+                    "operation": "call",
+                    "tool": "ping",
+                    "arguments": {}
+                })),
+                test_ctx(),
+            )
+            .await;
+
+        match result {
+            ActionResult::Error { message } => {
+                let lowered = message.to_lowercase();
+                assert!(
+                    lowered.contains("rpc") || lowered.contains("error"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("upstream refused"),
+                    "error message should carry the server's reason, got: {message}"
+                );
+            }
+            other => panic!("expected Error for JSON-RPC error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_call_rejects_disabled_tool_before_reaching_server() {
+        let spec = ActionSpec {
+            name: "mcp__alpha".to_string(),
+            kind: "mcp_server".to_string(),
+            description: None,
+            category: None,
+            config: json!({
+                "server_name": "alpha",
+                // Intentionally point to a non-existent binary — if the guard fails to
+                // short-circuit, spawning the server would surface a different error.
+                "command": "/nonexistent/mcp-server-binary",
+                "args": [],
+                "enabled_tools": ["allowed_tool"],
+                "disabled_tools": ["blocked_tool"]
+            }),
+            interface: None,
+        };
+        let action = McpServerAction::from_spec(&spec).expect("build action");
+
+        let result = action
+            .run(
+                ActionInput::with_params(json!({
+                    "operation": "call",
+                    "tool": "blocked_tool",
+                    "arguments": {}
+                })),
+                test_ctx(),
+            )
+            .await;
+
+        match result {
+            ActionResult::Error { message } => {
+                assert!(
+                    message.contains("blocked_tool") && message.to_lowercase().contains("disabled"),
+                    "expected disabled-tool error, got: {message}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn call_operation_requires_tool_parameter() {
+        let spec = ActionSpec {
+            name: "mcp__alpha".to_string(),
+            kind: "mcp_server".to_string(),
+            description: None,
+            category: None,
+            config: json!({
+                "server_name": "alpha",
+                "command": "/nonexistent/mcp-server-binary",
+                "args": [],
+            }),
+            interface: None,
+        };
+        let action = McpServerAction::from_spec(&spec).expect("build action");
+        let result = action
+            .run(
+                ActionInput::with_params(json!({"operation": "call"})),
+                test_ctx(),
+            )
+            .await;
+
+        match result {
+            ActionResult::Error { message } => {
+                assert!(
+                    message.to_lowercase().contains("tool"),
+                    "error should mention missing tool param, got: {message}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_operation_returns_structured_error() {
+        let spec = ActionSpec {
+            name: "mcp__alpha".to_string(),
+            kind: "mcp_server".to_string(),
+            description: None,
+            category: None,
+            config: json!({
+                "server_name": "alpha",
+                "command": "/nonexistent/mcp-server-binary",
+                "args": [],
+            }),
+            interface: None,
+        };
+        let action = McpServerAction::from_spec(&spec).expect("build action");
+        let result = action
+            .run(
+                ActionInput::with_params(json!({"operation": "reboot_universe"})),
+                test_ctx(),
+            )
+            .await;
+
+        match result {
+            ActionResult::Error { message } => {
+                assert!(
+                    message.contains("reboot_universe"),
+                    "error should echo the unknown operation, got: {message}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stdio_server_spawn_failure_maps_to_error() {
+        let spec = ActionSpec {
+            name: "mcp__alpha".to_string(),
+            kind: "mcp_server".to_string(),
+            description: None,
+            category: None,
+            config: json!({
+                "server_name": "alpha",
+                // Use an executable that is guaranteed not to exist.
+                "command": "/definitely/not/a/binary/that/exists",
+                "args": [],
+                "startup_timeout_ms": 500,
+                "enabled_tools": ["ping"]
+            }),
+            interface: None,
+        };
+        let action = McpServerAction::from_spec(&spec).expect("build action");
+        let result = action
+            .run(
+                ActionInput::with_params(json!({
+                    "operation": "call",
+                    "tool": "ping",
+                    "arguments": {}
+                })),
+                test_ctx(),
+            )
+            .await;
+
+        assert!(
+            matches!(result, ActionResult::Error { .. }),
+            "stdio spawn failure should map to ActionResult::Error, got {result:?}"
+        );
     }
 }
