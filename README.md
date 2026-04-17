@@ -33,7 +33,7 @@ The planner discovers MCP tools at startup via `tool_lookup`, activates the `xls
 export OPENROUTER_API_KEY="sk-or-..."
 cargo build -p orchestral-cli
 cargo run -p orchestral-cli -- scenario \
-  --spec configs/scenarios/sales_report_pipeline.smoke.yaml
+  --spec configs/scenarios/tier2/e2e_pipeline.yaml
 ```
 
 ## Architecture

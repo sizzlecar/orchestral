@@ -1,0 +1,53 @@
+version: 1
+name: multi-turn-followup
+config: ../../orchestral.cli.yaml
+no_mcp: true
+no_skills: true
+timeout_secs: 300
+workspace:
+  copies:
+    - from: ../../../fixtures/scenarios/multi_turn_followup/notes.md
+      to: notes.md
+
+turns:
+  - name: read-notes
+    input: >
+      读一下 notes.md 里的内容，告诉我里面写的版本号是多少。
+    expect:
+      require_execution_end: true
+      max_approvals: 0
+      max_errors: 0
+      assistant_contains:
+        - "1.7.3"
+      persist_not_contains:
+        - "Plan: no actions"
+
+  - name: persist-version
+    input: >
+      把这个版本号写到 version.txt 里。
+    expect:
+      require_execution_end: true
+      max_approvals: 0
+      max_errors: 0
+      # 跨 turn 上下文断言：LLM 必须记住上轮读到的 1.7.3，而不是询问版本号
+      artifact_contains:
+        - path: version.txt
+          text: "1.7.3"
+      assistant_not_contains:
+        - "请告诉我版本号"
+        - "需要版本号"
+
+  - name: append-usage-note
+    input: >
+      在刚才写的 version.txt 后面再追加一行：Used in release build。
+      保留原有版本号那一行，不要覆盖。
+    expect:
+      require_execution_end: true
+      max_approvals: 0
+      max_errors: 0
+      # 跨 turn 上下文：LLM 要记得第二轮写的文件（version.txt）并在其上追加
+      artifact_contains:
+        - path: version.txt
+          text: "1.7.3"
+        - path: version.txt
+          text: "Used in release build"

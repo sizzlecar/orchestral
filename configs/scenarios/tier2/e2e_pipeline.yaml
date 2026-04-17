@@ -1,18 +1,16 @@
 version: 1
 name: sales-report-pipeline
-config: ../orchestral.cli.runtime.override.yaml
+config: ../../orchestral.cli.runtime.override.yaml
 timeout_secs: 300
-env:
-  PYTHON: /Users/chejinxuan/rust_ws/orchestral/.claude/skills/xlsx/.venv/bin/python3
 workspace:
   copies:
-    - from: ../../fixtures/scenarios/sales_report/mock_sales_api.sh
+    - from: ../../../fixtures/scenarios/sales_report/mock_sales_api.sh
       to: mock_sales_api.sh
-    - from: ../../fixtures/scenarios/sales_report/.mcp.json
+    - from: ../../../fixtures/scenarios/sales_report/.mcp.json
       to: .mcp.json
-    - from: ../../fixtures/scenarios/sales_report/quarterly_report_template.xlsx
+    - from: ../../../fixtures/scenarios/sales_report/quarterly_report_template.xlsx
       to: quarterly_report_template.xlsx
-    - from: ../../fixtures/scenarios/sales_report/budget.yaml
+    - from: ../../../fixtures/scenarios/sales_report/budget.yaml
       to: budget.yaml
 
 turns:

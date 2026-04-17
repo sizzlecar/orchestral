@@ -1,19 +1,19 @@
 version: 1
 name: no-fake-execution-patch-toml
-config: ../orchestral.cli.yaml
+config: ../../orchestral.cli.yaml
 no_mcp: true
 no_skills: true
 timeout_secs: 300
 workspace:
   copies:
-    - from: ../../fixtures/scenarios/no_fake_execution/config/app.toml
+    - from: ../../../fixtures/scenarios/no_fake_execution/config/app.toml
       to: fixtures/scenarios/no_fake_execution/config/app.toml
 
 turns:
   - name: patch-toml-port
     input: >
       把 fixtures/scenarios/no_fake_execution/config/app.toml 里的 server.port 改成 9090，
-      然后返回最终值。
+      保留文件里其他配置项不变，然后返回最终值。
     expect:
       require_execution_end: true
       max_approvals: 0
@@ -32,7 +32,7 @@ turns:
     verify:
       - name: verify-toml-port-patched
         command: /bin/zsh
-        cwd: ../..
+        cwd: ../../..
         args:
           - -lc
           - >-

@@ -1,0 +1,22 @@
+version: 1
+name: action-file-write
+config: ../../orchestral.cli.yaml
+no_mcp: true
+no_skills: true
+timeout_secs: 180
+
+turns:
+  - name: write-greeting
+    input: >
+      在当前目录下新建一个文件 greeting.txt，内容写一行：hello orchestral
+    expect:
+      require_execution_end: true
+      max_approvals: 0
+      max_errors: 0
+      activity_contains:
+        - "file_write"
+      artifact_contains:
+        - path: greeting.txt
+          text: "hello orchestral"
+      persist_not_contains:
+        - "Plan: no actions"

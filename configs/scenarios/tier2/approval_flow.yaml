@@ -1,0 +1,37 @@
+version: 1
+name: approval-flow
+config: ../../orchestral.cli.yaml
+no_mcp: true
+no_skills: true
+timeout_secs: 240
+workspace:
+  copies:
+    - from: ../../../fixtures/scenarios/approval_flow/source.txt
+      to: source.txt
+
+turns:
+  - name: request-destructive-mv
+    input: >
+      把 source.txt 重命名为 moved.txt
+    expect:
+      # 运行到 approval gate 停下，不应该在第一轮就完成 mv
+      require_execution_end: true
+      execution_status: waiting_user
+      min_approvals: 1
+      max_approvals: 1
+      max_errors: 0
+      # 文件还没动
+      artifact_contains:
+        - path: source.txt
+          text: "important data"
+
+  - name: approve-and-continue
+    input: approve
+    expect:
+      require_execution_end: true
+      max_approvals: 0
+      max_errors: 0
+      artifact_contains:
+        - path: moved.txt
+          text: "important data"
+      # 重命名后源文件应该不存在（artifact_not_contains 在文件不存在时会通过）

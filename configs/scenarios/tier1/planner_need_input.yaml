@@ -1,12 +1,12 @@
 version: 1
 name: wait-user-missing-required-field-contract
-config: ../orchestral.cli.yaml
+config: ../../orchestral.cli.yaml
 no_mcp: true
 no_skills: true
 timeout_secs: 300
 workspace:
   copies:
-    - from: ../../fixtures/scenarios/wait_user_contract/docs/contract.md
+    - from: ../../../fixtures/scenarios/wait_user_contract/docs/contract.md
       to: fixtures/scenarios/wait_user_contract/docs/contract.md
 
 turns:

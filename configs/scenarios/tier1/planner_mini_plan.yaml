@@ -1,0 +1,28 @@
+version: 1
+name: planner-mini-plan
+config: ../../orchestral.cli.yaml
+no_mcp: true
+no_skills: true
+timeout_secs: 180
+workspace:
+  copies:
+    - from: ../../../fixtures/scenarios/planner_mini_plan/a.txt
+      to: a.txt
+    - from: ../../../fixtures/scenarios/planner_mini_plan/b.txt
+      to: b.txt
+
+turns:
+  - name: read-and-combine
+    input: >
+      读一下 a.txt 和 b.txt 两个文件，把里面的内容合并告诉我。
+    expect:
+      require_execution_end: true
+      max_approvals: 0
+      max_errors: 0
+      # 正向断言：planner 至少要把两次读取组织成一步或多步执行（mini_plan 或两次 single_action）
+      # 失败时两个文件内容缺一即 assistant_contains 不过
+      assistant_contains:
+        - "Section A"
+        - "Section B"
+      persist_not_contains:
+        - "Plan: no actions"

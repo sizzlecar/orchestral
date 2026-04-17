@@ -120,6 +120,8 @@ struct ScenarioExpect {
     execution_status: Option<String>,
     #[serde(default = "default_zero_usize")]
     max_approvals: Option<usize>,
+    #[serde(default)]
+    min_approvals: Option<usize>,
     #[serde(default = "default_zero_usize")]
     max_errors: Option<usize>,
     #[serde(default)]
@@ -813,6 +815,7 @@ fn prepare_scenario(options: ScenarioRunOptions) -> anyhow::Result<PreparedScena
                 require_execution_end: !options.allow_missing_execution_end,
                 execution_status: None,
                 max_approvals: options.max_approvals.or(Some(0)),
+                min_approvals: None,
                 max_errors: options.max_errors.or(Some(0)),
                 persist_contains: options.persist_contains,
                 persist_not_contains: options.persist_not_contains,
@@ -1098,6 +1101,15 @@ fn evaluate_expectations(
             report.failures.push(format!(
                 "expected at most {} approvals, got {}",
                 max_approvals,
+                report.approvals.len()
+            ));
+        }
+    }
+    if let Some(min_approvals) = expect.min_approvals {
+        if report.approvals.len() < min_approvals {
+            report.failures.push(format!(
+                "expected at least {} approvals, got {}",
+                min_approvals,
                 report.approvals.len()
             ));
         }
@@ -2060,6 +2072,7 @@ turns:
             require_execution_end: true,
             execution_status: None,
             max_approvals: Some(0),
+            min_approvals: None,
             max_errors: Some(0),
             persist_contains: vec!["plan".to_string()],
             persist_not_contains: vec!["error".to_string()],
@@ -2174,6 +2187,7 @@ turns:
             require_execution_end: true,
             execution_status: Some("completed".to_string()),
             max_approvals: Some(0),
+            min_approvals: None,
             max_errors: Some(0),
             persist_contains: Vec::new(),
             persist_not_contains: Vec::new(),
@@ -2232,6 +2246,7 @@ turns:
             require_execution_end: true,
             execution_status: Some("failed".to_string()),
             max_approvals: Some(0),
+            min_approvals: None,
             max_errors: Some(0),
             persist_contains: Vec::new(),
             persist_not_contains: Vec::new(),
@@ -2299,6 +2314,7 @@ turns:
             require_execution_end: true,
             execution_status: Some("completed".to_string()),
             max_approvals: Some(0),
+            min_approvals: None,
             max_errors: Some(0),
             persist_contains: Vec::new(),
             persist_not_contains: Vec::new(),
@@ -2367,6 +2383,7 @@ turns:
             require_execution_end: true,
             execution_status: Some("completed".to_string()),
             max_approvals: Some(0),
+            min_approvals: None,
             max_errors: Some(0),
             persist_contains: Vec::new(),
             persist_not_contains: Vec::new(),
@@ -2447,6 +2464,7 @@ turns:
             require_execution_end: true,
             execution_status: Some("completed".to_string()),
             max_approvals: Some(0),
+            min_approvals: None,
             max_errors: Some(0),
             persist_contains: Vec::new(),
             persist_not_contains: Vec::new(),

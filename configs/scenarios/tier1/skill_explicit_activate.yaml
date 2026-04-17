@@ -1,6 +1,6 @@
 version: 1
 name: skill-activate-smoke
-config: ../orchestral.cli.runtime.override.yaml
+config: ../../orchestral.cli.runtime.override.yaml
 no_mcp: true
 timeout_secs: 180
 

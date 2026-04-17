@@ -1,0 +1,401 @@
+2026-04-17T10:00:00 [INFO] auth: worker 141 shutdown gracefully
+2026-04-17T10:00:01 [WARN] db: retrying after 378ms backoff
+2026-04-17T10:00:02 [INFO] pipeline: worker 457 shutdown gracefully
+2026-04-17T10:00:03 [INFO] cache: cache miss for key_17
+2026-04-17T10:00:04 [INFO] auth: retrying after 120ms backoff
+2026-04-17T10:00:05 [INFO] cache: retrying after 367ms backoff
+2026-04-17T10:00:06 [DEBUG] db: cache miss for key_302
+2026-04-17T10:00:07 [ERROR] auth: retrying after 358ms backoff
+2026-04-17T10:00:08 [DEBUG] http: processed 80 records
+2026-04-17T10:00:09 [WARN] http: connection refused from 10.0.0.48
+2026-04-17T10:00:10 [DEBUG] auth: processed 434 records
+2026-04-17T10:00:11 [ERROR] cache: processed 414 records
+2026-04-17T10:00:12 [INFO] pipeline: cache miss for key_275
+2026-04-17T10:00:13 [INFO] scheduler: connection refused from 10.0.0.283
+2026-04-17T10:00:14 [ERROR] pipeline: slow query detected in 454ms
+2026-04-17T10:00:15 [ERROR] cache: retrying after 361ms backoff
+2026-04-17T10:00:16 [INFO] auth: worker 117 shutdown gracefully
+2026-04-17T10:00:17 [ERROR] auth: retrying after 444ms backoff
+2026-04-17T10:00:18 [INFO] scheduler: processed 233 records
+2026-04-17T10:00:19 [ERROR] db: processed 182 records
+2026-04-17T10:00:20 [WARN] pipeline: processed 360 records
+2026-04-17T10:00:21 [INFO] cache: worker 88 shutdown gracefully
+2026-04-17T10:00:22 [WARN] db: cache miss for key_195
+2026-04-17T10:00:23 [ERROR] pipeline: worker 286 shutdown gracefully
+2026-04-17T10:00:24 [WARN] pipeline: processed 432 records
+2026-04-17T10:00:25 [INFO] db: connection refused from 10.0.0.413
+2026-04-17T10:00:26 [ERROR] scheduler: processed 34 records
+2026-04-17T10:00:27 [WARN] cache: worker 162 shutdown gracefully
+2026-04-17T10:00:28 [WARN] pipeline: cache miss for key_203
+2026-04-17T10:00:29 [DEBUG] db: processed 72 records
+2026-04-17T10:00:30 [WARN] pipeline: slow query detected in 276ms
+2026-04-17T10:00:31 [ERROR] pipeline: slow query detected in 220ms
+2026-04-17T10:00:32 [DEBUG] http: retrying after 71ms backoff
+2026-04-17T10:00:33 [DEBUG] auth: connection refused from 10.0.0.441
+2026-04-17T10:00:34 [INFO] db: worker 82 shutdown gracefully
+2026-04-17T10:00:35 [DEBUG] cache: connection refused from 10.0.0.198
+2026-04-17T10:00:36 [DEBUG] cache: cache miss for key_271
+2026-04-17T10:00:37 [ERROR] cache: connection refused from 10.0.0.349
+2026-04-17T10:00:38 [INFO] pipeline: slow query detected in 385ms
+2026-04-17T10:00:39 [ERROR] pipeline: processed 58 records
+2026-04-17T10:00:40 [ERROR] scheduler: retrying after 233ms backoff
+2026-04-17T10:00:41 [INFO] pipeline: worker 135 shutdown gracefully
+2026-04-17T10:00:42 [WARN] cache: connection refused from 10.0.0.446
+2026-04-17T10:00:43 [ERROR] pipeline: slow query detected in 312ms
+2026-04-17T10:00:44 [WARN] db: processed 391 records
+2026-04-17T10:00:45 [WARN] cache: slow query detected in 471ms
+2026-04-17T10:00:46 [INFO] cache: processed 251 records
+2026-04-17T10:00:47 [INFO] auth: processed 450 records
+2026-04-17T10:00:48 [ERROR] db: connection refused from 10.0.0.124
+2026-04-17T10:00:49 [INFO] auth: worker 249 shutdown gracefully
+2026-04-17T10:00:50 [INFO] cache: retrying after 66ms backoff
+2026-04-17T10:00:51 [DEBUG] cache: retrying after 136ms backoff
+2026-04-17T10:00:52 [DEBUG] db: slow query detected in 387ms
+2026-04-17T10:00:53 [WARN] pipeline: processed 205 records
+2026-04-17T10:00:54 [ERROR] scheduler: slow query detected in 232ms
+2026-04-17T10:00:55 [INFO] db: retrying after 33ms backoff
+2026-04-17T10:00:56 [ERROR] auth: slow query detected in 284ms
+2026-04-17T10:00:57 [WARN] cache: retrying after 4ms backoff
+2026-04-17T10:00:58 [INFO] pipeline: worker 31 shutdown gracefully
+2026-04-17T10:00:59 [WARN] auth: connection refused from 10.0.0.441
+2026-04-17T10:01:00 [ERROR] auth: slow query detected in 122ms
+2026-04-17T10:01:01 [ERROR] pipeline: cache miss for key_110
+2026-04-17T10:01:02 [WARN] pipeline: slow query detected in 296ms
+2026-04-17T10:01:03 [DEBUG] db: cache miss for key_414
+2026-04-17T10:01:04 [DEBUG] db: connection refused from 10.0.0.50
+2026-04-17T10:01:05 [DEBUG] http: cache miss for key_211
+2026-04-17T10:01:06 [DEBUG] pipeline: connection refused from 10.0.0.345
+2026-04-17T10:01:07 [INFO] auth: cache miss for key_373
+2026-04-17T10:01:08 [ERROR] auth: retrying after 99ms backoff
+2026-04-17T10:01:09 [WARN] cache: cache miss for key_72
+2026-04-17T10:01:10 [DEBUG] db: processed 237 records
+2026-04-17T10:01:11 [WARN] auth: cache miss for key_414
+2026-04-17T10:01:12 [INFO] auth: worker 277 shutdown gracefully
+2026-04-17T10:01:13 [INFO] auth: retrying after 86ms backoff
+2026-04-17T10:01:14 [DEBUG] scheduler: cache miss for key_110
+2026-04-17T10:01:15 [DEBUG] auth: retrying after 195ms backoff
+2026-04-17T10:01:16 [INFO] scheduler: processed 475 records
+2026-04-17T10:01:17 [DEBUG] http: cache miss for key_357
+2026-04-17T10:01:18 [DEBUG] db: retrying after 152ms backoff
+2026-04-17T10:01:19 [WARN] auth: slow query detected in 377ms
+2026-04-17T10:01:20 [INFO] pipeline: processed 30 records
+2026-04-17T10:01:21 [INFO] cache: cache miss for key_258
+2026-04-17T10:01:22 [WARN] auth: slow query detected in 42ms
+2026-04-17T10:01:23 [WARN] auth: slow query detected in 35ms
+2026-04-17T10:01:24 [WARN] scheduler: connection refused from 10.0.0.483
+2026-04-17T10:01:25 [WARN] cache: slow query detected in 21ms
+2026-04-17T10:01:26 [INFO] scheduler: worker 299 shutdown gracefully
+2026-04-17T10:01:27 [ERROR] http: retrying after 343ms backoff
+2026-04-17T10:01:28 [ERROR] db: processed 203 records
+2026-04-17T10:01:29 [WARN] pipeline: worker 154 shutdown gracefully
+2026-04-17T10:01:30 [DEBUG] http: connection refused from 10.0.0.5
+2026-04-17T10:01:31 [DEBUG] cache: slow query detected in 52ms
+2026-04-17T10:01:32 [INFO] cache: retrying after 260ms backoff
+2026-04-17T10:01:33 [ERROR] db: processed 452 records
+2026-04-17T10:01:34 [INFO] db: processed 146 records
+2026-04-17T10:01:35 [WARN] scheduler: slow query detected in 361ms
+2026-04-17T10:01:36 [ERROR] cache: worker 271 shutdown gracefully
+2026-04-17T10:01:37 [INFO] pipeline: slow query detected in 154ms
+2026-04-17T10:01:38 [INFO] db: processed 60 records
+2026-04-17T10:01:39 [INFO] pipeline: slow query detected in 80ms
+2026-04-17T10:01:40 [ERROR] http: slow query detected in 108ms
+2026-04-17T10:01:41 [ERROR] db: worker 325 shutdown gracefully
+2026-04-17T10:01:42 [ERROR] cache: cache miss for key_129
+2026-04-17T10:01:43 [INFO] auth: worker 217 shutdown gracefully
+2026-04-17T10:01:44 [ERROR] auth: connection refused from 10.0.0.171
+2026-04-17T10:01:45 [WARN] pipeline: processed 83 records
+2026-04-17T10:01:46 [DEBUG] cache: worker 219 shutdown gracefully
+2026-04-17T10:01:47 [INFO] auth: connection refused from 10.0.0.484
+2026-04-17T10:01:48 [WARN] cache: connection refused from 10.0.0.428
+2026-04-17T10:01:49 [ERROR] cache: slow query detected in 76ms
+2026-04-17T10:01:50 [DEBUG] db: connection refused from 10.0.0.158
+2026-04-17T10:01:51 [ERROR] auth: processed 108 records
+2026-04-17T10:01:52 [WARN] pipeline: connection refused from 10.0.0.182
+2026-04-17T10:01:53 [DEBUG] cache: worker 80 shutdown gracefully
+2026-04-17T10:01:54 [WARN] db: retrying after 452ms backoff
+2026-04-17T10:01:55 [DEBUG] auth: retrying after 378ms backoff
+2026-04-17T10:01:56 [ERROR] scheduler: worker 443 shutdown gracefully
+2026-04-17T10:01:57 [WARN] http: retrying after 404ms backoff
+2026-04-17T10:01:58 [INFO] scheduler: connection refused from 10.0.0.440
+2026-04-17T10:01:59 [DEBUG] db: retrying after 419ms backoff
+2026-04-17T10:02:00 [DEBUG] http: processed 421 records
+2026-04-17T10:02:01 [WARN] db: connection refused from 10.0.0.338
+2026-04-17T10:02:02 [WARN] scheduler: processed 143 records
+2026-04-17T10:02:03 [INFO] http: processed 329 records
+2026-04-17T10:02:04 [DEBUG] pipeline: slow query detected in 170ms
+2026-04-17T10:02:05 [INFO] auth: processed 92 records
+2026-04-17T10:02:06 [ERROR] auth: connection refused from 10.0.0.306
+2026-04-17T10:02:07 [DEBUG] http: worker 403 shutdown gracefully
+2026-04-17T10:02:08 [ERROR] scheduler: slow query detected in 262ms
+2026-04-17T10:02:09 [INFO] scheduler: slow query detected in 98ms
+2026-04-17T10:02:10 [ERROR] auth: worker 224 shutdown gracefully
+2026-04-17T10:02:11 [INFO] cache: slow query detected in 352ms
+2026-04-17T10:02:12 [WARN] http: cache miss for key_36
+2026-04-17T10:02:13 [ERROR] cache: processed 340 records
+2026-04-17T10:02:14 [INFO] pipeline: processed 260 records
+2026-04-17T10:02:15 [ERROR] pipeline: cache miss for key_168
+2026-04-17T10:02:16 [DEBUG] pipeline: processed 284 records
+2026-04-17T10:02:17 [WARN] db: cache miss for key_341
+2026-04-17T10:02:18 [DEBUG] pipeline: worker 463 shutdown gracefully
+2026-04-17T10:02:19 [WARN] cache: slow query detected in 155ms
+2026-04-17T10:02:20 [DEBUG] cache: connection refused from 10.0.0.156
+2026-04-17T10:02:21 [ERROR] db: cache miss for key_403
+2026-04-17T10:02:22 [ERROR] scheduler: cache miss for key_227
+2026-04-17T10:02:23 [WARN] cache: cache miss for key_407
+2026-04-17T10:02:24 [WARN] pipeline: connection refused from 10.0.0.146
+2026-04-17T10:02:25 [ERROR] auth: retrying after 345ms backoff
+2026-04-17T10:02:26 [ERROR] db: retrying after 76ms backoff
+2026-04-17T10:02:27 [INFO] auth: retrying after 244ms backoff
+2026-04-17T10:02:28 [INFO] scheduler: cache miss for key_454
+2026-04-17T10:02:29 [WARN] pipeline: worker 197 shutdown gracefully
+2026-04-17T10:02:30 [DEBUG] scheduler: retrying after 76ms backoff
+2026-04-17T10:02:31 [INFO] auth: cache miss for key_113
+2026-04-17T10:02:32 [WARN] pipeline: slow query detected in 238ms
+2026-04-17T10:02:33 [INFO] cache: retrying after 470ms backoff
+2026-04-17T10:02:34 [INFO] scheduler: retrying after 411ms backoff
+2026-04-17T10:02:35 [DEBUG] pipeline: slow query detected in 287ms
+2026-04-17T10:02:36 [ERROR] scheduler: slow query detected in 418ms
+2026-04-17T10:02:37 [DEBUG] cache: cache miss for key_460
+2026-04-17T10:02:38 [WARN] pipeline: cache miss for key_231
+2026-04-17T10:02:39 [ERROR] db: worker 142 shutdown gracefully
+2026-04-17T10:02:40 [DEBUG] pipeline: retrying after 141ms backoff
+2026-04-17T10:02:41 [DEBUG] auth: worker 147 shutdown gracefully
+2026-04-17T10:02:42 [WARN] http: processed 164 records
+2026-04-17T10:02:43 [INFO] db: retrying after 119ms backoff
+2026-04-17T10:02:44 [DEBUG] pipeline: retrying after 362ms backoff
+2026-04-17T10:02:45 [WARN] auth: cache miss for key_209
+2026-04-17T10:02:46 [ERROR] cache: cache miss for key_213
+2026-04-17T10:02:47 [INFO] db: cache miss for key_200
+2026-04-17T10:02:48 [INFO] cache: cache miss for key_245
+2026-04-17T10:02:49 [INFO] http: processed 386 records
+2026-04-17T10:02:50 [DEBUG] scheduler: slow query detected in 383ms
+2026-04-17T10:02:51 [WARN] scheduler: retrying after 140ms backoff
+2026-04-17T10:02:52 [DEBUG] scheduler: connection refused from 10.0.0.200
+2026-04-17T10:02:53 [ERROR] pipeline: worker 409 shutdown gracefully
+2026-04-17T10:02:54 [DEBUG] pipeline: retrying after 431ms backoff
+2026-04-17T10:02:55 [DEBUG] db: slow query detected in 274ms
+2026-04-17T10:02:56 [INFO] scheduler: slow query detected in 289ms
+2026-04-17T10:02:57 [INFO] auth: worker 220 shutdown gracefully
+2026-04-17T10:02:58 [WARN] scheduler: retrying after 26ms backoff
+2026-04-17T10:02:59 [ERROR] scheduler: processed 109 records
+2026-04-17T10:03:00 [DEBUG] http: processed 390 records
+2026-04-17T10:03:01 [DEBUG] http: cache miss for key_130
+2026-04-17T10:03:02 [INFO] scheduler: connection refused from 10.0.0.384
+2026-04-17T10:03:03 [INFO] http: retrying after 333ms backoff
+2026-04-17T10:03:04 [INFO] pipeline: connection refused from 10.0.0.387
+2026-04-17T10:03:05 [INFO] db: retrying after 430ms backoff
+2026-04-17T10:03:06 [INFO] cache: retrying after 123ms backoff
+2026-04-17T10:03:07 [WARN] scheduler: worker 59 shutdown gracefully
+2026-04-17T10:03:08 [WARN] scheduler: worker 132 shutdown gracefully
+2026-04-17T10:03:09 [ERROR] db: slow query detected in 311ms
+2026-04-17T10:03:10 [INFO] db: processed 56 records
+2026-04-17T10:03:11 [INFO] http: slow query detected in 347ms
+2026-04-17T10:03:12 [DEBUG] scheduler: worker 102 shutdown gracefully
+2026-04-17T10:03:13 [INFO] cache: worker 426 shutdown gracefully
+2026-04-17T10:03:14 [WARN] auth: worker 396 shutdown gracefully
+2026-04-17T10:03:15 [ERROR] pipeline: slow query detected in 413ms
+2026-04-17T10:03:16 [INFO] cache: connection refused from 10.0.0.178
+2026-04-17T10:03:17 [DEBUG] pipeline: processed 36 records
+2026-04-17T10:03:18 [ERROR] auth: cache miss for key_422
+2026-04-17T10:03:19 [DEBUG] auth: cache miss for key_492
+2026-04-17T10:03:20 [ERROR] pipeline: cache miss for key_363
+2026-04-17T10:03:21 [WARN] scheduler: retrying after 376ms backoff
+2026-04-17T10:03:22 [ERROR] cache: slow query detected in 397ms
+2026-04-17T10:03:23 [DEBUG] scheduler: cache miss for key_423
+2026-04-17T10:03:24 [ERROR] http: retrying after 426ms backoff
+2026-04-17T10:03:25 [INFO] http: cache miss for key_125
+2026-04-17T10:03:26 [DEBUG] cache: slow query detected in 343ms
+2026-04-17T10:03:27 [DEBUG] http: connection refused from 10.0.0.254
+2026-04-17T10:03:28 [ERROR] db: cache miss for key_109
+2026-04-17T10:03:29 [ERROR] http: processed 144 records
+2026-04-17T10:03:30 [ERROR] cache: connection refused from 10.0.0.265
+2026-04-17T10:03:31 [WARN] auth: retrying after 369ms backoff
+2026-04-17T10:03:32 [DEBUG] scheduler: slow query detected in 389ms
+2026-04-17T10:03:33 [WARN] pipeline: cache miss for key_331
+2026-04-17T10:03:34 [DEBUG] scheduler: connection refused from 10.0.0.48
+2026-04-17T10:03:35 [ERROR] db: cache miss for key_355
+2026-04-17T10:03:36 [WARN] http: worker 298 shutdown gracefully
+2026-04-17T10:03:37 [ERROR] scheduler: slow query detected in 272ms
+2026-04-17T10:03:38 [ERROR] scheduler: worker 282 shutdown gracefully
+2026-04-17T10:03:39 [ERROR] http: worker 233 shutdown gracefully
+2026-04-17T10:03:40 [ERROR] http: processed 119 records
+2026-04-17T10:03:41 [INFO] pipeline: retrying after 162ms backoff
+2026-04-17T10:03:42 [INFO] pipeline: slow query detected in 487ms
+2026-04-17T10:03:43 [WARN] db: retrying after 379ms backoff
+2026-04-17T10:03:44 [DEBUG] http: worker 302 shutdown gracefully
+2026-04-17T10:03:45 [ERROR] auth: retrying after 152ms backoff
+2026-04-17T10:03:46 [WARN] http: retrying after 155ms backoff
+2026-04-17T10:03:47 [INFO] pipeline: slow query detected in 65ms
+2026-04-17T10:03:48 [ERROR] auth: connection refused from 10.0.0.284
+2026-04-17T10:03:49 [ERROR] pipeline: retrying after 327ms backoff
+2026-04-17T10:03:50 [DEBUG] auth: connection refused from 10.0.0.294
+2026-04-17T10:03:51 [ERROR] scheduler: cache miss for key_226
+2026-04-17T10:03:52 [ERROR] db: connection refused from 10.0.0.130
+2026-04-17T10:03:53 [DEBUG] auth: connection refused from 10.0.0.206
+2026-04-17T10:03:54 [DEBUG] auth: slow query detected in 323ms
+2026-04-17T10:03:55 [INFO] db: retrying after 416ms backoff
+2026-04-17T10:03:56 [ERROR] auth: retrying after 61ms backoff
+2026-04-17T10:03:57 [DEBUG] cache: slow query detected in 405ms
+2026-04-17T10:03:58 [WARN] cache: cache miss for key_231
+2026-04-17T10:03:59 [DEBUG] http: slow query detected in 220ms
+2026-04-17T10:04:00 [ERROR] cache: slow query detected in 31ms
+2026-04-17T10:04:01 [INFO] db: worker 109 shutdown gracefully
+2026-04-17T10:04:02 [ERROR] pipeline: connection refused from 10.0.0.81
+2026-04-17T10:04:03 [WARN] db: slow query detected in 39ms
+2026-04-17T10:04:04 [WARN] auth: cache miss for key_231
+2026-04-17T10:04:05 [DEBUG] http: connection refused from 10.0.0.119
+2026-04-17T10:04:06 [ERROR] pipeline: processed 360 records
+2026-04-17T10:04:07 [DEBUG] auth: worker 120 shutdown gracefully
+2026-04-17T10:04:08 [ERROR] pipeline: slow query detected in 339ms
+2026-04-17T10:04:09 [WARN] scheduler: connection refused from 10.0.0.279
+2026-04-17T10:04:10 [WARN] pipeline: retrying after 466ms backoff
+2026-04-17T10:04:11 [ERROR] db: connection refused from 10.0.0.31
+2026-04-17T10:04:12 [WARN] http: slow query detected in 384ms
+2026-04-17T10:04:13 [ERROR] scheduler: connection refused from 10.0.0.240
+2026-04-17T10:04:14 [ERROR] pipeline: cache miss for key_483
+2026-04-17T10:04:15 [ERROR] cache: slow query detected in 253ms
+2026-04-17T10:04:16 [DEBUG] auth: slow query detected in 21ms
+2026-04-17T10:04:17 [DEBUG] pipeline: processed 310 records
+2026-04-17T10:04:18 [ERROR] auth: connection refused from 10.0.0.118
+2026-04-17T10:04:19 [INFO] pipeline: processed 296 records
+2026-04-17T10:04:20 [INFO] db: cache miss for key_266
+2026-04-17T10:04:21 [DEBUG] http: retrying after 300ms backoff
+2026-04-17T10:04:22 [DEBUG] pipeline: cache miss for key_497
+2026-04-17T10:04:23 [INFO] scheduler: processed 210 records
+2026-04-17T10:04:24 [ERROR] http: worker 54 shutdown gracefully
+2026-04-17T10:04:25 [WARN] http: cache miss for key_356
+2026-04-17T10:04:26 [DEBUG] http: worker 484 shutdown gracefully
+2026-04-17T10:04:27 [DEBUG] cache: connection refused from 10.0.0.233
+2026-04-17T10:04:28 [INFO] http: processed 166 records
+2026-04-17T10:04:29 [INFO] scheduler: slow query detected in 423ms
+2026-04-17T10:04:30 [INFO] pipeline: slow query detected in 237ms
+2026-04-17T10:04:31 [DEBUG] auth: retrying after 266ms backoff
+2026-04-17T10:04:32 [ERROR] cache: cache miss for key_321
+2026-04-17T10:04:33 [DEBUG] auth: retrying after 137ms backoff
+2026-04-17T10:04:34 [WARN] http: cache miss for key_451
+2026-04-17T10:04:35 [DEBUG] auth: connection refused from 10.0.0.499
+2026-04-17T10:04:36 [WARN] pipeline: retrying after 160ms backoff
+2026-04-17T10:04:37 [INFO] cache: cache miss for key_48
+2026-04-17T10:04:38 [WARN] auth: cache miss for key_485
+2026-04-17T10:04:39 [INFO] pipeline: retrying after 256ms backoff
+2026-04-17T10:04:40 [ERROR] cache: worker 140 shutdown gracefully
+2026-04-17T10:04:41 [DEBUG] scheduler: cache miss for key_125
+2026-04-17T10:04:42 [DEBUG] cache: retrying after 197ms backoff
+2026-04-17T10:04:43 [WARN] cache: slow query detected in 383ms
+2026-04-17T10:04:44 [WARN] auth: processed 396 records
+2026-04-17T10:04:45 [DEBUG] http: slow query detected in 137ms
+2026-04-17T10:04:46 [INFO] http: worker 153 shutdown gracefully
+2026-04-17T10:04:47 [DEBUG] db: cache miss for key_276
+2026-04-17T10:04:48 [DEBUG] http: processed 283 records
+2026-04-17T10:04:49 [DEBUG] scheduler: processed 446 records
+2026-04-17T10:04:50 [WARN] pipeline: retrying after 293ms backoff
+2026-04-17T10:04:51 [DEBUG] db: cache miss for key_23
+2026-04-17T10:04:52 [ERROR] pipeline: cache miss for key_362
+2026-04-17T10:04:53 [DEBUG] scheduler: worker 406 shutdown gracefully
+2026-04-17T10:04:54 [WARN] scheduler: connection refused from 10.0.0.65
+2026-04-17T10:04:55 [ERROR] auth: cache miss for key_52
+2026-04-17T10:04:56 [DEBUG] auth: worker 74 shutdown gracefully
+2026-04-17T10:04:57 [DEBUG] pipeline: retrying after 39ms backoff
+2026-04-17T10:04:58 [DEBUG] http: processed 320 records
+2026-04-17T10:04:59 [DEBUG] pipeline: connection refused from 10.0.0.437
+2026-04-17T10:05:00 [ERROR] pipeline: slow query detected in 195ms
+2026-04-17T10:05:01 [ERROR] pipeline: worker 455 shutdown gracefully
+2026-04-17T10:05:02 [DEBUG] cache: connection refused from 10.0.0.317
+2026-04-17T10:05:03 [INFO] db: worker 351 shutdown gracefully
+2026-04-17T10:05:04 [ERROR] db: worker 47 shutdown gracefully
+2026-04-17T10:05:05 [DEBUG] auth: worker 361 shutdown gracefully
+2026-04-17T10:05:06 [INFO] scheduler: retrying after 356ms backoff
+2026-04-17T10:05:07 [ERROR] auth: connection refused from 10.0.0.167
+2026-04-17T10:05:08 [INFO] http: processed 192 records
+2026-04-17T10:05:09 [DEBUG] db: retrying after 272ms backoff
+2026-04-17T10:05:10 [DEBUG] cache: worker 406 shutdown gracefully
+2026-04-17T10:05:11 [WARN] db: retrying after 41ms backoff
+2026-04-17T10:05:12 [DEBUG] cache: worker 124 shutdown gracefully
+2026-04-17T10:05:13 [DEBUG] cache: retrying after 119ms backoff
+2026-04-17T10:05:14 [DEBUG] pipeline: processed 236 records
+2026-04-17T10:05:15 [ERROR] pipeline: connection refused from 10.0.0.461
+2026-04-17T10:05:16 [DEBUG] http: worker 280 shutdown gracefully
+2026-04-17T10:05:17 [WARN] auth: cache miss for key_484
+2026-04-17T10:05:18 [ERROR] cache: processed 328 records
+2026-04-17T10:05:19 [DEBUG] pipeline: processed 234 records
+2026-04-17T10:05:20 [ERROR] db: cache miss for key_437
+2026-04-17T10:05:21 [DEBUG] auth: retrying after 196ms backoff
+2026-04-17T10:05:22 [ERROR] cache: processed 359 records
+2026-04-17T10:05:23 [ERROR] auth: worker 203 shutdown gracefully
+2026-04-17T10:05:24 [ERROR] auth: slow query detected in 443ms
+2026-04-17T10:05:25 [INFO] cache: worker 255 shutdown gracefully
+2026-04-17T10:05:26 [ERROR] db: slow query detected in 411ms
+2026-04-17T10:05:27 [ERROR] db: worker 98 shutdown gracefully
+2026-04-17T10:05:28 [ERROR] pipeline: worker 393 shutdown gracefully
+2026-04-17T10:05:29 [WARN] pipeline: connection refused from 10.0.0.463
+2026-04-17T10:05:30 [INFO] http: cache miss for key_18
+2026-04-17T10:05:31 [ERROR] pipeline: retrying after 47ms backoff
+2026-04-17T10:05:32 [ERROR] http: worker 213 shutdown gracefully
+2026-04-17T10:05:33 [WARN] db: retrying after 403ms backoff
+2026-04-17T10:05:34 [ERROR] cache: slow query detected in 468ms
+2026-04-17T10:05:35 [ERROR] db: processed 468 records
+2026-04-17T10:05:36 [DEBUG] http: worker 446 shutdown gracefully
+2026-04-17T10:05:37 [ERROR] auth: cache miss for key_494
+2026-04-17T10:05:38 [INFO] db: retrying after 441ms backoff
+2026-04-17T10:05:39 [DEBUG] cache: processed 47 records
+2026-04-17T10:05:40 [DEBUG] auth: processed 275 records
+2026-04-17T10:05:41 [INFO] scheduler: processed 345 records
+2026-04-17T10:05:42 [ERROR] cache: cache miss for key_422
+2026-04-17T10:05:43 [ERROR] auth: worker 120 shutdown gracefully
+2026-04-17T10:05:44 [DEBUG] auth: slow query detected in 453ms
+2026-04-17T10:05:45 [ERROR] cache: retrying after 332ms backoff
+2026-04-17T10:05:46 [INFO] pipeline: cache miss for key_466
+2026-04-17T10:05:47 [ERROR] pipeline: cache miss for key_60
+2026-04-17T10:05:48 [WARN] auth: connection refused from 10.0.0.156
+2026-04-17T10:05:49 [DEBUG] auth: connection refused from 10.0.0.121
+2026-04-17T10:05:50 [WARN] scheduler: cache miss for key_190
+2026-04-17T10:05:51 [DEBUG] cache: worker 373 shutdown gracefully
+2026-04-17T10:05:52 [WARN] scheduler: worker 51 shutdown gracefully
+2026-04-17T10:05:53 [DEBUG] cache: cache miss for key_481
+2026-04-17T10:05:54 [ERROR] auth: worker 190 shutdown gracefully
+2026-04-17T10:05:55 [WARN] scheduler: cache miss for key_487
+2026-04-17T10:05:56 [WARN] http: connection refused from 10.0.0.352
+2026-04-17T10:05:57 [ERROR] cache: worker 184 shutdown gracefully
+2026-04-17T10:05:58 [INFO] scheduler: processed 98 records
+2026-04-17T10:05:59 [INFO] scheduler: connection refused from 10.0.0.340
+2026-04-17T10:06:00 [WARN] pipeline: worker 306 shutdown gracefully
+2026-04-17T10:06:01 [INFO] auth: processed 125 records
+2026-04-17T10:06:02 [WARN] cache: retrying after 36ms backoff
+2026-04-17T10:06:03 [WARN] cache: retrying after 417ms backoff
+2026-04-17T10:06:04 [WARN] http: retrying after 404ms backoff
+2026-04-17T10:06:05 [INFO] http: retrying after 67ms backoff
+2026-04-17T10:06:06 [ERROR] db: connection refused from 10.0.0.339
+2026-04-17T10:06:07 [INFO] db: connection refused from 10.0.0.184
+2026-04-17T10:06:08 [WARN] cache: processed 9 records
+2026-04-17T10:06:09 [WARN] http: connection refused from 10.0.0.65
+2026-04-17T10:06:10 [DEBUG] cache: connection refused from 10.0.0.382
+2026-04-17T10:06:11 [INFO] scheduler: cache miss for key_399
+2026-04-17T10:06:12 [ERROR] cache: slow query detected in 56ms
+2026-04-17T10:06:13 [DEBUG] cache: retrying after 485ms backoff
+2026-04-17T10:06:14 [INFO] pipeline: worker 267 shutdown gracefully
+2026-04-17T10:06:15 [ERROR] scheduler: worker 494 shutdown gracefully
+2026-04-17T10:06:16 [INFO] auth: cache miss for key_434
+2026-04-17T10:06:17 [DEBUG] scheduler: worker 56 shutdown gracefully
+2026-04-17T10:06:18 [DEBUG] pipeline: cache miss for key_38
+2026-04-17T10:06:19 [INFO] http: slow query detected in 76ms
+2026-04-17T10:06:20 [INFO] db: processed 320 records
+2026-04-17T10:06:21 [ERROR] scheduler: slow query detected in 272ms
+2026-04-17T10:06:22 [ERROR] scheduler: slow query detected in 310ms
+2026-04-17T10:06:23 [DEBUG] auth: worker 59 shutdown gracefully
+2026-04-17T10:06:24 [WARN] scheduler: cache miss for key_455
+2026-04-17T10:06:25 [WARN] scheduler: processed 424 records
+2026-04-17T10:06:26 [DEBUG] scheduler: cache miss for key_374
+2026-04-17T10:06:27 [INFO] http: cache miss for key_161
+2026-04-17T10:06:28 [ERROR] http: retrying after 352ms backoff
+2026-04-17T10:06:29 [DEBUG] auth: connection refused from 10.0.0.426
+2026-04-17T10:06:30 [INFO] auth: cache miss for key_50
+2026-04-17T10:06:31 [ERROR] db: slow query detected in 31ms
+2026-04-17T10:06:32 [ERROR] pipeline: connection refused from 10.0.0.211
+2026-04-17T10:06:33 [ERROR] pipeline: cache miss for key_445
+2026-04-17T10:06:34 [INFO] http: slow query detected in 160ms
+2026-04-17T10:06:35 [ERROR] auth: slow query detected in 260ms
+2026-04-17T10:06:36 [WARN] db: worker 247 shutdown gracefully
+2026-04-17T10:06:37 [WARN] auth: processed 433 records
+2026-04-17T10:06:38 [ERROR] auth: processed 294 records
+2026-04-17T10:06:39 [WARN] scheduler: slow query detected in 499ms
+FINAL_MARKER: the quarterly revenue is 4.2M

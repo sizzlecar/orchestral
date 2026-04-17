@@ -49,15 +49,22 @@ def main():
     import os
 
     path = sys.argv[1]
-    # If the specified file doesn't exist, search for any xlsx in the same directory
-    if not os.path.exists(path):
-        search_dir = os.path.dirname(path) or "."
-        candidates = glob.glob(os.path.join(search_dir, "*.xlsx"))
-        if candidates:
-            path = max(candidates, key=os.path.getmtime)
+    # Pick the most recently modified xlsx in the same directory — covers LLM
+    # writing to a different filename (e.g. `_filled.xlsx`) while the original
+    # sits untouched on disk.
+    search_dir = os.path.dirname(path) or "."
+    candidates = glob.glob(os.path.join(search_dir, "*.xlsx"))
+    if candidates:
+        newest = max(candidates, key=os.path.getmtime)
+        if os.path.exists(path):
+            # Prefer newest only if it's strictly newer than the original.
+            if os.path.getmtime(newest) > os.path.getmtime(path):
+                path = newest
         else:
-            print(json.dumps({"ok": False, "error": f"no xlsx found in {search_dir}"}, ensure_ascii=False, indent=2))
-            return 1
+            path = newest
+    elif not os.path.exists(path):
+        print(json.dumps({"ok": False, "error": f"no xlsx found in {search_dir}"}, ensure_ascii=False, indent=2))
+        return 1
 
     wb = load_workbook(path, data_only=False)
     ws = wb[wb.sheetnames[0]]

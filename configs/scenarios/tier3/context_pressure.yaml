@@ -1,0 +1,26 @@
+version: 1
+name: context-pressure
+config: ../../orchestral.cli.yaml
+no_mcp: true
+no_skills: true
+timeout_secs: 300
+workspace:
+  copies:
+    - from: ../../../fixtures/scenarios/context_pressure/large_log.txt
+      to: large_log.txt
+
+turns:
+  - name: read-and-find-marker
+    input: >
+      读一下 large_log.txt。文件里藏着一行以 FINAL_MARKER 开头的关键信息，
+      找到并告诉我那一行完整内容。
+    expect:
+      require_execution_end: true
+      max_approvals: 0
+      max_errors: 0
+      # 验证 planner 在大输入下仍能定位关键信息（而非在 budget pressure 下砍掉正确区段）
+      assistant_contains:
+        - "FINAL_MARKER"
+        - "4.2M"
+      persist_not_contains:
+        - "Plan: no actions"

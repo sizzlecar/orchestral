@@ -14,16 +14,16 @@ if ! [[ "$ROUNDS" =~ ^[0-9]+$ ]] || [[ "$ROUNDS" -lt 1 ]]; then
 fi
 
 SPECS=(
-  "configs/scenarios/no_fake_execution_patch_toml.smoke.yaml"
-  "configs/scenarios/resume_after_action_failure_xlsx.smoke.yaml"
-  "configs/scenarios/wait_user_missing_required_field_contract.smoke.yaml"
-  "configs/scenarios/git_log_summary_no_approval.smoke.yaml"
+  "configs/scenarios/tier1/no_fake_execution.yaml"
+  "configs/scenarios/tier1/planner_need_input.yaml"
+  "configs/scenarios/tier1/action_shell_git_log.yaml"
+  "configs/scenarios/tier3/context_pressure.yaml"
 )
 
 if [[ "$INCLUDE_P2" == "1" ]]; then
   SPECS+=(
-    "configs/scenarios/skill_implicit_xlsx.smoke.yaml"
-    "configs/scenarios/mcp_tool_lookup.smoke.yaml"
+    "configs/scenarios/tier1/skill_auto_match.yaml"
+    "configs/scenarios/tier1/mcp_basic_call.yaml"
   )
 fi
 

@@ -15,7 +15,7 @@ cargo clippy --workspace --all-targets -- -D warnings  # Lint (CI enforces -D wa
 
 Run the CLI: `cargo run -p orchestral-cli -- run` (requires a provider key like `OPENROUTER_API_KEY`).
 
-Run a scenario smoke test: `cargo run -p orchestral-cli -- scenario --spec configs/scenarios/<name>.smoke.yaml --env-file .env.local`
+Run a scenario smoke test: `cargo run -p orchestral-cli -- scenario --spec configs/scenarios/tier1/<name>.yaml --env-file .env.local`
 
 Toolchain: Rust 1.91.0 stable (pinned in `rust-toolchain.toml`).
 
@@ -101,7 +101,9 @@ Follow Conventional Commits: `feat(scope):`, `fix(scope):`, `refactor(scope):`, 
 
 ## Configuration
 
-Main config: `configs/orchestral.cli.yaml`. Runtime override: `configs/orchestral.cli.runtime.override.yaml`. Scenario smoke tests: `configs/scenarios/*.smoke.yaml`.
+Main config: `configs/orchestral.cli.yaml`. Runtime override: `configs/orchestral.cli.runtime.override.yaml`. Scenario smoke tests organized in three tiers under `configs/scenarios/{tier1,tier2,tier3}/`: Tier 1 = capability contracts (one per dimension), Tier 2 = integration paths (end-to-end), Tier 3 = robustness (errors/pressure).
+
+Scenario layer has a deliberate scope: observable user-facing behavior and LLM decision correctness. Purely internal mechanics (ConcurrencyPolicy interrupt/queue/parallel timing, HTTP action I/O, MCP error propagation) live in unit/integration tests under the owning crate — scenario layer would make those tests unstable and slow without adding signal.
 
 Skills are auto-discovered from `.claude/skills/` directories with `SKILL.md` instruction files. MCP servers from `.mcp.json` files.
 

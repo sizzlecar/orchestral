@@ -1,18 +1,18 @@
 version: 1
-name: action-call-list-docs
-config: ../orchestral.cli.yaml
+name: action-call-read-file
+config: ../../orchestral.cli.yaml
 no_mcp: true
 no_skills: true
 timeout_secs: 180
 workspace:
   copies:
-    - from: ../../fixtures/scenarios/action_call_list_docs/docs
-      to: docs
+    - from: ../../../fixtures/scenarios/action_call_read_file/README.md
+      to: README.md
 
 turns:
-  - name: list-docs-dir
+  - name: read-readme
     input: >
-      docs下面有什么文件
+      README 里写了什么
     expect:
       require_execution_end: true
       max_approvals: 0
@@ -21,8 +21,8 @@ turns:
         - "single_action"
         - "done"
       assistant_contains:
-        - "alpha.md"
-        - "beta.txt"
+        - "Demo Readme"
+        - "file_read action-call execution"
       assistant_not_contains:
         - "```shell"
         - "请告诉我执行结果"

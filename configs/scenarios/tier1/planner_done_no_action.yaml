@@ -1,0 +1,23 @@
+version: 1
+name: planner-done-no-action
+config: ../../orchestral.cli.yaml
+no_mcp: true
+no_skills: true
+timeout_secs: 120
+
+turns:
+  - name: meta-question
+    input: >
+      你好，你是什么？能帮我做哪些事情？简单介绍一下自己。
+    expect:
+      require_execution_end: true
+      max_approvals: 0
+      max_errors: 0
+      # 正向断言：纯元问题应该直接 Done，不该跑任何 action
+      execution_mode_contains:
+        - "done"
+      execution_mode_not_contains:
+        - "single_action"
+        - "mini_plan"
+      persist_not_contains:
+        - "Plan: no actions"

@@ -1,13 +1,13 @@
 version: 1
 name: mcp-tool-lookup-smoke
-config: ../orchestral.cli.runtime.override.yaml
+config: ../../orchestral.cli.runtime.override.yaml
 no_skills: true
 timeout_secs: 180
 workspace:
   copies:
-    - from: ../../fixtures/scenarios/mcp_tool_lookup/mock_mcp_server.sh
+    - from: ../../../fixtures/scenarios/mcp_tool_lookup/mock_mcp_server.sh
       to: mock_mcp_server.sh
-    - from: ../../fixtures/scenarios/mcp_tool_lookup/.mcp.json
+    - from: ../../../fixtures/scenarios/mcp_tool_lookup/.mcp.json
       to: .mcp.json
 
 turns:
