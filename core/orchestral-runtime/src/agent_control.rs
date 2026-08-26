@@ -472,7 +472,8 @@ impl AgentController {
 
         let recovery =
             AgentRecoveryRequest::new(start_request, execution.clone(), &self.descriptor)?;
-        let mut stream = self.provider.recover(recovery).await?;
+        let recovered = self.provider.recover(recovery).await?;
+        let (mut stream, confirmation) = recovered.into_parts();
         let mut matched_digests = Vec::with_capacity(expected_provider_prefix.len());
         for (expected_event_id, expected_draft_digest) in &expected_provider_prefix {
             loop {
@@ -541,6 +542,16 @@ impl AgentController {
             )?;
             self.commit_sequenced(&slot, &mut entry, next_reducer, restored)
                 .await?;
+        }
+
+        if let Err(error) = confirmation.await {
+            self.mark_continuity_lost(
+                run_id,
+                &slot,
+                format!("Provider could not resume after reconciliation: {error}"),
+            )
+            .await?;
+            return Err(error.into());
         }
 
         let controller = Arc::clone(self);

@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use orchestral_core::agent_protocol::{
     reference::{AgentRunReducer, AgentRunStatus, ApplyOutcome},
     spi::{AgentProvider, AgentRecoveryRequest, AgentStartError},
@@ -575,13 +575,22 @@ async fn recover_stable_when_declared(
     let initial = collect_provider_drafts(start.stream, "initial stream").await?;
     let recovery = AgentRecoveryRequest::new(scenario.start_request, execution, &descriptor)
         .map_err(|error| CaseFailure::Failed(format!("recovery request was invalid: {error}")))?;
-    let recovered_stream = provider.recover(recovery).await.map_err(|error| {
+    let recovered = provider.recover(recovery).await.map_err(|error| {
         CaseFailure::Failed(format!(
             "recover=true returned {:?} instead of a stream: {error}",
             error.code
         ))
     })?;
-    let recovered = collect_provider_drafts(recovered_stream, "recovery stream").await?;
+    let (mut recovered_stream, confirmation) = recovered.into_parts();
+    let mut recovered =
+        collect_provider_prefix(&mut recovered_stream, initial.len(), "recovery prefix").await?;
+    confirmation.await.map_err(|error| {
+        CaseFailure::Failed(format!(
+            "recovery confirmation failed with {:?}: {error}",
+            error.code
+        ))
+    })?;
+    recovered.extend(collect_provider_drafts(recovered_stream, "recovery stream tail").await?);
     if initial != recovered {
         return Err(CaseFailure::Failed(
             "recovery changed draft IDs, order, or semantic content".to_owned(),
@@ -1008,6 +1017,25 @@ fn request_for(
     .map_err(|error| CaseFailure::NotProven(format!("could not build test start: {error}")))
 }
 
+async fn collect_provider_prefix(
+    stream: &mut orchestral_core::agent_protocol::spi::AgentProviderStream,
+    expected: usize,
+    label: &str,
+) -> Result<Vec<AgentEventDraft>, CaseFailure> {
+    let mut drafts = Vec::with_capacity(expected);
+    while drafts.len() < expected {
+        let item = stream.next().await.ok_or_else(|| {
+            CaseFailure::Failed(format!(
+                "{label} ended after {} of {expected} durable events",
+                drafts.len()
+            ))
+        })?;
+        let item = item.map_err(|error| CaseFailure::Failed(format!("{label} failed: {error}")))?;
+        drafts.push(provider_draft_from_item(item, label)?);
+    }
+    Ok(drafts)
+}
+
 async fn collect_provider_drafts(
     stream: orchestral_core::agent_protocol::spi::AgentProviderStream,
     label: &str,
@@ -1018,21 +1046,28 @@ async fn collect_provider_drafts(
         .map_err(|error| CaseFailure::Failed(format!("{label} failed: {error}")))?;
     items
         .into_iter()
-        .map(|item| match item {
-            AgentProviderStreamItem::Event(draft) => {
-                draft.validate_integrity().map_err(|error| {
-                    CaseFailure::Failed(format!("{label} emitted an invalid draft: {error}"))
-                })?;
-                Ok(*draft)
-            }
-            AgentProviderStreamItem::Telemetry(_) => Err(CaseFailure::Failed(format!(
-                "{label} emitted telemetry instead of its durable fixture events"
-            ))),
-            _ => Err(CaseFailure::Failed(format!(
-                "{label} emitted an unsupported stream item"
-            ))),
-        })
+        .map(|item| provider_draft_from_item(item, label))
         .collect()
+}
+
+fn provider_draft_from_item(
+    item: AgentProviderStreamItem,
+    label: &str,
+) -> Result<AgentEventDraft, CaseFailure> {
+    match item {
+        AgentProviderStreamItem::Event(draft) => {
+            draft.validate_integrity().map_err(|error| {
+                CaseFailure::Failed(format!("{label} emitted an invalid draft: {error}"))
+            })?;
+            Ok(*draft)
+        }
+        AgentProviderStreamItem::Telemetry(_) => Err(CaseFailure::Failed(format!(
+            "{label} emitted telemetry instead of its durable fixture events"
+        ))),
+        _ => Err(CaseFailure::Failed(format!(
+            "{label} emitted an unsupported stream item"
+        ))),
+    }
 }
 
 fn immediate_completion_events(

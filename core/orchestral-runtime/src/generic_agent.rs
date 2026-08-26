@@ -10,7 +10,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
 use orchestral_core::agent_protocol::{
-    spi::{AgentProvider, AgentProviderStream, AgentRecoveryRequest, AgentStart, AgentStartError},
+    spi::{
+        AgentProvider, AgentProviderStream, AgentRecovery, AgentRecoveryRequest, AgentStart,
+        AgentStartError,
+    },
     wire::{
         AgentAdmission, AgentCapabilities, AgentCommand, AgentCommandEnvelope, AgentDelivery,
         AgentDescriptor, AgentDescriptorEnvelope, AgentEvent, AgentEventDraft, AgentEventId,
@@ -994,7 +997,7 @@ impl AgentProvider for InternalGenericAgentProvider {
     async fn recover(
         &self,
         request: AgentRecoveryRequest,
-    ) -> Result<AgentProviderStream, AgentProtocolError> {
+    ) -> Result<AgentRecovery, AgentProtocolError> {
         request.validate_for(&self.inner.descriptor)?;
         let state = self.state();
         let run = state.runs.get(&request.execution.run_id).ok_or_else(|| {
@@ -1006,7 +1009,7 @@ impl AgentProvider for InternalGenericAgentProvider {
                 "recovery identity does not match the Generic Agent Run",
             ));
         }
-        Ok(Self::stream_for(run))
+        Ok(AgentRecovery::reattached(Self::stream_for(run)))
     }
 }
 

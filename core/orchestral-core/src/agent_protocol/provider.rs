@@ -1,3 +1,6 @@
+use std::future::Future;
+use std::pin::Pin;
+
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
 
@@ -11,6 +14,48 @@ use super::types::{
 /// journal assigns normalized `run_seq` after validating each event draft.
 pub type AgentProviderStream =
     BoxStream<'static, Result<AgentProviderStreamItem, AgentProtocolError>>;
+
+/// One-shot Provider continuation that the Host polls only after recovery
+/// evidence has been accepted and `ContinuityRestored` is durable.
+///
+/// A reconstructing Provider must keep all newly created model, Tool, and
+/// native work quiescent until this future is polled. Dropping the future must
+/// leave that work abandoned. A Provider that merely reattaches work which was
+/// already running may use [`AgentRecovery::reattached`].
+pub type AgentRecoveryConfirmation =
+    Pin<Box<dyn Future<Output = Result<(), AgentProtocolError>> + Send + 'static>>;
+
+/// Atomic first phase of recovery: a replay stream plus a one-shot continuation
+/// gate. The Host validates the stream prefix before opening the gate.
+pub struct AgentRecovery {
+    stream: AgentProviderStream,
+    confirmation: AgentRecoveryConfirmation,
+}
+
+impl AgentRecovery {
+    /// Recovery for native work that was already running and is only being
+    /// reattached. No newly reconstructed execution may be hidden behind this
+    /// convenience constructor.
+    pub fn reattached(stream: AgentProviderStream) -> Self {
+        Self::staged(stream, async { Ok(()) })
+    }
+
+    /// Recovery whose newly reconstructed execution remains gated by
+    /// `confirmation` until the Host has durably restored continuity.
+    pub fn staged<F>(stream: AgentProviderStream, confirmation: F) -> Self
+    where
+        F: Future<Output = Result<(), AgentProtocolError>> + Send + 'static,
+    {
+        Self {
+            stream,
+            confirmation: Box::pin(confirmation),
+        }
+    }
+
+    pub fn into_parts(self) -> (AgentProviderStream, AgentRecoveryConfirmation) {
+        (self.stream, self.confirmation)
+    }
+}
 
 /// Atomic result of `start`: the stream is established before native work may
 /// publish events, avoiding a subscribe-after-complete race for no-replay agents.
@@ -100,5 +145,5 @@ pub trait AgentProvider: Send + Sync {
     async fn recover(
         &self,
         request: AgentRecoveryRequest,
-    ) -> Result<AgentProviderStream, AgentProtocolError>;
+    ) -> Result<AgentRecovery, AgentProtocolError>;
 }

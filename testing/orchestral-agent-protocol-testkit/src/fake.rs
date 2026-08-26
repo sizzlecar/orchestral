@@ -5,7 +5,10 @@ use async_trait::async_trait;
 use futures_util::stream;
 use futures_util::StreamExt;
 use orchestral_core::agent_protocol::{
-    spi::{AgentProvider, AgentProviderStream, AgentRecoveryRequest, AgentStart, AgentStartError},
+    spi::{
+        AgentProvider, AgentProviderStream, AgentRecovery, AgentRecoveryRequest, AgentStart,
+        AgentStartError,
+    },
     wire::{
         AgentAdmission, AgentCapabilities, AgentCommandEnvelope, AgentDescriptor,
         AgentDescriptorEnvelope, AgentEventDraft, AgentExecutionRef, AgentId, AgentProtocolError,
@@ -419,7 +422,7 @@ impl AgentProvider for DeterministicProvider {
     async fn recover(
         &self,
         request: AgentRecoveryRequest,
-    ) -> Result<AgentProviderStream, AgentProtocolError> {
+    ) -> Result<AgentRecovery, AgentProtocolError> {
         request.validate_for(&self.descriptor)?;
         if !self.descriptor.descriptor.capabilities.controls.recover {
             return Err(AgentProtocolError::new(
@@ -442,6 +445,8 @@ impl AgentProvider for DeterministicProvider {
                 "execution reference does not match the stored immutable Run",
             ));
         }
-        Ok(self.stream_for(stored.events.clone()))
+        Ok(AgentRecovery::reattached(
+            self.stream_for(stored.events.clone()),
+        ))
     }
 }
