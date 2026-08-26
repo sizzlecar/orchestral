@@ -30,8 +30,9 @@ use orchestral_core::{
     tool_effect::InMemoryToolEffectJournalStore,
     tool_protocol::{
         ApprovalPolicy, EffectScope, HostApprovalVerifier, HostToolPolicy,
-        InMemoryApprovalCapabilityStore, ModelToolSchema, RunToolGrant, ToolConcurrency,
-        ToolDescriptor, ToolId, ToolIdempotency, ToolOutcome, ToolPolicyBounds, ToolRestriction,
+        InMemoryApprovalCapabilityStore, ModelToolSchema, RunToolGrant, ToolCallId,
+        ToolConcurrency, ToolDescriptor, ToolId, ToolIdempotency, ToolInvocation, ToolOutcome,
+        ToolPolicyBounds, ToolRestriction,
     },
 };
 use orchestral_runtime::{
@@ -39,7 +40,7 @@ use orchestral_runtime::{
     AppendGenericCheckpointOutcome, CreateGenericRunOutcome, GenericAgentCheckpointStore,
     GenericAgentConfig, GenericAgentRunRegistration, GenericCheckpointDraft,
     GenericCheckpointError, GenericCheckpointEvent, GenericCheckpointPhase, GuardedToolExecution,
-    GuardedToolExecutor, GuardedToolRuntime, InMemoryBlobStore,
+    GuardedToolExecutor, GuardedToolResult, GuardedToolRuntime, InMemoryBlobStore,
     InMemoryGenericAgentCheckpointStore, InMemoryHostApprovalBroker, InternalGenericAgentProvider,
     JsonSizeTokenMeter, StoredGenericAgentRun, ToolArtifactStore, WorkflowExecutionStrategy,
 };
@@ -167,6 +168,13 @@ struct AckLostAfterApprovalResolveCheckpointStore {
     unavailable: AtomicBool,
 }
 
+#[derive(Default)]
+struct AckLostAfterModelObservationCheckpointStore {
+    inner: InMemoryGenericAgentCheckpointStore,
+    acknowledgement_lost: AtomicBool,
+    unavailable: AtomicBool,
+}
+
 impl AckLostAfterInputOpenCheckpointStore {
     fn allow_recovery_writes(&self) {
         self.unavailable.store(false, Ordering::SeqCst);
@@ -186,6 +194,12 @@ impl AckLostAfterApprovalOpenCheckpointStore {
 }
 
 impl AckLostAfterApprovalResolveCheckpointStore {
+    fn allow_recovery_writes(&self) {
+        self.unavailable.store(false, Ordering::SeqCst);
+    }
+}
+
+impl AckLostAfterModelObservationCheckpointStore {
     fn allow_recovery_writes(&self) {
         self.unavailable.store(false, Ordering::SeqCst);
     }
@@ -439,6 +453,47 @@ impl GenericAgentCheckpointStore for AckLostAfterApprovalResolveCheckpointStore 
     }
 }
 
+impl GenericAgentCheckpointStore for AckLostAfterModelObservationCheckpointStore {
+    fn load_run(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Option<StoredGenericAgentRun>, GenericCheckpointError> {
+        self.inner.load_run(run_id)
+    }
+
+    fn create_run(
+        &self,
+        registration: GenericAgentRunRegistration,
+    ) -> Result<CreateGenericRunOutcome, GenericCheckpointError> {
+        self.inner.create_run(registration)
+    }
+
+    fn append(
+        &self,
+        run_id: &RunId,
+        expected_previous: u64,
+        draft: GenericCheckpointDraft,
+    ) -> Result<AppendGenericCheckpointOutcome, GenericCheckpointError> {
+        if self.unavailable.load(Ordering::SeqCst) {
+            return Err(GenericCheckpointError::Unavailable(
+                "simulated Provider process loss after durable model observation".to_owned(),
+            ));
+        }
+        let loses_acknowledgement = matches!(
+            &draft.payload,
+            GenericCheckpointEvent::ModelAttemptObserved { .. }
+        );
+        let outcome = self.inner.append(run_id, expected_previous, draft)?;
+        if loses_acknowledgement && !self.acknowledgement_lost.swap(true, Ordering::SeqCst) {
+            self.unavailable.store(true, Ordering::SeqCst);
+            return Err(GenericCheckpointError::Unavailable(
+                "model observation commit acknowledgement was lost".to_owned(),
+            ));
+        }
+        Ok(outcome)
+    }
+}
+
 impl GenericAgentCheckpointStore for PausingCheckpointStore {
     fn load_run(
         &self,
@@ -568,6 +623,8 @@ struct ApprovalLoopModel {
 struct EchoTool {
     calls: AtomicUsize,
 }
+
+struct UnknownEffectTool;
 
 struct WalInspectingEchoTool {
     calls: AtomicUsize,
@@ -1321,6 +1378,15 @@ impl GuardedToolExecutor for EchoTool {
 }
 
 #[async_trait]
+impl GuardedToolExecutor for UnknownEffectTool {
+    async fn execute(&self, _execution: GuardedToolExecution) -> ToolOutcome {
+        ToolOutcome::UnknownEffect {
+            message: "simulated process loss after durable Tool invocation".to_owned(),
+        }
+    }
+}
+
+#[async_trait]
 impl GuardedToolExecutor for WalInspectingEchoTool {
     async fn execute(&self, execution: GuardedToolExecution) -> ToolOutcome {
         let projection = self
@@ -1453,6 +1519,59 @@ fn durable_approval_runtime(
             tool,
         )
         .expect("approval Tool registers");
+    runtime
+}
+
+fn durable_direct_runtime(
+    bounds: &ToolPolicyBounds,
+    effect_journal: Arc<InMemoryToolEffectJournalStore>,
+    tool: Arc<dyn GuardedToolExecutor>,
+) -> Arc<GuardedToolRuntime<InMemoryApprovalCapabilityStore>> {
+    let verifier = HostApprovalVerifier::new(
+        b"0123456789abcdef0123456789abcdef",
+        InMemoryApprovalCapabilityStore::default(),
+    )
+    .expect("valid Host signing key");
+    let runtime = Arc::new(
+        GuardedToolRuntime::new_with_effect_journal(
+            HostToolPolicy {
+                bounds: bounds.clone(),
+            },
+            verifier,
+            effect_journal,
+        )
+        .expect("valid direct Tool policy"),
+    );
+    runtime
+        .register(
+            ToolDescriptor {
+                tool_id: ToolId::new("test/echo"),
+                model_schema: ModelToolSchema {
+                    name: "echo".to_owned(),
+                    description: "Echo one string".to_owned(),
+                    input_schema: json!({
+                        "type": "object",
+                        "required": ["value"],
+                        "properties": { "value": { "type": "string" } },
+                        "additionalProperties": false
+                    }),
+                },
+                output_schema: json!({
+                    "type": "object",
+                    "required": ["result"],
+                    "properties": { "result": { "type": "string" } },
+                    "additionalProperties": false
+                }),
+                effect_scopes: BTreeSet::new(),
+                restriction: ToolRestriction {
+                    bounds: bounds.clone(),
+                },
+                idempotency: ToolIdempotency::IdempotentWithKey,
+                concurrency: ToolConcurrency::ParallelSafe,
+            },
+            tool,
+        )
+        .expect("direct Tool registers");
     runtime
 }
 
@@ -3832,6 +3951,250 @@ async fn run_committed_approval_exchange_recovery(allow: bool) {
             .count(),
         1
     );
+    assert_eq!(
+        checkpoint_store
+            .load_run(&run_id)
+            .expect("private WAL remains readable")
+            .expect("recovered Run remains registered")
+            .validate()
+            .expect("recovered WAL remains valid")
+            .phase,
+        GenericCheckpointPhase::Terminal
+    );
+}
+
+#[derive(Clone, Copy)]
+enum DirectEffectRecoveryState {
+    Fresh,
+    Committed,
+    Unknown,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn observed_direct_tool_executes_once_after_recovery() {
+    run_direct_tool_recovery(DirectEffectRecoveryState::Fresh).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn committed_direct_tool_effect_replays_without_reexecution() {
+    run_direct_tool_recovery(DirectEffectRecoveryState::Committed).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_direct_tool_effect_fails_without_reexecution() {
+    run_direct_tool_recovery(DirectEffectRecoveryState::Unknown).await;
+}
+
+async fn run_direct_tool_recovery(effect_state: DirectEffectRecoveryState) {
+    let suffix = match effect_state {
+        DirectEffectRecoveryState::Fresh => "fresh",
+        DirectEffectRecoveryState::Committed => "committed",
+        DirectEffectRecoveryState::Unknown => "unknown",
+    };
+    let run_id = RunId::new(format!("direct-tool-{suffix}-recovery-run"));
+    let session_id = AgentSessionId::new(format!("direct-tool-{suffix}-recovery-session"));
+    let checkpoint_store = Arc::new(AckLostAfterModelObservationCheckpointStore::default());
+    let effect_journal = Arc::new(InMemoryToolEffectJournalStore::default());
+    let session_journal = Arc::new(InMemoryAgentSessionJournalStore::default());
+    let host_journal = Arc::new(InMemoryAgentJournalStore::default());
+    let tool = Arc::new(EchoTool {
+        calls: AtomicUsize::new(0),
+    });
+    let bounds = ToolPolicyBounds {
+        approval: ApprovalPolicy::NotRequired,
+        max_timeout_ms: Some(1_000),
+        max_output_bytes: Some(1_024),
+        ..ToolPolicyBounds::default()
+    };
+    let config = GenericAgentConfig::new("internal-provider", "generic-agent");
+    let first_provider = Arc::new(
+        InternalGenericAgentProvider::new_with_tools_and_session_journal(
+            Arc::new(ToolLoopModel {
+                rounds: AtomicUsize::new(0),
+            }),
+            config.clone(),
+            durable_direct_runtime(&bounds, effect_journal.clone(), tool.clone()),
+            RunToolGrant {
+                bounds: bounds.clone(),
+            },
+            session_journal.clone(),
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+        .expect("first direct-Tool Generic Agent starts")
+        .with_checkpoint_store(checkpoint_store.clone())
+        .expect("private WAL binds before the Provider is shared"),
+    );
+    let first_controller = Arc::new(
+        AgentController::with_journal_store(
+            first_provider,
+            ProviderBindingRef::new("direct-tool-recovery-binding"),
+            host_journal.clone(),
+        )
+        .expect("first controller binds"),
+    );
+    let execution = first_controller
+        .start(
+            AgentRunEnvelope::new(
+                AGENT_PROTOCOL_V1,
+                session_id.clone(),
+                run_id.clone(),
+                vec![Content::text("recover this direct Tool call")],
+            )
+            .expect("valid direct Tool Run"),
+        )
+        .await
+        .expect("Run starts");
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        first_controller.wait_for_terminal(&execution.run_id),
+    )
+    .await
+    .expect("lost model-observation acknowledgement reaches the Host")
+    .expect_err("observed but unfinished direct Tool Run is not terminal");
+    assert!(matches!(
+        error,
+        AgentControlError::ContinuityUnknown(ref actual) if actual == &run_id
+    ));
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        checkpoint_store
+            .load_run(&run_id)
+            .expect("private WAL remains readable")
+            .expect("private Run remains registered")
+            .validate()
+            .expect("private WAL remains valid")
+            .phase,
+        GenericCheckpointPhase::ModelAttemptObserved { round: 1, .. }
+    ));
+    drop(first_controller);
+    checkpoint_store.allow_recovery_writes();
+
+    let invocation = ToolInvocation {
+        run_id: run_id.clone(),
+        call_id: ToolCallId::new("echo-call"),
+        tool_id: ToolId::new("test/echo"),
+        arguments: json!({ "value": "hello" }),
+    };
+    match effect_state {
+        DirectEffectRecoveryState::Fresh => {}
+        DirectEffectRecoveryState::Committed => {
+            let runtime = durable_direct_runtime(&bounds, effect_journal.clone(), tool.clone());
+            let result = runtime
+                .invoke(
+                    invocation.clone(),
+                    RunToolGrant {
+                        bounds: bounds.clone(),
+                    },
+                    None,
+                    CancellationToken::new(),
+                )
+                .await;
+            assert!(matches!(
+                result,
+                GuardedToolResult::Outcome {
+                    outcome: ToolOutcome::Completed { .. },
+                    cached: false,
+                }
+            ));
+            assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+        }
+        DirectEffectRecoveryState::Unknown => {
+            let runtime = durable_direct_runtime(
+                &bounds,
+                effect_journal.clone(),
+                Arc::new(UnknownEffectTool),
+            );
+            let unknown = runtime
+                .invoke(
+                    invocation,
+                    RunToolGrant {
+                        bounds: bounds.clone(),
+                    },
+                    None,
+                    CancellationToken::new(),
+                )
+                .await;
+            assert!(matches!(
+                unknown,
+                GuardedToolResult::Outcome {
+                    outcome: ToolOutcome::UnknownEffect { .. },
+                    ..
+                }
+            ));
+            assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    let replacement_model = Arc::new(ToolLoopModel {
+        rounds: AtomicUsize::new(1),
+    });
+    let replacement_provider = Arc::new(
+        InternalGenericAgentProvider::new_with_tools_and_session_journal(
+            replacement_model.clone(),
+            config,
+            durable_direct_runtime(&bounds, effect_journal, tool.clone()),
+            RunToolGrant { bounds },
+            session_journal.clone(),
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+        .expect("replacement direct-Tool Generic Agent starts")
+        .with_checkpoint_store(checkpoint_store.clone())
+        .expect("replacement Provider binds the same private WAL"),
+    );
+    let replacement_controller = Arc::new(
+        AgentController::with_journal_store(
+            replacement_provider,
+            ProviderBindingRef::new("direct-tool-recovery-binding"),
+            host_journal,
+        )
+        .expect("replacement controller binds"),
+    );
+    replacement_controller
+        .recover(&run_id)
+        .await
+        .expect("observed direct Tool call is recoverable");
+    let view = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        replacement_controller.wait_for_terminal(&run_id),
+    )
+    .await
+    .expect("direct Tool recovery reaches a terminal promptly")
+    .expect("direct Tool recovery remains authoritative");
+
+    match effect_state {
+        DirectEffectRecoveryState::Fresh | DirectEffectRecoveryState::Committed => {
+            assert_eq!(view.state.status(), AgentRunStatus::Delivered);
+            assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(replacement_model.rounds.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                session_journal
+                    .load_session(&session_id)
+                    .await
+                    .expect("recovered Session Journal remains readable")
+                    .iter()
+                    .filter(|record| matches!(
+                        &record.payload,
+                        AgentSessionEvent::ToolExchangeCommitted { .. }
+                    ))
+                    .count(),
+                1
+            );
+        }
+        DirectEffectRecoveryState::Unknown => {
+            assert_eq!(view.state.status(), AgentRunStatus::Failed);
+            assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(replacement_model.rounds.load(Ordering::SeqCst), 1);
+            assert!(session_journal
+                .load_session(&session_id)
+                .await
+                .expect("failed Session Journal remains readable")
+                .iter()
+                .all(|record| !matches!(
+                    &record.payload,
+                    AgentSessionEvent::ToolExchangeCommitted { .. }
+                )));
+        }
+    }
     assert_eq!(
         checkpoint_store
             .load_run(&run_id)

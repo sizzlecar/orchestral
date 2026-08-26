@@ -239,6 +239,14 @@ enum GenericRecoveryContinuation {
         resolved_response: Option<ApprovalResponse>,
         response: Option<oneshot::Receiver<ApprovalResponse>>,
     },
+    Tool {
+        round: u64,
+        request_id: ModelRequestId,
+        request_digest: Digest,
+        observation: GenericModelObservation,
+        call: GenericObservedToolCall,
+        arguments: serde_json::Value,
+    },
 }
 
 impl GenericExecutionSeed {
@@ -1207,7 +1215,7 @@ impl AgentProvider for InternalGenericAgentProvider {
                 request_id,
                 request_digest,
                 observation,
-            } => stage_input_recovery(
+            } => stage_observed_recovery(
                 self.inner.clone(),
                 stored,
                 boundary,
@@ -1276,7 +1284,7 @@ fn checkpoint_recovery_events(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn stage_input_recovery(
+fn stage_observed_recovery(
     inner: Arc<GenericInner>,
     stored: StoredGenericAgentRun,
     boundary: GenericLoopBoundary,
@@ -1325,18 +1333,54 @@ fn stage_input_recovery(
     };
     let arguments = parse_tool_arguments(&pending_call).map_err(observed_recovery_error)?;
     if call.name != REQUEST_INPUT_TOOL_NAME {
-        return stage_approval_recovery(
-            inner,
-            stored,
-            boundary,
-            round,
-            request_id,
-            request_digest,
-            observation,
-            call,
-            arguments,
-            recovery_events,
-        );
+        if matches!(
+            call.name.as_str(),
+            SKILL_ACTIVATE_TOOL_NAME | WORKFLOW_TOOL_NAME
+        ) {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::Unsupported,
+                "observed Skill or Workflow recovery is not yet supported",
+            )
+            .with_details(serde_json::json!({
+                "boundary": "model_attempt_observed",
+                "round": round,
+                "request_id": request_id,
+                "tool_name": call.name,
+            })));
+        }
+        let approval_id = approval_request_id(stored.registration.run_id(), round, &call.call_id);
+        let has_approval_interaction = recovery_events.iter().any(|event| match &event.payload {
+            AgentEvent::RequestOpened { request } => request.request_id == approval_id,
+            AgentEvent::RequestResolved { request_id, .. } => request_id == &approval_id,
+            _ => false,
+        });
+        return if has_approval_interaction {
+            stage_approval_recovery(
+                inner,
+                stored,
+                boundary,
+                round,
+                request_id,
+                request_digest,
+                observation,
+                call,
+                arguments,
+                recovery_events,
+            )
+        } else {
+            stage_tool_recovery(
+                inner,
+                stored,
+                boundary,
+                round,
+                request_id,
+                request_digest,
+                observation,
+                call,
+                arguments,
+                recovery_events,
+            )
+        };
     }
     let prompt = parse_input_request(arguments.clone()).map_err(observed_recovery_error)?;
     let input_request_id = input_request_id(stored.registration.run_id(), round, &call.call_id);
@@ -1415,6 +1459,46 @@ fn stage_input_recovery(
             committed_response: None,
             resolved_response,
             response: None,
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_tool_recovery(
+    inner: Arc<GenericInner>,
+    stored: StoredGenericAgentRun,
+    boundary: GenericLoopBoundary,
+    round: u64,
+    request_id: ModelRequestId,
+    request_digest: Digest,
+    observation: GenericModelObservation,
+    call: GenericObservedToolCall,
+    arguments: serde_json::Value,
+    recovery_events: Vec<AgentEventDraft>,
+) -> Result<AgentRecovery, AgentProtocolError> {
+    if recovery_events.iter().any(|event| {
+        matches!(
+            &event.payload,
+            AgentEvent::RequestOpened { .. } | AgentEvent::RequestResolved { .. }
+        )
+    }) {
+        return Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidDigest,
+            "recovered direct Tool crossed an interaction boundary",
+        ));
+    }
+    stage_loop_recovery(
+        inner,
+        stored,
+        boundary,
+        recovery_events,
+        GenericRecoveryContinuation::Tool {
+            round,
+            request_id,
+            request_digest,
+            observation,
+            call,
+            arguments,
         },
     )
 }
@@ -1511,6 +1595,53 @@ fn stage_approval_recovery(
             response: None,
         },
     )
+}
+
+async fn prepare_recovered_tool(
+    inner: &GenericInner,
+    run_id: &RunId,
+    call: &GenericObservedToolCall,
+    arguments: &serde_json::Value,
+    cancellation: CancellationToken,
+) -> Result<GuardedToolResult, AgentFailure> {
+    let tools = inner.tools.as_ref().ok_or_else(|| {
+        agent_failure(
+            "tool_runtime_unavailable",
+            "recovered Tool call has no bound Tool Runtime",
+            false,
+        )
+    })?;
+    let tool_id = tools
+        .runtime
+        .resolve_tool_id(&call.name)
+        .map_err(|error| {
+            agent_failure(
+                "tool_runtime_unavailable",
+                format!("recovered Tool catalog is unavailable: {error}"),
+                true,
+            )
+        })?
+        .ok_or_else(|| {
+            agent_failure(
+                "tool_not_found",
+                "recovered Tool is no longer registered",
+                false,
+            )
+        })?;
+    Ok(tools
+        .runtime
+        .invoke(
+            ToolInvocation {
+                run_id: run_id.clone(),
+                call_id: ToolCallId::new(call.call_id.as_str()),
+                tool_id,
+                arguments: arguments.clone(),
+            },
+            tools.run_grant.clone(),
+            None,
+            cancellation,
+        )
+        .await)
 }
 
 async fn prepare_recovered_approval(
@@ -1820,6 +1951,20 @@ fn stage_loop_recovery(
                 "command_id": pending.command_id,
             })));
         }
+        GenericRecoveryContinuation::Tool { .. } if !pending_resolutions.is_empty() => {
+            let pending = pending_resolutions
+                .values()
+                .next()
+                .expect("non-empty pending resolution map was checked");
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidTransition,
+                "direct Tool recovery cannot apply an accepted request resolution",
+            )
+            .with_details(serde_json::json!({
+                "boundary": "accepted_resolution_pending",
+                "command_id": pending.command_id,
+            })));
+        }
         GenericRecoveryContinuation::Input {
             round,
             call,
@@ -1913,7 +2058,8 @@ fn stage_loop_recovery(
                 ));
             }
         }
-        GenericRecoveryContinuation::ModelLoop { .. } => {}
+        GenericRecoveryContinuation::ModelLoop { .. }
+        | GenericRecoveryContinuation::Tool { .. } => {}
     }
     let mut pending_inputs = BTreeMap::new();
     if let GenericRecoveryContinuation::Input {
@@ -2186,6 +2332,29 @@ fn stage_loop_recovery(
             *binding = Some(prepared.binding);
             *response = prepared.response;
         }
+        if let GenericRecoveryContinuation::Tool {
+            round,
+            request_id,
+            request_digest,
+            ..
+        } = &mut continuation
+        {
+            let session_exchange_seq =
+                recovered_tool_exchange_committed(&inner, &request, *round, request_id, None, None)
+                    .await?;
+            debug_assert!(session_exchange_seq.is_none());
+            let rebuilt =
+                model_request_for_round(&request, *round, &model_messages, &model_definitions);
+            if rebuilt.request_id != *request_id
+                || model_request_digest(&rebuilt).map_err(checkpoint_stream_error)?
+                    != *request_digest
+            {
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::InvalidDigest,
+                    "recovered direct Tool model request no longer matches the private WAL attempt",
+                ));
+            }
+        }
         let install_result = {
             let mut state = inner
                 .state
@@ -2328,6 +2497,33 @@ fn stage_loop_recovery(
                         resolved_response,
                         session_exchange_committed,
                         response,
+                    )
+                    .await;
+                }
+                GenericRecoveryContinuation::Tool {
+                    round,
+                    request_id,
+                    observation,
+                    call,
+                    arguments,
+                    ..
+                } => {
+                    resume_observed_tool(
+                        inner,
+                        request,
+                        admission,
+                        user_message,
+                        model_messages,
+                        model_definitions,
+                        run_skills,
+                        seed,
+                        cancellation,
+                        steer_updates,
+                        round,
+                        request_id,
+                        observation,
+                        call,
+                        arguments,
                     )
                     .await;
                 }
@@ -3432,7 +3628,7 @@ async fn resume_observed_approval(
     request: AgentStartRequest,
     admission: AgentAdmission,
     user_message: ModelMessage,
-    mut model_messages: Vec<ModelMessage>,
+    model_messages: Vec<ModelMessage>,
     model_tools: Vec<ModelToolDefinition>,
     run_skills: Option<Arc<SkillRuntime>>,
     mut seed: GenericExecutionSeed,
@@ -3573,6 +3769,173 @@ async fn resume_observed_approval(
             return;
         }
     };
+    continue_observed_tool(
+        inner,
+        request,
+        admission,
+        user_message,
+        model_messages,
+        model_tools,
+        run_skills,
+        seed,
+        cancellation,
+        steer_updates,
+        round,
+        model_request_id,
+        observation,
+        call,
+        arguments,
+        guarded,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resume_observed_tool(
+    inner: Arc<GenericInner>,
+    request: AgentStartRequest,
+    admission: AgentAdmission,
+    user_message: ModelMessage,
+    model_messages: Vec<ModelMessage>,
+    model_tools: Vec<ModelToolDefinition>,
+    run_skills: Option<Arc<SkillRuntime>>,
+    mut seed: GenericExecutionSeed,
+    cancellation: CancellationToken,
+    steer_updates: watch::Receiver<u64>,
+    round: u64,
+    model_request_id: ModelRequestId,
+    observation: GenericModelObservation,
+    call: GenericObservedToolCall,
+    arguments: serde_json::Value,
+) {
+    let run_id = request.run.spec.run_id.clone();
+    let Some(tools) = inner.tools.as_ref() else {
+        emit_failure(
+            &inner,
+            &request,
+            &user_message,
+            agent_failure(
+                "tool_runtime_unavailable",
+                "recovered Tool call has no Host Tool runtime",
+                false,
+            ),
+        );
+        return;
+    };
+    if let Some(usage) = observation.usage.clone() {
+        merge_usage(&mut seed.total_usage, usage);
+    }
+    if !observation.response.is_empty() {
+        seed.last_response = observation.response.clone();
+    }
+    seed.tool_call_count = seed.tool_call_count.saturating_add(1);
+
+    let prepared = match prepare_recovered_tool(
+        &inner,
+        &run_id,
+        &call,
+        &arguments,
+        cancellation.clone(),
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(failure) => {
+            emit_failure(&inner, &request, &user_message, failure);
+            return;
+        }
+    };
+    let guarded = match prepared {
+        GuardedToolResult::ApprovalRequired { binding, summary } => {
+            let invocation = ToolInvocation {
+                run_id: run_id.clone(),
+                call_id: ToolCallId::new(call.call_id.as_str()),
+                tool_id: binding.tool_id.clone(),
+                arguments: arguments.clone(),
+            };
+            match await_tool_approval(
+                inner.clone(),
+                tools,
+                &run_id,
+                round,
+                &call.call_id,
+                binding,
+                summary,
+                cancellation.clone(),
+            )
+            .await
+            {
+                ApprovalWaitOutcome::Allowed(capability) => {
+                    tools
+                        .runtime
+                        .invoke(
+                            invocation,
+                            tools.run_grant.clone(),
+                            Some(capability),
+                            cancellation.clone(),
+                        )
+                        .await
+                }
+                ApprovalWaitOutcome::Denied => GuardedToolResult::Outcome {
+                    outcome: ToolOutcome::Rejected {
+                        code: "approval_denied".to_owned(),
+                        message: "Host denied this Tool invocation".to_owned(),
+                    },
+                    cached: false,
+                },
+                ApprovalWaitOutcome::Cancelled => {
+                    emit_cancel(&inner, &request, &user_message);
+                    return;
+                }
+                ApprovalWaitOutcome::Failed(failure) => {
+                    emit_failure(&inner, &request, &user_message, failure);
+                    return;
+                }
+            }
+        }
+        outcome @ GuardedToolResult::Outcome { .. } => outcome,
+    };
+    continue_observed_tool(
+        inner,
+        request,
+        admission,
+        user_message,
+        model_messages,
+        model_tools,
+        run_skills,
+        seed,
+        cancellation,
+        steer_updates,
+        round,
+        model_request_id,
+        observation,
+        call,
+        arguments,
+        guarded,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn continue_observed_tool(
+    inner: Arc<GenericInner>,
+    request: AgentStartRequest,
+    admission: AgentAdmission,
+    user_message: ModelMessage,
+    mut model_messages: Vec<ModelMessage>,
+    model_tools: Vec<ModelToolDefinition>,
+    run_skills: Option<Arc<SkillRuntime>>,
+    mut seed: GenericExecutionSeed,
+    cancellation: CancellationToken,
+    steer_updates: watch::Receiver<u64>,
+    round: u64,
+    model_request_id: ModelRequestId,
+    observation: GenericModelObservation,
+    call: GenericObservedToolCall,
+    arguments: serde_json::Value,
+    guarded: GuardedToolResult,
+) {
+    let run_id = request.run.spec.run_id.clone();
     let (result, is_error) = match guarded {
         GuardedToolResult::ApprovalRequired { binding, .. } => {
             emit_failure(
