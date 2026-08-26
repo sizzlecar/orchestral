@@ -207,6 +207,7 @@ enum GenericRecoveryContinuation {
         prompt: String,
         request_open: bool,
         committed_response: Option<InputResponse>,
+        resolved_response: Option<InputResponse>,
         response: Option<oneshot::Receiver<InputResponse>>,
     },
 }
@@ -1297,6 +1298,7 @@ fn stage_input_recovery(
         },
     };
     let mut request_open = false;
+    let mut resolved_response = None;
     for event in &recovery_events {
         match &event.payload {
             AgentEvent::RequestOpened { request } if request.request_id == input_request_id => {
@@ -1308,16 +1310,30 @@ fn stage_input_recovery(
                 }
                 request_open = true;
             }
-            AgentEvent::RequestResolved { request_id, .. } if request_id == &input_request_id => {
-                return Err(AgentProtocolError::new(
-                    AgentProtocolErrorCode::Unsupported,
-                    "observed input recovery cannot yet continue after RequestResolved",
-                )
-                .with_details(serde_json::json!({
-                    "boundary": "observed_input_resolved",
-                    "round": round,
-                    "request_id": request_id,
-                })));
+            AgentEvent::RequestResolved {
+                request_id,
+                resolution,
+                ..
+            } if request_id == &input_request_id => {
+                if !request_open
+                    || resolved_response.is_some()
+                    || !matches!(resolution, RequestResolution::Input { .. })
+                {
+                    return Err(AgentProtocolError::new(
+                        AgentProtocolErrorCode::InvalidDigest,
+                        "recovered input resolution does not match its pending request",
+                    ));
+                }
+                let command_id = event.causation_id.clone().ok_or_else(|| {
+                    AgentProtocolError::new(
+                        AgentProtocolErrorCode::InvalidDigest,
+                        "recovered input resolution has no causating command",
+                    )
+                })?;
+                resolved_response = Some(InputResponse {
+                    command_id,
+                    resolution: resolution.clone(),
+                });
             }
             AgentEvent::RequestOpened { .. } | AgentEvent::RequestResolved { .. } => {
                 return Err(AgentProtocolError::new(
@@ -1327,6 +1343,9 @@ fn stage_input_recovery(
             }
             _ => {}
         }
+    }
+    if let Some(response) = &resolved_response {
+        validate_recovered_input_resolution(&stored.records, &input_request_id, response)?;
     }
     stage_loop_recovery(
         inner,
@@ -1343,9 +1362,48 @@ fn stage_input_recovery(
             prompt,
             request_open,
             committed_response: None,
+            resolved_response,
             response: None,
         },
     )
+}
+
+fn validate_recovered_input_resolution(
+    records: &[crate::generic_agent_checkpoint::GenericCheckpointRecord],
+    request_id: &RequestId,
+    response: &InputResponse,
+) -> Result<(), AgentProtocolError> {
+    let mut matching_commands = 0_usize;
+    for record in records {
+        let GenericCheckpointEvent::CommandCommitted { command, outcome } = &record.payload else {
+            continue;
+        };
+        if command.command_id != response.command_id {
+            continue;
+        }
+        matching_commands = matching_commands.saturating_add(1);
+        let matches_resolution = matches!(
+            &command.payload,
+            AgentCommand::ResolveRequest { response: command_response }
+                if command_response == &response.resolution
+        );
+        if outcome != &ProviderCommandOutcome::Accepted
+            || command.request_id.as_ref() != Some(request_id)
+            || !matches_resolution
+        {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidDigest,
+                "recovered input resolution does not match its accepted command",
+            ));
+        }
+    }
+    if matching_commands != 1 {
+        return Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidDigest,
+            "recovered input resolution has no unique accepted command",
+        ));
+    }
+    Ok(())
 }
 
 fn stage_loop_recovery(
@@ -1386,6 +1444,7 @@ fn stage_loop_recovery(
             call,
             request_open,
             committed_response,
+            resolved_response,
             ..
         } => {
             let expected_request_id = input_request_id(&run_id, *round, &call.call_id);
@@ -1396,7 +1455,13 @@ fn stage_loop_recovery(
                     "accepted request resolution crossed the recovered input boundary",
                 ));
             }
-            if let Some(response) = committed_response {
+            if committed_response.is_some() && resolved_response.is_some() {
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::InvalidDigest,
+                    "recovered input resolution was both pending and already applied",
+                ));
+            }
+            if let Some(response) = committed_response.as_ref().or(resolved_response.as_ref()) {
                 if !*request_open || !matches!(response.resolution, RequestResolution::Input { .. })
                 {
                     return Err(AgentProtocolError::new(
@@ -1414,6 +1479,7 @@ fn stage_loop_recovery(
         call,
         request_open: true,
         committed_response: None,
+        resolved_response: None,
         response,
         ..
     } = &mut continuation
@@ -1581,6 +1647,7 @@ fn stage_loop_recovery(
                     prompt,
                     request_open,
                     committed_response,
+                    resolved_response,
                     response,
                     ..
                 } => {
@@ -1603,6 +1670,7 @@ fn stage_loop_recovery(
                         prompt,
                         request_open,
                         committed_response,
+                        resolved_response,
                         response,
                     )
                     .await;
@@ -2703,6 +2771,7 @@ async fn resume_observed_input(
     prompt: String,
     request_open: bool,
     committed_response: Option<InputResponse>,
+    resolved_response: Option<InputResponse>,
     response: Option<oneshot::Receiver<InputResponse>>,
 ) {
     let run_id = request.run.spec.run_id.clone();
@@ -2725,7 +2794,9 @@ async fn resume_observed_input(
         role: ModelRole::Assistant,
         content: assistant_content,
     };
-    let input = if let Some(committed_response) = committed_response {
+    let input = if let Some(resolved_response) = resolved_response {
+        input_resolution_outcome(resolved_response.resolution)
+    } else if let Some(committed_response) = committed_response {
         commit_input_response(
             &inner,
             &run_id,
@@ -3037,7 +3108,11 @@ fn commit_input_response(
             true,
         ));
     }
-    match response.resolution {
+    input_resolution_outcome(response.resolution)
+}
+
+fn input_resolution_outcome(resolution: RequestResolution) -> InputWaitOutcome {
+    match resolution {
         RequestResolution::Input { content } => InputWaitOutcome::Resolved(serde_json::json!({
             "content": content,
         })),
