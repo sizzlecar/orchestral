@@ -49,6 +49,11 @@ use tokio::sync::{broadcast, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::approval_bridge::AgentApprovalBridge;
+use crate::generic_agent_checkpoint::{
+    CreateGenericRunOutcome, GenericAgentCheckpointStore, GenericAgentRunRegistration,
+    GenericCheckpointDraft, GenericCheckpointError, GenericCheckpointEvent,
+    GenericCheckpointEventId, InMemoryGenericAgentCheckpointStore,
+};
 use crate::skill::{
     ActivatedSkillSet, SkillActivationOutcome, SkillActivationRequest, SkillRuntime,
 };
@@ -103,6 +108,7 @@ struct GenericInner {
     skills: Option<Arc<SkillRuntime>>,
     session_journal: Arc<dyn AgentSessionJournalStore>,
     context_engine: AgentSessionContextEngine,
+    checkpoint_store: Arc<dyn GenericAgentCheckpointStore>,
     config_digest: Digest,
     state: Mutex<GenericState>,
 }
@@ -140,6 +146,7 @@ struct GenericRun {
     steer_signal: watch::Sender<u64>,
     pending_inputs: BTreeMap<RequestId, PendingInput>,
     pending_approvals: BTreeMap<RequestId, PendingApproval>,
+    checkpoint_seq: u64,
 }
 
 struct QueuedSteer {
@@ -174,6 +181,22 @@ struct StoredCommand {
 }
 
 impl InternalGenericAgentProvider {
+    /// Replaces the process-lifetime checkpoint WAL before this Provider is
+    /// cloned or bound to a controller.
+    pub fn with_checkpoint_store(
+        mut self,
+        checkpoint_store: Arc<dyn GenericAgentCheckpointStore>,
+    ) -> Result<Self, AgentProtocolError> {
+        let inner = Arc::get_mut(&mut self.inner).ok_or_else(|| {
+            AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidTransition,
+                "Generic Agent checkpoint store must be bound before the Provider is shared",
+            )
+        })?;
+        inner.checkpoint_store = checkpoint_store;
+        Ok(self)
+    }
+
     pub fn new(
         backend: Arc<dyn ModelBackend>,
         config: GenericAgentConfig,
@@ -446,6 +469,7 @@ impl InternalGenericAgentProvider {
                 skills,
                 session_journal,
                 context_engine,
+                checkpoint_store: Arc::new(InMemoryGenericAgentCheckpointStore::default()),
                 config_digest,
                 state: Mutex::new(GenericState::default()),
             }),
@@ -557,6 +581,24 @@ impl AgentProvider for InternalGenericAgentProvider {
                     "Generic Agent permits one active Run per session",
                 ));
             }
+            match self
+                .inner
+                .checkpoint_store
+                .create_run(GenericAgentRunRegistration {
+                    request: request.clone(),
+                    execution: execution.clone(),
+                    admission: admission.clone(),
+                    config_digest: self.inner.config_digest.clone(),
+                }) {
+                Ok(CreateGenericRunOutcome::Created) => {}
+                Ok(CreateGenericRunOutcome::ExactExisting) => {
+                    return Err(AgentStartError::OutcomeUnknown(AgentProtocolError::new(
+                        AgentProtocolErrorCode::InvalidTransition,
+                        "Generic Agent private WAL already owns this Run; use recovery",
+                    )))
+                }
+                Err(error) => return Err(checkpoint_start_error(error)),
+            }
             session.active_run = Some(request.run.spec.run_id.clone());
 
             let (sender, _) = broadcast::channel(self.inner.config.stream_buffer);
@@ -576,6 +618,7 @@ impl AgentProvider for InternalGenericAgentProvider {
                 steer_signal: steer_signal.clone(),
                 pending_inputs: BTreeMap::new(),
                 pending_approvals: BTreeMap::new(),
+                checkpoint_seq: 0,
             };
             let stream = Self::stream_for(&run);
             state.runs.insert(request.run.spec.run_id.clone(), run);
@@ -665,6 +708,28 @@ impl AgentProvider for InternalGenericAgentProvider {
                 });
             }
         };
+
+        if let Err(failure) = commit_loop_boundary(
+            &self.inner,
+            &request.run.spec.run_id,
+            1,
+            &ModelUsage::default(),
+            0,
+            "",
+            &[],
+        ) {
+            let inner = self.inner.clone();
+            let failed_request = request.clone();
+            let failed_user_message = user_message.clone();
+            tokio::spawn(async move {
+                fail_before_model(inner, &failed_request, &failed_user_message, failure);
+            });
+            return Ok(AgentStart {
+                execution,
+                admission,
+                stream,
+            });
+        }
 
         let inner = self.inner.clone();
         let run_admission = admission.clone();
@@ -1131,6 +1196,10 @@ async fn execute_model_run(
             max_output_tokens: request.run.spec.limits.max_output_tokens,
             extensions: Default::default(),
         };
+        if let Err(failure) = commit_model_attempt(&inner, &run_id, round, &model_request) {
+            emit_failure(&inner, &request, &user_message, failure);
+            return;
+        }
         let model_cancellation = cancellation.child_token();
         let mut model_stream = match tokio::select! {
             _ = cancellation.cancelled() => {
@@ -1151,6 +1220,18 @@ async fn execute_model_run(
                 if let Err(failure) =
                     commit_queued_steers(&inner, &request, &mut model_messages).await
                 {
+                    emit_failure(&inner, &request, &user_message, failure);
+                    return;
+                }
+                if let Err(failure) = commit_loop_boundary(
+                    &inner,
+                    &run_id,
+                    round.saturating_add(1),
+                    &total_usage,
+                    tool_call_count,
+                    &last_response,
+                    &supporting_event_ids,
+                ) {
                     emit_failure(&inner, &request, &user_message, failure);
                     return;
                 }
@@ -1193,6 +1274,18 @@ async fn execute_model_run(
                     if let Err(failure) =
                         commit_queued_steers(&inner, &request, &mut model_messages).await
                     {
+                        emit_failure(&inner, &request, &user_message, failure);
+                        return;
+                    }
+                    if let Err(failure) = commit_loop_boundary(
+                        &inner,
+                        &run_id,
+                        round.saturating_add(1),
+                        &total_usage,
+                        tool_call_count,
+                        &last_response,
+                        &supporting_event_ids,
+                    ) {
                         emit_failure(&inner, &request, &user_message, failure);
                         return;
                     }
@@ -1344,12 +1437,25 @@ async fn execute_model_run(
                                     return;
                                 }
                                 DeliveryCommit::SteerPending => {
+                                    last_response = response.clone();
                                     model_messages
                                         .push(ModelMessage::text(ModelRole::Assistant, response));
                                     if let Err(failure) =
                                         commit_queued_steers(&inner, &request, &mut model_messages)
                                             .await
                                     {
+                                        emit_failure(&inner, &request, &user_message, failure);
+                                        return;
+                                    }
+                                    if let Err(failure) = commit_loop_boundary(
+                                        &inner,
+                                        &run_id,
+                                        round.saturating_add(1),
+                                        &total_usage,
+                                        tool_call_count,
+                                        &last_response,
+                                        &supporting_event_ids,
+                                    ) {
                                         emit_failure(&inner, &request, &user_message, failure);
                                         return;
                                     }
@@ -1765,6 +1871,18 @@ async fn execute_model_run(
                     model_messages.extend(activated_context_messages);
                     model_messages.push(assistant_message);
                     model_messages.push(tool_message);
+                    if let Err(failure) = commit_loop_boundary(
+                        &inner,
+                        &run_id,
+                        round.saturating_add(1),
+                        &total_usage,
+                        tool_call_count,
+                        &last_response,
+                        &supporting_event_ids,
+                    ) {
+                        emit_failure(&inner, &request, &user_message, failure);
+                        return;
+                    }
                     continue 'model_rounds;
                 }
                 _ => {
@@ -2614,6 +2732,91 @@ fn agent_content_message(items: &[Content]) -> Result<ModelMessage, AgentProtoco
     })
 }
 
+fn commit_loop_boundary(
+    inner: &GenericInner,
+    run_id: &RunId,
+    next_model_round: u64,
+    usage: &ModelUsage,
+    tool_call_count: u64,
+    last_response: &str,
+    supporting_event_ids: &[AgentEventId],
+) -> Result<(), AgentFailure> {
+    append_checkpoint(
+        inner,
+        run_id,
+        GenericCheckpointEventId::new(format!(
+            "generic-{}-boundary-{next_model_round}",
+            run_id.as_str()
+        )),
+        GenericCheckpointEvent::LoopBoundaryCommitted {
+            next_model_round,
+            usage: usage.clone(),
+            tool_call_count,
+            last_response: last_response.to_owned(),
+            supporting_event_ids: supporting_event_ids.to_vec(),
+        },
+    )
+}
+
+fn commit_model_attempt(
+    inner: &GenericInner,
+    run_id: &RunId,
+    round: u64,
+    request: &ModelRequest,
+) -> Result<(), AgentFailure> {
+    let request_bytes = serde_jcs::to_vec(request).map_err(|error| {
+        agent_failure(
+            "generic_checkpoint",
+            format!("could not digest model request: {error}"),
+            true,
+        )
+    })?;
+    append_checkpoint(
+        inner,
+        run_id,
+        GenericCheckpointEventId::new(format!("generic-{}-model-attempt-{round}", run_id.as_str())),
+        GenericCheckpointEvent::ModelAttemptStarted {
+            round,
+            request_id: request.request_id.clone(),
+            request_digest: Digest::sha256(request_bytes),
+        },
+    )
+}
+
+fn append_checkpoint(
+    inner: &GenericInner,
+    run_id: &RunId,
+    event_id: GenericCheckpointEventId,
+    payload: GenericCheckpointEvent,
+) -> Result<(), AgentFailure> {
+    let mut state = inner
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let run = state.runs.get_mut(run_id).ok_or_else(|| {
+        agent_failure(
+            "generic_checkpoint",
+            "Run disappeared before its private checkpoint was committed",
+            true,
+        )
+    })?;
+    let expected_previous = run.checkpoint_seq;
+    inner
+        .checkpoint_store
+        .append(
+            run_id,
+            expected_previous,
+            GenericCheckpointDraft {
+                event_id,
+                run_id: run_id.clone(),
+                payload,
+            },
+        )
+        .map_err(checkpoint_failure)?;
+    run.checkpoint_seq = expected_previous.saturating_add(1);
+    Ok(())
+}
+
 fn take_queued_steers(inner: &GenericInner, run_id: &RunId) -> Vec<QueuedSteer> {
     let mut state = inner
         .state
@@ -3217,6 +3420,20 @@ async fn append_session_event(
 
 fn session_journal_failure(error: AgentSessionError) -> AgentFailure {
     agent_failure("session_journal", error.to_string(), true)
+}
+
+fn checkpoint_failure(error: GenericCheckpointError) -> AgentFailure {
+    agent_failure("generic_checkpoint", error.to_string(), true)
+}
+
+fn checkpoint_start_error(error: GenericCheckpointError) -> AgentStartError {
+    AgentStartError::OutcomeUnknown(
+        AgentProtocolError::new(
+            AgentProtocolErrorCode::ProviderUnavailable,
+            error.to_string(),
+        )
+        .with_retryable(true),
+    )
 }
 
 fn session_failure(error: SessionContextError) -> AgentFailure {

@@ -33,10 +33,11 @@ use orchestral_core::{
     },
 };
 use orchestral_runtime::{
-    api::AgentApi, AgentClient, AgentControlEvent, AgentController, GenericAgentConfig,
-    GuardedToolExecution, GuardedToolExecutor, GuardedToolRuntime, InMemoryBlobStore,
-    InMemoryHostApprovalBroker, InternalGenericAgentProvider, JsonSizeTokenMeter,
-    ToolArtifactStore, WorkflowExecutionStrategy,
+    api::AgentApi, AgentClient, AgentControlEvent, AgentController, GenericAgentCheckpointStore,
+    GenericAgentConfig, GenericCheckpointEvent, GenericCheckpointPhase, GuardedToolExecution,
+    GuardedToolExecutor, GuardedToolRuntime, InMemoryBlobStore,
+    InMemoryGenericAgentCheckpointStore, InMemoryHostApprovalBroker, InternalGenericAgentProvider,
+    JsonSizeTokenMeter, ToolArtifactStore, WorkflowExecutionStrategy,
 };
 use serde_json::json;
 use tokio::sync::Notify;
@@ -45,6 +46,12 @@ use tokio_util::sync::CancellationToken;
 struct ScriptedModel;
 
 struct BlockingModel;
+
+struct WalInspectingModel {
+    checkpoint_store: Arc<InMemoryGenericAgentCheckpointStore>,
+    run_id: RunId,
+    observed_open_attempt: AtomicUsize,
+}
 
 struct SteerAccumulatingModel {
     rounds: AtomicUsize,
@@ -153,6 +160,58 @@ impl ModelBackend for BlockingModel {
     ) -> Result<ModelStream, ModelError> {
         request.validate()?;
         Ok(Box::pin(stream::pending()))
+    }
+}
+
+#[async_trait]
+impl ModelBackend for WalInspectingModel {
+    fn descriptor(&self) -> ModelDescriptor {
+        ModelDescriptor {
+            backend_id: "wal-inspecting-model".to_owned(),
+            capabilities: ModelCapabilities {
+                streaming: true,
+                ..ModelCapabilities::default()
+            },
+            extensions: Default::default(),
+        }
+    }
+
+    async fn start(
+        &self,
+        request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelStream, ModelError> {
+        request.validate()?;
+        let stored = self
+            .checkpoint_store
+            .load_run(&self.run_id)
+            .expect("checkpoint WAL remains readable")
+            .expect("Run is registered before model start");
+        let projection = stored.validate().expect("checkpoint WAL replays");
+        assert!(matches!(
+            projection.phase,
+            GenericCheckpointPhase::ModelAttemptOpen { round: 1, .. }
+        ));
+        self.observed_open_attempt.fetch_add(1, Ordering::SeqCst);
+        let request_id = request.request_id;
+        Ok(Box::pin(stream::iter([
+            Ok(ModelStreamEvent {
+                request_id: request_id.clone(),
+                event_id: ModelEventId::new("wal-answer"),
+                sequence: 1,
+                payload: ModelEvent::TextDelta {
+                    delta: "write ahead confirmed".to_owned(),
+                },
+            }),
+            Ok(ModelStreamEvent {
+                request_id,
+                event_id: ModelEventId::new("wal-finish"),
+                sequence: 2,
+                payload: ModelEvent::Finish {
+                    reason: ModelFinishReason::Stop,
+                },
+            }),
+        ])))
     }
 }
 
@@ -875,6 +934,60 @@ async fn neutral_model_stream_becomes_an_inspectable_agent_delivery() {
         delivery.final_response.body,
         ContentBody::Inline(serde_json::Value::String(ref text))
             if text == "hello from the neutral model"
+    ));
+}
+
+#[tokio::test]
+async fn model_attempt_is_in_the_private_wal_before_backend_start() {
+    let run_id = RunId::new("wal-run");
+    let checkpoint_store = Arc::new(InMemoryGenericAgentCheckpointStore::default());
+    let model = Arc::new(WalInspectingModel {
+        checkpoint_store: checkpoint_store.clone(),
+        run_id: run_id.clone(),
+        observed_open_attempt: AtomicUsize::new(0),
+    });
+    let provider = Arc::new(
+        InternalGenericAgentProvider::new(
+            model.clone(),
+            GenericAgentConfig::new("internal-provider", "generic-agent"),
+        )
+        .expect("Generic Agent accepts the neutral backend")
+        .with_checkpoint_store(checkpoint_store.clone())
+        .expect("private WAL binds before the Provider is shared"),
+    );
+    let controller = Arc::new(
+        AgentController::new(provider, ProviderBindingRef::new("wal-binding"))
+            .expect("controller binds the Generic Agent"),
+    );
+    let run = AgentRunEnvelope::new(
+        AGENT_PROTOCOL_V1,
+        AgentSessionId::new("wal-session"),
+        run_id.clone(),
+        vec![Content::text("prove the model attempt is write-ahead")],
+    )
+    .expect("valid text Run");
+
+    let execution = controller.start(run).await.expect("Run starts");
+    controller
+        .wait_for_terminal(&execution.run_id)
+        .await
+        .expect("Run reaches delivery");
+
+    assert_eq!(model.observed_open_attempt.load(Ordering::SeqCst), 1);
+    let stored = checkpoint_store
+        .load_run(&run_id)
+        .expect("private WAL remains readable")
+        .expect("private Run registration is durable");
+    assert!(matches!(
+        &stored.records[0].payload,
+        GenericCheckpointEvent::LoopBoundaryCommitted {
+            next_model_round: 1,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &stored.records[1].payload,
+        GenericCheckpointEvent::ModelAttemptStarted { round: 1, .. }
     ));
 }
 
