@@ -4,8 +4,9 @@
 //! runtime. A model tool call never carries authority by itself.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
@@ -70,6 +71,10 @@ use crate::{
 const WORKFLOW_TOOL_NAME: &str = "orchestral_workflow";
 const SKILL_ACTIVATE_TOOL_NAME: &str = "orchestral_skill_activate";
 const REQUEST_INPUT_TOOL_NAME: &str = "orchestral_request_input";
+const RUN_STOP_RUNNING: u8 = 0;
+const RUN_STOP_HOST_CANCEL: u8 = 1;
+const RUN_STOP_DEADLINE: u8 = 2;
+const RUN_STOP_COMPLETING: u8 = 3;
 
 #[derive(Debug, Clone)]
 pub struct GenericAgentConfig {
@@ -144,6 +149,7 @@ struct GenericRun {
     sender: broadcast::Sender<Result<AgentProviderStreamItem, AgentProtocolError>>,
     terminal: bool,
     cancellation: CancellationToken,
+    stop_cause: Arc<AtomicU8>,
     cancel_command: Option<(CommandId, String)>,
     commands: BTreeMap<CommandId, StoredCommand>,
     queued_steers: VecDeque<QueuedSteer>,
@@ -517,8 +523,11 @@ impl InternalGenericAgentProvider {
             .as_ref()
             .and_then(|tools| tools.approval_bridge.as_ref())
             .is_some();
-        let mut supported_limits =
-            BTreeSet::from([RunLimitKind::ModelSteps, RunLimitKind::InputTokens]);
+        let mut supported_limits = BTreeSet::from([
+            RunLimitKind::Deadline,
+            RunLimitKind::ModelSteps,
+            RunLimitKind::InputTokens,
+        ]);
         if has_tools {
             supported_limits.insert(RunLimitKind::ToolCalls);
         }
@@ -714,6 +723,12 @@ impl AgentProvider for InternalGenericAgentProvider {
 
             let (sender, _) = broadcast::channel(self.inner.config.stream_buffer);
             let cancellation = CancellationToken::new();
+            let stop_cause = Arc::new(AtomicU8::new(RUN_STOP_RUNNING));
+            arm_run_deadline(
+                request.run.spec.limits.deadline_unix_ms,
+                cancellation.clone(),
+                stop_cause.clone(),
+            );
             let (steer_signal, steer_updates) = watch::channel(0_u64);
             let run = GenericRun {
                 request: request.clone(),
@@ -723,6 +738,7 @@ impl AgentProvider for InternalGenericAgentProvider {
                 sender,
                 terminal: false,
                 cancellation: cancellation.clone(),
+                stop_cause,
                 cancel_command: None,
                 commands: BTreeMap::new(),
                 queued_steers: VecDeque::new(),
@@ -841,6 +857,17 @@ impl AgentProvider for InternalGenericAgentProvider {
                     duplicate: true,
                 });
             }
+            if !run.terminal && run.stop_cause.load(Ordering::SeqCst) != RUN_STOP_RUNNING {
+                return record_command(
+                    &self.inner,
+                    run,
+                    &command,
+                    ProviderCommandOutcome::Rejected {
+                        code: AgentProtocolErrorCode::InvalidTransition,
+                        message: "Run termination is already in progress".to_owned(),
+                    },
+                );
+            }
 
             match &command.payload {
                 AgentCommand::Cancel { .. } if run.terminal => {
@@ -854,18 +881,27 @@ impl AgentProvider for InternalGenericAgentProvider {
                         },
                     );
                 }
-                AgentCommand::Cancel { .. } if run.cancel_command.is_some() => {
-                    return record_command(
-                        &self.inner,
-                        run,
-                        &command,
-                        ProviderCommandOutcome::Rejected {
-                            code: AgentProtocolErrorCode::InvalidTransition,
-                            message: "cancellation is already in progress".to_owned(),
-                        },
-                    );
-                }
                 AgentCommand::Cancel { reason } => {
+                    if run
+                        .stop_cause
+                        .compare_exchange(
+                            RUN_STOP_RUNNING,
+                            RUN_STOP_HOST_CANCEL,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        )
+                        .is_err()
+                    {
+                        return record_command(
+                            &self.inner,
+                            run,
+                            &command,
+                            ProviderCommandOutcome::Rejected {
+                                code: AgentProtocolErrorCode::InvalidTransition,
+                                message: "Run termination is already in progress".to_owned(),
+                            },
+                        );
+                    }
                     let disposition = record_command(
                         &self.inner,
                         run,
@@ -2455,6 +2491,12 @@ fn stage_loop_recovery(
     };
     let (sender, _) = broadcast::channel(inner.config.stream_buffer);
     let cancellation = CancellationToken::new();
+    let stop_cause = Arc::new(AtomicU8::new(RUN_STOP_RUNNING));
+    arm_run_deadline(
+        request.run.spec.limits.deadline_unix_ms,
+        cancellation.clone(),
+        stop_cause.clone(),
+    );
     let (steer_signal, steer_updates) = watch::channel(0_u64);
     let mut run = GenericRun {
         request: request.clone(),
@@ -2464,6 +2506,7 @@ fn stage_loop_recovery(
         sender,
         terminal: false,
         cancellation: cancellation.clone(),
+        stop_cause,
         cancel_command: None,
         commands,
         queued_steers,
@@ -3031,6 +3074,10 @@ fn stage_loop_recovery(
         }
 
         tokio::spawn(async move {
+            if seed.run_started && cancellation.is_cancelled() {
+                emit_cancel(&inner, &request, &user_message);
+                return;
+            }
             match continuation {
                 GenericRecoveryContinuation::ModelLoop { .. } => {
                     execute_model_run(ModelRunExecution {
@@ -3590,6 +3637,10 @@ async fn execute_model_run(execution: ModelRunExecution) {
     if !supporting_event_ids.contains(&started_event_id) {
         supporting_event_ids.push(started_event_id.clone());
     }
+    if cancellation.is_cancelled() {
+        emit_cancel(&inner, &request, &user_message);
+        return;
+    }
 
     let model_round_limit = request
         .run
@@ -3609,6 +3660,10 @@ async fn execute_model_run(execution: ModelRunExecution) {
 
     'model_rounds: for round in next_model_round..=model_round_limit {
         steer_updates.borrow_and_update();
+        if cancellation.is_cancelled() {
+            emit_cancel(&inner, &request, &user_message);
+            return;
+        }
         if let Err(failure) = commit_queued_steers(&inner, &request, &mut model_messages).await {
             emit_failure(&inner, &request, &user_message, failure);
             return;
@@ -3902,7 +3957,7 @@ async fn execute_model_run(execution: ModelRunExecution) {
                                     }
                                     continue 'model_rounds;
                                 }
-                                DeliveryCommit::CancelPending => {
+                                DeliveryCommit::TerminationPending => {
                                     emit_cancel(&inner, &request, &user_message);
                                     return;
                                 }
@@ -3987,6 +4042,10 @@ async fn execute_model_run(execution: ModelRunExecution) {
 
                     let mut tool_results = Vec::with_capacity(parsed_calls.len());
                     for (call, arguments) in parsed_calls {
+                        if cancellation.is_cancelled() {
+                            emit_cancel(&inner, &request, &user_message);
+                            return;
+                        }
                         if call.name == REQUEST_INPUT_TOOL_NAME {
                             let prompt = match parse_input_request(arguments) {
                                 Ok(prompt) => prompt,
@@ -7262,7 +7321,7 @@ fn publish_telemetry(inner: &GenericInner, run_id: &RunId, telemetry: AgentTelem
 enum DeliveryCommit {
     Committed,
     SteerPending,
-    CancelPending,
+    TerminationPending,
     CheckpointFailed,
     AlreadyTerminal,
 }
@@ -7318,11 +7377,23 @@ fn try_emit_delivery(
     if run.terminal {
         return DeliveryCommit::AlreadyTerminal;
     }
-    if run.cancel_command.is_some() {
-        return DeliveryCommit::CancelPending;
+    if run.stop_cause.load(Ordering::SeqCst) != RUN_STOP_RUNNING {
+        return DeliveryCommit::TerminationPending;
     }
     if !run.queued_steers.is_empty() {
         return DeliveryCommit::SteerPending;
+    }
+    if run
+        .stop_cause
+        .compare_exchange(
+            RUN_STOP_RUNNING,
+            RUN_STOP_COMPLETING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return DeliveryCommit::TerminationPending;
     }
     if let Err(failure) =
         checkpoint_provider_events(inner, run, run_id, &[output.clone(), delivery.clone()])
@@ -7412,9 +7483,82 @@ fn emit_failure(
     }
 }
 
+fn current_unix_ms() -> i64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    i64::try_from(millis).unwrap_or(i64::MAX)
+}
+
+fn arm_run_deadline(
+    deadline_unix_ms: Option<i64>,
+    cancellation: CancellationToken,
+    stop_cause: Arc<AtomicU8>,
+) {
+    let Some(deadline_unix_ms) = deadline_unix_ms else {
+        return;
+    };
+    let remaining_ms = deadline_unix_ms.saturating_sub(current_unix_ms());
+    if remaining_ms <= 0 {
+        if stop_cause
+            .compare_exchange(
+                RUN_STOP_RUNNING,
+                RUN_STOP_DEADLINE,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            cancellation.cancel();
+        }
+        return;
+    }
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = cancellation.cancelled() => {}
+            _ = tokio::time::sleep(Duration::from_millis(remaining_ms as u64)) => {
+                if stop_cause
+                    .compare_exchange(
+                        RUN_STOP_RUNNING,
+                        RUN_STOP_DEADLINE,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    )
+                    .is_ok()
+                {
+                    cancellation.cancel();
+                }
+            }
+        }
+    });
+}
+
+fn emit_deadline_incomplete(inner: &GenericInner, request: &AgentStartRequest) {
+    let run_id = &request.run.spec.run_id;
+    if publish_durable(
+        inner,
+        run_id,
+        AgentEventDraft {
+            event_id: AgentEventId::new(format!("generic-{}-deadline", run_id.as_str())),
+            run_id: run_id.clone(),
+            causation_id: None,
+            source_fingerprint: None,
+            payload: AgentEvent::RunIncomplete {
+                reason: IncompleteReason::LimitReached {
+                    limit: RunLimitKind::Deadline,
+                },
+                partial_delivery: None,
+            },
+        },
+    ) {
+        finish_session(inner, request);
+    }
+}
+
 fn emit_cancel(inner: &GenericInner, request: &AgentStartRequest, user_message: &ModelMessage) {
     let run_id = &request.run.spec.run_id;
-    let cancellation = {
+    let (stop_cause, cancel_command) = {
         let state = inner
             .state
             .lock()
@@ -7422,9 +7566,31 @@ fn emit_cancel(inner: &GenericInner, request: &AgentStartRequest, user_message: 
         state
             .runs
             .get(run_id)
-            .and_then(|run| run.cancel_command.clone())
+            .map_or((RUN_STOP_RUNNING, None), |run| {
+                (
+                    run.stop_cause.load(Ordering::SeqCst),
+                    run.cancel_command.clone(),
+                )
+            })
     };
-    if let Some((command_id, reason)) = cancellation {
+    if stop_cause == RUN_STOP_DEADLINE {
+        emit_deadline_incomplete(inner, request);
+        return;
+    }
+    if stop_cause == RUN_STOP_HOST_CANCEL {
+        let Some((command_id, reason)) = cancel_command else {
+            emit_failure(
+                inner,
+                request,
+                user_message,
+                agent_failure(
+                    "cancel_command_missing",
+                    "Host cancellation won the termination race without a durable command",
+                    true,
+                ),
+            );
+            return;
+        };
         if !publish_durable(
             inner,
             run_id,
@@ -7475,12 +7641,20 @@ fn finish_session(inner: &GenericInner, request: &AgentStartRequest) {
         .state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let cancellation = state
+        .runs
+        .get(&request.run.spec.run_id)
+        .map(|run| run.cancellation.clone());
     let session = state
         .sessions
         .entry(request.run.spec.session_id.clone())
         .or_default();
     if session.active_run.as_ref() == Some(&request.run.spec.run_id) {
         session.active_run = None;
+    }
+    drop(state);
+    if let Some(cancellation) = cancellation {
+        cancellation.cancel();
     }
 }
 

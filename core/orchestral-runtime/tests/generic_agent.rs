@@ -12,10 +12,10 @@ use orchestral_core::{
             AgentCommand, AgentCommandEnvelope, AgentEvent, AgentEventAuthority,
             AgentProtocolErrorCode, AgentProviderStreamItem, AgentRunEnvelope, AgentSessionId,
             AgentStartRequest, AgentTelemetry, ApprovalDecision, BindingRequirement,
-            CommandAckState, CommandId, Content, ContentBody, PendingRequestKind,
+            CommandAckState, CommandId, Content, ContentBody, IncompleteReason, PendingRequestKind,
             PendingRequestPayload, ProviderBindingRef, ProviderCommandOutcome, RequestResolution,
             ResourceBinding, ResourceBindingId, ResourceBindingMode, ResourceId, ResourceKind,
-            ResourceRef, ResourceRevision, RunId,
+            ResourceRef, ResourceRevision, RunId, RunLimitKind,
         },
         AGENT_PROTOCOL_V1,
     },
@@ -60,6 +60,10 @@ use tokio_util::sync::CancellationToken;
 struct ScriptedModel;
 
 struct BlockingModel;
+
+struct CountingBlockingModel {
+    starts: Arc<AtomicUsize>,
+}
 
 struct WalInspectingModel {
     checkpoint_store: Arc<InMemoryGenericAgentCheckpointStore>,
@@ -856,6 +860,30 @@ impl ModelBackend for BlockingModel {
         _cancellation: CancellationToken,
     ) -> Result<ModelStream, ModelError> {
         request.validate()?;
+        Ok(Box::pin(stream::pending()))
+    }
+}
+
+#[async_trait]
+impl ModelBackend for CountingBlockingModel {
+    fn descriptor(&self) -> ModelDescriptor {
+        ModelDescriptor {
+            backend_id: "counting-blocking-model".to_owned(),
+            capabilities: ModelCapabilities {
+                streaming: true,
+                ..ModelCapabilities::default()
+            },
+            extensions: Default::default(),
+        }
+    }
+
+    async fn start(
+        &self,
+        request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelStream, ModelError> {
+        request.validate()?;
+        self.starts.fetch_add(1, Ordering::SeqCst);
         Ok(Box::pin(stream::pending()))
     }
 }
@@ -6160,6 +6188,122 @@ async fn sdk_and_api_share_the_same_agent_event_semantics() {
     assert_eq!(sdk_turn.final_text(), api_turn.final_text());
 }
 
+fn test_unix_ms() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock is after the Unix epoch")
+            .as_millis(),
+    )
+    .expect("test timestamp fits i64")
+}
+
+#[tokio::test]
+async fn expired_deadline_commits_incomplete_without_starting_the_model() {
+    let starts = Arc::new(AtomicUsize::new(0));
+    let checkpoint_store = Arc::new(InMemoryGenericAgentCheckpointStore::default());
+    let provider = Arc::new(
+        InternalGenericAgentProvider::new(
+            Arc::new(CountingBlockingModel {
+                starts: starts.clone(),
+            }),
+            GenericAgentConfig::new("internal-provider", "generic-agent"),
+        )
+        .expect("Generic Agent accepts the neutral backend")
+        .with_checkpoint_store(checkpoint_store.clone())
+        .expect("private WAL binds before the Provider is shared"),
+    );
+    let controller = Arc::new(
+        AgentController::new(provider, ProviderBindingRef::new("deadline-binding"))
+            .expect("controller binds the Generic Agent"),
+    );
+    let run_id = RunId::new("expired-deadline-run");
+    let mut run = AgentRunEnvelope::new(
+        AGENT_PROTOCOL_V1,
+        AgentSessionId::new("expired-deadline-session"),
+        run_id.clone(),
+        vec![Content::text("must not reach the model")],
+    )
+    .expect("valid text Run");
+    run.spec.limits.deadline_unix_ms = Some(test_unix_ms().saturating_sub(1));
+    let run = AgentRunEnvelope::seal(run.spec).expect("deadline Run reseals");
+
+    let execution = controller.start(run).await.expect("deadline Run starts");
+    let view = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        controller.wait_for_terminal(&execution.run_id),
+    )
+    .await
+    .expect("expired deadline terminates promptly")
+    .expect("deadline terminal remains authoritative");
+
+    assert_eq!(view.state.status(), AgentRunStatus::Incomplete);
+    assert_eq!(starts.load(Ordering::SeqCst), 0);
+    let records = controller
+        .events(&run_id, 0)
+        .await
+        .expect("events remain readable");
+    assert!(records.iter().any(|record| matches!(
+        &record.event.payload,
+        AgentEvent::RunIncomplete {
+            reason: IncompleteReason::LimitReached {
+                limit: RunLimitKind::Deadline
+            },
+            partial_delivery: None,
+        }
+    )));
+    let stored = checkpoint_store
+        .load_run(&run_id)
+        .expect("private WAL remains readable")
+        .expect("deadline Run remains durable");
+    assert_eq!(
+        stored.validate().expect("deadline WAL replays").phase,
+        GenericCheckpointPhase::Terminal
+    );
+}
+
+#[tokio::test]
+async fn deadline_cancels_a_blocked_model_and_stays_incomplete() {
+    let starts = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(
+        InternalGenericAgentProvider::new(
+            Arc::new(CountingBlockingModel {
+                starts: starts.clone(),
+            }),
+            GenericAgentConfig::new("internal-provider", "generic-agent"),
+        )
+        .expect("Generic Agent accepts the neutral backend"),
+    );
+    let controller = Arc::new(
+        AgentController::new(provider, ProviderBindingRef::new("live-deadline-binding"))
+            .expect("controller binds the Generic Agent"),
+    );
+    let run_id = RunId::new("live-deadline-run");
+    let deadline_unix_ms = test_unix_ms().saturating_add(500);
+    let mut run = AgentRunEnvelope::new(
+        AGENT_PROTOCOL_V1,
+        AgentSessionId::new("live-deadline-session"),
+        run_id.clone(),
+        vec![Content::text("wait until the deadline")],
+    )
+    .expect("valid text Run");
+    run.spec.limits.deadline_unix_ms = Some(deadline_unix_ms);
+    let run = AgentRunEnvelope::seal(run.spec).expect("deadline Run reseals");
+
+    let execution = controller.start(run).await.expect("deadline Run starts");
+    let view = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        controller.wait_for_terminal(&execution.run_id),
+    )
+    .await
+    .expect("deadline reaches the blocked model")
+    .expect("deadline terminal remains authoritative");
+
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    assert_eq!(view.state.status(), AgentRunStatus::Incomplete);
+    assert!(test_unix_ms().saturating_sub(deadline_unix_ms) < 1_000);
+}
+
 #[tokio::test]
 async fn controller_cancel_terminates_a_generic_agent_model_run() {
     let run_id = RunId::new("cancel-run");
@@ -6177,13 +6321,15 @@ async fn controller_cancel_terminates_a_generic_agent_model_run() {
         AgentController::new(provider, ProviderBindingRef::new("generic-binding"))
             .expect("controller binds the Generic Agent"),
     );
-    let run = AgentRunEnvelope::new(
+    let mut run = AgentRunEnvelope::new(
         AGENT_PROTOCOL_V1,
         AgentSessionId::new("cancel-session"),
         run_id.clone(),
         vec![Content::text("wait")],
     )
     .expect("valid text Run");
+    run.spec.limits.deadline_unix_ms = Some(test_unix_ms().saturating_add(5_000));
+    let run = AgentRunEnvelope::seal(run.spec).expect("cancel race Run reseals");
 
     let execution = controller.start(run.clone()).await.expect("Run starts");
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
