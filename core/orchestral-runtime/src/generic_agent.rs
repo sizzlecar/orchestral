@@ -676,6 +676,7 @@ impl AgentProvider for InternalGenericAgentProvider {
             &model_definitions,
             run_skills.as_deref(),
             Some(user_message.clone()),
+            None,
         )
         .await;
 
@@ -1553,18 +1554,71 @@ fn stage_loop_recovery(
             &model_definitions,
             run_skills.as_deref(),
             initial_input,
+            None,
         )
         .await
         .map_err(session_context_recovery_error)?;
+        let mut session_exchange_committed = false;
         if let GenericRecoveryContinuation::Input {
             round,
             request_id,
             request_digest,
+            observation,
+            call,
+            arguments,
+            resolved_response,
             ..
         } = &continuation
         {
+            let expected_exchange = resolved_response
+                .as_ref()
+                .map(|response| {
+                    input_resolution_result(&response.resolution).map(|result| {
+                        observed_input_exchange_messages(observation, call, arguments, &result)
+                    })
+                })
+                .transpose()
+                .map_err(checkpoint_stream_error)?;
+            let session_exchange_seq = recovered_input_exchange_committed(
+                &inner,
+                &request,
+                *round,
+                request_id,
+                expected_exchange.as_ref(),
+                observation.usage.as_ref(),
+            )
+            .await?;
+            session_exchange_committed = session_exchange_seq.is_some();
+            let prior_model_messages = if let Some(exchange_seq) = session_exchange_seq {
+                let (assistant, tool) = expected_exchange
+                    .as_ref()
+                    .expect("a committed input exchange has a private resolved response");
+                if !model_messages.ends_with(&[assistant.clone(), tool.clone()]) {
+                    return Err(AgentProtocolError::new(
+                        AgentProtocolErrorCode::InvalidDigest,
+                        "recovered Session input exchange is not the final projected context",
+                    ));
+                }
+                Some(
+                    project_model_messages(
+                        &inner,
+                        &request,
+                        &model_definitions,
+                        run_skills.as_deref(),
+                        None,
+                        Some(exchange_seq.saturating_sub(1)),
+                    )
+                    .await
+                    .map_err(session_context_recovery_error)?,
+                )
+            } else {
+                None
+            };
+            let request_messages = prior_model_messages
+                .as_deref()
+                .unwrap_or(model_messages.as_slice());
             let rebuilt =
-                model_request_for_round(&request, *round, &model_messages, &model_definitions);
+                model_request_for_round(&request, *round, request_messages, &model_definitions);
             if rebuilt.request_id != *request_id
                 || model_request_digest(&rebuilt).map_err(checkpoint_stream_error)?
                     != *request_digest
@@ -1671,6 +1725,7 @@ fn stage_loop_recovery(
                         request_open,
                         committed_response,
                         resolved_response,
+                        session_exchange_committed,
                         response,
                     )
                     .await;
@@ -1862,6 +1917,7 @@ async fn project_model_messages(
     model_definitions: &[ModelToolDefinition],
     run_skills: Option<&SkillRuntime>,
     initial_input: Option<ModelMessage>,
+    through_session_seq: Option<u64>,
 ) -> Result<Vec<ModelMessage>, SessionContextError> {
     if let Some(message) = initial_input {
         inner
@@ -1900,6 +1956,7 @@ async fn project_model_messages(
         .project(SessionContextRequest {
             session_id: request.run.spec.session_id.clone(),
             current_run_id: request.run.spec.run_id.clone(),
+            through_session_seq,
             system_message: system_message_for_run(&inner.config, run_skills),
             tools: model_definitions.to_vec(),
             max_context_tokens,
@@ -2751,6 +2808,68 @@ async fn execute_model_run(
     );
 }
 
+async fn recovered_input_exchange_committed(
+    inner: &GenericInner,
+    request: &AgentStartRequest,
+    round: u64,
+    request_id: &ModelRequestId,
+    expected_messages: Option<&(ModelMessage, ModelMessage)>,
+    usage: Option<&ModelUsage>,
+) -> Result<Option<u64>, AgentProtocolError> {
+    let records = inner
+        .session_journal
+        .load_session(&request.run.spec.session_id)
+        .await
+        .map_err(|error| session_context_recovery_error(SessionContextError::Journal(error)))?;
+    let matching = records
+        .iter()
+        .filter(|record| match &record.payload {
+            AgentSessionEvent::ToolExchangeCommitted {
+                request_id: actual, ..
+            }
+            | AgentSessionEvent::RunOutputCommitted {
+                request_id: actual, ..
+            } => actual == request_id,
+            _ => false,
+        })
+        .collect::<Vec<_>>();
+    let [] = matching.as_slice() else {
+        let [record] = matching.as_slice() else {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidDigest,
+                "recovered model attempt has multiple Session outcomes",
+            ));
+        };
+        let Some((assistant, tool)) = expected_messages else {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidDigest,
+                "Session contains an input exchange without a durable input resolution",
+            ));
+        };
+        let expected_payload = AgentSessionEvent::ToolExchangeCommitted {
+            request_id: request_id.clone(),
+            assistant: assistant.clone(),
+            tool: tool.clone(),
+            usage: usage.cloned(),
+        };
+        let expected_event_id = AgentSessionEventId::new(format!(
+            "generic-{}-tool-exchange-{round}",
+            request.run.spec.run_id.as_str()
+        ));
+        if record.run_id != request.run.spec.run_id
+            || record.event_id != expected_event_id
+            || record.payload != expected_payload
+        {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidDigest,
+                "recovered Session input exchange does not match the private model observation",
+            ));
+        }
+        return Ok(Some(record.session_seq));
+    };
+    Ok(None)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn resume_observed_input(
     inner: Arc<GenericInner>,
@@ -2772,28 +2891,16 @@ async fn resume_observed_input(
     request_open: bool,
     committed_response: Option<InputResponse>,
     resolved_response: Option<InputResponse>,
+    session_exchange_committed: bool,
     response: Option<oneshot::Receiver<InputResponse>>,
 ) {
     let run_id = request.run.spec.run_id.clone();
     if let Some(usage) = observation.usage.clone() {
         merge_usage(&mut seed.total_usage, usage);
     }
-    let mut assistant_content = Vec::new();
     if !observation.response.is_empty() {
         seed.last_response = observation.response.clone();
-        assistant_content.push(ModelContent::Text {
-            text: observation.response,
-        });
     }
-    assistant_content.push(ModelContent::ToolCall {
-        call_id: call.call_id.clone(),
-        name: call.name,
-        arguments,
-    });
-    let assistant_message = ModelMessage {
-        role: ModelRole::Assistant,
-        content: assistant_content,
-    };
     let input = if let Some(resolved_response) = resolved_response {
         input_resolution_outcome(resolved_response.resolution)
     } else if let Some(committed_response) = committed_response {
@@ -2837,38 +2944,34 @@ async fn resume_observed_input(
             return;
         }
     };
-    let tool_message = ModelMessage {
-        role: ModelRole::Tool,
-        content: vec![ModelContent::ToolResult {
-            call_id: call.call_id,
-            result,
-            is_error: false,
-        }],
-    };
-    if let Err(failure) = append_session_event(
-        &inner,
-        AgentSessionEventDraft {
-            event_id: AgentSessionEventId::new(format!(
-                "generic-{}-tool-exchange-{round}",
-                run_id.as_str()
-            )),
-            session_id: request.run.spec.session_id.clone(),
-            run_id: run_id.clone(),
-            payload: AgentSessionEvent::ToolExchangeCommitted {
-                request_id: model_request_id,
-                assistant: assistant_message.clone(),
-                tool: tool_message.clone(),
-                usage: observation.usage,
+    let (assistant_message, tool_message) =
+        observed_input_exchange_messages(&observation, &call, &arguments, &result);
+    if !session_exchange_committed {
+        if let Err(failure) = append_session_event(
+            &inner,
+            AgentSessionEventDraft {
+                event_id: AgentSessionEventId::new(format!(
+                    "generic-{}-tool-exchange-{round}",
+                    run_id.as_str()
+                )),
+                session_id: request.run.spec.session_id.clone(),
+                run_id: run_id.clone(),
+                payload: AgentSessionEvent::ToolExchangeCommitted {
+                    request_id: model_request_id,
+                    assistant: assistant_message.clone(),
+                    tool: tool_message.clone(),
+                    usage: observation.usage,
+                },
             },
-        },
-    )
-    .await
-    {
-        emit_failure(&inner, &request, &user_message, failure);
-        return;
+        )
+        .await
+        {
+            emit_failure(&inner, &request, &user_message, failure);
+            return;
+        }
+        model_messages.push(assistant_message);
+        model_messages.push(tool_message);
     }
-    model_messages.push(assistant_message);
-    model_messages.push(tool_message);
     seed.next_model_round = round.saturating_add(1);
     if let Err(failure) = commit_loop_boundary(
         &inner,
@@ -3112,16 +3215,58 @@ fn commit_input_response(
 }
 
 fn input_resolution_outcome(resolution: RequestResolution) -> InputWaitOutcome {
+    match input_resolution_result(&resolution) {
+        Ok(result) => InputWaitOutcome::Resolved(result),
+        Err(failure) => InputWaitOutcome::Failed(failure),
+    }
+}
+
+fn input_resolution_result(
+    resolution: &RequestResolution,
+) -> Result<serde_json::Value, AgentFailure> {
     match resolution {
-        RequestResolution::Input { content } => InputWaitOutcome::Resolved(serde_json::json!({
+        RequestResolution::Input { content } => Ok(serde_json::json!({
             "content": content,
         })),
-        _ => InputWaitOutcome::Failed(agent_failure(
+        _ => Err(agent_failure(
             "input_resolution_invalid",
             "input request received a non-input resolution",
             false,
         )),
     }
+}
+
+fn observed_input_exchange_messages(
+    observation: &GenericModelObservation,
+    call: &GenericObservedToolCall,
+    arguments: &serde_json::Value,
+    result: &serde_json::Value,
+) -> (ModelMessage, ModelMessage) {
+    let mut assistant_content = Vec::new();
+    if !observation.response.is_empty() {
+        assistant_content.push(ModelContent::Text {
+            text: observation.response.clone(),
+        });
+    }
+    assistant_content.push(ModelContent::ToolCall {
+        call_id: call.call_id.clone(),
+        name: call.name.clone(),
+        arguments: arguments.clone(),
+    });
+    (
+        ModelMessage {
+            role: ModelRole::Assistant,
+            content: assistant_content,
+        },
+        ModelMessage {
+            role: ModelRole::Tool,
+            content: vec![ModelContent::ToolResult {
+                call_id: call.call_id.clone(),
+                result: result.clone(),
+                is_error: false,
+            }],
+        },
+    )
 }
 
 fn remove_pending_input(inner: &GenericInner, run_id: &RunId, request_id: &RequestId) {

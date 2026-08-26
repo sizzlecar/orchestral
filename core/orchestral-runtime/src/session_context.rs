@@ -76,6 +76,9 @@ impl ModelTokenMeter for JsonSizeTokenMeter {
 pub struct SessionContextRequest {
     pub session_id: AgentSessionId,
     pub current_run_id: RunId,
+    /// Optional append-only Journal cursor used to reproduce a prior model
+    /// request exactly during recovery. `None` projects the current head.
+    pub through_session_seq: Option<u64>,
     pub system_message: Option<ModelMessage>,
     pub tools: Vec<ModelToolDefinition>,
     pub max_context_tokens: u64,
@@ -118,8 +121,18 @@ impl AgentSessionContextEngine {
         validate_context_request(&request)?;
         let records = self.journal.load_session(&request.session_id).await?;
         validate_session_trace(&request.session_id, &records)?;
+        let records = match request.through_session_seq {
+            Some(through) if through > records.len() as u64 => {
+                return Err(SessionContextError::InvalidRequest(format!(
+                    "Session Context cursor {through} is past Journal head {}",
+                    records.len()
+                )))
+            }
+            Some(through) => &records[..through as usize],
+            None => records.as_slice(),
+        };
         let groups = replay_groups(
-            &records,
+            records,
             &request.current_run_id,
             &request.allowed_skill_digests,
         )?;
@@ -630,6 +643,7 @@ mod tests {
             .project(SessionContextRequest {
                 session_id: AgentSessionId::new("session-1"),
                 current_run_id: RunId::new("current"),
+                through_session_seq: None,
                 system_message: Some(ModelMessage::text(ModelRole::System, "system")),
                 tools: Vec::new(),
                 max_context_tokens: 600,
@@ -685,6 +699,7 @@ mod tests {
             .project(SessionContextRequest {
                 session_id: AgentSessionId::new("session-1"),
                 current_run_id: RunId::new("current"),
+                through_session_seq: None,
                 system_message: None,
                 tools: Vec::new(),
                 max_context_tokens: 180,
@@ -707,6 +722,30 @@ mod tests {
                 .any(|content| matches!(content, ModelContent::ToolResult { .. }))
         });
         assert_eq!(has_call, has_result);
+
+        let prior = engine
+            .project(SessionContextRequest {
+                session_id: AgentSessionId::new("session-1"),
+                current_run_id: RunId::new("current"),
+                through_session_seq: Some(1),
+                system_message: None,
+                tools: Vec::new(),
+                max_context_tokens: 180,
+                reserved_output_tokens: 20,
+                config_digest: Digest::sha256("config"),
+                allowed_skill_digests: BTreeMap::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(prior.through_session_seq, 1);
+        assert!(prior.messages.iter().all(|message| {
+            message.content.iter().all(|content| {
+                !matches!(
+                    content,
+                    ModelContent::ToolCall { .. } | ModelContent::ToolResult { .. }
+                )
+            })
+        }));
     }
 
     #[tokio::test]
@@ -757,6 +796,7 @@ mod tests {
             .project(SessionContextRequest {
                 session_id: AgentSessionId::new("session-1"),
                 current_run_id: RunId::new("current"),
+                through_session_seq: None,
                 system_message: None,
                 tools: Vec::new(),
                 max_context_tokens: 10_000,

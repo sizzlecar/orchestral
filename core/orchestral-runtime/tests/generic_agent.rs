@@ -86,6 +86,7 @@ enum CheckpointCrashCut {
     ModelObservation,
     InputRequestOpen,
     InputRequestResolve,
+    InputToolExchangeBoundary,
 }
 
 struct PausingCheckpointStore {
@@ -381,6 +382,13 @@ impl GenericAgentCheckpointStore for PausingCheckpointStore {
                     matches!(&event.payload, AgentEvent::RequestResolved { resolution, .. }
                         if matches!(resolution, RequestResolution::Input { .. }))
                 }),
+                (
+                    CheckpointCrashCut::InputToolExchangeBoundary,
+                    GenericCheckpointEvent::LoopBoundaryCommitted {
+                        next_model_round: 2,
+                        ..
+                    },
+                ) => true,
                 _ => false,
             };
             if !state.paused_once && at_cut {
@@ -2400,6 +2408,211 @@ async fn durable_input_resolution_recovers_before_session_tool_exchange() {
                 &record.payload,
                 AgentSessionEvent::ToolExchangeCommitted { .. }
             ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        checkpoint_store
+            .load_run(&run_id)
+            .expect("private WAL remains readable")
+            .expect("recovered Run remains registered")
+            .validate()
+            .expect("recovered WAL remains valid")
+            .phase,
+        GenericCheckpointPhase::Terminal
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn committed_input_tool_exchange_recovers_before_private_loop_boundary() {
+    let run_id = RunId::new("committed-input-exchange-recovery-run");
+    let session_id = AgentSessionId::new("committed-input-exchange-recovery-session");
+    let checkpoint_store = Arc::new(PausingCheckpointStore::at(
+        CheckpointCrashCut::InputToolExchangeBoundary,
+    ));
+    let session_journal = Arc::new(InMemoryAgentSessionJournalStore::default());
+    let host_journal = Arc::new(InMemoryAgentJournalStore::default());
+    let config = GenericAgentConfig::new("internal-provider", "generic-agent");
+    let first_provider = Arc::new(
+        InternalGenericAgentProvider::new_with_session_journal(
+            Arc::new(InputRequestModel {
+                rounds: AtomicUsize::new(0),
+            }),
+            config.clone(),
+            session_journal.clone(),
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+        .expect("first input-capable Generic Agent starts")
+        .with_checkpoint_store(checkpoint_store.clone())
+        .expect("private WAL binds before the Provider is shared"),
+    );
+    let first_controller = Arc::new(
+        AgentController::with_journal_store(
+            first_provider,
+            ProviderBindingRef::new("committed-input-exchange-recovery-binding"),
+            host_journal.clone(),
+        )
+        .expect("first controller binds"),
+    );
+    let execution = first_controller
+        .start(
+            AgentRunEnvelope::new(
+                AGENT_PROTOCOL_V1,
+                session_id.clone(),
+                run_id.clone(),
+                vec![Content::text("recover my committed Tool exchange")],
+            )
+            .expect("valid input Run"),
+        )
+        .await
+        .expect("Run starts");
+    let pending = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let view = first_controller
+                .inspect(&run_id)
+                .await
+                .expect("Run remains inspectable");
+            if let Some(request) = view.pending_requests.first() {
+                break request.clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first process opens the input request");
+    let paused = checkpoint_store.paused.notified();
+    let ack = first_controller
+        .command(
+            AgentCommandEnvelope::new(
+                CommandId::new("committed-input-exchange-resolution"),
+                run_id.clone(),
+                Some(pending.request_id),
+                AgentCommand::ResolveRequest {
+                    response: RequestResolution::Input {
+                        content: vec![Content::text("Shanghai")],
+                    },
+                },
+            )
+            .expect("valid correlated input resolution"),
+        )
+        .await
+        .expect("input resolution command is accepted");
+    assert!(matches!(ack.state, CommandAckState::Accepted { .. }));
+    tokio::time::timeout(std::time::Duration::from_secs(1), paused)
+        .await
+        .expect("Session Tool exchange reaches the next private boundary");
+
+    let projection = checkpoint_store
+        .load_run(&run_id)
+        .expect("private WAL remains readable")
+        .expect("private Run remains registered")
+        .validate()
+        .expect("private WAL remains valid");
+    assert!(matches!(
+        projection.phase,
+        GenericCheckpointPhase::ModelAttemptObserved { round: 1, .. }
+    ));
+    assert_eq!(
+        projection
+            .provider_events
+            .iter()
+            .filter(|event| matches!(&event.payload, AgentEvent::RequestResolved { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        session_journal
+            .load_session(&session_id)
+            .await
+            .expect("Session Journal remains readable")
+            .iter()
+            .filter(|record| matches!(
+                &record.payload,
+                AgentSessionEvent::ToolExchangeCommitted { .. }
+            ))
+            .count(),
+        1
+    );
+
+    checkpoint_store.release_as_crash();
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        first_controller.wait_for_terminal(&execution.run_id),
+    )
+    .await
+    .expect("simulated boundary process loss reaches the Host")
+    .expect_err("uncommitted private loop boundary is not terminal");
+    assert!(matches!(
+        error,
+        AgentControlError::ContinuityUnknown(ref actual) if actual == &run_id
+    ));
+    drop(first_controller);
+    checkpoint_store.allow_recovery_writes();
+
+    let replacement_model = Arc::new(InputRequestModel {
+        rounds: AtomicUsize::new(1),
+    });
+    let replacement_provider = Arc::new(
+        InternalGenericAgentProvider::new_with_session_journal(
+            replacement_model.clone(),
+            config,
+            session_journal.clone(),
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+        .expect("replacement Generic Agent starts")
+        .with_checkpoint_store(checkpoint_store.clone())
+        .expect("replacement Provider binds the same private WAL"),
+    );
+    let replacement_controller = Arc::new(
+        AgentController::with_journal_store(
+            replacement_provider,
+            ProviderBindingRef::new("committed-input-exchange-recovery-binding"),
+            host_journal,
+        )
+        .expect("replacement controller binds"),
+    );
+    replacement_controller
+        .recover(&run_id)
+        .await
+        .expect("committed Session Tool exchange is recoverable");
+    let view = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        replacement_controller.wait_for_terminal(&run_id),
+    )
+    .await
+    .expect("recovered Session exchange advances without another answer")
+    .expect("recovered Session exchange reaches Delivery");
+    assert_eq!(view.state.status(), AgentRunStatus::Delivered);
+    assert!(view.pending_requests.is_empty());
+    assert_eq!(replacement_model.rounds.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        session_journal
+            .load_session(&session_id)
+            .await
+            .expect("recovered Session Journal remains readable")
+            .iter()
+            .filter(|record| matches!(
+                &record.payload,
+                AgentSessionEvent::ToolExchangeCommitted { .. }
+            ))
+            .count(),
+        1
+    );
+    let events = replacement_controller
+        .events(&run_id, 0)
+        .await
+        .expect("recovered Host Journal remains readable");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|record| matches!(&record.event.payload, AgentEvent::RequestOpened { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|record| matches!(&record.event.payload, AgentEvent::RequestResolved { .. }))
             .count(),
         1
     );
