@@ -1127,9 +1127,11 @@ impl AgentProvider for InternalGenericAgentProvider {
 
         match projection.phase {
             GenericCheckpointPhase::Terminal => {
-                let replay = stream::iter(recovery_events.into_iter().map(|draft| {
-                    Ok(AgentProviderStreamItem::Event(Box::new(draft)))
-                }))
+                let replay = stream::iter(
+                    recovery_events
+                        .into_iter()
+                        .map(|draft| Ok(AgentProviderStreamItem::Event(Box::new(draft)))),
+                )
                 .boxed();
                 Ok(AgentRecovery::staged(replay, async { Ok(()) }))
             }
@@ -1144,16 +1146,22 @@ impl AgentProvider for InternalGenericAgentProvider {
                 "round": round,
                 "request_id": request_id,
             }))),
-            GenericCheckpointPhase::Stable(boundary) => stage_stable_recovery(
+            GenericCheckpointPhase::Stable(boundary) => {
+                stage_loop_recovery(self.inner.clone(), stored, boundary, recovery_events, false)
+            }
+            GenericCheckpointPhase::Prepared => stage_loop_recovery(
                 self.inner.clone(),
                 stored,
-                boundary,
+                GenericLoopBoundary {
+                    next_model_round: 1,
+                    usage: ModelUsage::default(),
+                    tool_call_count: 0,
+                    last_response: String::new(),
+                    supporting_event_ids: Vec::new(),
+                },
                 recovery_events,
+                true,
             ),
-            GenericCheckpointPhase::Prepared => Err(AgentProtocolError::new(
-                    AgentProtocolErrorCode::Unsupported,
-                    "Generic Agent recovery cannot yet reconstruct a Run before its first stable loop boundary",
-                )),
         }
     }
 }
@@ -1185,11 +1193,12 @@ fn checkpoint_recovery_events(
     Ok(events)
 }
 
-fn stage_stable_recovery(
+fn stage_loop_recovery(
     inner: Arc<GenericInner>,
     stored: StoredGenericAgentRun,
     boundary: GenericLoopBoundary,
     recovery_events: Vec<AgentEventDraft>,
+    restore_initial_input: bool,
 ) -> Result<AgentRecovery, AgentProtocolError> {
     let checkpoint_seq = stored.last_checkpoint_seq();
     let registration = stored.registration;
@@ -1248,12 +1257,13 @@ fn stage_stable_recovery(
     let replay = InternalGenericAgentProvider::stream_for(&run);
 
     Ok(AgentRecovery::staged(replay, async move {
+        let initial_input = restore_initial_input.then(|| user_message.clone());
         let model_messages = project_model_messages(
             &inner,
             &request,
             &model_definitions,
             run_skills.as_deref(),
-            None,
+            initial_input,
         )
         .await
         .map_err(session_context_recovery_error)?;
@@ -1284,6 +1294,23 @@ fn stage_stable_recovery(
             }
             session.active_run = Some(run_id.clone());
             state.runs.insert(run_id.clone(), run);
+        }
+
+        if restore_initial_input {
+            if let Err(failure) =
+                commit_loop_boundary(&inner, &run_id, 1, &ModelUsage::default(), 0, "", &[])
+            {
+                let mut state = inner
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let error = state
+                    .runs
+                    .get_mut(&run_id)
+                    .map(|run| poison_run_after_checkpoint_failure(run, failure.clone()))
+                    .unwrap_or_else(|| checkpoint_stream_error(failure));
+                return Err(error);
+            }
         }
 
         tokio::spawn(async move {

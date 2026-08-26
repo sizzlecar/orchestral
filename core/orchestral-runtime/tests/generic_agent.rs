@@ -68,6 +68,10 @@ struct RecoveryIdentityModel {
     starts: Arc<AtomicUsize>,
 }
 
+struct PreparedRecoveryModel {
+    starts: Arc<AtomicUsize>,
+}
+
 #[derive(Default)]
 struct PausedAttemptState {
     paused_once: bool,
@@ -75,15 +79,31 @@ struct PausedAttemptState {
     crashed: bool,
 }
 
-#[derive(Default)]
-struct PausingModelAttemptCheckpointStore {
+#[derive(Clone, Copy)]
+enum CheckpointCrashCut {
+    InitialBoundary,
+    ModelAttempt,
+}
+
+struct PausingCheckpointStore {
     inner: InMemoryGenericAgentCheckpointStore,
+    cut: CheckpointCrashCut,
     state: std::sync::Mutex<PausedAttemptState>,
     release: std::sync::Condvar,
     paused: Notify,
 }
 
-impl PausingModelAttemptCheckpointStore {
+impl PausingCheckpointStore {
+    fn at(cut: CheckpointCrashCut) -> Self {
+        Self {
+            inner: InMemoryGenericAgentCheckpointStore::default(),
+            cut,
+            state: std::sync::Mutex::new(PausedAttemptState::default()),
+            release: std::sync::Condvar::new(),
+            paused: Notify::new(),
+        }
+    }
+
     fn release_as_crash(&self) {
         let mut state = self
             .state
@@ -181,7 +201,7 @@ impl GenericAgentCheckpointStore for FailingCommandCheckpointStore {
     }
 }
 
-impl GenericAgentCheckpointStore for PausingModelAttemptCheckpointStore {
+impl GenericAgentCheckpointStore for PausingCheckpointStore {
     fn load_run(
         &self,
         run_id: &RunId,
@@ -212,12 +232,21 @@ impl GenericAgentCheckpointStore for PausingModelAttemptCheckpointStore {
                     "simulated Provider process loss".to_owned(),
                 ));
             }
-            if !state.paused_once
-                && matches!(
-                    &draft.payload,
-                    GenericCheckpointEvent::ModelAttemptStarted { .. }
+            let at_cut = match (&self.cut, &draft.payload) {
+                (
+                    CheckpointCrashCut::InitialBoundary,
+                    GenericCheckpointEvent::LoopBoundaryCommitted {
+                        next_model_round: 1,
+                        ..
+                    },
                 )
-            {
+                | (
+                    CheckpointCrashCut::ModelAttempt,
+                    GenericCheckpointEvent::ModelAttemptStarted { .. },
+                ) => true,
+                _ => false,
+            };
+            if !state.paused_once && at_cut {
                 state.paused_once = true;
                 self.paused.notify_waiters();
                 while !state.release {
@@ -472,6 +501,58 @@ impl ModelBackend for RecoveryIdentityModel {
         request.validate()?;
         self.starts.fetch_add(1, Ordering::SeqCst);
         Ok(Box::pin(stream::pending()))
+    }
+}
+
+#[async_trait]
+impl ModelBackend for PreparedRecoveryModel {
+    fn descriptor(&self) -> ModelDescriptor {
+        ModelDescriptor {
+            backend_id: "prepared-recovery-model".to_owned(),
+            capabilities: ModelCapabilities {
+                streaming: true,
+                ..ModelCapabilities::default()
+            },
+            extensions: Default::default(),
+        }
+    }
+
+    async fn start(
+        &self,
+        request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelStream, ModelError> {
+        request.validate()?;
+        assert!(request.messages.iter().any(|message| {
+            message.role == ModelRole::User
+                && message.content.iter().any(|content| {
+                    matches!(
+                        content,
+                        ModelContent::Text { text }
+                            if text == "recover the registered initial input"
+                    )
+                })
+        }));
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        let request_id = request.request_id;
+        Ok(Box::pin(stream::iter([
+            Ok(ModelStreamEvent {
+                request_id: request_id.clone(),
+                event_id: ModelEventId::new("prepared-recovery-answer"),
+                sequence: 1,
+                payload: ModelEvent::TextDelta {
+                    delta: "prepared recovery completed".to_owned(),
+                },
+            }),
+            Ok(ModelStreamEvent {
+                request_id,
+                event_id: ModelEventId::new("prepared-recovery-finish"),
+                sequence: 2,
+                payload: ModelEvent::Finish {
+                    reason: ModelFinishReason::Stop,
+                },
+            }),
+        ])))
     }
 }
 
@@ -1493,9 +1574,158 @@ async fn open_model_attempt_is_never_restarted_from_the_private_wal() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepared_private_wal_recovers_initial_input_after_confirmation() {
+    let run_id = RunId::new("prepared-recovery-run");
+    let session_id = AgentSessionId::new("prepared-recovery-session");
+    let checkpoint_store = Arc::new(PausingCheckpointStore::at(
+        CheckpointCrashCut::InitialBoundary,
+    ));
+    let session_journal = Arc::new(InMemoryAgentSessionJournalStore::default());
+    let starts = Arc::new(AtomicUsize::new(0));
+    let config = GenericAgentConfig::new("internal-provider", "generic-agent");
+    let first = Arc::new(
+        InternalGenericAgentProvider::new_with_session_journal(
+            Arc::new(PreparedRecoveryModel {
+                starts: starts.clone(),
+            }),
+            config.clone(),
+            session_journal.clone(),
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+        .expect("first Generic Agent starts")
+        .with_checkpoint_store(checkpoint_store.clone())
+        .expect("private WAL binds before the Provider is shared"),
+    );
+    let descriptor = first.describe();
+    let request = AgentStartRequest::new(
+        AgentRunEnvelope::new(
+            AGENT_PROTOCOL_V1,
+            session_id.clone(),
+            run_id.clone(),
+            vec![Content::text("recover the registered initial input")],
+        )
+        .expect("valid prepared-recovery Run"),
+        ProviderBindingRef::new("prepared-recovery-binding"),
+        &descriptor,
+    )
+    .expect("valid prepared-recovery start request");
+
+    let paused = checkpoint_store.paused.notified();
+    let first_for_start = first.clone();
+    let request_for_start = request.clone();
+    let start_task = tokio::spawn(async move { first_for_start.start(request_for_start).await });
+    tokio::time::timeout(std::time::Duration::from_secs(1), paused)
+        .await
+        .expect("initial loop boundary reaches the injected crash cut");
+    assert_eq!(
+        checkpoint_store
+            .load_run(&run_id)
+            .expect("private WAL remains readable")
+            .expect("Run registration is durable")
+            .validate()
+            .expect("registered WAL is valid")
+            .phase,
+        GenericCheckpointPhase::Prepared
+    );
+    assert_eq!(starts.load(Ordering::SeqCst), 0);
+
+    checkpoint_store.release_as_crash();
+    let started = start_task
+        .await
+        .expect("first Provider task joins")
+        .expect("admission outcome remains available after the crash cut");
+    let execution = started.execution.clone();
+    let mut first_stream = started.stream;
+    let stream_error = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            match first_stream.next().await {
+                Some(Err(error)) => break error,
+                Some(Ok(_)) => {}
+                None => panic!("simulated Provider loss must be explicit"),
+            }
+        }
+    })
+    .await
+    .expect("simulated Provider loss reaches the stream");
+    assert_eq!(
+        stream_error.code,
+        AgentProtocolErrorCode::ProviderUnavailable
+    );
+    drop(first);
+    checkpoint_store.allow_recovery_writes();
+
+    let replacement = InternalGenericAgentProvider::new_with_session_journal(
+        Arc::new(PreparedRecoveryModel {
+            starts: starts.clone(),
+        }),
+        config,
+        session_journal.clone(),
+        Arc::new(JsonSizeTokenMeter::default()),
+    )
+    .expect("replacement Generic Agent starts")
+    .with_checkpoint_store(checkpoint_store.clone())
+    .expect("replacement Provider binds the same private WAL");
+    let recovery = replacement
+        .recover(
+            AgentRecoveryRequest::new(request, execution, &descriptor)
+                .expect("recovery identity is valid"),
+        )
+        .await
+        .expect("Prepared Run is safe to reconstruct");
+    let (mut recovered_stream, confirmation) = recovery.into_parts();
+    assert_eq!(starts.load(Ordering::SeqCst), 0);
+    confirmation
+        .await
+        .expect("Host confirmation opens the reconstructed execution");
+
+    let terminal = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            match recovered_stream.next().await {
+                Some(Ok(AgentProviderStreamItem::Event(event)))
+                    if matches!(&event.payload, AgentEvent::DeliveryCommitted { .. }) =>
+                {
+                    break *event;
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => panic!("recovered stream failed: {error}"),
+                None => panic!("recovered stream ended before Delivery"),
+            }
+        }
+    })
+    .await
+    .expect("Prepared recovery reaches Delivery");
+    assert!(matches!(
+        terminal.payload,
+        AgentEvent::DeliveryCommitted { .. }
+    ));
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        checkpoint_store
+            .load_run(&run_id)
+            .expect("private WAL remains readable")
+            .expect("recovered Run remains registered")
+            .validate()
+            .expect("recovered WAL is valid")
+            .phase,
+        GenericCheckpointPhase::Terminal
+    );
+    let input_events = session_journal
+        .load_session(&session_id)
+        .await
+        .expect("Session Journal remains readable")
+        .into_iter()
+        .filter(|record| {
+            record.run_id == run_id
+                && matches!(&record.payload, AgentSessionEvent::RunInputCommitted { .. })
+        })
+        .count();
+    assert_eq!(input_events, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stable_private_boundary_resumes_only_after_host_restores_continuity() {
     let run_id = RunId::new("stable-recovery-run");
-    let checkpoint_store = Arc::new(PausingModelAttemptCheckpointStore::default());
+    let checkpoint_store = Arc::new(PausingCheckpointStore::at(CheckpointCrashCut::ModelAttempt));
     let session_journal = Arc::new(InMemoryAgentSessionJournalStore::default());
     let host_journal = Arc::new(InMemoryAgentJournalStore::default());
     let config = GenericAgentConfig::new("internal-provider", "generic-agent");
@@ -1622,7 +1852,7 @@ async fn stable_private_boundary_resumes_only_after_host_restores_continuity() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn private_wal_recovery_is_bound_to_model_and_tool_authority() {
     let run_id = RunId::new("recovery-authority-run");
-    let checkpoint_store = Arc::new(PausingModelAttemptCheckpointStore::default());
+    let checkpoint_store = Arc::new(PausingCheckpointStore::at(CheckpointCrashCut::ModelAttempt));
     let session_journal = Arc::new(InMemoryAgentSessionJournalStore::default());
     let config = GenericAgentConfig::new("internal-provider", "generic-agent");
     let base_bounds = ToolPolicyBounds {
