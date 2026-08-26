@@ -1,138 +1,117 @@
 # Orchestral
 
-面向 grounded agent 的流程编排运行时。
+一个 AI 中立、可安全执行、可持久恢复、可交互的单 Agent 运行时。
 
 [English Version](./README.md)
 
-## 它能做什么
+> 当前状态：Agent Foundation 仍在持续实现。本阶段只完成完整的单 Agent 协议与运行时，
+> 不包含 Goal Compiler、Task Broker 或多 Agent 编排。
 
-- 重点是有状态的流程编排，不是单次 tool calling
-- 用 `agent loop` + `mini-DAG` 执行 typed actions
-- 基于真实状态重规划，并在结束前校验结果
+## 当前已经具备什么
 
-## 看它怎么跑
+- **Agent Protocol v1**：版本化 Run/Session 合同、Command、持久事件、Inspect、Cancel、
+  Recovery，以及唯一终态投影。
+- **Generic Agent**：CLI、SDK、API 共用同一套 AI 中立的
+  `Model → Tool/Workflow → Model` 循环。
+- **模型适配器**：OpenAI-compatible 与 Gemini Native 统一实现 `ModelBackend` 合同。
+- **Guarded Tool Runtime**：Host 持有权限策略、审批 capability、取消、Effect Journal、
+  Artifact spill，并对 `UnknownEffect` 保守停机。
+- **两套独立扩展面**：Skill 只把受信任指令加入 Context；MCP Tool 只进入 Action Plane，
+  且必须经过统一 Guarded Runtime。
+- **可选 Workflow 策略**：复杂调用复用类型化 Plan Normalizer、DAG 和 Executor；Workflow
+  从属于 Agent Run，不能产生第二个顶层终态。
+- **持久上下文**：Run、Session、Tool Effect、Generic Agent checkpoint 都可使用文件插件，
+  并支持进程替换后的恢复。
 
-一条用户指令，Orchestral 协调 MCP 数据源、领域 Skill 和 shell 执行，串成多步管道：
-
-```
-用户: "从 API 查询 Q4 销售数据，用实际数字和公式填充 Excel 模板，
-       再写一份 markdown 摘要对比预算。"
-
-Orchestral 自动执行:
-  ├─ mcp__sales-api__query_sales_data  → 从外部 API 获取实际销售额
-  ├─ file_read budget.yaml             → 读取预算目标
-  ├─ shell (venv python + openpyxl)    → 填充 Excel：数值、公式、状态
-  └─ file_write report.md              → 生成对比报告
-```
-
-Planner 在启动时通过 `tool_lookup` 自动发现 MCP tools，激活 `xlsx` skill 获取 openpyxl 操作指引，并使用 skill 的虚拟环境运行 Python。当某一步失败时，agent loop 观察错误并重新规划 — 无需人工介入。
-
-**试一下：**
-
-```bash
-export OPENROUTER_API_KEY="sk-or-..."
-cargo build -p orchestral-cli
-cargo run -p orchestral-cli -- scenario \
-  --spec configs/scenarios/tier2/e2e_pipeline.yaml
-```
-
-## 架构
-
-```
-Intent → Planner (LLM) → Normalizer (DAG 校验) → Executor (并行 + 重试)
-            ↑                                              ↓
-            └──── agent loop: 观察执行结果 ────────────────┘
-```
-
-- **Agent loop** — planner 最多迭代 6 轮，观察结果后重新规划
-- **MCP 集成** — 启动时探测 server，每个 tool 注册为独立 action，通过 `tool_lookup` 延迟加载 schema
-- **Skill 系统** — SKILL.md 自动发现并注入 planner 上下文；`skill_activate` 支持按需加载
-- **类型化 action** — 文档 inspect/patch/verify、结构化配置 patch/verify、shell、文件读写、HTTP
-
-## SDK
-
-把 Orchestral 当库用 — 注册自定义 action 和生命周期钩子：
-
-```rust
-use orchestral::{Orchestral, core::action::*};
-
-let app = Orchestral::builder()
-    .action(MyCustomAction::new())
-    .hook(MyLoggingHook::new())
-    .planner_backend("openrouter")
-    .planner_model("anthropic/claude-sonnet-4.5")
-    .build()
-    .await?;
-
-let result = app.run("分析数据并生成报告").await?;
-println!("{}", result.message);
-```
-
-参考 [`examples/sdk_quickstart.rs`](examples/sdk_quickstart.rs) 和 [`examples/sdk_hooks.rs`](examples/sdk_hooks.rs)。
-
-## 安装
-
-```bash
-# 作为库使用
-cargo add orchestral
-
-# 安装 CLI 工具
-cargo install orchestral-cli
+```text
+CLI / SDK / API
+      │
+      ▼
+AgentController ── Agent Protocol + 持久 Run Journal
+      │
+      ▼
+Generic Agent ─── ModelBackend + 持久 Session Context
+      │
+      ├── 直接 Tool ────────────────┐
+      └── Workflow → Plan/DAG/Step ─┤
+                                    ▼
+                         GuardedToolRuntime
+                           ├── 内置 Tools
+                           └── MCP stdio Tools
 ```
 
 ## 快速开始
 
-导出一个模型密钥：
+导出任意一个已配置模型的密钥：
 
 ```bash
-export GOOGLE_API_KEY="..."  # 或 OPENAI_API_KEY、ANTHROPIC_API_KEY、OPENROUTER_API_KEY
+export OPENAI_API_KEY="..."
+# 或 GOOGLE_API_KEY / OPENROUTER_API_KEY / DEEPSEEK_API_KEY
 ```
 
-CLI：
+执行单轮任务：
+
 ```bash
-orchestral-cli run
+cargo run -p orchestral-cli -- run "总结这个仓库的公共 API"
 ```
 
-作为库使用：
-```rust
-let app = Orchestral::builder()
-    .planner_backend("google")
-    .planner_model("gemini-2.5-flash")
-    .build().await?;
-let result = app.run("读取 README.md").await?;
+进入交互式 Agent Session：
+
+```bash
+cargo run -p orchestral-cli -- run
 ```
+
+CLI 默认发现 `configs/orchestral.cli.yaml`。可以用 `--config`、`--backend`、
+`--model-profile` 或 `--model` 显式选择；`--session-id` 为多轮对话提供稳定、持久的
+Session 身份；`--no-mcp` 和 `--no-skills` 可分别关闭两套扩展面。
+
+默认 Host 策略使用显式进程白名单，不把宿主环境变量自动传给 Tool，并关闭网络访问；
+模型可见参数无法扩大这些权限。
+
+## SDK
+
+公共 SDK 就是 Agent 控制面：`AgentClient` 启动 Run，`AgentRunHandle` 提供事件订阅、
+Inspect、Command、输入恢复、Steer、Cancel 和终态等待，不再暴露旧 Planner Loop。
+
+运行完整的 AI 中立示例：
+
+```bash
+cargo run -p orchestral-examples --example agent_session
+```
+
+最小组合方式见 [`examples/agent_session.rs`](examples/agent_session.rs)：它把
+`ModelBackend`、`InternalGenericAgentProvider`、`AgentController` 与 `AgentClient` 连接起来。
 
 ## 项目结构
 
-```
-core/orchestral-core     — 纯抽象：Intent/Plan/Step、trait 定义、DAG 执行器
-core/orchestral-runtime  — LLM planner、action 实现、MCP 桥接、skill 系统
-core/orchestral          — 对外门面，re-export core + runtime
-apps/orchestral-cli      — CLI + TUI (ratatui)
-apps/orchestral-telegram — Telegram 机器人适配器
+```text
+core/orchestral-core      Agent/Model/Tool/Skill/MCP 合同与确定性 Plan/DAG 内核
+core/orchestral-runtime   Agent 控制面、Generic Agent、Context、Guarded Tool、Workflow 桥接
+core/orchestral           对外 re-export core/runtime 公共 API 的 facade
+plugins/                  文件 Journal/Blob Store 与具体模型 Adapter
+apps/orchestral-cli       对话式 CLI composition root
+examples/                 可运行的 Agent Session 示例
+testing/                  协议一致性与属性测试 harness
 ```
 
-## Telegram 机器人
+具体基础设施实现放在 `plugins/`，由应用层 composition root 装配；core/runtime 只依赖合同。
 
-把 Orchestral 作为 Telegram 机器人运行 — 每条消息都经过完整的编排管道：
+## 开发
 
 ```bash
-export TELEGRAM_BOT_TOKEN="你的 bot token"
-export GOOGLE_API_KEY="你的 key"  # 或 OPENAI_API_KEY、ANTHROPIC_API_KEY 等
-cargo run -p orchestral-telegram
+cargo build --workspace
+cargo test --workspace --all-targets
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-LLM 后端可在代码中配置（默认 Google Gemini）。支持文件操作、shell 命令和多轮对话。
+## 当前边界
 
-## 当前状态
-
-- 核心编排循环已跑通：agent loop + mini-DAG
-- MCP per-tool 注册 + 延迟 schema 加载
-- Skill 自动发现 + 按需激活
-- SDK：builder API + 生命周期钩子 + 程序化执行
-- Telegram 机器人适配器（可配置 LLM 后端）
-- 文档和结构化配置的类型化管道
-- 场景 smoke 测试覆盖核心工作流
+- 当前不是 Goal Compiler、Task Broker 或多 Agent Scheduler。
+- `DeliveryCommitted` 只表示 Agent 已交付输出，不代表外部目标已经被独立满足或验证。
+- MCP stdio Tool 已走统一 Guarded Action 路径；Streamable HTTP 与剩余量化安全/恢复 gate
+  尚未达到发布完成标准。
+- 类型化 Plan/DAG 是单 Agent 内部的可选执行策略，不是产品顶层入口。
 
 ## 许可证
 
