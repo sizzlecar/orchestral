@@ -6,21 +6,23 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use orchestral_core::agent_protocol::wire::RunId;
+use orchestral_core::agent_protocol::wire::{Digest, RunId};
 use orchestral_core::executor::{
     ExecutionDag, ExecutionProgressReporter, ExecutionResult, Executor, ExecutorContext,
     StepExecutionPort, StepExecutionRequest, StepOutcome,
 };
 use orchestral_core::normalizer::{NormalizeError, PlanNormalizer};
 use orchestral_core::spi::{HookRegistry, RuntimeHookContext, RuntimeHookEventEnvelope, SpiMeta};
+use orchestral_core::tool_effect::{ToolEffectKey, ToolEffectPhase};
 use orchestral_core::tool_protocol::{
     RunToolGrant, ToolCallId, ToolInvocation, ToolOutcome, ToolOutput,
 };
-use orchestral_core::types::{Plan, StepKind, WorkflowId};
+use orchestral_core::types::{Plan, StepId, StepKind, WorkflowId};
 use orchestral_core::workflow_state::WorkingSet;
+use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -28,6 +30,8 @@ use tokio_util::sync::CancellationToken;
 use crate::tool_runtime::{AgentToolRuntime, GuardedToolResult};
 
 const DEFAULT_MAX_WORKFLOW_TOOL_CALLS: u64 = 32;
+const WORKFLOW_RECOVERY_CONTRACT_VERSION: &str = "workflow-recovery/v1";
+const WORKFLOW_STEP_CALL_ID_VERSION: &str = "workflow-step-call/v1";
 
 /// One invocation of the workflow execution strategy.
 pub struct WorkflowExecutionRequest {
@@ -41,6 +45,10 @@ pub struct WorkflowExecutionRequest {
     pub progress_reporter: Option<Arc<dyn ExecutionProgressReporter>>,
     /// Optional Run-specific cap. The strategy's Host cap still wins.
     pub max_tool_calls: Option<u64>,
+    /// Re-enter an already fenced Workflow using only durable Tool outcomes.
+    /// The strategy performs a global unresolved-effect preflight before any
+    /// new Step is dispatched.
+    pub recovery_replay: bool,
 }
 
 impl WorkflowExecutionRequest {
@@ -59,6 +67,7 @@ impl WorkflowExecutionRequest {
             cancellation: CancellationToken::new(),
             progress_reporter: None,
             max_tool_calls: None,
+            recovery_replay: false,
         }
     }
 
@@ -84,12 +93,18 @@ impl WorkflowExecutionRequest {
         self.max_tool_calls = Some(max_tool_calls);
         self
     }
+
+    pub fn with_recovery_replay(mut self) -> Self {
+        self.recovery_replay = true;
+        self
+    }
 }
 
 /// Result of one normalized DAG execution.
 ///
 /// The caller remains the Agent Run owner and decides how to journal or expose
 /// this snapshot. The legacy `Task` type is not made authoritative here.
+#[derive(Debug)]
 pub struct WorkflowExecutionSnapshot {
     pub result: ExecutionResult,
     pub normalized_plan: Plan,
@@ -158,6 +173,17 @@ pub enum WorkflowExecutionError {
     Normalize(#[from] NormalizeError),
     #[error("invalid workflow execution request: {0}")]
     InvalidRequest(String),
+    #[error("workflow recovery is not supported by this execution contract: {0}")]
+    RecoveryUnsupported(String),
+    #[error("workflow recovery state is inconsistent: {0}")]
+    RecoveryState(String),
+    #[error("workflow recovery is blocked by an unknown Tool effect {call_id}: {message}")]
+    UnknownEffect {
+        call_id: ToolCallId,
+        message: String,
+    },
+    #[error("workflow Tool effect inspection failed: {0}")]
+    EffectInspection(String),
 }
 
 /// Thin strategy around the original normalizer and DAG executor.
@@ -201,9 +227,23 @@ impl WorkflowExecutionStrategy {
 
     pub(crate) fn recovery_contract(&self) -> serde_json::Value {
         serde_json::json!({
+            "version": WORKFLOW_RECOVERY_CONTRACT_VERSION,
+            "step_call_identity": WORKFLOW_STEP_CALL_ID_VERSION,
             "max_tool_calls": self.max_tool_calls,
             "hooks_enabled": self.hooks.is_some(),
+            "normalizer": self.normalizer.deterministic_contract(),
+            "executor": {
+                "max_parallel": self.executor.max_parallel,
+                "max_retry_attempts": self.executor.max_retry_attempts,
+                "retry_base_delay_nanos": self.executor.retry_base_delay.as_nanos().to_string(),
+                "retry_max_delay_nanos": self.executor.retry_max_delay.as_nanos().to_string(),
+                "strict_exports": self.executor.strict_exports,
+            },
         })
+    }
+
+    pub(crate) fn supports_recovery_replay(&self) -> bool {
+        self.hooks.is_none() && self.normalizer.deterministic_contract().is_some()
     }
 
     pub async fn execute(
@@ -246,7 +286,23 @@ impl WorkflowExecutionStrategy {
             .unwrap_or(self.max_tool_calls)
             .min(self.max_tool_calls);
         let normalized = self.normalizer.normalize(request.plan)?;
+        let plan_digest = workflow_plan_digest(&normalized.plan)?;
         let mut dag = normalized.dag;
+        if request.recovery_replay {
+            if !self.supports_recovery_replay() {
+                return Err(WorkflowExecutionError::RecoveryUnsupported(
+                    "custom normalizer rules or lifecycle hooks have no durable replay identity"
+                        .to_owned(),
+                ));
+            }
+            self.preflight_recovery_effects(
+                &request.run_id,
+                &request.workflow_id,
+                &normalized.plan,
+                &plan_digest,
+            )
+            .await?;
+        }
         let working_set = Arc::new(RwLock::new(request.working_set));
         let port = Arc::new(RunBoundGuardedToolPort::new(
             request.run_id,
@@ -254,11 +310,36 @@ impl WorkflowExecutionStrategy {
             self.tools.clone(),
             self.hooks.clone(),
             effective_tool_limit,
+            plan_digest,
         ));
         let context = ExecutorContext::new(request.workflow_id, working_set.clone(), port.clone())
             .with_cancellation_token(request.cancellation)
             .with_progress_reporter(progress_reporter);
-        let result = self.executor.execute(&mut dag, &context).await;
+        // When the budget could bind, serialize the otherwise sorted ready
+        // frontier so the accepted logical calls do not depend on task races.
+        let maximum_logical_calls = (normalized.plan.steps.len() as u64)
+            .saturating_mul(u64::from(self.executor.max_retry_attempts).saturating_add(1));
+        let max_parallel = if effective_tool_limit < maximum_logical_calls {
+            1
+        } else {
+            self.executor.max_parallel
+        };
+        let executor = Executor {
+            max_parallel,
+            max_retry_attempts: self.executor.max_retry_attempts,
+            retry_base_delay: self.executor.retry_base_delay,
+            retry_max_delay: self.executor.retry_max_delay,
+            strict_exports: self.executor.strict_exports,
+        };
+        let result = executor.execute(&mut dag, &context).await;
+        if let Some(message) = port.unknown_effect() {
+            return Err(WorkflowExecutionError::UnknownEffect {
+                call_id: port
+                    .unknown_call_id()
+                    .expect("unknown effect always records its call identity"),
+                message,
+            });
+        }
         let working_set = working_set.read().await.export_workflow_data();
 
         Ok(WorkflowExecutionSnapshot {
@@ -270,6 +351,105 @@ impl WorkflowExecutionStrategy {
             tool_calls: port.tool_calls(),
         })
     }
+
+    async fn preflight_recovery_effects(
+        &self,
+        run_id: &RunId,
+        workflow_id: &WorkflowId,
+        plan: &Plan,
+        plan_digest: &Digest,
+    ) -> Result<(), WorkflowExecutionError> {
+        let mut step_ids = plan
+            .steps
+            .iter()
+            .map(|step| step.id.clone())
+            .collect::<Vec<_>>();
+        step_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        for step_id in step_ids {
+            let mut prior_attempt_allows_retry = true;
+            let mut saw_gap = false;
+            for attempt in 1..=self.executor.max_retry_attempts.saturating_add(1) {
+                let call_id =
+                    workflow_step_call_id(run_id, workflow_id, plan_digest, &step_id, attempt);
+                let key = ToolEffectKey::new(run_id.clone(), call_id.clone());
+                let projection =
+                    self.tools.inspect_effect(&key).await.map_err(|error| {
+                        WorkflowExecutionError::EffectInspection(error.to_string())
+                    })?;
+                let Some(projection) = projection else {
+                    saw_gap = true;
+                    continue;
+                };
+                if saw_gap || !prior_attempt_allows_retry {
+                    return Err(WorkflowExecutionError::RecoveryState(format!(
+                        "Step {} has a non-contiguous durable retry attempt {}",
+                        step_id, attempt
+                    )));
+                }
+                prior_attempt_allows_retry = match projection.phase {
+                    ToolEffectPhase::Invoked { .. } => {
+                        return Err(WorkflowExecutionError::UnknownEffect {
+                            call_id,
+                            message: "durable invocation has no observation".to_owned(),
+                        })
+                    }
+                    ToolEffectPhase::UnknownEffect { reason, .. } => {
+                        return Err(WorkflowExecutionError::UnknownEffect {
+                            call_id,
+                            message: reason,
+                        })
+                    }
+                    ToolEffectPhase::Prepared => false,
+                    ToolEffectPhase::Observed { outcome, .. }
+                    | ToolEffectPhase::Committed { outcome, .. } => matches!(
+                        outcome,
+                        ToolOutcome::Failed {
+                            retryable: true,
+                            ..
+                        }
+                    ),
+                };
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+struct WorkflowStepCallIdentity<'a> {
+    version: &'static str,
+    run_id: &'a str,
+    workflow_id: &'a str,
+    plan_digest: &'a str,
+    step_id: &'a str,
+    attempt: u32,
+}
+
+/// Stable Tool call identity for one logical Workflow Step attempt.
+pub fn workflow_step_call_id(
+    run_id: &RunId,
+    workflow_id: &WorkflowId,
+    plan_digest: &Digest,
+    step_id: &StepId,
+    attempt: u32,
+) -> ToolCallId {
+    let bytes = serde_jcs::to_vec(&WorkflowStepCallIdentity {
+        version: WORKFLOW_STEP_CALL_ID_VERSION,
+        run_id: run_id.as_str(),
+        workflow_id: workflow_id.as_str(),
+        plan_digest: plan_digest.as_str(),
+        step_id: step_id.as_str(),
+        attempt,
+    })
+    .expect("Workflow Step call identity contains only finite scalar values");
+    ToolCallId::new(format!("workflow-step:{}", Digest::sha256(bytes).as_str()))
+}
+
+/// Canonical identity of the normalized Plan bound to all Step call IDs.
+pub fn workflow_plan_digest(plan: &Plan) -> Result<Digest, WorkflowExecutionError> {
+    serde_jcs::to_vec(plan)
+        .map(Digest::sha256)
+        .map_err(|error| WorkflowExecutionError::InvalidRequest(error.to_string()))
 }
 
 /// Run-bound adapter from normalized DAG Steps to the guarded Tool boundary.
@@ -282,7 +462,9 @@ pub struct RunBoundGuardedToolPort {
     tools: Arc<dyn AgentToolRuntime>,
     hooks: Option<Arc<HookRegistry>>,
     max_tool_calls: u64,
+    plan_digest: Digest,
     tool_calls: AtomicU64,
+    unknown_effect: OnceLock<(ToolCallId, String)>,
 }
 
 impl RunBoundGuardedToolPort {
@@ -292,6 +474,7 @@ impl RunBoundGuardedToolPort {
         tools: Arc<dyn AgentToolRuntime>,
         hooks: Option<Arc<HookRegistry>>,
         max_tool_calls: u64,
+        plan_digest: Digest,
     ) -> Self {
         Self {
             run_id,
@@ -299,7 +482,9 @@ impl RunBoundGuardedToolPort {
             tools,
             hooks,
             max_tool_calls,
+            plan_digest,
             tool_calls: AtomicU64::new(0),
+            unknown_effect: OnceLock::new(),
         }
     }
 
@@ -313,6 +498,18 @@ impl RunBoundGuardedToolPort {
                 (current < self.max_tool_calls).then_some(current + 1)
             })
             .is_ok()
+    }
+
+    fn unknown_effect(&self) -> Option<String> {
+        self.unknown_effect
+            .get()
+            .map(|(_, message)| message.clone())
+    }
+
+    fn unknown_call_id(&self) -> Option<ToolCallId> {
+        self.unknown_effect
+            .get()
+            .map(|(call_id, _)| call_id.clone())
     }
 }
 
@@ -337,6 +534,9 @@ impl StepExecutionPort for RunBoundGuardedToolPort {
         }
 
         let mut result = self.execute_guarded_step(&request, context).await;
+        if self.unknown_effect.get().is_some() {
+            return result;
+        }
         if let Err(error) = self
             .dispatch_step_hook(
                 "after_step",
@@ -392,15 +592,19 @@ impl RunBoundGuardedToolPort {
                 )
             }
         };
+        let call_id = workflow_step_call_id(
+            &self.run_id,
+            &context.workflow_id,
+            &self.plan_digest,
+            &request.step_id,
+            request.attempt,
+        );
         let result = self
             .tools
             .invoke(
                 ToolInvocation {
                     run_id: self.run_id.clone(),
-                    call_id: ToolCallId::new(format!(
-                        "workflow:{}:{}",
-                        request.step_id, request.execution_id
-                    )),
+                    call_id: call_id.clone(),
                     tool_id,
                     arguments: request.resolved_params.clone(),
                 },
@@ -454,7 +658,10 @@ impl RunBoundGuardedToolPort {
             GuardedToolResult::Outcome {
                 outcome: ToolOutcome::UnknownEffect { message },
                 ..
-            } => StepOutcome::error(format!("workflow Tool effect is unknown: {message}")),
+            } => {
+                let _ = self.unknown_effect.set((call_id, message.clone()));
+                StepOutcome::error(format!("workflow Tool effect is unknown: {message}"))
+            }
             GuardedToolResult::Outcome { .. } => {
                 StepOutcome::error("unsupported Tool outcome returned by Tool Runtime")
             }
@@ -505,6 +712,7 @@ impl RunBoundGuardedToolPort {
                         "workflow_id": context.workflow_id.as_str(),
                         "step_id": request.step_id.as_str(),
                         "execution_id": request.execution_id,
+                        "attempt": request.attempt,
                         "action": request.action,
                         "detail": payload,
                     }),

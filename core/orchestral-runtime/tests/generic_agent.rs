@@ -4361,7 +4361,7 @@ async fn observed_workflow_starts_once_after_recovery() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn durable_workflow_start_fence_never_reruns_an_unknown_dag() {
+async fn durable_workflow_start_fence_replays_only_after_global_effect_preflight() {
     let run_id = RunId::new("workflow-start-fence-run");
     let checkpoint_store = Arc::new(AckLostAfterWorkflowStartCheckpointStore::default());
     let session_journal = Arc::new(InMemoryAgentSessionJournalStore::default());
@@ -4466,10 +4466,17 @@ async fn durable_workflow_start_fence_never_reruns_an_unknown_dag() {
         )
         .expect("replacement fenced Workflow controller binds"),
     );
-    let recovery = replacement_controller.recover(&run_id).await;
-    assert!(recovery.is_err());
-    assert_eq!(echo.calls.load(Ordering::SeqCst), 0);
-    assert_eq!(replacement_model.rounds.load(Ordering::SeqCst), 1);
+    replacement_controller
+        .recover(&run_id)
+        .await
+        .expect("fenced Workflow with no unresolved effect is recoverable");
+    let view = replacement_controller
+        .wait_for_terminal(&run_id)
+        .await
+        .expect("recovered fenced Workflow delivers");
+    assert_eq!(view.state.status(), AgentRunStatus::Delivered);
+    assert_eq!(echo.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(replacement_model.rounds.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -175,8 +175,16 @@ impl Executor {
             }
         }
 
-        let mut terminal_result: Option<ExecutionResult> = None;
+        let mut completed = Vec::new();
         while let Some((step_id, step, result)) = in_flight.next().await {
+            completed.push((step_id, step, result));
+        }
+        // Futures may complete in any order. Apply their state transitions in
+        // logical Step order so WorkingSet collisions, progress, and terminal
+        // selection replay deterministically.
+        completed.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut terminal_result: Option<ExecutionResult> = None;
+        for (step_id, step, result) in completed {
             self.process_step_result(dag, step_id, step, result, ctx, &mut terminal_result)
                 .await;
         }
@@ -312,8 +320,9 @@ impl Executor {
         let mut current_execution_id = execution_id.to_string();
 
         loop {
+            let attempt = retries_used.saturating_add(1);
             let result = self
-                .execute_step_data(step, &current_execution_id, ctx)
+                .execute_step_data(step, &current_execution_id, attempt, ctx)
                 .await;
             let StepOutcome::RetryableError {
                 message,
@@ -388,6 +397,7 @@ impl Executor {
         &self,
         step: &Step,
         execution_id: &str,
+        attempt: u32,
         ctx: &ExecutorContext,
     ) -> StepOutcome {
         if tracing::enabled!(tracing::Level::DEBUG) {
@@ -459,6 +469,7 @@ impl Executor {
                     step_kind: step.kind.clone(),
                     action: step.action.clone(),
                     execution_id: execution_id.to_string(),
+                    attempt,
                     resolved_params,
                 },
                 ctx,

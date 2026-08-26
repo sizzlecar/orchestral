@@ -25,6 +25,12 @@ pub struct StepExecutionRequest {
     pub action: String,
     /// Identity of this concrete attempt, stable for the duration of the call.
     pub execution_id: String,
+    /// One-based logical attempt number for this Step.
+    ///
+    /// Unlike `execution_id`, this value is stable when the same normalized
+    /// workflow is replayed. Effect mediators can therefore derive a durable
+    /// idempotency identity without depending on scheduler-local UUIDs.
+    pub attempt: u32,
     /// Parameters after WorkingSet bindings and templates have been resolved.
     pub resolved_params: Value,
 }

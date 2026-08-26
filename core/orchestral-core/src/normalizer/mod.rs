@@ -125,6 +125,26 @@ impl PlanNormalizer {
         self.known_actions.entry(name).or_default();
     }
 
+    /// Returns the immutable contract required to replay normalization after
+    /// a process restart.
+    ///
+    /// Custom trait-object validators and fixers have no stable identity in
+    /// v1, so a normalizer containing either is intentionally not replayable.
+    pub fn deterministic_contract(&self) -> Option<serde_json::Value> {
+        if !self.validators.is_empty() || !self.fixers.is_empty() {
+            return None;
+        }
+        let actions = self
+            .known_actions
+            .iter()
+            .map(|(name, contract)| (name.clone(), contract.output_keys.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        Some(serde_json::json!({
+            "version": "plan-normalizer/v1",
+            "known_actions": actions,
+        }))
+    }
+
     /// Normalize a plan
     pub fn normalize(&self, mut plan: Plan) -> Result<NormalizedPlan, NormalizeError> {
         let mut fix_summary: Vec<String> = Vec::new();

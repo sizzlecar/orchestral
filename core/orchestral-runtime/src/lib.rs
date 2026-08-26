@@ -56,8 +56,8 @@ pub use tools::{
     McpToolsAdapterRegistry,
 };
 pub use workflow_strategy::{
-    RunBoundGuardedToolPort, WorkflowExecutionError, WorkflowExecutionRequest,
-    WorkflowExecutionSnapshot, WorkflowExecutionStrategy,
+    workflow_plan_digest, workflow_step_call_id, RunBoundGuardedToolPort, WorkflowExecutionError,
+    WorkflowExecutionRequest, WorkflowExecutionSnapshot, WorkflowExecutionStrategy,
 };
 
 // Re-export core types for convenience

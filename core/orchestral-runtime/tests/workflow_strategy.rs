@@ -8,17 +8,23 @@ use orchestral_core::executor::{
     ExecutionProgressEvent, ExecutionProgressReporter, ExecutionResult, Executor,
 };
 use orchestral_core::normalizer::PlanNormalizer;
+use orchestral_core::tool_effect::{
+    InMemoryToolEffectJournalStore, PreparedToolEffect, ToolAuthorizationEvidence,
+    ToolEffectAttemptId, ToolEffectEvent, ToolEffectEventDraft, ToolEffectEventId,
+    ToolEffectJournalStore, ToolEffectKey,
+};
 use orchestral_core::tool_protocol::{
-    ApprovalPolicy, EffectScope, EnvironmentPolicy, FilesystemPolicy, HostApprovalVerifier,
-    HostToolPolicy, InMemoryApprovalCapabilityStore, ModelToolSchema, NetworkPolicy, ProcessPolicy,
-    RunToolGrant, SandboxPolicy, ToolConcurrency, ToolDescriptor, ToolId, ToolIdempotency,
-    ToolOutcome, ToolPolicyBounds, ToolRestriction,
+    ApprovalPolicy, EffectScope, EffectiveToolPolicy, EnvironmentPolicy, FilesystemPolicy,
+    HostApprovalVerifier, HostToolPolicy, InMemoryApprovalCapabilityStore, ModelToolSchema,
+    NetworkPolicy, ProcessPolicy, RunToolGrant, SandboxPolicy, ToolConcurrency, ToolDescriptor,
+    ToolId, ToolIdempotency, ToolInvocation, ToolOutcome, ToolPolicyBounds, ToolRestriction,
 };
 use orchestral_core::types::{Plan, Step, WorkflowId};
 use orchestral_runtime::{
-    GuardedToolExecution, GuardedToolExecutor, GuardedToolRuntime, HookDispatchMode, HookError,
-    HookExecutionPolicy, HookFailurePolicy, HookRegistry, RuntimeHook, RuntimeHookContext,
-    RuntimeHookEventEnvelope, WorkflowExecutionRequest, WorkflowExecutionStrategy,
+    workflow_plan_digest, workflow_step_call_id, GuardedToolExecution, GuardedToolExecutor,
+    GuardedToolRuntime, HookDispatchMode, HookError, HookExecutionPolicy, HookFailurePolicy,
+    HookRegistry, RuntimeHook, RuntimeHookContext, RuntimeHookEventEnvelope,
+    WorkflowExecutionError, WorkflowExecutionRequest, WorkflowExecutionStrategy,
 };
 use serde_json::json;
 
@@ -70,12 +76,33 @@ struct GuardedEcho {
     calls: AtomicUsize,
 }
 
+struct RetryOnceEcho {
+    calls: AtomicUsize,
+}
+
 #[async_trait]
 impl GuardedToolExecutor for GuardedEcho {
     async fn execute(&self, execution: GuardedToolExecution) -> ToolOutcome {
         self.calls.fetch_add(1, Ordering::SeqCst);
         ToolOutcome::Completed {
             output: json!({ "result": execution.invocation.arguments["value"].clone() }).into(),
+        }
+    }
+}
+
+#[async_trait]
+impl GuardedToolExecutor for RetryOnceEcho {
+    async fn execute(&self, execution: GuardedToolExecution) -> ToolOutcome {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            ToolOutcome::Failed {
+                code: "retry_once".to_owned(),
+                message: "retry the logical Step once".to_owned(),
+                retryable: true,
+            }
+        } else {
+            ToolOutcome::Completed {
+                output: json!({ "result": execution.invocation.arguments["value"].clone() }).into(),
+            }
         }
     }
 }
@@ -384,4 +411,290 @@ async fn step_lifecycle_hooks_are_fail_closed_when_configured() {
     ));
     assert_eq!(events, ["before_step", "after_step", "on_step_error"]);
     assert_eq!(calls, 1);
+}
+
+fn durable_echo_runtime(
+    host_bounds: &ToolPolicyBounds,
+    journal: Arc<InMemoryToolEffectJournalStore>,
+    executor: Arc<dyn GuardedToolExecutor>,
+) -> (
+    Arc<GuardedToolRuntime<InMemoryApprovalCapabilityStore>>,
+    ToolDescriptor,
+) {
+    let verifier =
+        HostApprovalVerifier::new(SIGNING_KEY, InMemoryApprovalCapabilityStore::default())
+            .expect("valid signing key");
+    let runtime = Arc::new(
+        GuardedToolRuntime::new_with_effect_journal(
+            HostToolPolicy {
+                bounds: host_bounds.clone(),
+            },
+            verifier,
+            journal,
+        )
+        .expect("durable Tool runtime is valid"),
+    );
+    let descriptor = ToolDescriptor {
+        tool_id: ToolId::new("test/durable-echo"),
+        model_schema: ModelToolSchema {
+            name: "echo".to_owned(),
+            description: "Echo one durable value".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["value"],
+                "properties": { "value": { "type": "string" } },
+                "additionalProperties": false
+            }),
+        },
+        output_schema: json!({
+            "type": "object",
+            "required": ["result"],
+            "properties": { "result": { "type": "string" } },
+            "additionalProperties": false
+        }),
+        effect_scopes: effects(&[EffectScope::Process]),
+        restriction: ToolRestriction {
+            bounds: host_bounds.clone(),
+        },
+        idempotency: ToolIdempotency::IdempotentWithKey,
+        concurrency: ToolConcurrency::ParallelSafe,
+    };
+    runtime
+        .register(descriptor.clone(), executor)
+        .expect("durable echo Tool registers");
+    (runtime, descriptor)
+}
+
+fn durable_workflow_strategy(
+    runtime: Arc<GuardedToolRuntime<InMemoryApprovalCapabilityStore>>,
+) -> WorkflowExecutionStrategy {
+    let mut normalizer = PlanNormalizer::new();
+    normalizer.register_action("echo");
+    WorkflowExecutionStrategy::new(
+        Arc::new(normalizer),
+        Arc::new(Executor::new().with_retry_policy(
+            3,
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+        )),
+        runtime,
+    )
+}
+
+#[tokio::test]
+async fn recovery_replay_reuses_committed_step_effects_with_stable_call_ids() {
+    let host_bounds = bounds(ApprovalPolicy::NotRequired);
+    let journal = Arc::new(InMemoryToolEffectJournalStore::default());
+    let first_executor = Arc::new(GuardedEcho {
+        calls: AtomicUsize::new(0),
+    });
+    let (first_runtime, _) =
+        durable_echo_runtime(&host_bounds, journal.clone(), first_executor.clone());
+    let plan = Plan::new(
+        "durable replay",
+        vec![Step::action("echo-step", "echo")
+            .with_params(json!({ "value": "stable" }))
+            .with_exports(vec!["result".to_owned()])],
+    );
+    let run_id = RunId::new("durable-workflow-run");
+    let workflow_id = WorkflowId::new("durable-workflow");
+    let first = durable_workflow_strategy(first_runtime)
+        .execute(
+            WorkflowExecutionRequest::new(
+                run_id.clone(),
+                workflow_id.clone(),
+                plan.clone(),
+                RunToolGrant {
+                    bounds: host_bounds.clone(),
+                },
+            )
+            .with_progress_reporter(Arc::new(RecordedProgress::default())),
+        )
+        .await
+        .expect("first Workflow execution completes");
+    assert!(matches!(first.result, ExecutionResult::Completed));
+    assert_eq!(first_executor.calls.load(Ordering::SeqCst), 1);
+
+    let replacement_executor = Arc::new(GuardedEcho {
+        calls: AtomicUsize::new(0),
+    });
+    let (replacement_runtime, _) =
+        durable_echo_runtime(&host_bounds, journal, replacement_executor.clone());
+    let replayed = durable_workflow_strategy(replacement_runtime)
+        .execute(
+            WorkflowExecutionRequest::new(
+                run_id,
+                workflow_id,
+                plan,
+                RunToolGrant {
+                    bounds: host_bounds,
+                },
+            )
+            .with_progress_reporter(Arc::new(RecordedProgress::default()))
+            .with_recovery_replay(),
+        )
+        .await
+        .expect("committed Workflow effects replay");
+    assert!(matches!(replayed.result, ExecutionResult::Completed));
+    assert_eq!(replayed.tool_calls, 1);
+    assert_eq!(replacement_executor.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(replayed.working_set.get("result"), Some(&json!("stable")));
+}
+
+#[tokio::test]
+async fn recovery_replay_preserves_logical_retry_attempt_identities() {
+    let host_bounds = bounds(ApprovalPolicy::NotRequired);
+    let journal = Arc::new(InMemoryToolEffectJournalStore::default());
+    let first_executor = Arc::new(RetryOnceEcho {
+        calls: AtomicUsize::new(0),
+    });
+    let (first_runtime, _) =
+        durable_echo_runtime(&host_bounds, journal.clone(), first_executor.clone());
+    let plan = Plan::new(
+        "durable retry replay",
+        vec![Step::action("retry-step", "echo")
+            .with_params(json!({ "value": "after-retry" }))
+            .with_exports(vec!["result".to_owned()])],
+    );
+    let run_id = RunId::new("durable-retry-run");
+    let workflow_id = WorkflowId::new("durable-retry-workflow");
+    let first = durable_workflow_strategy(first_runtime)
+        .execute(
+            WorkflowExecutionRequest::new(
+                run_id.clone(),
+                workflow_id.clone(),
+                plan.clone(),
+                RunToolGrant {
+                    bounds: host_bounds.clone(),
+                },
+            )
+            .with_progress_reporter(Arc::new(RecordedProgress::default())),
+        )
+        .await
+        .expect("retrying Workflow completes");
+    assert!(matches!(first.result, ExecutionResult::Completed));
+    assert_eq!(first.tool_calls, 2);
+    assert_eq!(first_executor.calls.load(Ordering::SeqCst), 2);
+
+    let replacement_executor = Arc::new(GuardedEcho {
+        calls: AtomicUsize::new(0),
+    });
+    let (replacement_runtime, _) =
+        durable_echo_runtime(&host_bounds, journal, replacement_executor.clone());
+    let replayed = durable_workflow_strategy(replacement_runtime)
+        .execute(
+            WorkflowExecutionRequest::new(
+                run_id,
+                workflow_id,
+                plan,
+                RunToolGrant {
+                    bounds: host_bounds,
+                },
+            )
+            .with_progress_reporter(Arc::new(RecordedProgress::default()))
+            .with_recovery_replay(),
+        )
+        .await
+        .expect("both durable retry attempts replay");
+    assert!(matches!(replayed.result, ExecutionResult::Completed));
+    assert_eq!(replayed.tool_calls, 2);
+    assert_eq!(replacement_executor.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        replayed.working_set.get("result"),
+        Some(&json!("after-retry"))
+    );
+}
+
+#[tokio::test]
+async fn recovery_preflight_blocks_all_siblings_when_one_effect_is_unresolved() {
+    let host_bounds = bounds(ApprovalPolicy::NotRequired);
+    let run_grant = RunToolGrant {
+        bounds: host_bounds.clone(),
+    };
+    let journal = Arc::new(InMemoryToolEffectJournalStore::default());
+    let executor = Arc::new(GuardedEcho {
+        calls: AtomicUsize::new(0),
+    });
+    let (runtime, descriptor) =
+        durable_echo_runtime(&host_bounds, journal.clone(), executor.clone());
+    let run_id = RunId::new("unknown-workflow-run");
+    let workflow_id = WorkflowId::new("unknown-workflow");
+    let step_a = Step::action("a", "echo")
+        .with_params(json!({ "value": "a" }))
+        .with_exports(vec!["result".to_owned()]);
+    let step_b = Step::action("b", "echo")
+        .with_params(json!({ "value": "b" }))
+        .with_exports(vec!["result".to_owned()]);
+    let plan = Plan::new("unknown recovery", vec![step_a.clone(), step_b.clone()]);
+    let plan_digest = workflow_plan_digest(&plan).expect("normalized Plan digest");
+    let call_a = workflow_step_call_id(&run_id, &workflow_id, &plan_digest, &step_a.id, 1);
+    let invocation = ToolInvocation {
+        run_id: run_id.clone(),
+        call_id: call_a.clone(),
+        tool_id: descriptor.tool_id.clone(),
+        arguments: step_a.params.clone(),
+    };
+    let effective_policy = EffectiveToolPolicy::resolve(
+        &HostToolPolicy {
+            bounds: host_bounds.clone(),
+        },
+        &run_grant,
+        &descriptor.restriction,
+    )
+    .expect("effective policy is valid");
+    let prepared = PreparedToolEffect {
+        args_digest: invocation.args_digest().expect("arguments digest"),
+        policy_digest: effective_policy.digest().expect("policy digest"),
+        descriptor_digest: descriptor.digest().expect("descriptor digest"),
+        idempotency: descriptor.idempotency,
+        effect_scopes: descriptor.effect_scopes.clone(),
+        invocation,
+    };
+    let key_a = ToolEffectKey::new(run_id.clone(), call_a);
+    journal
+        .append(
+            0,
+            ToolEffectEventDraft {
+                event_id: ToolEffectEventId::new("unknown-a-prepared"),
+                key: key_a.clone(),
+                payload: ToolEffectEvent::Prepared { effect: prepared },
+            },
+        )
+        .await
+        .expect("Prepared effect is durable");
+    journal
+        .append(
+            1,
+            ToolEffectEventDraft {
+                event_id: ToolEffectEventId::new("unknown-a-invoked"),
+                key: key_a,
+                payload: ToolEffectEvent::Invoked {
+                    attempt_id: ToolEffectAttemptId::new("unknown-a-attempt"),
+                    authorization: ToolAuthorizationEvidence::Policy,
+                },
+            },
+        )
+        .await
+        .expect("Invoked effect is durable");
+
+    let error = durable_workflow_strategy(runtime)
+        .execute(
+            WorkflowExecutionRequest::new(run_id.clone(), workflow_id.clone(), plan, run_grant)
+                .with_progress_reporter(Arc::new(RecordedProgress::default()))
+                .with_recovery_replay(),
+        )
+        .await
+        .expect_err("an unresolved effect blocks the whole Workflow replay");
+    assert!(matches!(
+        error,
+        WorkflowExecutionError::UnknownEffect { .. }
+    ));
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+    let sibling_call = workflow_step_call_id(&run_id, &workflow_id, &plan_digest, &step_b.id, 1);
+    let sibling_key = ToolEffectKey::new(run_id, sibling_call);
+    assert!(journal
+        .load_effect(&sibling_key)
+        .await
+        .expect("sibling effect lookup succeeds")
+        .is_empty());
 }

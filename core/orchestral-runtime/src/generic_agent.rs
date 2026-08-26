@@ -51,10 +51,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::approval_bridge::AgentApprovalBridge;
 use crate::generic_agent_checkpoint::{
-    CreateGenericRunOutcome, GenericAgentCheckpointStore, GenericAgentRunRegistration,
-    GenericCheckpointDraft, GenericCheckpointError, GenericCheckpointEvent,
-    GenericCheckpointEventId, GenericCheckpointPhase, GenericLoopBoundary, GenericModelObservation,
-    GenericObservedToolCall, InMemoryGenericAgentCheckpointStore, StoredGenericAgentRun,
+    AppendGenericCheckpointOutcome, CreateGenericRunOutcome, GenericAgentCheckpointStore,
+    GenericAgentRunRegistration, GenericCheckpointDraft, GenericCheckpointError,
+    GenericCheckpointEvent, GenericCheckpointEventId, GenericCheckpointPhase, GenericLoopBoundary,
+    GenericModelObservation, GenericObservedToolCall, InMemoryGenericAgentCheckpointStore,
+    StoredGenericAgentRun,
 };
 use crate::skill::{
     ActivatedSkillSet, SkillActivationOutcome, SkillActivationRequest, SkillRuntime,
@@ -256,6 +257,7 @@ enum GenericRecoveryContinuation {
         observation: GenericModelObservation,
         call: GenericObservedToolCall,
         arguments: serde_json::Value,
+        recovery_replay: bool,
     },
     WorkflowOutput {
         round: u64,
@@ -1561,6 +1563,7 @@ fn stage_workflow_recovery(
             observation,
             call,
             arguments,
+            recovery_replay: false,
         },
     )
 }
@@ -1605,24 +1608,50 @@ fn stage_started_workflow_recovery(
         ended: call.ended,
     })
     .map_err(observed_recovery_error)?;
-    let Some((workflow_event_id, outcome)) = recovered_workflow_output(
+    let recovered_output = recovered_workflow_output(
         stored.registration.run_id(),
         round,
         &call.call_id,
         &recovery_events,
-    )?
-    else {
-        return Err(AgentProtocolError::new(
-            AgentProtocolErrorCode::InvalidTransition,
-            "Generic Agent recovery cannot rerun a Workflow with an unknown outcome",
-        )
-        .with_details(serde_json::json!({
-            "boundary": "workflow_attempt_open",
-            "round": round,
-            "request_id": request_id,
-            "call_id": call_id,
-            "outcome": "unknown",
-        })));
+    )?;
+    let Some((workflow_event_id, outcome)) = recovered_output else {
+        let workflow = inner
+            .tools
+            .as_ref()
+            .and_then(|tools| tools.workflow.as_ref())
+            .ok_or_else(|| {
+                AgentProtocolError::new(
+                    AgentProtocolErrorCode::InvalidDigest,
+                    "recovered Workflow call has no bound execution strategy",
+                )
+            })?;
+        if !workflow.supports_recovery_replay() {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::Unsupported,
+                "Workflow execution contract does not support deterministic recovery replay",
+            )
+            .with_details(serde_json::json!({
+                "boundary": "workflow_attempt_open",
+                "round": round,
+                "request_id": request_id,
+                "call_id": call_id,
+            })));
+        }
+        return stage_loop_recovery(
+            inner,
+            stored,
+            boundary,
+            recovery_events,
+            GenericRecoveryContinuation::Workflow {
+                round,
+                request_id,
+                request_digest,
+                observation,
+                call,
+                arguments,
+                recovery_replay: true,
+            },
+        );
     };
     let tool_call_limit = stored
         .registration
@@ -3112,6 +3141,7 @@ fn stage_loop_recovery(
                     observation,
                     call,
                     arguments,
+                    recovery_replay,
                     ..
                 } => {
                     resume_observed_workflow(
@@ -3130,6 +3160,7 @@ fn stage_loop_recovery(
                         observation,
                         call,
                         arguments,
+                        recovery_replay,
                     )
                     .await;
                 }
@@ -4057,17 +4088,33 @@ async fn execute_model_run(
                             let observation = match execute_workflow_call(
                                 inner.clone(),
                                 tools,
-                                &run_id,
-                                &call.call_id,
-                                arguments,
-                                remaining_tool_calls,
-                                cancellation.clone(),
+                                WorkflowCallRequest {
+                                    run_id: &run_id,
+                                    call_id: &call.call_id,
+                                    arguments,
+                                    remaining_tool_calls,
+                                    cancellation: cancellation.clone(),
+                                    recovery_replay: false,
+                                },
                             )
                             .await
                             {
                                 WorkflowCallExecution::Observed(observation) => observation,
                                 WorkflowCallExecution::Cancelled => {
                                     emit_cancel(&inner, &request, &user_message);
+                                    return;
+                                }
+                                WorkflowCallExecution::UnknownEffect(message) => {
+                                    emit_failure(
+                                        &inner,
+                                        &request,
+                                        &user_message,
+                                        agent_failure("tool_unknown_effect", message, false),
+                                    );
+                                    return;
+                                }
+                                WorkflowCallExecution::RecoveryFailed(failure) => {
+                                    emit_failure(&inner, &request, &user_message, failure);
                                     return;
                                 }
                             };
@@ -4442,6 +4489,7 @@ async fn resume_observed_workflow(
     observation: GenericModelObservation,
     call: GenericObservedToolCall,
     arguments: serde_json::Value,
+    recovery_replay: bool,
 ) {
     let run_id = request.run.spec.run_id.clone();
     if let Some(usage) = observation.usage.clone() {
@@ -4517,17 +4565,33 @@ async fn resume_observed_workflow(
     let workflow_observation = match execute_workflow_call(
         inner.clone(),
         tools,
-        &run_id,
-        &call.call_id,
-        arguments.clone(),
-        remaining_tool_calls,
-        cancellation.clone(),
+        WorkflowCallRequest {
+            run_id: &run_id,
+            call_id: &call.call_id,
+            arguments: arguments.clone(),
+            remaining_tool_calls,
+            cancellation: cancellation.clone(),
+            recovery_replay,
+        },
     )
     .await
     {
         WorkflowCallExecution::Observed(observation) => observation,
         WorkflowCallExecution::Cancelled => {
             emit_cancel(&inner, &request, &user_message);
+            return;
+        }
+        WorkflowCallExecution::UnknownEffect(message) => {
+            emit_failure(
+                &inner,
+                &request,
+                &user_message,
+                agent_failure("tool_unknown_effect", message, false),
+            );
+            return;
+        }
+        WorkflowCallExecution::RecoveryFailed(failure) => {
+            emit_failure(&inner, &request, &user_message, failure);
             return;
         }
     };
@@ -6500,18 +6564,25 @@ struct WorkflowCallObservation {
 enum WorkflowCallExecution {
     Observed(WorkflowCallObservation),
     Cancelled,
+    UnknownEffect(String),
+    RecoveryFailed(AgentFailure),
+}
+
+struct WorkflowCallRequest<'a> {
+    run_id: &'a RunId,
+    call_id: &'a ModelToolCallId,
+    arguments: serde_json::Value,
+    remaining_tool_calls: u64,
+    cancellation: CancellationToken,
+    recovery_replay: bool,
 }
 
 async fn execute_workflow_call(
     inner: Arc<GenericInner>,
     tools: &GenericTools,
-    run_id: &RunId,
-    call_id: &ModelToolCallId,
-    arguments: serde_json::Value,
-    remaining_tool_calls: u64,
-    cancellation: CancellationToken,
+    call: WorkflowCallRequest<'_>,
 ) -> WorkflowCallExecution {
-    let parsed = match serde_json::from_value::<WorkflowToolArguments>(arguments) {
+    let parsed = match serde_json::from_value::<WorkflowToolArguments>(call.arguments) {
         Ok(parsed) => parsed,
         Err(error) => {
             return WorkflowCallExecution::Observed(WorkflowCallObservation {
@@ -6531,24 +6602,43 @@ async fn execute_workflow_call(
             tool_calls: 0,
         });
     };
-    let workflow_id = WorkflowId::new(format!("workflow:{}:{}", run_id.as_str(), call_id.as_str()));
+    let workflow_id = WorkflowId::new(format!(
+        "workflow:{}:{}",
+        call.run_id.as_str(),
+        call.call_id.as_str()
+    ));
     let reporter = Arc::new(GenericWorkflowProgressReporter::new(
         inner,
-        run_id.clone(),
+        call.run_id.clone(),
         workflow_id.clone(),
         parsed.plan.steps.len(),
     ));
     let request = WorkflowExecutionRequest::new(
-        run_id.clone(),
+        call.run_id.clone(),
         workflow_id,
         parsed.plan,
         tools.run_grant.clone(),
     )
-    .with_cancellation(cancellation.clone())
+    .with_cancellation(call.cancellation.clone())
     .with_progress_reporter(reporter)
-    .with_max_tool_calls(remaining_tool_calls);
+    .with_max_tool_calls(call.remaining_tool_calls);
+    let request = if call.recovery_replay {
+        request.with_recovery_replay()
+    } else {
+        request
+    };
     let snapshot = match workflow.execute(request).await {
         Ok(snapshot) => snapshot,
+        Err(crate::workflow_strategy::WorkflowExecutionError::UnknownEffect {
+            message, ..
+        }) => return WorkflowCallExecution::UnknownEffect(message),
+        Err(error) if call.recovery_replay => {
+            return WorkflowCallExecution::RecoveryFailed(agent_failure(
+                "workflow_recovery",
+                error.to_string(),
+                false,
+            ))
+        }
         Err(error) => {
             return WorkflowCallExecution::Observed(WorkflowCallObservation {
                 result: workflow_error("workflow_rejected", error.to_string()),
@@ -6557,7 +6647,7 @@ async fn execute_workflow_call(
             })
         }
     };
-    if cancellation.is_cancelled() {
+    if call.cancellation.is_cancelled() {
         return WorkflowCallExecution::Cancelled;
     }
     let tool_calls = snapshot.tool_calls;
@@ -6960,7 +7050,7 @@ fn append_checkpoint_to_run(
     payload: GenericCheckpointEvent,
 ) -> Result<(), AgentFailure> {
     let expected_previous = run.checkpoint_seq;
-    inner
+    let outcome = inner
         .checkpoint_store
         .append(
             run_id,
@@ -6972,7 +7062,9 @@ fn append_checkpoint_to_run(
             },
         )
         .map_err(checkpoint_failure)?;
-    run.checkpoint_seq = expected_previous.saturating_add(1);
+    if matches!(outcome, AppendGenericCheckpointOutcome::Appended) {
+        run.checkpoint_seq = expected_previous.saturating_add(1);
+    }
     Ok(())
 }
 

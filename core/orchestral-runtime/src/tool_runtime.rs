@@ -19,7 +19,7 @@ use orchestral_core::tool_effect::{
     replay_tool_effect, InMemoryToolEffectJournalStore, PreparedToolEffect,
     ToolAuthorizationEvidence, ToolEffectAttemptId, ToolEffectError, ToolEffectEvent,
     ToolEffectEventDraft, ToolEffectEventId, ToolEffectJournalStore, ToolEffectKey,
-    ToolEffectPhase,
+    ToolEffectPhase, ToolEffectProjection,
 };
 use orchestral_core::tool_protocol::{
     ApprovalBinding, ApprovalCapability, ApprovalCapabilityStore, EffectiveToolPolicy,
@@ -79,6 +79,14 @@ pub trait AgentToolRuntime: Send + Sync {
     fn model_tool_schemas(&self) -> Result<Vec<ModelToolSchema>, ToolRuntimeError>;
 
     fn resolve_tool_id(&self, model_name: &str) -> Result<Option<ToolId>, ToolRuntimeError>;
+
+    /// Reads one durable effect projection without changing its phase.
+    /// Workflow recovery uses this to reject an entire replay before any new
+    /// sibling Tool is dispatched when one prior invocation is unresolved.
+    async fn inspect_effect(
+        &self,
+        key: &ToolEffectKey,
+    ) -> Result<Option<ToolEffectProjection>, ToolOutcomeRecoveryError>;
 
     /// Recovers an already-started invocation from the durable Effect Journal
     /// without ever calling its executor or creating a fresh effect record.
@@ -906,6 +914,22 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
         }
     }
 
+    /// Loads a durable Tool effect without closing `Observed` or classifying
+    /// `Invoked`. This is deliberately read-only so a workflow can perform a
+    /// global recovery preflight before it dispatches any new work.
+    pub async fn inspect_effect(
+        &self,
+        key: &ToolEffectKey,
+    ) -> Result<Option<ToolEffectProjection>, ToolOutcomeRecoveryError> {
+        key.validate().map_err(effect_journal_recovery_error)?;
+        let records = self
+            .effect_journal
+            .load_effect(key)
+            .await
+            .map_err(effect_journal_recovery_error)?;
+        replay_tool_effect(key, &records).map_err(effect_journal_recovery_error)
+    }
+
     async fn prepare_durable_invocation(
         &self,
         registered: &Arc<RegisteredTool>,
@@ -1401,6 +1425,13 @@ where
 
     fn resolve_tool_id(&self, model_name: &str) -> Result<Option<ToolId>, ToolRuntimeError> {
         GuardedToolRuntime::resolve_tool_id(self, model_name)
+    }
+
+    async fn inspect_effect(
+        &self,
+        key: &ToolEffectKey,
+    ) -> Result<Option<ToolEffectProjection>, ToolOutcomeRecoveryError> {
+        GuardedToolRuntime::inspect_effect(self, key).await
     }
 
     async fn recover_outcome(
