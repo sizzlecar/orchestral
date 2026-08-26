@@ -46,6 +46,15 @@ struct ScriptedModel;
 
 struct BlockingModel;
 
+struct SteerAccumulatingModel {
+    rounds: AtomicUsize,
+    first_started: Notify,
+}
+
+struct InputRequestModel {
+    rounds: AtomicUsize,
+}
+
 struct ToolLoopModel {
     rounds: AtomicUsize,
 }
@@ -148,6 +157,159 @@ impl ModelBackend for BlockingModel {
 }
 
 #[async_trait]
+impl ModelBackend for SteerAccumulatingModel {
+    fn descriptor(&self) -> ModelDescriptor {
+        ModelDescriptor {
+            backend_id: "steer-accumulating-model".to_owned(),
+            capabilities: ModelCapabilities {
+                streaming: true,
+                ..ModelCapabilities::default()
+            },
+            extensions: Default::default(),
+        }
+    }
+
+    async fn start(
+        &self,
+        request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelStream, ModelError> {
+        request.validate()?;
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        if round == 0 {
+            self.first_started.notify_one();
+        }
+        let user_messages = request
+            .messages
+            .iter()
+            .filter(|message| message.role == ModelRole::User)
+            .count();
+        if user_messages < 101 {
+            return Ok(Box::pin(stream::pending()));
+        }
+        let request_id = request.request_id;
+        Ok(Box::pin(stream::iter([
+            Ok(ModelStreamEvent {
+                request_id: request_id.clone(),
+                event_id: ModelEventId::new("steer-answer"),
+                sequence: 1,
+                payload: ModelEvent::TextDelta {
+                    delta: "all steering inputs applied".to_owned(),
+                },
+            }),
+            Ok(ModelStreamEvent {
+                request_id,
+                event_id: ModelEventId::new("steer-finish"),
+                sequence: 2,
+                payload: ModelEvent::Finish {
+                    reason: ModelFinishReason::Stop,
+                },
+            }),
+        ])))
+    }
+}
+
+#[async_trait]
+impl ModelBackend for InputRequestModel {
+    fn descriptor(&self) -> ModelDescriptor {
+        ModelDescriptor {
+            backend_id: "input-request-model".to_owned(),
+            capabilities: ModelCapabilities {
+                streaming: true,
+                tool_calls: true,
+                ..ModelCapabilities::default()
+            },
+            extensions: Default::default(),
+        }
+    }
+
+    async fn start(
+        &self,
+        request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelStream, ModelError> {
+        request.validate()?;
+        assert!(request
+            .tools
+            .iter()
+            .any(|tool| tool.name == "orchestral_request_input"));
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        let request_id = request.request_id;
+        if round == 0 {
+            return Ok(Box::pin(stream::iter([
+                Ok(ModelStreamEvent {
+                    request_id: request_id.clone(),
+                    event_id: ModelEventId::new("input-start"),
+                    sequence: 1,
+                    payload: ModelEvent::ToolCallStart {
+                        call_id: ModelToolCallId::new("input-call"),
+                        name: "orchestral_request_input".to_owned(),
+                    },
+                }),
+                Ok(ModelStreamEvent {
+                    request_id: request_id.clone(),
+                    event_id: ModelEventId::new("input-arguments"),
+                    sequence: 2,
+                    payload: ModelEvent::ToolCallArgumentsDelta {
+                        call_id: ModelToolCallId::new("input-call"),
+                        delta: r#"{"prompt":"Which city should I use?"}"#.to_owned(),
+                    },
+                }),
+                Ok(ModelStreamEvent {
+                    request_id: request_id.clone(),
+                    event_id: ModelEventId::new("input-end"),
+                    sequence: 3,
+                    payload: ModelEvent::ToolCallEnd {
+                        call_id: ModelToolCallId::new("input-call"),
+                    },
+                }),
+                Ok(ModelStreamEvent {
+                    request_id,
+                    event_id: ModelEventId::new("input-finish"),
+                    sequence: 4,
+                    payload: ModelEvent::Finish {
+                        reason: ModelFinishReason::ToolCalls,
+                    },
+                }),
+            ])));
+        }
+
+        assert!(request.messages.iter().any(|message| {
+            message.role == ModelRole::Tool
+                && message.content.iter().any(|content| {
+                    matches!(
+                        content,
+                        ModelContent::ToolResult {
+                            call_id,
+                            result,
+                            is_error: false,
+                        } if call_id.as_str() == "input-call"
+                            && result.to_string().contains("Shanghai")
+                    )
+                })
+        }));
+        Ok(Box::pin(stream::iter([
+            Ok(ModelStreamEvent {
+                request_id: request_id.clone(),
+                event_id: ModelEventId::new("input-answer"),
+                sequence: 1,
+                payload: ModelEvent::TextDelta {
+                    delta: "Using Shanghai".to_owned(),
+                },
+            }),
+            Ok(ModelStreamEvent {
+                request_id,
+                event_id: ModelEventId::new("input-answer-finish"),
+                sequence: 2,
+                payload: ModelEvent::Finish {
+                    reason: ModelFinishReason::Stop,
+                },
+            }),
+        ])))
+    }
+}
+
+#[async_trait]
 impl ModelBackend for ToolLoopModel {
     fn descriptor(&self) -> ModelDescriptor {
         ModelDescriptor {
@@ -167,7 +329,11 @@ impl ModelBackend for ToolLoopModel {
         _cancellation: CancellationToken,
     ) -> Result<ModelStream, ModelError> {
         request.validate()?;
-        assert_eq!(request.tools.len(), 1);
+        assert!(request.tools.iter().any(|tool| tool.name == "echo"));
+        assert!(request
+            .tools
+            .iter()
+            .any(|tool| tool.name == "orchestral_request_input"));
         let round = self.rounds.fetch_add(1, Ordering::SeqCst);
         let request_id = request.request_id;
         if round == 0 {
@@ -369,7 +535,11 @@ impl ModelBackend for ApprovalLoopModel {
         _cancellation: CancellationToken,
     ) -> Result<ModelStream, ModelError> {
         request.validate()?;
-        assert_eq!(request.tools.len(), 1);
+        assert!(request.tools.iter().any(|tool| tool.name == "echo"));
+        assert!(request
+            .tools
+            .iter()
+            .any(|tool| tool.name == "orchestral_request_input"));
         let round = self.rounds.fetch_add(1, Ordering::SeqCst);
         let request_id = request.request_id;
         if round == 0 {
@@ -834,6 +1004,163 @@ async fn controller_cancel_terminates_a_generic_agent_model_run() {
 
     assert_eq!(view.state.status(), AgentRunStatus::Cancelled);
     assert!(view.delivery.is_none());
+}
+
+#[tokio::test]
+async fn one_hundred_steers_are_committed_in_order_without_crossing_the_run() {
+    let model = Arc::new(SteerAccumulatingModel {
+        rounds: AtomicUsize::new(0),
+        first_started: Notify::new(),
+    });
+    let mut config = GenericAgentConfig::new("internal-provider", "generic-agent");
+    config.max_model_rounds = 128;
+    config.stream_buffer = 128;
+    let provider = Arc::new(
+        InternalGenericAgentProvider::new(model.clone(), config)
+            .expect("steer-capable Generic Agent starts"),
+    );
+    assert!(provider.describe().descriptor.capabilities.controls.steer);
+    let controller = Arc::new(
+        AgentController::new(provider, ProviderBindingRef::new("generic-binding"))
+            .expect("controller binds the Generic Agent"),
+    );
+    let client = AgentClient::new(controller.clone(), AgentSessionId::new("steer-session"));
+    let handle = client
+        .start_with_run_id(
+            RunId::new("steer-run"),
+            vec![Content::text("initial input")],
+        )
+        .await
+        .expect("Run starts");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        model.first_started.notified(),
+    )
+    .await
+    .expect("first model request starts");
+
+    for index in 0..100 {
+        let ack = handle
+            .steer_text(format!("steer-{index:03}"))
+            .await
+            .expect("steer command is accepted");
+        assert!(matches!(
+            ack.state,
+            CommandAckState::Accepted { .. } | CommandAckState::Applied { .. }
+        ));
+    }
+
+    let view = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        controller.wait_for_terminal(handle.run_id()),
+    )
+    .await
+    .expect("steered Run reaches one terminal")
+    .expect("steered Run remains inspectable");
+    assert_eq!(view.state.status(), AgentRunStatus::Delivered);
+    assert_eq!(
+        view.delivery
+            .as_ref()
+            .and_then(|delivery| match &delivery.final_response.body {
+                ContentBody::Inline(serde_json::Value::String(text)) => Some(text.as_str()),
+                _ => None,
+            }),
+        Some("all steering inputs applied")
+    );
+
+    let committed = handle
+        .events(0)
+        .await
+        .expect("steer events remain replayable")
+        .into_iter()
+        .filter_map(|record| match record.event.payload {
+            AgentEvent::InputCommitted { content } => {
+                content
+                    .into_iter()
+                    .next()
+                    .and_then(|content| match content.body {
+                        ContentBody::Inline(serde_json::Value::String(text)) => Some(text),
+                        _ => None,
+                    })
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(committed.len(), 100);
+    assert_eq!(
+        committed,
+        (0..100)
+            .map(|index| format!("steer-{index:03}"))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn model_input_request_resolves_by_request_id_and_resumes_the_same_run() {
+    let model = Arc::new(InputRequestModel {
+        rounds: AtomicUsize::new(0),
+    });
+    let provider = Arc::new(
+        InternalGenericAgentProvider::new(
+            model.clone(),
+            GenericAgentConfig::new("internal-provider", "generic-agent"),
+        )
+        .expect("input-capable Generic Agent starts"),
+    );
+    assert!(provider
+        .describe()
+        .descriptor
+        .capabilities
+        .pending_request_kinds
+        .contains(&PendingRequestKind::Input));
+    let controller = Arc::new(
+        AgentController::new(provider, ProviderBindingRef::new("generic-binding"))
+            .expect("controller binds the Generic Agent"),
+    );
+    let client = AgentClient::new(controller.clone(), AgentSessionId::new("input-session"));
+    let handle = client
+        .start_with_run_id(
+            RunId::new("input-run"),
+            vec![Content::text("prepare a city report")],
+        )
+        .await
+        .expect("Run starts");
+    let blocked = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        handle.wait_until_blocked(),
+    )
+    .await
+    .expect("Run opens an input request")
+    .expect("blocked Run remains inspectable");
+    assert!(blocked.is_waiting());
+    assert_eq!(blocked.view.pending_requests.len(), 1);
+    let request = &blocked.view.pending_requests[0];
+    assert_eq!(request.kind(), PendingRequestKind::Input);
+    let ack = handle
+        .resolve_input_text(request.request_id.clone(), "Shanghai")
+        .await
+        .expect("correlated input resolution is accepted");
+    assert!(matches!(
+        ack.state,
+        CommandAckState::Accepted { .. } | CommandAckState::Applied { .. }
+    ));
+
+    let view = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        controller.wait_for_terminal(handle.run_id()),
+    )
+    .await
+    .expect("resolved Run reaches terminal")
+    .expect("resolved Run remains inspectable");
+    assert_eq!(view.state.status(), AgentRunStatus::Delivered);
+    assert_eq!(model.rounds.load(Ordering::SeqCst), 2);
+    assert!(view.pending_requests.is_empty());
+    assert!(handle
+        .events(0)
+        .await
+        .unwrap()
+        .iter()
+        .any(|record| matches!(record.event.payload, AgentEvent::RequestResolved { .. })));
 }
 
 #[tokio::test]

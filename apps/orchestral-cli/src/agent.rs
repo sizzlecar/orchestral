@@ -773,6 +773,7 @@ async fn run_turn(
     let mut events = handle.subscribe().await.context("subscribe to Agent Run")?;
     let mut handled_requests = BTreeSet::new();
     let mut streamed_output = false;
+    let mut stdin_open = true;
     let view = loop {
         let view = handle.inspect().await.context("inspect Agent Run")?;
         if is_terminal(view.state.status()) {
@@ -831,6 +832,39 @@ async fn run_turn(
                     tracing::debug!(%error, "Agent Run reached terminal while cancellation was sent");
                 }
             }
+            line = lines.next_line(), if stdin_open => {
+                let line = line.context("read running Agent input")?;
+                let Some(line) = line else {
+                    stdin_open = false;
+                    continue;
+                };
+                let input = line.trim();
+                if input.is_empty() {
+                    continue;
+                }
+                if matches!(input, "/cancel" | "/stop") {
+                    if let Err(error) = handle.cancel("CLI cancellation command").await {
+                        tracing::debug!(%error, "Agent Run reached terminal while cancellation was sent");
+                    }
+                    continue;
+                }
+                let ack = handle
+                    .steer_text(input.to_owned())
+                    .await
+                    .context("steer running Agent")?;
+                match ack.state {
+                    CommandAckState::Accepted { .. } | CommandAckState::Applied { .. } => {
+                        eprintln!("\n[steer accepted]");
+                    }
+                    CommandAckState::Rejected { code, message, .. } => {
+                        eprintln!("\n[steer rejected: {code:?}: {message}]");
+                    }
+                    CommandAckState::Unsupported { feature, .. } => {
+                        eprintln!("\n[steer unsupported: {feature}]");
+                    }
+                    _ => eprintln!("\n[steer acknowledgement pending]"),
+                }
+            }
         }
     };
 
@@ -857,75 +891,108 @@ async fn resolve_cli_request(
     request: PendingRequest,
     lines: &mut tokio::io::Lines<BufReader<tokio::io::Stdin>>,
 ) -> anyhow::Result<bool> {
-    let PendingRequestPayload::Approval {
-        requested_scope,
-        reason,
-        ..
-    } = &request.payload
-    else {
-        bail!(
-            "CLI does not yet support pending request kind {:?}",
-            request.kind()
-        )
-    };
-    eprintln!("\nApproval required: {reason}");
-    eprintln!("Effects: {}", requested_scope.join(", "));
-    print!("Allow this exact operation? [y/N] ");
-    io::stdout().flush().context("flush approval prompt")?;
-    let answer = tokio::select! {
-        line = lines.next_line() => line.context("read approval decision")?,
-        signal = tokio::signal::ctrl_c() => {
-            signal.context("listen for Ctrl-C")?;
-            eprintln!("\nCancelling current Agent Run...");
-            if let Err(error) = controller.cancel(run_id, "CLI interrupted during approval").await {
-                tracing::debug!(%error, "Agent Run reached terminal while cancellation was sent");
+    let resolution = match &request.payload {
+        PendingRequestPayload::Input { prompt, .. } => {
+            eprintln!("\nInput required:");
+            for item in prompt {
+                eprintln!("{}", display_content(item));
             }
-            return Ok(false);
+            print!("> ");
+            io::stdout().flush().context("flush input prompt")?;
+            let answer = tokio::select! {
+                line = lines.next_line() => line.context("read requested Agent input")?,
+                signal = tokio::signal::ctrl_c() => {
+                    signal.context("listen for Ctrl-C")?;
+                    eprintln!("\nCancelling current Agent Run...");
+                    if let Err(error) = controller.cancel(run_id, "CLI interrupted during input request").await {
+                        tracing::debug!(%error, "Agent Run reached terminal while cancellation was sent");
+                    }
+                    return Ok(false);
+                }
+            };
+            let Some(answer) = answer else {
+                controller
+                    .cancel(run_id, "CLI input closed during input request")
+                    .await
+                    .context("cancel Agent after stdin closed")?;
+                return Ok(false);
+            };
+            if answer.trim().is_empty() {
+                bail!("input response must not be empty")
+            }
+            RequestResolution::Input {
+                content: vec![Content::text(answer)],
+            }
         }
-    };
-    let allow = answer
-        .as_deref()
-        .is_some_and(|answer| matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"));
-    let resolution = if allow {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
-        let grant_ref = approval_broker
-            .approve(&request.request_id, now_ms.saturating_add(5 * 60 * 1_000))
-            .context("issue exact Host approval grant")?;
-        RequestResolution::Approval {
-            decision: ApprovalDecision::Allow,
-            grant_ref: Some(grant_ref),
+        PendingRequestPayload::Approval {
+            requested_scope,
+            reason,
+            ..
+        } => {
+            eprintln!("\nApproval required: {reason}");
+            eprintln!("Effects: {}", requested_scope.join(", "));
+            print!("Allow this exact operation? [y/N] ");
+            io::stdout().flush().context("flush approval prompt")?;
+            let answer = tokio::select! {
+                line = lines.next_line() => line.context("read approval decision")?,
+                signal = tokio::signal::ctrl_c() => {
+                    signal.context("listen for Ctrl-C")?;
+                    eprintln!("\nCancelling current Agent Run...");
+                    if let Err(error) = controller.cancel(run_id, "CLI interrupted during approval").await {
+                        tracing::debug!(%error, "Agent Run reached terminal while cancellation was sent");
+                    }
+                    return Ok(false);
+                }
+            };
+            let allow = answer.as_deref().is_some_and(|answer| {
+                matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+            });
+            if allow {
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+                let grant_ref = approval_broker
+                    .approve(&request.request_id, now_ms.saturating_add(5 * 60 * 1_000))
+                    .context("issue exact Host approval grant")?;
+                RequestResolution::Approval {
+                    decision: ApprovalDecision::Allow,
+                    grant_ref: Some(grant_ref),
+                }
+            } else {
+                RequestResolution::Approval {
+                    decision: ApprovalDecision::Deny,
+                    grant_ref: None,
+                }
+            }
         }
-    } else {
-        RequestResolution::Approval {
-            decision: ApprovalDecision::Deny,
-            grant_ref: None,
+        PendingRequestPayload::ExternalAction { .. } => {
+            bail!("CLI does not support external action requests")
         }
+        _ => bail!("CLI does not support this pending request kind"),
     };
     let command = AgentCommandEnvelope::new(
-        CommandId::new(unique_id("cli-approval", 0)),
+        CommandId::new(unique_id("cli-request", 0)),
         run_id.clone(),
         Some(request.request_id),
         AgentCommand::ResolveRequest {
             response: resolution,
         },
     )
-    .context("build approval resolution command")?;
+    .context("build request resolution command")?;
     let ack = controller
         .command(command)
         .await
-        .context("resolve approval request")?;
+        .context("resolve Agent request")?;
     match ack.state {
         CommandAckState::Accepted { .. } | CommandAckState::Applied { .. } => Ok(true),
         CommandAckState::Rejected { code, message, .. } => {
-            bail!("approval resolution was rejected ({code:?}): {message}")
+            bail!("request resolution was rejected ({code:?}): {message}")
         }
         CommandAckState::Unsupported { feature, .. } => {
-            bail!("approval resolution is unsupported: {feature}")
+            bail!("request resolution is unsupported: {feature}")
         }
-        _ => bail!("approval resolution returned an unknown acknowledgement state"),
+        _ => bail!("request resolution returned an unknown acknowledgement state"),
     }
 }
 
@@ -949,6 +1016,13 @@ fn print_content(body: &ContentBody) -> anyhow::Result<()> {
         other => println!("{}", serde_json::to_string_pretty(other)?),
     }
     Ok(())
+}
+
+fn display_content(content: &Content) -> String {
+    match &content.body {
+        ContentBody::Inline(serde_json::Value::String(text)) => text.clone(),
+        body => serde_json::to_string(body).unwrap_or_else(|_| "<unprintable content>".to_owned()),
+    }
 }
 
 fn unique_id(prefix: &str, sequence: u64) -> String {

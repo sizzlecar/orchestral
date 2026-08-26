@@ -3,7 +3,7 @@
 //! Tools are optional and can only enter through the Host-owned guarded Tool
 //! runtime. A model tool call never carries authority by itself.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -42,7 +42,7 @@ use orchestral_core::tool_protocol::{
 };
 use orchestral_core::types::{Plan, WorkflowId};
 use serde::Deserialize;
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::{broadcast, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::approval_bridge::AgentApprovalBridge;
@@ -58,6 +58,7 @@ use crate::{
 
 const WORKFLOW_TOOL_NAME: &str = "orchestral_workflow";
 const SKILL_ACTIVATE_TOOL_NAME: &str = "orchestral_skill_activate";
+const REQUEST_INPUT_TOOL_NAME: &str = "orchestral_request_input";
 
 #[derive(Debug, Clone)]
 pub struct GenericAgentConfig {
@@ -132,7 +133,25 @@ struct GenericRun {
     cancellation: CancellationToken,
     cancel_command: Option<(CommandId, String)>,
     commands: BTreeMap<CommandId, StoredCommand>,
+    queued_steers: VecDeque<QueuedSteer>,
+    steer_signal: watch::Sender<u64>,
+    pending_inputs: BTreeMap<RequestId, PendingInput>,
     pending_approvals: BTreeMap<RequestId, PendingApproval>,
+}
+
+struct QueuedSteer {
+    command_id: CommandId,
+    content: Vec<Content>,
+    message: ModelMessage,
+}
+
+struct PendingInput {
+    responder: Option<oneshot::Sender<InputResponse>>,
+}
+
+struct InputResponse {
+    command_id: CommandId,
+    resolution: RequestResolution,
 }
 
 struct PendingApproval {
@@ -326,19 +345,16 @@ impl InternalGenericAgentProvider {
                 "configured ModelBackend does not support model function calls",
             ));
         }
-        if skills.is_some()
-            && tools.as_ref().is_some_and(|tools| {
-                tools
-                    .model_definitions
-                    .iter()
-                    .any(|definition| definition.name == SKILL_ACTIVATE_TOOL_NAME)
+        if let Some(conflict) = tools.as_ref().and_then(|tools| {
+            tools.model_definitions.iter().find_map(|definition| {
+                [SKILL_ACTIVATE_TOOL_NAME, REQUEST_INPUT_TOOL_NAME]
+                    .contains(&definition.name.as_str())
+                    .then(|| definition.name.clone())
             })
-        {
+        }) {
             return Err(AgentProtocolError::new(
                 AgentProtocolErrorCode::InvalidSpec,
-                format!(
-                    "reserved Generic Agent function name is already registered: {SKILL_ACTIVATE_TOOL_NAME}"
-                ),
+                format!("reserved Generic Agent function name is already registered: {conflict}"),
             ));
         }
         if config.stream_buffer == 0
@@ -353,6 +369,7 @@ impl InternalGenericAgentProvider {
             ));
         }
         let has_tools = tools.is_some();
+        let has_input_requests = model_descriptor.capabilities.tool_calls;
         let has_approval = tools
             .as_ref()
             .and_then(|tools| tools.approval_bridge.as_ref())
@@ -371,13 +388,20 @@ impl InternalGenericAgentProvider {
                 session_reuse: true,
                 structured_output: false,
                 controls: ControlCapabilities {
-                    steer: false,
+                    steer: true,
                     cancel: CancelSupport::Confirmed,
                     recover: true,
                 },
-                pending_request_kinds: has_approval
-                    .then(|| BTreeSet::from([PendingRequestKind::Approval]))
-                    .unwrap_or_default(),
+                pending_request_kinds: {
+                    let mut kinds = BTreeSet::new();
+                    if has_input_requests {
+                        kinds.insert(PendingRequestKind::Input);
+                    }
+                    if has_approval {
+                        kinds.insert(PendingRequestKind::Approval);
+                    }
+                    kinds
+                },
                 supported_limits,
                 resources: skills
                     .as_ref()
@@ -407,6 +431,7 @@ impl InternalGenericAgentProvider {
                 .map(|tools| tools.model_definitions.as_slice()),
             skills.as_ref().map(|skills| skills.catalog()),
             has_approval,
+            has_input_requests,
         )?;
         let context_engine = AgentSessionContextEngine::new(session_journal.clone(), token_meter);
         Ok(Self {
@@ -503,7 +528,7 @@ impl AgentProvider for InternalGenericAgentProvider {
                 Self::rejection(AgentRejectionCode::RunIdConflict, error.to_string())
             })?;
 
-        let (stream, cancellation) = {
+        let (stream, cancellation, steer_updates) = {
             let mut state = self.state();
             if let Some(existing) = state.runs.get(&request.run.spec.run_id) {
                 if existing.execution != execution || existing.request != request {
@@ -533,6 +558,7 @@ impl AgentProvider for InternalGenericAgentProvider {
 
             let (sender, _) = broadcast::channel(self.inner.config.stream_buffer);
             let cancellation = CancellationToken::new();
+            let (steer_signal, steer_updates) = watch::channel(0_u64);
             let run = GenericRun {
                 request: request.clone(),
                 execution: execution.clone(),
@@ -543,11 +569,14 @@ impl AgentProvider for InternalGenericAgentProvider {
                 cancellation: cancellation.clone(),
                 cancel_command: None,
                 commands: BTreeMap::new(),
+                queued_steers: VecDeque::new(),
+                steer_signal: steer_signal.clone(),
+                pending_inputs: BTreeMap::new(),
                 pending_approvals: BTreeMap::new(),
             };
             let stream = Self::stream_for(&run);
             state.runs.insert(request.run.spec.run_id.clone(), run);
-            (stream, cancellation)
+            (stream, cancellation, steer_updates)
         };
 
         let input_event = AgentSessionEventDraft {
@@ -646,6 +675,7 @@ impl AgentProvider for InternalGenericAgentProvider {
                 model_definitions,
                 run_skills,
                 cancellation,
+                steer_updates,
             )
             .await;
         });
@@ -713,14 +743,63 @@ impl AgentProvider for InternalGenericAgentProvider {
                         ProviderCommandOutcome::Accepted,
                     ));
                 }
-                AgentCommand::Steer { .. } => {
+                AgentCommand::Steer { .. } if run.terminal => {
                     return Ok(record_command(
                         run,
                         &command,
-                        ProviderCommandOutcome::Unsupported {
-                            feature: "steer".to_owned(),
+                        ProviderCommandOutcome::Rejected {
+                            code: AgentProtocolErrorCode::TerminalRun,
+                            message: "Run is already terminal".to_owned(),
                         },
                     ));
+                }
+                AgentCommand::Steer { .. } if run.cancel_command.is_some() => {
+                    return Ok(record_command(
+                        run,
+                        &command,
+                        ProviderCommandOutcome::Rejected {
+                            code: AgentProtocolErrorCode::InvalidTransition,
+                            message: "Run cancellation is already in progress".to_owned(),
+                        },
+                    ));
+                }
+                AgentCommand::Steer { content } => {
+                    let message = match agent_content_message(content) {
+                        Ok(message) => message,
+                        Err(error) => {
+                            return Ok(record_command(
+                                run,
+                                &command,
+                                ProviderCommandOutcome::Rejected {
+                                    code: error.code,
+                                    message: error.message,
+                                },
+                            ));
+                        }
+                    };
+                    if run.queued_steers.len() >= self.inner.config.stream_buffer {
+                        return Ok(record_command(
+                            run,
+                            &command,
+                            ProviderCommandOutcome::Rejected {
+                                code: AgentProtocolErrorCode::InvalidTransition,
+                                message: "Steer input buffer is full".to_owned(),
+                            },
+                        ));
+                    }
+                    run.queued_steers.push_back(QueuedSteer {
+                        command_id: command.command_id.clone(),
+                        content: content.clone(),
+                        message,
+                    });
+                    let signal = run.steer_signal.clone();
+                    let disposition =
+                        record_command(run, &command, ProviderCommandOutcome::Accepted);
+                    drop(state);
+                    signal.send_modify(|generation| {
+                        *generation = generation.saturating_add(1);
+                    });
+                    return Ok(disposition);
                 }
                 AgentCommand::ResolveRequest { response } => {
                     let Some(request_id) = command.request_id.as_ref() else {
@@ -736,14 +815,54 @@ impl AgentProvider for InternalGenericAgentProvider {
                             },
                         ));
                     }
+                    if let RequestResolution::Input { content } = response {
+                        if let Err(error) = agent_content_message(content) {
+                            return Ok(record_command(
+                                run,
+                                &command,
+                                ProviderCommandOutcome::Rejected {
+                                    code: error.code,
+                                    message: error.message,
+                                },
+                            ));
+                        }
+                        let Some(mut pending) = run.pending_inputs.remove(request_id) else {
+                            return Ok(record_command(
+                                run,
+                                &command,
+                                ProviderCommandOutcome::Rejected {
+                                    code: AgentProtocolErrorCode::RequestNotFound,
+                                    message: "input request is not pending".to_owned(),
+                                },
+                            ));
+                        };
+                        let delivered = pending.responder.take().is_some_and(|responder| {
+                            responder
+                                .send(InputResponse {
+                                    command_id: command.command_id.clone(),
+                                    resolution: response.clone(),
+                                })
+                                .is_ok()
+                        });
+                        let outcome = if delivered {
+                            ProviderCommandOutcome::Accepted
+                        } else {
+                            ProviderCommandOutcome::Rejected {
+                                code: AgentProtocolErrorCode::InvalidTransition,
+                                message: "input waiter is no longer active".to_owned(),
+                            }
+                        };
+                        return Ok(record_command(run, &command, outcome));
+                    }
                     if !matches!(response, RequestResolution::Approval { .. }) {
                         return Ok(record_command(
                             run,
                             &command,
                             ProviderCommandOutcome::Rejected {
                                 code: AgentProtocolErrorCode::RequestTypeMismatch,
-                                message: "Generic Agent is waiting for an approval resolution"
-                                    .to_owned(),
+                                message:
+                                    "request resolution kind is not pending in this Generic Agent"
+                                        .to_owned(),
                             },
                         ));
                     }
@@ -941,6 +1060,7 @@ async fn execute_model_run(
     model_tools: Vec<ModelToolDefinition>,
     run_skills: Option<Arc<SkillRuntime>>,
     cancellation: CancellationToken,
+    mut steer_updates: watch::Receiver<u64>,
 ) {
     let run_id = request.run.spec.run_id.clone();
     for (index, skip) in admission.skipped_optional_bindings.into_iter().enumerate() {
@@ -994,6 +1114,11 @@ async fn execute_model_run(
     let mut supporting_event_ids = vec![started_event_id.clone()];
 
     'model_rounds: for round in 1..=model_round_limit {
+        steer_updates.borrow_and_update();
+        if let Err(failure) = commit_queued_steers(&inner, &request, &mut model_messages).await {
+            emit_failure(&inner, &request, &user_message, failure);
+            return;
+        }
         let model_request = ModelRequest {
             request_id: ModelRequestId::new(format!("model-{}-{round}", run_id.as_str())),
             messages: model_messages.clone(),
@@ -1002,12 +1127,32 @@ async fn execute_model_run(
             max_output_tokens: request.run.spec.limits.max_output_tokens,
             extensions: Default::default(),
         };
+        let model_cancellation = cancellation.child_token();
         let mut model_stream = match tokio::select! {
             _ = cancellation.cancelled() => {
                 emit_cancel(&inner, &request, &user_message);
                 return;
             }
-            result = inner.backend.start(model_request.clone(), cancellation.clone()) => result,
+            changed = steer_updates.changed() => {
+                if changed.is_err() {
+                    emit_failure(
+                        &inner,
+                        &request,
+                        &user_message,
+                        agent_failure("steer_channel_closed", "Steer control channel closed", true),
+                    );
+                    return;
+                }
+                model_cancellation.cancel();
+                if let Err(failure) =
+                    commit_queued_steers(&inner, &request, &mut model_messages).await
+                {
+                    emit_failure(&inner, &request, &user_message, failure);
+                    return;
+                }
+                continue 'model_rounds;
+            }
+            result = inner.backend.start(model_request.clone(), model_cancellation.clone()) => result,
         } {
             Ok(stream) => stream,
             Err(error) => {
@@ -1029,6 +1174,25 @@ async fn execute_model_run(
                 _ = cancellation.cancelled() => {
                     emit_cancel(&inner, &request, &user_message);
                     return;
+                }
+                changed = steer_updates.changed() => {
+                    if changed.is_err() {
+                        emit_failure(
+                            &inner,
+                            &request,
+                            &user_message,
+                            agent_failure("steer_channel_closed", "Steer control channel closed", true),
+                        );
+                        return;
+                    }
+                    model_cancellation.cancel();
+                    if let Err(failure) =
+                        commit_queued_steers(&inner, &request, &mut model_messages).await
+                    {
+                        emit_failure(&inner, &request, &user_message, failure);
+                        return;
+                    }
+                    continue 'model_rounds;
                 }
                 item = model_stream.next() => item,
             };
@@ -1143,8 +1307,8 @@ async fn execute_model_run(
                                 &inner,
                                 AgentSessionEventDraft {
                                     event_id: AgentSessionEventId::new(format!(
-                                        "generic-{}-output",
-                                        run_id.as_str()
+                                        "generic-{}-output-{round}",
+                                        run_id.as_str(),
                                     )),
                                     session_id: request.run.spec.session_id.clone(),
                                     run_id: run_id.clone(),
@@ -1163,16 +1327,36 @@ async fn execute_model_run(
                                 emit_failure(&inner, &request, &user_message, failure);
                                 return;
                             }
-                            emit_delivery(
+                            match try_emit_delivery(
                                 &inner,
                                 &request,
-                                user_message,
-                                response,
-                                has_usage.then_some(total_usage),
+                                response.clone(),
+                                has_usage.then_some(total_usage.clone()),
                                 tool_call_count,
-                                supporting_event_ids,
-                            );
-                            return;
+                                supporting_event_ids.clone(),
+                            ) {
+                                DeliveryCommit::Committed => {
+                                    finish_session(&inner, &request);
+                                    return;
+                                }
+                                DeliveryCommit::SteerPending => {
+                                    model_messages
+                                        .push(ModelMessage::text(ModelRole::Assistant, response));
+                                    if let Err(failure) =
+                                        commit_queued_steers(&inner, &request, &mut model_messages)
+                                            .await
+                                    {
+                                        emit_failure(&inner, &request, &user_message, failure);
+                                        return;
+                                    }
+                                    continue 'model_rounds;
+                                }
+                                DeliveryCommit::CancelPending => {
+                                    emit_cancel(&inner, &request, &user_message);
+                                    return;
+                                }
+                                DeliveryCommit::AlreadyTerminal => return,
+                            }
                         }
                         ModelFinishReason::Length => {
                             emit_incomplete(
@@ -1251,6 +1435,41 @@ async fn execute_model_run(
                     let mut tool_results = Vec::with_capacity(parsed_calls.len());
                     let mut activated_context_messages = Vec::new();
                     for (call, arguments) in parsed_calls {
+                        if call.name == REQUEST_INPUT_TOOL_NAME {
+                            let prompt = match parse_input_request(arguments) {
+                                Ok(prompt) => prompt,
+                                Err(failure) => {
+                                    emit_failure(&inner, &request, &user_message, failure);
+                                    return;
+                                }
+                            };
+                            let result = match await_agent_input(
+                                inner.clone(),
+                                &run_id,
+                                round,
+                                &call.call_id,
+                                prompt,
+                                cancellation.clone(),
+                            )
+                            .await
+                            {
+                                InputWaitOutcome::Resolved(result) => result,
+                                InputWaitOutcome::Cancelled => {
+                                    emit_cancel(&inner, &request, &user_message);
+                                    return;
+                                }
+                                InputWaitOutcome::Failed(failure) => {
+                                    emit_failure(&inner, &request, &user_message, failure);
+                                    return;
+                                }
+                            };
+                            tool_results.push(ModelContent::ToolResult {
+                                call_id: call.call_id,
+                                result,
+                                is_error: false,
+                            });
+                            continue;
+                        }
                         if call.name == SKILL_ACTIVATE_TOOL_NAME {
                             let Some(skills) = run_skills.as_ref() else {
                                 emit_failure(
@@ -1572,6 +1791,179 @@ async fn execute_model_run(
         RunLimitKind::ModelSteps,
         "model step limit reached",
     );
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InputRequestArguments {
+    prompt: String,
+}
+
+fn parse_input_request(arguments: serde_json::Value) -> Result<String, AgentFailure> {
+    let arguments =
+        serde_json::from_value::<InputRequestArguments>(arguments).map_err(|error| {
+            agent_failure(
+                "input_request_arguments_invalid",
+                format!("model emitted invalid input request arguments: {error}"),
+                false,
+            )
+        })?;
+    if arguments.prompt.trim().is_empty() {
+        return Err(agent_failure(
+            "input_request_arguments_invalid",
+            "input request prompt must not be empty",
+            false,
+        ));
+    }
+    Ok(arguments.prompt)
+}
+
+enum InputWaitOutcome {
+    Resolved(serde_json::Value),
+    Cancelled,
+    Failed(AgentFailure),
+}
+
+async fn await_agent_input(
+    inner: Arc<GenericInner>,
+    run_id: &RunId,
+    round: u64,
+    model_call_id: &ModelToolCallId,
+    prompt: String,
+    cancellation: CancellationToken,
+) -> InputWaitOutcome {
+    let request_id = RequestId::new(format!(
+        "input:{}:{round}:{}",
+        run_id.as_str(),
+        model_call_id.as_str()
+    ));
+    let (responder, response) = oneshot::channel();
+    let registration = {
+        let mut state = inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match state.runs.get_mut(run_id) {
+            None => Err(agent_failure(
+                "input_run_missing",
+                "Run disappeared before its input request was opened",
+                true,
+            )),
+            Some(run) if run.terminal || run.pending_inputs.contains_key(&request_id) => {
+                Err(agent_failure(
+                    "input_request_conflict",
+                    "input request identity is no longer available",
+                    false,
+                ))
+            }
+            Some(run) => {
+                run.pending_inputs.insert(
+                    request_id.clone(),
+                    PendingInput {
+                        responder: Some(responder),
+                    },
+                );
+                Ok(())
+            }
+        }
+    };
+    if let Err(failure) = registration {
+        return InputWaitOutcome::Failed(failure);
+    }
+    publish_durable(
+        &inner,
+        run_id,
+        AgentEventDraft {
+            event_id: AgentEventId::new(format!(
+                "generic-{}-input-{round}-{}-opened",
+                run_id.as_str(),
+                model_call_id.as_str()
+            )),
+            run_id: run_id.clone(),
+            causation_id: None,
+            source_fingerprint: None,
+            payload: AgentEvent::RequestOpened {
+                request: PendingRequest {
+                    request_id: request_id.clone(),
+                    blocking: true,
+                    payload: PendingRequestPayload::Input {
+                        prompt: vec![Content::text(prompt)],
+                        input_schema: None,
+                    },
+                },
+            },
+        },
+    );
+
+    let response = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => None,
+        response = response => Some(response),
+    };
+    let Some(response) = response else {
+        remove_pending_input(&inner, run_id, &request_id);
+        return InputWaitOutcome::Cancelled;
+    };
+    let response = match response {
+        Ok(response) => response,
+        Err(_) => {
+            remove_pending_input(&inner, run_id, &request_id);
+            return InputWaitOutcome::Failed(agent_failure(
+                "input_waiter_closed",
+                "input response channel closed before resolution",
+                true,
+            ));
+        }
+    };
+    let resolution_digest = match response.resolution.digest() {
+        Ok(digest) => digest,
+        Err(error) => {
+            return InputWaitOutcome::Failed(agent_failure(
+                "input_resolution_invalid",
+                error.to_string(),
+                false,
+            ));
+        }
+    };
+    publish_durable(
+        &inner,
+        run_id,
+        AgentEventDraft {
+            event_id: AgentEventId::new(format!(
+                "generic-{}-input-{round}-{}-resolved",
+                run_id.as_str(),
+                model_call_id.as_str()
+            )),
+            run_id: run_id.clone(),
+            causation_id: Some(response.command_id),
+            source_fingerprint: None,
+            payload: AgentEvent::RequestResolved {
+                request_id,
+                resolution: response.resolution.clone(),
+                resolution_digest,
+            },
+        },
+    );
+    match response.resolution {
+        RequestResolution::Input { content } => InputWaitOutcome::Resolved(serde_json::json!({
+            "content": content,
+        })),
+        _ => InputWaitOutcome::Failed(agent_failure(
+            "input_resolution_invalid",
+            "input request received a non-input resolution",
+            false,
+        )),
+    }
+}
+
+fn remove_pending_input(inner: &GenericInner, run_id: &RunId, request_id: &RequestId) {
+    let mut state = inner
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(run) = state.runs.get_mut(run_id) {
+        run.pending_inputs.remove(request_id);
+    }
 }
 
 enum ApprovalWaitOutcome {
@@ -2192,8 +2584,12 @@ fn add_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
 }
 
 fn agent_input_message(request: &AgentStartRequest) -> Result<ModelMessage, AgentProtocolError> {
-    let mut content = Vec::with_capacity(request.run.spec.input.len());
-    for item in &request.run.spec.input {
+    agent_content_message(&request.run.spec.input)
+}
+
+fn agent_content_message(items: &[Content]) -> Result<ModelMessage, AgentProtocolError> {
+    let mut content = Vec::with_capacity(items.len());
+    for item in items {
         match (&item.media_type[..], &item.body) {
             ("text/plain", ContentBody::Inline(serde_json::Value::String(text)))
                 if !text.is_empty() =>
@@ -2212,6 +2608,65 @@ fn agent_input_message(request: &AgentStartRequest) -> Result<ModelMessage, Agen
         role: ModelRole::User,
         content,
     })
+}
+
+fn take_queued_steers(inner: &GenericInner, run_id: &RunId) -> Vec<QueuedSteer> {
+    let mut state = inner
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state
+        .runs
+        .get_mut(run_id)
+        .map(|run| run.queued_steers.drain(..).collect())
+        .unwrap_or_default()
+}
+
+async fn commit_queued_steers(
+    inner: &GenericInner,
+    request: &AgentStartRequest,
+    model_messages: &mut Vec<ModelMessage>,
+) -> Result<usize, AgentFailure> {
+    let run_id = &request.run.spec.run_id;
+    let queued = take_queued_steers(inner, run_id);
+    let count = queued.len();
+    for steer in queued {
+        append_session_event(
+            inner,
+            AgentSessionEventDraft {
+                event_id: AgentSessionEventId::new(format!(
+                    "generic-{}-steer-{}",
+                    run_id.as_str(),
+                    steer.command_id.as_str()
+                )),
+                session_id: request.run.spec.session_id.clone(),
+                run_id: run_id.clone(),
+                payload: AgentSessionEvent::RunInputCommitted {
+                    message: steer.message.clone(),
+                },
+            },
+        )
+        .await?;
+        publish_durable(
+            inner,
+            run_id,
+            AgentEventDraft {
+                event_id: AgentEventId::new(format!(
+                    "generic-{}-steer-{}-committed",
+                    run_id.as_str(),
+                    steer.command_id.as_str()
+                )),
+                run_id: run_id.clone(),
+                causation_id: Some(steer.command_id),
+                source_fingerprint: None,
+                payload: AgentEvent::InputCommitted {
+                    content: steer.content,
+                },
+            },
+        );
+        model_messages.push(steer.message);
+    }
+    Ok(count)
 }
 
 fn publish_durable(inner: &GenericInner, run_id: &RunId, draft: AgentEventDraft) {
@@ -2253,57 +2708,80 @@ fn publish_telemetry(inner: &GenericInner, run_id: &RunId, telemetry: AgentTelem
     }
 }
 
-fn emit_delivery(
+enum DeliveryCommit {
+    Committed,
+    SteerPending,
+    CancelPending,
+    AlreadyTerminal,
+}
+
+fn try_emit_delivery(
     inner: &GenericInner,
     request: &AgentStartRequest,
-    user_message: ModelMessage,
     response: String,
     usage: Option<ModelUsage>,
     tool_calls: u64,
     mut supporting_event_ids: Vec<AgentEventId>,
-) {
+) -> DeliveryCommit {
     let run_id = &request.run.spec.run_id;
     let output_event_id = AgentEventId::new(format!("generic-{}-output", run_id.as_str()));
-    publish_durable(
-        inner,
-        run_id,
-        AgentEventDraft {
-            event_id: output_event_id.clone(),
-            run_id: run_id.clone(),
-            causation_id: None,
-            source_fingerprint: None,
-            payload: AgentEvent::OutputCommitted {
-                output_id: OutputId::new(format!("generic-{}-response", run_id.as_str())),
-                content: vec![Content::text(response.clone())],
-            },
+    let output = AgentEventDraft {
+        event_id: output_event_id.clone(),
+        run_id: run_id.clone(),
+        causation_id: None,
+        source_fingerprint: None,
+        payload: AgentEvent::OutputCommitted {
+            output_id: OutputId::new(format!("generic-{}-response", run_id.as_str())),
+            content: vec![Content::text(response.clone())],
         },
-    );
+    };
     supporting_event_ids.push(output_event_id);
-    publish_durable(
-        inner,
-        run_id,
-        AgentEventDraft {
-            event_id: AgentEventId::new(format!("generic-{}-delivered", run_id.as_str())),
-            run_id: run_id.clone(),
-            causation_id: None,
-            source_fingerprint: None,
-            payload: AgentEvent::DeliveryCommitted {
-                delivery: AgentDelivery {
-                    delivery_id: DeliveryId::new(format!("generic-{}-delivery", run_id.as_str())),
-                    run_id: run_id.clone(),
-                    spec_digest: request.run.spec_digest.clone(),
-                    final_response: Content::text(response.clone()),
-                    outputs: Vec::new(),
-                    artifacts: Vec::new(),
-                    unresolved_issues: Vec::new(),
-                    usage: agent_usage(usage, tool_calls),
-                    provenance: provenance(inner, supporting_event_ids),
-                },
+    let delivery = AgentEventDraft {
+        event_id: AgentEventId::new(format!("generic-{}-delivered", run_id.as_str())),
+        run_id: run_id.clone(),
+        causation_id: None,
+        source_fingerprint: None,
+        payload: AgentEvent::DeliveryCommitted {
+            delivery: AgentDelivery {
+                delivery_id: DeliveryId::new(format!("generic-{}-delivery", run_id.as_str())),
+                run_id: run_id.clone(),
+                spec_digest: request.run.spec_digest.clone(),
+                final_response: Content::text(response),
+                outputs: Vec::new(),
+                artifacts: Vec::new(),
+                unresolved_issues: Vec::new(),
+                usage: agent_usage(usage, tool_calls),
+                provenance: provenance(inner, supporting_event_ids),
             },
         },
-    );
-    let _ = user_message;
-    finish_session(inner, request);
+    };
+
+    let mut state = inner
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(run) = state.runs.get_mut(run_id) else {
+        return DeliveryCommit::AlreadyTerminal;
+    };
+    if run.terminal {
+        return DeliveryCommit::AlreadyTerminal;
+    }
+    if run.cancel_command.is_some() {
+        return DeliveryCommit::CancelPending;
+    }
+    if !run.queued_steers.is_empty() {
+        return DeliveryCommit::SteerPending;
+    }
+    run.durable_events.push(output.clone());
+    run.durable_events.push(delivery.clone());
+    run.terminal = true;
+    let _ = run
+        .sender
+        .send(AgentProviderStreamItem::Event(Box::new(output)));
+    let _ = run
+        .sender
+        .send(AgentProviderStreamItem::Event(Box::new(delivery)));
+    DeliveryCommit::Committed
 }
 
 fn emit_incomplete(
@@ -2527,10 +3005,32 @@ fn model_definitions_for_run(
         .as_ref()
         .map(|tools| tools.model_definitions.clone())
         .unwrap_or_default();
+    if inner.backend.descriptor().capabilities.tool_calls {
+        definitions.push(request_input_definition());
+    }
     if skill_catalog_bound {
         definitions.push(skill_activate_definition());
     }
     definitions
+}
+
+fn request_input_definition() -> ModelToolDefinition {
+    ModelToolDefinition {
+        name: REQUEST_INPUT_TOOL_NAME.to_owned(),
+        description: "Ask the user for information that is required before the current Run can continue. Use only when the answer cannot be derived from available context or Tools.".to_owned(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "required": ["prompt"],
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "A concise question for the user"
+                }
+            },
+            "additionalProperties": false
+        }),
+    }
 }
 
 fn system_message_for_run(
@@ -2673,6 +3173,7 @@ fn generic_config_digest(
     tools: Option<&[ModelToolDefinition]>,
     skills: Option<&orchestral_core::skill_protocol::SkillCatalogDescriptor>,
     approval_enabled: bool,
+    input_requests_enabled: bool,
 ) -> Result<Digest, AgentProtocolError> {
     let value = serde_json::json!({
         "provider_id": config.provider_id,
@@ -2686,6 +3187,8 @@ fn generic_config_digest(
         "tools": tools.unwrap_or_default(),
         "skill_catalog": skills,
         "approval_enabled": approval_enabled,
+        "input_requests_enabled": input_requests_enabled,
+        "steer_enabled": true,
     });
     let bytes = serde_jcs::to_vec(&value).map_err(|error| {
         AgentProtocolError::new(

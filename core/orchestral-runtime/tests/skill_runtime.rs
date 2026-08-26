@@ -55,8 +55,11 @@ impl ModelBackend for SkillActivationModel {
         _cancellation: CancellationToken,
     ) -> Result<ModelStream, ModelError> {
         request.validate()?;
-        assert_eq!(request.tools.len(), 1);
-        assert_eq!(request.tools[0].name, SKILL_FUNCTION);
+        assert!(request.tools.iter().any(|tool| tool.name == SKILL_FUNCTION));
+        assert!(request
+            .tools
+            .iter()
+            .any(|tool| tool.name == "orchestral_request_input"));
         let round = self.rounds.fetch_add(1, Ordering::SeqCst);
         let system = system_text(&request.messages);
         let request_id = request.request_id;
@@ -152,7 +155,8 @@ impl ModelBackend for UnboundCatalogModel {
         _cancellation: CancellationToken,
     ) -> Result<ModelStream, ModelError> {
         request.validate()?;
-        assert!(request.tools.is_empty());
+        assert_eq!(request.tools.len(), 1);
+        assert_eq!(request.tools[0].name, "orchestral_request_input");
         let system = system_text(&request.messages);
         assert!(!system.contains("Spreadsheet workflow"));
         assert!(!system.contains(SECRET_INSTRUCTIONS));

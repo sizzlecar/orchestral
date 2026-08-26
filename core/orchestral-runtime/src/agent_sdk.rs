@@ -10,8 +10,9 @@ use std::sync::Arc;
 use orchestral_core::agent_protocol::{
     reference::AgentRunStatus,
     wire::{
-        AgentCommandEnvelope, AgentExecutionRef, AgentJournalRecord, AgentRunEnvelope,
-        AgentRunView, AgentSessionId, CommandAck, Content, ContentBody, ResourceBinding, RunId,
+        AgentCommand, AgentCommandEnvelope, AgentExecutionRef, AgentJournalRecord,
+        AgentRunEnvelope, AgentRunView, AgentSessionId, CommandAck, CommandId, Content,
+        ContentBody, RequestId, RequestResolution, ResourceBinding, RunId,
     },
     AGENT_PROTOCOL_V1,
 };
@@ -146,6 +147,48 @@ impl AgentRunHandle {
 
     pub async fn cancel(&self, reason: impl Into<String>) -> Result<CommandAck, AgentSdkError> {
         Ok(self.controller.cancel(&self.run_id, reason).await?)
+    }
+
+    pub async fn steer_text(&self, input: impl Into<String>) -> Result<CommandAck, AgentSdkError> {
+        let input = input.into();
+        if input.trim().is_empty() {
+            return Err(AgentSdkError::InvalidInput(
+                "Steer input must not be empty".to_owned(),
+            ));
+        }
+        let command = AgentCommandEnvelope::new(
+            CommandId::new(format!("sdk-steer-{}", uuid::Uuid::new_v4())),
+            self.run_id.clone(),
+            None,
+            AgentCommand::Steer {
+                content: vec![Content::text(input)],
+            },
+        )?;
+        self.command(command).await
+    }
+
+    pub async fn resolve_input_text(
+        &self,
+        request_id: RequestId,
+        input: impl Into<String>,
+    ) -> Result<CommandAck, AgentSdkError> {
+        let input = input.into();
+        if input.trim().is_empty() {
+            return Err(AgentSdkError::InvalidInput(
+                "Input resolution must not be empty".to_owned(),
+            ));
+        }
+        let command = AgentCommandEnvelope::new(
+            CommandId::new(format!("sdk-input-{}", uuid::Uuid::new_v4())),
+            self.run_id.clone(),
+            Some(request_id),
+            AgentCommand::ResolveRequest {
+                response: RequestResolution::Input {
+                    content: vec![Content::text(input)],
+                },
+            },
+        )?;
+        self.command(command).await
     }
 
     pub async fn wait_until_blocked(&self) -> Result<AgentTurn, AgentSdkError> {
