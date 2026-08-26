@@ -180,6 +180,28 @@ struct StoredCommand {
     outcome: ProviderCommandOutcome,
 }
 
+struct GenericExecutionSeed {
+    publish_start: bool,
+    next_model_round: u64,
+    total_usage: ModelUsage,
+    tool_call_count: u64,
+    last_response: String,
+    supporting_event_ids: Vec<AgentEventId>,
+}
+
+impl GenericExecutionSeed {
+    fn fresh() -> Self {
+        Self {
+            publish_start: true,
+            next_model_round: 1,
+            total_usage: ModelUsage::default(),
+            tool_call_count: 0,
+            last_response: String::new(),
+            supporting_event_ids: Vec::new(),
+        }
+    }
+}
+
 impl InternalGenericAgentProvider {
     /// Replaces the process-lifetime checkpoint WAL before this Provider is
     /// cloned or bound to a controller.
@@ -625,70 +647,18 @@ impl AgentProvider for InternalGenericAgentProvider {
             (stream, cancellation, steer_updates)
         };
 
-        let input_event = AgentSessionEventDraft {
-            event_id: AgentSessionEventId::new(format!(
-                "generic-{}-input",
-                request.run.spec.run_id.as_str()
-            )),
-            session_id: request.run.spec.session_id.clone(),
-            run_id: request.run.spec.run_id.clone(),
-            payload: AgentSessionEvent::RunInputCommitted {
-                message: user_message.clone(),
-            },
-        };
         let model_definitions = model_definitions_for_run(&self.inner, run_skills.is_some());
-        let system_message = system_message_for_run(&self.inner.config, run_skills.as_deref());
-        let context_result = async {
-            self.inner.session_journal.append(input_event).await?;
-            let backend_context_limit = self
-                .inner
-                .backend
-                .descriptor()
-                .capabilities
-                .max_context_tokens
-                .unwrap_or(self.inner.config.max_context_tokens)
-                .min(self.inner.config.max_context_tokens);
-            let max_context_tokens = request
-                .run
-                .spec
-                .limits
-                .max_input_tokens
-                .map(|limit| {
-                    limit
-                        .saturating_add(self.inner.config.reserved_output_tokens)
-                        .min(backend_context_limit)
-                })
-                .unwrap_or(backend_context_limit);
-            self.inner
-                .context_engine
-                .project(SessionContextRequest {
-                    session_id: request.run.spec.session_id.clone(),
-                    current_run_id: request.run.spec.run_id.clone(),
-                    system_message,
-                    tools: model_definitions.clone(),
-                    max_context_tokens,
-                    reserved_output_tokens: self.inner.config.reserved_output_tokens,
-                    config_digest: self.inner.config_digest.clone(),
-                    allowed_skill_digests: run_skills
-                        .as_ref()
-                        .map(|skills| {
-                            skills
-                                .catalog()
-                                .skills
-                                .iter()
-                                .map(|descriptor| {
-                                    (descriptor.skill_id.clone(), descriptor.digest.clone())
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                })
-                .await
-        }
+        let context_result = project_model_messages(
+            &self.inner,
+            &request,
+            &model_definitions,
+            run_skills.as_deref(),
+            Some(user_message.clone()),
+        )
         .await;
 
         let model_messages = match context_result {
-            Ok(context) => context.messages,
+            Ok(messages) => messages,
             Err(error) => {
                 let inner = self.inner.clone();
                 let failed_request = request.clone();
@@ -742,6 +712,7 @@ impl AgentProvider for InternalGenericAgentProvider {
                 model_messages,
                 model_definitions,
                 run_skills,
+                GenericExecutionSeed::fresh(),
                 cancellation,
                 steer_updates,
             )
@@ -1239,6 +1210,70 @@ fn record_command(
     })
 }
 
+async fn project_model_messages(
+    inner: &GenericInner,
+    request: &AgentStartRequest,
+    model_definitions: &[ModelToolDefinition],
+    run_skills: Option<&SkillRuntime>,
+    initial_input: Option<ModelMessage>,
+) -> Result<Vec<ModelMessage>, SessionContextError> {
+    if let Some(message) = initial_input {
+        inner
+            .session_journal
+            .append(AgentSessionEventDraft {
+                event_id: AgentSessionEventId::new(format!(
+                    "generic-{}-input",
+                    request.run.spec.run_id.as_str()
+                )),
+                session_id: request.run.spec.session_id.clone(),
+                run_id: request.run.spec.run_id.clone(),
+                payload: AgentSessionEvent::RunInputCommitted { message },
+            })
+            .await?;
+    }
+    let backend_context_limit = inner
+        .backend
+        .descriptor()
+        .capabilities
+        .max_context_tokens
+        .unwrap_or(inner.config.max_context_tokens)
+        .min(inner.config.max_context_tokens);
+    let max_context_tokens = request
+        .run
+        .spec
+        .limits
+        .max_input_tokens
+        .map(|limit| {
+            limit
+                .saturating_add(inner.config.reserved_output_tokens)
+                .min(backend_context_limit)
+        })
+        .unwrap_or(backend_context_limit);
+    inner
+        .context_engine
+        .project(SessionContextRequest {
+            session_id: request.run.spec.session_id.clone(),
+            current_run_id: request.run.spec.run_id.clone(),
+            system_message: system_message_for_run(&inner.config, run_skills),
+            tools: model_definitions.to_vec(),
+            max_context_tokens,
+            reserved_output_tokens: inner.config.reserved_output_tokens,
+            config_digest: inner.config_digest.clone(),
+            allowed_skill_digests: run_skills
+                .map(|skills| {
+                    skills
+                        .catalog()
+                        .skills
+                        .iter()
+                        .map(|descriptor| (descriptor.skill_id.clone(), descriptor.digest.clone()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        })
+        .await
+        .map(|projection| projection.messages)
+}
+
 async fn execute_model_run(
     inner: Arc<GenericInner>,
     request: AgentStartRequest,
@@ -1247,42 +1282,54 @@ async fn execute_model_run(
     mut model_messages: Vec<ModelMessage>,
     model_tools: Vec<ModelToolDefinition>,
     run_skills: Option<Arc<SkillRuntime>>,
+    seed: GenericExecutionSeed,
     cancellation: CancellationToken,
     mut steer_updates: watch::Receiver<u64>,
 ) {
     let run_id = request.run.spec.run_id.clone();
-    for (index, skip) in admission.skipped_optional_bindings.into_iter().enumerate() {
+    let GenericExecutionSeed {
+        publish_start,
+        next_model_round,
+        mut total_usage,
+        mut tool_call_count,
+        mut last_response,
+        mut supporting_event_ids,
+    } = seed;
+    let started_event_id = AgentEventId::new(format!("generic-{}-started", run_id.as_str()));
+    if publish_start {
+        for (index, skip) in admission.skipped_optional_bindings.into_iter().enumerate() {
+            if !publish_durable(
+                &inner,
+                &run_id,
+                AgentEventDraft {
+                    event_id: AgentEventId::new(format!(
+                        "generic-{}-resource-skip-{}",
+                        run_id.as_str(),
+                        index + 1
+                    )),
+                    run_id: run_id.clone(),
+                    causation_id: None,
+                    source_fingerprint: None,
+                    payload: AgentEvent::ResourceBindingSkipped { skip },
+                },
+            ) {
+                return;
+            }
+        }
         if !publish_durable(
             &inner,
             &run_id,
             AgentEventDraft {
-                event_id: AgentEventId::new(format!(
-                    "generic-{}-resource-skip-{}",
-                    run_id.as_str(),
-                    index + 1
-                )),
+                event_id: started_event_id.clone(),
                 run_id: run_id.clone(),
                 causation_id: None,
                 source_fingerprint: None,
-                payload: AgentEvent::ResourceBindingSkipped { skip },
+                payload: AgentEvent::RunStarted,
             },
         ) {
             return;
         }
-    }
-    let started_event_id = AgentEventId::new(format!("generic-{}-started", run_id.as_str()));
-    if !publish_durable(
-        &inner,
-        &run_id,
-        AgentEventDraft {
-            event_id: started_event_id.clone(),
-            run_id: run_id.clone(),
-            causation_id: None,
-            source_fingerprint: None,
-            payload: AgentEvent::RunStarted,
-        },
-    ) {
-        return;
+        supporting_event_ids.push(started_event_id.clone());
     }
 
     let model_round_limit = request
@@ -1299,13 +1346,9 @@ async fn execute_model_run(
         .max_tool_calls
         .unwrap_or(inner.config.max_tool_calls)
         .min(inner.config.max_tool_calls);
-    let mut total_usage = ModelUsage::default();
-    let mut has_usage = false;
-    let mut tool_call_count = 0;
-    let mut last_response = String::new();
-    let mut supporting_event_ids = vec![started_event_id.clone()];
+    let mut has_usage = total_usage.input_tokens.is_some() || total_usage.output_tokens.is_some();
 
-    'model_rounds: for round in 1..=model_round_limit {
+    'model_rounds: for round in next_model_round..=model_round_limit {
         steer_updates.borrow_and_update();
         if let Err(failure) = commit_queued_steers(&inner, &request, &mut model_messages).await {
             emit_failure(&inner, &request, &user_message, failure);
