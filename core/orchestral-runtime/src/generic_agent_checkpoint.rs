@@ -15,6 +15,7 @@ use orchestral_core::agent_protocol::wire::{
 use orchestral_core::model_protocol::{
     ModelFinishReason, ModelRequestId, ModelToolCallId, ModelUsage,
 };
+use orchestral_core::tool_protocol::ApprovalCapability;
 use serde::{Deserialize, Serialize};
 
 macro_rules! string_id {
@@ -161,6 +162,8 @@ pub enum GenericCheckpointEvent {
     CommandCommitted {
         command: AgentCommandEnvelope,
         outcome: ProviderCommandOutcome,
+        #[serde(default)]
+        approval_capability: Option<ApprovalCapability>,
     },
     /// Provider drafts are persisted before they enter the live Provider
     /// stream. A delivery batch may contain OutputCommitted followed by the
@@ -210,12 +213,39 @@ impl GenericCheckpointEvent {
                 }
                 observation.validate()?;
             }
-            Self::CommandCommitted { command, outcome } => {
+            Self::CommandCommitted {
+                command,
+                outcome,
+                approval_capability,
+            } => {
                 command.verify_digest().map_err(invalid_data)?;
                 outcome.validate_shape().map_err(invalid_data)?;
                 if command.run_id != *run_id {
                     return Err(GenericCheckpointError::InvalidData(
                         "checkpoint command crossed a Run boundary".to_owned(),
+                    ));
+                }
+                let accepted_allow = matches!(
+                    (&command.payload, outcome),
+                    (
+                        orchestral_core::agent_protocol::wire::AgentCommand::ResolveRequest {
+                            response: orchestral_core::agent_protocol::wire::RequestResolution::Approval {
+                                decision: orchestral_core::agent_protocol::wire::ApprovalDecision::Allow,
+                                ..
+                            }
+                        },
+                        ProviderCommandOutcome::Accepted
+                    )
+                );
+                if accepted_allow != approval_capability.is_some()
+                    || approval_capability.as_ref().is_some_and(|capability| {
+                        capability.claims.binding.run_id != *run_id
+                            || !capability.authenticator.is_sha256()
+                    })
+                {
+                    return Err(GenericCheckpointError::InvalidData(
+                        "checkpoint approval capability does not match its accepted command"
+                            .to_owned(),
                     ));
                 }
             }
@@ -414,6 +444,7 @@ pub struct GenericAgentCheckpointProjection {
 pub struct CommandCheckpoint {
     pub command: AgentCommandEnvelope,
     pub outcome: ProviderCommandOutcome,
+    pub approval_capability: Option<ApprovalCapability>,
 }
 
 pub fn replay_generic_agent_checkpoint(
@@ -530,9 +561,16 @@ pub fn replay_generic_agent_checkpoint(
                     observation: observation.clone(),
                 };
             }
-            GenericCheckpointEvent::CommandCommitted { command, outcome } => {
+            GenericCheckpointEvent::CommandCommitted {
+                command,
+                outcome,
+                approval_capability,
+            } => {
                 if let Some(existing) = commands.get(&command.command_id) {
-                    if existing.command != *command || existing.outcome != *outcome {
+                    if existing.command != *command
+                        || existing.outcome != *outcome
+                        || existing.approval_capability != *approval_capability
+                    {
                         return Err(GenericCheckpointError::InvalidData(
                             "command identity was reused with different checkpoint content"
                                 .to_owned(),
@@ -547,6 +585,7 @@ pub fn replay_generic_agent_checkpoint(
                     CommandCheckpoint {
                         command: command.clone(),
                         outcome: outcome.clone(),
+                        approval_capability: approval_capability.clone(),
                     },
                 );
             }

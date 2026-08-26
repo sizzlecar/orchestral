@@ -87,6 +87,7 @@ enum CheckpointCrashCut {
     InputRequestOpen,
     InputRequestResolve,
     InputToolExchangeBoundary,
+    ApprovalRequestResolve,
 }
 
 struct PausingCheckpointStore {
@@ -439,6 +440,13 @@ impl GenericAgentCheckpointStore for PausingCheckpointStore {
                 ) => events.iter().any(|event| {
                     matches!(&event.payload, AgentEvent::RequestResolved { resolution, .. }
                         if matches!(resolution, RequestResolution::Input { .. }))
+                }),
+                (
+                    CheckpointCrashCut::ApprovalRequestResolve,
+                    GenericCheckpointEvent::ProviderEventsCommitted { events },
+                ) => events.iter().any(|event| {
+                    matches!(&event.payload, AgentEvent::RequestResolved { resolution, .. }
+                        if matches!(resolution, RequestResolution::Approval { .. }))
                 }),
                 (
                     CheckpointCrashCut::InputToolExchangeBoundary,
@@ -2974,6 +2982,245 @@ async fn run_pending_approval_recovery(allow: bool) {
                 &record.payload,
                 AgentSessionEvent::ToolExchangeCommitted { .. }
             ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        checkpoint_store
+            .load_run(&run_id)
+            .expect("private WAL remains readable")
+            .expect("recovered Run remains registered")
+            .validate()
+            .expect("recovered WAL remains valid")
+            .phase,
+        GenericCheckpointPhase::Terminal
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepted_approval_recovers_without_a_second_allow() {
+    run_accepted_approval_recovery(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepted_denial_recovers_without_a_second_command() {
+    run_accepted_approval_recovery(false).await;
+}
+
+async fn run_accepted_approval_recovery(allow: bool) {
+    const SIGNING_KEY: &[u8] = b"0123456789abcdef0123456789abcdef";
+    let suffix = if allow { "allow" } else { "deny" };
+    let run_id = RunId::new(format!("accepted-approval-{suffix}-recovery-run"));
+    let command_id = CommandId::new(format!("accepted-approval-{suffix}-resolution"));
+    let checkpoint_store = Arc::new(PausingCheckpointStore::at(
+        CheckpointCrashCut::ApprovalRequestResolve,
+    ));
+    let effect_journal = Arc::new(InMemoryToolEffectJournalStore::default());
+    let session_journal = Arc::new(InMemoryAgentSessionJournalStore::default());
+    let host_journal = Arc::new(InMemoryAgentJournalStore::default());
+    let tool = Arc::new(EchoTool {
+        calls: AtomicUsize::new(0),
+    });
+    let bounds = ToolPolicyBounds {
+        allowed_effects: BTreeSet::from([EffectScope::Process]),
+        approval: ApprovalPolicy::Required,
+        max_timeout_ms: Some(1_000),
+        max_output_bytes: Some(1_024),
+        ..ToolPolicyBounds::default()
+    };
+    let config = GenericAgentConfig::new("internal-provider", "generic-agent");
+    let first_broker = Arc::new(
+        InMemoryHostApprovalBroker::new(SIGNING_KEY).expect("first approval broker is valid"),
+    );
+    let first_provider = Arc::new(
+        InternalGenericAgentProvider::new_with_tools_approval_and_session_journal(
+            Arc::new(ApprovalLoopModel {
+                rounds: AtomicUsize::new(0),
+                expect_allowed: allow,
+            }),
+            config.clone(),
+            durable_approval_runtime(SIGNING_KEY, &bounds, effect_journal.clone(), tool.clone()),
+            RunToolGrant {
+                bounds: bounds.clone(),
+            },
+            first_broker.clone(),
+            session_journal.clone(),
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+        .expect("first approval-capable Generic Agent starts")
+        .with_checkpoint_store(checkpoint_store.clone())
+        .expect("private WAL binds before the Provider is shared"),
+    );
+    let first_controller = Arc::new(
+        AgentController::with_journal_store(
+            first_provider,
+            ProviderBindingRef::new("accepted-approval-recovery-binding"),
+            host_journal.clone(),
+        )
+        .expect("first controller binds"),
+    );
+    let execution = first_controller
+        .start(
+            AgentRunEnvelope::new(
+                AGENT_PROTOCOL_V1,
+                AgentSessionId::new(format!("accepted-approval-{suffix}-recovery-session")),
+                run_id.clone(),
+                vec![Content::text("recover my accepted approval decision")],
+            )
+            .expect("valid approval Run"),
+        )
+        .await
+        .expect("Run starts");
+    let pending = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let view = first_controller
+                .inspect(&run_id)
+                .await
+                .expect("Run remains inspectable");
+            if let Some(request) = view.pending_requests.first() {
+                break request.clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first process opens the approval request");
+    let resolution = if allow {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("wall clock follows Unix epoch")
+            .as_millis() as i64;
+        let grant_ref = first_broker
+            .approve(&pending.request_id, now_ms + 60_000)
+            .expect("Host issues an exact approval grant");
+        RequestResolution::Approval {
+            decision: ApprovalDecision::Allow,
+            grant_ref: Some(grant_ref),
+        }
+    } else {
+        RequestResolution::Approval {
+            decision: ApprovalDecision::Deny,
+            grant_ref: None,
+        }
+    };
+    let paused = checkpoint_store.paused.notified();
+    let ack = first_controller
+        .command(
+            AgentCommandEnvelope::new(
+                command_id.clone(),
+                run_id.clone(),
+                Some(pending.request_id),
+                AgentCommand::ResolveRequest {
+                    response: resolution,
+                },
+            )
+            .expect("valid approval resolution"),
+        )
+        .await
+        .expect("approval decision is accepted");
+    assert!(matches!(ack.state, CommandAckState::Accepted { .. }));
+    tokio::time::timeout(std::time::Duration::from_secs(1), paused)
+        .await
+        .expect("RequestResolved reaches the injected crash cut");
+    let projection = checkpoint_store
+        .load_run(&run_id)
+        .expect("private WAL remains readable")
+        .expect("private Run remains registered")
+        .validate()
+        .expect("private WAL remains valid");
+    let checkpointed = projection
+        .commands
+        .get(&command_id)
+        .expect("accepted approval command is durable");
+    assert_eq!(checkpointed.approval_capability.is_some(), allow);
+    assert!(projection
+        .provider_events
+        .iter()
+        .all(|event| !matches!(&event.payload, AgentEvent::RequestResolved { .. })));
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+
+    checkpoint_store.release_as_crash();
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        first_controller.wait_for_terminal(&execution.run_id),
+    )
+    .await
+    .expect("simulated process loss reaches the Host")
+    .expect_err("accepted but unapplied approval is not terminal");
+    assert!(matches!(
+        error,
+        AgentControlError::ContinuityUnknown(ref actual) if actual == &run_id
+    ));
+    drop(first_controller);
+    checkpoint_store.allow_recovery_writes();
+
+    let replacement_model = Arc::new(ApprovalLoopModel {
+        rounds: AtomicUsize::new(1),
+        expect_allowed: allow,
+    });
+    let replacement_provider = Arc::new(
+        InternalGenericAgentProvider::new_with_tools_approval_and_session_journal(
+            replacement_model.clone(),
+            config,
+            durable_approval_runtime(SIGNING_KEY, &bounds, effect_journal, tool.clone()),
+            RunToolGrant { bounds },
+            Arc::new(
+                InMemoryHostApprovalBroker::new(SIGNING_KEY)
+                    .expect("replacement approval broker is valid"),
+            ),
+            session_journal,
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+        .expect("replacement approval-capable Generic Agent starts")
+        .with_checkpoint_store(checkpoint_store.clone())
+        .expect("replacement Provider binds the same private WAL"),
+    );
+    let replacement_controller = Arc::new(
+        AgentController::with_journal_store(
+            replacement_provider,
+            ProviderBindingRef::new("accepted-approval-recovery-binding"),
+            host_journal,
+        )
+        .expect("replacement controller binds"),
+    );
+    replacement_controller
+        .recover(&run_id)
+        .await
+        .expect("accepted approval decision is recoverable");
+    let view = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        replacement_controller.wait_for_terminal(&run_id),
+    )
+    .await
+    .expect("accepted approval continuation completes without another command")
+    .expect("accepted approval continuation reaches Delivery");
+    assert_eq!(view.state.status(), AgentRunStatus::Delivered);
+    assert!(view.pending_requests.is_empty());
+    assert_eq!(tool.calls.load(Ordering::SeqCst), usize::from(allow));
+    assert_eq!(replacement_model.rounds.load(Ordering::SeqCst), 2);
+    assert!(matches!(
+        replacement_controller
+            .command_ack(&run_id, &command_id)
+            .await
+            .expect("original approval command remains queryable")
+            .state,
+        CommandAckState::Applied { .. }
+    ));
+    let events = replacement_controller
+        .events(&run_id, 0)
+        .await
+        .expect("recovered Host Journal remains readable");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|record| matches!(&record.event.payload, AgentEvent::RequestOpened { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|record| matches!(&record.event.payload, AgentEvent::RequestResolved { .. }))
             .count(),
         1
     );

@@ -172,7 +172,14 @@ struct PendingApproval {
     responder: Option<oneshot::Sender<ApprovalResponse>>,
 }
 
+#[derive(Clone)]
 struct ApprovalResponse {
+    command_id: CommandId,
+    resolution: RequestResolution,
+    capability: Option<ApprovalCapability>,
+}
+
+struct RecoveredResolution {
     command_id: CommandId,
     resolution: RequestResolution,
     capability: Option<ApprovalCapability>,
@@ -181,8 +188,8 @@ struct ApprovalResponse {
 struct RecoveredApprovalWaiter {
     request_id: RequestId,
     binding: ApprovalBinding,
-    responder: oneshot::Sender<ApprovalResponse>,
-    response: oneshot::Receiver<ApprovalResponse>,
+    responder: Option<oneshot::Sender<ApprovalResponse>>,
+    response: Option<oneshot::Receiver<ApprovalResponse>>,
     bridge: Arc<dyn AgentApprovalBridge>,
 }
 
@@ -227,6 +234,7 @@ enum GenericRecoveryContinuation {
         arguments: serde_json::Value,
         request: PendingRequest,
         binding: Option<ApprovalBinding>,
+        committed_response: Option<ApprovalResponse>,
         response: Option<oneshot::Receiver<ApprovalResponse>>,
     },
 }
@@ -1108,8 +1116,13 @@ impl AgentProvider for InternalGenericAgentProvider {
             run.pending_approvals.remove(&request_id);
             return Ok(disposition);
         }
-        let disposition =
-            record_command(&self.inner, run, &command, ProviderCommandOutcome::Accepted)?;
+        let disposition = record_command_with_approval(
+            &self.inner,
+            run,
+            &command,
+            ProviderCommandOutcome::Accepted,
+            capability.clone(),
+        )?;
         let mut pending = run
             .pending_approvals
             .remove(&request_id)
@@ -1239,7 +1252,9 @@ fn checkpoint_recovery_events(
             GenericCheckpointEvent::ProviderEventsCommitted { events: committed } => {
                 events.extend(committed.iter().cloned());
             }
-            GenericCheckpointEvent::CommandCommitted { command, outcome } => {
+            GenericCheckpointEvent::CommandCommitted {
+                command, outcome, ..
+            } => {
                 events.push(
                     ProviderCommandDisposition {
                         command_id: command.command_id.clone(),
@@ -1470,6 +1485,7 @@ fn stage_approval_recovery(
             arguments,
             request,
             binding: None,
+            committed_response: None,
             response: None,
         },
     )
@@ -1482,6 +1498,7 @@ async fn prepare_recovered_approval(
     call: &GenericObservedToolCall,
     arguments: &serde_json::Value,
     opened_request: &PendingRequest,
+    attach_waiter: bool,
     cancellation: CancellationToken,
 ) -> Result<RecoveredApprovalWaiter, AgentProtocolError> {
     let tools = inner.tools.as_ref().ok_or_else(|| {
@@ -1558,17 +1575,22 @@ async fn prepare_recovered_approval(
             "reconstructed approval does not match the durable pending request",
         ));
     }
-    bridge
-        .stage(&request_id, binding.clone())
-        .await
-        .map_err(|error| {
-            AgentProtocolError::new(
-                AgentProtocolErrorCode::ProviderUnavailable,
-                format!("Host approval bridge could not restage the request: {error}"),
-            )
-            .with_retryable(true)
-        })?;
-    let (responder, response) = oneshot::channel();
+    let (responder, response) = if attach_waiter {
+        bridge
+            .stage(&request_id, binding.clone())
+            .await
+            .map_err(|error| {
+                AgentProtocolError::new(
+                    AgentProtocolErrorCode::ProviderUnavailable,
+                    format!("Host approval bridge could not restage the request: {error}"),
+                )
+                .with_retryable(true)
+            })?;
+        let (responder, response) = oneshot::channel();
+        (Some(responder), Some(response))
+    } else {
+        (None, None)
+    };
     Ok(RecoveredApprovalWaiter {
         request_id,
         binding,
@@ -1585,7 +1607,10 @@ fn validate_recovered_input_resolution(
 ) -> Result<(), AgentProtocolError> {
     let mut matching_commands = 0_usize;
     for record in records {
-        let GenericCheckpointEvent::CommandCommitted { command, outcome } = &record.payload else {
+        let GenericCheckpointEvent::CommandCommitted {
+            command, outcome, ..
+        } = &record.payload
+        else {
             continue;
         };
         if command.command_id != response.command_id {
@@ -1658,7 +1683,18 @@ fn stage_loop_recovery(
             ..
         } => {
             let expected_request_id = input_request_id(&run_id, *round, &call.call_id);
-            *committed_response = pending_resolutions.remove(&expected_request_id);
+            if let Some(recovered) = pending_resolutions.remove(&expected_request_id) {
+                if recovered.capability.is_some() {
+                    return Err(AgentProtocolError::new(
+                        AgentProtocolErrorCode::InvalidDigest,
+                        "input resolution unexpectedly carried an approval capability",
+                    ));
+                }
+                *committed_response = Some(InputResponse {
+                    command_id: recovered.command_id,
+                    resolution: recovered.resolution,
+                });
+            }
             if !pending_resolutions.is_empty() {
                 return Err(AgentProtocolError::new(
                     AgentProtocolErrorCode::InvalidDigest,
@@ -1681,14 +1717,50 @@ fn stage_loop_recovery(
                 }
             }
         }
-        GenericRecoveryContinuation::Approval { .. } if !pending_resolutions.is_empty() => {
-            return Err(AgentProtocolError::new(
-                AgentProtocolErrorCode::Unsupported,
-                "accepted approval resolution recovery is not yet supported",
-            ));
+        GenericRecoveryContinuation::Approval {
+            round,
+            call,
+            committed_response,
+            ..
+        } => {
+            let expected_request_id = approval_request_id(&run_id, *round, &call.call_id);
+            if let Some(recovered) = pending_resolutions.remove(&expected_request_id) {
+                let valid = matches!(
+                    (&recovered.resolution, &recovered.capability),
+                    (
+                        RequestResolution::Approval {
+                            decision: ApprovalDecision::Allow,
+                            ..
+                        },
+                        Some(_)
+                    ) | (
+                        RequestResolution::Approval {
+                            decision: ApprovalDecision::Deny,
+                            ..
+                        },
+                        None
+                    )
+                );
+                if !valid {
+                    return Err(AgentProtocolError::new(
+                        AgentProtocolErrorCode::InvalidDigest,
+                        "accepted approval resolution has inconsistent capability evidence",
+                    ));
+                }
+                *committed_response = Some(ApprovalResponse {
+                    command_id: recovered.command_id,
+                    resolution: recovered.resolution,
+                    capability: recovered.capability,
+                });
+            }
+            if !pending_resolutions.is_empty() {
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::InvalidDigest,
+                    "accepted request resolution crossed the recovered approval boundary",
+                ));
+            }
         }
-        GenericRecoveryContinuation::ModelLoop { .. }
-        | GenericRecoveryContinuation::Approval { .. } => {}
+        GenericRecoveryContinuation::ModelLoop { .. } => {}
     }
     let mut pending_inputs = BTreeMap::new();
     if let GenericRecoveryContinuation::Input {
@@ -1872,6 +1944,7 @@ fn stage_loop_recovery(
             arguments,
             request: opened_request,
             binding,
+            committed_response,
             response,
             ..
         } = &mut continuation
@@ -1883,19 +1956,33 @@ fn stage_loop_recovery(
                 call,
                 arguments,
                 opened_request,
+                committed_response.is_none(),
                 cancellation.clone(),
             )
             .await?;
-            run.pending_approvals.insert(
-                prepared.request_id.clone(),
-                PendingApproval {
-                    binding: prepared.binding.clone(),
-                    responder: Some(prepared.responder),
-                },
-            );
+            if committed_response.as_ref().is_some_and(|response| {
+                response
+                    .capability
+                    .as_ref()
+                    .is_some_and(|capability| capability.claims.binding != prepared.binding)
+            }) {
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::InvalidDigest,
+                    "persisted approval capability does not match the reconstructed binding",
+                ));
+            }
+            if let Some(responder) = prepared.responder {
+                run.pending_approvals.insert(
+                    prepared.request_id.clone(),
+                    PendingApproval {
+                        binding: prepared.binding.clone(),
+                        responder: Some(responder),
+                    },
+                );
+                staged_approval = Some((prepared.bridge.clone(), prepared.request_id.clone()));
+            }
             *binding = Some(prepared.binding);
-            *response = Some(prepared.response);
-            staged_approval = Some((prepared.bridge, prepared.request_id));
+            *response = prepared.response;
         }
         let install_result = {
             let mut state = inner
@@ -2013,6 +2100,7 @@ fn stage_loop_recovery(
                     call,
                     arguments,
                     binding,
+                    committed_response,
                     response,
                     ..
                 } => {
@@ -2033,7 +2121,8 @@ fn stage_loop_recovery(
                         call,
                         arguments,
                         binding.expect("recovered approval binding was prepared"),
-                        response.expect("recovered approval owns a response channel"),
+                        committed_response,
+                        response,
                     )
                     .await;
                 }
@@ -2067,7 +2156,7 @@ fn reconstruct_recovery_commands(
     (
         BTreeMap<CommandId, StoredCommand>,
         VecDeque<QueuedSteer>,
-        BTreeMap<RequestId, InputResponse>,
+        BTreeMap<RequestId, RecoveredResolution>,
     ),
     AgentProtocolError,
 > {
@@ -2088,7 +2177,12 @@ fn reconstruct_recovery_commands(
     let mut queued_steers = VecDeque::new();
     let mut pending_resolutions = BTreeMap::new();
     for record in records {
-        let GenericCheckpointEvent::CommandCommitted { command, outcome } = &record.payload else {
+        let GenericCheckpointEvent::CommandCommitted {
+            command,
+            outcome,
+            approval_capability,
+        } = &record.payload
+        else {
             continue;
         };
         commands.insert(
@@ -2131,9 +2225,10 @@ fn reconstruct_recovery_commands(
                 if pending_resolutions
                     .insert(
                         request_id,
-                        InputResponse {
+                        RecoveredResolution {
                             command_id: command.command_id.clone(),
                             resolution: response.clone(),
+                            capability: approval_capability.clone(),
                         },
                     )
                     .is_some()
@@ -2184,6 +2279,16 @@ fn record_command(
     command: &AgentCommandEnvelope,
     outcome: ProviderCommandOutcome,
 ) -> Result<ProviderCommandDisposition, AgentProtocolError> {
+    record_command_with_approval(inner, run, command, outcome, None)
+}
+
+fn record_command_with_approval(
+    inner: &GenericInner,
+    run: &mut GenericRun,
+    command: &AgentCommandEnvelope,
+    outcome: ProviderCommandOutcome,
+    approval_capability: Option<ApprovalCapability>,
+) -> Result<ProviderCommandDisposition, AgentProtocolError> {
     let disposition = ProviderCommandDisposition {
         command_id: command.command_id.clone(),
         run_id: command.run_id.clone(),
@@ -2203,6 +2308,7 @@ fn record_command(
         GenericCheckpointEvent::CommandCommitted {
             command: command.clone(),
             outcome: outcome.clone(),
+            approval_capability,
         },
     ) {
         return Err(poison_run_after_checkpoint_failure(run, failure));
@@ -3133,7 +3239,8 @@ async fn resume_observed_approval(
     call: GenericObservedToolCall,
     arguments: serde_json::Value,
     binding: ApprovalBinding,
-    response: oneshot::Receiver<ApprovalResponse>,
+    committed_response: Option<ApprovalResponse>,
+    response: Option<oneshot::Receiver<ApprovalResponse>>,
 ) {
     let run_id = request.run.spec.run_id.clone();
     let Some(tools) = inner.tools.as_ref() else {
@@ -3170,16 +3277,29 @@ async fn resume_observed_approval(
     }
     seed.tool_call_count = seed.tool_call_count.saturating_add(1);
 
-    let approval = await_recovered_tool_approval(
-        inner.clone(),
-        bridge,
-        &run_id,
-        round,
-        &call.call_id,
-        response,
-        cancellation.clone(),
-    )
-    .await;
+    let approval = if let Some(committed_response) = committed_response {
+        commit_approval_response(
+            &inner,
+            bridge.as_ref(),
+            &run_id,
+            round,
+            &call.call_id,
+            approval_request_id(&run_id, round, &call.call_id),
+            committed_response,
+        )
+        .await
+    } else {
+        await_recovered_tool_approval(
+            inner.clone(),
+            bridge,
+            &run_id,
+            round,
+            &call.call_id,
+            response.expect("pending recovered approval owns a response channel"),
+            cancellation.clone(),
+        )
+        .await
+    };
     let invocation = ToolInvocation {
         run_id: run_id.clone(),
         call_id: ToolCallId::new(call.call_id.as_str()),
