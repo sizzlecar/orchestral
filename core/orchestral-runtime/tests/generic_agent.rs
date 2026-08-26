@@ -7,7 +7,7 @@ use futures_util::{stream, StreamExt};
 use orchestral_core::{
     agent_protocol::{
         reference::AgentRunStatus,
-        spi::{AgentProvider, AgentRecoveryRequest},
+        spi::{AgentJournalStore, AgentProvider, AgentRecoveryRequest, InMemoryAgentJournalStore},
         wire::{
             AgentCommand, AgentCommandEnvelope, AgentEvent, AgentEventAuthority,
             AgentProtocolErrorCode, AgentProviderStreamItem, AgentRunEnvelope, AgentSessionId,
@@ -55,6 +55,45 @@ struct WalInspectingModel {
     checkpoint_store: Arc<InMemoryGenericAgentCheckpointStore>,
     run_id: RunId,
     observed_open_attempt: AtomicUsize,
+}
+
+struct RecoveryAfterRestoreModel {
+    host_journal: Arc<InMemoryAgentJournalStore>,
+    run_id: RunId,
+    starts: AtomicUsize,
+}
+
+#[derive(Default)]
+struct PausedAttemptState {
+    paused_once: bool,
+    release: bool,
+    crashed: bool,
+}
+
+#[derive(Default)]
+struct PausingModelAttemptCheckpointStore {
+    inner: InMemoryGenericAgentCheckpointStore,
+    state: std::sync::Mutex<PausedAttemptState>,
+    release: std::sync::Condvar,
+    paused: Notify,
+}
+
+impl PausingModelAttemptCheckpointStore {
+    fn release_as_crash(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.release = true;
+        self.release.notify_all();
+    }
+
+    fn allow_recovery_writes(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .crashed = false;
+    }
 }
 
 #[derive(Default)]
@@ -132,6 +171,61 @@ impl GenericAgentCheckpointStore for FailingCommandCheckpointStore {
             return Err(GenericCheckpointError::Unavailable(
                 "injected command WAL failure".to_owned(),
             ));
+        }
+        self.inner.append(run_id, expected_previous, draft)
+    }
+}
+
+impl GenericAgentCheckpointStore for PausingModelAttemptCheckpointStore {
+    fn load_run(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Option<StoredGenericAgentRun>, GenericCheckpointError> {
+        self.inner.load_run(run_id)
+    }
+
+    fn create_run(
+        &self,
+        registration: GenericAgentRunRegistration,
+    ) -> Result<CreateGenericRunOutcome, GenericCheckpointError> {
+        self.inner.create_run(registration)
+    }
+
+    fn append(
+        &self,
+        run_id: &RunId,
+        expected_previous: u64,
+        draft: GenericCheckpointDraft,
+    ) -> Result<AppendGenericCheckpointOutcome, GenericCheckpointError> {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.crashed {
+                return Err(GenericCheckpointError::Unavailable(
+                    "simulated Provider process loss".to_owned(),
+                ));
+            }
+            if !state.paused_once
+                && matches!(
+                    &draft.payload,
+                    GenericCheckpointEvent::ModelAttemptStarted { .. }
+                )
+            {
+                state.paused_once = true;
+                self.paused.notify_waiters();
+                while !state.release {
+                    state = self
+                        .release
+                        .wait(state)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+                state.crashed = true;
+                return Err(GenericCheckpointError::Unavailable(
+                    "simulated Provider process loss".to_owned(),
+                ));
+            }
         }
         self.inner.append(run_id, expected_previous, draft)
     }
@@ -290,6 +384,58 @@ impl ModelBackend for WalInspectingModel {
             Ok(ModelStreamEvent {
                 request_id,
                 event_id: ModelEventId::new("wal-finish"),
+                sequence: 2,
+                payload: ModelEvent::Finish {
+                    reason: ModelFinishReason::Stop,
+                },
+            }),
+        ])))
+    }
+}
+
+#[async_trait]
+impl ModelBackend for RecoveryAfterRestoreModel {
+    fn descriptor(&self) -> ModelDescriptor {
+        ModelDescriptor {
+            backend_id: "blocking-model".to_owned(),
+            capabilities: ModelCapabilities {
+                streaming: true,
+                ..ModelCapabilities::default()
+            },
+            extensions: Default::default(),
+        }
+    }
+
+    async fn start(
+        &self,
+        request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelStream, ModelError> {
+        request.validate()?;
+        let stored = self
+            .host_journal
+            .load_run(&self.run_id)
+            .await
+            .expect("Host journal remains readable")
+            .expect("Host Run remains registered");
+        assert!(stored
+            .records
+            .iter()
+            .any(|record| matches!(&record.event.payload, AgentEvent::ContinuityRestored { .. })));
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        let request_id = request.request_id;
+        Ok(Box::pin(stream::iter([
+            Ok(ModelStreamEvent {
+                request_id: request_id.clone(),
+                event_id: ModelEventId::new("recovered-answer"),
+                sequence: 1,
+                payload: ModelEvent::TextDelta {
+                    delta: "continued after durable recovery".to_owned(),
+                },
+            }),
+            Ok(ModelStreamEvent {
+                request_id,
+                event_id: ModelEventId::new("recovered-finish"),
                 sequence: 2,
                 payload: ModelEvent::Finish {
                     reason: ModelFinishReason::Stop,
@@ -1261,6 +1407,133 @@ async fn open_model_attempt_is_never_restarted_from_the_private_wal() {
         )
         .await
         .expect("cleanup cancellation is accepted");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stable_private_boundary_resumes_only_after_host_restores_continuity() {
+    let run_id = RunId::new("stable-recovery-run");
+    let checkpoint_store = Arc::new(PausingModelAttemptCheckpointStore::default());
+    let session_journal = Arc::new(InMemoryAgentSessionJournalStore::default());
+    let host_journal = Arc::new(InMemoryAgentJournalStore::default());
+    let config = GenericAgentConfig::new("internal-provider", "generic-agent");
+    let first_provider = Arc::new(
+        InternalGenericAgentProvider::new_with_session_journal(
+            Arc::new(BlockingModel),
+            config.clone(),
+            session_journal.clone(),
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+        .expect("first Generic Agent starts")
+        .with_checkpoint_store(checkpoint_store.clone())
+        .expect("private WAL binds before the Provider is shared"),
+    );
+    let first_controller = Arc::new(
+        AgentController::with_journal_store(
+            first_provider,
+            ProviderBindingRef::new("stable-recovery-binding"),
+            host_journal.clone(),
+        )
+        .expect("first controller binds"),
+    );
+    let paused = checkpoint_store.paused.notified();
+    let execution = first_controller
+        .start(
+            AgentRunEnvelope::new(
+                AGENT_PROTOCOL_V1,
+                AgentSessionId::new("stable-recovery-session"),
+                run_id.clone(),
+                vec![Content::text("continue from the last stable boundary")],
+            )
+            .expect("valid text Run"),
+        )
+        .await
+        .expect("Run starts");
+    tokio::time::timeout(std::time::Duration::from_secs(1), paused)
+        .await
+        .expect("first model attempt reaches the injected crash cut");
+    assert!(matches!(
+        checkpoint_store
+            .load_run(&run_id)
+            .expect("private WAL remains readable")
+            .expect("private Run remains registered")
+            .validate()
+            .expect("private WAL replays")
+            .phase,
+        GenericCheckpointPhase::Stable(_)
+    ));
+
+    checkpoint_store.release_as_crash();
+    let first_error = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        first_controller.wait_for_terminal(&execution.run_id),
+    )
+    .await
+    .expect("simulated process loss reaches the Host")
+    .expect_err("lost Provider continuity is not a terminal outcome");
+    assert!(matches!(
+        first_error,
+        AgentControlError::ContinuityUnknown(ref actual) if actual == &run_id
+    ));
+    drop(first_controller);
+    checkpoint_store.allow_recovery_writes();
+
+    let recovery_model = Arc::new(RecoveryAfterRestoreModel {
+        host_journal: host_journal.clone(),
+        run_id: run_id.clone(),
+        starts: AtomicUsize::new(0),
+    });
+    let replacement_provider = Arc::new(
+        InternalGenericAgentProvider::new_with_session_journal(
+            recovery_model.clone(),
+            config,
+            session_journal,
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+        .expect("replacement Generic Agent starts")
+        .with_checkpoint_store(checkpoint_store.clone())
+        .expect("same private WAL binds to the replacement Provider"),
+    );
+    let replacement_controller = Arc::new(
+        AgentController::with_journal_store(
+            replacement_provider,
+            ProviderBindingRef::new("stable-recovery-binding"),
+            host_journal,
+        )
+        .expect("replacement controller binds"),
+    );
+    replacement_controller
+        .recover(&run_id)
+        .await
+        .expect("stable private boundary reconciles");
+    let view = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        replacement_controller.wait_for_terminal(&run_id),
+    )
+    .await
+    .expect("reconstructed execution completes promptly")
+    .expect("reconstructed Run reaches an authoritative delivery");
+
+    assert_eq!(view.state.status(), AgentRunStatus::Delivered);
+    assert_eq!(
+        view.delivery
+            .as_ref()
+            .and_then(|delivery| match &delivery.final_response.body {
+                ContentBody::Inline(serde_json::Value::String(text)) => Some(text.as_str()),
+                _ => None,
+            }),
+        Some("continued after durable recovery")
+    );
+    assert_eq!(recovery_model.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        checkpoint_store
+            .load_run(&run_id)
+            .expect("private WAL remains readable")
+            .expect("recovered Run remains durable")
+            .validate()
+            .expect("recovered WAL replays")
+            .phase,
+        GenericCheckpointPhase::Terminal
+    );
 }
 
 #[tokio::test]

@@ -24,8 +24,8 @@ use orchestral_core::agent_protocol::{
         DeliveryId, Digest, EffectMediation, IncompleteReason, OutputId, PartialDelivery,
         PartialDeliveryId, PendingRequest, PendingRequestKind, PendingRequestPayload, Provenance,
         ProviderCommandDisposition, ProviderCommandOutcome, RequestId, RequestResolution,
-        ResourceBindingMode, ResourceBindingSkip, ResourceBindingSkipCode, ResourceCapability,
-        ResourceKind, RunId, RunLimitKind, TelemetryId, UsageReport,
+        ResourceBindingId, ResourceBindingMode, ResourceBindingSkip, ResourceBindingSkipCode,
+        ResourceCapability, ResourceKind, RunId, RunLimitKind, TelemetryId, UsageReport,
     },
     AGENT_PROTOCOL_V1,
 };
@@ -52,7 +52,8 @@ use crate::approval_bridge::AgentApprovalBridge;
 use crate::generic_agent_checkpoint::{
     CreateGenericRunOutcome, GenericAgentCheckpointStore, GenericAgentRunRegistration,
     GenericCheckpointDraft, GenericCheckpointError, GenericCheckpointEvent,
-    GenericCheckpointEventId, GenericCheckpointPhase, InMemoryGenericAgentCheckpointStore,
+    GenericCheckpointEventId, GenericCheckpointPhase, GenericLoopBoundary,
+    InMemoryGenericAgentCheckpointStore, StoredGenericAgentRun,
 };
 use crate::skill::{
     ActivatedSkillSet, SkillActivationOutcome, SkillActivationRequest, SkillRuntime,
@@ -181,7 +182,8 @@ struct StoredCommand {
 }
 
 struct GenericExecutionSeed {
-    publish_start: bool,
+    published_resource_skips: BTreeSet<ResourceBindingId>,
+    run_started: bool,
     next_model_round: u64,
     total_usage: ModelUsage,
     tool_call_count: u64,
@@ -192,7 +194,8 @@ struct GenericExecutionSeed {
 impl GenericExecutionSeed {
     fn fresh() -> Self {
         Self {
-            publish_start: true,
+            published_resource_skips: BTreeSet::new(),
+            run_started: false,
             next_model_round: 1,
             total_usage: ModelUsage::default(),
             tool_call_count: 0,
@@ -1121,10 +1124,11 @@ impl AgentProvider for InternalGenericAgentProvider {
                 "recovery identity or Generic Agent configuration does not match the private WAL",
             ));
         }
+        let recovery_events = checkpoint_recovery_events(&stored)?;
 
         match projection.phase {
             GenericCheckpointPhase::Terminal => {
-                let replay = stream::iter(checkpoint_recovery_events(&stored)?.into_iter().map(|draft| {
+                let replay = stream::iter(recovery_events.into_iter().map(|draft| {
                     Ok(AgentProviderStreamItem::Event(Box::new(draft)))
                 }))
                 .boxed();
@@ -1141,18 +1145,22 @@ impl AgentProvider for InternalGenericAgentProvider {
                 "round": round,
                 "request_id": request_id,
             }))),
-            GenericCheckpointPhase::Prepared | GenericCheckpointPhase::Stable(_) => {
-                Err(AgentProtocolError::new(
+            GenericCheckpointPhase::Stable(boundary) => stage_stable_recovery(
+                self.inner.clone(),
+                stored,
+                boundary,
+                recovery_events,
+            ),
+            GenericCheckpointPhase::Prepared => Err(AgentProtocolError::new(
                     AgentProtocolErrorCode::Unsupported,
-                    "Generic Agent execution reconstruction is not available at this checkpoint boundary",
-                ))
-            }
+                    "Generic Agent recovery cannot yet reconstruct a Run before its first stable loop boundary",
+                )),
         }
     }
 }
 
 fn checkpoint_recovery_events(
-    stored: &crate::generic_agent_checkpoint::StoredGenericAgentRun,
+    stored: &StoredGenericAgentRun,
 ) -> Result<Vec<AgentEventDraft>, AgentProtocolError> {
     let mut events = Vec::new();
     for record in &stored.records {
@@ -1176,6 +1184,220 @@ fn checkpoint_recovery_events(
         }
     }
     Ok(events)
+}
+
+fn stage_stable_recovery(
+    inner: Arc<GenericInner>,
+    stored: StoredGenericAgentRun,
+    boundary: GenericLoopBoundary,
+    recovery_events: Vec<AgentEventDraft>,
+) -> Result<AgentRecovery, AgentProtocolError> {
+    let checkpoint_seq = stored.last_checkpoint_seq();
+    let registration = stored.registration;
+    let request = registration.request.clone();
+    let execution = registration.execution.clone();
+    let admission = registration.admission.clone();
+    let run_id = execution.run_id.clone();
+    let user_message = agent_input_message(&request)?;
+    let run_skills = resolve_recovery_skill_binding(&inner, &registration)?;
+    let model_definitions = model_definitions_for_run(&inner, run_skills.is_some());
+    let (commands, queued_steers) =
+        reconstruct_recovery_commands(&stored.records, &recovery_events)?;
+    let published_resource_skips = recovery_events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            AgentEvent::ResourceBindingSkipped { skip } => Some(skip.binding_id.clone()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let run_started = recovery_events
+        .iter()
+        .any(|event| matches!(&event.payload, AgentEvent::RunStarted));
+    let started_event_id = AgentEventId::new(format!("generic-{}-started", run_id.as_str()));
+    let mut supporting_event_ids = boundary.supporting_event_ids;
+    if run_started && !supporting_event_ids.contains(&started_event_id) {
+        supporting_event_ids.push(started_event_id);
+    }
+    let seed = GenericExecutionSeed {
+        published_resource_skips,
+        run_started,
+        next_model_round: boundary.next_model_round,
+        total_usage: boundary.usage,
+        tool_call_count: boundary.tool_call_count,
+        last_response: boundary.last_response,
+        supporting_event_ids,
+    };
+    let (sender, _) = broadcast::channel(inner.config.stream_buffer);
+    let cancellation = CancellationToken::new();
+    let (steer_signal, steer_updates) = watch::channel(0_u64);
+    let run = GenericRun {
+        request: request.clone(),
+        execution: execution.clone(),
+        admission: admission.clone(),
+        durable_events: recovery_events,
+        sender,
+        terminal: false,
+        cancellation: cancellation.clone(),
+        cancel_command: None,
+        commands,
+        queued_steers,
+        steer_signal,
+        pending_inputs: BTreeMap::new(),
+        pending_approvals: BTreeMap::new(),
+        checkpoint_seq,
+    };
+    let replay = InternalGenericAgentProvider::stream_for(&run);
+
+    Ok(AgentRecovery::staged(replay, async move {
+        let model_messages = project_model_messages(
+            &inner,
+            &request,
+            &model_definitions,
+            run_skills.as_deref(),
+            None,
+        )
+        .await
+        .map_err(session_context_recovery_error)?;
+        {
+            let mut state = inner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.runs.contains_key(&run_id) {
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::InvalidTransition,
+                    "Generic Agent Run was recovered concurrently",
+                ));
+            }
+            let session = state
+                .sessions
+                .entry(request.run.spec.session_id.clone())
+                .or_default();
+            if session
+                .active_run
+                .as_ref()
+                .is_some_and(|active| active != &run_id)
+            {
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::InvalidTransition,
+                    "another Generic Agent Run already owns this Session",
+                ));
+            }
+            session.active_run = Some(run_id.clone());
+            state.runs.insert(run_id.clone(), run);
+        }
+
+        tokio::spawn(async move {
+            execute_model_run(
+                inner,
+                request,
+                admission,
+                user_message,
+                model_messages,
+                model_definitions,
+                run_skills,
+                seed,
+                cancellation,
+                steer_updates,
+            )
+            .await;
+        });
+        Ok(())
+    }))
+}
+
+fn resolve_recovery_skill_binding(
+    inner: &GenericInner,
+    registration: &GenericAgentRunRegistration,
+) -> Result<Option<Arc<SkillRuntime>>, AgentProtocolError> {
+    let mut skipped = registration.admission.skipped_optional_bindings.clone();
+    let skills =
+        resolve_run_skill_binding(inner.skills.as_ref(), &registration.request, &mut skipped)
+            .map_err(recovery_start_error)?;
+    if skipped != registration.admission.skipped_optional_bindings {
+        return Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidDigest,
+            "recovery resource admission does not match the immutable start",
+        ));
+    }
+    Ok(skills)
+}
+
+fn reconstruct_recovery_commands(
+    records: &[crate::generic_agent_checkpoint::GenericCheckpointRecord],
+    recovery_events: &[AgentEventDraft],
+) -> Result<(BTreeMap<CommandId, StoredCommand>, VecDeque<QueuedSteer>), AgentProtocolError> {
+    let applied_commands = recovery_events
+        .iter()
+        .filter_map(|event| {
+            matches!(
+                &event.payload,
+                AgentEvent::InputCommitted { .. }
+                    | AgentEvent::RequestResolved { .. }
+                    | AgentEvent::StopRequested { .. }
+            )
+            .then(|| event.causation_id.clone())
+            .flatten()
+        })
+        .collect::<BTreeSet<_>>();
+    let mut commands = BTreeMap::new();
+    let mut queued_steers = VecDeque::new();
+    for record in records {
+        let GenericCheckpointEvent::CommandCommitted { command, outcome } = &record.payload else {
+            continue;
+        };
+        commands.insert(
+            command.command_id.clone(),
+            StoredCommand {
+                digest: command.command_digest.clone(),
+                outcome: outcome.clone(),
+            },
+        );
+        if outcome != &ProviderCommandOutcome::Accepted {
+            continue;
+        }
+        match &command.payload {
+            AgentCommand::Cancel { .. } => {
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::InvalidTransition,
+                    "stable recovery cannot restart a Run with an accepted cancellation",
+                )
+                .with_details(serde_json::json!({
+                    "boundary": "accepted_cancel_pending",
+                    "command_id": command.command_id,
+                })))
+            }
+            AgentCommand::Steer { content }
+                if !applied_commands.contains(&command.command_id) =>
+            {
+                queued_steers.push_back(QueuedSteer {
+                    command_id: command.command_id.clone(),
+                    content: content.clone(),
+                    message: agent_content_message(content)?,
+                })
+            }
+            AgentCommand::ResolveRequest { .. }
+                if !applied_commands.contains(&command.command_id) =>
+            {
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::InvalidTransition,
+                    "stable recovery cannot guess whether an accepted request resolution was delivered",
+                )
+                .with_details(serde_json::json!({
+                    "boundary": "accepted_resolution_pending",
+                    "command_id": command.command_id,
+                })))
+            }
+            AgentCommand::Steer { .. } | AgentCommand::ResolveRequest { .. } => {}
+            _ => {
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::Unsupported,
+                    "stable recovery encountered an unsupported accepted command",
+                ))
+            }
+        }
+    }
+    Ok((commands, queued_steers))
 }
 
 fn validate_execution_and_duplicate(
@@ -1206,6 +1428,13 @@ fn record_command(
     command: &AgentCommandEnvelope,
     outcome: ProviderCommandOutcome,
 ) -> Result<ProviderCommandDisposition, AgentProtocolError> {
+    let disposition = ProviderCommandDisposition {
+        command_id: command.command_id.clone(),
+        run_id: command.run_id.clone(),
+        outcome: outcome.clone(),
+        duplicate: false,
+    };
+    let durable_disposition = disposition.to_event_draft()?;
     if let Err(failure) = append_checkpoint_to_run(
         inner,
         run,
@@ -1229,12 +1458,8 @@ fn record_command(
             outcome: outcome.clone(),
         },
     );
-    Ok(ProviderCommandDisposition {
-        command_id: command.command_id.clone(),
-        run_id: command.run_id.clone(),
-        outcome,
-        duplicate: false,
-    })
+    run.durable_events.push(durable_disposition);
+    Ok(disposition)
 }
 
 async fn project_model_messages(
@@ -1315,7 +1540,8 @@ async fn execute_model_run(
 ) {
     let run_id = request.run.spec.run_id.clone();
     let GenericExecutionSeed {
-        publish_start,
+        published_resource_skips,
+        run_started,
         next_model_round,
         mut total_usage,
         mut tool_call_count,
@@ -1323,8 +1549,8 @@ async fn execute_model_run(
         mut supporting_event_ids,
     } = seed;
     let started_event_id = AgentEventId::new(format!("generic-{}-started", run_id.as_str()));
-    if publish_start {
-        for (index, skip) in admission.skipped_optional_bindings.into_iter().enumerate() {
+    for (index, skip) in admission.skipped_optional_bindings.into_iter().enumerate() {
+        if !published_resource_skips.contains(&skip.binding_id) {
             if !publish_durable(
                 &inner,
                 &run_id,
@@ -1343,6 +1569,8 @@ async fn execute_model_run(
                 return;
             }
         }
+    }
+    if !run_started {
         if !publish_durable(
             &inner,
             &run_id,
@@ -1356,6 +1584,8 @@ async fn execute_model_run(
         ) {
             return;
         }
+    }
+    if !supporting_event_ids.contains(&started_event_id) {
         supporting_event_ids.push(started_event_id.clone());
     }
 
@@ -3755,6 +3985,33 @@ fn checkpoint_recovery_error(error: GenericCheckpointError) -> AgentProtocolErro
             format!("Generic Agent private WAL cannot be trusted for recovery: {other}"),
         ),
     }
+}
+
+fn recovery_start_error(error: AgentStartError) -> AgentProtocolError {
+    match error {
+        AgentStartError::Rejected(rejection) => {
+            AgentProtocolError::new(AgentProtocolErrorCode::Unsupported, rejection.message)
+                .with_retryable(rejection.retryable)
+                .with_details(rejection.details)
+        }
+        AgentStartError::OutcomeUnknown(error) => error,
+        _ => AgentProtocolError::new(
+            AgentProtocolErrorCode::Internal,
+            "Generic Agent recovery encountered an unknown start error",
+        ),
+    }
+}
+
+fn session_context_recovery_error(error: SessionContextError) -> AgentProtocolError {
+    let failure = session_failure(error);
+    let code = if failure.retryable {
+        AgentProtocolErrorCode::ProviderUnavailable
+    } else {
+        AgentProtocolErrorCode::InvalidSpec
+    };
+    AgentProtocolError::new(code, failure.message)
+        .with_retryable(failure.retryable)
+        .with_details(failure.details)
 }
 
 fn session_failure(error: SessionContextError) -> AgentFailure {
