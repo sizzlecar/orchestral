@@ -188,6 +188,7 @@ struct RecoveredResolution {
 struct RecoveredApprovalWaiter {
     request_id: RequestId,
     binding: ApprovalBinding,
+    replayed_outcome: Option<ToolOutcome>,
     responder: Option<oneshot::Sender<ApprovalResponse>>,
     response: Option<oneshot::Receiver<ApprovalResponse>>,
     bridge: Arc<dyn AgentApprovalBridge>,
@@ -1519,6 +1520,7 @@ async fn prepare_recovered_approval(
     call: &GenericObservedToolCall,
     arguments: &serde_json::Value,
     opened_request: &PendingRequest,
+    persisted_response: Option<&ApprovalResponse>,
     attach_waiter: bool,
     cancellation: CancellationToken,
 ) -> Result<RecoveredApprovalWaiter, AgentProtocolError> {
@@ -1556,16 +1558,58 @@ async fn prepare_recovered_approval(
         tool_id,
         arguments: arguments.clone(),
     };
-    let (binding, summary) = match tools
+    let (binding, summary, replayed_outcome) = match tools
         .runtime
-        .invoke(invocation, tools.run_grant.clone(), None, cancellation)
+        .invoke(
+            invocation.clone(),
+            tools.run_grant.clone(),
+            None,
+            cancellation,
+        )
         .await
     {
-        GuardedToolResult::ApprovalRequired { binding, summary } => (binding, summary),
-        GuardedToolResult::Outcome { outcome, .. } => {
+        GuardedToolResult::ApprovalRequired { binding, summary } => (binding, Some(summary), None),
+        GuardedToolResult::Outcome {
+            outcome,
+            cached: true,
+        } => {
+            let capability = persisted_response
+                .and_then(|response| match &response.resolution {
+                    RequestResolution::Approval {
+                        decision: ApprovalDecision::Allow,
+                        ..
+                    } => response.capability.as_ref(),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    AgentProtocolError::new(
+                        AgentProtocolErrorCode::InvalidDigest,
+                        "recovered Tool outcome has no durable Allow capability",
+                    )
+                })?;
+            let binding = capability.claims.binding.clone();
+            let args_digest = invocation.args_digest().map_err(|error| {
+                AgentProtocolError::new(AgentProtocolErrorCode::InvalidDigest, error.to_string())
+            })?;
+            if binding.run_id != invocation.run_id
+                || binding.call_id != invocation.call_id
+                || binding.tool_id != invocation.tool_id
+                || binding.args_digest != args_digest
+            {
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::InvalidDigest,
+                    "persisted approval capability crossed its recovered Tool invocation",
+                ));
+            }
+            (binding, None, Some(outcome))
+        }
+        GuardedToolResult::Outcome {
+            outcome,
+            cached: false,
+        } => {
             return Err(AgentProtocolError::new(
                 AgentProtocolErrorCode::InvalidDigest,
-                "recovered Tool no longer requires the durable approval request",
+                "recovery executed a Tool before validating its durable approval state",
             )
             .with_details(serde_json::to_value(outcome).unwrap_or(serde_json::Value::Null)))
         }
@@ -1581,16 +1625,22 @@ async fn prepare_recovered_approval(
     })?;
     let requested_scope = approval_scope_names(&binding).map_err(observed_recovery_error)?;
     let request_id = approval_request_id(run_id, round, &call.call_id);
-    let expected_request = PendingRequest {
-        request_id: request_id.clone(),
-        blocking: true,
-        payload: PendingRequestPayload::Approval {
-            operation_digest,
-            requested_scope,
-            reason: summary,
-        },
-    };
-    if opened_request != &expected_request {
+    // A committed effect replays before the Tool Runtime can re-emit its
+    // presentation-only summary. The authority-bearing request fields remain
+    // fully derivable from the persisted capability binding.
+    let request_matches = opened_request.request_id == request_id
+        && opened_request.blocking
+        && matches!(
+            &opened_request.payload,
+            PendingRequestPayload::Approval {
+                operation_digest: actual_digest,
+                requested_scope: actual_scope,
+                reason,
+            } if actual_digest == &operation_digest
+                && actual_scope == &requested_scope
+                && summary.as_ref().is_none_or(|expected| reason == expected)
+        );
+    if !request_matches {
         return Err(AgentProtocolError::new(
             AgentProtocolErrorCode::InvalidDigest,
             "reconstructed approval does not match the durable pending request",
@@ -1615,6 +1665,7 @@ async fn prepare_recovered_approval(
     Ok(RecoveredApprovalWaiter {
         request_id,
         binding,
+        replayed_outcome,
         responder,
         response,
         bridge,
@@ -1969,7 +2020,7 @@ fn stage_loop_recovery(
                 })
                 .transpose()
                 .map_err(checkpoint_stream_error)?;
-            let session_exchange_seq = recovered_input_exchange_committed(
+            let session_exchange_seq = recovered_tool_exchange_committed(
                 &inner,
                 &request,
                 *round,
@@ -2019,29 +2070,12 @@ fn stage_loop_recovery(
                 ));
             }
         }
+        let mut staged_approval = None;
         if let GenericRecoveryContinuation::Approval {
             round,
             request_id,
             request_digest,
-            ..
-        } = &continuation
-        {
-            let rebuilt =
-                model_request_for_round(&request, *round, &model_messages, &model_definitions);
-            if rebuilt.request_id != *request_id
-                || model_request_digest(&rebuilt).map_err(checkpoint_stream_error)?
-                    != *request_digest
-            {
-                return Err(AgentProtocolError::new(
-                    AgentProtocolErrorCode::InvalidDigest,
-                    "recovered approval model request no longer matches the private WAL attempt",
-                ));
-            }
-        }
-
-        let mut staged_approval = None;
-        if let GenericRecoveryContinuation::Approval {
-            round,
+            observation,
             call,
             arguments,
             request: opened_request,
@@ -2052,6 +2086,7 @@ fn stage_loop_recovery(
             ..
         } = &mut continuation
         {
+            let persisted_response = committed_response.as_ref().or(resolved_response.as_ref());
             let prepared = prepare_recovered_approval(
                 &inner,
                 &run_id,
@@ -2059,10 +2094,70 @@ fn stage_loop_recovery(
                 call,
                 arguments,
                 opened_request,
+                persisted_response,
                 committed_response.is_none() && resolved_response.is_none(),
                 cancellation.clone(),
             )
             .await?;
+            let expected_exchange = match resolved_response.as_ref() {
+                Some(resolution) => recovered_approval_exchange_messages(
+                    observation,
+                    call,
+                    arguments,
+                    resolution,
+                    prepared.replayed_outcome.as_ref(),
+                )?,
+                None => None,
+            };
+            let session_exchange_seq = recovered_tool_exchange_committed(
+                &inner,
+                &request,
+                *round,
+                request_id,
+                expected_exchange.as_ref(),
+                observation.usage.as_ref(),
+            )
+            .await?;
+            session_exchange_committed = session_exchange_seq.is_some();
+            let prior_model_messages = if let Some(exchange_seq) = session_exchange_seq {
+                let (assistant, tool) = expected_exchange
+                    .as_ref()
+                    .expect("a committed approval exchange has a recoverable durable result");
+                if !model_messages.ends_with(&[assistant.clone(), tool.clone()]) {
+                    return Err(AgentProtocolError::new(
+                        AgentProtocolErrorCode::InvalidDigest,
+                        "recovered Session approval exchange is not the final projected context",
+                    ));
+                }
+                Some(
+                    project_model_messages(
+                        &inner,
+                        &request,
+                        &model_definitions,
+                        run_skills.as_deref(),
+                        None,
+                        Some(exchange_seq.saturating_sub(1)),
+                    )
+                    .await
+                    .map_err(session_context_recovery_error)?,
+                )
+            } else {
+                None
+            };
+            let request_messages = prior_model_messages
+                .as_deref()
+                .unwrap_or(model_messages.as_slice());
+            let rebuilt =
+                model_request_for_round(&request, *round, request_messages, &model_definitions);
+            if rebuilt.request_id != *request_id
+                || model_request_digest(&rebuilt).map_err(checkpoint_stream_error)?
+                    != *request_digest
+            {
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::InvalidDigest,
+                    "recovered approval model request no longer matches the private WAL attempt",
+                ));
+            }
             if committed_response
                 .as_ref()
                 .or(resolved_response.as_ref())
@@ -2231,6 +2326,7 @@ fn stage_loop_recovery(
                         binding.expect("recovered approval binding was prepared"),
                         committed_response,
                         resolved_response,
+                        session_exchange_committed,
                         response,
                     )
                     .await;
@@ -3350,6 +3446,7 @@ async fn resume_observed_approval(
     binding: ApprovalBinding,
     committed_response: Option<ApprovalResponse>,
     resolved_response: Option<ApprovalResponse>,
+    session_exchange_committed: bool,
     response: Option<oneshot::Receiver<ApprovalResponse>>,
 ) {
     let run_id = request.run.spec.run_id.clone();
@@ -3386,6 +3483,36 @@ async fn resume_observed_approval(
         seed.last_response = observation.response.clone();
     }
     seed.tool_call_count = seed.tool_call_count.saturating_add(1);
+
+    if session_exchange_committed {
+        seed.next_model_round = round.saturating_add(1);
+        if let Err(failure) = commit_loop_boundary(
+            &inner,
+            &run_id,
+            seed.next_model_round,
+            &seed.total_usage,
+            seed.tool_call_count,
+            &seed.last_response,
+            &seed.supporting_event_ids,
+        ) {
+            emit_failure(&inner, &request, &user_message, failure);
+            return;
+        }
+        execute_model_run(
+            inner,
+            request,
+            admission,
+            user_message,
+            model_messages,
+            model_tools,
+            run_skills,
+            seed,
+            cancellation,
+            steer_updates,
+        )
+        .await;
+        return;
+    }
 
     let approval = if let Some(resolved_response) = resolved_response {
         approval_response_outcome(resolved_response)
@@ -3545,7 +3672,7 @@ async fn resume_observed_approval(
     .await;
 }
 
-async fn recovered_input_exchange_committed(
+async fn recovered_tool_exchange_committed(
     inner: &GenericInner,
     request: &AgentStartRequest,
     round: u64,
@@ -3580,7 +3707,7 @@ async fn recovered_input_exchange_committed(
         let Some((assistant, tool)) = expected_messages else {
             return Err(AgentProtocolError::new(
                 AgentProtocolErrorCode::InvalidDigest,
-                "Session contains an input exchange without a durable input resolution",
+                "Session contains a Tool exchange without a recoverable durable result",
             ));
         };
         let expected_payload = AgentSessionEvent::ToolExchangeCommitted {
@@ -3599,7 +3726,7 @@ async fn recovered_input_exchange_committed(
         {
             return Err(AgentProtocolError::new(
                 AgentProtocolErrorCode::InvalidDigest,
-                "recovered Session input exchange does not match the private model observation",
+                "recovered Session Tool exchange does not match the private model observation",
             ));
         }
         return Ok(Some(record.session_seq));
@@ -4022,6 +4149,56 @@ fn observed_tool_exchange_messages(
             }],
         },
     )
+}
+
+fn recovered_approval_exchange_messages(
+    observation: &GenericModelObservation,
+    call: &GenericObservedToolCall,
+    arguments: &serde_json::Value,
+    response: &ApprovalResponse,
+    replayed_outcome: Option<&ToolOutcome>,
+) -> Result<Option<(ModelMessage, ModelMessage)>, AgentProtocolError> {
+    let outcome = match &response.resolution {
+        RequestResolution::Approval {
+            decision: ApprovalDecision::Allow,
+            ..
+        } => replayed_outcome.cloned(),
+        RequestResolution::Approval {
+            decision: ApprovalDecision::Deny,
+            ..
+        } => {
+            if replayed_outcome.is_some() {
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::InvalidDigest,
+                    "denied approval unexpectedly has a durable Tool outcome",
+                ));
+            }
+            Some(ToolOutcome::Rejected {
+                code: "approval_denied".to_owned(),
+                message: "Host denied this Tool invocation".to_owned(),
+            })
+        }
+        _ => {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidDigest,
+                "recovered approval exchange has a non-approval resolution",
+            ))
+        }
+    };
+    let Some(outcome) = outcome else {
+        return Ok(None);
+    };
+    if matches!(outcome, ToolOutcome::UnknownEffect { .. }) {
+        return Ok(None);
+    }
+    let (result, is_error) = model_tool_result(outcome);
+    Ok(Some(observed_tool_exchange_messages(
+        observation,
+        call,
+        arguments,
+        &result,
+        is_error,
+    )))
 }
 
 fn remove_pending_input(inner: &GenericInner, run_id: &RunId, request_id: &RequestId) {
