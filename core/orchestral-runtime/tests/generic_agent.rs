@@ -3,15 +3,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures_util::stream;
+use futures_util::{stream, StreamExt};
 use orchestral_core::{
     agent_protocol::{
         reference::AgentRunStatus,
-        spi::AgentProvider,
+        spi::{AgentProvider, AgentRecoveryRequest},
         wire::{
-            AgentCommand, AgentCommandEnvelope, AgentEvent, AgentEventAuthority, AgentRunEnvelope,
-            AgentSessionId, AgentTelemetry, ApprovalDecision, CommandAckState, CommandId, Content,
-            ContentBody, PendingRequestKind, ProviderBindingRef, ProviderCommandOutcome,
+            AgentCommand, AgentCommandEnvelope, AgentEvent, AgentEventAuthority,
+            AgentProtocolErrorCode, AgentProviderStreamItem, AgentRunEnvelope, AgentSessionId,
+            AgentStartRequest, AgentTelemetry, ApprovalDecision, CommandAckState, CommandId,
+            Content, ContentBody, PendingRequestKind, ProviderBindingRef, ProviderCommandOutcome,
             RequestResolution, RunId,
         },
         AGENT_PROTOCOL_V1,
@@ -1096,6 +1097,170 @@ async fn model_attempt_is_in_the_private_wal_before_backend_start() {
         })
         .collect::<Vec<_>>();
     assert_eq!(private_provider_digests, host_provider_digests);
+}
+
+#[tokio::test]
+async fn terminal_private_wal_replays_from_a_new_generic_provider() {
+    let run_id = RunId::new("terminal-recovery-run");
+    let checkpoint_store = Arc::new(InMemoryGenericAgentCheckpointStore::default());
+    let session_journal = Arc::new(InMemoryAgentSessionJournalStore::default());
+    let config = GenericAgentConfig::new("internal-provider", "generic-agent");
+    let first = InternalGenericAgentProvider::new_with_session_journal(
+        Arc::new(ScriptedModel),
+        config.clone(),
+        session_journal.clone(),
+        Arc::new(JsonSizeTokenMeter::default()),
+    )
+    .expect("first Generic Agent starts")
+    .with_checkpoint_store(checkpoint_store.clone())
+    .expect("private WAL binds before the Provider is shared");
+    let descriptor = first.describe();
+    let request = AgentStartRequest::new(
+        AgentRunEnvelope::new(
+            AGENT_PROTOCOL_V1,
+            AgentSessionId::new("terminal-recovery-session"),
+            run_id.clone(),
+            vec![Content::text("complete before the Provider restarts")],
+        )
+        .expect("valid text Run"),
+        ProviderBindingRef::new("terminal-recovery-binding"),
+        &descriptor,
+    )
+    .expect("valid start request");
+    let started = first.start(request.clone()).await.expect("Run starts");
+    let execution = started.execution.clone();
+    let mut original_stream = started.stream;
+    let mut original_events = Vec::new();
+    loop {
+        let item = tokio::time::timeout(std::time::Duration::from_secs(1), original_stream.next())
+            .await
+            .expect("first Provider publishes promptly")
+            .expect("first Provider reaches a terminal event")
+            .expect("first Provider stream remains valid");
+        if let AgentProviderStreamItem::Event(draft) = item {
+            let terminal = matches!(&draft.payload, AgentEvent::DeliveryCommitted { .. });
+            original_events.push(*draft);
+            if terminal {
+                break;
+            }
+        }
+    }
+    drop(first);
+
+    let second = InternalGenericAgentProvider::new_with_session_journal(
+        Arc::new(ScriptedModel),
+        config,
+        session_journal,
+        Arc::new(JsonSizeTokenMeter::default()),
+    )
+    .expect("replacement Generic Agent starts")
+    .with_checkpoint_store(checkpoint_store)
+    .expect("same private WAL binds to the replacement Provider");
+    let recovery = second
+        .recover(
+            AgentRecoveryRequest::new(request, execution, &descriptor)
+                .expect("recovery identity is valid"),
+        )
+        .await
+        .expect("terminal private WAL is recoverable");
+    let (mut replay, confirmation) = recovery.into_parts();
+    let mut recovered_events = Vec::new();
+    while let Some(item) = replay.next().await {
+        if let AgentProviderStreamItem::Event(draft) = item.expect("replay remains valid") {
+            recovered_events.push(*draft);
+        }
+    }
+    confirmation
+        .await
+        .expect("terminal replay has no reconstructed work to start");
+    assert_eq!(recovered_events, original_events);
+}
+
+#[tokio::test]
+async fn open_model_attempt_is_never_restarted_from_the_private_wal() {
+    let run_id = RunId::new("unsafe-model-recovery-run");
+    let checkpoint_store = Arc::new(InMemoryGenericAgentCheckpointStore::default());
+    let session_journal = Arc::new(InMemoryAgentSessionJournalStore::default());
+    let config = GenericAgentConfig::new("internal-provider", "generic-agent");
+    let first = InternalGenericAgentProvider::new_with_session_journal(
+        Arc::new(BlockingModel),
+        config.clone(),
+        session_journal.clone(),
+        Arc::new(JsonSizeTokenMeter::default()),
+    )
+    .expect("first Generic Agent starts")
+    .with_checkpoint_store(checkpoint_store.clone())
+    .expect("private WAL binds before the Provider is shared");
+    let descriptor = first.describe();
+    let request = AgentStartRequest::new(
+        AgentRunEnvelope::new(
+            AGENT_PROTOCOL_V1,
+            AgentSessionId::new("unsafe-model-recovery-session"),
+            run_id.clone(),
+            vec![Content::text("leave one model attempt open")],
+        )
+        .expect("valid text Run"),
+        ProviderBindingRef::new("unsafe-model-recovery-binding"),
+        &descriptor,
+    )
+    .expect("valid start request");
+    let started = first.start(request.clone()).await.expect("Run starts");
+    let execution = started.execution.clone();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let stored = checkpoint_store
+                .load_run(&run_id)
+                .expect("private WAL remains readable")
+                .expect("private Run remains registered");
+            if matches!(
+                stored.validate().expect("private WAL replays").phase,
+                GenericCheckpointPhase::ModelAttemptOpen { .. }
+            ) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("model attempt becomes durably open");
+
+    let second = InternalGenericAgentProvider::new_with_session_journal(
+        Arc::new(BlockingModel),
+        config,
+        session_journal,
+        Arc::new(JsonSizeTokenMeter::default()),
+    )
+    .expect("replacement Generic Agent starts")
+    .with_checkpoint_store(checkpoint_store.clone())
+    .expect("same private WAL binds to the replacement Provider");
+    let error = match second
+        .recover(
+            AgentRecoveryRequest::new(request, execution.clone(), &descriptor)
+                .expect("recovery identity is valid"),
+        )
+        .await
+    {
+        Ok(_) => panic!("an open model attempt must not be restarted"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, AgentProtocolErrorCode::InvalidTransition);
+    assert_eq!(error.details["boundary"], "model_attempt_open");
+
+    first
+        .command(
+            &execution,
+            AgentCommandEnvelope::new(
+                CommandId::new("cleanup-unsafe-model-recovery"),
+                run_id,
+                None,
+                AgentCommand::Cancel {
+                    reason: "test cleanup".to_owned(),
+                },
+            )
+            .expect("cleanup command is valid"),
+        )
+        .await
+        .expect("cleanup cancellation is accepted");
 }
 
 #[tokio::test]

@@ -52,7 +52,7 @@ use crate::approval_bridge::AgentApprovalBridge;
 use crate::generic_agent_checkpoint::{
     CreateGenericRunOutcome, GenericAgentCheckpointStore, GenericAgentRunRegistration,
     GenericCheckpointDraft, GenericCheckpointError, GenericCheckpointEvent,
-    GenericCheckpointEventId, InMemoryGenericAgentCheckpointStore,
+    GenericCheckpointEventId, GenericCheckpointPhase, InMemoryGenericAgentCheckpointStore,
 };
 use crate::skill::{
     ActivatedSkillSet, SkillActivationOutcome, SkillActivationRequest, SkillRuntime,
@@ -1116,17 +1116,67 @@ impl AgentProvider for InternalGenericAgentProvider {
         request: AgentRecoveryRequest,
     ) -> Result<AgentRecovery, AgentProtocolError> {
         request.validate_for(&self.inner.descriptor)?;
-        let state = self.state();
-        let run = state.runs.get(&request.execution.run_id).ok_or_else(|| {
-            AgentProtocolError::new(AgentProtocolErrorCode::RunNotFound, "run does not exist")
-        })?;
-        if run.execution != request.execution || run.request != request.start_request {
+        {
+            let state = self.state();
+            if let Some(run) = state.runs.get(&request.execution.run_id) {
+                if run.execution != request.execution || run.request != request.start_request {
+                    return Err(AgentProtocolError::new(
+                        AgentProtocolErrorCode::RunIdConflict,
+                        "recovery identity does not match the Generic Agent Run",
+                    ));
+                }
+                return Ok(AgentRecovery::reattached(Self::stream_for(run)));
+            }
+        }
+
+        let stored = self
+            .inner
+            .checkpoint_store
+            .load_run(&request.execution.run_id)
+            .map_err(checkpoint_recovery_error)?
+            .ok_or_else(|| {
+                AgentProtocolError::new(
+                    AgentProtocolErrorCode::RunNotFound,
+                    "Generic Agent private WAL has no matching Run",
+                )
+            })?;
+        let projection = stored.validate().map_err(checkpoint_recovery_error)?;
+        if stored.registration.request != request.start_request
+            || stored.registration.execution != request.execution
+            || stored.registration.config_digest != self.inner.config_digest
+        {
             return Err(AgentProtocolError::new(
                 AgentProtocolErrorCode::RunIdConflict,
-                "recovery identity does not match the Generic Agent Run",
+                "recovery identity or Generic Agent configuration does not match the private WAL",
             ));
         }
-        Ok(AgentRecovery::reattached(Self::stream_for(run)))
+
+        match projection.phase {
+            GenericCheckpointPhase::Terminal => {
+                let replay = stream::iter(projection.provider_events.into_iter().map(|draft| {
+                    Ok(AgentProviderStreamItem::Event(Box::new(draft)))
+                }))
+                .boxed();
+                Ok(AgentRecovery::staged(replay, async { Ok(()) }))
+            }
+            GenericCheckpointPhase::ModelAttemptOpen {
+                round, request_id, ..
+            } => Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidTransition,
+                "Generic Agent recovery is unsafe while a model attempt outcome is unknown",
+            )
+            .with_details(serde_json::json!({
+                "boundary": "model_attempt_open",
+                "round": round,
+                "request_id": request_id,
+            }))),
+            GenericCheckpointPhase::Prepared | GenericCheckpointPhase::Stable(_) => {
+                Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::Unsupported,
+                    "Generic Agent execution reconstruction is not available at this checkpoint boundary",
+                ))
+            }
+        }
     }
 }
 
@@ -3617,6 +3667,24 @@ fn checkpoint_start_error(error: GenericCheckpointError) -> AgentStartError {
         )
         .with_retryable(true),
     )
+}
+
+fn checkpoint_recovery_error(error: GenericCheckpointError) -> AgentProtocolError {
+    match error {
+        GenericCheckpointError::Unavailable(message) => AgentProtocolError::new(
+            AgentProtocolErrorCode::ProviderUnavailable,
+            format!("Generic Agent checkpoint storage is unavailable: {message}"),
+        )
+        .with_retryable(true),
+        GenericCheckpointError::RunNotFound(run_id) => AgentProtocolError::new(
+            AgentProtocolErrorCode::RunNotFound,
+            format!("Generic Agent checkpoint Run does not exist: {run_id}"),
+        ),
+        other => AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidDigest,
+            format!("Generic Agent private WAL cannot be trusted for recovery: {other}"),
+        ),
+    }
 }
 
 fn session_failure(error: SessionContextError) -> AgentFailure {
