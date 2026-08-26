@@ -31,7 +31,7 @@ use orchestral_core::agent_protocol::{
 };
 use orchestral_core::agent_session::{
     AgentSessionError, AgentSessionEvent, AgentSessionEventDraft, AgentSessionEventId,
-    AgentSessionJournalStore, InMemoryAgentSessionJournalStore,
+    AgentSessionJournalStore, AgentSessionRecord, InMemoryAgentSessionJournalStore,
 };
 use orchestral_core::executor::{ExecutionProgressEvent, ExecutionProgressReporter};
 use orchestral_core::model_protocol::{
@@ -1644,6 +1644,64 @@ async fn prepare_recovered_tool(
         .await)
 }
 
+async fn recover_committed_tool_outcome(
+    inner: &GenericInner,
+    run_id: &RunId,
+    call: &GenericObservedToolCall,
+    arguments: &serde_json::Value,
+) -> Result<ToolOutcome, AgentProtocolError> {
+    let tools = inner.tools.as_ref().ok_or_else(|| {
+        AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidDigest,
+            "recovered Tool exchange has no bound Tool Runtime",
+        )
+    })?;
+    let tool_id = tools
+        .runtime
+        .resolve_tool_id(&call.name)
+        .map_err(|error| {
+            AgentProtocolError::new(
+                AgentProtocolErrorCode::ProviderUnavailable,
+                format!("recovered Tool catalog is unavailable: {error}"),
+            )
+            .with_retryable(true)
+        })?
+        .ok_or_else(|| {
+            AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidDigest,
+                "recovered Tool is no longer registered",
+            )
+        })?;
+    let recovered = tools
+        .runtime
+        .recover_outcome(
+            ToolInvocation {
+                run_id: run_id.clone(),
+                call_id: ToolCallId::new(call.call_id.as_str()),
+                tool_id,
+                arguments: arguments.clone(),
+            },
+            tools.run_grant.clone(),
+        )
+        .await
+        .map_err(|error| {
+            AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidDigest,
+                "durable Tool effect cannot validate the recovered Session exchange",
+            )
+            .with_details(serde_json::json!({
+                "code": error.code,
+                "message": error.message,
+            }))
+        })?;
+    recovered.ok_or_else(|| {
+        AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidDigest,
+            "Session Tool exchange has no durable Tool outcome",
+        )
+    })
+}
+
 async fn prepare_recovered_approval(
     inner: &GenericInner,
     run_id: &RunId,
@@ -2336,15 +2394,47 @@ fn stage_loop_recovery(
             round,
             request_id,
             request_digest,
+            observation,
+            call,
+            arguments,
             ..
         } = &mut continuation
         {
-            let session_exchange_seq =
-                recovered_tool_exchange_committed(&inner, &request, *round, request_id, None, None)
-                    .await?;
-            debug_assert!(session_exchange_seq.is_none());
+            let recovered_exchange =
+                recovered_tool_exchange_record(&inner, &request, *round, request_id).await?;
+            let prior_model_messages = if let Some(record) = &recovered_exchange {
+                let AgentSessionEvent::ToolExchangeCommitted {
+                    assistant, tool, ..
+                } = &record.payload
+                else {
+                    unreachable!("recovered Tool exchange shape was checked");
+                };
+                if !model_messages.ends_with(&[assistant.clone(), tool.clone()]) {
+                    return Err(AgentProtocolError::new(
+                        AgentProtocolErrorCode::InvalidDigest,
+                        "recovered direct Tool exchange is not the final projected context",
+                    ));
+                }
+                Some(
+                    project_model_messages(
+                        &inner,
+                        &request,
+                        &model_definitions,
+                        run_skills.as_deref(),
+                        None,
+                        Some(record.session_seq.saturating_sub(1)),
+                    )
+                    .await
+                    .map_err(session_context_recovery_error)?,
+                )
+            } else {
+                None
+            };
+            let request_messages = prior_model_messages
+                .as_deref()
+                .unwrap_or(model_messages.as_slice());
             let rebuilt =
-                model_request_for_round(&request, *round, &model_messages, &model_definitions);
+                model_request_for_round(&request, *round, request_messages, &model_definitions);
             if rebuilt.request_id != *request_id
                 || model_request_digest(&rebuilt).map_err(checkpoint_stream_error)?
                     != *request_digest
@@ -2353,6 +2443,37 @@ fn stage_loop_recovery(
                     AgentProtocolErrorCode::InvalidDigest,
                     "recovered direct Tool model request no longer matches the private WAL attempt",
                 ));
+            }
+            if let Some(record) = recovered_exchange {
+                let outcome =
+                    recover_committed_tool_outcome(&inner, &run_id, call, arguments).await?;
+                if matches!(outcome, ToolOutcome::UnknownEffect { .. }) {
+                    return Err(AgentProtocolError::new(
+                        AgentProtocolErrorCode::InvalidDigest,
+                        "Session Tool exchange cannot be backed by an unknown effect",
+                    ));
+                }
+                let (result, is_error) = model_tool_result(outcome);
+                let (assistant, tool) = observed_tool_exchange_messages(
+                    observation,
+                    call,
+                    arguments,
+                    &result,
+                    is_error,
+                );
+                let expected_payload = AgentSessionEvent::ToolExchangeCommitted {
+                    request_id: request_id.clone(),
+                    assistant,
+                    tool,
+                    usage: observation.usage.clone(),
+                };
+                if record.payload != expected_payload {
+                    return Err(AgentProtocolError::new(
+                        AgentProtocolErrorCode::InvalidDigest,
+                        "direct Tool Session exchange differs from its durable Effect outcome",
+                    ));
+                }
+                session_exchange_committed = true;
             }
         }
         let install_result = {
@@ -2524,6 +2645,7 @@ fn stage_loop_recovery(
                         observation,
                         call,
                         arguments,
+                        session_exchange_committed,
                     )
                     .await;
                 }
@@ -3807,6 +3929,7 @@ async fn resume_observed_tool(
     observation: GenericModelObservation,
     call: GenericObservedToolCall,
     arguments: serde_json::Value,
+    session_exchange_committed: bool,
 ) {
     let run_id = request.run.spec.run_id.clone();
     let Some(tools) = inner.tools.as_ref() else {
@@ -3829,6 +3952,36 @@ async fn resume_observed_tool(
         seed.last_response = observation.response.clone();
     }
     seed.tool_call_count = seed.tool_call_count.saturating_add(1);
+
+    if session_exchange_committed {
+        seed.next_model_round = round.saturating_add(1);
+        if let Err(failure) = commit_loop_boundary(
+            &inner,
+            &run_id,
+            seed.next_model_round,
+            &seed.total_usage,
+            seed.tool_call_count,
+            &seed.last_response,
+            &seed.supporting_event_ids,
+        ) {
+            emit_failure(&inner, &request, &user_message, failure);
+            return;
+        }
+        execute_model_run(
+            inner,
+            request,
+            admission,
+            user_message,
+            model_messages,
+            model_tools,
+            run_skills,
+            seed,
+            cancellation,
+            steer_updates,
+        )
+        .await;
+        return;
+    }
 
     let prepared = match prepare_recovered_tool(
         &inner,
@@ -4035,21 +4188,19 @@ async fn continue_observed_tool(
     .await;
 }
 
-async fn recovered_tool_exchange_committed(
+async fn recovered_tool_exchange_record(
     inner: &GenericInner,
     request: &AgentStartRequest,
     round: u64,
     request_id: &ModelRequestId,
-    expected_messages: Option<&(ModelMessage, ModelMessage)>,
-    usage: Option<&ModelUsage>,
-) -> Result<Option<u64>, AgentProtocolError> {
+) -> Result<Option<AgentSessionRecord>, AgentProtocolError> {
     let records = inner
         .session_journal
         .load_session(&request.run.spec.session_id)
         .await
         .map_err(|error| session_context_recovery_error(SessionContextError::Journal(error)))?;
-    let matching = records
-        .iter()
+    let mut matching = records
+        .into_iter()
         .filter(|record| match &record.payload {
             AgentSessionEvent::ToolExchangeCommitted {
                 request_id: actual, ..
@@ -4060,41 +4211,69 @@ async fn recovered_tool_exchange_committed(
             _ => false,
         })
         .collect::<Vec<_>>();
-    let [] = matching.as_slice() else {
-        let [record] = matching.as_slice() else {
-            return Err(AgentProtocolError::new(
-                AgentProtocolErrorCode::InvalidDigest,
-                "recovered model attempt has multiple Session outcomes",
-            ));
-        };
-        let Some((assistant, tool)) = expected_messages else {
-            return Err(AgentProtocolError::new(
-                AgentProtocolErrorCode::InvalidDigest,
-                "Session contains a Tool exchange without a recoverable durable result",
-            ));
-        };
-        let expected_payload = AgentSessionEvent::ToolExchangeCommitted {
-            request_id: request_id.clone(),
-            assistant: assistant.clone(),
-            tool: tool.clone(),
-            usage: usage.cloned(),
-        };
-        let expected_event_id = AgentSessionEventId::new(format!(
-            "generic-{}-tool-exchange-{round}",
-            request.run.spec.run_id.as_str()
+    if matching.len() > 1 {
+        return Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidDigest,
+            "recovered model attempt has multiple Session outcomes",
         ));
-        if record.run_id != request.run.spec.run_id
-            || record.event_id != expected_event_id
-            || record.payload != expected_payload
-        {
-            return Err(AgentProtocolError::new(
-                AgentProtocolErrorCode::InvalidDigest,
-                "recovered Session Tool exchange does not match the private model observation",
-            ));
-        }
-        return Ok(Some(record.session_seq));
+    }
+    let Some(record) = matching.pop() else {
+        return Ok(None);
     };
-    Ok(None)
+    let expected_event_id = AgentSessionEventId::new(format!(
+        "generic-{}-tool-exchange-{round}",
+        request.run.spec.run_id.as_str()
+    ));
+    if record.run_id != request.run.spec.run_id
+        || record.session_id != request.run.spec.session_id
+        || record.event_id != expected_event_id
+        || !matches!(
+            &record.payload,
+            AgentSessionEvent::ToolExchangeCommitted {
+                request_id: actual,
+                ..
+            } if actual == request_id
+        )
+    {
+        return Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidDigest,
+            "recovered Session Tool exchange crossed its Run or model attempt",
+        ));
+    }
+    Ok(Some(record))
+}
+
+async fn recovered_tool_exchange_committed(
+    inner: &GenericInner,
+    request: &AgentStartRequest,
+    round: u64,
+    request_id: &ModelRequestId,
+    expected_messages: Option<&(ModelMessage, ModelMessage)>,
+    usage: Option<&ModelUsage>,
+) -> Result<Option<u64>, AgentProtocolError> {
+    let Some(record) = recovered_tool_exchange_record(inner, request, round, request_id).await?
+    else {
+        return Ok(None);
+    };
+    let Some((assistant, tool)) = expected_messages else {
+        return Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidDigest,
+            "Session contains a Tool exchange without a recoverable durable result",
+        ));
+    };
+    let expected_payload = AgentSessionEvent::ToolExchangeCommitted {
+        request_id: request_id.clone(),
+        assistant: assistant.clone(),
+        tool: tool.clone(),
+        usage: usage.cloned(),
+    };
+    if record.payload != expected_payload {
+        return Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidDigest,
+            "recovered Session Tool exchange does not match the private model observation",
+        ));
+    }
+    Ok(Some(record.session_seq))
 }
 
 #[allow(clippy::too_many_arguments)]

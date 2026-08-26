@@ -90,6 +90,7 @@ enum CheckpointCrashCut {
     InputToolExchangeBoundary,
     ApprovalRequestResolve,
     ApprovalToolExchangeBoundary,
+    DirectToolExchangeBoundary,
 }
 
 struct PausingCheckpointStore {
@@ -571,6 +572,13 @@ impl GenericAgentCheckpointStore for PausingCheckpointStore {
                 ) => true,
                 (
                     CheckpointCrashCut::ApprovalToolExchangeBoundary,
+                    GenericCheckpointEvent::LoopBoundaryCommitted {
+                        next_model_round: 2,
+                        ..
+                    },
+                ) => true,
+                (
+                    CheckpointCrashCut::DirectToolExchangeBoundary,
                     GenericCheckpointEvent::LoopBoundaryCommitted {
                         next_model_round: 2,
                         ..
@@ -4195,6 +4203,214 @@ async fn run_direct_tool_recovery(effect_state: DirectEffectRecoveryState) {
                 )));
         }
     }
+    assert_eq!(
+        checkpoint_store
+            .load_run(&run_id)
+            .expect("private WAL remains readable")
+            .expect("recovered Run remains registered")
+            .validate()
+            .expect("recovered WAL remains valid")
+            .phase,
+        GenericCheckpointPhase::Terminal
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn committed_direct_tool_exchange_recovers_without_reexecution() {
+    run_committed_direct_exchange_recovery(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_tool_exchange_without_effect_evidence_is_rejected_without_execution() {
+    run_committed_direct_exchange_recovery(false).await;
+}
+
+async fn run_committed_direct_exchange_recovery(retain_effect: bool) {
+    let suffix = if retain_effect { "durable" } else { "missing" };
+    let run_id = RunId::new(format!("committed-direct-{suffix}-exchange-run"));
+    let session_id = AgentSessionId::new(format!("committed-direct-{suffix}-exchange-session"));
+    let checkpoint_store = Arc::new(PausingCheckpointStore::at(
+        CheckpointCrashCut::DirectToolExchangeBoundary,
+    ));
+    let effect_journal = Arc::new(InMemoryToolEffectJournalStore::default());
+    let session_journal = Arc::new(InMemoryAgentSessionJournalStore::default());
+    let host_journal = Arc::new(InMemoryAgentJournalStore::default());
+    let first_tool = Arc::new(EchoTool {
+        calls: AtomicUsize::new(0),
+    });
+    let bounds = ToolPolicyBounds {
+        approval: ApprovalPolicy::NotRequired,
+        max_timeout_ms: Some(1_000),
+        max_output_bytes: Some(1_024),
+        ..ToolPolicyBounds::default()
+    };
+    let config = GenericAgentConfig::new("internal-provider", "generic-agent");
+    let first_provider = Arc::new(
+        InternalGenericAgentProvider::new_with_tools_and_session_journal(
+            Arc::new(ToolLoopModel {
+                rounds: AtomicUsize::new(0),
+            }),
+            config.clone(),
+            durable_direct_runtime(&bounds, effect_journal.clone(), first_tool.clone()),
+            RunToolGrant {
+                bounds: bounds.clone(),
+            },
+            session_journal.clone(),
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+        .expect("first direct-Tool Generic Agent starts")
+        .with_checkpoint_store(checkpoint_store.clone())
+        .expect("private WAL binds before the Provider is shared"),
+    );
+    let first_controller = Arc::new(
+        AgentController::with_journal_store(
+            first_provider,
+            ProviderBindingRef::new("committed-direct-exchange-binding"),
+            host_journal.clone(),
+        )
+        .expect("first controller binds"),
+    );
+    let execution = first_controller
+        .start(
+            AgentRunEnvelope::new(
+                AGENT_PROTOCOL_V1,
+                session_id.clone(),
+                run_id.clone(),
+                vec![Content::text("recover this committed direct Tool exchange")],
+            )
+            .expect("valid direct Tool Run"),
+        )
+        .await
+        .expect("Run starts");
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if checkpoint_store
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .paused_once
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Session Tool exchange reaches the next private boundary");
+    assert_eq!(first_tool.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        session_journal
+            .load_session(&session_id)
+            .await
+            .expect("Session Journal remains readable")
+            .iter()
+            .filter(|record| matches!(
+                &record.payload,
+                AgentSessionEvent::ToolExchangeCommitted { .. }
+            ))
+            .count(),
+        1
+    );
+    assert!(matches!(
+        checkpoint_store
+            .load_run(&run_id)
+            .expect("private WAL remains readable")
+            .expect("private Run remains registered")
+            .validate()
+            .expect("private WAL remains valid")
+            .phase,
+        GenericCheckpointPhase::ModelAttemptObserved { round: 1, .. }
+    ));
+
+    checkpoint_store.release_as_crash();
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        first_controller.wait_for_terminal(&execution.run_id),
+    )
+    .await
+    .expect("simulated boundary process loss reaches the Host")
+    .expect_err("uncommitted private loop boundary is not terminal");
+    assert!(matches!(
+        error,
+        AgentControlError::ContinuityUnknown(ref actual) if actual == &run_id
+    ));
+    drop(first_controller);
+    checkpoint_store.allow_recovery_writes();
+
+    let replacement_tool = Arc::new(EchoTool {
+        calls: AtomicUsize::new(0),
+    });
+    let replacement_model = Arc::new(ToolLoopModel {
+        rounds: AtomicUsize::new(1),
+    });
+    let recovery_effect_journal = if retain_effect {
+        effect_journal
+    } else {
+        Arc::new(InMemoryToolEffectJournalStore::default())
+    };
+    let replacement_provider = Arc::new(
+        InternalGenericAgentProvider::new_with_tools_and_session_journal(
+            replacement_model.clone(),
+            config,
+            durable_direct_runtime(&bounds, recovery_effect_journal, replacement_tool.clone()),
+            RunToolGrant { bounds },
+            session_journal.clone(),
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+        .expect("replacement direct-Tool Generic Agent starts")
+        .with_checkpoint_store(checkpoint_store.clone())
+        .expect("replacement Provider binds the same private WAL"),
+    );
+    let replacement_controller = Arc::new(
+        AgentController::with_journal_store(
+            replacement_provider,
+            ProviderBindingRef::new("committed-direct-exchange-binding"),
+            host_journal,
+        )
+        .expect("replacement controller binds"),
+    );
+    let recovery = replacement_controller.recover(&run_id).await;
+    assert_eq!(replacement_tool.calls.load(Ordering::SeqCst), 0);
+    if !retain_effect {
+        assert!(recovery.is_err());
+        assert_eq!(replacement_model.rounds.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            checkpoint_store
+                .load_run(&run_id)
+                .expect("private WAL remains readable")
+                .expect("private Run remains registered")
+                .validate()
+                .expect("private WAL remains valid")
+                .phase,
+            GenericCheckpointPhase::ModelAttemptObserved { round: 1, .. }
+        ));
+        return;
+    }
+    recovery.expect("committed direct Tool exchange is recoverable");
+    let view = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        replacement_controller.wait_for_terminal(&run_id),
+    )
+    .await
+    .expect("recovered direct Tool exchange reaches a terminal promptly")
+    .expect("recovered direct Tool exchange remains authoritative");
+    assert_eq!(view.state.status(), AgentRunStatus::Delivered);
+    assert_eq!(first_tool.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(replacement_tool.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(replacement_model.rounds.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        session_journal
+            .load_session(&session_id)
+            .await
+            .expect("recovered Session Journal remains readable")
+            .iter()
+            .filter(|record| matches!(
+                &record.payload,
+                AgentSessionEvent::ToolExchangeCommitted { .. }
+            ))
+            .count(),
+        1
+    );
     assert_eq!(
         checkpoint_store
             .load_run(&run_id)

@@ -48,7 +48,8 @@ pub use skill::{
 };
 pub use tool_runtime::{
     AgentToolRuntime, GuardedToolExecution, GuardedToolExecutor, GuardedToolResult,
-    GuardedToolRuntime, ToolArtifactError, ToolArtifactStore, ToolRuntimeError,
+    GuardedToolRuntime, ToolArtifactError, ToolArtifactStore, ToolOutcomeRecoveryError,
+    ToolRuntimeError,
 };
 pub use tools::{
     GuardedMcpServerConfig, McpServerConnectionManager, McpServerHealth, McpToolsAdapterError,

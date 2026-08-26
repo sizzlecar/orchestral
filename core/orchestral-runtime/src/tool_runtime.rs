@@ -80,6 +80,16 @@ pub trait AgentToolRuntime: Send + Sync {
 
     fn resolve_tool_id(&self, model_name: &str) -> Result<Option<ToolId>, ToolRuntimeError>;
 
+    /// Recovers an already-started invocation from the durable Effect Journal
+    /// without ever calling its executor or creating a fresh effect record.
+    /// `Ok(None)` means no durable outcome exists. Callers must establish
+    /// exclusive recovery ownership before using this operation.
+    async fn recover_outcome(
+        &self,
+        invocation: ToolInvocation,
+        run_grant: RunToolGrant,
+    ) -> Result<Option<ToolOutcome>, ToolOutcomeRecoveryError>;
+
     async fn invoke(
         &self,
         invocation: ToolInvocation,
@@ -102,6 +112,16 @@ pub enum GuardedToolResult {
     /// Semantic Tool result. `cached=true` means this call joined or replayed
     /// an invocation that another caller already executed.
     Outcome { outcome: ToolOutcome, cached: bool },
+}
+
+/// Structured failure from replay-only Tool outcome recovery. This is kept
+/// separate from a semantic [`ToolOutcome`] so callers cannot confuse a
+/// recovery-contract violation with a result produced by the Tool.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("Tool outcome recovery failed ({code}): {message}")]
+pub struct ToolOutcomeRecoveryError {
+    pub code: String,
+    pub message: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -605,6 +625,144 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
             .values()
             .find(|registered| registered.descriptor.model_schema.name == model_name)
             .map(|registered| registered.descriptor.tool_id.clone()))
+    }
+
+    /// Replays only durable Tool state. This path can close an Observed result
+    /// or classify an orphaned Invoked effect as unknown, but it never creates
+    /// Prepared/Invoked records and never enters an executor.
+    pub async fn recover_outcome(
+        &self,
+        invocation: ToolInvocation,
+        run_grant: RunToolGrant,
+    ) -> Result<Option<ToolOutcome>, ToolOutcomeRecoveryError> {
+        if let Err(error) = invocation.validate() {
+            return Err(tool_outcome_recovery_error(
+                "invalid_invocation",
+                error.message,
+            ));
+        }
+        let registered = match self.registered_tool(&invocation.tool_id) {
+            Ok(Some(registered)) => registered,
+            Ok(None) => {
+                return Err(tool_outcome_recovery_error(
+                    "tool_not_found",
+                    format!("tool is not registered: {}", invocation.tool_id),
+                ))
+            }
+            Err(error) => {
+                return Err(tool_outcome_recovery_error(
+                    "runtime_unavailable",
+                    error.to_string(),
+                ))
+            }
+        };
+        if let Err(error) = registered
+            .descriptor
+            .model_schema
+            .validate_arguments(&invocation.arguments)
+        {
+            return Err(tool_outcome_recovery_error(
+                "input_schema_violation",
+                error.message,
+            ));
+        }
+        let effective_policy = EffectiveToolPolicy::resolve(
+            &self.host_ceiling,
+            &run_grant,
+            &registered.descriptor.restriction,
+        )
+        .map_err(|error| tool_outcome_recovery_error("invalid_effective_policy", error.message))?;
+        if !effective_policy.authorizes_scopes(&registered.descriptor.effect_scopes) {
+            return Err(tool_outcome_recovery_error(
+                "policy_denied",
+                "tool effects are outside the effective Host policy",
+            ));
+        }
+        let prepared = PreparedToolEffect {
+            invocation: invocation.clone(),
+            args_digest: invocation.args_digest().map_err(|error| {
+                tool_outcome_recovery_error("invalid_invocation", error.message)
+            })?,
+            policy_digest: effective_policy.digest().map_err(|error| {
+                tool_outcome_recovery_error("invalid_effective_policy", error.message)
+            })?,
+            descriptor_digest: registered.descriptor.digest().map_err(|error| {
+                tool_outcome_recovery_error("invalid_descriptor", error.message)
+            })?,
+            idempotency: registered.descriptor.idempotency,
+            effect_scopes: registered.descriptor.effect_scopes.clone(),
+        };
+        let key = prepared.key();
+
+        for _ in 0..4 {
+            let records = self
+                .effect_journal
+                .load_effect(&key)
+                .await
+                .map_err(effect_journal_recovery_error)?;
+            let Some(projection) =
+                replay_tool_effect(&key, &records).map_err(effect_journal_recovery_error)?
+            else {
+                return Ok(None);
+            };
+            if projection.prepared != prepared {
+                return Err(tool_outcome_recovery_error(
+                    "call_identity_conflict",
+                    "durable Tool effect identity differs for the same run_id/call_id",
+                ));
+            }
+            match projection.phase {
+                ToolEffectPhase::Prepared => return Ok(None),
+                ToolEffectPhase::Observed { outcome, .. } => {
+                    let outcome_digest = outcome.digest().map_err(|error| {
+                        tool_outcome_recovery_error("invalid_tool_outcome", error.message)
+                    })?;
+                    match self
+                        .effect_journal
+                        .append(
+                            projection.last_effect_seq,
+                            ToolEffectEventDraft {
+                                event_id: effect_event_id(&key, "committed"),
+                                key: key.clone(),
+                                payload: ToolEffectEvent::Committed { outcome_digest },
+                            },
+                        )
+                        .await
+                    {
+                        Ok(_) | Err(ToolEffectError::SequenceConflict { .. }) => continue,
+                        Err(error) => return Err(effect_journal_recovery_error(error)),
+                    }
+                }
+                ToolEffectPhase::Committed { outcome, .. } => return Ok(Some(outcome)),
+                ToolEffectPhase::Invoked { .. } => {
+                    let reason = "durable invocation has no observation after runtime recovery";
+                    match self
+                        .effect_journal
+                        .append(
+                            projection.last_effect_seq,
+                            ToolEffectEventDraft {
+                                event_id: effect_event_id(&key, "unknown"),
+                                key: key.clone(),
+                                payload: ToolEffectEvent::EffectUnknown {
+                                    reason: reason.to_owned(),
+                                },
+                            },
+                        )
+                        .await
+                    {
+                        Ok(_) | Err(ToolEffectError::SequenceConflict { .. }) => continue,
+                        Err(error) => return Err(effect_journal_recovery_error(error)),
+                    }
+                }
+                ToolEffectPhase::UnknownEffect { reason, .. } => {
+                    return Ok(Some(unknown_effect(reason)))
+                }
+            }
+        }
+        Err(tool_outcome_recovery_error(
+            "effect_journal_contention",
+            "Tool effect journal did not converge during recovery",
+        ))
     }
 
     /// Executes the fixed guarded pipeline:
@@ -1245,6 +1403,14 @@ where
         GuardedToolRuntime::resolve_tool_id(self, model_name)
     }
 
+    async fn recover_outcome(
+        &self,
+        invocation: ToolInvocation,
+        run_grant: RunToolGrant,
+    ) -> Result<Option<ToolOutcome>, ToolOutcomeRecoveryError> {
+        GuardedToolRuntime::recover_outcome(self, invocation, run_grant).await
+    }
+
     async fn invoke(
         &self,
         invocation: ToolInvocation,
@@ -1279,6 +1445,20 @@ fn effect_event_id(key: &ToolEffectKey, phase: &str) -> ToolEffectEventId {
 
 fn effect_journal_rejected(error: ToolEffectError) -> GuardedToolResult {
     rejected("effect_journal_unavailable", error.to_string())
+}
+
+fn tool_outcome_recovery_error(
+    code: impl Into<String>,
+    message: impl Into<String>,
+) -> ToolOutcomeRecoveryError {
+    ToolOutcomeRecoveryError {
+        code: code.into(),
+        message: message.into(),
+    }
+}
+
+fn effect_journal_recovery_error(error: ToolEffectError) -> ToolOutcomeRecoveryError {
+    tool_outcome_recovery_error("effect_journal_unavailable", error.to_string())
 }
 
 fn unknown_effect(message: impl Into<String>) -> ToolOutcome {
