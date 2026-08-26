@@ -6,12 +6,17 @@ use orchestral_agent_protocol_testkit::{
 };
 use orchestral_core::agent_protocol::{
     reference::AgentRunStatus,
-    wire::{AgentSessionId, Digest, ProviderBindingRef, RunId},
+    wire::{
+        AgentAdmission, AgentDescriptor, AgentDescriptorEnvelope, AgentExecutionRef, AgentId,
+        AgentProviderId, AgentRunEnvelope, AgentSessionId, AgentStartRequest, Content, Digest,
+        ProviderBindingRef, RunId,
+    },
+    AGENT_PROTOCOL_V1,
 };
 use orchestral_core::agent_session::{
     AgentSessionEvent, AgentSessionEventDraft, AgentSessionEventId, AgentSessionJournalStore,
 };
-use orchestral_core::model_protocol::{ModelMessage, ModelRole};
+use orchestral_core::model_protocol::{ModelMessage, ModelRequestId, ModelRole, ModelUsage};
 use orchestral_core::tool_effect::{
     replay_tool_effect, PreparedToolEffect, ToolAuthorizationEvidence, ToolEffectAttemptId,
     ToolEffectEvent, ToolEffectEventDraft, ToolEffectEventId, ToolEffectJournalStore,
@@ -20,7 +25,104 @@ use orchestral_core::tool_effect::{
 use orchestral_core::tool_protocol::{
     EffectScope, ToolCallId, ToolId, ToolIdempotency, ToolInvocation,
 };
-use orchestral_runtime::AgentController;
+use orchestral_runtime::{
+    AgentController, AppendGenericCheckpointOutcome, CreateGenericRunOutcome,
+    GenericAgentCheckpointStore, GenericAgentRunRegistration, GenericCheckpointDraft,
+    GenericCheckpointEvent, GenericCheckpointEventId, GenericCheckpointPhase,
+};
+
+#[test]
+fn generic_private_wal_rehydrates_from_a_new_store_instance() {
+    let root = std::env::temp_dir().join(format!(
+        "orchestral-generic-checkpoint-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let descriptor = AgentDescriptorEnvelope::seal(AgentDescriptor {
+        provider_id: AgentProviderId::new("test/generic"),
+        agent_id: AgentId::new("generic-v1"),
+        supported_protocol_versions: vec![AGENT_PROTOCOL_V1],
+        accepted_content_types: std::collections::BTreeSet::from(["text/plain".to_owned()]),
+        capabilities: Default::default(),
+        extensions: Default::default(),
+    })
+    .expect("descriptor seals");
+    let run = AgentRunEnvelope::new(
+        AGENT_PROTOCOL_V1,
+        AgentSessionId::new("generic-checkpoint-session"),
+        RunId::new("generic-checkpoint-run"),
+        vec![Content::text("resume me safely")],
+    )
+    .expect("Run is valid");
+    let request = AgentStartRequest::new(
+        run,
+        ProviderBindingRef::new("generic-checkpoint-binding"),
+        &descriptor,
+    )
+    .expect("start request is valid");
+    let registration = GenericAgentRunRegistration {
+        execution: AgentExecutionRef::for_start(&request, &descriptor)
+            .expect("execution reference is valid"),
+        request,
+        admission: AgentAdmission::default(),
+        config_digest: Digest::sha256("generic-config-v1"),
+    };
+    let run_id = registration.run_id().clone();
+    let boundary = GenericCheckpointDraft {
+        event_id: GenericCheckpointEventId::new("boundary-1"),
+        run_id: run_id.clone(),
+        payload: GenericCheckpointEvent::LoopBoundaryCommitted {
+            next_model_round: 1,
+            usage: ModelUsage::default(),
+            tool_call_count: 0,
+            last_response: String::new(),
+            supporting_event_ids: Vec::new(),
+        },
+    };
+    let attempt = GenericCheckpointDraft {
+        event_id: GenericCheckpointEventId::new("attempt-1"),
+        run_id: run_id.clone(),
+        payload: GenericCheckpointEvent::ModelAttemptStarted {
+            round: 1,
+            request_id: ModelRequestId::new("model-attempt-1"),
+            request_digest: Digest::sha256("model-request-1"),
+        },
+    };
+
+    let first = FileAgentJournalStore::open(&root).expect("journal opens");
+    assert_eq!(
+        GenericAgentCheckpointStore::create_run(&first, registration)
+            .expect("private Run registration persists"),
+        CreateGenericRunOutcome::Created
+    );
+    assert_eq!(
+        GenericAgentCheckpointStore::append(&first, &run_id, 0, boundary)
+            .expect("stable boundary persists"),
+        AppendGenericCheckpointOutcome::Appended
+    );
+    assert_eq!(
+        GenericAgentCheckpointStore::append(&first, &run_id, 1, attempt.clone())
+            .expect("model attempt persists"),
+        AppendGenericCheckpointOutcome::Appended
+    );
+    drop(first);
+
+    let second = FileAgentJournalStore::open(&root).expect("journal reopens");
+    let stored = GenericAgentCheckpointStore::load_run(&second, &run_id)
+        .expect("private WAL reloads")
+        .expect("private Run exists");
+    assert_eq!(stored.records.len(), 2);
+    assert!(matches!(
+        stored.validate().expect("private WAL replays").phase,
+        GenericCheckpointPhase::ModelAttemptOpen { round: 1, .. }
+    ));
+    assert_eq!(
+        GenericAgentCheckpointStore::append(&second, &run_id, 2, attempt)
+            .expect("exact retry is idempotent"),
+        AppendGenericCheckpointOutcome::ExactDuplicate
+    );
+
+    std::fs::remove_dir_all(root).expect("temporary journal cleans up");
+}
 
 #[tokio::test]
 async fn terminal_run_rehydrates_from_a_new_store_and_controller_instance() {

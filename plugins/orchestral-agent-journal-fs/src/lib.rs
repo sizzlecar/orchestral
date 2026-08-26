@@ -1,5 +1,5 @@
-//! Crash-safe, single-writer filesystem implementation of Agent Run and
-//! Agent Session journals.
+//! Crash-safe, single-writer filesystem implementation of Host Agent,
+//! Agent Session, Tool Effect, and Generic Agent private checkpoint journals.
 //!
 //! Each Agent Run is one validated snapshot file. Updates are serialized by
 //! this store instance and committed through a same-directory temporary file,
@@ -26,6 +26,11 @@ use orchestral_core::agent_session::{
 use orchestral_core::tool_effect::{
     replay_tool_effect, ToolEffectAppend, ToolEffectError, ToolEffectEventDraft,
     ToolEffectJournalRecord, ToolEffectJournalStore, ToolEffectKey,
+};
+use orchestral_runtime::{
+    AppendGenericCheckpointOutcome, CreateGenericRunOutcome, GenericAgentCheckpointStore,
+    GenericAgentRunRegistration, GenericCheckpointDraft, GenericCheckpointError,
+    GenericCheckpointRecord, StoredGenericAgentRun,
 };
 
 #[derive(Clone)]
@@ -68,6 +73,12 @@ impl FileAgentJournalStore {
     fn effect_path(&self, key: &ToolEffectKey) -> PathBuf {
         let digest = Digest::sha256(format!("{}\0{}", key.run_id.as_str(), key.call_id.as_str()));
         self.root.join(format!("effect-{}.json", digest.as_str()))
+    }
+
+    fn generic_checkpoint_path(&self, run_id: &RunId) -> PathBuf {
+        let digest = Digest::sha256(run_id.as_str());
+        self.root
+            .join(format!("generic-checkpoint-{}.json", digest.as_str()))
     }
 
     fn load_sync(&self, run_id: &RunId) -> Result<Option<StoredAgentRun>, AgentJournalStoreError> {
@@ -220,6 +231,67 @@ impl FileAgentJournalStore {
         if let Err(error) = write_result {
             let _ = fs::remove_file(&temporary);
             return Err(effect_unavailable(error));
+        }
+        Ok(())
+    }
+
+    fn load_generic_checkpoint_sync(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Option<StoredGenericAgentRun>, GenericCheckpointError> {
+        let path = self.generic_checkpoint_path(run_id);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(checkpoint_unavailable(error)),
+        };
+        let run = serde_json::from_slice::<StoredGenericAgentRun>(&bytes).map_err(|error| {
+            GenericCheckpointError::InvalidData(format!(
+                "could not decode {}: {error}",
+                path.display()
+            ))
+        })?;
+        run.validate()?;
+        if run.registration.run_id() != run_id {
+            return Err(GenericCheckpointError::InvalidData(format!(
+                "Generic checkpoint filename identity does not match stored run_id: {}",
+                path.display()
+            )));
+        }
+        Ok(Some(run))
+    }
+
+    fn write_generic_checkpoint_sync(
+        &self,
+        run: &StoredGenericAgentRun,
+    ) -> Result<(), GenericCheckpointError> {
+        run.validate()?;
+        let run_id = run.registration.run_id();
+        let destination = self.generic_checkpoint_path(run_id);
+        let temporary = self.root.join(format!(
+            ".generic-checkpoint-{}-{}.tmp",
+            Digest::sha256(run_id.as_str()).as_str(),
+            uuid::Uuid::new_v4()
+        ));
+        let bytes = serde_json::to_vec(run).map_err(|error| {
+            GenericCheckpointError::InvalidData(format!(
+                "could not encode Generic Agent checkpoint: {error}"
+            ))
+        })?;
+        let write_result = (|| {
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            fs::rename(&temporary, &destination)?;
+            File::open(self.root.as_path())?.sync_all()?;
+            Ok::<(), std::io::Error>(())
+        })();
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temporary);
+            return Err(checkpoint_unavailable(error));
         }
         Ok(())
     }
@@ -485,6 +557,87 @@ impl ToolEffectJournalStore for FileAgentJournalStore {
     }
 }
 
+impl GenericAgentCheckpointStore for FileAgentJournalStore {
+    fn load_run(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Option<StoredGenericAgentRun>, GenericCheckpointError> {
+        self.load_generic_checkpoint_sync(run_id)
+    }
+
+    fn create_run(
+        &self,
+        registration: GenericAgentRunRegistration,
+    ) -> Result<CreateGenericRunOutcome, GenericCheckpointError> {
+        registration.validate()?;
+        let run_id = registration.run_id().clone();
+        let _guard = self
+            .writer_gate
+            .lock()
+            .map_err(|_| checkpoint_unavailable("writer lock poisoned"))?;
+        if let Some(existing) = self.load_generic_checkpoint_sync(&run_id)? {
+            return if existing.registration == registration {
+                Ok(CreateGenericRunOutcome::ExactExisting)
+            } else {
+                Err(GenericCheckpointError::RunConflict(run_id))
+            };
+        }
+        self.write_generic_checkpoint_sync(&StoredGenericAgentRun {
+            registration,
+            records: Vec::new(),
+        })?;
+        Ok(CreateGenericRunOutcome::Created)
+    }
+
+    fn append(
+        &self,
+        run_id: &RunId,
+        expected_previous: u64,
+        draft: GenericCheckpointDraft,
+    ) -> Result<AppendGenericCheckpointOutcome, GenericCheckpointError> {
+        draft.validate()?;
+        if draft.run_id != *run_id {
+            return Err(GenericCheckpointError::InvalidData(
+                "checkpoint append crossed a Run boundary".to_owned(),
+            ));
+        }
+        let draft_digest = draft.digest()?;
+        let _guard = self
+            .writer_gate
+            .lock()
+            .map_err(|_| checkpoint_unavailable("writer lock poisoned"))?;
+        let mut run = self
+            .load_generic_checkpoint_sync(run_id)?
+            .ok_or_else(|| GenericCheckpointError::RunNotFound(run_id.clone()))?;
+        if let Some(existing) = run
+            .records
+            .iter()
+            .find(|record| record.event_id == draft.event_id)
+        {
+            return if existing.draft_digest == draft_digest {
+                Ok(AppendGenericCheckpointOutcome::ExactDuplicate)
+            } else {
+                Err(GenericCheckpointError::EventConflict(draft.event_id))
+            };
+        }
+        let actual_previous = run.last_checkpoint_seq();
+        if actual_previous != expected_previous {
+            return Err(GenericCheckpointError::SequenceConflict {
+                run_id: run_id.clone(),
+                expected_previous,
+                actual_previous,
+            });
+        }
+        let record = GenericCheckpointRecord::seal(draft, actual_previous + 1)?;
+        let mut candidate = run.clone();
+        candidate.records.push(record.clone());
+        candidate.validate()?;
+        run.records.push(record);
+        self.write_generic_checkpoint_sync(&run)?;
+        Ok(AppendGenericCheckpointOutcome::Appended)
+    }
+}
+
 fn sequence_conflict(
     run_id: &RunId,
     expected_previous: u64,
@@ -509,4 +662,8 @@ fn session_unavailable(error: impl std::fmt::Display) -> AgentSessionError {
 
 fn effect_unavailable(error: impl std::fmt::Display) -> ToolEffectError {
     ToolEffectError::StoreUnavailable(error.to_string())
+}
+
+fn checkpoint_unavailable(error: impl std::fmt::Display) -> GenericCheckpointError {
+    GenericCheckpointError::Unavailable(error.to_string())
 }

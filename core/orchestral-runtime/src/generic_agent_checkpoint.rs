@@ -230,7 +230,10 @@ struct GenericCheckpointRecordDigestView<'a> {
 }
 
 impl GenericCheckpointRecord {
-    fn seal(
+    /// Seals one validated private-WAL draft at the store-assigned sequence.
+    /// Concrete checkpoint-store plugins use this after enforcing their
+    /// compare-and-append boundary.
+    pub fn seal(
         draft: GenericCheckpointDraft,
         checkpoint_seq: u64,
     ) -> Result<Self, GenericCheckpointError> {
