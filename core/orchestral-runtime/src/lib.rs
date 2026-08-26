@@ -7,6 +7,7 @@ pub mod agent_sdk;
 pub mod api;
 pub mod approval_bridge;
 pub mod generic_agent;
+pub mod generic_agent_checkpoint;
 mod in_memory_blob;
 pub mod pty_process;
 pub mod session_context;
@@ -19,6 +20,13 @@ pub use agent_control::{AgentControlError, AgentControlEvent, AgentController};
 pub use agent_sdk::{AgentClient, AgentRunHandle, AgentSdkError, AgentTurn};
 pub use approval_bridge::{AgentApprovalBridge, ApprovalBridgeError, InMemoryHostApprovalBroker};
 pub use generic_agent::{GenericAgentConfig, InternalGenericAgentProvider};
+pub use generic_agent_checkpoint::{
+    replay_generic_agent_checkpoint, AppendGenericCheckpointOutcome, CommandCheckpoint,
+    CreateGenericRunOutcome, GenericAgentCheckpointProjection, GenericAgentCheckpointStore,
+    GenericAgentRunRegistration, GenericCheckpointDraft, GenericCheckpointError,
+    GenericCheckpointEvent, GenericCheckpointEventId, GenericCheckpointPhase, GenericLoopBoundary,
+    InMemoryGenericAgentCheckpointStore, StoredGenericAgentRun,
+};
 pub use in_memory_blob::InMemoryBlobStore;
 pub use orchestral_core::spi::{
     ComponentRegistry, HookDispatchError, HookDispatchMode, HookError, HookExecutionPolicy,
