@@ -116,6 +116,7 @@ struct GenericInner {
 
 struct GenericTools {
     runtime: Arc<dyn AgentToolRuntime>,
+    runtime_contract_digest: Digest,
     run_grant: RunToolGrant,
     model_definitions: Vec<ModelToolDefinition>,
     workflow: Option<Arc<WorkflowExecutionStrategy>>,
@@ -476,10 +477,8 @@ impl InternalGenericAgentProvider {
         })?;
         let config_digest = generic_config_digest(
             &config,
-            &model_descriptor.backend_id,
-            tools
-                .as_ref()
-                .map(|tools| tools.model_definitions.as_slice()),
+            &model_descriptor,
+            tools.as_ref(),
             skills.as_ref().map(|skills| skills.catalog()),
             has_approval,
             has_input_requests,
@@ -3779,6 +3778,9 @@ fn configure_tools(
     run_grant.bounds.validate().map_err(|error| {
         AgentProtocolError::new(AgentProtocolErrorCode::InvalidSpec, error.message)
     })?;
+    let runtime_contract_digest = runtime
+        .execution_contract_digest()
+        .map_err(tool_runtime_error)?;
     let mut model_definitions = runtime
         .model_tool_schemas()
         .map_err(tool_runtime_error)?
@@ -3811,6 +3813,7 @@ fn configure_tools(
     }
     Ok(GenericTools {
         runtime,
+        runtime_contract_digest,
         run_grant,
         model_definitions,
         workflow,
@@ -3892,22 +3895,33 @@ fn workflow_tool_definition() -> ModelToolDefinition {
 
 fn generic_config_digest(
     config: &GenericAgentConfig,
-    backend_id: &str,
-    tools: Option<&[ModelToolDefinition]>,
+    model_descriptor: &orchestral_core::model_protocol::ModelDescriptor,
+    tools: Option<&GenericTools>,
     skills: Option<&orchestral_core::skill_protocol::SkillCatalogDescriptor>,
     approval_enabled: bool,
     input_requests_enabled: bool,
 ) -> Result<Digest, AgentProtocolError> {
+    let tool_contract = tools.map(|tools| {
+        serde_json::json!({
+            "runtime_contract_digest": &tools.runtime_contract_digest,
+            "run_grant": &tools.run_grant,
+            "model_definitions": &tools.model_definitions,
+            "workflow": tools
+                .workflow
+                .as_ref()
+                .map(|workflow| workflow.recovery_contract()),
+        })
+    });
     let value = serde_json::json!({
         "provider_id": config.provider_id,
         "agent_id": config.agent_id,
         "system_prompt": config.system_prompt,
-        "backend_id": backend_id,
+        "model_descriptor": model_descriptor,
         "max_model_rounds": config.max_model_rounds,
         "max_tool_calls": config.max_tool_calls,
         "max_context_tokens": config.max_context_tokens,
         "reserved_output_tokens": config.reserved_output_tokens,
-        "tools": tools.unwrap_or_default(),
+        "tool_contract": tool_contract,
         "skill_catalog": skills,
         "approval_enabled": approval_enabled,
         "input_requests_enabled": input_requests_enabled,

@@ -199,6 +199,13 @@ impl WorkflowExecutionStrategy {
         Arc::ptr_eq(&self.tools, runtime)
     }
 
+    pub(crate) fn recovery_contract(&self) -> serde_json::Value {
+        serde_json::json!({
+            "max_tool_calls": self.max_tool_calls,
+            "hooks_enabled": self.hooks.is_some(),
+        })
+    }
+
     pub async fn execute(
         &self,
         request: WorkflowExecutionRequest,

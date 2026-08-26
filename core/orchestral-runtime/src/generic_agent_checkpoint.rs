@@ -52,8 +52,9 @@ pub struct GenericAgentRunRegistration {
     pub request: AgentStartRequest,
     pub execution: AgentExecutionRef,
     pub admission: AgentAdmission,
-    /// Binds model backend, system prompt, Tool schemas, Skill catalog, and
-    /// loop limits that determine the reconstructed execution.
+    /// Binds the model contract, system prompt, Host Tool authority and
+    /// schemas, Skill catalog, and loop limits that determine reconstructed
+    /// execution.
     pub config_digest: Digest,
 }
 

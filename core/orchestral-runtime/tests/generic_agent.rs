@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -61,6 +61,11 @@ struct RecoveryAfterRestoreModel {
     host_journal: Arc<InMemoryAgentJournalStore>,
     run_id: RunId,
     starts: AtomicUsize,
+}
+
+struct RecoveryIdentityModel {
+    revision: &'static str,
+    starts: Arc<AtomicUsize>,
 }
 
 #[derive(Default)]
@@ -442,6 +447,31 @@ impl ModelBackend for RecoveryAfterRestoreModel {
                 },
             }),
         ])))
+    }
+}
+
+#[async_trait]
+impl ModelBackend for RecoveryIdentityModel {
+    fn descriptor(&self) -> ModelDescriptor {
+        ModelDescriptor {
+            backend_id: "recovery-identity-model".to_owned(),
+            capabilities: ModelCapabilities {
+                streaming: true,
+                tool_calls: true,
+                ..ModelCapabilities::default()
+            },
+            extensions: BTreeMap::from([("test/revision".to_owned(), json!(self.revision))]),
+        }
+    }
+
+    async fn start(
+        &self,
+        request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelStream, ModelError> {
+        request.validate()?;
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::pin(stream::pending()))
     }
 }
 
@@ -923,6 +953,59 @@ impl GuardedToolExecutor for EchoTool {
             output: json!({ "result": execution.invocation.arguments["value"].clone() }).into(),
         }
     }
+}
+
+fn recovery_identity_tool_runtime(
+    host_bounds: ToolPolicyBounds,
+    restriction_bounds: ToolPolicyBounds,
+) -> Arc<GuardedToolRuntime<InMemoryApprovalCapabilityStore>> {
+    let verifier = HostApprovalVerifier::new(
+        b"0123456789abcdef0123456789abcdef",
+        InMemoryApprovalCapabilityStore::default(),
+    )
+    .expect("valid Host signing key");
+    let runtime = Arc::new(
+        GuardedToolRuntime::new(
+            HostToolPolicy {
+                bounds: host_bounds,
+            },
+            verifier,
+        )
+        .expect("valid Host Tool policy"),
+    );
+    runtime
+        .register(
+            ToolDescriptor {
+                tool_id: ToolId::new("test/recovery-echo"),
+                model_schema: ModelToolSchema {
+                    name: "recovery_echo".to_owned(),
+                    description: "Echo one recovery test value".to_owned(),
+                    input_schema: json!({
+                        "type": "object",
+                        "required": ["value"],
+                        "properties": { "value": { "type": "string" } },
+                        "additionalProperties": false
+                    }),
+                },
+                output_schema: json!({
+                    "type": "object",
+                    "required": ["result"],
+                    "properties": { "result": { "type": "string" } },
+                    "additionalProperties": false
+                }),
+                effect_scopes: BTreeSet::new(),
+                restriction: ToolRestriction {
+                    bounds: restriction_bounds,
+                },
+                idempotency: ToolIdempotency::IdempotentWithKey,
+                concurrency: ToolConcurrency::ParallelSafe,
+            },
+            Arc::new(EchoTool {
+                calls: AtomicUsize::new(0),
+            }),
+        )
+        .expect("recovery identity Tool registers");
+    runtime
 }
 
 #[async_trait]
@@ -1534,6 +1617,176 @@ async fn stable_private_boundary_resumes_only_after_host_restores_continuity() {
             .phase,
         GenericCheckpointPhase::Terminal
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn private_wal_recovery_is_bound_to_model_and_tool_authority() {
+    let run_id = RunId::new("recovery-authority-run");
+    let checkpoint_store = Arc::new(PausingModelAttemptCheckpointStore::default());
+    let session_journal = Arc::new(InMemoryAgentSessionJournalStore::default());
+    let config = GenericAgentConfig::new("internal-provider", "generic-agent");
+    let base_bounds = ToolPolicyBounds {
+        approval: ApprovalPolicy::NotRequired,
+        max_timeout_ms: Some(1_000),
+        max_output_bytes: Some(1_024),
+        ..ToolPolicyBounds::default()
+    };
+    let base_grant = RunToolGrant {
+        bounds: base_bounds.clone(),
+    };
+    let base_runtime = recovery_identity_tool_runtime(base_bounds.clone(), base_bounds.clone());
+    let starts = Arc::new(AtomicUsize::new(0));
+    let first = InternalGenericAgentProvider::new_with_tools_and_session_journal(
+        Arc::new(RecoveryIdentityModel {
+            revision: "v1",
+            starts: starts.clone(),
+        }),
+        config.clone(),
+        base_runtime.clone(),
+        base_grant.clone(),
+        session_journal.clone(),
+        Arc::new(JsonSizeTokenMeter::default()),
+    )
+    .expect("first authority-bound Generic Agent starts")
+    .with_checkpoint_store(checkpoint_store.clone())
+    .expect("private WAL binds before the Provider is shared");
+    let descriptor = first.describe();
+    let request = AgentStartRequest::new(
+        AgentRunEnvelope::new(
+            AGENT_PROTOCOL_V1,
+            AgentSessionId::new("recovery-authority-session"),
+            run_id.clone(),
+            vec![Content::text("continue only under the same authority")],
+        )
+        .expect("valid authority-bound Run"),
+        ProviderBindingRef::new("recovery-authority-binding"),
+        &descriptor,
+    )
+    .expect("valid authority-bound start request");
+
+    let paused = checkpoint_store.paused.notified();
+    let started = first
+        .start(request.clone())
+        .await
+        .expect("first Run is admitted");
+    let execution = started.execution.clone();
+    tokio::time::timeout(std::time::Duration::from_secs(1), paused)
+        .await
+        .expect("first model attempt reaches the crash cut");
+    checkpoint_store.release_as_crash();
+
+    let mut stream = started.stream;
+    let stream_error = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            match stream.next().await {
+                Some(Err(error)) => break error,
+                Some(Ok(_)) => {}
+                None => panic!("simulated process loss must be explicit"),
+            }
+        }
+    })
+    .await
+    .expect("simulated process loss reaches the Provider stream");
+    assert_eq!(
+        stream_error.code,
+        AgentProtocolErrorCode::ProviderUnavailable
+    );
+    assert_eq!(starts.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        checkpoint_store
+            .load_run(&run_id)
+            .expect("private WAL remains readable")
+            .expect("private Run remains registered")
+            .validate()
+            .expect("private WAL remains valid")
+            .phase,
+        GenericCheckpointPhase::Stable(_)
+    ));
+
+    let changed_model = InternalGenericAgentProvider::new_with_tools_and_session_journal(
+        Arc::new(RecoveryIdentityModel {
+            revision: "v2",
+            starts: starts.clone(),
+        }),
+        config.clone(),
+        base_runtime.clone(),
+        base_grant.clone(),
+        session_journal.clone(),
+        Arc::new(JsonSizeTokenMeter::default()),
+    )
+    .expect("replacement model contract is internally valid")
+    .with_checkpoint_store(checkpoint_store.clone())
+    .expect("replacement model sees the same private WAL");
+    let error = match changed_model
+        .recover(
+            AgentRecoveryRequest::new(request.clone(), execution.clone(), &descriptor)
+                .expect("recovery request identity is valid"),
+        )
+        .await
+    {
+        Ok(_) => panic!("changed model contract must not resume the Run"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, AgentProtocolErrorCode::RunIdConflict);
+
+    let mut narrower_grant_bounds = base_bounds.clone();
+    narrower_grant_bounds.max_timeout_ms = Some(500);
+    let changed_grant = InternalGenericAgentProvider::new_with_tools_and_session_journal(
+        Arc::new(RecoveryIdentityModel {
+            revision: "v1",
+            starts: starts.clone(),
+        }),
+        config.clone(),
+        base_runtime,
+        RunToolGrant {
+            bounds: narrower_grant_bounds,
+        },
+        session_journal.clone(),
+        Arc::new(JsonSizeTokenMeter::default()),
+    )
+    .expect("replacement Run grant is internally valid")
+    .with_checkpoint_store(checkpoint_store.clone())
+    .expect("replacement grant sees the same private WAL");
+    let error = match changed_grant
+        .recover(
+            AgentRecoveryRequest::new(request.clone(), execution.clone(), &descriptor)
+                .expect("recovery request identity is valid"),
+        )
+        .await
+    {
+        Ok(_) => panic!("changed Run Tool grant must not resume the Run"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, AgentProtocolErrorCode::RunIdConflict);
+
+    let mut narrower_restriction = base_bounds.clone();
+    narrower_restriction.max_output_bytes = Some(512);
+    let changed_runtime = InternalGenericAgentProvider::new_with_tools_and_session_journal(
+        Arc::new(RecoveryIdentityModel {
+            revision: "v1",
+            starts: starts.clone(),
+        }),
+        config,
+        recovery_identity_tool_runtime(base_bounds, narrower_restriction),
+        base_grant,
+        session_journal,
+        Arc::new(JsonSizeTokenMeter::default()),
+    )
+    .expect("replacement Tool Runtime contract is internally valid")
+    .with_checkpoint_store(checkpoint_store)
+    .expect("replacement Tool Runtime sees the same private WAL");
+    let error = match changed_runtime
+        .recover(
+            AgentRecoveryRequest::new(request, execution, &descriptor)
+                .expect("recovery request identity is valid"),
+        )
+        .await
+    {
+        Ok(_) => panic!("changed Host Tool contract must not resume the Run"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, AgentProtocolErrorCode::RunIdConflict);
+    assert_eq!(starts.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

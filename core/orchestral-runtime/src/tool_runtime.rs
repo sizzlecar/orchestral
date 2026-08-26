@@ -67,6 +67,15 @@ pub trait GuardedToolExecutor: Send + Sync {
 /// reference-monitor state stay behind this Host-owned boundary.
 #[async_trait]
 pub trait AgentToolRuntime: Send + Sync {
+    /// Stable identity of the Host-side execution contract used to decide
+    /// whether a private Agent checkpoint may continue after restart.
+    ///
+    /// Implementations must cover authority ceilings, registered Tool
+    /// descriptors, and other durable policy that can change whether an
+    /// invocation is accepted or how its result is represented. Credentials,
+    /// live ledgers, and other ephemeral state must not enter this digest.
+    fn execution_contract_digest(&self) -> Result<Digest, ToolRuntimeError>;
+
     fn model_tool_schemas(&self) -> Result<Vec<ModelToolSchema>, ToolRuntimeError>;
 
     fn resolve_tool_id(&self, model_name: &str) -> Result<Option<ToolId>, ToolRuntimeError>;
@@ -106,6 +115,8 @@ pub enum ToolRuntimeError {
     DuplicateToolId(ToolId),
     #[error("model tool name is already registered: {0}")]
     DuplicateModelName(String),
+    #[error("Tool Runtime execution contract cannot be encoded: {0}")]
+    InvalidExecutionContract(String),
     #[error("Tool Runtime state is unavailable")]
     StateUnavailable,
 }
@@ -540,6 +551,36 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
             }),
         );
         Ok(())
+    }
+
+    /// Digests only the declared execution boundary. Executor pointers,
+    /// approval signing material, and mutable invocation state are
+    /// intentionally excluded.
+    pub fn execution_contract_digest(&self) -> Result<Digest, ToolRuntimeError> {
+        let registry = self
+            .registry
+            .read()
+            .map_err(|_| ToolRuntimeError::StateUnavailable)?;
+        let descriptors = registry
+            .values()
+            .map(|registered| &registered.descriptor)
+            .collect::<Vec<_>>();
+        let artifact_contract = self.artifact_store.as_ref().map(|store| {
+            serde_json::json!({
+                "max_artifact_bytes": store.max_artifact_bytes,
+                "summary_max_chars": store.summary_max_chars,
+                "hooks_enabled": store.hooks.is_some(),
+            })
+        });
+        let contract = serde_json::json!({
+            "contract": "orchestral.guarded-tool-runtime/v1",
+            "host_ceiling": &self.host_ceiling,
+            "registered_tools": descriptors,
+            "artifact_store": artifact_contract,
+        });
+        let bytes = serde_jcs::to_vec(&contract)
+            .map_err(|error| ToolRuntimeError::InvalidExecutionContract(error.to_string()))?;
+        Ok(Digest::sha256(bytes))
     }
 
     /// Projects only the model-facing schema. Host policy, effect declarations,
@@ -1192,6 +1233,10 @@ impl<S> AgentToolRuntime for GuardedToolRuntime<S>
 where
     S: ApprovalCapabilityStore + 'static,
 {
+    fn execution_contract_digest(&self) -> Result<Digest, ToolRuntimeError> {
+        GuardedToolRuntime::execution_contract_digest(self)
+    }
+
     fn model_tool_schemas(&self) -> Result<Vec<ModelToolSchema>, ToolRuntimeError> {
         GuardedToolRuntime::model_tool_schemas(self)
     }
