@@ -211,6 +211,10 @@ struct GenericExecutionSeed {
     supporting_event_ids: Vec<AgentEventId>,
 }
 
+// Recovery state is created once per Run and retained behind the provider's
+// Run allocation; keeping the variants explicit is safer than obscuring their
+// durable-boundary fields behind unrelated heap payload types.
+#[allow(clippy::large_enum_variant)]
 enum GenericRecoveryContinuation {
     ModelLoop {
         restore_initial_input: bool,
@@ -606,20 +610,16 @@ impl InternalGenericAgentProvider {
             return replay_stream.boxed();
         }
         let live = stream::unfold(receiver, |mut receiver| async move {
-            loop {
-                match receiver.recv().await {
-                    Ok(item) => return Some((item, receiver)),
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        return Some((
-                            Err(AgentProtocolError::new(
-                                AgentProtocolErrorCode::SequenceGap,
-                                format!("Generic Agent stream subscriber lagged by {skipped}"),
-                            )),
-                            receiver,
-                        ));
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return None,
-                }
+            match receiver.recv().await {
+                Ok(item) => Some((item, receiver)),
+                Err(broadcast::error::RecvError::Lagged(skipped)) => Some((
+                    Err(AgentProtocolError::new(
+                        AgentProtocolErrorCode::SequenceGap,
+                        format!("Generic Agent stream subscriber lagged by {skipped}"),
+                    )),
+                    receiver,
+                )),
+                Err(broadcast::error::RecvError::Closed) => None,
             }
         });
         replay_stream.chain(live).boxed()
@@ -794,18 +794,18 @@ impl AgentProvider for InternalGenericAgentProvider {
         let inner = self.inner.clone();
         let run_admission = admission.clone();
         tokio::spawn(async move {
-            execute_model_run(
+            execute_model_run(ModelRunExecution {
                 inner,
                 request,
-                run_admission,
+                admission: run_admission,
                 user_message,
                 model_messages,
-                model_definitions,
+                model_tools: model_definitions,
                 run_skills,
-                GenericExecutionSeed::fresh(),
+                seed: GenericExecutionSeed::fresh(),
                 cancellation,
                 steer_updates,
-            )
+            })
             .await;
         });
         Ok(AgentStart {
@@ -980,10 +980,10 @@ impl AgentProvider for InternalGenericAgentProvider {
                                 },
                             );
                         };
-                        if !pending
+                        if pending
                             .responder
                             .as_ref()
-                            .is_some_and(|responder| !responder.is_closed())
+                            .is_none_or(|responder| responder.is_closed())
                         {
                             let disposition = record_command(
                                 &self.inner,
@@ -1139,10 +1139,10 @@ impl AgentProvider for InternalGenericAgentProvider {
                 },
             );
         }
-        if !pending
+        if pending
             .responder
             .as_ref()
-            .is_some_and(|responder| !responder.is_closed())
+            .is_none_or(|responder| responder.is_closed())
         {
             let disposition = record_command(
                 &self.inner,
@@ -1969,17 +1969,31 @@ async fn recover_committed_tool_outcome(
     })
 }
 
-async fn prepare_recovered_approval(
-    inner: &GenericInner,
-    run_id: &RunId,
+struct RecoveredApprovalPreparation<'a> {
+    run_id: &'a RunId,
     round: u64,
-    call: &GenericObservedToolCall,
-    arguments: &serde_json::Value,
-    opened_request: &PendingRequest,
-    persisted_response: Option<&ApprovalResponse>,
+    call: &'a GenericObservedToolCall,
+    arguments: &'a serde_json::Value,
+    opened_request: &'a PendingRequest,
+    persisted_response: Option<&'a ApprovalResponse>,
     attach_waiter: bool,
     cancellation: CancellationToken,
+}
+
+async fn prepare_recovered_approval(
+    inner: &GenericInner,
+    preparation: RecoveredApprovalPreparation<'_>,
 ) -> Result<RecoveredApprovalWaiter, AgentProtocolError> {
+    let RecoveredApprovalPreparation {
+        run_id,
+        round,
+        call,
+        arguments,
+        opened_request,
+        persisted_response,
+        attach_waiter,
+        cancellation,
+    } = preparation;
     let tools = inner.tools.as_ref().ok_or_else(|| {
         AgentProtocolError::new(
             AgentProtocolErrorCode::InvalidDigest,
@@ -2568,14 +2582,16 @@ fn stage_loop_recovery(
             let persisted_response = committed_response.as_ref().or(resolved_response.as_ref());
             let prepared = prepare_recovered_approval(
                 &inner,
-                &run_id,
-                *round,
-                call,
-                arguments,
-                opened_request,
-                persisted_response,
-                committed_response.is_none() && resolved_response.is_none(),
-                cancellation.clone(),
+                RecoveredApprovalPreparation {
+                    run_id: &run_id,
+                    round: *round,
+                    call,
+                    arguments,
+                    opened_request,
+                    persisted_response,
+                    attach_waiter: committed_response.is_none() && resolved_response.is_none(),
+                    cancellation: cancellation.clone(),
+                },
             )
             .await?;
             let expected_exchange = match resolved_response.as_ref() {
@@ -3017,18 +3033,18 @@ fn stage_loop_recovery(
         tokio::spawn(async move {
             match continuation {
                 GenericRecoveryContinuation::ModelLoop { .. } => {
-                    execute_model_run(
+                    execute_model_run(ModelRunExecution {
                         inner,
                         request,
                         admission,
                         user_message,
                         model_messages,
-                        model_definitions,
+                        model_tools: model_definitions,
                         run_skills,
                         seed,
                         cancellation,
                         steer_updates,
-                    )
+                    })
                     .await;
                 }
                 GenericRecoveryContinuation::Input {
@@ -3247,17 +3263,16 @@ fn resolve_recovery_skill_binding(
     Ok(skills)
 }
 
+type RecoveredCommandProjection = (
+    BTreeMap<CommandId, StoredCommand>,
+    VecDeque<QueuedSteer>,
+    BTreeMap<RequestId, RecoveredResolution>,
+);
+
 fn reconstruct_recovery_commands(
     records: &[crate::generic_agent_checkpoint::GenericCheckpointRecord],
     recovery_events: &[AgentEventDraft],
-) -> Result<
-    (
-        BTreeMap<CommandId, StoredCommand>,
-        VecDeque<QueuedSteer>,
-        BTreeMap<RequestId, RecoveredResolution>,
-    ),
-    AgentProtocolError,
-> {
+) -> Result<RecoveredCommandProjection, AgentProtocolError> {
     let applied_commands = recovery_events
         .iter()
         .filter_map(|event| {
@@ -3499,18 +3514,32 @@ async fn project_committed_model_messages(
         .map_err(session_failure)
 }
 
-async fn execute_model_run(
+struct ModelRunExecution {
     inner: Arc<GenericInner>,
     request: AgentStartRequest,
     admission: AgentAdmission,
     user_message: ModelMessage,
-    mut model_messages: Vec<ModelMessage>,
+    model_messages: Vec<ModelMessage>,
     model_tools: Vec<ModelToolDefinition>,
     run_skills: Option<Arc<SkillRuntime>>,
     seed: GenericExecutionSeed,
     cancellation: CancellationToken,
-    mut steer_updates: watch::Receiver<u64>,
-) {
+    steer_updates: watch::Receiver<u64>,
+}
+
+async fn execute_model_run(execution: ModelRunExecution) {
+    let ModelRunExecution {
+        inner,
+        request,
+        admission,
+        user_message,
+        mut model_messages,
+        model_tools,
+        run_skills,
+        seed,
+        cancellation,
+        mut steer_updates,
+    } = execution;
     let run_id = request.run.spec.run_id.clone();
     let GenericExecutionSeed {
         published_resource_skips,
@@ -3523,8 +3552,8 @@ async fn execute_model_run(
     } = seed;
     let started_event_id = AgentEventId::new(format!("generic-{}-started", run_id.as_str()));
     for (index, skip) in admission.skipped_optional_bindings.into_iter().enumerate() {
-        if !published_resource_skips.contains(&skip.binding_id) {
-            if !publish_durable(
+        if !published_resource_skips.contains(&skip.binding_id)
+            && !publish_durable(
                 &inner,
                 &run_id,
                 AgentEventDraft {
@@ -3538,13 +3567,13 @@ async fn execute_model_run(
                     source_fingerprint: None,
                     payload: AgentEvent::ResourceBindingSkipped { skip },
                 },
-            ) {
-                return;
-            }
+            )
+        {
+            return;
         }
     }
-    if !run_started {
-        if !publish_durable(
+    if !run_started
+        && !publish_durable(
             &inner,
             &run_id,
             AgentEventDraft {
@@ -3554,9 +3583,9 @@ async fn execute_model_run(
                 source_fingerprint: None,
                 payload: AgentEvent::RunStarted,
             },
-        ) {
-            return;
-        }
+        )
+    {
+        return;
     }
     if !supporting_event_ids.contains(&started_event_id) {
         supporting_event_ids.push(started_event_id.clone());
@@ -3885,13 +3914,14 @@ async fn execute_model_run(
                             emit_incomplete(
                                 &inner,
                                 &request,
-                                &user_message,
-                                response,
-                                has_usage.then_some(total_usage),
-                                tool_call_count,
-                                started_event_id,
-                                RunLimitKind::OutputTokens,
-                                "model output limit reached",
+                                IncompleteRun {
+                                    response,
+                                    usage: has_usage.then_some(total_usage),
+                                    tool_calls: tool_call_count,
+                                    started_event_id,
+                                    limit: RunLimitKind::OutputTokens,
+                                    unresolved_issue: "model output limit reached",
+                                },
                             );
                             return;
                         }
@@ -4046,13 +4076,14 @@ async fn execute_model_run(
                             emit_incomplete(
                                 &inner,
                                 &request,
-                                &user_message,
-                                last_response,
-                                has_usage.then_some(total_usage),
-                                tool_call_count,
-                                started_event_id,
-                                RunLimitKind::ToolCalls,
-                                "Tool call limit reached",
+                                IncompleteRun {
+                                    response: last_response,
+                                    usage: has_usage.then_some(total_usage),
+                                    tool_calls: tool_call_count,
+                                    started_event_id,
+                                    limit: RunLimitKind::ToolCalls,
+                                    unresolved_issue: "Tool call limit reached",
+                                },
                             );
                             return;
                         }
@@ -4064,13 +4095,15 @@ async fn execute_model_run(
                                 emit_incomplete(
                                     &inner,
                                     &request,
-                                    &user_message,
-                                    last_response,
-                                    has_usage.then_some(total_usage),
-                                    tool_call_count,
-                                    started_event_id,
-                                    RunLimitKind::ToolCalls,
-                                    "Workflow has no remaining Tool call budget",
+                                    IncompleteRun {
+                                        response: last_response,
+                                        usage: has_usage.then_some(total_usage),
+                                        tool_calls: tool_call_count,
+                                        started_event_id,
+                                        limit: RunLimitKind::ToolCalls,
+                                        unresolved_issue:
+                                            "Workflow has no remaining Tool call budget",
+                                    },
                                 );
                                 return;
                             }
@@ -4186,12 +4219,14 @@ async fn execute_model_run(
                                 match await_tool_approval(
                                     inner.clone(),
                                     tools,
-                                    &run_id,
-                                    round,
-                                    &call.call_id,
-                                    binding,
-                                    summary,
-                                    cancellation.clone(),
+                                    ToolApprovalWaitRequest {
+                                        run_id: &run_id,
+                                        round,
+                                        model_call_id: &call.call_id,
+                                        binding,
+                                        summary,
+                                        cancellation: cancellation.clone(),
+                                    },
                                 )
                                 .await
                                 {
@@ -4354,13 +4389,14 @@ async fn execute_model_run(
     emit_incomplete(
         &inner,
         &request,
-        &user_message,
-        last_response,
-        has_usage.then_some(total_usage),
-        tool_call_count,
-        started_event_id,
-        RunLimitKind::ModelSteps,
-        "model step limit reached",
+        IncompleteRun {
+            response: last_response,
+            usage: has_usage.then_some(total_usage),
+            tool_calls: tool_call_count,
+            started_event_id,
+            limit: RunLimitKind::ModelSteps,
+            unresolved_issue: "model step limit reached",
+        },
     );
 }
 
@@ -4457,7 +4493,7 @@ async fn resume_observed_workflow_output(
         emit_failure(&inner, &request, &user_message, failure);
         return;
     }
-    execute_model_run(
+    execute_model_run(ModelRunExecution {
         inner,
         request,
         admission,
@@ -4468,7 +4504,7 @@ async fn resume_observed_workflow_output(
         seed,
         cancellation,
         steer_updates,
-    )
+    })
     .await;
 }
 
@@ -4512,13 +4548,14 @@ async fn resume_observed_workflow(
         emit_incomplete(
             &inner,
             &request,
-            &user_message,
-            seed.last_response,
-            has_usage.then_some(seed.total_usage),
-            seed.tool_call_count,
-            started_event_id,
-            RunLimitKind::ToolCalls,
-            "Tool call limit reached",
+            IncompleteRun {
+                response: seed.last_response,
+                usage: has_usage.then_some(seed.total_usage),
+                tool_calls: seed.tool_call_count,
+                started_event_id,
+                limit: RunLimitKind::ToolCalls,
+                unresolved_issue: "Tool call limit reached",
+            },
         );
         return;
     }
@@ -4528,13 +4565,14 @@ async fn resume_observed_workflow(
         emit_incomplete(
             &inner,
             &request,
-            &user_message,
-            seed.last_response,
-            has_usage.then_some(seed.total_usage),
-            seed.tool_call_count,
-            started_event_id,
-            RunLimitKind::ToolCalls,
-            "Workflow has no remaining Tool call budget",
+            IncompleteRun {
+                response: seed.last_response,
+                usage: has_usage.then_some(seed.total_usage),
+                tool_calls: seed.tool_call_count,
+                started_event_id,
+                limit: RunLimitKind::ToolCalls,
+                unresolved_issue: "Workflow has no remaining Tool call budget",
+            },
         );
         return;
     }
@@ -4664,7 +4702,7 @@ async fn resume_observed_workflow(
         emit_failure(&inner, &request, &user_message, failure);
         return;
     }
-    execute_model_run(
+    execute_model_run(ModelRunExecution {
         inner,
         request,
         admission,
@@ -4675,7 +4713,7 @@ async fn resume_observed_workflow(
         seed,
         cancellation,
         steer_updates,
-    )
+    })
     .await;
 }
 
@@ -4720,7 +4758,7 @@ async fn resume_observed_skill(
             emit_failure(&inner, &request, &user_message, failure);
             return;
         }
-        execute_model_run(
+        execute_model_run(ModelRunExecution {
             inner,
             request,
             admission,
@@ -4731,7 +4769,7 @@ async fn resume_observed_skill(
             seed,
             cancellation,
             steer_updates,
-        )
+        })
         .await;
         return;
     }
@@ -4824,7 +4862,7 @@ async fn resume_observed_skill(
         emit_failure(&inner, &request, &user_message, failure);
         return;
     }
-    execute_model_run(
+    execute_model_run(ModelRunExecution {
         inner,
         request,
         admission,
@@ -4835,7 +4873,7 @@ async fn resume_observed_skill(
         seed,
         cancellation,
         steer_updates,
-    )
+    })
     .await;
 }
 
@@ -4911,7 +4949,7 @@ async fn resume_observed_approval(
             emit_failure(&inner, &request, &user_message, failure);
             return;
         }
-        execute_model_run(
+        execute_model_run(ModelRunExecution {
             inner,
             request,
             admission,
@@ -4922,7 +4960,7 @@ async fn resume_observed_approval(
             seed,
             cancellation,
             steer_updates,
-        )
+        })
         .await;
         return;
     }
@@ -5062,7 +5100,7 @@ async fn resume_observed_tool(
             emit_failure(&inner, &request, &user_message, failure);
             return;
         }
-        execute_model_run(
+        execute_model_run(ModelRunExecution {
             inner,
             request,
             admission,
@@ -5073,7 +5111,7 @@ async fn resume_observed_tool(
             seed,
             cancellation,
             steer_updates,
-        )
+        })
         .await;
         return;
     }
@@ -5104,12 +5142,14 @@ async fn resume_observed_tool(
             match await_tool_approval(
                 inner.clone(),
                 tools,
-                &run_id,
-                round,
-                &call.call_id,
-                binding,
-                summary,
-                cancellation.clone(),
+                ToolApprovalWaitRequest {
+                    run_id: &run_id,
+                    round,
+                    model_call_id: &call.call_id,
+                    binding,
+                    summary,
+                    cancellation: cancellation.clone(),
+                },
             )
             .await
             {
@@ -5280,7 +5320,7 @@ async fn continue_observed_tool(
         emit_failure(&inner, &request, &user_message, failure);
         return;
     }
-    execute_model_run(
+    execute_model_run(ModelRunExecution {
         inner,
         request,
         admission,
@@ -5291,7 +5331,7 @@ async fn continue_observed_tool(
         seed,
         cancellation,
         steer_updates,
-    )
+    })
     .await;
 }
 
@@ -5654,7 +5694,7 @@ async fn resume_observed_input(
         emit_failure(&inner, &request, &user_message, failure);
         return;
     }
-    execute_model_run(
+    execute_model_run(ModelRunExecution {
         inner,
         request,
         admission,
@@ -5665,7 +5705,7 @@ async fn resume_observed_input(
         seed,
         cancellation,
         steer_updates,
-    )
+    })
     .await;
 }
 
@@ -6023,16 +6063,28 @@ enum ApprovalWaitOutcome {
     Failed(AgentFailure),
 }
 
-async fn await_tool_approval(
-    inner: Arc<GenericInner>,
-    tools: &GenericTools,
-    run_id: &RunId,
+struct ToolApprovalWaitRequest<'a> {
+    run_id: &'a RunId,
     round: u64,
-    model_call_id: &ModelToolCallId,
+    model_call_id: &'a ModelToolCallId,
     binding: ApprovalBinding,
     summary: String,
     cancellation: CancellationToken,
+}
+
+async fn await_tool_approval(
+    inner: Arc<GenericInner>,
+    tools: &GenericTools,
+    request: ToolApprovalWaitRequest<'_>,
 ) -> ApprovalWaitOutcome {
+    let ToolApprovalWaitRequest {
+        run_id,
+        round,
+        model_call_id,
+        binding,
+        summary,
+        cancellation,
+    } = request;
     let Some(bridge) = tools.approval_bridge.clone() else {
         return ApprovalWaitOutcome::Failed(AgentFailure {
             code: "approval_interaction_not_connected".to_owned(),
@@ -6197,7 +6249,7 @@ async fn commit_approval_response(
         }
     };
     if !publish_durable(
-        &inner,
+        inner,
         run_id,
         AgentEventDraft {
             event_id: AgentEventId::new(format!(
@@ -7172,7 +7224,9 @@ fn publish_durable(inner: &GenericInner, run_id: &RunId, draft: AgentEventDraft)
     if run.terminal {
         return false;
     }
-    if let Err(failure) = checkpoint_provider_events(inner, run, run_id, &[draft.clone()]) {
+    if let Err(failure) =
+        checkpoint_provider_events(inner, run, run_id, std::slice::from_ref(&draft))
+    {
         poison_run_after_checkpoint_failure(run, failure);
         return false;
     }
@@ -7288,17 +7342,24 @@ fn try_emit_delivery(
     DeliveryCommit::Committed
 }
 
-fn emit_incomplete(
-    inner: &GenericInner,
-    request: &AgentStartRequest,
-    _user_message: &ModelMessage,
+struct IncompleteRun {
     response: String,
     usage: Option<ModelUsage>,
     tool_calls: u64,
     started_event_id: AgentEventId,
     limit: RunLimitKind,
-    unresolved_issue: &str,
-) {
+    unresolved_issue: &'static str,
+}
+
+fn emit_incomplete(inner: &GenericInner, request: &AgentStartRequest, incomplete: IncompleteRun) {
+    let IncompleteRun {
+        response,
+        usage,
+        tool_calls,
+        started_event_id,
+        limit,
+        unresolved_issue,
+    } = incomplete;
     let run_id = &request.run.spec.run_id;
     let partial_delivery = (!response.is_empty()).then(|| PartialDelivery {
         partial_delivery_id: PartialDeliveryId::new(format!("generic-{}-partial", run_id.as_str())),

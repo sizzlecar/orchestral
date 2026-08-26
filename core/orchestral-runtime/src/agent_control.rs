@@ -34,7 +34,7 @@ use tokio::sync::{broadcast, Mutex, Notify, RwLock};
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum AgentControlEvent {
-    Durable(AgentJournalRecord),
+    Durable(Arc<AgentJournalRecord>),
     Telemetry(AgentTelemetryEnvelope),
 }
 
@@ -280,7 +280,7 @@ impl AgentController {
         });
         self.runs.write().await.insert(run_id.clone(), slot.clone());
         for record in journal {
-            slot.publish(AgentControlEvent::Durable(record));
+            slot.publish(AgentControlEvent::Durable(Arc::new(record)));
         }
 
         let controller = Arc::clone(self);
@@ -720,7 +720,7 @@ impl AgentController {
             .await?;
         entry.reducer = next_reducer;
         entry.journal.push(sequenced.record.clone());
-        slot.publish(AgentControlEvent::Durable(sequenced.record));
+        slot.publish(AgentControlEvent::Durable(Arc::new(sequenced.record)));
         Ok(())
     }
 

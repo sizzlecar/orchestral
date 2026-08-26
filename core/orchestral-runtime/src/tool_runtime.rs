@@ -835,7 +835,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
         let effect_key = ToolEffectKey::new(invocation.run_id.clone(), invocation.call_id.clone());
         let entry = match self.invocation_entry(&invocation, identity) {
             Ok(entry) => entry,
-            Err(result) => return result,
+            Err(result) => return *result,
         };
 
         let verified_approval = loop {
@@ -1280,18 +1280,20 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
         &self,
         invocation: &ToolInvocation,
         identity: InvocationIdentity,
-    ) -> Result<Arc<InvocationEntry>, GuardedToolResult> {
+    ) -> Result<Arc<InvocationEntry>, Box<GuardedToolResult>> {
         let key = (invocation.run_id.clone(), invocation.call_id.clone());
-        let mut invocations = self
-            .invocations
-            .lock()
-            .map_err(|_| rejected("runtime_unavailable", "Tool call ledger is unavailable"))?;
+        let mut invocations = self.invocations.lock().map_err(|_| {
+            Box::new(rejected(
+                "runtime_unavailable",
+                "Tool call ledger is unavailable",
+            ))
+        })?;
         if let Some(entry) = invocations.get(&key) {
             if entry.identity != identity {
-                return Err(rejected(
+                return Err(Box::new(rejected(
                     "call_identity_conflict",
                     "the same run_id/call_id was reused with different content or policy",
-                ));
+                )));
             }
             return Ok(entry.clone());
         }

@@ -318,16 +318,15 @@ impl SkillRuntime {
         if !descriptor.trust.permits_activation() && !self.policy.allow_untrusted_workspace {
             return Err(SkillRuntimeError::Untrusted(descriptor.name.clone()));
         }
-        if !matches_constraint(
+        if (!matches_constraint(
             &descriptor.compatibility.operating_systems,
             &self.host.operating_system,
         ) || !matches_constraint(
             &descriptor.compatibility.architectures,
             &self.host.architecture,
-        ) {
-            if !self.policy.allow_incompatible {
-                return Err(SkillRuntimeError::Incompatible(descriptor.name.clone()));
-            }
+        )) && !self.policy.allow_incompatible
+        {
+            return Err(SkillRuntimeError::Incompatible(descriptor.name.clone()));
         }
         let missing_programs = descriptor
             .compatibility

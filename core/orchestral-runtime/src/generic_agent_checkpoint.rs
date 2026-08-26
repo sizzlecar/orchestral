@@ -138,6 +138,9 @@ impl GenericAgentRunRegistration {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
+// This is a versioned wire contract. Boxing individual fields would change the
+// public Rust construction API without changing the serialized representation.
+#[allow(clippy::large_enum_variant)]
 pub enum GenericCheckpointEvent {
     LoopBoundaryCommitted {
         next_model_round: u64,

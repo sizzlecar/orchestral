@@ -1,20 +1,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ShellSandboxPolicy {
     pub writable_roots: Vec<PathBuf>,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub linux_bwrap_path: Option<PathBuf>,
-}
-
-impl Default for ShellSandboxPolicy {
-    fn default() -> Self {
-        Self {
-            writable_roots: Vec::new(),
-            linux_bwrap_path: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
