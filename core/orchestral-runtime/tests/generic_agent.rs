@@ -9,9 +9,9 @@ use orchestral_core::{
         reference::AgentRunStatus,
         spi::AgentProvider,
         wire::{
-            AgentCommand, AgentCommandEnvelope, AgentEvent, AgentRunEnvelope, AgentSessionId,
-            AgentTelemetry, ApprovalDecision, CommandAckState, CommandId, Content, ContentBody,
-            PendingRequestKind, ProviderBindingRef, RequestResolution, RunId,
+            AgentCommand, AgentCommandEnvelope, AgentEvent, AgentEventAuthority, AgentRunEnvelope,
+            AgentSessionId, AgentTelemetry, ApprovalDecision, CommandAckState, CommandId, Content,
+            ContentBody, PendingRequestKind, ProviderBindingRef, RequestResolution, RunId,
         },
         AGENT_PROTOCOL_V1,
     },
@@ -33,11 +33,13 @@ use orchestral_core::{
     },
 };
 use orchestral_runtime::{
-    api::AgentApi, AgentClient, AgentControlEvent, AgentController, GenericAgentCheckpointStore,
-    GenericAgentConfig, GenericCheckpointEvent, GenericCheckpointPhase, GuardedToolExecution,
+    api::AgentApi, AgentClient, AgentControlError, AgentControlEvent, AgentController,
+    AppendGenericCheckpointOutcome, CreateGenericRunOutcome, GenericAgentCheckpointStore,
+    GenericAgentConfig, GenericAgentRunRegistration, GenericCheckpointDraft,
+    GenericCheckpointError, GenericCheckpointEvent, GenericCheckpointPhase, GuardedToolExecution,
     GuardedToolExecutor, GuardedToolRuntime, InMemoryBlobStore,
     InMemoryGenericAgentCheckpointStore, InMemoryHostApprovalBroker, InternalGenericAgentProvider,
-    JsonSizeTokenMeter, ToolArtifactStore, WorkflowExecutionStrategy,
+    JsonSizeTokenMeter, StoredGenericAgentRun, ToolArtifactStore, WorkflowExecutionStrategy,
 };
 use serde_json::json;
 use tokio::sync::Notify;
@@ -51,6 +53,46 @@ struct WalInspectingModel {
     checkpoint_store: Arc<InMemoryGenericAgentCheckpointStore>,
     run_id: RunId,
     observed_open_attempt: AtomicUsize,
+}
+
+#[derive(Default)]
+struct FailingProviderEventCheckpointStore {
+    inner: InMemoryGenericAgentCheckpointStore,
+    provider_event_attempts: AtomicUsize,
+}
+
+impl GenericAgentCheckpointStore for FailingProviderEventCheckpointStore {
+    fn load_run(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Option<StoredGenericAgentRun>, GenericCheckpointError> {
+        self.inner.load_run(run_id)
+    }
+
+    fn create_run(
+        &self,
+        registration: GenericAgentRunRegistration,
+    ) -> Result<CreateGenericRunOutcome, GenericCheckpointError> {
+        self.inner.create_run(registration)
+    }
+
+    fn append(
+        &self,
+        run_id: &RunId,
+        expected_previous: u64,
+        draft: GenericCheckpointDraft,
+    ) -> Result<AppendGenericCheckpointOutcome, GenericCheckpointError> {
+        if matches!(
+            &draft.payload,
+            GenericCheckpointEvent::ProviderEventsCommitted { .. }
+        ) {
+            self.provider_event_attempts.fetch_add(1, Ordering::SeqCst);
+            return Err(GenericCheckpointError::Unavailable(
+                "injected Provider event WAL failure".to_owned(),
+            ));
+        }
+        self.inner.append(run_id, expected_previous, draft)
+    }
 }
 
 struct SteerAccumulatingModel {
@@ -978,6 +1020,10 @@ async fn model_attempt_is_in_the_private_wal_before_backend_start() {
         .load_run(&run_id)
         .expect("private WAL remains readable")
         .expect("private Run registration is durable");
+    let projection = stored
+        .validate()
+        .expect("private WAL replays after delivery");
+    assert_eq!(projection.phase, GenericCheckpointPhase::Terminal);
     assert!(matches!(
         &stored.records[0].payload,
         GenericCheckpointEvent::LoopBoundaryCommitted {
@@ -985,9 +1031,104 @@ async fn model_attempt_is_in_the_private_wal_before_backend_start() {
             ..
         }
     ));
-    assert!(matches!(
-        &stored.records[1].payload,
+    assert!(stored.records.iter().any(|record| matches!(
+        &record.payload,
         GenericCheckpointEvent::ModelAttemptStarted { round: 1, .. }
+    )));
+
+    let host_journal = controller
+        .events(&run_id, 0)
+        .await
+        .expect("Host journal remains readable");
+    let host_provider_digests = host_journal
+        .iter()
+        .filter(|record| matches!(&record.authority, AgentEventAuthority::Provider))
+        .map(|record| record.draft_digest.clone())
+        .collect::<Vec<_>>();
+    let private_provider_digests = projection
+        .provider_events
+        .iter()
+        .map(|event| {
+            event
+                .computed_digest()
+                .expect("private event remains valid")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(private_provider_digests, host_provider_digests);
+}
+
+#[tokio::test]
+async fn provider_event_wal_failure_is_not_published_and_host_becomes_unknown() {
+    let run_id = RunId::new("provider-wal-failure-run");
+    let checkpoint_store = Arc::new(FailingProviderEventCheckpointStore::default());
+    let provider = Arc::new(
+        InternalGenericAgentProvider::new(
+            Arc::new(ScriptedModel),
+            GenericAgentConfig::new("internal-provider", "generic-agent"),
+        )
+        .expect("Generic Agent accepts the neutral backend")
+        .with_checkpoint_store(checkpoint_store.clone())
+        .expect("failing private WAL binds before the Provider is shared"),
+    );
+    let controller = Arc::new(
+        AgentController::new(
+            provider,
+            ProviderBindingRef::new("provider-wal-failure-binding"),
+        )
+        .expect("controller binds the Generic Agent"),
+    );
+    let run = AgentRunEnvelope::new(
+        AGENT_PROTOCOL_V1,
+        AgentSessionId::new("provider-wal-failure-session"),
+        run_id.clone(),
+        vec![Content::text("fail closed before publishing RunStarted")],
+    )
+    .expect("valid text Run");
+
+    let execution = controller.start(run).await.expect("Run admission succeeds");
+    let wait_error = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        controller.wait_for_terminal(&execution.run_id),
+    )
+    .await
+    .expect("WAL failure is observed promptly")
+    .expect_err("WAL failure cannot become an authoritative terminal");
+    assert!(matches!(
+        wait_error,
+        AgentControlError::ContinuityUnknown(ref actual) if actual == &run_id
+    ));
+    assert_eq!(
+        controller
+            .inspect(&run_id)
+            .await
+            .expect("Unknown Run remains inspectable")
+            .state
+            .status(),
+        AgentRunStatus::Unknown
+    );
+
+    let host_journal = controller
+        .events(&run_id, 0)
+        .await
+        .expect("Host journal remains readable");
+    assert!(host_journal
+        .iter()
+        .all(|record| !matches!(&record.authority, AgentEventAuthority::Provider)));
+    assert_eq!(
+        checkpoint_store
+            .provider_event_attempts
+            .load(Ordering::SeqCst),
+        1
+    );
+    let stored = checkpoint_store
+        .load_run(&run_id)
+        .expect("private WAL remains readable")
+        .expect("private Run registration remains durable");
+    let projection = stored.validate().expect("committed WAL prefix replays");
+    assert!(projection.provider_events.is_empty());
+    assert!(matches!(
+        projection.phase,
+        GenericCheckpointPhase::Stable(_)
     ));
 }
 

@@ -137,7 +137,7 @@ struct GenericRun {
     execution: AgentExecutionRef,
     admission: AgentAdmission,
     durable_events: Vec<AgentEventDraft>,
-    sender: broadcast::Sender<AgentProviderStreamItem>,
+    sender: broadcast::Sender<Result<AgentProviderStreamItem, AgentProtocolError>>,
     terminal: bool,
     cancellation: CancellationToken,
     cancel_command: Option<(CommandId, String)>,
@@ -497,7 +497,7 @@ impl InternalGenericAgentProvider {
         let live = stream::unfold(receiver, |mut receiver| async move {
             loop {
                 match receiver.recv().await {
-                    Ok(item) => return Some((Ok(item), receiver)),
+                    Ok(item) => return Some((item, receiver)),
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         return Some((
                             Err(AgentProtocolError::new(
@@ -1133,7 +1133,7 @@ async fn execute_model_run(
 ) {
     let run_id = request.run.spec.run_id.clone();
     for (index, skip) in admission.skipped_optional_bindings.into_iter().enumerate() {
-        publish_durable(
+        if !publish_durable(
             &inner,
             &run_id,
             AgentEventDraft {
@@ -1147,10 +1147,12 @@ async fn execute_model_run(
                 source_fingerprint: None,
                 payload: AgentEvent::ResourceBindingSkipped { skip },
             },
-        );
+        ) {
+            return;
+        }
     }
     let started_event_id = AgentEventId::new(format!("generic-{}-started", run_id.as_str()));
-    publish_durable(
+    if !publish_durable(
         &inner,
         &run_id,
         AgentEventDraft {
@@ -1160,7 +1162,9 @@ async fn execute_model_run(
             source_fingerprint: None,
             payload: AgentEvent::RunStarted,
         },
-    );
+    ) {
+        return;
+    }
 
     let model_round_limit = request
         .run
@@ -1465,6 +1469,7 @@ async fn execute_model_run(
                                     emit_cancel(&inner, &request, &user_message);
                                     return;
                                 }
+                                DeliveryCommit::CheckpointFailed => return,
                                 DeliveryCommit::AlreadyTerminal => return,
                             }
                         }
@@ -1684,13 +1689,15 @@ async fn execute_model_run(
                             };
                             tool_call_count =
                                 tool_call_count.saturating_add(observation.tool_calls);
-                            let workflow_event_id = publish_workflow_output(
+                            let Some(workflow_event_id) = publish_workflow_output(
                                 &inner,
                                 &run_id,
                                 round,
                                 &call.call_id,
                                 observation.result.clone(),
-                            );
+                            ) else {
+                                return;
+                            };
                             supporting_event_ids.push(workflow_event_id);
                             tool_results.push(ModelContent::ToolResult {
                                 call_id: call.call_id,
@@ -1992,7 +1999,7 @@ async fn await_agent_input(
     if let Err(failure) = registration {
         return InputWaitOutcome::Failed(failure);
     }
-    publish_durable(
+    if !publish_durable(
         &inner,
         run_id,
         AgentEventDraft {
@@ -2015,7 +2022,14 @@ async fn await_agent_input(
                 },
             },
         },
-    );
+    ) {
+        remove_pending_input(&inner, run_id, &request_id);
+        return InputWaitOutcome::Failed(agent_failure(
+            "generic_checkpoint",
+            "input request could not be committed to the private WAL",
+            true,
+        ));
+    }
 
     let response = tokio::select! {
         biased;
@@ -2047,7 +2061,7 @@ async fn await_agent_input(
             ));
         }
     };
-    publish_durable(
+    if !publish_durable(
         &inner,
         run_id,
         AgentEventDraft {
@@ -2065,7 +2079,13 @@ async fn await_agent_input(
                 resolution_digest,
             },
         },
-    );
+    ) {
+        return InputWaitOutcome::Failed(agent_failure(
+            "generic_checkpoint",
+            "input resolution could not be committed to the private WAL",
+            true,
+        ));
+    }
     match response.resolution {
         RequestResolution::Input { content } => InputWaitOutcome::Resolved(serde_json::json!({
             "content": content,
@@ -2184,7 +2204,7 @@ async fn await_tool_approval(
         let _ = bridge.clear(&request_id).await;
         return ApprovalWaitOutcome::Failed(failure);
     }
-    publish_durable(
+    if !publish_durable(
         &inner,
         run_id,
         AgentEventDraft {
@@ -2208,7 +2228,15 @@ async fn await_tool_approval(
                 },
             },
         },
-    );
+    ) {
+        remove_pending_approval(&inner, run_id, &request_id);
+        let _ = bridge.clear(&request_id).await;
+        return ApprovalWaitOutcome::Failed(agent_failure(
+            "generic_checkpoint",
+            "approval request could not be committed to the private WAL",
+            true,
+        ));
+    }
 
     let response = tokio::select! {
         biased;
@@ -2243,7 +2271,7 @@ async fn await_tool_approval(
             ));
         }
     };
-    publish_durable(
+    if !publish_durable(
         &inner,
         run_id,
         AgentEventDraft {
@@ -2261,7 +2289,14 @@ async fn await_tool_approval(
                 resolution_digest,
             },
         },
-    );
+    ) {
+        let _ = bridge.clear(&request_id).await;
+        return ApprovalWaitOutcome::Failed(agent_failure(
+            "generic_checkpoint",
+            "approval resolution could not be committed to the private WAL",
+            true,
+        ));
+    }
     if let Err(error) = bridge.clear(&request_id).await {
         return ApprovalWaitOutcome::Failed(agent_failure(
             "approval_bridge",
@@ -2602,7 +2637,7 @@ fn publish_workflow_output(
     round: u64,
     call_id: &ModelToolCallId,
     result: serde_json::Value,
-) -> AgentEventId {
+) -> Option<AgentEventId> {
     let event_id = AgentEventId::new(format!(
         "generic-{}-workflow-{round}-{}",
         run_id.as_str(),
@@ -2629,8 +2664,8 @@ fn publish_workflow_output(
                 }],
             },
         },
-    );
-    event_id
+    )
+    .then_some(event_id)
 }
 
 fn parse_tool_arguments(call: &PendingModelToolCall) -> Result<serde_json::Value, AgentFailure> {
@@ -2800,6 +2835,16 @@ fn append_checkpoint(
             true,
         )
     })?;
+    append_checkpoint_to_run(inner, run, run_id, event_id, payload)
+}
+
+fn append_checkpoint_to_run(
+    inner: &GenericInner,
+    run: &mut GenericRun,
+    run_id: &RunId,
+    event_id: GenericCheckpointEventId,
+    payload: GenericCheckpointEvent,
+) -> Result<(), AgentFailure> {
     let expected_previous = run.checkpoint_seq;
     inner
         .checkpoint_store
@@ -2815,6 +2860,34 @@ fn append_checkpoint(
         .map_err(checkpoint_failure)?;
     run.checkpoint_seq = expected_previous.saturating_add(1);
     Ok(())
+}
+
+fn checkpoint_provider_events(
+    inner: &GenericInner,
+    run: &mut GenericRun,
+    run_id: &RunId,
+    events: &[AgentEventDraft],
+) -> Result<(), AgentFailure> {
+    let first = events
+        .first()
+        .expect("Provider checkpoint event batch is never empty");
+    let last = events
+        .last()
+        .expect("Provider checkpoint event batch is never empty");
+    append_checkpoint_to_run(
+        inner,
+        run,
+        run_id,
+        GenericCheckpointEventId::new(format!(
+            "generic-{}-provider-{}-{}",
+            run_id.as_str(),
+            first.event_id.as_str(),
+            last.event_id.as_str()
+        )),
+        GenericCheckpointEvent::ProviderEventsCommitted {
+            events: events.to_vec(),
+        },
+    )
 }
 
 fn take_queued_steers(inner: &GenericInner, run_id: &RunId) -> Vec<QueuedSteer> {
@@ -2854,7 +2927,7 @@ async fn commit_queued_steers(
             },
         )
         .await?;
-        publish_durable(
+        if !publish_durable(
             inner,
             run_id,
             AgentEventDraft {
@@ -2870,22 +2943,33 @@ async fn commit_queued_steers(
                     content: steer.content,
                 },
             },
-        );
+        ) {
+            return Err(agent_failure(
+                "generic_checkpoint",
+                "steer input could not be committed to the private WAL",
+                true,
+            ));
+        }
         model_messages.push(steer.message);
     }
     Ok(count)
 }
 
-fn publish_durable(inner: &GenericInner, run_id: &RunId, draft: AgentEventDraft) {
+fn publish_durable(inner: &GenericInner, run_id: &RunId, draft: AgentEventDraft) -> bool {
     let mut state = inner
         .state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(run) = state.runs.get_mut(run_id) else {
-        return;
+        return false;
     };
     if run.terminal {
-        return;
+        return false;
+    }
+    if let Err(failure) = checkpoint_provider_events(inner, run, run_id, &[draft.clone()]) {
+        run.terminal = true;
+        let _ = run.sender.send(Err(checkpoint_stream_error(failure)));
+        return false;
     }
     let terminal = matches!(
         draft.payload,
@@ -2898,7 +2982,8 @@ fn publish_durable(inner: &GenericInner, run_id: &RunId, draft: AgentEventDraft)
     run.terminal = terminal;
     let _ = run
         .sender
-        .send(AgentProviderStreamItem::Event(Box::new(draft)));
+        .send(Ok(AgentProviderStreamItem::Event(Box::new(draft))));
+    true
 }
 
 fn publish_telemetry(inner: &GenericInner, run_id: &RunId, telemetry: AgentTelemetryEnvelope) {
@@ -2910,7 +2995,7 @@ fn publish_telemetry(inner: &GenericInner, run_id: &RunId, telemetry: AgentTelem
         if !run.terminal {
             let _ = run
                 .sender
-                .send(AgentProviderStreamItem::Telemetry(telemetry));
+                .send(Ok(AgentProviderStreamItem::Telemetry(telemetry)));
         }
     }
 }
@@ -2919,6 +3004,7 @@ enum DeliveryCommit {
     Committed,
     SteerPending,
     CancelPending,
+    CheckpointFailed,
     AlreadyTerminal,
 }
 
@@ -2979,15 +3065,22 @@ fn try_emit_delivery(
     if !run.queued_steers.is_empty() {
         return DeliveryCommit::SteerPending;
     }
+    if let Err(failure) =
+        checkpoint_provider_events(inner, run, run_id, &[output.clone(), delivery.clone()])
+    {
+        run.terminal = true;
+        let _ = run.sender.send(Err(checkpoint_stream_error(failure)));
+        return DeliveryCommit::CheckpointFailed;
+    }
     run.durable_events.push(output.clone());
     run.durable_events.push(delivery.clone());
     run.terminal = true;
     let _ = run
         .sender
-        .send(AgentProviderStreamItem::Event(Box::new(output)));
+        .send(Ok(AgentProviderStreamItem::Event(Box::new(output))));
     let _ = run
         .sender
-        .send(AgentProviderStreamItem::Event(Box::new(delivery)));
+        .send(Ok(AgentProviderStreamItem::Event(Box::new(delivery))));
     DeliveryCommit::Committed
 }
 
@@ -3014,7 +3107,7 @@ fn emit_incomplete(
         usage: agent_usage(usage, tool_calls),
         provenance: provenance(inner, vec![started_event_id]),
     });
-    publish_durable(
+    if publish_durable(
         inner,
         run_id,
         AgentEventDraft {
@@ -3027,8 +3120,9 @@ fn emit_incomplete(
                 partial_delivery,
             },
         },
-    );
-    finish_session(inner, request);
+    ) {
+        finish_session(inner, request);
+    }
 }
 
 fn emit_failure(
@@ -3038,7 +3132,7 @@ fn emit_failure(
     failure: AgentFailure,
 ) {
     let run_id = &request.run.spec.run_id;
-    publish_durable(
+    if publish_durable(
         inner,
         run_id,
         AgentEventDraft {
@@ -3048,8 +3142,9 @@ fn emit_failure(
             source_fingerprint: None,
             payload: AgentEvent::RunFailed { failure },
         },
-    );
-    finish_session(inner, request);
+    ) {
+        finish_session(inner, request);
+    }
 }
 
 fn emit_cancel(inner: &GenericInner, request: &AgentStartRequest, user_message: &ModelMessage) {
@@ -3065,7 +3160,7 @@ fn emit_cancel(inner: &GenericInner, request: &AgentStartRequest, user_message: 
             .and_then(|run| run.cancel_command.clone())
     };
     if let Some((command_id, reason)) = cancellation {
-        publish_durable(
+        if !publish_durable(
             inner,
             run_id,
             AgentEventDraft {
@@ -3077,8 +3172,10 @@ fn emit_cancel(inner: &GenericInner, request: &AgentStartRequest, user_message: 
                     reason: reason.clone(),
                 },
             },
-        );
-        publish_durable(
+        ) {
+            return;
+        }
+        if !publish_durable(
             inner,
             run_id,
             AgentEventDraft {
@@ -3088,7 +3185,9 @@ fn emit_cancel(inner: &GenericInner, request: &AgentStartRequest, user_message: 
                 source_fingerprint: None,
                 payload: AgentEvent::RunCancelled { reason },
             },
-        );
+        ) {
+            return;
+        }
     } else {
         emit_failure(
             inner,
@@ -3426,6 +3525,12 @@ fn checkpoint_failure(error: GenericCheckpointError) -> AgentFailure {
     agent_failure("generic_checkpoint", error.to_string(), true)
 }
 
+fn checkpoint_stream_error(failure: AgentFailure) -> AgentProtocolError {
+    AgentProtocolError::new(AgentProtocolErrorCode::ProviderUnavailable, failure.message)
+        .with_retryable(failure.retryable)
+        .with_details(failure.details)
+}
+
 fn checkpoint_start_error(error: GenericCheckpointError) -> AgentStartError {
     AgentStartError::OutcomeUnknown(
         AgentProtocolError::new(
@@ -3456,7 +3561,7 @@ fn fail_before_model(
 ) {
     let run_id = &request.run.spec.run_id;
     let started_event_id = AgentEventId::new(format!("generic-{}-started", run_id.as_str()));
-    publish_durable(
+    if !publish_durable(
         &inner,
         run_id,
         AgentEventDraft {
@@ -3466,7 +3571,9 @@ fn fail_before_model(
             source_fingerprint: None,
             payload: AgentEvent::RunStarted,
         },
-    );
+    ) {
+        return;
+    }
     emit_failure(&inner, request, user_message, failure);
 }
 
