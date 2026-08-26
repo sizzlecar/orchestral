@@ -178,6 +178,14 @@ struct ApprovalResponse {
     capability: Option<ApprovalCapability>,
 }
 
+struct RecoveredApprovalWaiter {
+    request_id: RequestId,
+    binding: ApprovalBinding,
+    responder: oneshot::Sender<ApprovalResponse>,
+    response: oneshot::Receiver<ApprovalResponse>,
+    bridge: Arc<dyn AgentApprovalBridge>,
+}
+
 struct StoredCommand {
     digest: Digest,
     outcome: ProviderCommandOutcome,
@@ -209,6 +217,17 @@ enum GenericRecoveryContinuation {
         committed_response: Option<InputResponse>,
         resolved_response: Option<InputResponse>,
         response: Option<oneshot::Receiver<InputResponse>>,
+    },
+    Approval {
+        round: u64,
+        request_id: ModelRequestId,
+        request_digest: Digest,
+        observation: GenericModelObservation,
+        call: GenericObservedToolCall,
+        arguments: serde_json::Value,
+        request: PendingRequest,
+        binding: Option<ApprovalBinding>,
+        response: Option<oneshot::Receiver<ApprovalResponse>>,
     },
 }
 
@@ -1270,10 +1289,10 @@ fn stage_input_recovery(
         .first()
         .cloned()
         .expect("one observed Tool call was checked");
-    if call.name != REQUEST_INPUT_TOOL_NAME || !call.ended {
+    if !call.ended {
         return Err(AgentProtocolError::new(
             AgentProtocolErrorCode::Unsupported,
-            "observed model recovery currently supports only a complete input request",
+            "observed model recovery requires a complete Tool call",
         )
         .with_details(serde_json::json!({
             "boundary": "model_attempt_observed",
@@ -1288,6 +1307,20 @@ fn stage_input_recovery(
         ended: call.ended,
     };
     let arguments = parse_tool_arguments(&pending_call).map_err(observed_recovery_error)?;
+    if call.name != REQUEST_INPUT_TOOL_NAME {
+        return stage_approval_recovery(
+            inner,
+            stored,
+            boundary,
+            round,
+            request_id,
+            request_digest,
+            observation,
+            call,
+            arguments,
+            recovery_events,
+        );
+    }
     let prompt = parse_input_request(arguments.clone()).map_err(observed_recovery_error)?;
     let input_request_id = input_request_id(stored.registration.run_id(), round, &call.call_id);
     let expected_request = PendingRequest {
@@ -1367,6 +1400,182 @@ fn stage_input_recovery(
             response: None,
         },
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_approval_recovery(
+    inner: Arc<GenericInner>,
+    stored: StoredGenericAgentRun,
+    boundary: GenericLoopBoundary,
+    round: u64,
+    request_id: ModelRequestId,
+    request_digest: Digest,
+    observation: GenericModelObservation,
+    call: GenericObservedToolCall,
+    arguments: serde_json::Value,
+    recovery_events: Vec<AgentEventDraft>,
+) -> Result<AgentRecovery, AgentProtocolError> {
+    let approval_request_id =
+        approval_request_id(stored.registration.run_id(), round, &call.call_id);
+    let mut opened_request = None;
+    for event in &recovery_events {
+        match &event.payload {
+            AgentEvent::RequestOpened { request } if request.request_id == approval_request_id => {
+                if opened_request.is_some()
+                    || !request.blocking
+                    || !matches!(request.payload, PendingRequestPayload::Approval { .. })
+                {
+                    return Err(AgentProtocolError::new(
+                        AgentProtocolErrorCode::InvalidDigest,
+                        "recovered approval request is not a unique blocking request",
+                    ));
+                }
+                opened_request = Some(request.clone());
+            }
+            AgentEvent::RequestResolved {
+                request_id: resolved,
+                ..
+            } if resolved == &approval_request_id => {
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::Unsupported,
+                    "observed approval recovery cannot yet continue after RequestResolved",
+                ));
+            }
+            AgentEvent::RequestOpened { .. } | AgentEvent::RequestResolved { .. } => {
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::InvalidDigest,
+                    "recovered interaction crossed the observed approval request boundary",
+                ));
+            }
+            _ => {}
+        }
+    }
+    let request = opened_request.ok_or_else(|| {
+        AgentProtocolError::new(
+            AgentProtocolErrorCode::Unsupported,
+            "observed effect Tool recovery currently requires a durable approval request",
+        )
+    })?;
+    stage_loop_recovery(
+        inner,
+        stored,
+        boundary,
+        recovery_events,
+        GenericRecoveryContinuation::Approval {
+            round,
+            request_id,
+            request_digest,
+            observation,
+            call,
+            arguments,
+            request,
+            binding: None,
+            response: None,
+        },
+    )
+}
+
+async fn prepare_recovered_approval(
+    inner: &GenericInner,
+    run_id: &RunId,
+    round: u64,
+    call: &GenericObservedToolCall,
+    arguments: &serde_json::Value,
+    opened_request: &PendingRequest,
+    cancellation: CancellationToken,
+) -> Result<RecoveredApprovalWaiter, AgentProtocolError> {
+    let tools = inner.tools.as_ref().ok_or_else(|| {
+        AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidDigest,
+            "recovered approval has no bound Tool Runtime",
+        )
+    })?;
+    let bridge = tools.approval_bridge.clone().ok_or_else(|| {
+        AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidDigest,
+            "recovered approval has no Host approval bridge",
+        )
+    })?;
+    let tool_id = tools
+        .runtime
+        .resolve_tool_id(&call.name)
+        .map_err(|error| {
+            AgentProtocolError::new(
+                AgentProtocolErrorCode::ProviderUnavailable,
+                format!("recovered Tool catalog is unavailable: {error}"),
+            )
+            .with_retryable(true)
+        })?
+        .ok_or_else(|| {
+            AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidDigest,
+                "recovered approval Tool is no longer registered",
+            )
+        })?;
+    let invocation = ToolInvocation {
+        run_id: run_id.clone(),
+        call_id: ToolCallId::new(call.call_id.as_str()),
+        tool_id,
+        arguments: arguments.clone(),
+    };
+    let (binding, summary) = match tools
+        .runtime
+        .invoke(invocation, tools.run_grant.clone(), None, cancellation)
+        .await
+    {
+        GuardedToolResult::ApprovalRequired { binding, summary } => (binding, summary),
+        GuardedToolResult::Outcome { outcome, .. } => {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidDigest,
+                "recovered Tool no longer requires the durable approval request",
+            )
+            .with_details(serde_json::to_value(outcome).unwrap_or(serde_json::Value::Null)))
+        }
+    };
+    if binding.run_id != *run_id || binding.call_id.as_str() != call.call_id.as_str() {
+        return Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidDigest,
+            "reconstructed approval binding crossed its Run or Tool call",
+        ));
+    }
+    let operation_digest = binding.digest().map_err(|error| {
+        AgentProtocolError::new(AgentProtocolErrorCode::InvalidDigest, error.to_string())
+    })?;
+    let requested_scope = approval_scope_names(&binding).map_err(observed_recovery_error)?;
+    let request_id = approval_request_id(run_id, round, &call.call_id);
+    let expected_request = PendingRequest {
+        request_id: request_id.clone(),
+        blocking: true,
+        payload: PendingRequestPayload::Approval {
+            operation_digest,
+            requested_scope,
+            reason: summary,
+        },
+    };
+    if opened_request != &expected_request {
+        return Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidDigest,
+            "reconstructed approval does not match the durable pending request",
+        ));
+    }
+    bridge
+        .stage(&request_id, binding.clone())
+        .await
+        .map_err(|error| {
+            AgentProtocolError::new(
+                AgentProtocolErrorCode::ProviderUnavailable,
+                format!("Host approval bridge could not restage the request: {error}"),
+            )
+            .with_retryable(true)
+        })?;
+    let (responder, response) = oneshot::channel();
+    Ok(RecoveredApprovalWaiter {
+        request_id,
+        binding,
+        responder,
+        response,
+        bridge,
+    })
 }
 
 fn validate_recovered_input_resolution(
@@ -1472,7 +1681,14 @@ fn stage_loop_recovery(
                 }
             }
         }
-        GenericRecoveryContinuation::ModelLoop { .. } => {}
+        GenericRecoveryContinuation::Approval { .. } if !pending_resolutions.is_empty() => {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::Unsupported,
+                "accepted approval resolution recovery is not yet supported",
+            ));
+        }
+        GenericRecoveryContinuation::ModelLoop { .. }
+        | GenericRecoveryContinuation::Approval { .. } => {}
     }
     let mut pending_inputs = BTreeMap::new();
     if let GenericRecoveryContinuation::Input {
@@ -1522,7 +1738,7 @@ fn stage_loop_recovery(
     let (sender, _) = broadcast::channel(inner.config.stream_buffer);
     let cancellation = CancellationToken::new();
     let (steer_signal, steer_updates) = watch::channel(0_u64);
-    let run = GenericRun {
+    let mut run = GenericRun {
         request: request.clone(),
         execution: execution.clone(),
         admission: admission.clone(),
@@ -1629,33 +1845,93 @@ fn stage_loop_recovery(
                 ));
             }
         }
+        if let GenericRecoveryContinuation::Approval {
+            round,
+            request_id,
+            request_digest,
+            ..
+        } = &continuation
         {
+            let rebuilt =
+                model_request_for_round(&request, *round, &model_messages, &model_definitions);
+            if rebuilt.request_id != *request_id
+                || model_request_digest(&rebuilt).map_err(checkpoint_stream_error)?
+                    != *request_digest
+            {
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::InvalidDigest,
+                    "recovered approval model request no longer matches the private WAL attempt",
+                ));
+            }
+        }
+
+        let mut staged_approval = None;
+        if let GenericRecoveryContinuation::Approval {
+            round,
+            call,
+            arguments,
+            request: opened_request,
+            binding,
+            response,
+            ..
+        } = &mut continuation
+        {
+            let prepared = prepare_recovered_approval(
+                &inner,
+                &run_id,
+                *round,
+                call,
+                arguments,
+                opened_request,
+                cancellation.clone(),
+            )
+            .await?;
+            run.pending_approvals.insert(
+                prepared.request_id.clone(),
+                PendingApproval {
+                    binding: prepared.binding.clone(),
+                    responder: Some(prepared.responder),
+                },
+            );
+            *binding = Some(prepared.binding);
+            *response = Some(prepared.response);
+            staged_approval = Some((prepared.bridge, prepared.request_id));
+        }
+        let install_result = {
             let mut state = inner
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.runs.contains_key(&run_id) {
-                return Err(AgentProtocolError::new(
+                Err(AgentProtocolError::new(
                     AgentProtocolErrorCode::InvalidTransition,
                     "Generic Agent Run was recovered concurrently",
-                ));
-            }
-            let session = state
+                ))
+            } else if state
                 .sessions
-                .entry(request.run.spec.session_id.clone())
-                .or_default();
-            if session
-                .active_run
-                .as_ref()
+                .get(&request.run.spec.session_id)
+                .and_then(|session| session.active_run.as_ref())
                 .is_some_and(|active| active != &run_id)
             {
-                return Err(AgentProtocolError::new(
+                Err(AgentProtocolError::new(
                     AgentProtocolErrorCode::InvalidTransition,
                     "another Generic Agent Run already owns this Session",
-                ));
+                ))
+            } else {
+                state
+                    .sessions
+                    .entry(request.run.spec.session_id.clone())
+                    .or_default()
+                    .active_run = Some(run_id.clone());
+                state.runs.insert(run_id.clone(), run);
+                Ok(())
             }
-            session.active_run = Some(run_id.clone());
-            state.runs.insert(run_id.clone(), run);
+        };
+        if let Err(error) = install_result {
+            if let Some((bridge, request_id)) = staged_approval {
+                let _ = bridge.clear(&request_id).await;
+            }
+            return Err(error);
         }
 
         if restore_initial_input {
@@ -1727,6 +2003,37 @@ fn stage_loop_recovery(
                         resolved_response,
                         session_exchange_committed,
                         response,
+                    )
+                    .await;
+                }
+                GenericRecoveryContinuation::Approval {
+                    round,
+                    request_id,
+                    observation,
+                    call,
+                    arguments,
+                    binding,
+                    response,
+                    ..
+                } => {
+                    resume_observed_approval(
+                        inner,
+                        request,
+                        admission,
+                        user_message,
+                        model_messages,
+                        model_definitions,
+                        run_skills,
+                        seed,
+                        cancellation,
+                        steer_updates,
+                        round,
+                        request_id,
+                        observation,
+                        call,
+                        arguments,
+                        binding.expect("recovered approval binding was prepared"),
+                        response.expect("recovered approval owns a response channel"),
                     )
                     .await;
                 }
@@ -2808,6 +3115,204 @@ async fn execute_model_run(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn resume_observed_approval(
+    inner: Arc<GenericInner>,
+    request: AgentStartRequest,
+    admission: AgentAdmission,
+    user_message: ModelMessage,
+    mut model_messages: Vec<ModelMessage>,
+    model_tools: Vec<ModelToolDefinition>,
+    run_skills: Option<Arc<SkillRuntime>>,
+    mut seed: GenericExecutionSeed,
+    cancellation: CancellationToken,
+    steer_updates: watch::Receiver<u64>,
+    round: u64,
+    model_request_id: ModelRequestId,
+    observation: GenericModelObservation,
+    call: GenericObservedToolCall,
+    arguments: serde_json::Value,
+    binding: ApprovalBinding,
+    response: oneshot::Receiver<ApprovalResponse>,
+) {
+    let run_id = request.run.spec.run_id.clone();
+    let Some(tools) = inner.tools.as_ref() else {
+        emit_failure(
+            &inner,
+            &request,
+            &user_message,
+            agent_failure(
+                "tool_runtime_unavailable",
+                "recovered approval has no Host Tool runtime",
+                false,
+            ),
+        );
+        return;
+    };
+    let Some(bridge) = tools.approval_bridge.clone() else {
+        emit_failure(
+            &inner,
+            &request,
+            &user_message,
+            agent_failure(
+                "approval_interaction_not_connected",
+                "recovered approval has no Host approval bridge",
+                false,
+            ),
+        );
+        return;
+    };
+    if let Some(usage) = observation.usage.clone() {
+        merge_usage(&mut seed.total_usage, usage);
+    }
+    if !observation.response.is_empty() {
+        seed.last_response = observation.response.clone();
+    }
+    seed.tool_call_count = seed.tool_call_count.saturating_add(1);
+
+    let approval = await_recovered_tool_approval(
+        inner.clone(),
+        bridge,
+        &run_id,
+        round,
+        &call.call_id,
+        response,
+        cancellation.clone(),
+    )
+    .await;
+    let invocation = ToolInvocation {
+        run_id: run_id.clone(),
+        call_id: ToolCallId::new(call.call_id.as_str()),
+        tool_id: binding.tool_id.clone(),
+        arguments: arguments.clone(),
+    };
+    let guarded = match approval {
+        ApprovalWaitOutcome::Allowed(capability) => {
+            tools
+                .runtime
+                .invoke(
+                    invocation,
+                    tools.run_grant.clone(),
+                    Some(capability),
+                    cancellation.clone(),
+                )
+                .await
+        }
+        ApprovalWaitOutcome::Denied => GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Rejected {
+                code: "approval_denied".to_owned(),
+                message: "Host denied this Tool invocation".to_owned(),
+            },
+            cached: false,
+        },
+        ApprovalWaitOutcome::Cancelled => {
+            emit_cancel(&inner, &request, &user_message);
+            return;
+        }
+        ApprovalWaitOutcome::Failed(failure) => {
+            emit_failure(&inner, &request, &user_message, failure);
+            return;
+        }
+    };
+    let (result, is_error) = match guarded {
+        GuardedToolResult::ApprovalRequired { binding, .. } => {
+            emit_failure(
+                &inner,
+                &request,
+                &user_message,
+                AgentFailure {
+                    code: "approval_capability_rejected".to_owned(),
+                    message:
+                        "Tool still requires approval after recovery resolved the exact request"
+                            .to_owned(),
+                    retryable: false,
+                    details: serde_json::to_value(binding).unwrap_or(serde_json::Value::Null),
+                },
+            );
+            return;
+        }
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::UnknownEffect { .. },
+            ..
+        } if cancellation.is_cancelled() => {
+            emit_cancel(&inner, &request, &user_message);
+            return;
+        }
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::UnknownEffect { message },
+            ..
+        } => {
+            emit_failure(
+                &inner,
+                &request,
+                &user_message,
+                agent_failure("tool_unknown_effect", message, false),
+            );
+            return;
+        }
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Cancelled,
+            ..
+        } if cancellation.is_cancelled() => {
+            emit_cancel(&inner, &request, &user_message);
+            return;
+        }
+        GuardedToolResult::Outcome { outcome, .. } => model_tool_result(outcome),
+    };
+    let (assistant_message, tool_message) =
+        observed_tool_exchange_messages(&observation, &call, &arguments, &result, is_error);
+    if let Err(failure) = append_session_event(
+        &inner,
+        AgentSessionEventDraft {
+            event_id: AgentSessionEventId::new(format!(
+                "generic-{}-tool-exchange-{round}",
+                run_id.as_str()
+            )),
+            session_id: request.run.spec.session_id.clone(),
+            run_id: run_id.clone(),
+            payload: AgentSessionEvent::ToolExchangeCommitted {
+                request_id: model_request_id,
+                assistant: assistant_message.clone(),
+                tool: tool_message.clone(),
+                usage: observation.usage,
+            },
+        },
+    )
+    .await
+    {
+        emit_failure(&inner, &request, &user_message, failure);
+        return;
+    }
+    model_messages.push(assistant_message);
+    model_messages.push(tool_message);
+    seed.next_model_round = round.saturating_add(1);
+    if let Err(failure) = commit_loop_boundary(
+        &inner,
+        &run_id,
+        seed.next_model_round,
+        &seed.total_usage,
+        seed.tool_call_count,
+        &seed.last_response,
+        &seed.supporting_event_ids,
+    ) {
+        emit_failure(&inner, &request, &user_message, failure);
+        return;
+    }
+    execute_model_run(
+        inner,
+        request,
+        admission,
+        user_message,
+        model_messages,
+        model_tools,
+        run_skills,
+        seed,
+        cancellation,
+        steer_updates,
+    )
+    .await;
+}
+
 async fn recovered_input_exchange_committed(
     inner: &GenericInner,
     request: &AgentStartRequest,
@@ -3039,6 +3544,14 @@ fn input_request_id(run_id: &RunId, round: u64, model_call_id: &ModelToolCallId)
     ))
 }
 
+fn approval_request_id(run_id: &RunId, round: u64, model_call_id: &ModelToolCallId) -> RequestId {
+    RequestId::new(format!(
+        "approval:{}:{round}:{}",
+        run_id.as_str(),
+        model_call_id.as_str()
+    ))
+}
+
 async fn await_agent_input(
     inner: Arc<GenericInner>,
     run_id: &RunId,
@@ -3242,6 +3755,16 @@ fn observed_input_exchange_messages(
     arguments: &serde_json::Value,
     result: &serde_json::Value,
 ) -> (ModelMessage, ModelMessage) {
+    observed_tool_exchange_messages(observation, call, arguments, result, false)
+}
+
+fn observed_tool_exchange_messages(
+    observation: &GenericModelObservation,
+    call: &GenericObservedToolCall,
+    arguments: &serde_json::Value,
+    result: &serde_json::Value,
+    is_error: bool,
+) -> (ModelMessage, ModelMessage) {
     let mut assistant_content = Vec::new();
     if !observation.response.is_empty() {
         assistant_content.push(ModelContent::Text {
@@ -3263,7 +3786,7 @@ fn observed_input_exchange_messages(
             content: vec![ModelContent::ToolResult {
                 call_id: call.call_id.clone(),
                 result: result.clone(),
-                is_error: false,
+                is_error,
             }],
         },
     )
@@ -3327,11 +3850,7 @@ async fn await_tool_approval(
         Ok(scopes) => scopes,
         Err(failure) => return ApprovalWaitOutcome::Failed(failure),
     };
-    let request_id = RequestId::new(format!(
-        "approval:{}:{round}:{}",
-        run_id.as_str(),
-        model_call_id.as_str()
-    ));
+    let request_id = approval_request_id(run_id, round, model_call_id);
     if let Err(error) = bridge.stage(&request_id, binding.clone()).await {
         return ApprovalWaitOutcome::Failed(agent_failure(
             "approval_bridge",
@@ -3431,6 +3950,27 @@ async fn await_tool_approval(
             ));
         }
     };
+    commit_approval_response(
+        &inner,
+        bridge.as_ref(),
+        run_id,
+        round,
+        model_call_id,
+        request_id,
+        response,
+    )
+    .await
+}
+
+async fn commit_approval_response(
+    inner: &GenericInner,
+    bridge: &dyn AgentApprovalBridge,
+    run_id: &RunId,
+    round: u64,
+    model_call_id: &ModelToolCallId,
+    request_id: RequestId,
+    response: ApprovalResponse,
+) -> ApprovalWaitOutcome {
     let resolution_digest = match response.resolution.digest() {
         Ok(digest) => digest,
         Err(error) => {
@@ -3496,6 +4036,50 @@ async fn await_tool_approval(
             false,
         )),
     }
+}
+
+async fn await_recovered_tool_approval(
+    inner: Arc<GenericInner>,
+    bridge: Arc<dyn AgentApprovalBridge>,
+    run_id: &RunId,
+    round: u64,
+    model_call_id: &ModelToolCallId,
+    response: oneshot::Receiver<ApprovalResponse>,
+    cancellation: CancellationToken,
+) -> ApprovalWaitOutcome {
+    let request_id = approval_request_id(run_id, round, model_call_id);
+    let response = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => None,
+        response = response => Some(response),
+    };
+    let Some(response) = response else {
+        remove_pending_approval(&inner, run_id, &request_id);
+        let _ = bridge.clear(&request_id).await;
+        return ApprovalWaitOutcome::Cancelled;
+    };
+    let response = match response {
+        Ok(response) => response,
+        Err(_) => {
+            remove_pending_approval(&inner, run_id, &request_id);
+            let _ = bridge.clear(&request_id).await;
+            return ApprovalWaitOutcome::Failed(agent_failure(
+                "approval_waiter_closed",
+                "recovered approval response channel closed before resolution",
+                true,
+            ));
+        }
+    };
+    commit_approval_response(
+        &inner,
+        bridge.as_ref(),
+        run_id,
+        round,
+        model_call_id,
+        request_id,
+        response,
+    )
+    .await
 }
 
 fn remove_pending_approval(inner: &GenericInner, run_id: &RunId, request_id: &RequestId) {
