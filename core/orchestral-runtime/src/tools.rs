@@ -12,6 +12,6 @@ pub(crate) mod shell_sandbox;
 
 pub use builtin::*;
 pub use mcp::{
-    GuardedMcpServerConfig, GuardedMcpTransportConfig, McpServerConnectionManager, McpServerHealth,
-    McpToolsAdapterError, McpToolsAdapterRegistry,
+    GuardedMcpServerConfig, McpServerConnectionManager, McpServerHealth, McpToolsAdapterError,
+    McpToolsAdapterRegistry, StdioMcpTransportFactory,
 };

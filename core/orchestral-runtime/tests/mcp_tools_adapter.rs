@@ -18,8 +18,8 @@ use orchestral_core::tool_protocol::{
     ToolOutput, ToolPolicyBounds, ToolRestriction,
 };
 use orchestral_runtime::{
-    GuardedMcpServerConfig, GuardedMcpTransportConfig, GuardedToolResult, GuardedToolRuntime,
-    InMemoryBlobStore, McpServerHealth, McpToolsAdapterRegistry, ToolArtifactStore,
+    GuardedMcpServerConfig, GuardedToolResult, GuardedToolRuntime, InMemoryBlobStore,
+    McpServerHealth, McpToolsAdapterRegistry, StdioMcpTransportFactory, ToolArtifactStore,
 };
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -94,11 +94,14 @@ fn config(program: PathBuf, script: String, tool_timeout: Duration) -> GuardedMc
     GuardedMcpServerConfig {
         server_id: McpServerId::new("mock"),
         required: true,
-        transport: GuardedMcpTransportConfig::Stdio {
-            program,
-            args: vec!["-c".to_owned(), script],
-            environment: Default::default(),
-        },
+        transport: Arc::new(
+            StdioMcpTransportFactory::new(
+                program,
+                vec!["-c".to_owned(), script],
+                Default::default(),
+            )
+            .unwrap(),
+        ),
         startup_timeout: Duration::from_secs(2),
         tool_timeout,
         enabled_tools: Default::default(),

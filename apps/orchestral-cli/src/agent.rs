@@ -42,10 +42,10 @@ use orchestral_runtime::tools::{
 };
 use orchestral_runtime::{
     AgentClient, AgentControlEvent, AgentController, AgentToolRuntime, GenericAgentCheckpointStore,
-    GenericAgentConfig, GuardedMcpServerConfig, GuardedMcpTransportConfig, GuardedToolRuntime,
-    InMemoryBlobStore, InMemoryGenericAgentCheckpointStore, InMemoryHostApprovalBroker,
-    InternalGenericAgentProvider, JsonSizeTokenMeter, McpToolsAdapterRegistry,
-    SkillActivationPolicy, SkillHostProfile, SkillRoot, SkillRuntime, ToolArtifactStore,
+    GenericAgentConfig, GuardedMcpServerConfig, GuardedToolRuntime, InMemoryBlobStore,
+    InMemoryGenericAgentCheckpointStore, InMemoryHostApprovalBroker, InternalGenericAgentProvider,
+    JsonSizeTokenMeter, McpToolsAdapterRegistry, SkillActivationPolicy, SkillHostProfile,
+    SkillRoot, SkillRuntime, StdioMcpTransportFactory, ToolArtifactStore,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
@@ -603,15 +603,14 @@ fn configured_mcp_servers(
         let server = GuardedMcpServerConfig {
             server_id: McpServerId::new(spec.name.trim()),
             required: spec.required,
-            transport: GuardedMcpTransportConfig::Stdio {
-                program: PathBuf::from(program),
-                args: spec.args.clone(),
-                environment: spec
-                    .env
+            transport: Arc::new(StdioMcpTransportFactory::new(
+                PathBuf::from(program),
+                spec.args.clone(),
+                spec.env
                     .iter()
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect(),
-            },
+            )?),
             startup_timeout: Duration::from_millis(spec.startup_timeout_ms.unwrap_or(15_000)),
             tool_timeout: Duration::from_millis(spec.tool_timeout_ms.unwrap_or(20_000)),
             enabled_tools: spec.enabled_tools.iter().cloned().collect(),

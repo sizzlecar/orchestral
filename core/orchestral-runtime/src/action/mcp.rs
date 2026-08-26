@@ -10,9 +10,12 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
 
+use orchestral_core::agent_protocol::wire::Digest;
 use orchestral_core::mcp_protocol::{
-    McpProtocolEra, McpServerId, McpServerSnapshot, McpToolSnapshot, McpTransportKind,
-    MCP_LATEST_LEGACY_PROTOCOL, MCP_STATELESS_PROTOCOL_2026_07_28,
+    McpProtocolEra, McpServerId, McpServerSnapshot, McpToolSnapshot, McpTransportAuthority,
+    McpTransportCancellation, McpTransportConnection, McpTransportError, McpTransportFactory,
+    McpTransportKind, McpTransportRequest, MCP_LATEST_LEGACY_PROTOCOL,
+    MCP_STATELESS_PROTOCOL_2026_07_28,
 };
 use orchestral_core::tool_protocol::{
     ApprovalCapabilityStore, ApprovalPolicy, EffectScope, ModelToolSchema, ToolConcurrency,
@@ -26,30 +29,124 @@ use crate::tool_runtime::{
 
 const DEFAULT_MCP_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
-/// Host-resolved transport authority. Concrete transport details never enter
-/// the model-visible Tool schema.
+/// Built-in stdio transport factory. External transports implement the core
+/// [`McpTransportFactory`] SPI from a plugin and are injected by the Host.
 #[derive(Debug, Clone)]
-pub enum GuardedMcpTransportConfig {
-    Stdio {
-        /// Canonical absolute executable identity.
+pub struct StdioMcpTransportFactory {
+    program: PathBuf,
+    args: Vec<String>,
+    environment: BTreeMap<String, String>,
+    authority: McpTransportAuthority,
+}
+
+impl StdioMcpTransportFactory {
+    pub fn new(
         program: PathBuf,
         args: Vec<String>,
-        /// Exact environment assignments; the inherited Host environment is cleared.
         environment: BTreeMap<String, String>,
-    },
+    ) -> Result<Self, McpToolsAdapterError> {
+        let canonical_program = program.canonicalize().ok();
+        if !program.is_absolute()
+            || !program.is_file()
+            || canonical_program.as_ref() != Some(&program)
+            || environment.keys().any(|name| {
+                name.trim().is_empty() || name.contains('=') || name.chars().any(char::is_control)
+            })
+        {
+            return Err(McpToolsAdapterError::InvalidConfig(
+                "invalid guarded MCP stdio transport".to_owned(),
+            ));
+        }
+        let mut effect_scopes = BTreeSet::from([
+            EffectScope::Process,
+            EffectScope::FilesystemRead,
+            EffectScope::FilesystemWrite,
+            EffectScope::ExternalSideEffect,
+        ]);
+        if !environment.is_empty() {
+            effect_scopes.insert(EffectScope::SecretRead);
+        }
+        let binding = json!({
+            "transport": "stdio",
+            "program": program.to_string_lossy(),
+            "args": args,
+            "environmentNames": environment.keys().collect::<Vec<_>>(),
+            "maxFrameBytes": DEFAULT_MCP_MAX_FRAME_BYTES,
+        });
+        let binding_digest = Digest::sha256(
+            serde_jcs::to_vec(&binding)
+                .map_err(|error| McpToolsAdapterError::InvalidConfig(error.to_string()))?,
+        );
+        let authority = McpTransportAuthority {
+            kind: McpTransportKind::Stdio,
+            binding_digest,
+            effect_scopes,
+            process_programs: BTreeSet::from([program.to_string_lossy().to_string()]),
+            network_targets: BTreeSet::new(),
+            environment_variables: environment.keys().cloned().collect(),
+            credential_references: BTreeSet::new(),
+        };
+        authority
+            .validate()
+            .map_err(|error| McpToolsAdapterError::InvalidConfig(error.to_string()))?;
+        Ok(Self {
+            program,
+            args,
+            environment,
+            authority,
+        })
+    }
+}
+
+#[async_trait]
+impl McpTransportFactory for StdioMcpTransportFactory {
+    fn authority(&self) -> &McpTransportAuthority {
+        &self.authority
+    }
+
+    async fn connect(&self) -> Result<Box<dyn McpTransportConnection>, McpTransportError> {
+        let environment = self
+            .environment
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<HashMap<_, _>>();
+        StdioMcpTransport::connect(
+            self.program.to_string_lossy().as_ref(),
+            &self.args,
+            &environment,
+        )
+        .await
+        .map(|transport| Box::new(transport) as Box<dyn McpTransportConnection>)
+        .map_err(McpTransportError::Transport)
+    }
 }
 
 /// One explicitly configured MCP Tool provider. Discovery and invocation use
 /// the same immutable transport authority for the lifetime of this registry.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GuardedMcpServerConfig {
     pub server_id: McpServerId,
     pub required: bool,
-    pub transport: GuardedMcpTransportConfig,
+    pub transport: Arc<dyn McpTransportFactory>,
     pub startup_timeout: Duration,
     pub tool_timeout: Duration,
     pub enabled_tools: BTreeSet<String>,
     pub disabled_tools: BTreeSet<String>,
+}
+
+impl std::fmt::Debug for GuardedMcpServerConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardedMcpServerConfig")
+            .field("server_id", &self.server_id)
+            .field("required", &self.required)
+            .field("transport_authority", self.transport.authority())
+            .field("startup_timeout", &self.startup_timeout)
+            .field("tool_timeout", &self.tool_timeout)
+            .field("enabled_tools", &self.enabled_tools)
+            .field("disabled_tools", &self.disabled_tools)
+            .finish()
+    }
 }
 
 impl GuardedMcpServerConfig {
@@ -68,29 +165,12 @@ impl GuardedMcpServerConfig {
                 self.server_id
             )));
         }
-        match &self.transport {
-            GuardedMcpTransportConfig::Stdio {
-                program,
-                environment,
-                ..
-            } => {
-                let canonical_program = program.canonicalize().ok();
-                if !program.is_absolute()
-                    || !program.is_file()
-                    || canonical_program.as_ref() != Some(program)
-                    || environment.keys().any(|name| {
-                        name.trim().is_empty()
-                            || name.contains('=')
-                            || name.chars().any(char::is_control)
-                    })
-                {
-                    return Err(McpToolsAdapterError::InvalidConfig(format!(
-                        "invalid guarded MCP stdio transport for '{}'",
-                        self.server_id
-                    )));
-                }
-            }
-        }
+        self.transport.authority().validate().map_err(|error| {
+            McpToolsAdapterError::InvalidConfig(format!(
+                "invalid MCP transport authority for '{}': {error}",
+                self.server_id
+            ))
+        })?;
         Ok(())
     }
 
@@ -101,42 +181,27 @@ impl GuardedMcpServerConfig {
     }
 
     pub fn effect_scopes(&self) -> BTreeSet<EffectScope> {
-        match &self.transport {
-            GuardedMcpTransportConfig::Stdio { environment, .. } => {
-                let mut scopes = BTreeSet::from([
-                    EffectScope::Process,
-                    EffectScope::FilesystemRead,
-                    EffectScope::FilesystemWrite,
-                    EffectScope::ExternalSideEffect,
-                ]);
-                if !environment.is_empty() {
-                    scopes.insert(EffectScope::SecretRead);
-                }
-                scopes
-            }
-        }
+        self.transport.authority().effect_scopes.clone()
     }
 
     pub fn allowed_programs(&self) -> BTreeSet<String> {
-        match &self.transport {
-            GuardedMcpTransportConfig::Stdio { program, .. } => {
-                BTreeSet::from([program.to_string_lossy().to_string()])
-            }
-        }
+        self.transport.authority().process_programs.clone()
+    }
+
+    pub fn allowed_network_targets(&self) -> BTreeSet<String> {
+        self.transport.authority().network_targets.clone()
     }
 
     pub fn environment_names(&self) -> BTreeSet<String> {
-        match &self.transport {
-            GuardedMcpTransportConfig::Stdio { environment, .. } => {
-                environment.keys().cloned().collect()
-            }
-        }
+        self.transport.authority().environment_variables.clone()
+    }
+
+    pub fn credential_references(&self) -> BTreeSet<String> {
+        self.transport.authority().credential_references.clone()
     }
 
     fn transport_kind(&self) -> McpTransportKind {
-        match &self.transport {
-            GuardedMcpTransportConfig::Stdio { .. } => McpTransportKind::Stdio,
-        }
+        self.transport.authority().kind
     }
 }
 
@@ -254,6 +319,7 @@ impl McpServerConnectionManager {
         let request = {
             let session = guard.as_mut().expect("MCP session was initialized");
             let request_id = session.next_request_id();
+            let exchange_cancellation = cancellation.child_token();
             enum Wait {
                 Response(Result<Value, String>),
                 Cancelled,
@@ -267,6 +333,8 @@ impl McpServerConnectionManager {
                     session.request(
                         "tools/call",
                         json!({"name": tool_name, "arguments": arguments}),
+                        BTreeMap::new(),
+                        exchange_cancellation.clone(),
                     ),
                 ) => match result {
                     Ok(response) => Wait::Response(response),
@@ -282,11 +350,9 @@ impl McpServerConnectionManager {
                 ),
                 Wait::Response(Err(error)) => Err(GuardedMcpCallError::UnknownEffect(error)),
                 Wait::Cancelled => {
-                    let _ = session
-                        .notification(
-                            "notifications/cancelled",
-                            json!({"requestId": request_id, "reason": "Agent Run cancelled"}),
-                        )
+                    exchange_cancellation.cancel();
+                    session
+                        .cancel_request(request_id, "Agent Run cancelled")
                         .await;
                     Err(GuardedMcpCallError::UnknownEffect(
                         "MCP call was cancelled after dispatch; remote effect is unknown"
@@ -294,11 +360,9 @@ impl McpServerConnectionManager {
                     ))
                 }
                 Wait::TimedOut => {
-                    let _ = session
-                        .notification(
-                            "notifications/cancelled",
-                            json!({"requestId": request_id, "reason": "Host deadline exceeded"}),
-                        )
+                    exchange_cancellation.cancel();
+                    session
+                        .cancel_request(request_id, "Host deadline exceeded")
                         .await;
                     Err(GuardedMcpCallError::UnknownEffect(
                         "MCP call timed out after dispatch; remote effect is unknown".to_owned(),
@@ -343,13 +407,25 @@ async fn connect_guarded_mcp_session(
             let _ = session.shutdown().await;
             return Err(McpToolsAdapterError::Cancelled);
         }
-        result = timeout(config.startup_timeout, session.probe_stateless()) => result,
+        result = timeout(
+            config.startup_timeout,
+            session.probe_stateless(cancellation.child_token()),
+        ) => result,
     };
     match probe {
         Ok(Ok(true)) => return Ok(session),
-        Ok(Ok(false)) => {}
+        Ok(Ok(false)) if config.transport_kind() == McpTransportKind::Stdio => {}
+        Ok(Ok(false)) => {
+            let _ = session.shutdown().await;
+            return Err(McpToolsAdapterError::Protocol(
+                "Streamable HTTP endpoint does not support MCP 2026-07-28".to_owned(),
+            ));
+        }
         Ok(Err(error)) if error.is_transport() => {
             let _ = session.shutdown().await;
+            if config.transport_kind() != McpTransportKind::Stdio {
+                return Err(mcp_request_adapter_error(error));
+            }
             session = spawn_guarded_mcp_session(config).await?;
         }
         Ok(Err(error)) => {
@@ -357,9 +433,14 @@ async fn connect_guarded_mcp_session(
             return Err(mcp_request_adapter_error(error));
         }
         Err(_) => {
+            let _ = session.shutdown().await;
+            if config.transport_kind() != McpTransportKind::Stdio {
+                return Err(McpToolsAdapterError::Transport(
+                    "MCP server/discover timed out".to_owned(),
+                ));
+            }
             // A legacy stdio server may wait forever for initialize instead of
             // rejecting server/discover. Restart it before legacy fallback.
-            let _ = session.shutdown().await;
             session = spawn_guarded_mcp_session(config).await?;
         }
     }
@@ -369,7 +450,10 @@ async fn connect_guarded_mcp_session(
             let _ = session.shutdown().await;
             return Err(McpToolsAdapterError::Cancelled);
         }
-        result = timeout(config.startup_timeout, session.initialize_guarded_legacy()) => result,
+        result = timeout(
+            config.startup_timeout,
+            session.initialize_guarded_legacy(cancellation.child_token()),
+        ) => result,
     };
     match initialized {
         Ok(Ok(())) => Ok(session),
@@ -389,22 +473,18 @@ async fn connect_guarded_mcp_session(
 async fn spawn_guarded_mcp_session(
     config: &GuardedMcpServerConfig,
 ) -> Result<McpTransportSession, McpToolsAdapterError> {
-    match &config.transport {
-        GuardedMcpTransportConfig::Stdio {
-            program,
-            args,
-            environment,
-        } => {
-            let environment = environment
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect::<HashMap<_, _>>();
-            StdioMcpSession::connect(program.to_string_lossy().as_ref(), args, &environment)
-                .await
-                .map(McpTransportSession::Stdio)
-                .map_err(McpToolsAdapterError::Transport)
-        }
+    let connection = config
+        .transport
+        .connect()
+        .await
+        .map_err(mcp_request_adapter_error)?;
+    if connection.kind() != config.transport_kind() {
+        return Err(McpToolsAdapterError::InvalidConfig(format!(
+            "MCP transport factory for '{}' returned a connection of the wrong kind",
+            config.server_id
+        )));
     }
+    Ok(McpTransportSession::new(connection))
 }
 
 async fn discover_guarded_mcp_session(
@@ -418,7 +498,10 @@ async fn discover_guarded_mcp_session(
             let _ = session.shutdown().await;
             return Err(McpToolsAdapterError::Cancelled);
         }
-        result = timeout(config.startup_timeout, list_all_mcp_tools(&mut session)) => result,
+        result = timeout(
+            config.startup_timeout,
+            list_all_mcp_tools(&mut session, cancellation),
+        ) => result,
     };
     let listed = match listed {
         Ok(Ok(value)) => value,
@@ -446,7 +529,10 @@ async fn discover_guarded_mcp_session(
     }
 }
 
-async fn list_all_mcp_tools(session: &mut McpTransportSession) -> Result<Value, String> {
+async fn list_all_mcp_tools(
+    session: &mut McpTransportSession,
+    cancellation: &CancellationToken,
+) -> Result<Value, String> {
     const MAX_PAGES: usize = 256;
     let stateless = session
         .negotiated_protocol()
@@ -461,7 +547,14 @@ async fn list_all_mcp_tools(session: &mut McpTransportSession) -> Result<Value, 
             .as_ref()
             .map(|cursor| json!({"cursor": cursor}))
             .unwrap_or_else(|| json!({}));
-        let result = session.request("tools/list", params).await?;
+        let result = session
+            .request(
+                "tools/list",
+                params,
+                BTreeMap::new(),
+                cancellation.child_token(),
+            )
+            .await?;
         match result.get("resultType").and_then(Value::as_str) {
             Some("input_required") => {
                 return Err(
@@ -548,6 +641,7 @@ fn parse_guarded_tool_snapshot(
     McpServerSnapshot::seal(
         config.server_id.clone(),
         config.transport_kind(),
+        config.transport.authority().binding_digest.clone(),
         negotiated.version.clone(),
         negotiated.era,
         snapshots,
@@ -596,12 +690,16 @@ impl McpToolsAdapterRegistry {
                 )));
             }
             let programs = config.allowed_programs();
+            let network_targets = config.allowed_network_targets();
             let environment = config.environment_names();
+            let credentials = config.credential_references();
             if !config
                 .effect_scopes()
                 .is_subset(&restriction.bounds.allowed_effects)
                 || !programs.is_subset(&restriction.bounds.process.allowed_programs)
+                || !network_targets.is_subset(&restriction.bounds.network.allowed_targets)
                 || !environment.is_subset(&restriction.bounds.environment.allowed_variables)
+                || !credentials.is_subset(&restriction.bounds.allowed_credentials)
             {
                 return Err(McpToolsAdapterError::InvalidConfig(format!(
                     "MCP server '{}' exceeds its Host Tool restriction",
@@ -771,9 +869,13 @@ impl GuardedToolExecutor for GuardedMcpToolExecutor {
         }
         let bounds = execution.effective_policy.bounds();
         let programs = self.manager.config.allowed_programs();
+        let network_targets = self.manager.config.allowed_network_targets();
         let environment = self.manager.config.environment_names();
+        let credentials = self.manager.config.credential_references();
         if !programs.is_subset(&bounds.process.allowed_programs)
+            || !network_targets.is_subset(&bounds.network.allowed_targets)
             || !environment.is_subset(&bounds.environment.allowed_variables)
+            || !credentials.is_subset(&bounds.allowed_credentials)
         {
             return ToolOutcome::Rejected {
                 code: "mcp_policy_rejected".to_owned(),
@@ -921,135 +1023,36 @@ struct NegotiatedMcpProtocol {
     era: McpProtocolEra,
 }
 
-#[derive(Debug, thiserror::Error)]
-enum McpRequestError {
-    #[error("MCP JSON-RPC error {code}: {message}")]
-    Rpc { code: i64, message: String },
-    #[error("MCP transport error: {0}")]
-    Transport(String),
-    #[error("MCP protocol error: {0}")]
-    Protocol(String),
-}
+type McpRequestError = McpTransportError;
 
-impl McpRequestError {
-    fn permits_legacy_fallback(&self) -> bool {
-        matches!(
-            self,
-            Self::Rpc {
-                code: -32601 | -32022,
-                ..
-            }
-        )
-    }
-
-    fn is_transport(&self) -> bool {
-        matches!(self, Self::Transport(_))
-    }
-}
-
-enum McpTransportSession {
-    Stdio(StdioMcpSession),
+struct McpTransportSession {
+    connection: Box<dyn McpTransportConnection>,
+    next_id: u64,
+    negotiated: Option<NegotiatedMcpProtocol>,
 }
 
 impl McpTransportSession {
-    fn next_request_id(&self) -> u64 {
-        match self {
-            Self::Stdio(session) => session.next_id,
-        }
-    }
-
-    async fn probe_stateless(&mut self) -> Result<bool, McpRequestError> {
-        match self {
-            Self::Stdio(session) => session.probe_stateless().await,
-        }
-    }
-
-    async fn initialize_guarded_legacy(&mut self) -> Result<(), McpRequestError> {
-        match self {
-            Self::Stdio(session) => session.initialize_guarded_legacy().await,
-        }
-    }
-
-    fn negotiated_protocol(&self) -> Result<&NegotiatedMcpProtocol, McpRequestError> {
-        match self {
-            Self::Stdio(session) => session.negotiated_protocol(),
-        }
-    }
-
-    async fn shutdown(&mut self) -> Result<(), String> {
-        match self {
-            Self::Stdio(session) => session.shutdown().await,
-        }
-    }
-
-    async fn notification(&mut self, method: &str, params: Value) -> Result<(), String> {
-        match self {
-            Self::Stdio(session) => session.notification(method, params).await,
-        }
-    }
-
-    async fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
-        match self {
-            Self::Stdio(session) => session.request(method, params).await,
-        }
-    }
-}
-
-struct StdioMcpSession {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-    next_id: u64,
-    process_group_id: Option<u32>,
-    negotiated: Option<NegotiatedMcpProtocol>,
-    max_frame_bytes: usize,
-}
-
-impl StdioMcpSession {
-    async fn connect(
-        command: &str,
-        args: &[String],
-        env: &HashMap<String, String>,
-    ) -> Result<Self, String> {
-        let mut cmd = Command::new(command);
-        cmd.args(args);
-        // MCP stdio servers receive only the Host-configured environment.
-        cmd.env_clear();
-        cmd.envs(env);
-        isolate_mcp_process_group(&mut cmd);
-        cmd.kill_on_drop(true)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
-
-        let mut child = cmd
-            .spawn()
-            .map_err(|err| format!("spawn mcp process failed: {}", err))?;
-
-        let process_group_id = child.id();
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "mcp stdio missing stdin pipe".to_string())?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "mcp stdio missing stdout pipe".to_string())?;
-
-        Ok(Self {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
+    fn new(connection: Box<dyn McpTransportConnection>) -> Self {
+        Self {
+            connection,
             next_id: 1,
-            process_group_id,
             negotiated: None,
-            max_frame_bytes: DEFAULT_MCP_MAX_FRAME_BYTES,
-        })
+        }
     }
 
-    async fn probe_stateless(&mut self) -> Result<bool, McpRequestError> {
+    fn next_request_id(&self) -> u64 {
+        self.next_id
+    }
+
+    async fn probe_stateless(
+        &mut self,
+        cancellation: CancellationToken,
+    ) -> Result<bool, McpRequestError> {
         let params = attach_stateless_request_metadata(json!({}))?;
-        let result = match self.request_raw("server/discover", params).await {
+        let result = match self
+            .request_raw("server/discover", params, BTreeMap::new(), cancellation)
+            .await
+        {
             Ok(result) => result,
             Err(error) if error.permits_legacy_fallback() => return Ok(false),
             Err(error) => return Err(error),
@@ -1083,7 +1086,10 @@ impl StdioMcpSession {
         Ok(true)
     }
 
-    async fn initialize_guarded_legacy(&mut self) -> Result<(), McpRequestError> {
+    async fn initialize_guarded_legacy(
+        &mut self,
+        cancellation: CancellationToken,
+    ) -> Result<(), McpRequestError> {
         let params = json!({
             "protocolVersion": MCP_LATEST_LEGACY_PROTOCOL,
             "capabilities": {},
@@ -1092,7 +1098,14 @@ impl StdioMcpSession {
                 "version": env!("CARGO_PKG_VERSION")
             }
         });
-        let result = self.request_raw("initialize", params).await?;
+        let result = self
+            .request_raw(
+                "initialize",
+                params,
+                BTreeMap::new(),
+                cancellation.child_token(),
+            )
+            .await?;
         let version = result
             .get("protocolVersion")
             .and_then(Value::as_str)
@@ -1121,9 +1134,13 @@ impl StdioMcpSession {
             version: version.to_owned(),
             era: McpProtocolEra::LegacyHandshake,
         });
-        self.notification("notifications/initialized", json!({}))
+        self.connection
+            .notification(
+                "notifications/initialized",
+                json!({}),
+                cancellation.child_token(),
+            )
             .await
-            .map_err(McpRequestError::Transport)
     }
 
     fn negotiated_protocol(&self) -> Result<&NegotiatedMcpProtocol, McpRequestError> {
@@ -1133,49 +1150,140 @@ impl StdioMcpSession {
     }
 
     async fn shutdown(&mut self) -> Result<(), String> {
-        terminate_mcp_process_tree(&mut self.child, self.process_group_id).await;
-        Ok(())
+        self.connection
+            .close()
+            .await
+            .map_err(|error| error.to_string())
     }
 
-    async fn notification(&mut self, method: &str, params: Value) -> Result<(), String> {
-        let payload = json!({
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
-        });
-        self.write_frame(&payload).await
+    async fn cancel_request(&self, request_id: u64, reason: &str) {
+        if self.connection.cancellation() == McpTransportCancellation::ProtocolNotification {
+            let _ = timeout(
+                Duration::from_millis(100),
+                self.connection.notification(
+                    "notifications/cancelled",
+                    json!({"requestId": request_id, "reason": reason}),
+                    CancellationToken::new(),
+                ),
+            )
+            .await;
+        }
     }
 
-    async fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+    async fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+        parameter_headers: BTreeMap<String, String>,
+        cancellation: CancellationToken,
+    ) -> Result<Value, String> {
         let params = match self.negotiated.as_ref().map(|value| value.era) {
             Some(McpProtocolEra::Stateless) => {
                 attach_stateless_request_metadata(params).map_err(|error| error.to_string())?
             }
             _ => params,
         };
-        self.request_raw(method, params)
+        self.request_raw(method, params, parameter_headers, cancellation)
             .await
             .map_err(|error| error.to_string())
     }
 
-    async fn request_raw(&mut self, method: &str, params: Value) -> Result<Value, McpRequestError> {
+    async fn request_raw(
+        &mut self,
+        method: &str,
+        params: Value,
+        parameter_headers: BTreeMap<String, String>,
+        cancellation: CancellationToken,
+    ) -> Result<Value, McpRequestError> {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
+        self.connection
+            .request(
+                McpTransportRequest {
+                    id,
+                    method: method.to_owned(),
+                    params,
+                    parameter_headers,
+                },
+                cancellation,
+            )
+            .await
+    }
+}
+
+struct StdioMcpTransport {
+    state: tokio::sync::Mutex<StdioMcpTransportState>,
+}
+
+struct StdioMcpTransportState {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    process_group_id: Option<u32>,
+    max_frame_bytes: usize,
+}
+
+impl StdioMcpTransport {
+    async fn connect(
+        command: &str,
+        args: &[String],
+        env: &HashMap<String, String>,
+    ) -> Result<Self, String> {
+        let mut cmd = Command::new(command);
+        cmd.args(args);
+        // MCP stdio servers receive only the Host-configured environment.
+        cmd.env_clear();
+        cmd.envs(env);
+        isolate_mcp_process_group(&mut cmd);
+        cmd.kill_on_drop(true)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|err| format!("spawn mcp process failed: {}", err))?;
+
+        let process_group_id = child.id();
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "mcp stdio missing stdin pipe".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "mcp stdio missing stdout pipe".to_string())?;
+
+        Ok(Self {
+            state: tokio::sync::Mutex::new(StdioMcpTransportState {
+                child,
+                stdin,
+                stdout: BufReader::new(stdout),
+                process_group_id,
+                max_frame_bytes: DEFAULT_MCP_MAX_FRAME_BYTES,
+            }),
+        })
+    }
+}
+
+impl StdioMcpTransportState {
+    async fn request(&mut self, request: McpTransportRequest) -> Result<Value, McpTransportError> {
+        let id = request.id;
         let payload = json!({
             "jsonrpc": "2.0",
             "id": id,
-            "method": method,
-            "params": params,
+            "method": request.method,
+            "params": request.params,
         });
         self.write_frame(&payload)
             .await
-            .map_err(McpRequestError::Transport)?;
+            .map_err(McpTransportError::Transport)?;
 
         loop {
             let msg = self
                 .read_frame()
                 .await
-                .map_err(McpRequestError::Transport)?;
+                .map_err(McpTransportError::Transport)?;
             let matched = msg
                 .get("id")
                 .and_then(Value::as_u64)
@@ -1183,13 +1291,13 @@ impl StdioMcpSession {
                 .unwrap_or(false);
             if !matched {
                 if msg.get("id").is_some() && msg.get("method").is_some() {
-                    return Err(McpRequestError::Protocol(
+                    return Err(McpTransportError::Protocol(
                         "MCP server initiated a request without a negotiated client capability"
                             .to_owned(),
                     ));
                 }
                 if msg.get("id").is_some() {
-                    return Err(McpRequestError::Protocol(format!(
+                    return Err(McpTransportError::Protocol(format!(
                         "MCP server returned an unexpected response id while waiting for {id}"
                     )));
                 }
@@ -1197,7 +1305,7 @@ impl StdioMcpSession {
             }
 
             if let Some(error) = msg.get("error") {
-                return Err(McpRequestError::Rpc {
+                return Err(McpTransportError::Rpc {
                     code: error.get("code").and_then(Value::as_i64).unwrap_or(-32000),
                     message: error
                         .get("message")
@@ -1306,6 +1414,73 @@ impl StdioMcpSession {
                     .map_err(|error| format!("MCP response is not UTF-8: {error}"));
             }
         }
+    }
+}
+
+#[async_trait]
+impl McpTransportConnection for StdioMcpTransport {
+    fn kind(&self) -> McpTransportKind {
+        McpTransportKind::Stdio
+    }
+
+    fn cancellation(&self) -> McpTransportCancellation {
+        McpTransportCancellation::ProtocolNotification
+    }
+
+    async fn request(
+        &self,
+        request: McpTransportRequest,
+        cancellation: CancellationToken,
+    ) -> Result<Value, McpTransportError> {
+        let mut state = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                return Err(McpTransportError::Transport(
+                    "stdio MCP request was cancelled before dispatch".to_owned(),
+                ));
+            }
+            state = self.state.lock() => state,
+        };
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(McpTransportError::Transport(
+                "stdio MCP request was cancelled after dispatch".to_owned(),
+            )),
+            result = state.request(request) => result,
+        }
+    }
+
+    async fn notification(
+        &self,
+        method: &str,
+        params: Value,
+        cancellation: CancellationToken,
+    ) -> Result<(), McpTransportError> {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        });
+        let mut state = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                return Err(McpTransportError::Transport(
+                    "stdio MCP notification was cancelled".to_owned(),
+                ));
+            }
+            state = self.state.lock() => state,
+        };
+        state
+            .write_frame(&payload)
+            .await
+            .map_err(McpTransportError::Transport)
+    }
+
+    async fn close(&self) -> Result<(), McpTransportError> {
+        let mut state = self.state.lock().await;
+        let process_group_id = state.process_group_id;
+        terminate_mcp_process_tree(&mut state.child, process_group_id).await;
+        Ok(())
     }
 }
 

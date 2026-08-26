@@ -3,13 +3,16 @@
 //! MCP is an external Tool provider. These types describe a pinned discovery
 //! result; they do not carry Agent context or effect authority.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::agent_protocol::wire::Digest;
+use crate::tool_protocol::EffectScope;
 
 pub const MCP_ADAPTER_PROTOCOL_V1: &str = "orchestral.mcp-tools/v1";
 pub const MCP_STATELESS_PROTOCOL_2026_07_28: &str = "2026-07-28";
@@ -51,6 +54,158 @@ string_id!(McpServerId);
 pub enum McpTransportKind {
     Stdio,
     StreamableHttp,
+}
+
+/// Immutable Host authority consumed by one MCP transport factory.
+///
+/// Implementations may hold resolved secret values internally, but only their
+/// opaque references are exposed here and compared with Tool policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpTransportAuthority {
+    pub kind: McpTransportKind,
+    /// Digest of non-secret binding identity (endpoint/program, arguments,
+    /// credential references, fixed header names, and transport limits).
+    pub binding_digest: Digest,
+    pub effect_scopes: BTreeSet<EffectScope>,
+    pub process_programs: BTreeSet<String>,
+    pub network_targets: BTreeSet<String>,
+    pub environment_variables: BTreeSet<String>,
+    pub credential_references: BTreeSet<String>,
+}
+
+impl McpTransportAuthority {
+    pub fn validate(&self) -> Result<(), McpProtocolError> {
+        let invalid = self
+            .process_programs
+            .iter()
+            .chain(self.network_targets.iter())
+            .chain(self.environment_variables.iter())
+            .chain(self.credential_references.iter())
+            .any(|value| value.trim().is_empty() || value.chars().any(char::is_control));
+        if invalid || !self.binding_digest.is_sha256() {
+            return Err(McpProtocolError::Invalid(
+                "MCP transport authority contains an invalid target or reference".to_owned(),
+            ));
+        }
+        let required_effects = match self.kind {
+            McpTransportKind::Stdio => BTreeSet::from([
+                EffectScope::Process,
+                EffectScope::FilesystemRead,
+                EffectScope::FilesystemWrite,
+                EffectScope::ExternalSideEffect,
+            ]),
+            McpTransportKind::StreamableHttp => {
+                BTreeSet::from([EffectScope::Network, EffectScope::ExternalSideEffect])
+            }
+        };
+        if !required_effects.is_subset(&self.effect_scopes)
+            || (!self.credential_references.is_empty()
+                && !self.effect_scopes.contains(&EffectScope::SecretRead))
+        {
+            return Err(McpProtocolError::Invalid(
+                "MCP transport authority omits a mandatory effect scope".to_owned(),
+            ));
+        }
+        match self.kind {
+            McpTransportKind::Stdio
+                if self.process_programs.len() != 1 || !self.network_targets.is_empty() =>
+            {
+                Err(McpProtocolError::Invalid(
+                    "stdio MCP transport authority requires one program and no network target"
+                        .to_owned(),
+                ))
+            }
+            McpTransportKind::StreamableHttp
+                if self.network_targets.len() != 1
+                    || !self.process_programs.is_empty()
+                    || !self.environment_variables.is_empty() =>
+            {
+                Err(McpProtocolError::Invalid(
+                    "Streamable HTTP MCP authority requires one network target and no process or environment authority"
+                        .to_owned(),
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Transport-specific metadata derived by the trusted MCP adapter. Values are
+/// raw canonical primitive strings; concrete HTTP transports perform the
+/// required header-safe encoding.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpTransportRequest {
+    pub id: u64,
+    pub method: String,
+    pub params: Value,
+    pub parameter_headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpTransportCancellation {
+    /// The transport uses `notifications/cancelled` before the connection is closed.
+    ProtocolNotification,
+    /// Dropping the in-flight exchange is the cancellation signal.
+    DropExchange,
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+#[non_exhaustive]
+pub enum McpTransportError {
+    #[error("MCP JSON-RPC error {code}: {message}")]
+    Rpc { code: i64, message: String },
+    #[error("MCP transport error: {0}")]
+    Transport(String),
+    #[error("MCP protocol error: {0}")]
+    Protocol(String),
+}
+
+impl McpTransportError {
+    pub fn permits_legacy_fallback(&self) -> bool {
+        matches!(
+            self,
+            Self::Rpc {
+                code: -32601 | -32022,
+                ..
+            }
+        )
+    }
+
+    pub fn is_transport(&self) -> bool {
+        matches!(self, Self::Transport(_))
+    }
+}
+
+/// One connected MCP message transport. Protocol negotiation, catalog
+/// semantics, Tool policy, and effect journaling remain owned by runtime.
+#[async_trait]
+pub trait McpTransportConnection: Send + Sync {
+    fn kind(&self) -> McpTransportKind;
+
+    fn cancellation(&self) -> McpTransportCancellation;
+
+    async fn request(
+        &self,
+        request: McpTransportRequest,
+        cancellation: CancellationToken,
+    ) -> Result<Value, McpTransportError>;
+
+    async fn notification(
+        &self,
+        method: &str,
+        params: Value,
+        cancellation: CancellationToken,
+    ) -> Result<(), McpTransportError>;
+
+    async fn close(&self) -> Result<(), McpTransportError>;
+}
+
+/// Host-composed extension point for concrete stdio/HTTP implementations.
+#[async_trait]
+pub trait McpTransportFactory: Send + Sync {
+    fn authority(&self) -> &McpTransportAuthority;
+
+    async fn connect(&self) -> Result<Box<dyn McpTransportConnection>, McpTransportError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,6 +296,7 @@ pub struct McpServerSnapshot {
     pub protocol: String,
     pub server_id: McpServerId,
     pub transport: McpTransportKind,
+    pub transport_binding_digest: Digest,
     pub mcp_protocol_version: String,
     pub mcp_protocol_era: McpProtocolEra,
     pub tools: Vec<McpToolSnapshot>,
@@ -152,6 +308,7 @@ struct McpServerDigestView<'a> {
     protocol: &'a str,
     server_id: &'a McpServerId,
     transport: McpTransportKind,
+    transport_binding_digest: &'a Digest,
     mcp_protocol_version: &'a str,
     mcp_protocol_era: McpProtocolEra,
     tools: &'a [McpToolSnapshot],
@@ -161,6 +318,7 @@ impl McpServerSnapshot {
     pub fn seal(
         server_id: McpServerId,
         transport: McpTransportKind,
+        transport_binding_digest: Digest,
         mcp_protocol_version: impl Into<String>,
         mcp_protocol_era: McpProtocolEra,
         mut tools: Vec<McpToolSnapshot>,
@@ -170,6 +328,7 @@ impl McpServerSnapshot {
             protocol: MCP_ADAPTER_PROTOCOL_V1.to_owned(),
             server_id,
             transport,
+            transport_binding_digest,
             mcp_protocol_version: mcp_protocol_version.into(),
             mcp_protocol_era,
             tools,
@@ -185,6 +344,7 @@ impl McpServerSnapshot {
             protocol: &self.protocol,
             server_id: &self.server_id,
             transport: self.transport,
+            transport_binding_digest: &self.transport_binding_digest,
             mcp_protocol_version: &self.mcp_protocol_version,
             mcp_protocol_era: self.mcp_protocol_era,
             tools: &self.tools,
@@ -194,6 +354,7 @@ impl McpServerSnapshot {
     pub fn validate(&self) -> Result<(), McpProtocolError> {
         if self.protocol != MCP_ADAPTER_PROTOCOL_V1
             || self.server_id.is_empty()
+            || !self.transport_binding_digest.is_sha256()
             || !is_protocol_version(&self.mcp_protocol_version)
             || (self.mcp_protocol_era == McpProtocolEra::Stateless
                 && self.mcp_protocol_version != MCP_STATELESS_PROTOCOL_2026_07_28)
@@ -276,6 +437,7 @@ mod tests {
         let first = McpServerSnapshot::seal(
             server.clone(),
             McpTransportKind::Stdio,
+            Digest::sha256("stdio-binding"),
             MCP_STATELESS_PROTOCOL_2026_07_28,
             McpProtocolEra::Stateless,
             vec![left.clone(), right.clone()],
@@ -284,6 +446,7 @@ mod tests {
         let second = McpServerSnapshot::seal(
             server,
             McpTransportKind::Stdio,
+            Digest::sha256("stdio-binding"),
             MCP_STATELESS_PROTOCOL_2026_07_28,
             McpProtocolEra::Stateless,
             vec![right, left],

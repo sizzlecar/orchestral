@@ -52,8 +52,8 @@ pub use tool_runtime::{
     ToolRuntimeError,
 };
 pub use tools::{
-    GuardedMcpServerConfig, GuardedMcpTransportConfig, McpServerConnectionManager, McpServerHealth,
-    McpToolsAdapterError, McpToolsAdapterRegistry,
+    GuardedMcpServerConfig, McpServerConnectionManager, McpServerHealth, McpToolsAdapterError,
+    McpToolsAdapterRegistry, StdioMcpTransportFactory,
 };
 pub use workflow_strategy::{
     workflow_plan_digest, workflow_step_call_id, RunBoundGuardedToolPort, WorkflowExecutionError,
