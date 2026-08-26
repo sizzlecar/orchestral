@@ -257,6 +257,16 @@ enum GenericRecoveryContinuation {
         call: GenericObservedToolCall,
         arguments: serde_json::Value,
     },
+    WorkflowOutput {
+        round: u64,
+        request_id: ModelRequestId,
+        request_digest: Digest,
+        observation: GenericModelObservation,
+        call: GenericObservedToolCall,
+        arguments: serde_json::Value,
+        outcome: WorkflowCallObservation,
+        workflow_event_id: AgentEventId,
+    },
     Tool {
         round: u64,
         request_id: ModelRequestId,
@@ -1244,21 +1254,25 @@ impl AgentProvider for InternalGenericAgentProvider {
                 recovery_events,
             ),
             GenericCheckpointPhase::WorkflowAttemptOpen {
+                boundary,
                 round,
                 request_id,
+                request_digest,
+                observation,
                 call_id,
-                ..
-            } => Err(AgentProtocolError::new(
-                AgentProtocolErrorCode::InvalidTransition,
-                "Generic Agent recovery cannot rerun a Workflow with an unknown outcome",
-            )
-            .with_details(serde_json::json!({
-                "boundary": "workflow_attempt_open",
-                "round": round,
-                "request_id": request_id,
-                "call_id": call_id,
-                "outcome": "unknown",
-            }))),
+                arguments_digest,
+            } => stage_started_workflow_recovery(
+                self.inner.clone(),
+                stored,
+                boundary,
+                round,
+                request_id,
+                request_digest,
+                observation,
+                call_id,
+                arguments_digest,
+                recovery_events,
+            ),
             GenericCheckpointPhase::Stable(boundary) => stage_loop_recovery(
                 self.inner.clone(),
                 stored,
@@ -1547,6 +1561,101 @@ fn stage_workflow_recovery(
             observation,
             call,
             arguments,
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_started_workflow_recovery(
+    inner: Arc<GenericInner>,
+    stored: StoredGenericAgentRun,
+    boundary: GenericLoopBoundary,
+    round: u64,
+    request_id: ModelRequestId,
+    request_digest: Digest,
+    observation: GenericModelObservation,
+    call_id: ModelToolCallId,
+    arguments_digest: Digest,
+    recovery_events: Vec<AgentEventDraft>,
+) -> Result<AgentRecovery, AgentProtocolError> {
+    let call = observation
+        .tool_calls
+        .iter()
+        .find(|call| call.call_id == call_id)
+        .cloned()
+        .ok_or_else(|| {
+            AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidDigest,
+                "Workflow start fence has no matching observed model call",
+            )
+        })?;
+    if call.name != WORKFLOW_TOOL_NAME
+        || !call.ended
+        || Digest::sha256(call.arguments.as_bytes()) != arguments_digest
+    {
+        return Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidDigest,
+            "Workflow start fence differs from its observed model call",
+        ));
+    }
+    let arguments = parse_tool_arguments(&PendingModelToolCall {
+        call_id: call.call_id.clone(),
+        name: call.name.clone(),
+        arguments: call.arguments.clone(),
+        ended: call.ended,
+    })
+    .map_err(observed_recovery_error)?;
+    let Some((workflow_event_id, outcome)) = recovered_workflow_output(
+        stored.registration.run_id(),
+        round,
+        &call.call_id,
+        &recovery_events,
+    )?
+    else {
+        return Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidTransition,
+            "Generic Agent recovery cannot rerun a Workflow with an unknown outcome",
+        )
+        .with_details(serde_json::json!({
+            "boundary": "workflow_attempt_open",
+            "round": round,
+            "request_id": request_id,
+            "call_id": call_id,
+            "outcome": "unknown",
+        })));
+    };
+    let tool_call_limit = stored
+        .registration
+        .request
+        .run
+        .spec
+        .limits
+        .max_tool_calls
+        .unwrap_or(inner.config.max_tool_calls)
+        .min(inner.config.max_tool_calls);
+    let outer_count = boundary.tool_call_count.saturating_add(1);
+    if outer_count >= tool_call_limit
+        || outer_count.saturating_add(outcome.tool_calls) > tool_call_limit
+    {
+        return Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidDigest,
+            "durable Workflow output exceeds the Run Tool call limit",
+        ));
+    }
+    stage_loop_recovery(
+        inner,
+        stored,
+        boundary,
+        recovery_events,
+        GenericRecoveryContinuation::WorkflowOutput {
+            round,
+            request_id,
+            request_digest,
+            observation,
+            call,
+            arguments,
+            outcome,
+            workflow_event_id,
         },
     )
 }
@@ -2140,6 +2249,7 @@ fn stage_loop_recovery(
         }
         GenericRecoveryContinuation::Skill { .. }
         | GenericRecoveryContinuation::Workflow { .. }
+        | GenericRecoveryContinuation::WorkflowOutput { .. }
         | GenericRecoveryContinuation::Tool { .. }
             if !pending_resolutions.is_empty() =>
         {
@@ -2252,6 +2362,7 @@ fn stage_loop_recovery(
         GenericRecoveryContinuation::ModelLoop { .. }
         | GenericRecoveryContinuation::Skill { .. }
         | GenericRecoveryContinuation::Workflow { .. }
+        | GenericRecoveryContinuation::WorkflowOutput { .. }
         | GenericRecoveryContinuation::Tool { .. } => {}
     }
     let mut pending_inputs = BTreeMap::new();
@@ -2668,6 +2779,72 @@ fn stage_loop_recovery(
                 ));
             }
         }
+        if let GenericRecoveryContinuation::WorkflowOutput {
+            round,
+            request_id,
+            request_digest,
+            observation,
+            call,
+            arguments,
+            outcome,
+            ..
+        } = &continuation
+        {
+            let expected_exchange = observed_tool_exchange_messages(
+                observation,
+                call,
+                arguments,
+                &outcome.result,
+                outcome.is_error,
+            );
+            let session_exchange_seq = recovered_tool_exchange_committed(
+                &inner,
+                &request,
+                *round,
+                request_id,
+                Some(&expected_exchange),
+                observation.usage.as_ref(),
+            )
+            .await?;
+            session_exchange_committed = session_exchange_seq.is_some();
+            let prior_model_messages = if let Some(exchange_seq) = session_exchange_seq {
+                let (assistant, tool) = &expected_exchange;
+                if !model_messages.ends_with(&[assistant.clone(), tool.clone()]) {
+                    return Err(AgentProtocolError::new(
+                        AgentProtocolErrorCode::InvalidDigest,
+                        "recovered Workflow exchange is not the final projected Session context",
+                    ));
+                }
+                Some(
+                    project_model_messages(
+                        &inner,
+                        &request,
+                        &model_definitions,
+                        run_skills.as_deref(),
+                        None,
+                        Some(exchange_seq.saturating_sub(1)),
+                    )
+                    .await
+                    .map_err(session_context_recovery_error)?,
+                )
+            } else {
+                None
+            };
+            let request_messages = prior_model_messages
+                .as_deref()
+                .unwrap_or(model_messages.as_slice());
+            let rebuilt =
+                model_request_for_round(&request, *round, request_messages, &model_definitions);
+            if rebuilt.request_id != *request_id
+                || model_request_digest(&rebuilt).map_err(checkpoint_stream_error)?
+                    != *request_digest
+            {
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::InvalidDigest,
+                    "recovered Workflow model request no longer matches the private WAL attempt",
+                ));
+            }
+        }
         if let GenericRecoveryContinuation::Tool {
             round,
             request_id,
@@ -2953,6 +3130,38 @@ fn stage_loop_recovery(
                         observation,
                         call,
                         arguments,
+                    )
+                    .await;
+                }
+                GenericRecoveryContinuation::WorkflowOutput {
+                    round,
+                    request_id,
+                    observation,
+                    call,
+                    arguments,
+                    outcome,
+                    workflow_event_id,
+                    ..
+                } => {
+                    resume_observed_workflow_output(
+                        inner,
+                        request,
+                        admission,
+                        user_message,
+                        model_messages,
+                        model_definitions,
+                        run_skills,
+                        seed,
+                        cancellation,
+                        steer_updates,
+                        round,
+                        request_id,
+                        observation,
+                        call,
+                        arguments,
+                        outcome,
+                        workflow_event_id,
+                        session_exchange_committed,
                     )
                     .await;
                 }
@@ -4106,6 +4315,114 @@ async fn execute_model_run(
         RunLimitKind::ModelSteps,
         "model step limit reached",
     );
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resume_observed_workflow_output(
+    inner: Arc<GenericInner>,
+    request: AgentStartRequest,
+    admission: AgentAdmission,
+    user_message: ModelMessage,
+    mut model_messages: Vec<ModelMessage>,
+    model_tools: Vec<ModelToolDefinition>,
+    run_skills: Option<Arc<SkillRuntime>>,
+    mut seed: GenericExecutionSeed,
+    cancellation: CancellationToken,
+    steer_updates: watch::Receiver<u64>,
+    round: u64,
+    model_request_id: ModelRequestId,
+    observation: GenericModelObservation,
+    call: GenericObservedToolCall,
+    arguments: serde_json::Value,
+    outcome: WorkflowCallObservation,
+    workflow_event_id: AgentEventId,
+    session_exchange_committed: bool,
+) {
+    let run_id = request.run.spec.run_id.clone();
+    if let Some(usage) = observation.usage.clone() {
+        merge_usage(&mut seed.total_usage, usage);
+    }
+    if !observation.response.is_empty() {
+        seed.last_response = observation.response.clone();
+    }
+    seed.tool_call_count = seed
+        .tool_call_count
+        .saturating_add(1)
+        .saturating_add(outcome.tool_calls);
+    if !seed.supporting_event_ids.contains(&workflow_event_id) {
+        seed.supporting_event_ids.push(workflow_event_id);
+    }
+    if !session_exchange_committed {
+        let (assistant_message, tool_message) = observed_tool_exchange_messages(
+            &observation,
+            &call,
+            &arguments,
+            &outcome.result,
+            outcome.is_error,
+        );
+        if let Err(failure) = append_session_event(
+            &inner,
+            AgentSessionEventDraft {
+                event_id: AgentSessionEventId::new(format!(
+                    "generic-{}-tool-exchange-{round}",
+                    run_id.as_str()
+                )),
+                session_id: request.run.spec.session_id.clone(),
+                run_id: run_id.clone(),
+                payload: AgentSessionEvent::ToolExchangeCommitted {
+                    request_id: model_request_id,
+                    assistant: assistant_message,
+                    tool: tool_message,
+                    usage: observation.usage,
+                },
+            },
+        )
+        .await
+        {
+            emit_failure(&inner, &request, &user_message, failure);
+            return;
+        }
+        model_messages = match project_committed_model_messages(
+            &inner,
+            &request,
+            &model_tools,
+            run_skills.as_deref(),
+        )
+        .await
+        {
+            Ok(messages) => messages,
+            Err(failure) => {
+                emit_failure(&inner, &request, &user_message, failure);
+                return;
+            }
+        };
+    }
+    seed.next_model_round = round.saturating_add(1);
+    if let Err(failure) = commit_loop_boundary(
+        &inner,
+        &run_id,
+        seed.next_model_round,
+        &seed.total_usage,
+        seed.tool_call_count,
+        &seed.last_response,
+        &seed.supporting_event_ids,
+    ) {
+        emit_failure(&inner, &request, &user_message, failure);
+        return;
+    }
+    execute_model_run(
+        inner,
+        request,
+        admission,
+        user_message,
+        model_messages,
+        model_tools,
+        run_skills,
+        seed,
+        cancellation,
+        steer_updates,
+    )
+    .await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6277,11 +6594,7 @@ fn publish_workflow_output(
             causation_id: None,
             source_fingerprint: None,
             payload: AgentEvent::OutputCommitted {
-                output_id: OutputId::new(format!(
-                    "generic-{}-workflow-{round}-{}",
-                    run_id.as_str(),
-                    call_id.as_str()
-                )),
+                output_id: workflow_output_id(run_id, round, call_id),
                 content: vec![Content {
                     media_type: "application/json".to_owned(),
                     schema_id: None,
@@ -6299,6 +6612,103 @@ fn workflow_output_event_id(run_id: &RunId, round: u64, call_id: &ModelToolCallI
         run_id.as_str(),
         call_id.as_str()
     ))
+}
+
+fn workflow_output_id(run_id: &RunId, round: u64, call_id: &ModelToolCallId) -> OutputId {
+    OutputId::new(format!(
+        "generic-{}-workflow-{round}-{}",
+        run_id.as_str(),
+        call_id.as_str()
+    ))
+}
+
+fn recovered_workflow_output(
+    run_id: &RunId,
+    round: u64,
+    call_id: &ModelToolCallId,
+    recovery_events: &[AgentEventDraft],
+) -> Result<Option<(AgentEventId, WorkflowCallObservation)>, AgentProtocolError> {
+    let expected_event_id = workflow_output_event_id(run_id, round, call_id);
+    let Some(event) = recovery_events
+        .iter()
+        .find(|event| event.event_id == expected_event_id)
+    else {
+        return Ok(None);
+    };
+    let AgentEvent::OutputCommitted { output_id, content } = &event.payload else {
+        return Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidDigest,
+            "durable Workflow output event has the wrong shape",
+        ));
+    };
+    let [Content {
+        media_type,
+        schema_id,
+        body: ContentBody::Inline(result),
+    }] = content.as_slice()
+    else {
+        return Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidDigest,
+            "durable Workflow output must contain one inline JSON value",
+        ));
+    };
+    if event.run_id != *run_id
+        || output_id != &workflow_output_id(run_id, round, call_id)
+        || media_type != "application/json"
+        || schema_id.is_some()
+    {
+        return Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidDigest,
+            "durable Workflow output crossed its Run or output identity",
+        ));
+    }
+    let status = result
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidDigest,
+                "durable Workflow output has no status",
+            )
+        })?;
+    if !matches!(
+        status,
+        "completed" | "failed" | "waiting_user" | "waiting_event" | "rejected"
+    ) {
+        return Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidDigest,
+            "durable Workflow output has an unknown status",
+        ));
+    }
+    let tool_calls = match result.get("tool_calls") {
+        Some(value) => value.as_u64().ok_or_else(|| {
+            AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidDigest,
+                "durable Workflow output has an invalid Tool call count",
+            )
+        })?,
+        None if status == "rejected" => 0,
+        None => {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidDigest,
+                "durable Workflow output has no Tool call count",
+            ))
+        }
+    };
+    if status == "rejected" && tool_calls != 0 {
+        return Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidDigest,
+            "rejected Workflow output cannot report executed Tool calls",
+        ));
+    }
+    Ok(Some((
+        expected_event_id,
+        WorkflowCallObservation {
+            result: result.clone(),
+            is_error: status != "completed",
+            tool_calls,
+        },
+    )))
 }
 
 fn commit_workflow_attempt_started(
