@@ -12,7 +12,9 @@ use orchestral_core::agent_protocol::wire::{
     AgentAdmission, AgentCommandEnvelope, AgentEvent, AgentEventDraft, AgentEventId,
     AgentExecutionRef, AgentStartRequest, CommandId, Digest, ProviderCommandOutcome, RunId,
 };
-use orchestral_core::model_protocol::{ModelRequestId, ModelUsage};
+use orchestral_core::model_protocol::{
+    ModelFinishReason, ModelRequestId, ModelToolCallId, ModelUsage,
+};
 use serde::{Deserialize, Serialize};
 
 macro_rules! string_id {
@@ -56,6 +58,50 @@ pub struct GenericAgentRunRegistration {
     /// schemas, Skill catalog, and loop limits that determine reconstructed
     /// execution.
     pub config_digest: Digest,
+}
+
+/// One model Tool call reconstructed from the canonical streaming protocol.
+/// Raw argument bytes are retained so recovery can apply the same JSON/schema
+/// validation without asking the model to repeat the call.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenericObservedToolCall {
+    pub call_id: ModelToolCallId,
+    pub name: String,
+    #[serde(default)]
+    pub arguments: String,
+    pub ended: bool,
+}
+
+/// Durable aggregate produced only after a valid terminal Model stream event
+/// has been observed. It is Provider-private execution state, not a public
+/// Agent event and not a claim that any Tool effect has occurred.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenericModelObservation {
+    pub finish_reason: ModelFinishReason,
+    #[serde(default)]
+    pub response: String,
+    #[serde(default)]
+    pub usage: Option<ModelUsage>,
+    #[serde(default)]
+    pub tool_calls: Vec<GenericObservedToolCall>,
+}
+
+impl GenericModelObservation {
+    fn validate(&self) -> Result<(), GenericCheckpointError> {
+        let mut call_ids = BTreeSet::new();
+        if self.tool_calls.iter().any(|call| {
+            call.call_id.is_empty()
+                || call.name.trim().is_empty()
+                || !call_ids.insert(call.call_id.clone())
+        }) {
+            return Err(GenericCheckpointError::InvalidData(
+                "model observation Tool calls require unique identities and names".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl GenericAgentRunRegistration {
@@ -107,6 +153,11 @@ pub enum GenericCheckpointEvent {
         request_id: ModelRequestId,
         request_digest: Digest,
     },
+    ModelAttemptObserved {
+        round: u64,
+        request_id: ModelRequestId,
+        observation: GenericModelObservation,
+    },
     CommandCommitted {
         command: AgentCommandEnvelope,
         outcome: ProviderCommandOutcome,
@@ -146,6 +197,18 @@ impl GenericCheckpointEvent {
                         "model attempt requires a round, request identity, and digest".to_owned(),
                     ));
                 }
+            }
+            Self::ModelAttemptObserved {
+                round,
+                request_id,
+                observation,
+            } => {
+                if *round == 0 || request_id.is_empty() {
+                    return Err(GenericCheckpointError::InvalidData(
+                        "model observation requires a round and request identity".to_owned(),
+                    ));
+                }
+                observation.validate()?;
             }
             Self::CommandCommitted { command, outcome } => {
                 command.verify_digest().map_err(invalid_data)?;
@@ -323,6 +386,13 @@ pub enum GenericCheckpointPhase {
         request_id: ModelRequestId,
         request_digest: Digest,
     },
+    ModelAttemptObserved {
+        boundary: GenericLoopBoundary,
+        round: u64,
+        request_id: ModelRequestId,
+        request_digest: Digest,
+        observation: GenericModelObservation,
+    },
     Terminal,
 }
 
@@ -393,6 +463,7 @@ pub fn replay_generic_agent_checkpoint(
                 match &phase {
                     GenericCheckpointPhase::Prepared if *next_model_round == 1 => {}
                     GenericCheckpointPhase::ModelAttemptOpen { round, .. }
+                    | GenericCheckpointPhase::ModelAttemptObserved { round, .. }
                         if *next_model_round > *round => {}
                     _ => {
                         return Err(GenericCheckpointError::InvalidData(
@@ -428,6 +499,35 @@ pub fn replay_generic_agent_checkpoint(
                     round: *round,
                     request_id: request_id.clone(),
                     request_digest: request_digest.clone(),
+                };
+            }
+            GenericCheckpointEvent::ModelAttemptObserved {
+                round,
+                request_id,
+                observation,
+            } => {
+                let GenericCheckpointPhase::ModelAttemptOpen {
+                    boundary,
+                    round: open_round,
+                    request_id: open_request_id,
+                    request_digest,
+                } = &phase
+                else {
+                    return Err(GenericCheckpointError::InvalidData(
+                        "model observation did not close an open attempt".to_owned(),
+                    ));
+                };
+                if round != open_round || request_id != open_request_id {
+                    return Err(GenericCheckpointError::InvalidData(
+                        "model observation identity does not match its open attempt".to_owned(),
+                    ));
+                }
+                phase = GenericCheckpointPhase::ModelAttemptObserved {
+                    boundary: boundary.clone(),
+                    round: *round,
+                    request_id: request_id.clone(),
+                    request_digest: request_digest.clone(),
+                    observation: observation.clone(),
                 };
             }
             GenericCheckpointEvent::CommandCommitted { command, outcome } => {
@@ -709,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_boundary_and_open_attempt_are_distinguishable_after_replay() {
+    fn stable_open_and_observed_model_boundaries_are_distinguishable_after_replay() {
         let store = InMemoryGenericAgentCheckpointStore::default();
         let registration = registration();
         let run_id = registration.run_id().clone();
@@ -737,6 +837,59 @@ mod tests {
         assert!(matches!(
             uncertain.validate().unwrap().phase,
             GenericCheckpointPhase::ModelAttemptOpen { .. }
+        ));
+
+        store
+            .append(
+                &run_id,
+                2,
+                GenericCheckpointDraft {
+                    event_id: GenericCheckpointEventId::new("observed-1"),
+                    run_id: run_id.clone(),
+                    payload: GenericCheckpointEvent::ModelAttemptObserved {
+                        round: 1,
+                        request_id: ModelRequestId::new("model-run-1-1"),
+                        observation: GenericModelObservation {
+                            finish_reason: ModelFinishReason::ToolCalls,
+                            response: "calling a Tool".to_owned(),
+                            usage: Some(ModelUsage {
+                                input_tokens: Some(10),
+                                output_tokens: Some(5),
+                            }),
+                            tool_calls: vec![GenericObservedToolCall {
+                                call_id: ModelToolCallId::new("call-1"),
+                                name: "echo".to_owned(),
+                                arguments: r#"{"value":"hello"}"#.to_owned(),
+                                ended: true,
+                            }],
+                        },
+                    },
+                },
+            )
+            .unwrap();
+        let observed = store.load_run(&run_id).unwrap().unwrap();
+        assert!(matches!(
+            observed.validate().unwrap().phase,
+            GenericCheckpointPhase::ModelAttemptObserved {
+                round: 1,
+                observation: GenericModelObservation { ref tool_calls, .. },
+                ..
+            } if tool_calls.len() == 1
+        ));
+
+        store.append(&run_id, 3, boundary(&run_id, 2)).unwrap();
+        assert!(matches!(
+            store
+                .load_run(&run_id)
+                .unwrap()
+                .unwrap()
+                .validate()
+                .unwrap()
+                .phase,
+            GenericCheckpointPhase::Stable(GenericLoopBoundary {
+                next_model_round: 2,
+                ..
+            })
         ));
     }
 

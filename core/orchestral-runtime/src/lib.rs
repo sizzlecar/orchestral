@@ -25,8 +25,8 @@ pub use generic_agent_checkpoint::{
     CreateGenericRunOutcome, GenericAgentCheckpointProjection, GenericAgentCheckpointStore,
     GenericAgentRunRegistration, GenericCheckpointDraft, GenericCheckpointError,
     GenericCheckpointEvent, GenericCheckpointEventId, GenericCheckpointPhase,
-    GenericCheckpointRecord, GenericLoopBoundary, InMemoryGenericAgentCheckpointStore,
-    StoredGenericAgentRun,
+    GenericCheckpointRecord, GenericLoopBoundary, GenericModelObservation, GenericObservedToolCall,
+    InMemoryGenericAgentCheckpointStore, StoredGenericAgentRun,
 };
 pub use in_memory_blob::InMemoryBlobStore;
 pub use orchestral_core::spi::{

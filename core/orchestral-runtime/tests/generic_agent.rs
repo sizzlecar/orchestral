@@ -83,6 +83,7 @@ struct PausedAttemptState {
 enum CheckpointCrashCut {
     InitialBoundary,
     ModelAttempt,
+    ModelObservation,
 }
 
 struct PausingCheckpointStore {
@@ -243,6 +244,10 @@ impl GenericAgentCheckpointStore for PausingCheckpointStore {
                 | (
                     CheckpointCrashCut::ModelAttempt,
                     GenericCheckpointEvent::ModelAttemptStarted { .. },
+                )
+                | (
+                    CheckpointCrashCut::ModelObservation,
+                    GenericCheckpointEvent::ModelAttemptObserved { .. },
                 ) => true,
                 _ => false,
             };
@@ -290,6 +295,13 @@ struct ApprovalLoopModel {
 
 struct EchoTool {
     calls: AtomicUsize,
+}
+
+struct WalInspectingEchoTool {
+    calls: AtomicUsize,
+    checkpoint_store: Arc<InMemoryGenericAgentCheckpointStore>,
+    run_id: RunId,
+    observed_before_execute: AtomicUsize,
 }
 
 struct LargeResultTool {
@@ -1036,6 +1048,37 @@ impl GuardedToolExecutor for EchoTool {
     }
 }
 
+#[async_trait]
+impl GuardedToolExecutor for WalInspectingEchoTool {
+    async fn execute(&self, execution: GuardedToolExecution) -> ToolOutcome {
+        let projection = self
+            .checkpoint_store
+            .load_run(&self.run_id)
+            .expect("private WAL remains readable at Tool execution")
+            .expect("Tool execution belongs to a registered Run")
+            .validate()
+            .expect("private WAL remains valid at Tool execution");
+        assert!(matches!(
+            projection.phase,
+            GenericCheckpointPhase::ModelAttemptObserved {
+                round: 1,
+                observation: orchestral_runtime::GenericModelObservation {
+                    ref tool_calls,
+                    ..
+                },
+                ..
+            } if tool_calls.len() == 1
+                && tool_calls[0].call_id.as_str() == "echo-call"
+                && tool_calls[0].ended
+        ));
+        self.observed_before_execute.fetch_add(1, Ordering::SeqCst);
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        ToolOutcome::Completed {
+            output: json!({ "result": execution.invocation.arguments["value"].clone() }).into(),
+        }
+    }
+}
+
 fn recovery_identity_tool_runtime(
     host_bounds: ToolPolicyBounds,
     restriction_bounds: ToolPolicyBounds,
@@ -1407,6 +1450,88 @@ async fn model_attempt_is_in_the_private_wal_before_backend_start() {
         })
         .collect::<Vec<_>>();
     assert_eq!(private_provider_digests, host_provider_digests);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_observation_is_write_ahead_of_pending_interaction() {
+    let run_id = RunId::new("model-observation-wal-run");
+    let checkpoint_store = Arc::new(PausingCheckpointStore::at(
+        CheckpointCrashCut::ModelObservation,
+    ));
+    let model = Arc::new(InputRequestModel {
+        rounds: AtomicUsize::new(0),
+    });
+    let provider = Arc::new(
+        InternalGenericAgentProvider::new(
+            model.clone(),
+            GenericAgentConfig::new("internal-provider", "generic-agent"),
+        )
+        .expect("input-capable Generic Agent starts")
+        .with_checkpoint_store(checkpoint_store.clone())
+        .expect("private WAL binds before the Provider is shared"),
+    );
+    let controller = Arc::new(
+        AgentController::new(
+            provider,
+            ProviderBindingRef::new("model-observation-wal-binding"),
+        )
+        .expect("controller binds the Generic Agent"),
+    );
+    let paused = checkpoint_store.paused.notified();
+    let execution = controller
+        .start(
+            AgentRunEnvelope::new(
+                AGENT_PROTOCOL_V1,
+                AgentSessionId::new("model-observation-wal-session"),
+                run_id.clone(),
+                vec![Content::text(
+                    "request input only after durable observation",
+                )],
+            )
+            .expect("valid input Run"),
+        )
+        .await
+        .expect("Run starts");
+    tokio::time::timeout(std::time::Duration::from_secs(1), paused)
+        .await
+        .expect("model observation reaches the injected crash cut");
+
+    assert!(matches!(
+        checkpoint_store
+            .load_run(&run_id)
+            .expect("private WAL remains readable")
+            .expect("private Run remains registered")
+            .validate()
+            .expect("committed WAL prefix remains valid")
+            .phase,
+        GenericCheckpointPhase::ModelAttemptOpen { round: 1, .. }
+    ));
+    assert!(controller
+        .events(&run_id, 0)
+        .await
+        .expect("Host Journal remains readable")
+        .iter()
+        .all(|record| !matches!(&record.event.payload, AgentEvent::RequestOpened { .. })));
+
+    checkpoint_store.release_as_crash();
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        controller.wait_for_terminal(&execution.run_id),
+    )
+    .await
+    .expect("simulated process loss reaches the Host")
+    .expect_err("uncommitted model observation cannot become a terminal outcome");
+    assert!(matches!(
+        error,
+        AgentControlError::ContinuityUnknown(ref actual) if actual == &run_id
+    ));
+    assert_eq!(model.rounds.load(Ordering::SeqCst), 1);
+    assert!(controller
+        .events(&run_id, 0)
+        .await
+        .expect("Host Journal remains readable after loss")
+        .iter()
+        .all(|record| !matches!(&record.event.payload, AgentEvent::RequestOpened { .. })));
 }
 
 #[tokio::test]
@@ -2561,6 +2686,8 @@ async fn model_input_request_resolves_by_request_id_and_resumes_the_same_run() {
 
 #[tokio::test]
 async fn generic_agent_executes_model_tools_only_through_the_guarded_runtime() {
+    let run_id = RunId::new("tool-run");
+    let checkpoint_store = Arc::new(InMemoryGenericAgentCheckpointStore::default());
     let bounds = ToolPolicyBounds {
         approval: ApprovalPolicy::NotRequired,
         max_timeout_ms: Some(1_000),
@@ -2581,8 +2708,11 @@ async fn generic_agent_executes_model_tools_only_through_the_guarded_runtime() {
         )
         .expect("valid Host policy"),
     );
-    let tool = Arc::new(EchoTool {
+    let tool = Arc::new(WalInspectingEchoTool {
         calls: AtomicUsize::new(0),
+        checkpoint_store: checkpoint_store.clone(),
+        run_id: run_id.clone(),
+        observed_before_execute: AtomicUsize::new(0),
     });
     runtime
         .register(
@@ -2624,7 +2754,9 @@ async fn generic_agent_executes_model_tools_only_through_the_guarded_runtime() {
             runtime,
             RunToolGrant { bounds },
         )
-        .expect("tool-capable Generic Agent is valid"),
+        .expect("tool-capable Generic Agent is valid")
+        .with_checkpoint_store(checkpoint_store)
+        .expect("private WAL binds before the Provider is shared"),
     );
     let controller = Arc::new(
         AgentController::new(provider, ProviderBindingRef::new("generic-binding"))
@@ -2633,7 +2765,7 @@ async fn generic_agent_executes_model_tools_only_through_the_guarded_runtime() {
     let run = AgentRunEnvelope::new(
         AGENT_PROTOCOL_V1,
         AgentSessionId::new("tool-session"),
-        RunId::new("tool-run"),
+        run_id,
         vec![Content::text("use echo")],
     )
     .expect("valid text Run");
@@ -2646,6 +2778,7 @@ async fn generic_agent_executes_model_tools_only_through_the_guarded_runtime() {
 
     assert_eq!(view.state.status(), AgentRunStatus::Delivered);
     assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(tool.observed_before_execute.load(Ordering::SeqCst), 1);
     assert_eq!(model.rounds.load(Ordering::SeqCst), 2);
     let delivery = view.delivery.expect("Delivered Run exposes its delivery");
     assert_eq!(delivery.usage.and_then(|usage| usage.tool_calls), Some(1));

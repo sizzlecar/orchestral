@@ -52,8 +52,8 @@ use crate::approval_bridge::AgentApprovalBridge;
 use crate::generic_agent_checkpoint::{
     CreateGenericRunOutcome, GenericAgentCheckpointStore, GenericAgentRunRegistration,
     GenericCheckpointDraft, GenericCheckpointError, GenericCheckpointEvent,
-    GenericCheckpointEventId, GenericCheckpointPhase, GenericLoopBoundary,
-    InMemoryGenericAgentCheckpointStore, StoredGenericAgentRun,
+    GenericCheckpointEventId, GenericCheckpointPhase, GenericLoopBoundary, GenericModelObservation,
+    GenericObservedToolCall, InMemoryGenericAgentCheckpointStore, StoredGenericAgentRun,
 };
 use crate::skill::{
     ActivatedSkillSet, SkillActivationOutcome, SkillActivationRequest, SkillRuntime,
@@ -1146,6 +1146,17 @@ impl AgentProvider for InternalGenericAgentProvider {
                 "round": round,
                 "request_id": request_id,
             }))),
+            GenericCheckpointPhase::ModelAttemptObserved {
+                round, request_id, ..
+            } => Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::Unsupported,
+                "Generic Agent recovery has a durable model observation but cannot yet reconstruct its continuation",
+            )
+            .with_details(serde_json::json!({
+                "boundary": "model_attempt_observed",
+                "round": round,
+                "request_id": request_id,
+            }))),
             GenericCheckpointPhase::Stable(boundary) => {
                 stage_loop_recovery(self.inner.clone(), stored, boundary, recovery_events, false)
             }
@@ -1187,7 +1198,8 @@ fn checkpoint_recovery_events(
                 );
             }
             GenericCheckpointEvent::LoopBoundaryCommitted { .. }
-            | GenericCheckpointEvent::ModelAttemptStarted { .. } => {}
+            | GenericCheckpointEvent::ModelAttemptStarted { .. }
+            | GenericCheckpointEvent::ModelAttemptObserved { .. } => {}
         }
     }
     Ok(events)
@@ -1841,6 +1853,29 @@ async fn execute_model_run(
                 ModelEvent::Usage { usage: observed } => round_usage = Some(observed),
                 ModelEvent::Finish { reason } => {
                     let committed_usage = round_usage.take();
+                    if let Err(failure) = commit_model_observation(
+                        &inner,
+                        &run_id,
+                        round,
+                        &model_request.request_id,
+                        GenericModelObservation {
+                            finish_reason: reason.clone(),
+                            response: response.clone(),
+                            usage: committed_usage.clone(),
+                            tool_calls: tool_calls
+                                .iter()
+                                .map(|call| GenericObservedToolCall {
+                                    call_id: call.call_id.clone(),
+                                    name: call.name.clone(),
+                                    arguments: call.arguments.clone(),
+                                    ended: call.ended,
+                                })
+                                .collect(),
+                        },
+                    ) {
+                        emit_failure(&inner, &request, &user_message, failure);
+                        return;
+                    }
                     if let Some(observed) = committed_usage.clone() {
                         merge_usage(&mut total_usage, observed);
                         has_usage = true;
@@ -3259,6 +3294,28 @@ fn commit_model_attempt(
             round,
             request_id: request.request_id.clone(),
             request_digest: Digest::sha256(request_bytes),
+        },
+    )
+}
+
+fn commit_model_observation(
+    inner: &GenericInner,
+    run_id: &RunId,
+    round: u64,
+    request_id: &ModelRequestId,
+    observation: GenericModelObservation,
+) -> Result<(), AgentFailure> {
+    append_checkpoint(
+        inner,
+        run_id,
+        GenericCheckpointEventId::new(format!(
+            "generic-{}-model-observed-{round}",
+            run_id.as_str()
+        )),
+        GenericCheckpointEvent::ModelAttemptObserved {
+            round,
+            request_id: request_id.clone(),
+            observation,
         },
     )
 }
