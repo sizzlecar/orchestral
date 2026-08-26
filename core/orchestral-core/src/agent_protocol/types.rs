@@ -1432,6 +1432,32 @@ impl ProviderCommandDisposition {
         self.outcome.validate_shape()?;
         Ok(())
     }
+
+    /// Converts the Provider-native command response into its stable durable
+    /// observation. The Host still owns sequencing and authority metadata,
+    /// while the Provider can reproduce this exact draft during recovery.
+    pub fn to_event_draft(&self) -> Result<AgentEventDraft, AgentProtocolError> {
+        if self.command_id.is_empty() || self.run_id.is_empty() {
+            return Err(invalid_command(
+                "Provider command disposition identities must not be empty",
+            ));
+        }
+        self.outcome.validate_shape()?;
+        Ok(AgentEventDraft {
+            event_id: AgentEventId::new(format!(
+                "provider-command-disposition-{}-{}",
+                self.run_id.as_str(),
+                self.command_id.as_str()
+            )),
+            run_id: self.run_id.clone(),
+            causation_id: Some(self.command_id.clone()),
+            source_fingerprint: None,
+            payload: AgentEvent::CommandDispositionRecorded {
+                command_id: self.command_id.clone(),
+                outcome: self.outcome.clone(),
+            },
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

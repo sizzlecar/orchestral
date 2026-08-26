@@ -1124,7 +1124,7 @@ impl AgentProvider for InternalGenericAgentProvider {
 
         match projection.phase {
             GenericCheckpointPhase::Terminal => {
-                let replay = stream::iter(projection.provider_events.into_iter().map(|draft| {
+                let replay = stream::iter(checkpoint_recovery_events(&stored)?.into_iter().map(|draft| {
                     Ok(AgentProviderStreamItem::Event(Box::new(draft)))
                 }))
                 .boxed();
@@ -1149,6 +1149,33 @@ impl AgentProvider for InternalGenericAgentProvider {
             }
         }
     }
+}
+
+fn checkpoint_recovery_events(
+    stored: &crate::generic_agent_checkpoint::StoredGenericAgentRun,
+) -> Result<Vec<AgentEventDraft>, AgentProtocolError> {
+    let mut events = Vec::new();
+    for record in &stored.records {
+        match &record.payload {
+            GenericCheckpointEvent::ProviderEventsCommitted { events: committed } => {
+                events.extend(committed.iter().cloned());
+            }
+            GenericCheckpointEvent::CommandCommitted { command, outcome } => {
+                events.push(
+                    ProviderCommandDisposition {
+                        command_id: command.command_id.clone(),
+                        run_id: command.run_id.clone(),
+                        outcome: outcome.clone(),
+                        duplicate: false,
+                    }
+                    .to_event_draft()?,
+                );
+            }
+            GenericCheckpointEvent::LoopBoundaryCommitted { .. }
+            | GenericCheckpointEvent::ModelAttemptStarted { .. } => {}
+        }
+    }
+    Ok(events)
 }
 
 fn validate_execution_and_duplicate(

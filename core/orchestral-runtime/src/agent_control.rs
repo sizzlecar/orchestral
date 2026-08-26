@@ -353,20 +353,7 @@ impl AgentController {
             .await?;
         disposition.validate_for(&command)?;
         let mut next_reducer = entry.reducer.clone();
-        let disposition_event = next_reducer.apply_provider_draft(AgentEventDraft {
-            event_id: AgentEventId::new(format!(
-                "provider-command-disposition-{}-{}",
-                command.run_id.as_str(),
-                command.command_id.as_str()
-            )),
-            run_id: command.run_id.clone(),
-            causation_id: Some(command.command_id.clone()),
-            source_fingerprint: None,
-            payload: AgentEvent::CommandDispositionRecorded {
-                command_id: command.command_id.clone(),
-                outcome: disposition.outcome,
-            },
-        })?;
+        let disposition_event = next_reducer.apply_provider_draft(disposition.to_event_draft()?)?;
         self.commit_sequenced(&slot, &mut entry, next_reducer, disposition_event)
             .await?;
         Ok(entry.reducer.command_ack(&command.command_id, duplicate)?)

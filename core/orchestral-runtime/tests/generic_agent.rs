@@ -1435,7 +1435,7 @@ async fn controller_cancel_terminates_a_generic_agent_model_run() {
     )
     .expect("valid text Run");
 
-    let execution = controller.start(run).await.expect("Run starts");
+    let execution = controller.start(run.clone()).await.expect("Run starts");
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
             if controller
@@ -1483,6 +1483,50 @@ async fn controller_cancel_terminates_a_generic_agent_model_run() {
         AgentCommand::Cancel { reason } if reason == "user interrupted the conversation"
     ));
     assert_eq!(command.outcome, ProviderCommandOutcome::Accepted);
+
+    let replacement = InternalGenericAgentProvider::new(
+        Arc::new(BlockingModel),
+        GenericAgentConfig::new("internal-provider", "generic-agent"),
+    )
+    .expect("replacement Generic Agent starts")
+    .with_checkpoint_store(checkpoint_store)
+    .expect("same private WAL binds to the replacement Provider");
+    let descriptor = replacement.describe();
+    let start_request =
+        AgentStartRequest::new(run, ProviderBindingRef::new("generic-binding"), &descriptor)
+            .expect("original start identity reconstructs");
+    let recovery = replacement
+        .recover(
+            AgentRecoveryRequest::new(start_request, execution, &descriptor)
+                .expect("recovery identity is valid"),
+        )
+        .await
+        .expect("cancelled private WAL is recoverable");
+    let (mut replay, confirmation) = recovery.into_parts();
+    let mut replayed = Vec::new();
+    while let Some(item) = replay.next().await {
+        if let AgentProviderStreamItem::Event(draft) = item.expect("replay remains valid") {
+            replayed.push(*draft);
+        }
+    }
+    confirmation
+        .await
+        .expect("terminal replay starts no reconstructed work");
+    let disposition_index = replayed
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.payload,
+                AgentEvent::CommandDispositionRecorded { command_id, outcome }
+                    if command_id == &ack.command_id && outcome == &ProviderCommandOutcome::Accepted
+            )
+        })
+        .expect("private command reconstructs its Provider disposition");
+    let stop_index = replayed
+        .iter()
+        .position(|event| matches!(&event.payload, AgentEvent::StopRequested { .. }))
+        .expect("cancel effect remains replayable");
+    assert!(disposition_index < stop_index);
 }
 
 #[tokio::test]
