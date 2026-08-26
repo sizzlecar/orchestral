@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
@@ -635,6 +635,7 @@ struct ArtifactLoopModel {
 struct SkillRecoveryModel {
     rounds: AtomicUsize,
     digest: String,
+    round_two_messages: Arc<Mutex<Option<Vec<ModelMessage>>>>,
 }
 
 const RECOVERY_SKILL_INSTRUCTIONS: &str =
@@ -1352,6 +1353,10 @@ impl ModelBackend for SkillRecoveryModel {
             ])));
         }
 
+        *self
+            .round_two_messages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(request.messages.clone());
         assert!(request.messages.iter().any(|message| {
             message.content.iter().any(|content| {
                 matches!(content, ModelContent::Text { text }
@@ -4116,16 +4121,64 @@ enum SkillRecoveryState {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn observed_skill_activation_recovers_from_each_durable_session_boundary() {
+    let uninterrupted = run_uninterrupted_skill_activation().await;
     for state in [
         SkillRecoveryState::Fresh,
         SkillRecoveryState::ActivationCommitted,
         SkillRecoveryState::ExchangeCommitted,
     ] {
-        run_skill_recovery(state).await;
+        let recovered = run_skill_recovery(state).await;
+        assert_eq!(
+            recovered, uninterrupted,
+            "online and replayed Session projections must be identical"
+        );
     }
 }
 
-async fn run_skill_recovery(state: SkillRecoveryState) {
+async fn run_uninterrupted_skill_activation() -> Vec<ModelMessage> {
+    let skills = Arc::new(recovery_skill_runtime());
+    let round_two_messages = Arc::new(Mutex::new(None));
+    let model = Arc::new(SkillRecoveryModel {
+        rounds: AtomicUsize::new(0),
+        digest: skills.catalog().skills[0].digest.to_string(),
+        round_two_messages: round_two_messages.clone(),
+    });
+    let provider = Arc::new(
+        InternalGenericAgentProvider::new_with_skills_and_session_journal(
+            model,
+            GenericAgentConfig::new("internal-provider", "generic-agent"),
+            skills.clone(),
+            Arc::new(InMemoryAgentSessionJournalStore::default()),
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+        .expect("uninterrupted Skill-capable Generic Agent starts"),
+    );
+    let controller = Arc::new(
+        AgentController::new(provider, ProviderBindingRef::new("skill-recovery-binding"))
+            .expect("uninterrupted controller binds"),
+    );
+    let execution = controller
+        .start(bound_skill_recovery_run(
+            &skills,
+            AgentSessionId::new("skill-uninterrupted-session"),
+            RunId::new("skill-uninterrupted-run"),
+        ))
+        .await
+        .expect("uninterrupted Skill Run starts");
+    let view = controller
+        .wait_for_terminal(&execution.run_id)
+        .await
+        .expect("uninterrupted Skill Run terminates");
+    assert_eq!(view.state.status(), AgentRunStatus::Delivered);
+    let captured = round_two_messages
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .expect("uninterrupted second model request is captured");
+    captured
+}
+
+async fn run_skill_recovery(state: SkillRecoveryState) -> Vec<ModelMessage> {
     let suffix = match state {
         SkillRecoveryState::Fresh => "fresh",
         SkillRecoveryState::ActivationCommitted => "activation",
@@ -4144,6 +4197,7 @@ async fn run_skill_recovery(state: SkillRecoveryState) {
             Arc::new(SkillRecoveryModel {
                 rounds: AtomicUsize::new(0),
                 digest: digest.to_string(),
+                round_two_messages: Arc::new(Mutex::new(None)),
             }),
             config.clone(),
             skills.clone(),
@@ -4267,9 +4321,11 @@ async fn run_skill_recovery(state: SkillRecoveryState) {
     }
     checkpoint_store.allow_recovery_writes();
 
+    let round_two_messages = Arc::new(Mutex::new(None));
     let replacement_model = Arc::new(SkillRecoveryModel {
         rounds: AtomicUsize::new(1),
         digest: skills.catalog().skills[0].digest.to_string(),
+        round_two_messages: round_two_messages.clone(),
     });
     let replacement_provider = Arc::new(
         InternalGenericAgentProvider::new_with_skills_and_session_journal(
@@ -4325,6 +4381,12 @@ async fn run_skill_recovery(state: SkillRecoveryState) {
             .count(),
         1
     );
+    let captured = round_two_messages
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .expect("recovered second model request is captured");
+    captured
 }
 
 fn recovery_skill_runtime() -> SkillRuntime {

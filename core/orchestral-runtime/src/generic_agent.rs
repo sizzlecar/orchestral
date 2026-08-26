@@ -3108,6 +3108,17 @@ async fn project_model_messages(
         .map(|projection| projection.messages)
 }
 
+async fn project_committed_model_messages(
+    inner: &GenericInner,
+    request: &AgentStartRequest,
+    model_definitions: &[ModelToolDefinition],
+    run_skills: Option<&SkillRuntime>,
+) -> Result<Vec<ModelMessage>, AgentFailure> {
+    project_model_messages(inner, request, model_definitions, run_skills, None, None)
+        .await
+        .map_err(session_failure)
+}
+
 async fn execute_model_run(
     inner: Arc<GenericInner>,
     request: AgentStartRequest,
@@ -3565,7 +3576,6 @@ async fn execute_model_run(
                     };
 
                     let mut tool_results = Vec::with_capacity(parsed_calls.len());
-                    let mut activated_context_messages = Vec::new();
                     for (call, arguments) in parsed_calls {
                         if call.name == REQUEST_INPUT_TOOL_NAME {
                             let prompt = match parse_input_request(arguments) {
@@ -3632,9 +3642,6 @@ async fn execute_model_run(
                                     return;
                                 }
                             };
-                            if let Some(message) = observation.context_message {
-                                activated_context_messages.push(message);
-                            }
                             tool_results.push(ModelContent::ToolResult {
                                 call_id: call.call_id,
                                 result: observation.result,
@@ -3892,9 +3899,20 @@ async fn execute_model_run(
                         emit_failure(&inner, &request, &user_message, failure);
                         return;
                     }
-                    model_messages.extend(activated_context_messages);
-                    model_messages.push(assistant_message);
-                    model_messages.push(tool_message);
+                    model_messages = match project_committed_model_messages(
+                        &inner,
+                        &request,
+                        &model_tools,
+                        run_skills.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(messages) => messages,
+                        Err(failure) => {
+                            emit_failure(&inner, &request, &user_message, failure);
+                            return;
+                        }
+                    };
                     if let Err(failure) = commit_loop_boundary(
                         &inner,
                         &run_id,
@@ -3995,7 +4013,6 @@ async fn resume_observed_skill(
         .await;
         return;
     }
-    let activation_was_committed = recovered_observation.is_some();
     let skill_observation = if let Some(observation) = recovered_observation {
         observation
     } else {
@@ -4029,11 +4046,6 @@ async fn resume_observed_skill(
             }
         }
     };
-    if !activation_was_committed {
-        if let Some(context_message) = skill_observation.context_message.clone() {
-            model_messages.push(context_message);
-        }
-    }
     let (assistant_message, tool_message) = observed_tool_exchange_messages(
         &observation,
         &call,
@@ -4063,8 +4075,20 @@ async fn resume_observed_skill(
         emit_failure(&inner, &request, &user_message, failure);
         return;
     }
-    model_messages.push(assistant_message);
-    model_messages.push(tool_message);
+    model_messages = match project_committed_model_messages(
+        &inner,
+        &request,
+        &model_tools,
+        run_skills.as_deref(),
+    )
+    .await
+    {
+        Ok(messages) => messages,
+        Err(failure) => {
+            emit_failure(&inner, &request, &user_message, failure);
+            return;
+        }
+    };
     seed.next_model_round = round.saturating_add(1);
     if let Err(failure) = commit_loop_boundary(
         &inner,
@@ -4424,7 +4448,7 @@ async fn continue_observed_tool(
     request: AgentStartRequest,
     admission: AgentAdmission,
     user_message: ModelMessage,
-    mut model_messages: Vec<ModelMessage>,
+    _model_messages: Vec<ModelMessage>,
     model_tools: Vec<ModelToolDefinition>,
     run_skills: Option<Arc<SkillRuntime>>,
     mut seed: GenericExecutionSeed,
@@ -4507,8 +4531,20 @@ async fn continue_observed_tool(
         emit_failure(&inner, &request, &user_message, failure);
         return;
     }
-    model_messages.push(assistant_message);
-    model_messages.push(tool_message);
+    let model_messages = match project_committed_model_messages(
+        &inner,
+        &request,
+        &model_tools,
+        run_skills.as_deref(),
+    )
+    .await
+    {
+        Ok(messages) => messages,
+        Err(failure) => {
+            emit_failure(&inner, &request, &user_message, failure);
+            return;
+        }
+    };
     seed.next_model_round = round.saturating_add(1);
     if let Err(failure) = commit_loop_boundary(
         &inner,
@@ -4868,8 +4904,20 @@ async fn resume_observed_input(
             emit_failure(&inner, &request, &user_message, failure);
             return;
         }
-        model_messages.push(assistant_message);
-        model_messages.push(tool_message);
+        model_messages = match project_committed_model_messages(
+            &inner,
+            &request,
+            &model_tools,
+            run_skills.as_deref(),
+        )
+        .await
+        {
+            Ok(messages) => messages,
+            Err(failure) => {
+                emit_failure(&inner, &request, &user_message, failure);
+                return;
+            }
+        };
     }
     seed.next_model_round = round.saturating_add(1);
     if let Err(failure) = commit_loop_boundary(
