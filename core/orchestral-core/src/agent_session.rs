@@ -94,7 +94,7 @@ pub enum AgentSessionEvent {
     /// A Skill is context data, not a Tool exchange. Persisting the immutable
     /// package makes activation replay independent from a mutable filesystem.
     SkillActivated {
-        activation: SkillActivation,
+        activation: Box<SkillActivation>,
     },
     CompactionCommitted {
         source: SessionSourceRange,

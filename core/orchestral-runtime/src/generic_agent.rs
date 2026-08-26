@@ -2262,7 +2262,7 @@ async fn execute_skill_activation(
                     session_id: request.run.spec.session_id.clone(),
                     run_id: request.run.spec.run_id.clone(),
                     payload: AgentSessionEvent::SkillActivated {
-                        activation: activation.clone(),
+                        activation: Box::new(activation.clone()),
                     },
                 },
             )

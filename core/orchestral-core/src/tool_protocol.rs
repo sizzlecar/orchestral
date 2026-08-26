@@ -104,12 +104,13 @@ pub enum EffectScope {
 }
 
 /// Whether an invocation may proceed without a single-use Host capability.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ApprovalPolicy {
     NotRequired,
     Required,
+    #[default]
     Deny,
 }
 
@@ -132,12 +133,6 @@ impl ApprovalPolicy {
             }
         }
         rank(self) >= rank(ceiling)
-    }
-}
-
-impl Default for ApprovalPolicy {
-    fn default() -> Self {
-        Self::Deny
     }
 }
 
