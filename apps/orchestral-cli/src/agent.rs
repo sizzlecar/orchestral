@@ -41,10 +41,11 @@ use orchestral_runtime::tools::{
     GuardedFileReadExecutor,
 };
 use orchestral_runtime::{
-    AgentClient, AgentControlEvent, AgentController, AgentToolRuntime, GenericAgentConfig,
-    GuardedMcpServerConfig, GuardedToolRuntime, InMemoryBlobStore, InMemoryHostApprovalBroker,
-    InternalGenericAgentProvider, JsonSizeTokenMeter, McpToolsAdapterRegistry,
-    SkillActivationPolicy, SkillHostProfile, SkillRoot, SkillRuntime, ToolArtifactStore,
+    AgentClient, AgentControlEvent, AgentController, AgentToolRuntime, GenericAgentCheckpointStore,
+    GenericAgentConfig, GuardedMcpServerConfig, GuardedToolRuntime, InMemoryBlobStore,
+    InMemoryGenericAgentCheckpointStore, InMemoryHostApprovalBroker, InternalGenericAgentProvider,
+    JsonSizeTokenMeter, McpToolsAdapterRegistry, SkillActivationPolicy, SkillHostProfile,
+    SkillRoot, SkillRuntime, ToolArtifactStore,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
@@ -96,15 +97,17 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
     {
         agent_config.system_prompt = system_prompt;
     }
-    let (run_journal, session_journal, effect_journal): (
+    let (run_journal, session_journal, effect_journal, generic_checkpoint_journal): (
         Arc<dyn AgentJournalStore>,
         Arc<dyn AgentSessionJournalStore>,
         Arc<dyn ToolEffectJournalStore>,
+        Arc<dyn GenericAgentCheckpointStore>,
     ) = match config.journal.backend.as_str() {
         "memory" => (
             Arc::new(InMemoryAgentJournalStore::default()),
             Arc::new(InMemoryAgentSessionJournalStore::default()),
             Arc::new(InMemoryToolEffectJournalStore::default()),
+            Arc::new(InMemoryGenericAgentCheckpointStore::default()),
         ),
         "filesystem" | "fs" => {
             let root = config.journal.root_dir.as_str();
@@ -112,7 +115,7 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
                 FileAgentJournalStore::open(root)
                     .with_context(|| format!("open Agent Journal at '{root}'"))?,
             );
-            (store.clone(), store.clone(), store)
+            (store.clone(), store.clone(), store.clone(), store)
         }
         backend => bail!("unsupported Agent Journal backend for CLI: {backend}"),
     };
@@ -149,32 +152,33 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
     } else {
         build_cli_skill_runtime(&config, tool_runtime.as_ref(), mcp_registry.server_names())?
     };
-    let provider = Arc::new(
-        match skills.clone() {
-            Some(skills) => {
-                InternalGenericAgentProvider::new_with_tools_approval_skills_and_session_journal(
-                    model_backend,
-                    agent_config,
-                    tool_runtime,
-                    run_grant,
-                    approval_broker.clone(),
-                    skills,
-                    session_journal,
-                    Arc::new(JsonSizeTokenMeter::default()),
-                )
-            }
-            None => InternalGenericAgentProvider::new_with_tools_approval_and_session_journal(
+    let provider = match skills.clone() {
+        Some(skills) => {
+            InternalGenericAgentProvider::new_with_tools_approval_skills_and_session_journal(
                 model_backend,
                 agent_config,
                 tool_runtime,
                 run_grant,
                 approval_broker.clone(),
+                skills,
                 session_journal,
                 Arc::new(JsonSizeTokenMeter::default()),
-            ),
+            )
         }
-        .context("create Generic Agent provider")?,
-    );
+        None => InternalGenericAgentProvider::new_with_tools_approval_and_session_journal(
+            model_backend,
+            agent_config,
+            tool_runtime,
+            run_grant,
+            approval_broker.clone(),
+            session_journal,
+            Arc::new(JsonSizeTokenMeter::default()),
+        ),
+    }
+    .context("create Generic Agent provider")?
+    .with_checkpoint_store(generic_checkpoint_journal)
+    .context("bind Generic Agent private checkpoint journal")?;
+    let provider = Arc::new(provider);
     let controller = Arc::new(
         AgentController::with_journal_store(
             provider,
