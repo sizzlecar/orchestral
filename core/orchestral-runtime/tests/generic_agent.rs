@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -135,6 +135,19 @@ struct FailingCommandCheckpointStore {
     command_attempts: AtomicUsize,
 }
 
+#[derive(Default)]
+struct AckLostAfterInputOpenCheckpointStore {
+    inner: InMemoryGenericAgentCheckpointStore,
+    acknowledgement_lost: AtomicBool,
+    unavailable: AtomicBool,
+}
+
+impl AckLostAfterInputOpenCheckpointStore {
+    fn allow_recovery_writes(&self) {
+        self.unavailable.store(false, Ordering::SeqCst);
+    }
+}
+
 impl GenericAgentCheckpointStore for FailingProviderEventCheckpointStore {
     fn load_run(
         &self,
@@ -200,6 +213,51 @@ impl GenericAgentCheckpointStore for FailingCommandCheckpointStore {
             ));
         }
         self.inner.append(run_id, expected_previous, draft)
+    }
+}
+
+impl GenericAgentCheckpointStore for AckLostAfterInputOpenCheckpointStore {
+    fn load_run(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Option<StoredGenericAgentRun>, GenericCheckpointError> {
+        self.inner.load_run(run_id)
+    }
+
+    fn create_run(
+        &self,
+        registration: GenericAgentRunRegistration,
+    ) -> Result<CreateGenericRunOutcome, GenericCheckpointError> {
+        self.inner.create_run(registration)
+    }
+
+    fn append(
+        &self,
+        run_id: &RunId,
+        expected_previous: u64,
+        draft: GenericCheckpointDraft,
+    ) -> Result<AppendGenericCheckpointOutcome, GenericCheckpointError> {
+        if self.unavailable.load(Ordering::SeqCst) {
+            return Err(GenericCheckpointError::Unavailable(
+                "simulated Provider process loss after durable input request".to_owned(),
+            ));
+        }
+        let loses_acknowledgement = matches!(
+            &draft.payload,
+            GenericCheckpointEvent::ProviderEventsCommitted { events }
+                if events.iter().any(|event| {
+                    matches!(&event.payload, AgentEvent::RequestOpened { request }
+                        if matches!(&request.payload, PendingRequestPayload::Input { .. }))
+                })
+        );
+        let outcome = self.inner.append(run_id, expected_previous, draft)?;
+        if loses_acknowledgement && !self.acknowledgement_lost.swap(true, Ordering::SeqCst) {
+            self.unavailable.store(true, Ordering::SeqCst);
+            return Err(GenericCheckpointError::Unavailable(
+                "input RequestOpened commit acknowledgement was lost".to_owned(),
+            ));
+        }
+        Ok(outcome)
     }
 }
 
@@ -1686,6 +1744,183 @@ async fn observed_input_continuation_recovers_before_request_open() {
     .await
     .expect("recovered input continuation completes promptly")
     .expect("recovered input continuation reaches Delivery");
+    assert_eq!(view.state.status(), AgentRunStatus::Delivered);
+    assert_eq!(replacement_model.rounds.load(Ordering::SeqCst), 2);
+    let events = replacement_controller
+        .events(&run_id, 0)
+        .await
+        .expect("recovered Host Journal remains readable");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|record| matches!(&record.event.payload, AgentEvent::RequestOpened { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|record| matches!(&record.event.payload, AgentEvent::RequestResolved { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        checkpoint_store
+            .load_run(&run_id)
+            .expect("private WAL remains readable")
+            .expect("recovered Run remains registered")
+            .validate()
+            .expect("recovered WAL remains valid")
+            .phase,
+        GenericCheckpointPhase::Terminal
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opened_input_request_reattaches_without_duplicate_or_command_race() {
+    let run_id = RunId::new("opened-input-recovery-run");
+    let checkpoint_store = Arc::new(AckLostAfterInputOpenCheckpointStore::default());
+    let session_journal = Arc::new(InMemoryAgentSessionJournalStore::default());
+    let host_journal = Arc::new(InMemoryAgentJournalStore::default());
+    let config = GenericAgentConfig::new("internal-provider", "generic-agent");
+    let first_model = Arc::new(InputRequestModel {
+        rounds: AtomicUsize::new(0),
+    });
+    let first_provider = Arc::new(
+        InternalGenericAgentProvider::new_with_session_journal(
+            first_model.clone(),
+            config.clone(),
+            session_journal.clone(),
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+        .expect("first input-capable Generic Agent starts")
+        .with_checkpoint_store(checkpoint_store.clone())
+        .expect("private WAL binds before the Provider is shared"),
+    );
+    let first_controller = Arc::new(
+        AgentController::with_journal_store(
+            first_provider,
+            ProviderBindingRef::new("opened-input-recovery-binding"),
+            host_journal.clone(),
+        )
+        .expect("first controller binds"),
+    );
+    let execution = first_controller
+        .start(
+            AgentRunEnvelope::new(
+                AGENT_PROTOCOL_V1,
+                AgentSessionId::new("opened-input-recovery-session"),
+                run_id.clone(),
+                vec![Content::text("reattach the durably opened input request")],
+            )
+            .expect("valid input Run"),
+        )
+        .await
+        .expect("Run starts");
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        first_controller.wait_for_terminal(&execution.run_id),
+    )
+    .await
+    .expect("lost RequestOpened acknowledgement reaches the Host")
+    .expect_err("lost Provider continuity is not terminal");
+    assert!(matches!(
+        error,
+        AgentControlError::ContinuityUnknown(ref actual) if actual == &run_id
+    ));
+    let stored = checkpoint_store
+        .load_run(&run_id)
+        .expect("private WAL remains readable")
+        .expect("private Run remains registered");
+    let projection = stored.validate().expect("private WAL remains valid");
+    assert!(matches!(
+        projection.phase,
+        GenericCheckpointPhase::ModelAttemptObserved { round: 1, .. }
+    ));
+    assert_eq!(
+        projection
+            .provider_events
+            .iter()
+            .filter(|event| matches!(&event.payload, AgentEvent::RequestOpened { .. }))
+            .count(),
+        1
+    );
+    assert!(first_controller
+        .events(&run_id, 0)
+        .await
+        .expect("Host Journal remains readable")
+        .iter()
+        .all(|record| !matches!(&record.event.payload, AgentEvent::RequestOpened { .. })));
+    drop(first_controller);
+    checkpoint_store.allow_recovery_writes();
+
+    let replacement_model = Arc::new(InputRequestModel {
+        rounds: AtomicUsize::new(1),
+    });
+    let replacement_provider = Arc::new(
+        InternalGenericAgentProvider::new_with_session_journal(
+            replacement_model.clone(),
+            config,
+            session_journal,
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+        .expect("replacement Generic Agent starts")
+        .with_checkpoint_store(checkpoint_store.clone())
+        .expect("replacement Provider binds the same private WAL"),
+    );
+    let replacement_controller = Arc::new(
+        AgentController::with_journal_store(
+            replacement_provider,
+            ProviderBindingRef::new("opened-input-recovery-binding"),
+            host_journal,
+        )
+        .expect("replacement controller binds"),
+    );
+    replacement_controller
+        .recover(&run_id)
+        .await
+        .expect("durably opened input request is recoverable");
+    let pending = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let view = replacement_controller
+                .inspect(&run_id)
+                .await
+                .expect("recovered Run remains inspectable");
+            if let Some(request) = view.pending_requests.first() {
+                break request.clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("private RequestOpened is replayed to the Host");
+    let ack = replacement_controller
+        .command(
+            AgentCommandEnvelope::new(
+                CommandId::new("resolve-reattached-input"),
+                run_id.clone(),
+                Some(pending.request_id.clone()),
+                AgentCommand::ResolveRequest {
+                    response: RequestResolution::Input {
+                        content: vec![Content::text("Shanghai")],
+                    },
+                },
+            )
+            .expect("valid correlated input resolution"),
+        )
+        .await
+        .expect("reattached responder accepts the first immediate command");
+    assert!(matches!(
+        ack.state,
+        CommandAckState::Accepted { .. } | CommandAckState::Applied { .. }
+    ));
+    let view = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        replacement_controller.wait_for_terminal(&run_id),
+    )
+    .await
+    .expect("reattached input continuation completes promptly")
+    .expect("reattached input continuation reaches Delivery");
     assert_eq!(view.state.status(), AgentRunStatus::Delivered);
     assert_eq!(replacement_model.rounds.load(Ordering::SeqCst), 2);
     let events = replacement_controller

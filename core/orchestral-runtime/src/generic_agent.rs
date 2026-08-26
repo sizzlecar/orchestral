@@ -196,7 +196,7 @@ enum GenericRecoveryContinuation {
     ModelLoop {
         restore_initial_input: bool,
     },
-    FreshInput {
+    Input {
         round: u64,
         request_id: ModelRequestId,
         request_digest: Digest,
@@ -204,6 +204,8 @@ enum GenericRecoveryContinuation {
         call: GenericObservedToolCall,
         arguments: serde_json::Value,
         prompt: String,
+        request_open: bool,
+        response: Option<oneshot::Receiver<InputResponse>>,
     },
 }
 
@@ -1167,7 +1169,7 @@ impl AgentProvider for InternalGenericAgentProvider {
                 request_id,
                 request_digest,
                 observation,
-            } => stage_fresh_input_recovery(
+            } => stage_input_recovery(
                 self.inner.clone(),
                 stored,
                 boundary,
@@ -1234,7 +1236,7 @@ fn checkpoint_recovery_events(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn stage_fresh_input_recovery(
+fn stage_input_recovery(
     inner: Arc<GenericInner>,
     stored: StoredGenericAgentRun,
     boundary: GenericLoopBoundary,
@@ -1244,22 +1246,6 @@ fn stage_fresh_input_recovery(
     observation: GenericModelObservation,
     recovery_events: Vec<AgentEventDraft>,
 ) -> Result<AgentRecovery, AgentProtocolError> {
-    if recovery_events.iter().any(|event| {
-        matches!(
-            &event.payload,
-            AgentEvent::RequestOpened { .. } | AgentEvent::RequestResolved { .. }
-        )
-    }) {
-        return Err(AgentProtocolError::new(
-            AgentProtocolErrorCode::Unsupported,
-            "observed model recovery cannot yet reattach an interaction that was already opened",
-        )
-        .with_details(serde_json::json!({
-            "boundary": "observed_interaction_open",
-            "round": round,
-            "request_id": request_id,
-        })));
-    }
     if !matches!(
         observation.finish_reason,
         ModelFinishReason::ToolCalls | ModelFinishReason::Stop
@@ -1299,12 +1285,53 @@ fn stage_fresh_input_recovery(
     };
     let arguments = parse_tool_arguments(&pending_call).map_err(observed_recovery_error)?;
     let prompt = parse_input_request(arguments.clone()).map_err(observed_recovery_error)?;
+    let input_request_id = input_request_id(stored.registration.run_id(), round, &call.call_id);
+    let expected_request = PendingRequest {
+        request_id: input_request_id.clone(),
+        blocking: true,
+        payload: PendingRequestPayload::Input {
+            prompt: vec![Content::text(prompt.clone())],
+            input_schema: None,
+        },
+    };
+    let mut request_open = false;
+    for event in &recovery_events {
+        match &event.payload {
+            AgentEvent::RequestOpened { request } if request.request_id == input_request_id => {
+                if request_open || request != &expected_request {
+                    return Err(AgentProtocolError::new(
+                        AgentProtocolErrorCode::InvalidDigest,
+                        "recovered input request does not match its observed model call",
+                    ));
+                }
+                request_open = true;
+            }
+            AgentEvent::RequestResolved { request_id, .. } if request_id == &input_request_id => {
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::Unsupported,
+                    "observed input recovery cannot yet continue after RequestResolved",
+                )
+                .with_details(serde_json::json!({
+                    "boundary": "observed_input_resolved",
+                    "round": round,
+                    "request_id": request_id,
+                })));
+            }
+            AgentEvent::RequestOpened { .. } | AgentEvent::RequestResolved { .. } => {
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::InvalidDigest,
+                    "recovered interaction crossed the observed input request boundary",
+                ));
+            }
+            _ => {}
+        }
+    }
     stage_loop_recovery(
         inner,
         stored,
         boundary,
         recovery_events,
-        GenericRecoveryContinuation::FreshInput {
+        GenericRecoveryContinuation::Input {
             round,
             request_id,
             request_digest,
@@ -1312,6 +1339,8 @@ fn stage_fresh_input_recovery(
             call,
             arguments,
             prompt,
+            request_open,
+            response: None,
         },
     )
 }
@@ -1321,7 +1350,7 @@ fn stage_loop_recovery(
     stored: StoredGenericAgentRun,
     boundary: GenericLoopBoundary,
     recovery_events: Vec<AgentEventDraft>,
-    continuation: GenericRecoveryContinuation,
+    mut continuation: GenericRecoveryContinuation,
 ) -> Result<AgentRecovery, AgentProtocolError> {
     let checkpoint_seq = stored.last_checkpoint_seq();
     let registration = stored.registration;
@@ -1334,6 +1363,25 @@ fn stage_loop_recovery(
     let model_definitions = model_definitions_for_run(&inner, run_skills.is_some());
     let (commands, queued_steers) =
         reconstruct_recovery_commands(&stored.records, &recovery_events)?;
+    let mut pending_inputs = BTreeMap::new();
+    if let GenericRecoveryContinuation::Input {
+        round,
+        call,
+        request_open: true,
+        response,
+        ..
+    } = &mut continuation
+    {
+        let request_id = input_request_id(&run_id, *round, &call.call_id);
+        let (responder, receiver) = oneshot::channel();
+        pending_inputs.insert(
+            request_id,
+            PendingInput {
+                responder: Some(responder),
+            },
+        );
+        *response = Some(receiver);
+    }
     let published_resource_skips = recovery_events
         .iter()
         .filter_map(|event| match &event.payload {
@@ -1373,7 +1421,7 @@ fn stage_loop_recovery(
         commands,
         queued_steers,
         steer_signal,
-        pending_inputs: BTreeMap::new(),
+        pending_inputs,
         pending_approvals: BTreeMap::new(),
         checkpoint_seq,
     };
@@ -1396,7 +1444,7 @@ fn stage_loop_recovery(
         )
         .await
         .map_err(session_context_recovery_error)?;
-        if let GenericRecoveryContinuation::FreshInput {
+        if let GenericRecoveryContinuation::Input {
             round,
             request_id,
             request_digest,
@@ -1478,13 +1526,15 @@ fn stage_loop_recovery(
                     )
                     .await;
                 }
-                GenericRecoveryContinuation::FreshInput {
+                GenericRecoveryContinuation::Input {
                     round,
                     request_id,
                     observation,
                     call,
                     arguments,
                     prompt,
+                    request_open,
+                    response,
                     ..
                 } => {
                     resume_fresh_observed_input(
@@ -1504,6 +1554,8 @@ fn stage_loop_recovery(
                         call,
                         arguments,
                         prompt,
+                        request_open,
+                        response,
                     )
                     .await;
                 }
@@ -2582,6 +2634,8 @@ async fn resume_fresh_observed_input(
     call: GenericObservedToolCall,
     arguments: serde_json::Value,
     prompt: String,
+    request_open: bool,
+    response: Option<oneshot::Receiver<InputResponse>>,
 ) {
     let run_id = request.run.spec.run_id.clone();
     if let Some(usage) = observation.usage.clone() {
@@ -2603,16 +2657,28 @@ async fn resume_fresh_observed_input(
         role: ModelRole::Assistant,
         content: assistant_content,
     };
-    let result = match await_agent_input(
-        inner.clone(),
-        &run_id,
-        round,
-        &call.call_id,
-        prompt,
-        cancellation.clone(),
-    )
-    .await
-    {
+    let input = if request_open {
+        await_recovered_agent_input(
+            inner.clone(),
+            &run_id,
+            round,
+            &call.call_id,
+            response.expect("reattached input request owns a response channel"),
+            cancellation.clone(),
+        )
+        .await
+    } else {
+        await_agent_input(
+            inner.clone(),
+            &run_id,
+            round,
+            &call.call_id,
+            prompt,
+            cancellation.clone(),
+        )
+        .await
+    };
+    let result = match input {
         InputWaitOutcome::Resolved(result) => result,
         InputWaitOutcome::Cancelled => {
             emit_cancel(&inner, &request, &user_message);
@@ -2714,6 +2780,14 @@ enum InputWaitOutcome {
     Failed(AgentFailure),
 }
 
+fn input_request_id(run_id: &RunId, round: u64, model_call_id: &ModelToolCallId) -> RequestId {
+    RequestId::new(format!(
+        "input:{}:{round}:{}",
+        run_id.as_str(),
+        model_call_id.as_str()
+    ))
+}
+
 async fn await_agent_input(
     inner: Arc<GenericInner>,
     run_id: &RunId,
@@ -2722,11 +2796,7 @@ async fn await_agent_input(
     prompt: String,
     cancellation: CancellationToken,
 ) -> InputWaitOutcome {
-    let request_id = RequestId::new(format!(
-        "input:{}:{round}:{}",
-        run_id.as_str(),
-        model_call_id.as_str()
-    ));
+    let request_id = input_request_id(run_id, round, model_call_id);
     let (responder, response) = oneshot::channel();
     let registration = {
         let mut state = inner
@@ -2812,6 +2882,49 @@ async fn await_agent_input(
             ));
         }
     };
+    commit_input_response(&inner, run_id, round, model_call_id, request_id, response)
+}
+
+async fn await_recovered_agent_input(
+    inner: Arc<GenericInner>,
+    run_id: &RunId,
+    round: u64,
+    model_call_id: &ModelToolCallId,
+    response: oneshot::Receiver<InputResponse>,
+    cancellation: CancellationToken,
+) -> InputWaitOutcome {
+    let request_id = input_request_id(run_id, round, model_call_id);
+    let response = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => None,
+        response = response => Some(response),
+    };
+    let Some(response) = response else {
+        remove_pending_input(&inner, run_id, &request_id);
+        return InputWaitOutcome::Cancelled;
+    };
+    let response = match response {
+        Ok(response) => response,
+        Err(_) => {
+            remove_pending_input(&inner, run_id, &request_id);
+            return InputWaitOutcome::Failed(agent_failure(
+                "input_waiter_closed",
+                "recovered input response channel closed before resolution",
+                true,
+            ));
+        }
+    };
+    commit_input_response(&inner, run_id, round, model_call_id, request_id, response)
+}
+
+fn commit_input_response(
+    inner: &GenericInner,
+    run_id: &RunId,
+    round: u64,
+    model_call_id: &ModelToolCallId,
+    request_id: RequestId,
+    response: InputResponse,
+) -> InputWaitOutcome {
     let resolution_digest = match response.resolution.digest() {
         Ok(digest) => digest,
         Err(error) => {
@@ -2823,7 +2936,7 @@ async fn await_agent_input(
         }
     };
     if !publish_durable(
-        &inner,
+        inner,
         run_id,
         AgentEventDraft {
             event_id: AgentEventId::new(format!(
