@@ -42,10 +42,10 @@ use orchestral_runtime::tools::{
 };
 use orchestral_runtime::{
     AgentClient, AgentControlEvent, AgentController, AgentToolRuntime, GenericAgentCheckpointStore,
-    GenericAgentConfig, GuardedMcpServerConfig, GuardedToolRuntime, InMemoryBlobStore,
-    InMemoryGenericAgentCheckpointStore, InMemoryHostApprovalBroker, InternalGenericAgentProvider,
-    JsonSizeTokenMeter, McpToolsAdapterRegistry, SkillActivationPolicy, SkillHostProfile,
-    SkillRoot, SkillRuntime, ToolArtifactStore,
+    GenericAgentConfig, GuardedMcpServerConfig, GuardedMcpTransportConfig, GuardedToolRuntime,
+    InMemoryBlobStore, InMemoryGenericAgentCheckpointStore, InMemoryHostApprovalBroker,
+    InternalGenericAgentProvider, JsonSizeTokenMeter, McpToolsAdapterRegistry,
+    SkillActivationPolicy, SkillHostProfile, SkillRoot, SkillRuntime, ToolArtifactStore,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
@@ -290,7 +290,7 @@ fn build_cli_tool_runtime(
     allowed_programs.extend(
         mcp_configs
             .iter()
-            .map(|server| server.program.to_string_lossy().to_string()),
+            .flat_map(GuardedMcpServerConfig::allowed_programs),
     );
     let mut allowed_effects =
         BTreeSet::from([EffectScope::FilesystemRead, EffectScope::ArtifactRead]);
@@ -311,13 +311,13 @@ fn build_cli_tool_runtime(
     }
     if mcp_configs
         .iter()
-        .any(|server| !server.environment.is_empty())
+        .any(|server| !server.environment_names().is_empty())
     {
         allowed_effects.insert(EffectScope::SecretRead);
     }
     let allowed_environment = mcp_configs
         .iter()
-        .flat_map(|server| server.environment.keys().cloned())
+        .flat_map(GuardedMcpServerConfig::environment_names)
         .collect();
     let writable_roots = if shell_enabled || mcp_enabled {
         BTreeSet::from([workspace.clone()])
@@ -603,13 +603,15 @@ fn configured_mcp_servers(
         let server = GuardedMcpServerConfig {
             server_id: McpServerId::new(spec.name.trim()),
             required: spec.required,
-            program: PathBuf::from(program),
-            args: spec.args.clone(),
-            environment: spec
-                .env
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect(),
+            transport: GuardedMcpTransportConfig::Stdio {
+                program: PathBuf::from(program),
+                args: spec.args.clone(),
+                environment: spec
+                    .env
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            },
             startup_timeout: Duration::from_millis(spec.startup_timeout_ms.unwrap_or(15_000)),
             tool_timeout: Duration::from_millis(spec.tool_timeout_ms.unwrap_or(20_000)),
             enabled_tools: spec.enabled_tools.iter().cloned().collect(),

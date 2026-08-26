@@ -50,9 +50,7 @@ string_id!(McpServerId);
 #[non_exhaustive]
 pub enum McpTransportKind {
     Stdio,
-    /// Compatibility bridge only; it does not implement the current
-    /// per-request metadata, routing headers, or request-scoped SSE contract.
-    ExperimentalStatelessHttp,
+    StreamableHttp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

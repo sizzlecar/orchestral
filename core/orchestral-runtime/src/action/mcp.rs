@@ -26,17 +26,26 @@ use crate::tool_runtime::{
 
 const DEFAULT_MCP_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
-/// Host-resolved stdio MCP server configuration used by the new Agent path.
-/// Agent Foundation v1 intentionally exposes stdio Tools only.
+/// Host-resolved transport authority. Concrete transport details never enter
+/// the model-visible Tool schema.
+#[derive(Debug, Clone)]
+pub enum GuardedMcpTransportConfig {
+    Stdio {
+        /// Canonical absolute executable identity.
+        program: PathBuf,
+        args: Vec<String>,
+        /// Exact environment assignments; the inherited Host environment is cleared.
+        environment: BTreeMap<String, String>,
+    },
+}
+
+/// One explicitly configured MCP Tool provider. Discovery and invocation use
+/// the same immutable transport authority for the lifetime of this registry.
 #[derive(Debug, Clone)]
 pub struct GuardedMcpServerConfig {
     pub server_id: McpServerId,
     pub required: bool,
-    /// Canonical absolute executable identity.
-    pub program: PathBuf,
-    pub args: Vec<String>,
-    /// Exact environment assignments; the inherited Host environment is cleared.
-    pub environment: BTreeMap<String, String>,
+    pub transport: GuardedMcpTransportConfig,
     pub startup_timeout: Duration,
     pub tool_timeout: Duration,
     pub enabled_tools: BTreeSet<String>,
@@ -45,11 +54,7 @@ pub struct GuardedMcpServerConfig {
 
 impl GuardedMcpServerConfig {
     pub fn validate(&self) -> Result<(), McpToolsAdapterError> {
-        let canonical_program = self.program.canonicalize().ok();
         if self.server_id.is_empty()
-            || !self.program.is_absolute()
-            || !self.program.is_file()
-            || canonical_program.as_ref() != Some(&self.program)
             || self.startup_timeout.is_zero()
             || self.tool_timeout.is_zero()
             || self
@@ -57,14 +62,34 @@ impl GuardedMcpServerConfig {
                 .iter()
                 .chain(self.disabled_tools.iter())
                 .any(|name| name.trim().is_empty())
-            || self.environment.keys().any(|name| {
-                name.trim().is_empty() || name.contains('=') || name.chars().any(char::is_control)
-            })
         {
             return Err(McpToolsAdapterError::InvalidConfig(format!(
-                "invalid guarded MCP stdio configuration for '{}'",
+                "invalid guarded MCP configuration for '{}'",
                 self.server_id
             )));
+        }
+        match &self.transport {
+            GuardedMcpTransportConfig::Stdio {
+                program,
+                environment,
+                ..
+            } => {
+                let canonical_program = program.canonicalize().ok();
+                if !program.is_absolute()
+                    || !program.is_file()
+                    || canonical_program.as_ref() != Some(program)
+                    || environment.keys().any(|name| {
+                        name.trim().is_empty()
+                            || name.contains('=')
+                            || name.chars().any(char::is_control)
+                    })
+                {
+                    return Err(McpToolsAdapterError::InvalidConfig(format!(
+                        "invalid guarded MCP stdio transport for '{}'",
+                        self.server_id
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -76,16 +101,42 @@ impl GuardedMcpServerConfig {
     }
 
     pub fn effect_scopes(&self) -> BTreeSet<EffectScope> {
-        let mut scopes = BTreeSet::from([
-            EffectScope::Process,
-            EffectScope::FilesystemRead,
-            EffectScope::FilesystemWrite,
-            EffectScope::ExternalSideEffect,
-        ]);
-        if !self.environment.is_empty() {
-            scopes.insert(EffectScope::SecretRead);
+        match &self.transport {
+            GuardedMcpTransportConfig::Stdio { environment, .. } => {
+                let mut scopes = BTreeSet::from([
+                    EffectScope::Process,
+                    EffectScope::FilesystemRead,
+                    EffectScope::FilesystemWrite,
+                    EffectScope::ExternalSideEffect,
+                ]);
+                if !environment.is_empty() {
+                    scopes.insert(EffectScope::SecretRead);
+                }
+                scopes
+            }
         }
-        scopes
+    }
+
+    pub fn allowed_programs(&self) -> BTreeSet<String> {
+        match &self.transport {
+            GuardedMcpTransportConfig::Stdio { program, .. } => {
+                BTreeSet::from([program.to_string_lossy().to_string()])
+            }
+        }
+    }
+
+    pub fn environment_names(&self) -> BTreeSet<String> {
+        match &self.transport {
+            GuardedMcpTransportConfig::Stdio { environment, .. } => {
+                environment.keys().cloned().collect()
+            }
+        }
+    }
+
+    fn transport_kind(&self) -> McpTransportKind {
+        match &self.transport {
+            GuardedMcpTransportConfig::Stdio { .. } => McpTransportKind::Stdio,
+        }
     }
 }
 
@@ -118,11 +169,11 @@ impl McpServerHealth {
     }
 }
 
-/// Owns exactly one live stdio process for all Tools on one MCP server.
+/// Owns exactly one negotiated transport handle for all Tools on one MCP server.
 pub struct McpServerConnectionManager {
     config: GuardedMcpServerConfig,
     snapshot: McpServerSnapshot,
-    session: tokio::sync::Mutex<Option<StdioMcpSession>>,
+    session: tokio::sync::Mutex<Option<McpTransportSession>>,
     connection_generation: AtomicU64,
     health: AtomicU64,
 }
@@ -202,7 +253,7 @@ impl McpServerConnectionManager {
         }
         let request = {
             let session = guard.as_mut().expect("MCP session was initialized");
-            let request_id = session.next_id;
+            let request_id = session.next_request_id();
             enum Wait {
                 Response(Result<Value, String>),
                 Cancelled,
@@ -284,7 +335,7 @@ impl McpServerConnectionManager {
 async fn connect_guarded_mcp_session(
     config: &GuardedMcpServerConfig,
     cancellation: &CancellationToken,
-) -> Result<StdioMcpSession, McpToolsAdapterError> {
+) -> Result<McpTransportSession, McpToolsAdapterError> {
     let mut session = spawn_guarded_mcp_session(config).await?;
     let probe = tokio::select! {
         biased;
@@ -337,25 +388,29 @@ async fn connect_guarded_mcp_session(
 
 async fn spawn_guarded_mcp_session(
     config: &GuardedMcpServerConfig,
-) -> Result<StdioMcpSession, McpToolsAdapterError> {
-    let environment = config
-        .environment
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect::<HashMap<_, _>>();
-    StdioMcpSession::connect(
-        config.program.to_string_lossy().as_ref(),
-        &config.args,
-        &environment,
-    )
-    .await
-    .map_err(McpToolsAdapterError::Transport)
+) -> Result<McpTransportSession, McpToolsAdapterError> {
+    match &config.transport {
+        GuardedMcpTransportConfig::Stdio {
+            program,
+            args,
+            environment,
+        } => {
+            let environment = environment
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<HashMap<_, _>>();
+            StdioMcpSession::connect(program.to_string_lossy().as_ref(), args, &environment)
+                .await
+                .map(McpTransportSession::Stdio)
+                .map_err(McpToolsAdapterError::Transport)
+        }
+    }
 }
 
 async fn discover_guarded_mcp_session(
     config: &GuardedMcpServerConfig,
     cancellation: &CancellationToken,
-) -> Result<(StdioMcpSession, McpServerSnapshot), McpToolsAdapterError> {
+) -> Result<(McpTransportSession, McpServerSnapshot), McpToolsAdapterError> {
     let mut session = connect_guarded_mcp_session(config, cancellation).await?;
     let listed = tokio::select! {
         biased;
@@ -391,7 +446,7 @@ async fn discover_guarded_mcp_session(
     }
 }
 
-async fn list_all_mcp_tools(session: &mut StdioMcpSession) -> Result<Value, String> {
+async fn list_all_mcp_tools(session: &mut McpTransportSession) -> Result<Value, String> {
     const MAX_PAGES: usize = 256;
     let stateless = session
         .negotiated_protocol()
@@ -492,7 +547,7 @@ fn parse_guarded_tool_snapshot(
     }
     McpServerSnapshot::seal(
         config.server_id.clone(),
-        McpTransportKind::Stdio,
+        config.transport_kind(),
         negotiated.version.clone(),
         negotiated.era,
         snapshots,
@@ -500,9 +555,9 @@ fn parse_guarded_tool_snapshot(
     .map_err(|error| McpToolsAdapterError::Protocol(error.to_string()))
 }
 
-fn mcp_request_adapter_error(error: StdioMcpRequestError) -> McpToolsAdapterError {
+fn mcp_request_adapter_error(error: McpRequestError) -> McpToolsAdapterError {
     match error {
-        StdioMcpRequestError::Transport(message) => McpToolsAdapterError::Transport(message),
+        McpRequestError::Transport(message) => McpToolsAdapterError::Transport(message),
         error => McpToolsAdapterError::Protocol(error.to_string()),
     }
 }
@@ -540,16 +595,12 @@ impl McpToolsAdapterRegistry {
                     config.server_id
                 )));
             }
-            let program = config.program.to_string_lossy().to_string();
-            let environment = config.environment.keys().cloned().collect::<BTreeSet<_>>();
+            let programs = config.allowed_programs();
+            let environment = config.environment_names();
             if !config
                 .effect_scopes()
                 .is_subset(&restriction.bounds.allowed_effects)
-                || !restriction
-                    .bounds
-                    .process
-                    .allowed_programs
-                    .contains(&program)
+                || !programs.is_subset(&restriction.bounds.process.allowed_programs)
                 || !environment.is_subset(&restriction.bounds.environment.allowed_variables)
             {
                 return Err(McpToolsAdapterError::InvalidConfig(format!(
@@ -719,20 +770,14 @@ impl GuardedToolExecutor for GuardedMcpToolExecutor {
             };
         }
         let bounds = execution.effective_policy.bounds();
-        let program = self.manager.config.program.to_string_lossy().to_string();
-        let environment = self
-            .manager
-            .config
-            .environment
-            .keys()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        if !bounds.process.allowed_programs.contains(&program)
+        let programs = self.manager.config.allowed_programs();
+        let environment = self.manager.config.environment_names();
+        if !programs.is_subset(&bounds.process.allowed_programs)
             || !environment.is_subset(&bounds.environment.allowed_variables)
         {
             return ToolOutcome::Rejected {
                 code: "mcp_policy_rejected".to_owned(),
-                message: "MCP process or environment exceeds the effective Host policy".to_owned(),
+                message: "MCP transport exceeds the effective Host policy".to_owned(),
             };
         }
         // This watcher outlives a dropped executor future. GuardedToolRuntime
@@ -877,7 +922,7 @@ struct NegotiatedMcpProtocol {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum StdioMcpRequestError {
+enum McpRequestError {
     #[error("MCP JSON-RPC error {code}: {message}")]
     Rpc { code: i64, message: String },
     #[error("MCP transport error: {0}")]
@@ -886,7 +931,7 @@ enum StdioMcpRequestError {
     Protocol(String),
 }
 
-impl StdioMcpRequestError {
+impl McpRequestError {
     fn permits_legacy_fallback(&self) -> bool {
         matches!(
             self,
@@ -899,6 +944,54 @@ impl StdioMcpRequestError {
 
     fn is_transport(&self) -> bool {
         matches!(self, Self::Transport(_))
+    }
+}
+
+enum McpTransportSession {
+    Stdio(StdioMcpSession),
+}
+
+impl McpTransportSession {
+    fn next_request_id(&self) -> u64 {
+        match self {
+            Self::Stdio(session) => session.next_id,
+        }
+    }
+
+    async fn probe_stateless(&mut self) -> Result<bool, McpRequestError> {
+        match self {
+            Self::Stdio(session) => session.probe_stateless().await,
+        }
+    }
+
+    async fn initialize_guarded_legacy(&mut self) -> Result<(), McpRequestError> {
+        match self {
+            Self::Stdio(session) => session.initialize_guarded_legacy().await,
+        }
+    }
+
+    fn negotiated_protocol(&self) -> Result<&NegotiatedMcpProtocol, McpRequestError> {
+        match self {
+            Self::Stdio(session) => session.negotiated_protocol(),
+        }
+    }
+
+    async fn shutdown(&mut self) -> Result<(), String> {
+        match self {
+            Self::Stdio(session) => session.shutdown().await,
+        }
+    }
+
+    async fn notification(&mut self, method: &str, params: Value) -> Result<(), String> {
+        match self {
+            Self::Stdio(session) => session.notification(method, params).await,
+        }
+    }
+
+    async fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        match self {
+            Self::Stdio(session) => session.request(method, params).await,
+        }
     }
 }
 
@@ -954,7 +1047,7 @@ impl StdioMcpSession {
         })
     }
 
-    async fn probe_stateless(&mut self) -> Result<bool, StdioMcpRequestError> {
+    async fn probe_stateless(&mut self) -> Result<bool, McpRequestError> {
         let params = attach_stateless_request_metadata(json!({}))?;
         let result = match self.request_raw("server/discover", params).await {
             Ok(result) => result,
@@ -965,9 +1058,7 @@ impl StdioMcpSession {
             .get("supportedVersions")
             .and_then(Value::as_array)
             .ok_or_else(|| {
-                StdioMcpRequestError::Protocol(
-                    "server/discover omitted supportedVersions".to_owned(),
-                )
+                McpRequestError::Protocol("server/discover omitted supportedVersions".to_owned())
             })?;
         if !versions
             .iter()
@@ -981,7 +1072,7 @@ impl StdioMcpSession {
             .and_then(Value::as_object)
             .is_none()
         {
-            return Err(StdioMcpRequestError::Protocol(
+            return Err(McpRequestError::Protocol(
                 "MCP server does not advertise the tools capability".to_owned(),
             ));
         }
@@ -992,7 +1083,7 @@ impl StdioMcpSession {
         Ok(true)
     }
 
-    async fn initialize_guarded_legacy(&mut self) -> Result<(), StdioMcpRequestError> {
+    async fn initialize_guarded_legacy(&mut self) -> Result<(), McpRequestError> {
         let params = json!({
             "protocolVersion": MCP_LATEST_LEGACY_PROTOCOL,
             "capabilities": {},
@@ -1006,13 +1097,13 @@ impl StdioMcpSession {
             .get("protocolVersion")
             .and_then(Value::as_str)
             .ok_or_else(|| {
-                StdioMcpRequestError::Protocol(
+                McpRequestError::Protocol(
                     "legacy initialize response omitted protocolVersion".to_owned(),
                 )
             })?;
         const SUPPORTED_LEGACY: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
         if !SUPPORTED_LEGACY.contains(&version) {
-            return Err(StdioMcpRequestError::Protocol(format!(
+            return Err(McpRequestError::Protocol(format!(
                 "server selected unsupported legacy MCP version '{version}'"
             )));
         }
@@ -1022,7 +1113,7 @@ impl StdioMcpSession {
             .and_then(Value::as_object)
             .is_none()
         {
-            return Err(StdioMcpRequestError::Protocol(
+            return Err(McpRequestError::Protocol(
                 "legacy MCP server does not advertise the tools capability".to_owned(),
             ));
         }
@@ -1032,13 +1123,13 @@ impl StdioMcpSession {
         });
         self.notification("notifications/initialized", json!({}))
             .await
-            .map_err(StdioMcpRequestError::Transport)
+            .map_err(McpRequestError::Transport)
     }
 
-    fn negotiated_protocol(&self) -> Result<&NegotiatedMcpProtocol, StdioMcpRequestError> {
-        self.negotiated.as_ref().ok_or_else(|| {
-            StdioMcpRequestError::Protocol("MCP transport was not negotiated".to_owned())
-        })
+    fn negotiated_protocol(&self) -> Result<&NegotiatedMcpProtocol, McpRequestError> {
+        self.negotiated
+            .as_ref()
+            .ok_or_else(|| McpRequestError::Protocol("MCP transport was not negotiated".to_owned()))
     }
 
     async fn shutdown(&mut self) -> Result<(), String> {
@@ -1067,11 +1158,7 @@ impl StdioMcpSession {
             .map_err(|error| error.to_string())
     }
 
-    async fn request_raw(
-        &mut self,
-        method: &str,
-        params: Value,
-    ) -> Result<Value, StdioMcpRequestError> {
+    async fn request_raw(&mut self, method: &str, params: Value) -> Result<Value, McpRequestError> {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         let payload = json!({
@@ -1082,13 +1169,13 @@ impl StdioMcpSession {
         });
         self.write_frame(&payload)
             .await
-            .map_err(StdioMcpRequestError::Transport)?;
+            .map_err(McpRequestError::Transport)?;
 
         loop {
             let msg = self
                 .read_frame()
                 .await
-                .map_err(StdioMcpRequestError::Transport)?;
+                .map_err(McpRequestError::Transport)?;
             let matched = msg
                 .get("id")
                 .and_then(Value::as_u64)
@@ -1096,13 +1183,13 @@ impl StdioMcpSession {
                 .unwrap_or(false);
             if !matched {
                 if msg.get("id").is_some() && msg.get("method").is_some() {
-                    return Err(StdioMcpRequestError::Protocol(
+                    return Err(McpRequestError::Protocol(
                         "MCP server initiated a request without a negotiated client capability"
                             .to_owned(),
                     ));
                 }
                 if msg.get("id").is_some() {
-                    return Err(StdioMcpRequestError::Protocol(format!(
+                    return Err(McpRequestError::Protocol(format!(
                         "MCP server returned an unexpected response id while waiting for {id}"
                     )));
                 }
@@ -1110,7 +1197,7 @@ impl StdioMcpSession {
             }
 
             if let Some(error) = msg.get("error") {
-                return Err(StdioMcpRequestError::Rpc {
+                return Err(McpRequestError::Rpc {
                     code: error.get("code").and_then(Value::as_i64).unwrap_or(-32000),
                     message: error
                         .get("message")
@@ -1222,12 +1309,12 @@ impl StdioMcpSession {
     }
 }
 
-fn attach_stateless_request_metadata(mut params: Value) -> Result<Value, StdioMcpRequestError> {
+fn attach_stateless_request_metadata(mut params: Value) -> Result<Value, McpRequestError> {
     let object = params.as_object_mut().ok_or_else(|| {
-        StdioMcpRequestError::Protocol("MCP request params must be an object".to_owned())
+        McpRequestError::Protocol("MCP request params must be an object".to_owned())
     })?;
     if object.contains_key("_meta") {
-        return Err(StdioMcpRequestError::Protocol(
+        return Err(McpRequestError::Protocol(
             "MCP caller cannot override Host request metadata".to_owned(),
         ));
     }
