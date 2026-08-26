@@ -1,0 +1,1461 @@
+use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use futures_util::stream;
+use orchestral_core::{
+    agent_protocol::{
+        reference::AgentRunStatus,
+        spi::AgentProvider,
+        wire::{
+            AgentCommand, AgentCommandEnvelope, AgentEvent, AgentRunEnvelope, AgentSessionId,
+            AgentTelemetry, ApprovalDecision, CommandAckState, CommandId, Content, ContentBody,
+            PendingRequestKind, ProviderBindingRef, RequestResolution, RunId,
+        },
+        AGENT_PROTOCOL_V1,
+    },
+    agent_session::{
+        AgentSessionEvent, AgentSessionJournalStore, InMemoryAgentSessionJournalStore,
+    },
+    executor::Executor,
+    model_protocol::{
+        ModelBackend, ModelCapabilities, ModelContent, ModelDescriptor, ModelError, ModelEvent,
+        ModelEventId, ModelFinishReason, ModelRequest, ModelRole, ModelStream, ModelStreamEvent,
+        ModelToolCallId,
+    },
+    normalizer::PlanNormalizer,
+    tool_effect::InMemoryToolEffectJournalStore,
+    tool_protocol::{
+        ApprovalPolicy, EffectScope, HostApprovalVerifier, HostToolPolicy,
+        InMemoryApprovalCapabilityStore, ModelToolSchema, RunToolGrant, ToolConcurrency,
+        ToolDescriptor, ToolId, ToolIdempotency, ToolOutcome, ToolPolicyBounds, ToolRestriction,
+    },
+};
+use orchestral_runtime::{
+    api::AgentApi, AgentClient, AgentControlEvent, AgentController, GenericAgentConfig,
+    GuardedToolExecution, GuardedToolExecutor, GuardedToolRuntime, InMemoryBlobStore,
+    InMemoryHostApprovalBroker, InternalGenericAgentProvider, JsonSizeTokenMeter,
+    ToolArtifactStore, WorkflowExecutionStrategy,
+};
+use serde_json::json;
+use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
+
+struct ScriptedModel;
+
+struct BlockingModel;
+
+struct ToolLoopModel {
+    rounds: AtomicUsize,
+}
+
+struct ArtifactLoopModel {
+    rounds: AtomicUsize,
+    large_value: String,
+}
+
+struct ApprovalLoopModel {
+    rounds: AtomicUsize,
+    expect_allowed: bool,
+}
+
+struct EchoTool {
+    calls: AtomicUsize,
+}
+
+struct LargeResultTool {
+    value: String,
+}
+
+struct RestartSessionModel {
+    response: &'static str,
+    expect_prior_turn: bool,
+}
+
+struct WorkflowLoopModel {
+    rounds: AtomicUsize,
+}
+
+struct GatedWorkflowEcho {
+    calls: AtomicUsize,
+    first_started: Notify,
+    release_first: Notify,
+}
+
+#[async_trait]
+impl ModelBackend for ScriptedModel {
+    fn descriptor(&self) -> ModelDescriptor {
+        ModelDescriptor {
+            backend_id: "scripted-model".to_owned(),
+            capabilities: ModelCapabilities {
+                streaming: true,
+                ..ModelCapabilities::default()
+            },
+            extensions: Default::default(),
+        }
+    }
+
+    async fn start(
+        &self,
+        request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelStream, ModelError> {
+        request.validate()?;
+        let request_id = request.request_id;
+        Ok(Box::pin(stream::iter([
+            Ok(ModelStreamEvent {
+                request_id: request_id.clone(),
+                event_id: ModelEventId::new("scripted-delta"),
+                sequence: 1,
+                payload: ModelEvent::TextDelta {
+                    delta: "hello from the neutral model".to_owned(),
+                },
+            }),
+            Ok(ModelStreamEvent {
+                request_id,
+                event_id: ModelEventId::new("scripted-finish"),
+                sequence: 2,
+                payload: ModelEvent::Finish {
+                    reason: ModelFinishReason::Stop,
+                },
+            }),
+        ])))
+    }
+}
+
+#[async_trait]
+impl ModelBackend for BlockingModel {
+    fn descriptor(&self) -> ModelDescriptor {
+        ModelDescriptor {
+            backend_id: "blocking-model".to_owned(),
+            capabilities: ModelCapabilities {
+                streaming: true,
+                ..ModelCapabilities::default()
+            },
+            extensions: Default::default(),
+        }
+    }
+
+    async fn start(
+        &self,
+        request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelStream, ModelError> {
+        request.validate()?;
+        Ok(Box::pin(stream::pending()))
+    }
+}
+
+#[async_trait]
+impl ModelBackend for ToolLoopModel {
+    fn descriptor(&self) -> ModelDescriptor {
+        ModelDescriptor {
+            backend_id: "tool-loop-model".to_owned(),
+            capabilities: ModelCapabilities {
+                streaming: true,
+                tool_calls: true,
+                ..ModelCapabilities::default()
+            },
+            extensions: Default::default(),
+        }
+    }
+
+    async fn start(
+        &self,
+        request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelStream, ModelError> {
+        request.validate()?;
+        assert_eq!(request.tools.len(), 1);
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        let request_id = request.request_id;
+        if round == 0 {
+            return Ok(Box::pin(stream::iter([
+                Ok(ModelStreamEvent {
+                    request_id: request_id.clone(),
+                    event_id: ModelEventId::new("tool-start"),
+                    sequence: 1,
+                    payload: ModelEvent::ToolCallStart {
+                        call_id: ModelToolCallId::new("echo-call"),
+                        name: "echo".to_owned(),
+                    },
+                }),
+                Ok(ModelStreamEvent {
+                    request_id: request_id.clone(),
+                    event_id: ModelEventId::new("tool-arguments"),
+                    sequence: 2,
+                    payload: ModelEvent::ToolCallArgumentsDelta {
+                        call_id: ModelToolCallId::new("echo-call"),
+                        delta: r#"{"value":"hello"}"#.to_owned(),
+                    },
+                }),
+                Ok(ModelStreamEvent {
+                    request_id: request_id.clone(),
+                    event_id: ModelEventId::new("tool-end"),
+                    sequence: 3,
+                    payload: ModelEvent::ToolCallEnd {
+                        call_id: ModelToolCallId::new("echo-call"),
+                    },
+                }),
+                Ok(ModelStreamEvent {
+                    request_id,
+                    event_id: ModelEventId::new("tool-finish"),
+                    sequence: 4,
+                    payload: ModelEvent::Finish {
+                        reason: ModelFinishReason::ToolCalls,
+                    },
+                }),
+            ])));
+        }
+
+        assert!(request.messages.iter().any(|message| {
+            message.role == ModelRole::Tool
+                && message.content.iter().any(|content| {
+                    matches!(
+                        content,
+                        ModelContent::ToolResult {
+                            call_id,
+                            result,
+                            is_error: false,
+                        } if call_id.as_str() == "echo-call"
+                            && result == &json!({ "result": "hello" })
+                    )
+                })
+        }));
+        Ok(Box::pin(stream::iter([
+            Ok(ModelStreamEvent {
+                request_id: request_id.clone(),
+                event_id: ModelEventId::new("answer-delta"),
+                sequence: 1,
+                payload: ModelEvent::TextDelta {
+                    delta: "tool said hello".to_owned(),
+                },
+            }),
+            Ok(ModelStreamEvent {
+                request_id,
+                event_id: ModelEventId::new("answer-finish"),
+                sequence: 2,
+                payload: ModelEvent::Finish {
+                    reason: ModelFinishReason::Stop,
+                },
+            }),
+        ])))
+    }
+}
+
+#[async_trait]
+impl ModelBackend for ArtifactLoopModel {
+    fn descriptor(&self) -> ModelDescriptor {
+        ModelDescriptor {
+            backend_id: "artifact-loop-model".to_owned(),
+            capabilities: ModelCapabilities {
+                streaming: true,
+                tool_calls: true,
+                max_context_tokens: Some(16_384),
+                ..ModelCapabilities::default()
+            },
+            extensions: Default::default(),
+        }
+    }
+
+    async fn start(
+        &self,
+        request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelStream, ModelError> {
+        request.validate()?;
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        let request_id = request.request_id;
+        if round == 0 {
+            let arguments = json!({ "value": "seed" }).to_string();
+            return Ok(Box::pin(stream::iter([
+                Ok(ModelStreamEvent {
+                    request_id: request_id.clone(),
+                    event_id: ModelEventId::new("artifact-tool-start"),
+                    sequence: 1,
+                    payload: ModelEvent::ToolCallStart {
+                        call_id: ModelToolCallId::new("artifact-echo-call"),
+                        name: "echo".to_owned(),
+                    },
+                }),
+                Ok(ModelStreamEvent {
+                    request_id: request_id.clone(),
+                    event_id: ModelEventId::new("artifact-tool-arguments"),
+                    sequence: 2,
+                    payload: ModelEvent::ToolCallArgumentsDelta {
+                        call_id: ModelToolCallId::new("artifact-echo-call"),
+                        delta: arguments,
+                    },
+                }),
+                Ok(ModelStreamEvent {
+                    request_id: request_id.clone(),
+                    event_id: ModelEventId::new("artifact-tool-end"),
+                    sequence: 3,
+                    payload: ModelEvent::ToolCallEnd {
+                        call_id: ModelToolCallId::new("artifact-echo-call"),
+                    },
+                }),
+                Ok(ModelStreamEvent {
+                    request_id,
+                    event_id: ModelEventId::new("artifact-tool-finish"),
+                    sequence: 4,
+                    payload: ModelEvent::Finish {
+                        reason: ModelFinishReason::ToolCalls,
+                    },
+                }),
+            ])));
+        }
+
+        let serialized = serde_json::to_string(&request.messages).unwrap();
+        assert!(!serialized.contains(&self.large_value));
+        assert!(request.messages.iter().any(|message| {
+            message.role == ModelRole::Tool
+                && message.content.iter().any(|content| {
+                    matches!(
+                        content,
+                        ModelContent::ToolResult {
+                            call_id,
+                            result,
+                            is_error: false,
+                        } if call_id.as_str() == "artifact-echo-call"
+                            && result["kind"] == json!("artifact")
+                            && result["artifact"]["artifact_ref"].as_str().is_some()
+                            && result["artifact"]["digest"]
+                                .as_str()
+                                .is_some_and(|digest| digest.len() == 64)
+                            && result["summary"].as_str().is_some()
+                    )
+                })
+        }));
+        Ok(Box::pin(stream::iter([
+            Ok(ModelStreamEvent {
+                request_id: request_id.clone(),
+                event_id: ModelEventId::new("artifact-answer"),
+                sequence: 1,
+                payload: ModelEvent::TextDelta {
+                    delta: "artifact reference observed".to_owned(),
+                },
+            }),
+            Ok(ModelStreamEvent {
+                request_id,
+                event_id: ModelEventId::new("artifact-answer-finish"),
+                sequence: 2,
+                payload: ModelEvent::Finish {
+                    reason: ModelFinishReason::Stop,
+                },
+            }),
+        ])))
+    }
+}
+
+#[async_trait]
+impl ModelBackend for ApprovalLoopModel {
+    fn descriptor(&self) -> ModelDescriptor {
+        ModelDescriptor {
+            backend_id: "approval-loop-model".to_owned(),
+            capabilities: ModelCapabilities {
+                streaming: true,
+                tool_calls: true,
+                ..ModelCapabilities::default()
+            },
+            extensions: Default::default(),
+        }
+    }
+
+    async fn start(
+        &self,
+        request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelStream, ModelError> {
+        request.validate()?;
+        assert_eq!(request.tools.len(), 1);
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        let request_id = request.request_id;
+        if round == 0 {
+            return Ok(Box::pin(stream::iter([
+                Ok(ModelStreamEvent {
+                    request_id: request_id.clone(),
+                    event_id: ModelEventId::new("approval-tool-start"),
+                    sequence: 1,
+                    payload: ModelEvent::ToolCallStart {
+                        call_id: ModelToolCallId::new("approval-echo-call"),
+                        name: "echo".to_owned(),
+                    },
+                }),
+                Ok(ModelStreamEvent {
+                    request_id: request_id.clone(),
+                    event_id: ModelEventId::new("approval-tool-arguments"),
+                    sequence: 2,
+                    payload: ModelEvent::ToolCallArgumentsDelta {
+                        call_id: ModelToolCallId::new("approval-echo-call"),
+                        delta: r#"{"value":"approved value"}"#.to_owned(),
+                    },
+                }),
+                Ok(ModelStreamEvent {
+                    request_id: request_id.clone(),
+                    event_id: ModelEventId::new("approval-tool-end"),
+                    sequence: 3,
+                    payload: ModelEvent::ToolCallEnd {
+                        call_id: ModelToolCallId::new("approval-echo-call"),
+                    },
+                }),
+                Ok(ModelStreamEvent {
+                    request_id,
+                    event_id: ModelEventId::new("approval-tool-finish"),
+                    sequence: 4,
+                    payload: ModelEvent::Finish {
+                        reason: ModelFinishReason::ToolCalls,
+                    },
+                }),
+            ])));
+        }
+
+        assert!(request.messages.iter().any(|message| {
+            message.role == ModelRole::Tool
+                && message.content.iter().any(|content| match content {
+                    ModelContent::ToolResult {
+                        call_id,
+                        result,
+                        is_error,
+                    } if call_id.as_str() == "approval-echo-call" => {
+                        if self.expect_allowed {
+                            !*is_error && result == &json!({ "result": "approved value" })
+                        } else {
+                            *is_error
+                                && result["status"] == json!("rejected")
+                                && result["code"] == json!("approval_denied")
+                        }
+                    }
+                    _ => false,
+                })
+        }));
+        Ok(Box::pin(stream::iter([
+            Ok(ModelStreamEvent {
+                request_id: request_id.clone(),
+                event_id: ModelEventId::new("approval-answer"),
+                sequence: 1,
+                payload: ModelEvent::TextDelta {
+                    delta: if self.expect_allowed {
+                        "approved tool completed"
+                    } else {
+                        "tool approval denied"
+                    }
+                    .to_owned(),
+                },
+            }),
+            Ok(ModelStreamEvent {
+                request_id,
+                event_id: ModelEventId::new("approval-answer-finish"),
+                sequence: 2,
+                payload: ModelEvent::Finish {
+                    reason: ModelFinishReason::Stop,
+                },
+            }),
+        ])))
+    }
+}
+
+#[async_trait]
+impl GuardedToolExecutor for EchoTool {
+    async fn execute(&self, execution: GuardedToolExecution) -> ToolOutcome {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        ToolOutcome::Completed {
+            output: json!({ "result": execution.invocation.arguments["value"].clone() }).into(),
+        }
+    }
+}
+
+#[async_trait]
+impl GuardedToolExecutor for LargeResultTool {
+    async fn execute(&self, _execution: GuardedToolExecution) -> ToolOutcome {
+        ToolOutcome::Completed {
+            output: json!({ "result": self.value }).into(),
+        }
+    }
+}
+
+#[async_trait]
+impl GuardedToolExecutor for GatedWorkflowEcho {
+    async fn execute(&self, execution: GuardedToolExecution) -> ToolOutcome {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
+            self.first_started.notify_one();
+            self.release_first.notified().await;
+        }
+        ToolOutcome::Completed {
+            output: json!({ "result": execution.invocation.arguments["value"].clone() }).into(),
+        }
+    }
+}
+
+#[async_trait]
+impl ModelBackend for WorkflowLoopModel {
+    fn descriptor(&self) -> ModelDescriptor {
+        ModelDescriptor {
+            backend_id: "workflow-loop-model".to_owned(),
+            capabilities: ModelCapabilities {
+                streaming: true,
+                tool_calls: true,
+                ..ModelCapabilities::default()
+            },
+            extensions: Default::default(),
+        }
+    }
+
+    async fn start(
+        &self,
+        request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelStream, ModelError> {
+        request.validate()?;
+        assert!(request.tools.iter().any(|tool| tool.name == "echo"));
+        assert!(request
+            .tools
+            .iter()
+            .any(|tool| tool.name == "orchestral_workflow"));
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        let request_id = request.request_id;
+        if round == 0 {
+            let arguments = json!({
+                "plan": {
+                    "goal": "run two ordered echoes",
+                    "steps": [
+                        {
+                            "id": "first",
+                            "action": "echo",
+                            "kind": "action",
+                            "depends_on": [],
+                            "exports": ["result"],
+                            "params": { "value": "first" }
+                        },
+                        {
+                            "id": "second",
+                            "action": "echo",
+                            "kind": "action",
+                            "depends_on": ["first"],
+                            "exports": ["result"],
+                            "params": { "value": "second" }
+                        }
+                    ]
+                }
+            })
+            .to_string();
+            return Ok(Box::pin(stream::iter([
+                Ok(ModelStreamEvent {
+                    request_id: request_id.clone(),
+                    event_id: ModelEventId::new("workflow-start"),
+                    sequence: 1,
+                    payload: ModelEvent::ToolCallStart {
+                        call_id: ModelToolCallId::new("workflow-call"),
+                        name: "orchestral_workflow".to_owned(),
+                    },
+                }),
+                Ok(ModelStreamEvent {
+                    request_id: request_id.clone(),
+                    event_id: ModelEventId::new("workflow-arguments"),
+                    sequence: 2,
+                    payload: ModelEvent::ToolCallArgumentsDelta {
+                        call_id: ModelToolCallId::new("workflow-call"),
+                        delta: arguments,
+                    },
+                }),
+                Ok(ModelStreamEvent {
+                    request_id: request_id.clone(),
+                    event_id: ModelEventId::new("workflow-end"),
+                    sequence: 3,
+                    payload: ModelEvent::ToolCallEnd {
+                        call_id: ModelToolCallId::new("workflow-call"),
+                    },
+                }),
+                Ok(ModelStreamEvent {
+                    request_id,
+                    event_id: ModelEventId::new("workflow-finish"),
+                    sequence: 4,
+                    payload: ModelEvent::Finish {
+                        reason: ModelFinishReason::ToolCalls,
+                    },
+                }),
+            ])));
+        }
+
+        assert!(request.messages.iter().any(|message| {
+            message.role == ModelRole::Tool
+                && message.content.iter().any(|content| {
+                    matches!(
+                        content,
+                        ModelContent::ToolResult {
+                            call_id,
+                            result,
+                            is_error: false,
+                        } if call_id.as_str() == "workflow-call"
+                            && result["status"] == json!("completed")
+                            && result["tool_calls"] == json!(2)
+                            && result["working_set"]["result"] == json!("second")
+                    )
+                })
+        }));
+        Ok(Box::pin(stream::iter([
+            Ok(ModelStreamEvent {
+                request_id: request_id.clone(),
+                event_id: ModelEventId::new("workflow-answer"),
+                sequence: 1,
+                payload: ModelEvent::TextDelta {
+                    delta: "workflow complete".to_owned(),
+                },
+            }),
+            Ok(ModelStreamEvent {
+                request_id,
+                event_id: ModelEventId::new("workflow-answer-finish"),
+                sequence: 2,
+                payload: ModelEvent::Finish {
+                    reason: ModelFinishReason::Stop,
+                },
+            }),
+        ])))
+    }
+}
+
+#[async_trait]
+impl ModelBackend for RestartSessionModel {
+    fn descriptor(&self) -> ModelDescriptor {
+        ModelDescriptor {
+            backend_id: "restart-session-model".to_owned(),
+            capabilities: ModelCapabilities {
+                streaming: true,
+                max_context_tokens: Some(16_384),
+                ..ModelCapabilities::default()
+            },
+            extensions: Default::default(),
+        }
+    }
+
+    async fn start(
+        &self,
+        request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelStream, ModelError> {
+        request.validate()?;
+        let serialized = serde_json::to_string(&request.messages).unwrap();
+        if self.expect_prior_turn {
+            assert!(serialized.contains("first question"));
+            assert!(serialized.contains("first answer"));
+            assert!(serialized.contains("second question"));
+        } else {
+            assert!(!serialized.contains("first answer"));
+        }
+        let request_id = request.request_id;
+        Ok(Box::pin(stream::iter([
+            Ok(ModelStreamEvent {
+                request_id: request_id.clone(),
+                event_id: ModelEventId::new("restart-answer"),
+                sequence: 1,
+                payload: ModelEvent::TextDelta {
+                    delta: self.response.to_owned(),
+                },
+            }),
+            Ok(ModelStreamEvent {
+                request_id,
+                event_id: ModelEventId::new("restart-finish"),
+                sequence: 2,
+                payload: ModelEvent::Finish {
+                    reason: ModelFinishReason::Stop,
+                },
+            }),
+        ])))
+    }
+}
+
+#[tokio::test]
+async fn neutral_model_stream_becomes_an_inspectable_agent_delivery() {
+    let provider = Arc::new(
+        InternalGenericAgentProvider::new(
+            Arc::new(ScriptedModel),
+            GenericAgentConfig::new("internal-provider", "generic-agent"),
+        )
+        .expect("Generic Agent accepts the neutral backend"),
+    );
+    let controller = Arc::new(
+        AgentController::new(provider, ProviderBindingRef::new("generic-binding"))
+            .expect("controller binds the Generic Agent"),
+    );
+    let run = AgentRunEnvelope::new(
+        AGENT_PROTOCOL_V1,
+        AgentSessionId::new("generic-session"),
+        RunId::new("generic-run"),
+        vec![Content::text("say hello")],
+    )
+    .expect("valid text Run");
+
+    let execution = controller.start(run).await.expect("Run starts");
+    let view = controller
+        .wait_for_terminal(&execution.run_id)
+        .await
+        .expect("Run reaches a terminal delivery");
+    let journal = controller
+        .events(&execution.run_id, 0)
+        .await
+        .expect("Run journal remains readable");
+
+    assert_eq!(view.state.status(), AgentRunStatus::Delivered);
+    assert_eq!(view.last_run_seq, Some(4));
+    assert_eq!(journal.len(), 4);
+    let delivery = view.delivery.expect("Delivered Run exposes its delivery");
+    assert!(matches!(
+        delivery.final_response.body,
+        ContentBody::Inline(serde_json::Value::String(ref text))
+            if text == "hello from the neutral model"
+    ));
+}
+
+#[tokio::test]
+async fn agent_sdk_uses_the_same_controller_and_durable_run_projection() {
+    let provider = Arc::new(
+        InternalGenericAgentProvider::new(
+            Arc::new(ScriptedModel),
+            GenericAgentConfig::new("internal-provider", "generic-agent"),
+        )
+        .unwrap(),
+    );
+    let controller =
+        Arc::new(AgentController::new(provider, ProviderBindingRef::new("sdk-binding")).unwrap());
+    let client = AgentClient::new(controller.clone(), AgentSessionId::new("sdk-session"));
+    let turn = client.run_text("say hello through SDK").await.unwrap();
+
+    assert_eq!(turn.status(), AgentRunStatus::Delivered);
+    assert_eq!(turn.final_text(), Some("hello from the neutral model"));
+    let direct_view = controller.inspect(&turn.run_id).await.unwrap();
+    assert_eq!(direct_view, turn.view);
+    assert_eq!(controller.events(&turn.run_id, 0).await.unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn sdk_and_api_share_the_same_agent_event_semantics() {
+    let provider = Arc::new(
+        InternalGenericAgentProvider::new(
+            Arc::new(ScriptedModel),
+            GenericAgentConfig::new("internal-provider", "generic-agent"),
+        )
+        .unwrap(),
+    );
+    let controller = Arc::new(
+        AgentController::new(provider, ProviderBindingRef::new("shared-binding")).unwrap(),
+    );
+    let sdk = AgentClient::new(
+        controller.clone(),
+        AgentSessionId::new("shared-sdk-session"),
+    );
+    let sdk_turn = sdk.run_text("same request").await.unwrap();
+    let sdk_events = controller.events(&sdk_turn.run_id, 0).await.unwrap();
+
+    let api = AgentApi::new(controller.clone());
+    let api_session = api
+        .create_session(Some(AgentSessionId::new("shared-api-session")))
+        .await
+        .unwrap();
+    let api_handle = api
+        .start_text(
+            &api_session,
+            Some(RunId::new("shared-api-run")),
+            "same request",
+        )
+        .await
+        .unwrap();
+    let api_turn = api_handle.wait_until_blocked().await.unwrap();
+    let api_events = api.events(&api_turn.run_id, 0).await.unwrap();
+
+    let event_types = |records: &[orchestral_core::agent_protocol::wire::AgentJournalRecord]| {
+        records
+            .iter()
+            .map(|record| {
+                serde_json::to_value(&record.event.payload).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(event_types(&sdk_events), event_types(&api_events));
+    assert_eq!(sdk_turn.status(), api_turn.status());
+    assert_eq!(sdk_turn.final_text(), api_turn.final_text());
+}
+
+#[tokio::test]
+async fn controller_cancel_terminates_a_generic_agent_model_run() {
+    let provider = Arc::new(
+        InternalGenericAgentProvider::new(
+            Arc::new(BlockingModel),
+            GenericAgentConfig::new("internal-provider", "generic-agent"),
+        )
+        .expect("Generic Agent accepts the neutral backend"),
+    );
+    let controller = Arc::new(
+        AgentController::new(provider, ProviderBindingRef::new("generic-binding"))
+            .expect("controller binds the Generic Agent"),
+    );
+    let run = AgentRunEnvelope::new(
+        AGENT_PROTOCOL_V1,
+        AgentSessionId::new("cancel-session"),
+        RunId::new("cancel-run"),
+        vec![Content::text("wait")],
+    )
+    .expect("valid text Run");
+
+    let execution = controller.start(run).await.expect("Run starts");
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if controller
+                .inspect(&execution.run_id)
+                .await
+                .expect("Run remains inspectable")
+                .state
+                .status()
+                == AgentRunStatus::Running
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Run reaches Running before cancellation");
+
+    controller
+        .cancel(&execution.run_id, "user interrupted the conversation")
+        .await
+        .expect("cancel command is accepted");
+    let view = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        controller.wait_for_terminal(&execution.run_id),
+    )
+    .await
+    .expect("cancellation reaches a terminal promptly")
+    .expect("cancelled Run remains authoritative");
+
+    assert_eq!(view.state.status(), AgentRunStatus::Cancelled);
+    assert!(view.delivery.is_none());
+}
+
+#[tokio::test]
+async fn generic_agent_executes_model_tools_only_through_the_guarded_runtime() {
+    let bounds = ToolPolicyBounds {
+        approval: ApprovalPolicy::NotRequired,
+        max_timeout_ms: Some(1_000),
+        max_output_bytes: Some(1_024),
+        ..ToolPolicyBounds::default()
+    };
+    let verifier = HostApprovalVerifier::new(
+        b"0123456789abcdef0123456789abcdef",
+        InMemoryApprovalCapabilityStore::default(),
+    )
+    .expect("valid Host signing key");
+    let runtime = Arc::new(
+        GuardedToolRuntime::new(
+            HostToolPolicy {
+                bounds: bounds.clone(),
+            },
+            verifier,
+        )
+        .expect("valid Host policy"),
+    );
+    let tool = Arc::new(EchoTool {
+        calls: AtomicUsize::new(0),
+    });
+    runtime
+        .register(
+            ToolDescriptor {
+                tool_id: ToolId::new("test/echo"),
+                model_schema: ModelToolSchema {
+                    name: "echo".to_owned(),
+                    description: "Echo one string".to_owned(),
+                    input_schema: json!({
+                        "type": "object",
+                        "required": ["value"],
+                        "properties": { "value": { "type": "string" } },
+                        "additionalProperties": false
+                    }),
+                },
+                output_schema: json!({
+                    "type": "object",
+                    "required": ["result"],
+                    "properties": { "result": { "type": "string" } },
+                    "additionalProperties": false
+                }),
+                effect_scopes: BTreeSet::new(),
+                restriction: ToolRestriction {
+                    bounds: bounds.clone(),
+                },
+                idempotency: ToolIdempotency::IdempotentWithKey,
+                concurrency: ToolConcurrency::ParallelSafe,
+            },
+            tool.clone(),
+        )
+        .expect("Tool registers");
+    let model = Arc::new(ToolLoopModel {
+        rounds: AtomicUsize::new(0),
+    });
+    let provider = Arc::new(
+        InternalGenericAgentProvider::new_with_tools(
+            model.clone(),
+            GenericAgentConfig::new("internal-provider", "generic-agent"),
+            runtime,
+            RunToolGrant { bounds },
+        )
+        .expect("tool-capable Generic Agent is valid"),
+    );
+    let controller = Arc::new(
+        AgentController::new(provider, ProviderBindingRef::new("generic-binding"))
+            .expect("controller binds the Generic Agent"),
+    );
+    let run = AgentRunEnvelope::new(
+        AGENT_PROTOCOL_V1,
+        AgentSessionId::new("tool-session"),
+        RunId::new("tool-run"),
+        vec![Content::text("use echo")],
+    )
+    .expect("valid text Run");
+
+    let execution = controller.start(run).await.expect("Run starts");
+    let view = controller
+        .wait_for_terminal(&execution.run_id)
+        .await
+        .expect("Tool loop reaches a terminal delivery");
+
+    assert_eq!(view.state.status(), AgentRunStatus::Delivered);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(model.rounds.load(Ordering::SeqCst), 2);
+    let delivery = view.delivery.expect("Delivered Run exposes its delivery");
+    assert_eq!(delivery.usage.and_then(|usage| usage.tool_calls), Some(1));
+    assert!(matches!(
+        delivery.final_response.body,
+        ContentBody::Inline(serde_json::Value::String(ref text))
+            if text == "tool said hello"
+    ));
+}
+
+#[tokio::test]
+async fn generic_agent_journals_only_artifact_reference_and_summary_for_large_tool_result() {
+    let large_value = "large-result-marker/".repeat(128);
+    let bounds = ToolPolicyBounds {
+        approval: ApprovalPolicy::NotRequired,
+        max_timeout_ms: Some(1_000),
+        max_output_bytes: Some(64),
+        ..ToolPolicyBounds::default()
+    };
+    let verifier = HostApprovalVerifier::new(
+        b"0123456789abcdef0123456789abcdef",
+        InMemoryApprovalCapabilityStore::default(),
+    )
+    .unwrap();
+    let artifacts =
+        ToolArtifactStore::new(Arc::new(InMemoryBlobStore::default()), 16 * 1024, 80).unwrap();
+    let runtime = Arc::new(
+        GuardedToolRuntime::new_with_effect_journal_and_artifacts(
+            HostToolPolicy {
+                bounds: bounds.clone(),
+            },
+            verifier,
+            Arc::new(InMemoryToolEffectJournalStore::default()),
+            artifacts,
+        )
+        .unwrap(),
+    );
+    runtime
+        .register(
+            ToolDescriptor {
+                tool_id: ToolId::new("test/echo"),
+                model_schema: ModelToolSchema {
+                    name: "echo".to_owned(),
+                    description: "Echo one string".to_owned(),
+                    input_schema: json!({
+                        "type": "object",
+                        "required": ["value"],
+                        "properties": { "value": { "type": "string" } },
+                        "additionalProperties": false
+                    }),
+                },
+                output_schema: json!({
+                    "type": "object",
+                    "required": ["result"],
+                    "properties": { "result": { "type": "string" } },
+                    "additionalProperties": false
+                }),
+                effect_scopes: BTreeSet::new(),
+                restriction: ToolRestriction {
+                    bounds: bounds.clone(),
+                },
+                idempotency: ToolIdempotency::IdempotentWithKey,
+                concurrency: ToolConcurrency::ParallelSafe,
+            },
+            Arc::new(LargeResultTool {
+                value: large_value.clone(),
+            }),
+        )
+        .unwrap();
+    let session_journal = Arc::new(InMemoryAgentSessionJournalStore::default());
+    let session_id = AgentSessionId::new("artifact-session");
+    let model = Arc::new(ArtifactLoopModel {
+        rounds: AtomicUsize::new(0),
+        large_value: large_value.clone(),
+    });
+    let provider = Arc::new(
+        InternalGenericAgentProvider::new_with_tools_and_session_journal(
+            model,
+            GenericAgentConfig::new("internal-provider", "generic-agent"),
+            runtime,
+            RunToolGrant { bounds },
+            session_journal.clone(),
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+        .unwrap(),
+    );
+    let controller = Arc::new(
+        AgentController::new(provider, ProviderBindingRef::new("artifact-binding")).unwrap(),
+    );
+    let run = AgentRunEnvelope::new(
+        AGENT_PROTOCOL_V1,
+        session_id.clone(),
+        RunId::new("artifact-run"),
+        vec![Content::text("produce a large result")],
+    )
+    .unwrap();
+    let execution = controller.start(run).await.unwrap();
+    let view = controller
+        .wait_for_terminal(&execution.run_id)
+        .await
+        .unwrap();
+    assert_eq!(view.state.status(), AgentRunStatus::Delivered);
+
+    let records = session_journal.load_session(&session_id).await.unwrap();
+    let encoded = serde_json::to_string(&records).unwrap();
+    assert!(!encoded.contains(&large_value));
+    assert!(records.iter().any(|record| {
+        matches!(
+            &record.payload,
+            AgentSessionEvent::ToolExchangeCommitted { tool, .. }
+                if tool.content.iter().any(|content| matches!(
+                    content,
+                    ModelContent::ToolResult { result, is_error: false, .. }
+                        if result["kind"] == json!("artifact")
+                            && result["artifact"]["artifact_ref"].as_str().is_some()
+                            && result["summary"].as_str().is_some()
+                ))
+        )
+    }));
+}
+
+#[tokio::test]
+async fn generic_agent_resumes_the_exact_tool_call_after_host_approval() {
+    run_approval_case(true).await;
+}
+
+#[tokio::test]
+async fn generic_agent_returns_a_denial_observation_without_executing_the_tool() {
+    run_approval_case(false).await;
+}
+
+async fn run_approval_case(allow: bool) {
+    const SIGNING_KEY: &[u8] = b"0123456789abcdef0123456789abcdef";
+    let bounds = ToolPolicyBounds {
+        allowed_effects: BTreeSet::from([EffectScope::Process]),
+        approval: ApprovalPolicy::Required,
+        max_timeout_ms: Some(1_000),
+        max_output_bytes: Some(1_024),
+        ..ToolPolicyBounds::default()
+    };
+    let verifier =
+        HostApprovalVerifier::new(SIGNING_KEY, InMemoryApprovalCapabilityStore::default())
+            .expect("valid Host signing key");
+    let runtime = Arc::new(
+        GuardedToolRuntime::new(
+            HostToolPolicy {
+                bounds: bounds.clone(),
+            },
+            verifier,
+        )
+        .expect("valid Host policy"),
+    );
+    let tool = Arc::new(EchoTool {
+        calls: AtomicUsize::new(0),
+    });
+    runtime
+        .register(
+            ToolDescriptor {
+                tool_id: ToolId::new("test/approval-echo"),
+                model_schema: ModelToolSchema {
+                    name: "echo".to_owned(),
+                    description: "Echo one string after Host approval".to_owned(),
+                    input_schema: json!({
+                        "type": "object",
+                        "required": ["value"],
+                        "properties": { "value": { "type": "string" } },
+                        "additionalProperties": false
+                    }),
+                },
+                output_schema: json!({
+                    "type": "object",
+                    "required": ["result"],
+                    "properties": { "result": { "type": "string" } },
+                    "additionalProperties": false
+                }),
+                effect_scopes: BTreeSet::from([EffectScope::Process]),
+                restriction: ToolRestriction {
+                    bounds: bounds.clone(),
+                },
+                idempotency: ToolIdempotency::IdempotentWithKey,
+                concurrency: ToolConcurrency::ParallelSafe,
+            },
+            tool.clone(),
+        )
+        .expect("approval Tool registers");
+    let broker = Arc::new(
+        InMemoryHostApprovalBroker::new(SIGNING_KEY).expect("Host approval broker is valid"),
+    );
+    let model = Arc::new(ApprovalLoopModel {
+        rounds: AtomicUsize::new(0),
+        expect_allowed: allow,
+    });
+    let provider = Arc::new(
+        InternalGenericAgentProvider::new_with_tools_approval_and_session_journal(
+            model.clone(),
+            GenericAgentConfig::new("internal-provider", "generic-agent"),
+            runtime,
+            RunToolGrant { bounds },
+            broker.clone(),
+            Arc::new(InMemoryAgentSessionJournalStore::default()),
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+        .expect("approval-capable Generic Agent is valid"),
+    );
+    assert!(provider
+        .describe()
+        .descriptor
+        .capabilities
+        .pending_request_kinds
+        .contains(&PendingRequestKind::Approval));
+    let controller = Arc::new(
+        AgentController::new(provider, ProviderBindingRef::new("generic-binding"))
+            .expect("controller binds the Generic Agent"),
+    );
+    let suffix = if allow { "allow" } else { "deny" };
+    let run = AgentRunEnvelope::new(
+        AGENT_PROTOCOL_V1,
+        AgentSessionId::new(format!("approval-{suffix}-session")),
+        RunId::new(format!("approval-{suffix}-run")),
+        vec![Content::text("use the approval Tool")],
+    )
+    .expect("valid approval Run");
+
+    let execution = controller.start(run).await.expect("Run starts");
+    let pending = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let view = controller
+                .inspect(&execution.run_id)
+                .await
+                .expect("approval Run remains inspectable");
+            if let Some(request) = view.pending_requests.into_iter().next() {
+                break request;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Tool opens an approval request");
+    assert_eq!(pending.kind(), PendingRequestKind::Approval);
+
+    let resolution = if allow {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("wall clock follows Unix epoch")
+            .as_millis() as i64;
+        let grant_ref = broker
+            .approve(&pending.request_id, now_ms + 60_000)
+            .expect("Host issues an exact approval grant");
+        RequestResolution::Approval {
+            decision: ApprovalDecision::Allow,
+            grant_ref: Some(grant_ref),
+        }
+    } else {
+        RequestResolution::Approval {
+            decision: ApprovalDecision::Deny,
+            grant_ref: None,
+        }
+    };
+    let command_id = CommandId::new(format!("approval-{suffix}-command"));
+    let command = AgentCommandEnvelope::new(
+        command_id.clone(),
+        execution.run_id.clone(),
+        Some(pending.request_id.clone()),
+        AgentCommand::ResolveRequest {
+            response: resolution,
+        },
+    )
+    .expect("valid approval resolution command");
+    let initial_ack = controller
+        .command(command)
+        .await
+        .expect("Host resolution is accepted");
+    assert!(matches!(
+        initial_ack.state,
+        CommandAckState::Accepted { .. } | CommandAckState::Applied { .. }
+    ));
+
+    let view = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        controller.wait_for_terminal(&execution.run_id),
+    )
+    .await
+    .expect("approval resolution resumes the Run")
+    .expect("approval Run reaches an authoritative terminal state");
+    let final_ack = controller
+        .command_ack(&execution.run_id, &command_id)
+        .await
+        .expect("resolution command remains inspectable");
+    let journal = controller
+        .events(&execution.run_id, 0)
+        .await
+        .expect("approval Run journal remains readable");
+
+    assert_eq!(view.state.status(), AgentRunStatus::Delivered);
+    assert!(matches!(final_ack.state, CommandAckState::Applied { .. }));
+    assert_eq!(tool.calls.load(Ordering::SeqCst), usize::from(allow));
+    assert_eq!(model.rounds.load(Ordering::SeqCst), 2);
+    assert!(journal
+        .iter()
+        .any(|record| matches!(record.event.payload, AgentEvent::RequestOpened { .. })));
+    assert!(journal
+        .iter()
+        .any(|record| matches!(record.event.payload, AgentEvent::RequestResolved { .. })));
+}
+
+#[tokio::test]
+async fn generic_agent_projects_workflow_progress_and_result_into_the_same_agent_run() {
+    let bounds = ToolPolicyBounds {
+        approval: ApprovalPolicy::NotRequired,
+        max_timeout_ms: Some(5_000),
+        max_output_bytes: Some(16 * 1024),
+        ..ToolPolicyBounds::default()
+    };
+    let verifier = HostApprovalVerifier::new(
+        b"0123456789abcdef0123456789abcdef",
+        InMemoryApprovalCapabilityStore::default(),
+    )
+    .expect("valid Host signing key");
+    let runtime = Arc::new(
+        GuardedToolRuntime::new(
+            HostToolPolicy {
+                bounds: bounds.clone(),
+            },
+            verifier,
+        )
+        .expect("valid Host policy"),
+    );
+    let echo = Arc::new(GatedWorkflowEcho {
+        calls: AtomicUsize::new(0),
+        first_started: Notify::new(),
+        release_first: Notify::new(),
+    });
+    runtime
+        .register(
+            ToolDescriptor {
+                tool_id: ToolId::new("test/echo"),
+                model_schema: ModelToolSchema {
+                    name: "echo".to_owned(),
+                    description: "Echo one string".to_owned(),
+                    input_schema: json!({
+                        "type": "object",
+                        "required": ["value"],
+                        "properties": { "value": { "type": "string" } },
+                        "additionalProperties": false
+                    }),
+                },
+                output_schema: json!({
+                    "type": "object",
+                    "required": ["result"],
+                    "properties": { "result": { "type": "string" } },
+                    "additionalProperties": false
+                }),
+                effect_scopes: BTreeSet::new(),
+                restriction: ToolRestriction {
+                    bounds: bounds.clone(),
+                },
+                idempotency: ToolIdempotency::IdempotentWithKey,
+                concurrency: ToolConcurrency::ParallelSafe,
+            },
+            echo.clone(),
+        )
+        .expect("Tool registers");
+    let mut normalizer = PlanNormalizer::new();
+    normalizer.register_action("echo");
+    let workflow = Arc::new(WorkflowExecutionStrategy::new(
+        Arc::new(normalizer),
+        Arc::new(Executor::new()),
+        runtime.clone(),
+    ));
+    let model = Arc::new(WorkflowLoopModel {
+        rounds: AtomicUsize::new(0),
+    });
+    let provider = Arc::new(
+        InternalGenericAgentProvider::new_with_workflow_and_session_journal(
+            model.clone(),
+            GenericAgentConfig::new("internal-provider", "generic-agent"),
+            runtime,
+            RunToolGrant {
+                bounds: bounds.clone(),
+            },
+            workflow,
+            Arc::new(InMemoryAgentSessionJournalStore::default()),
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+        .expect("workflow-capable Generic Agent is valid"),
+    );
+    let controller = Arc::new(
+        AgentController::new(provider, ProviderBindingRef::new("generic-binding"))
+            .expect("controller binds the Generic Agent"),
+    );
+    let run = AgentRunEnvelope::new(
+        AGENT_PROTOCOL_V1,
+        AgentSessionId::new("workflow-session"),
+        RunId::new("workflow-run"),
+        vec![Content::text("run the ordered workflow")],
+    )
+    .expect("valid workflow Run");
+
+    let execution = controller.start(run).await.expect("Run starts");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        echo.first_started.notified(),
+    )
+    .await
+    .expect("first workflow Step starts");
+    let mut live = controller
+        .subscribe(&execution.run_id)
+        .await
+        .expect("Run supports live progress");
+    echo.release_first.notify_one();
+    let view = controller
+        .wait_for_terminal(&execution.run_id)
+        .await
+        .expect("workflow Run delivers");
+    let journal = controller
+        .events(&execution.run_id, 0)
+        .await
+        .expect("workflow Run journal is readable");
+
+    let mut saw_workflow_progress = false;
+    while let Ok(event) = live.try_recv() {
+        if matches!(
+            event,
+            AgentControlEvent::Telemetry(ref telemetry)
+                if matches!(
+                    telemetry.payload,
+                    AgentTelemetry::ProgressReported {
+                        fraction: Some(fraction),
+                        ..
+                    } if (fraction - 1.0).abs() < f64::EPSILON
+                )
+        ) {
+            saw_workflow_progress = true;
+        }
+    }
+    let workflow_record = journal
+        .iter()
+        .find(|record| {
+            matches!(
+                &record.event.payload,
+                AgentEvent::OutputCommitted { content, .. }
+                    if content.iter().any(|content| {
+                        content.media_type == "application/json"
+                            && matches!(
+                                &content.body,
+                                ContentBody::Inline(value)
+                                    if value["status"] == json!("completed")
+                                        && value["tool_calls"] == json!(2)
+                            )
+                    })
+            )
+        })
+        .expect("workflow result is a durable supporting output");
+    let delivery = view.delivery.expect("Run has one Agent delivery");
+
+    assert_eq!(view.state.status(), AgentRunStatus::Delivered);
+    assert!(saw_workflow_progress);
+    assert_eq!(echo.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(model.rounds.load(Ordering::SeqCst), 2);
+    assert_eq!(delivery.usage.and_then(|usage| usage.tool_calls), Some(3));
+    assert!(delivery
+        .provenance
+        .supporting_event_ids
+        .contains(&workflow_record.event.event_id));
+    assert!(matches!(
+        delivery.final_response.body,
+        ContentBody::Inline(serde_json::Value::String(ref text))
+            if text == "workflow complete"
+    ));
+}
+
+#[tokio::test]
+async fn a_new_generic_provider_rebuilds_session_context_from_the_session_journal() {
+    let session_journal = Arc::new(InMemoryAgentSessionJournalStore::default());
+    let session_id = AgentSessionId::new("restart-session");
+    let first_provider = Arc::new(
+        InternalGenericAgentProvider::new_with_session_journal(
+            Arc::new(RestartSessionModel {
+                response: "first answer",
+                expect_prior_turn: false,
+            }),
+            GenericAgentConfig::new("internal-provider", "generic-agent"),
+            session_journal.clone(),
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+        .expect("first provider starts"),
+    );
+    let first_controller = Arc::new(
+        AgentController::new(first_provider, ProviderBindingRef::new("generic-binding"))
+            .expect("first controller binds"),
+    );
+    let first_run = AgentRunEnvelope::new(
+        AGENT_PROTOCOL_V1,
+        session_id.clone(),
+        RunId::new("restart-run-1"),
+        vec![Content::text("first question")],
+    )
+    .unwrap();
+    let first_execution = first_controller.start(first_run).await.unwrap();
+    first_controller
+        .wait_for_terminal(&first_execution.run_id)
+        .await
+        .unwrap();
+    drop(first_controller);
+
+    let second_provider = Arc::new(
+        InternalGenericAgentProvider::new_with_session_journal(
+            Arc::new(RestartSessionModel {
+                response: "second answer",
+                expect_prior_turn: true,
+            }),
+            GenericAgentConfig::new("internal-provider", "generic-agent"),
+            session_journal,
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+        .expect("restarted provider starts"),
+    );
+    let second_controller = Arc::new(
+        AgentController::new(second_provider, ProviderBindingRef::new("generic-binding"))
+            .expect("second controller binds"),
+    );
+    let second_run = AgentRunEnvelope::new(
+        AGENT_PROTOCOL_V1,
+        session_id,
+        RunId::new("restart-run-2"),
+        vec![Content::text("second question")],
+    )
+    .unwrap();
+    let second_execution = second_controller.start(second_run).await.unwrap();
+    let second = second_controller
+        .wait_for_terminal(&second_execution.run_id)
+        .await
+        .unwrap();
+
+    assert_eq!(second.state.status(), AgentRunStatus::Delivered);
+}

@@ -1,673 +1,904 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
-use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
 
-use orchestral_core::action::{Action, ActionContext, ActionInput, ActionMeta, ActionResult};
-use orchestral_core::config::ActionSpec;
+use orchestral_core::mcp_protocol::{
+    McpProtocolEra, McpServerId, McpServerSnapshot, McpToolSnapshot, McpTransportKind,
+    MCP_LATEST_LEGACY_PROTOCOL, MCP_STATELESS_PROTOCOL_2026_07_28,
+};
+use orchestral_core::tool_protocol::{
+    ApprovalCapabilityStore, ApprovalPolicy, EffectScope, ModelToolSchema, ToolConcurrency,
+    ToolDescriptor, ToolId, ToolIdempotency, ToolOutcome, ToolRestriction,
+};
+use tokio_util::sync::CancellationToken;
 
-use super::factory::ActionBuildError;
+use crate::tool_runtime::{
+    GuardedToolExecution, GuardedToolExecutor, GuardedToolRuntime, ToolRuntimeError,
+};
 
-#[derive(Debug, Clone, Deserialize)]
-struct McpServerActionConfig {
-    server_name: String,
-    #[serde(default)]
-    command: Option<String>,
-    #[serde(default)]
-    args: Vec<String>,
-    #[serde(default)]
-    env: HashMap<String, String>,
-    #[serde(default)]
-    url: Option<String>,
-    #[serde(default)]
-    headers: HashMap<String, String>,
-    #[serde(default)]
-    bearer_token_env_var: Option<String>,
-    #[serde(default)]
-    required: bool,
-    #[serde(default)]
-    startup_timeout_ms: Option<u64>,
-    #[serde(default)]
-    tool_timeout_ms: Option<u64>,
-    #[serde(default)]
-    enabled_tools: Vec<String>,
-    #[serde(default)]
-    disabled_tools: Vec<String>,
+const DEFAULT_MCP_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
+/// Host-resolved stdio MCP server configuration used by the new Agent path.
+/// Agent Foundation v1 intentionally exposes stdio Tools only.
+#[derive(Debug, Clone)]
+pub struct GuardedMcpServerConfig {
+    pub server_id: McpServerId,
+    pub required: bool,
+    /// Canonical absolute executable identity.
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    /// Exact environment assignments; the inherited Host environment is cleared.
+    pub environment: BTreeMap<String, String>,
+    pub startup_timeout: Duration,
+    pub tool_timeout: Duration,
+    pub enabled_tools: BTreeSet<String>,
+    pub disabled_tools: BTreeSet<String>,
 }
 
-pub fn build_mcp_action(spec: &ActionSpec) -> Result<Option<Box<dyn Action>>, ActionBuildError> {
-    match spec.kind.as_str() {
-        "mcp_server" => {
-            let action = McpServerAction::from_spec(spec)?;
-            Ok(Some(Box::new(action)))
+impl GuardedMcpServerConfig {
+    pub fn validate(&self) -> Result<(), McpToolsAdapterError> {
+        let canonical_program = self.program.canonicalize().ok();
+        if self.server_id.is_empty()
+            || !self.program.is_absolute()
+            || !self.program.is_file()
+            || canonical_program.as_ref() != Some(&self.program)
+            || self.startup_timeout.is_zero()
+            || self.tool_timeout.is_zero()
+            || self
+                .enabled_tools
+                .iter()
+                .chain(self.disabled_tools.iter())
+                .any(|name| name.trim().is_empty())
+            || self.environment.keys().any(|name| {
+                name.trim().is_empty() || name.contains('=') || name.chars().any(char::is_control)
+            })
+        {
+            return Err(McpToolsAdapterError::InvalidConfig(format!(
+                "invalid guarded MCP stdio configuration for '{}'",
+                self.server_id
+            )));
         }
-        "mcp_tool" => {
-            let action = McpToolAction::from_spec(spec)?;
-            Ok(Some(Box::new(action)))
+        Ok(())
+    }
+
+    fn allows_tool(&self, name: &str) -> bool {
+        !name.trim().is_empty()
+            && (self.enabled_tools.is_empty() || self.enabled_tools.contains(name))
+            && !self.disabled_tools.contains(name)
+    }
+
+    pub fn effect_scopes(&self) -> BTreeSet<EffectScope> {
+        let mut scopes = BTreeSet::from([
+            EffectScope::Process,
+            EffectScope::FilesystemRead,
+            EffectScope::FilesystemWrite,
+            EffectScope::ExternalSideEffect,
+        ]);
+        if !self.environment.is_empty() {
+            scopes.insert(EffectScope::SecretRead);
         }
-        _ => Ok(None),
+        scopes
     }
 }
 
-/// Probe an MCP server for its tool list. Returns (name, description, inputSchema) per tool.
-/// Used at startup to register per-tool actions.
-pub async fn probe_mcp_server_tools(config: &ActionSpec) -> Result<Vec<McpToolDescriptor>, String> {
-    let server = McpServerAction::from_spec(config)
-        .map_err(|e| format!("failed to build MCP server for probing: {}", e))?;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum McpServerHealth {
+    Connecting,
+    Ready,
+    Degraded,
+    Closed,
+}
 
-    let result = if server.config.command.is_some() {
-        let mut session = StdioMcpSession::connect(
-            server
-                .config
-                .command
-                .as_deref()
-                .ok_or_else(|| "missing command".to_string())?,
-            &server.config.args,
-            &server.config.env,
-            server.startup_timeout(),
-        )
-        .await?;
-        session.initialize().await?;
-        let result = session.request("tools/list", json!({})).await?;
-        let _ = session.shutdown().await;
-        result
-    } else {
-        server
-            .http_request("tools/list", json!({}), server.io_timeout())
-            .await?
+impl McpServerHealth {
+    fn encode(self) -> u64 {
+        match self {
+            Self::Connecting => 0,
+            Self::Ready => 1,
+            Self::Degraded => 2,
+            Self::Closed => 3,
+        }
+    }
+
+    fn decode(value: u64) -> Self {
+        match value {
+            1 => Self::Ready,
+            2 => Self::Degraded,
+            3 => Self::Closed,
+            _ => Self::Connecting,
+        }
+    }
+}
+
+/// Owns exactly one live stdio process for all Tools on one MCP server.
+pub struct McpServerConnectionManager {
+    config: GuardedMcpServerConfig,
+    snapshot: McpServerSnapshot,
+    session: tokio::sync::Mutex<Option<StdioMcpSession>>,
+    connection_generation: AtomicU64,
+    health: AtomicU64,
+}
+
+impl McpServerConnectionManager {
+    async fn connect(
+        config: GuardedMcpServerConfig,
+        cancellation: CancellationToken,
+    ) -> Result<Arc<Self>, McpToolsAdapterError> {
+        config.validate()?;
+        let (session, snapshot) = discover_guarded_mcp_session(&config, &cancellation).await?;
+        Ok(Arc::new(Self {
+            config,
+            snapshot,
+            session: tokio::sync::Mutex::new(Some(session)),
+            connection_generation: AtomicU64::new(1),
+            health: AtomicU64::new(McpServerHealth::Ready.encode()),
+        }))
+    }
+
+    pub fn config(&self) -> &GuardedMcpServerConfig {
+        &self.config
+    }
+
+    pub fn snapshot(&self) -> &McpServerSnapshot {
+        &self.snapshot
+    }
+
+    pub fn connection_generation(&self) -> u64 {
+        self.connection_generation.load(Ordering::Acquire)
+    }
+
+    pub fn health(&self) -> McpServerHealth {
+        McpServerHealth::decode(self.health.load(Ordering::Acquire))
+    }
+
+    async fn invoke(
+        &self,
+        tool_name: &str,
+        arguments: Value,
+        cancellation: CancellationToken,
+    ) -> Result<Value, GuardedMcpCallError> {
+        if !self.config.allows_tool(tool_name)
+            || !self
+                .snapshot
+                .tools
+                .iter()
+                .any(|tool| tool.name == tool_name)
+        {
+            return Err(GuardedMcpCallError::Rejected(format!(
+                "MCP Tool '{tool_name}' is outside the pinned Host snapshot/filter"
+            )));
+        }
+        let mut guard = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(GuardedMcpCallError::Cancelled),
+            guard = self.session.lock() => guard,
+        };
+        if guard.is_none() {
+            self.health
+                .store(McpServerHealth::Connecting.encode(), Ordering::Release);
+            let (mut session, current_snapshot) =
+                discover_guarded_mcp_session(&self.config, &cancellation)
+                    .await
+                    .map_err(|error| GuardedMcpCallError::Failed(error.to_string()))?;
+            if current_snapshot.revision != self.snapshot.revision {
+                let _ = session.shutdown().await;
+                self.health
+                    .store(McpServerHealth::Degraded.encode(), Ordering::Release);
+                return Err(GuardedMcpCallError::Failed(
+                    "MCP Tool catalog changed after reconnect; the pinned Host snapshot is stale"
+                        .to_owned(),
+                ));
+            }
+            self.connection_generation.fetch_add(1, Ordering::AcqRel);
+            *guard = Some(session);
+        }
+        let request = {
+            let session = guard.as_mut().expect("MCP session was initialized");
+            let request_id = session.next_id;
+            enum Wait {
+                Response(Result<Value, String>),
+                Cancelled,
+                TimedOut,
+            }
+            let wait = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => Wait::Cancelled,
+                result = timeout(
+                    self.config.tool_timeout,
+                    session.request(
+                        "tools/call",
+                        json!({"name": tool_name, "arguments": arguments}),
+                    ),
+                ) => match result {
+                    Ok(response) => Wait::Response(response),
+                    Err(_) => Wait::TimedOut,
+                }
+            };
+            match wait {
+                Wait::Response(Ok(value)) => validate_mcp_call_result(
+                    session
+                        .negotiated_protocol()
+                        .map_err(|error| GuardedMcpCallError::Failed(error.to_string()))?,
+                    value,
+                ),
+                Wait::Response(Err(error)) => Err(GuardedMcpCallError::UnknownEffect(error)),
+                Wait::Cancelled => {
+                    let _ = session
+                        .notification(
+                            "notifications/cancelled",
+                            json!({"requestId": request_id, "reason": "Agent Run cancelled"}),
+                        )
+                        .await;
+                    Err(GuardedMcpCallError::UnknownEffect(
+                        "MCP call was cancelled after dispatch; remote effect is unknown"
+                            .to_owned(),
+                    ))
+                }
+                Wait::TimedOut => {
+                    let _ = session
+                        .notification(
+                            "notifications/cancelled",
+                            json!({"requestId": request_id, "reason": "Host deadline exceeded"}),
+                        )
+                        .await;
+                    Err(GuardedMcpCallError::UnknownEffect(
+                        "MCP call timed out after dispatch; remote effect is unknown".to_owned(),
+                    ))
+                }
+            }
+        };
+        if request
+            .as_ref()
+            .is_err_and(GuardedMcpCallError::invalidates_session)
+        {
+            self.health
+                .store(McpServerHealth::Degraded.encode(), Ordering::Release);
+            if let Some(mut session) = guard.take() {
+                let _ = session.shutdown().await;
+            }
+        } else {
+            self.health
+                .store(McpServerHealth::Ready.encode(), Ordering::Release);
+        }
+        request
+    }
+
+    pub async fn shutdown(&self) {
+        let mut guard = self.session.lock().await;
+        if let Some(mut session) = guard.take() {
+            let _ = session.shutdown().await;
+        }
+        self.health
+            .store(McpServerHealth::Closed.encode(), Ordering::Release);
+    }
+}
+
+async fn connect_guarded_mcp_session(
+    config: &GuardedMcpServerConfig,
+    cancellation: &CancellationToken,
+) -> Result<StdioMcpSession, McpToolsAdapterError> {
+    let mut session = spawn_guarded_mcp_session(config).await?;
+    let probe = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            let _ = session.shutdown().await;
+            return Err(McpToolsAdapterError::Cancelled);
+        }
+        result = timeout(config.startup_timeout, session.probe_stateless()) => result,
     };
+    match probe {
+        Ok(Ok(true)) => return Ok(session),
+        Ok(Ok(false)) => {}
+        Ok(Err(error)) if error.is_transport() => {
+            let _ = session.shutdown().await;
+            session = spawn_guarded_mcp_session(config).await?;
+        }
+        Ok(Err(error)) => {
+            let _ = session.shutdown().await;
+            return Err(mcp_request_adapter_error(error));
+        }
+        Err(_) => {
+            // A legacy stdio server may wait forever for initialize instead of
+            // rejecting server/discover. Restart it before legacy fallback.
+            let _ = session.shutdown().await;
+            session = spawn_guarded_mcp_session(config).await?;
+        }
+    }
+    let initialized = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            let _ = session.shutdown().await;
+            return Err(McpToolsAdapterError::Cancelled);
+        }
+        result = timeout(config.startup_timeout, session.initialize_guarded_legacy()) => result,
+    };
+    match initialized {
+        Ok(Ok(())) => Ok(session),
+        Ok(Err(error)) => {
+            let _ = session.shutdown().await;
+            Err(mcp_request_adapter_error(error))
+        }
+        Err(_) => {
+            let _ = session.shutdown().await;
+            Err(McpToolsAdapterError::Transport(
+                "legacy MCP initialize timed out".to_owned(),
+            ))
+        }
+    }
+}
 
+async fn spawn_guarded_mcp_session(
+    config: &GuardedMcpServerConfig,
+) -> Result<StdioMcpSession, McpToolsAdapterError> {
+    let environment = config
+        .environment
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<HashMap<_, _>>();
+    StdioMcpSession::connect(
+        config.program.to_string_lossy().as_ref(),
+        &config.args,
+        &environment,
+    )
+    .await
+    .map_err(McpToolsAdapterError::Transport)
+}
+
+async fn discover_guarded_mcp_session(
+    config: &GuardedMcpServerConfig,
+    cancellation: &CancellationToken,
+) -> Result<(StdioMcpSession, McpServerSnapshot), McpToolsAdapterError> {
+    let mut session = connect_guarded_mcp_session(config, cancellation).await?;
+    let listed = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            let _ = session.shutdown().await;
+            return Err(McpToolsAdapterError::Cancelled);
+        }
+        result = timeout(config.startup_timeout, list_all_mcp_tools(&mut session)) => result,
+    };
+    let listed = match listed {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => {
+            let _ = session.shutdown().await;
+            return Err(McpToolsAdapterError::Transport(error));
+        }
+        Err(_) => {
+            let _ = session.shutdown().await;
+            return Err(McpToolsAdapterError::Transport(
+                "MCP tools/list timed out".to_owned(),
+            ));
+        }
+    };
+    let negotiated = session
+        .negotiated_protocol()
+        .map_err(mcp_request_adapter_error)?
+        .clone();
+    match parse_guarded_tool_snapshot(config, &negotiated, &listed) {
+        Ok(snapshot) => Ok((session, snapshot)),
+        Err(error) => {
+            let _ = session.shutdown().await;
+            Err(error)
+        }
+    }
+}
+
+async fn list_all_mcp_tools(session: &mut StdioMcpSession) -> Result<Value, String> {
+    const MAX_PAGES: usize = 256;
+    let stateless = session
+        .negotiated_protocol()
+        .map_err(|error| error.to_string())?
+        .era
+        == McpProtocolEra::Stateless;
+    let mut tools = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = BTreeSet::new();
+    for _ in 0..MAX_PAGES {
+        let params = cursor
+            .as_ref()
+            .map(|cursor| json!({"cursor": cursor}))
+            .unwrap_or_else(|| json!({}));
+        let result = session.request("tools/list", params).await?;
+        match result.get("resultType").and_then(Value::as_str) {
+            Some("input_required") => {
+                return Err(
+                    "MCP tools/list requested unsupported multi-round-trip input".to_owned(),
+                )
+            }
+            Some("complete") => {}
+            None if !stateless => {}
+            Some(other) => {
+                return Err(format!(
+                    "MCP tools/list returned unknown resultType '{other}'"
+                ))
+            }
+            None => return Err("stateless MCP tools/list omitted resultType".to_owned()),
+        }
+        let page = result
+            .get("tools")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "MCP tools/list omitted a tools array".to_owned())?;
+        tools.extend(page.iter().cloned());
+        cursor = result
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .filter(|cursor| !cursor.is_empty())
+            .map(str::to_owned);
+        let Some(next) = cursor.as_ref() else {
+            return Ok(json!({"tools": tools}));
+        };
+        if !seen_cursors.insert(next.clone()) {
+            return Err("MCP tools/list repeated a pagination cursor".to_owned());
+        }
+    }
+    Err(format!(
+        "MCP tools/list exceeded the {MAX_PAGES}-page safety limit"
+    ))
+}
+
+fn parse_guarded_tool_snapshot(
+    config: &GuardedMcpServerConfig,
+    negotiated: &NegotiatedMcpProtocol,
+    result: &Value,
+) -> Result<McpServerSnapshot, McpToolsAdapterError> {
     let tools = result
         .get("tools")
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-
-    let mut descriptors = Vec::new();
-    for tool in tools {
-        let Some(name) = tool.get("name").and_then(Value::as_str) else {
-            continue;
-        };
-        let name = name.trim().to_string();
-        if name.is_empty() {
-            continue;
-        }
-        if !server.allows_tool(&name) {
-            continue;
-        }
-        let description = tool
-            .get("description")
+        .ok_or_else(|| {
+            McpToolsAdapterError::Protocol("MCP tools/list omitted a tools array".to_owned())
+        })?;
+    let mut names = BTreeSet::new();
+    let mut snapshots = Vec::new();
+    for raw in tools {
+        let name = raw
+            .get("name")
             .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let input_schema = tool
-            .get("inputSchema")
-            .cloned()
-            .unwrap_or(json!({"type": "object"}));
-        descriptors.push(McpToolDescriptor {
-            name,
-            description,
-            input_schema,
-        });
-    }
-    descriptors.sort_by(|a, b| a.name.cmp(&b.name));
-    descriptors.dedup_by(|a, b| a.name == b.name);
-    Ok(descriptors)
-}
-
-/// Descriptor for a single MCP tool discovered via tools/list.
-#[derive(Debug, Clone)]
-pub struct McpToolDescriptor {
-    pub name: String,
-    pub description: String,
-    pub input_schema: Value,
-}
-
-struct McpServerAction {
-    name: String,
-    description: String,
-    config: McpServerActionConfig,
-    enabled_tools: HashSet<String>,
-    disabled_tools: HashSet<String>,
-}
-
-impl McpServerAction {
-    fn from_spec(spec: &ActionSpec) -> Result<Self, ActionBuildError> {
-        let config: McpServerActionConfig =
-            serde_json::from_value(spec.config.clone()).map_err(|err| {
-                ActionBuildError::InvalidConfig(format!(
-                    "action '{}' invalid mcp_server config: {}",
-                    spec.name, err
-                ))
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                McpToolsAdapterError::Protocol(
+                    "MCP tools/list returned an invalid Tool name".to_owned(),
+                )
             })?;
-
-        if config.command.is_none() && config.url.is_none() {
-            return Err(ActionBuildError::InvalidConfig(format!(
-                "action '{}' mcp_server requires command or url",
-                spec.name
+        if !config.allows_tool(name) {
+            continue;
+        }
+        if !names.insert(name.to_owned()) {
+            return Err(McpToolsAdapterError::Protocol(format!(
+                "MCP server '{}' returned duplicate Tool '{name}'",
+                config.server_id
             )));
         }
-
-        let enabled_tools = config
-            .enabled_tools
-            .iter()
-            .map(|name| name.trim().to_string())
-            .filter(|name| !name.is_empty())
-            .collect::<HashSet<_>>();
-        let disabled_tools = config
-            .disabled_tools
-            .iter()
-            .map(|name| name.trim().to_string())
-            .filter(|name| !name.is_empty())
-            .collect::<HashSet<_>>();
-
-        Ok(Self {
-            name: spec.name.clone(),
-            description: spec.description_or("Invoke MCP tools on a configured server"),
-            config,
-            enabled_tools,
-            disabled_tools,
-        })
+        snapshots.push(
+            McpToolSnapshot::seal(
+                config.server_id.clone(),
+                name,
+                raw.get("description").and_then(Value::as_str).unwrap_or(""),
+                raw.get("inputSchema")
+                    .cloned()
+                    .unwrap_or_else(|| json!({"type": "object"})),
+                raw.get("outputSchema").cloned(),
+            )
+            .map_err(|error| McpToolsAdapterError::Protocol(error.to_string()))?,
+        );
     }
+    McpServerSnapshot::seal(
+        config.server_id.clone(),
+        McpTransportKind::Stdio,
+        negotiated.version.clone(),
+        negotiated.era,
+        snapshots,
+    )
+    .map_err(|error| McpToolsAdapterError::Protocol(error.to_string()))
+}
 
-    fn io_timeout(&self) -> Duration {
-        Duration::from_millis(self.config.tool_timeout_ms.unwrap_or(20_000))
+fn mcp_request_adapter_error(error: StdioMcpRequestError) -> McpToolsAdapterError {
+    match error {
+        StdioMcpRequestError::Transport(message) => McpToolsAdapterError::Transport(message),
+        error => McpToolsAdapterError::Protocol(error.to_string()),
     }
+}
 
-    fn startup_timeout(&self) -> Duration {
-        Duration::from_millis(self.config.startup_timeout_ms.unwrap_or(15_000))
-    }
+/// Keeps server managers alive after their thin Tool executors are registered.
+pub struct McpToolsAdapterRegistry {
+    managers: BTreeMap<McpServerId, Arc<McpServerConnectionManager>>,
+    skipped_optional_servers: BTreeMap<McpServerId, String>,
+    tool_count: usize,
+}
 
-    fn allows_tool(&self, tool: &str) -> bool {
-        let name = tool.trim();
-        if name.is_empty() {
-            return false;
+impl McpToolsAdapterRegistry {
+    pub async fn register<S: ApprovalCapabilityStore>(
+        runtime: &GuardedToolRuntime<S>,
+        mut configs: Vec<GuardedMcpServerConfig>,
+        restriction: ToolRestriction,
+        cancellation: CancellationToken,
+    ) -> Result<Self, McpToolsAdapterError> {
+        configs.sort_by(|left, right| left.server_id.cmp(&right.server_id));
+        restriction
+            .bounds
+            .validate()
+            .map_err(|error| McpToolsAdapterError::InvalidConfig(error.to_string()))?;
+        if restriction.bounds.approval != ApprovalPolicy::Required {
+            return Err(McpToolsAdapterError::InvalidConfig(
+                "MCP Tool restriction must require exact Host approval".to_owned(),
+            ));
         }
-        if !self.enabled_tools.is_empty() && !self.enabled_tools.contains(name) {
-            return false;
-        }
-        !self.disabled_tools.contains(name)
-    }
-
-    async fn invoke_list_tools(&self) -> Result<Vec<String>, String> {
-        if self.config.command.is_some() {
-            self.invoke_stdio_list_tools().await
-        } else {
-            self.invoke_http_list_tools().await
-        }
-    }
-
-    async fn invoke_call_tool(&self, tool: &str, arguments: Value) -> Result<Value, String> {
-        if self.config.command.is_some() {
-            self.invoke_stdio_call_tool(tool, arguments).await
-        } else {
-            self.invoke_http_call_tool(tool, arguments).await
-        }
-    }
-
-    async fn invoke_stdio_list_tools(&self) -> Result<Vec<String>, String> {
-        let mut session = StdioMcpSession::connect(
-            self.config
-                .command
-                .as_deref()
-                .ok_or_else(|| "missing command".to_string())?,
-            &self.config.args,
-            &self.config.env,
-            self.startup_timeout(),
-        )
-        .await?;
-
-        session.initialize().await?;
-        let result = session.request("tools/list", json!({})).await?;
-        let names = extract_tool_names(&result);
-        let _ = session.shutdown().await;
-        Ok(names)
-    }
-
-    async fn invoke_stdio_call_tool(&self, tool: &str, arguments: Value) -> Result<Value, String> {
-        let mut session = StdioMcpSession::connect(
-            self.config
-                .command
-                .as_deref()
-                .ok_or_else(|| "missing command".to_string())?,
-            &self.config.args,
-            &self.config.env,
-            self.startup_timeout(),
-        )
-        .await?;
-
-        session.initialize().await?;
-        let params = json!({
-            "name": tool,
-            "arguments": arguments,
-        });
-        let result = timeout(self.io_timeout(), session.request("tools/call", params))
-            .await
-            .map_err(|_| {
-                format!(
-                    "mcp call timed out for server '{}' tool '{}'",
-                    self.config.server_name, tool
-                )
-            })??;
-        let _ = session.shutdown().await;
-        Ok(result)
-    }
-
-    async fn invoke_http_list_tools(&self) -> Result<Vec<String>, String> {
-        let response = self
-            .http_request("tools/list", json!({}), self.io_timeout())
-            .await?;
-        Ok(extract_tool_names(&response))
-    }
-
-    async fn invoke_http_call_tool(&self, tool: &str, arguments: Value) -> Result<Value, String> {
-        let params = json!({
-            "name": tool,
-            "arguments": arguments,
-        });
-        self.http_request("tools/call", params, self.io_timeout())
-            .await
-    }
-
-    async fn http_request(
-        &self,
-        method: &str,
-        params: Value,
-        timeout_dur: Duration,
-    ) -> Result<Value, String> {
-        let url = self
-            .config
-            .url
-            .as_deref()
-            .ok_or_else(|| "missing url".to_string())?;
-        let client = reqwest::Client::new();
-        let mut headers = HeaderMap::new();
-        for (key, value) in &self.config.headers {
-            if let (Ok(name), Ok(value)) = (
-                HeaderName::from_bytes(key.as_bytes()),
-                HeaderValue::from_str(value),
-            ) {
-                headers.insert(name, value);
+        let mut configured_ids = BTreeSet::new();
+        for config in &configs {
+            config.validate()?;
+            if !configured_ids.insert(config.server_id.clone()) {
+                return Err(McpToolsAdapterError::Conflict(format!(
+                    "duplicate MCP server id: {}",
+                    config.server_id
+                )));
+            }
+            let program = config.program.to_string_lossy().to_string();
+            let environment = config.environment.keys().cloned().collect::<BTreeSet<_>>();
+            if !config
+                .effect_scopes()
+                .is_subset(&restriction.bounds.allowed_effects)
+                || !restriction
+                    .bounds
+                    .process
+                    .allowed_programs
+                    .contains(&program)
+                || !environment.is_subset(&restriction.bounds.environment.allowed_variables)
+            {
+                return Err(McpToolsAdapterError::InvalidConfig(format!(
+                    "MCP server '{}' exceeds its Host Tool restriction",
+                    config.server_id
+                )));
             }
         }
-        if let Some(env_var) = &self.config.bearer_token_env_var {
-            if let Ok(token) = std::env::var(env_var) {
-                let auth = format!("Bearer {}", token);
-                if let Ok(value) = HeaderValue::from_str(&auth) {
-                    headers.insert(AUTHORIZATION, value);
+        let mut managers = BTreeMap::new();
+        let mut skipped_optional_servers = BTreeMap::new();
+        for config in configs {
+            match McpServerConnectionManager::connect(config.clone(), cancellation.child_token())
+                .await
+            {
+                Ok(manager) => {
+                    managers.insert(config.server_id.clone(), manager);
+                }
+                Err(error) if !config.required => {
+                    skipped_optional_servers.insert(config.server_id.clone(), error.to_string());
+                }
+                Err(error) => {
+                    shutdown_mcp_managers(&managers).await;
+                    return Err(error);
                 }
             }
         }
 
-        let payload = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": method,
-            "params": params,
-        });
-
-        let send = client.post(url).headers(headers).json(&payload).send();
-        let response = timeout(timeout_dur, send)
-            .await
-            .map_err(|_| format!("mcp http request timed out to {}", url))?
-            .map_err(|err| format!("mcp http request failed: {}", err))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unavailable>".to_string());
-            return Err(format!(
-                "mcp http request failed with status {}: {}",
-                status,
-                truncate_text(&body, 800)
-            ));
-        }
-
-        let value: Value = response
-            .json()
-            .await
-            .map_err(|err| format!("mcp http response is not JSON: {}", err))?;
-
-        if let Some(error) = value.get("error") {
-            return Err(format!("mcp rpc error: {}", error));
-        }
-
-        Ok(value.get("result").cloned().unwrap_or(Value::Null))
-    }
-}
-
-#[async_trait]
-impl Action for McpServerAction {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn description(&self) -> &str {
-        &self.description
-    }
-
-    fn metadata(&self) -> ActionMeta {
-        ActionMeta::new(self.name(), self.description())
-            .with_capabilities(["mcp", "side_effect", "tool_invocation"])
-            .with_input_kinds(["structured"])
-            .with_output_kinds(["structured"])
-            .with_input_schema(json!({
-                "type": "object",
-                "properties": {
-                    "operation": {
-                        "type": "string",
-                        "enum": ["list_tools", "call"],
-                        "default": "call",
-                        "description": "MCP operation to execute"
+        let existing_names = runtime
+            .model_tool_schemas()
+            .map_err(McpToolsAdapterError::ToolRuntime)?
+            .into_iter()
+            .map(|schema| schema.name)
+            .collect::<BTreeSet<_>>();
+        let mut registrations = Vec::new();
+        let mut model_names = BTreeSet::new();
+        for manager in managers.values() {
+            let mut sanitized_names = BTreeSet::new();
+            for tool in &manager.snapshot.tools {
+                let server = sanitize_mcp_identifier(manager.config.server_id.as_str());
+                let tool_name = sanitize_mcp_identifier(&tool.name);
+                if !sanitized_names.insert(tool_name.clone()) {
+                    return Err(McpToolsAdapterError::Conflict(format!(
+                        "MCP server '{}' has Tool names that collide after namespacing",
+                        manager.config.server_id
+                    )));
+                }
+                let model_name = format!("mcp__{server}__{tool_name}");
+                if existing_names.contains(&model_name) || !model_names.insert(model_name.clone()) {
+                    return Err(McpToolsAdapterError::Conflict(format!(
+                        "MCP model Tool name collides: {model_name}"
+                    )));
+                }
+                let descriptor = ToolDescriptor {
+                    tool_id: ToolId::new(format!("mcp/{server}/{tool_name}/v1")),
+                    model_schema: ModelToolSchema {
+                        name: model_name,
+                        description: if tool.description.trim().is_empty() {
+                            format!(
+                                "MCP Tool '{}' on server '{}'",
+                                tool.name, manager.config.server_id
+                            )
+                        } else {
+                            tool.description.clone()
+                        },
+                        input_schema: tool.input_schema.clone(),
                     },
-                    "tool": {
-                        "type": "string",
-                        "description": "Tool name for operation=call"
-                    },
-                    "arguments": {
+                    output_schema: json!({
                         "type": "object",
-                        "description": "Tool arguments for operation=call",
-                        "default": {}
-                    }
-                },
-                "required": ["operation"]
-            }))
-            .with_output_schema(json!({
-                "type": "object",
-                "properties": {
-                    "server": {"type": "string"},
-                    "operation": {"type": "string"},
-                    "tools": {
-                        "type": "array",
-                        "items": {"type": "string"}
-                    },
-                    "tool": {"type": "string"},
-                    "result": {}
-                },
-                "required": ["server", "operation"]
-            }))
-    }
-
-    async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
-        let params = input.params;
-        let operation = params
-            .get("operation")
-            .and_then(Value::as_str)
-            .unwrap_or("call")
-            .to_string();
-
-        if operation == "list_tools" {
-            match self.invoke_list_tools().await {
-                Ok(tools) => {
-                    let mut exports = HashMap::new();
-                    exports.insert(
-                        "server".to_string(),
-                        Value::String(self.config.server_name.clone()),
-                    );
-                    exports.insert("operation".to_string(), Value::String(operation));
-                    exports.insert(
-                        "tools".to_string(),
-                        Value::Array(tools.into_iter().map(Value::String).collect()),
-                    );
-                    exports.insert("required".to_string(), Value::Bool(self.config.required));
-                    return ActionResult::success_with(exports);
-                }
-                Err(err) => return ActionResult::error(err),
-            }
-        }
-
-        if operation != "call" {
-            return ActionResult::error(format!(
-                "unsupported mcp operation '{}'; expected 'list_tools' or 'call'",
-                operation
-            ));
-        }
-
-        let Some(tool) = params.get("tool").and_then(Value::as_str) else {
-            return ActionResult::error("mcp call requires params.tool");
-        };
-        if !self.allows_tool(tool) {
-            return ActionResult::error(format!(
-                "mcp tool '{}' is disabled by config for server '{}'",
-                tool, self.config.server_name
-            ));
-        }
-
-        let arguments = params
-            .get("arguments")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-        let arguments = if arguments.is_null() {
-            json!({})
-        } else {
-            arguments
-        };
-
-        match self.invoke_call_tool(tool, arguments).await {
-            Ok(result) => {
-                let mut exports = HashMap::new();
-                exports.insert(
-                    "server".to_string(),
-                    Value::String(self.config.server_name.clone()),
-                );
-                exports.insert("operation".to_string(), Value::String(operation));
-                exports.insert("tool".to_string(), Value::String(tool.to_string()));
-                exports.insert("result".to_string(), result);
-                exports.insert("required".to_string(), Value::Bool(self.config.required));
-                ActionResult::success_with(exports)
-            }
-            Err(err) => ActionResult::error(err),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// McpToolAction — single-tool action (one per MCP tool, registered at startup)
-// ---------------------------------------------------------------------------
-
-struct McpToolAction {
-    /// Action name: mcp__<server>__<tool>
-    name: String,
-    /// Human-readable description from MCP tools/list
-    description: String,
-    /// Server connection config (reused from McpServerAction)
-    config: McpServerActionConfig,
-    /// The specific MCP tool name to invoke
-    tool_name: String,
-    /// Input schema from MCP tools/list
-    input_schema: Value,
-    /// Persistent stdio session (lazy-initialized, reused across calls)
-    persistent_session: Arc<tokio::sync::Mutex<Option<StdioMcpSession>>>,
-}
-
-impl McpToolAction {
-    fn from_spec(spec: &ActionSpec) -> Result<Self, ActionBuildError> {
-        let config: McpServerActionConfig =
-            serde_json::from_value(spec.config.clone()).map_err(|err| {
-                ActionBuildError::InvalidConfig(format!(
-                    "action '{}' invalid mcp_tool config: {}",
-                    spec.name, err
-                ))
-            })?;
-
-        let tool_name = spec
-            .config
-            .get("tool_name")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-
-        let input_schema = spec
-            .config
-            .get("tool_input_schema")
-            .cloned()
-            .unwrap_or(json!({"type": "object"}));
-
-        Ok(Self {
-            name: spec.name.clone(),
-            description: spec.description_or("Invoke an MCP tool"),
-            config,
-            tool_name,
-            input_schema,
-            persistent_session: Arc::new(tokio::sync::Mutex::new(None)),
-        })
-    }
-
-    fn io_timeout(&self) -> Duration {
-        Duration::from_millis(self.config.tool_timeout_ms.unwrap_or(20_000))
-    }
-
-    fn startup_timeout(&self) -> Duration {
-        Duration::from_millis(self.config.startup_timeout_ms.unwrap_or(15_000))
-    }
-
-    async fn invoke(&self, arguments: Value) -> Result<Value, String> {
-        if self.config.command.is_some() {
-            let mut guard = self.persistent_session.lock().await;
-
-            // Lazy-initialize: start MCP server once, reuse for all calls
-            if guard.is_none() {
-                tracing::info!(
-                    server = %self.config.server_name,
-                    tool = %self.tool_name,
-                    "Starting persistent MCP stdio session"
-                );
-                let mut session = StdioMcpSession::connect(
-                    self.config
-                        .command
-                        .as_deref()
-                        .ok_or_else(|| "missing command".to_string())?,
-                    &self.config.args,
-                    &self.config.env,
-                    self.startup_timeout(),
-                )
-                .await?;
-                session.initialize().await?;
-                *guard = Some(session);
-            }
-
-            let session = guard.as_mut().unwrap();
-            let params = json!({ "name": self.tool_name, "arguments": arguments });
-            let result = timeout(self.io_timeout(), session.request("tools/call", params))
-                .await
-                .map_err(|_| {
-                    // Session may be dead after timeout, drop it so next call reconnects
-                    *guard = None;
-                    format!(
-                        "mcp call timed out for server '{}' tool '{}'",
-                        self.config.server_name, self.tool_name
-                    )
-                })?;
-
-            // If request failed, drop session so next call reconnects
-            if result.is_err() {
-                *guard = None;
-            }
-
-            result
-        } else {
-            let url = self
-                .config
-                .url
-                .as_deref()
-                .ok_or_else(|| "missing url".to_string())?;
-            let client = reqwest::Client::new();
-            let mut headers = HeaderMap::new();
-            for (key, value) in &self.config.headers {
-                if let (Ok(name), Ok(value)) = (
-                    HeaderName::from_bytes(key.as_bytes()),
-                    HeaderValue::from_str(value),
-                ) {
-                    headers.insert(name, value);
-                }
-            }
-            if let Some(env_var) = &self.config.bearer_token_env_var {
-                if let Ok(token) = std::env::var(env_var) {
-                    let auth = format!("Bearer {}", token);
-                    if let Ok(value) = HeaderValue::from_str(&auth) {
-                        headers.insert(AUTHORIZATION, value);
-                    }
-                }
-            }
-            let payload = json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": { "name": self.tool_name, "arguments": arguments },
-            });
-            let send = client.post(url).headers(headers).json(&payload).send();
-            let response = timeout(self.io_timeout(), send)
-                .await
-                .map_err(|_| format!("mcp http request timed out to {}", url))?
-                .map_err(|err| format!("mcp http request failed: {}", err))?;
-
-            let status = response.status();
-            if !status.is_success() {
-                let body = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| "<unavailable>".to_string());
-                return Err(format!(
-                    "mcp http request failed with status {}: {}",
-                    status,
-                    truncate_text(&body, 800)
+                        "required": ["server", "tool", "result"],
+                        "properties": {
+                            "server": {"type": "string"},
+                            "tool": {"type": "string"},
+                            "result": {}
+                        },
+                        "additionalProperties": false
+                    }),
+                    effect_scopes: manager.config.effect_scopes(),
+                    restriction: restriction.clone(),
+                    idempotency: ToolIdempotency::NonIdempotent,
+                    concurrency: ToolConcurrency::GlobalSerial,
+                };
+                descriptor
+                    .validate()
+                    .map_err(|error| McpToolsAdapterError::Protocol(error.to_string()))?;
+                registrations.push((
+                    descriptor,
+                    Arc::new(GuardedMcpToolExecutor {
+                        manager: manager.clone(),
+                        tool_name: tool.name.clone(),
+                    }) as Arc<dyn GuardedToolExecutor>,
                 ));
             }
-            let value: Value = response
-                .json()
-                .await
-                .map_err(|err| format!("mcp http response is not JSON: {}", err))?;
-            if let Some(error) = value.get("error") {
-                return Err(format!("mcp rpc error: {}", error));
-            }
-            Ok(value.get("result").cloned().unwrap_or(Value::Null))
+        }
+        let tool_count = registrations.len();
+        for (descriptor, executor) in registrations {
+            runtime
+                .register(descriptor, executor)
+                .map_err(McpToolsAdapterError::ToolRuntime)?;
+        }
+        Ok(Self {
+            managers,
+            skipped_optional_servers,
+            tool_count,
+        })
+    }
+
+    pub fn tool_count(&self) -> usize {
+        self.tool_count
+    }
+
+    pub fn server_names(&self) -> BTreeSet<String> {
+        self.managers
+            .keys()
+            .map(|server| server.as_str().to_owned())
+            .collect()
+    }
+
+    pub fn skipped_optional_servers(&self) -> &BTreeMap<McpServerId, String> {
+        &self.skipped_optional_servers
+    }
+
+    pub fn manager(&self, server: &McpServerId) -> Option<Arc<McpServerConnectionManager>> {
+        self.managers.get(server).cloned()
+    }
+
+    pub async fn shutdown(&self) {
+        for manager in self.managers.values() {
+            manager.shutdown().await;
         }
     }
 }
 
+async fn shutdown_mcp_managers(managers: &BTreeMap<McpServerId, Arc<McpServerConnectionManager>>) {
+    for manager in managers.values() {
+        manager.shutdown().await;
+    }
+}
+
+struct GuardedMcpToolExecutor {
+    manager: Arc<McpServerConnectionManager>,
+    tool_name: String,
+}
+
 #[async_trait]
-impl Action for McpToolAction {
-    fn name(&self) -> &str {
-        &self.name
+impl GuardedToolExecutor for GuardedMcpToolExecutor {
+    fn approval_summary(
+        &self,
+        invocation: &orchestral_core::tool_protocol::ToolInvocation,
+    ) -> String {
+        let digest = invocation
+            .args_digest()
+            .map(|digest| digest.to_string())
+            .unwrap_or_else(|_| "invalid-arguments".to_owned());
+        format!(
+            "Call MCP server '{}' Tool '{}' with arguments {}",
+            self.manager.config.server_id, self.tool_name, digest
+        )
     }
 
-    fn description(&self) -> &str {
-        &self.description
-    }
-
-    fn metadata(&self) -> ActionMeta {
-        ActionMeta::new(self.name(), self.description())
-            .with_capabilities(["mcp", "side_effect", "tool_invocation"])
-            .with_input_schema(self.input_schema.clone())
-            .with_output_schema(json!({
-                "type": "object",
-                "properties": {
-                    "result": {}
-                },
-                "required": ["result"]
-            }))
-    }
-
-    async fn run(&self, input: ActionInput, _ctx: ActionContext) -> ActionResult {
-        // The input params ARE the tool arguments (direct pass-through).
-        let arguments = input.params;
-        match self.invoke(arguments).await {
-            Ok(result) => {
-                let mut exports = HashMap::new();
-                exports.insert("result".to_string(), result);
-                ActionResult::success_with(exports)
-            }
-            Err(err) => ActionResult::error(err),
+    async fn execute(&self, execution: GuardedToolExecution) -> ToolOutcome {
+        if execution.approval.is_none()
+            || execution.effective_policy.bounds().approval != ApprovalPolicy::Required
+        {
+            return ToolOutcome::Rejected {
+                code: "mcp_approval_missing".to_owned(),
+                message: "MCP Tool requires verified Host approval".to_owned(),
+            };
         }
+        let bounds = execution.effective_policy.bounds();
+        let program = self.manager.config.program.to_string_lossy().to_string();
+        let environment = self
+            .manager
+            .config
+            .environment
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if !bounds.process.allowed_programs.contains(&program)
+            || !environment.is_subset(&bounds.environment.allowed_variables)
+        {
+            return ToolOutcome::Rejected {
+                code: "mcp_policy_rejected".to_owned(),
+                message: "MCP process or environment exceeds the effective Host policy".to_owned(),
+            };
+        }
+        // This watcher outlives a dropped executor future. GuardedToolRuntime
+        // may finish the Run cancellation branch first, but the server process
+        // must still be terminated and reaped.
+        let cleanup_manager = self.manager.clone();
+        let cleanup_cancellation = execution.cancellation.clone();
+        let cleanup = tokio::spawn(async move {
+            cleanup_cancellation.cancelled().await;
+            cleanup_manager.shutdown().await;
+        });
+        let result = self
+            .manager
+            .invoke(
+                &self.tool_name,
+                execution.invocation.arguments,
+                execution.cancellation,
+            )
+            .await;
+        cleanup.abort();
+        match result {
+            Ok(result) => ToolOutcome::Completed {
+                output: json!({
+                    "server": self.manager.config.server_id,
+                    "tool": self.tool_name,
+                    "result": result,
+                })
+                .into(),
+            },
+            Err(GuardedMcpCallError::Rejected(message)) => ToolOutcome::Rejected {
+                code: "mcp_tool_rejected".to_owned(),
+                message,
+            },
+            Err(GuardedMcpCallError::Failed(message)) => ToolOutcome::Failed {
+                code: "mcp_call_failed".to_owned(),
+                message,
+                retryable: true,
+            },
+            Err(GuardedMcpCallError::ToolError(message)) => ToolOutcome::Failed {
+                code: "mcp_tool_error".to_owned(),
+                message,
+                retryable: false,
+            },
+            Err(GuardedMcpCallError::Unsupported(message)) => ToolOutcome::Failed {
+                code: "mcp_feature_unsupported".to_owned(),
+                message,
+                retryable: false,
+            },
+            Err(GuardedMcpCallError::UnknownEffect(message)) => {
+                ToolOutcome::UnknownEffect { message }
+            }
+            Err(GuardedMcpCallError::Cancelled) => ToolOutcome::Cancelled,
+        }
+    }
+}
+
+enum GuardedMcpCallError {
+    Rejected(String),
+    Failed(String),
+    ToolError(String),
+    Unsupported(String),
+    UnknownEffect(String),
+    Cancelled,
+}
+
+impl GuardedMcpCallError {
+    fn invalidates_session(&self) -> bool {
+        matches!(self, Self::Failed(_) | Self::UnknownEffect(_))
+    }
+}
+
+fn validate_mcp_call_result(
+    negotiated: &NegotiatedMcpProtocol,
+    result: Value,
+) -> Result<Value, GuardedMcpCallError> {
+    if negotiated.era == McpProtocolEra::Stateless {
+        match result.get("resultType").and_then(Value::as_str) {
+            Some("complete") => {}
+            Some("input_required") => {
+                return Err(GuardedMcpCallError::Unsupported(
+                    "MCP multi-round-trip input is not implemented by Tools Adapter v1".to_owned(),
+                ))
+            }
+            Some(other) => {
+                return Err(GuardedMcpCallError::Failed(format!(
+                    "MCP tools/call returned unknown resultType '{other}'"
+                )))
+            }
+            None => {
+                return Err(GuardedMcpCallError::Failed(
+                    "stateless MCP tools/call omitted resultType".to_owned(),
+                ))
+            }
+        }
+    }
+    if result.get("isError").and_then(Value::as_bool) == Some(true) {
+        return Err(GuardedMcpCallError::ToolError(result.to_string()));
+    }
+    Ok(result)
+}
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum McpToolsAdapterError {
+    #[error("invalid MCP Tools Adapter configuration: {0}")]
+    InvalidConfig(String),
+    #[error("MCP Tools transport failed: {0}")]
+    Transport(String),
+    #[error("MCP Tools protocol failed: {0}")]
+    Protocol(String),
+    #[error("MCP Tools registry conflict: {0}")]
+    Conflict(String),
+    #[error("MCP Tools startup was cancelled")]
+    Cancelled,
+    #[error(transparent)]
+    ToolRuntime(#[from] ToolRuntimeError),
+}
+
+fn sanitize_mcp_identifier(value: &str) -> String {
+    let normalized = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+                character.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let normalized = normalized.trim_matches('_');
+    if normalized.is_empty() {
+        "unnamed".to_owned()
+    } else {
+        normalized.to_owned()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NegotiatedMcpProtocol {
+    version: String,
+    era: McpProtocolEra,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum StdioMcpRequestError {
+    #[error("MCP JSON-RPC error {code}: {message}")]
+    Rpc { code: i64, message: String },
+    #[error("MCP transport error: {0}")]
+    Transport(String),
+    #[error("MCP protocol error: {0}")]
+    Protocol(String),
+}
+
+impl StdioMcpRequestError {
+    fn permits_legacy_fallback(&self) -> bool {
+        matches!(
+            self,
+            Self::Rpc {
+                code: -32601 | -32022,
+                ..
+            }
+        )
+    }
+
+    fn is_transport(&self) -> bool {
+        matches!(self, Self::Transport(_))
     }
 }
 
@@ -676,7 +907,9 @@ struct StdioMcpSession {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
-    startup_timeout: Duration,
+    process_group_id: Option<u32>,
+    negotiated: Option<NegotiatedMcpProtocol>,
+    max_frame_bytes: usize,
 }
 
 impl StdioMcpSession {
@@ -684,13 +917,13 @@ impl StdioMcpSession {
         command: &str,
         args: &[String],
         env: &HashMap<String, String>,
-        startup_timeout: Duration,
     ) -> Result<Self, String> {
         let mut cmd = Command::new(command);
         cmd.args(args);
-        if !env.is_empty() {
-            cmd.envs(env);
-        }
+        // MCP stdio servers receive only the Host-configured environment.
+        cmd.env_clear();
+        cmd.envs(env);
+        isolate_mcp_process_group(&mut cmd);
         cmd.kill_on_drop(true)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -700,6 +933,7 @@ impl StdioMcpSession {
             .spawn()
             .map_err(|err| format!("spawn mcp process failed: {}", err))?;
 
+        let process_group_id = child.id();
         let stdin = child
             .stdin
             .take()
@@ -714,33 +948,101 @@ impl StdioMcpSession {
             stdin,
             stdout: BufReader::new(stdout),
             next_id: 1,
-            startup_timeout,
+            process_group_id,
+            negotiated: None,
+            max_frame_bytes: DEFAULT_MCP_MAX_FRAME_BYTES,
         })
     }
 
-    async fn initialize(&mut self) -> Result<(), String> {
+    async fn probe_stateless(&mut self) -> Result<bool, StdioMcpRequestError> {
+        let params = attach_stateless_request_metadata(json!({}))?;
+        let result = match self.request_raw("server/discover", params).await {
+            Ok(result) => result,
+            Err(error) if error.permits_legacy_fallback() => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let versions = result
+            .get("supportedVersions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                StdioMcpRequestError::Protocol(
+                    "server/discover omitted supportedVersions".to_owned(),
+                )
+            })?;
+        if !versions
+            .iter()
+            .any(|version| version.as_str() == Some(MCP_STATELESS_PROTOCOL_2026_07_28))
+        {
+            return Ok(false);
+        }
+        if result
+            .get("capabilities")
+            .and_then(|value| value.get("tools"))
+            .and_then(Value::as_object)
+            .is_none()
+        {
+            return Err(StdioMcpRequestError::Protocol(
+                "MCP server does not advertise the tools capability".to_owned(),
+            ));
+        }
+        self.negotiated = Some(NegotiatedMcpProtocol {
+            version: MCP_STATELESS_PROTOCOL_2026_07_28.to_owned(),
+            era: McpProtocolEra::Stateless,
+        });
+        Ok(true)
+    }
+
+    async fn initialize_guarded_legacy(&mut self) -> Result<(), StdioMcpRequestError> {
         let params = json!({
-            "protocolVersion": "2025-06-18",
-            "capabilities": {
-                "tools": {}
-            },
+            "protocolVersion": MCP_LATEST_LEGACY_PROTOCOL,
+            "capabilities": {},
             "clientInfo": {
                 "name": "orchestral",
                 "version": env!("CARGO_PKG_VERSION")
             }
         });
-        let _ = timeout(self.startup_timeout, self.request("initialize", params))
+        let result = self.request_raw("initialize", params).await?;
+        let version = result
+            .get("protocolVersion")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                StdioMcpRequestError::Protocol(
+                    "legacy initialize response omitted protocolVersion".to_owned(),
+                )
+            })?;
+        const SUPPORTED_LEGACY: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+        if !SUPPORTED_LEGACY.contains(&version) {
+            return Err(StdioMcpRequestError::Protocol(format!(
+                "server selected unsupported legacy MCP version '{version}'"
+            )));
+        }
+        if result
+            .get("capabilities")
+            .and_then(|value| value.get("tools"))
+            .and_then(Value::as_object)
+            .is_none()
+        {
+            return Err(StdioMcpRequestError::Protocol(
+                "legacy MCP server does not advertise the tools capability".to_owned(),
+            ));
+        }
+        self.negotiated = Some(NegotiatedMcpProtocol {
+            version: version.to_owned(),
+            era: McpProtocolEra::LegacyHandshake,
+        });
+        self.notification("notifications/initialized", json!({}))
             .await
-            .map_err(|_| "mcp initialize timed out".to_string())??;
+            .map_err(StdioMcpRequestError::Transport)
+    }
 
-        let _ = self
-            .notification("notifications/initialized", json!({}))
-            .await;
-        Ok(())
+    fn negotiated_protocol(&self) -> Result<&NegotiatedMcpProtocol, StdioMcpRequestError> {
+        self.negotiated.as_ref().ok_or_else(|| {
+            StdioMcpRequestError::Protocol("MCP transport was not negotiated".to_owned())
+        })
     }
 
     async fn shutdown(&mut self) -> Result<(), String> {
-        let _ = self.child.kill().await;
+        terminate_mcp_process_tree(&mut self.child, self.process_group_id).await;
         Ok(())
     }
 
@@ -754,6 +1056,22 @@ impl StdioMcpSession {
     }
 
     async fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        let params = match self.negotiated.as_ref().map(|value| value.era) {
+            Some(McpProtocolEra::Stateless) => {
+                attach_stateless_request_metadata(params).map_err(|error| error.to_string())?
+            }
+            _ => params,
+        };
+        self.request_raw(method, params)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn request_raw(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, StdioMcpRequestError> {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         let payload = json!({
@@ -762,21 +1080,44 @@ impl StdioMcpSession {
             "method": method,
             "params": params,
         });
-        self.write_frame(&payload).await?;
+        self.write_frame(&payload)
+            .await
+            .map_err(StdioMcpRequestError::Transport)?;
 
         loop {
-            let msg = self.read_frame().await?;
+            let msg = self
+                .read_frame()
+                .await
+                .map_err(StdioMcpRequestError::Transport)?;
             let matched = msg
                 .get("id")
                 .and_then(Value::as_u64)
                 .map(|value| value == id)
                 .unwrap_or(false);
             if !matched {
+                if msg.get("id").is_some() && msg.get("method").is_some() {
+                    return Err(StdioMcpRequestError::Protocol(
+                        "MCP server initiated a request without a negotiated client capability"
+                            .to_owned(),
+                    ));
+                }
+                if msg.get("id").is_some() {
+                    return Err(StdioMcpRequestError::Protocol(format!(
+                        "MCP server returned an unexpected response id while waiting for {id}"
+                    )));
+                }
                 continue;
             }
 
             if let Some(error) = msg.get("error") {
-                return Err(format!("mcp rpc error: {}", error));
+                return Err(StdioMcpRequestError::Rpc {
+                    code: error.get("code").and_then(Value::as_i64).unwrap_or(-32000),
+                    message: error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| error.to_string()),
+                });
             }
             return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
         }
@@ -786,6 +1127,12 @@ impl StdioMcpSession {
         // Use NDJSON (newline-delimited JSON) — compatible with all MCP servers.
         let body = serde_json::to_vec(payload)
             .map_err(|err| format!("serialize mcp payload failed: {}", err))?;
+        if body.len() > self.max_frame_bytes {
+            return Err(format!(
+                "MCP request frame exceeds the {} byte limit",
+                self.max_frame_bytes
+            ));
+        }
         self.stdin
             .write_all(&body)
             .await
@@ -803,15 +1150,7 @@ impl StdioMcpSession {
     async fn read_frame(&mut self) -> Result<Value, String> {
         // Auto-detect: NDJSON (line = JSON) or LSP (Content-Length header).
         loop {
-            let mut line = String::new();
-            let read = self
-                .stdout
-                .read_line(&mut line)
-                .await
-                .map_err(|err| format!("read mcp frame failed: {}", err))?;
-            if read == 0 {
-                return Err("mcp process closed stdout".to_string());
-            }
+            let line = self.read_bounded_line().await?;
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
@@ -825,9 +1164,14 @@ impl StdioMcpSession {
             if let Some((key, value)) = trimmed.split_once(':') {
                 if key.trim().eq_ignore_ascii_case("content-length") {
                     if let Ok(len) = value.trim().parse::<usize>() {
+                        if len > self.max_frame_bytes {
+                            return Err(format!(
+                                "MCP response frame exceeds the {} byte limit",
+                                self.max_frame_bytes
+                            ));
+                        }
                         // Read blank line after headers
-                        let mut blank = String::new();
-                        let _ = self.stdout.read_line(&mut blank).await;
+                        let _ = self.read_bounded_line().await?;
                         // Read exact body
                         let mut body = vec![0_u8; len];
                         self.stdout
@@ -841,558 +1185,84 @@ impl StdioMcpSession {
             }
         }
     }
-}
 
-fn extract_tool_names(result: &Value) -> Vec<String> {
-    let mut names = result
-        .get("tools")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.get("name").and_then(Value::as_str))
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    names.sort();
-    names.dedup();
-    names
-}
-
-fn truncate_text(text: &str, max_chars: usize) -> String {
-    let char_count = text.chars().count();
-    if char_count <= max_chars {
-        return text.to_string();
-    }
-    let mut truncated = text.chars().take(max_chars).collect::<String>();
-    truncated.push_str(&format!("... [truncated total_chars={}]", char_count));
-    truncated
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-
-    use orchestral_core::config::ActionSpec;
-    use orchestral_core::store::WorkingSet;
-    use serde_json::json;
-    use tokio::sync::RwLock;
-
-    fn test_ctx() -> ActionContext {
-        ActionContext::new(
-            "task-1",
-            "s1",
-            "exec-1",
-            Arc::new(RwLock::new(WorkingSet::new())),
-        )
-    }
-
-    fn build_mock_mcp_stdio_script(second_result: Value) -> String {
-        build_mock_mcp_stdio_script_with(json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "result": second_result
-        }))
-    }
-
-    fn build_mock_mcp_stdio_error_script(error_body: Value) -> String {
-        build_mock_mcp_stdio_script_with(json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "error": error_body,
-        }))
-    }
-
-    fn build_mock_mcp_stdio_script_with(second_payload: Value) -> String {
-        let init_payload = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": {
-                "serverInfo": {
-                    "name": "mock",
-                    "version": "1.0.0"
-                }
-            }
-        })
-        .to_string();
-        let second_payload = second_payload.to_string();
-        format!(
-            "printf 'Content-Length: {}\\r\\n\\r\\n{}'; printf 'Content-Length: {}\\r\\n\\r\\n{}'; cat >/dev/null",
-            init_payload.len(),
-            init_payload,
-            second_payload.len(),
-            second_payload
-        )
-    }
-
-    #[test]
-    fn from_spec_requires_command_or_url() {
-        let spec = ActionSpec {
-            name: "mcp__bad".to_string(),
-            kind: "mcp_server".to_string(),
-            description: None,
-            category: None,
-            config: json!({
-                "server_name": "bad"
-            }),
-            interface: None,
-        };
-
-        match McpServerAction::from_spec(&spec) {
-            Ok(_) => panic!("should fail"),
-            Err(err) => assert!(err.to_string().contains("requires command or url")),
-        }
-    }
-
-    #[test]
-    fn allows_tool_respects_enabled_and_disabled_lists() {
-        let spec = ActionSpec {
-            name: "mcp__alpha".to_string(),
-            kind: "mcp_server".to_string(),
-            description: None,
-            category: None,
-            config: json!({
-                "server_name": "alpha",
-                "command": "node",
-                "args": ["server.js"],
-                "enabled_tools": ["allowed", "blocked"],
-                "disabled_tools": ["blocked"]
-            }),
-            interface: None,
-        };
-
-        let action = McpServerAction::from_spec(&spec).expect("parse action");
-        assert!(action.allows_tool("allowed"));
-        assert!(!action.allows_tool("blocked"));
-        assert!(!action.allows_tool("unknown"));
-    }
-
-    #[test]
-    fn extract_tool_names_sorts_and_deduplicates() {
-        let result = json!({
-            "tools": [
-                {"name": "zeta"},
-                {"name": "alpha"},
-                {"name": "alpha"}
-            ]
-        });
-
-        let names = extract_tool_names(&result);
-        assert_eq!(names, vec!["alpha".to_string(), "zeta".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn run_list_tools_over_stdio_returns_success_exports() {
-        let script = build_mock_mcp_stdio_script(json!({
-            "tools": [
-                {"name":"tool_a"},
-                {"name":"tool_b"}
-            ]
-        }));
-
-        let spec = ActionSpec {
-            name: "mcp__alpha".to_string(),
-            kind: "mcp_server".to_string(),
-            description: None,
-            category: None,
-            config: json!({
-                "server_name": "alpha",
-                "command": "sh",
-                "args": ["-c", script],
-            }),
-            interface: None,
-        };
-        let action = McpServerAction::from_spec(&spec).expect("build action");
-        let result = action
-            .run(
-                ActionInput::with_params(json!({"operation":"list_tools"})),
-                test_ctx(),
-            )
-            .await;
-
-        match result {
-            ActionResult::Success { exports } => {
-                assert_eq!(exports.get("server"), Some(&json!("alpha")));
-                assert_eq!(exports.get("operation"), Some(&json!("list_tools")));
-                assert_eq!(exports.get("tools"), Some(&json!(["tool_a", "tool_b"])));
-            }
-            other => panic!("expected success result, got {:?}", other),
-        }
-    }
-
-    #[tokio::test]
-    async fn probe_mcp_server_tools_returns_descriptors_with_schemas() {
-        let script = build_mock_mcp_stdio_script(json!({
-            "tools": [
-                {
-                    "name": "create_issue",
-                    "description": "Create a GitHub issue",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "repo": { "type": "string" },
-                            "title": { "type": "string" }
-                        },
-                        "required": ["repo", "title"]
+    async fn read_bounded_line(&mut self) -> Result<String, String> {
+        let mut bytes = Vec::new();
+        loop {
+            let (chunk, consumed, complete) = {
+                let available = self
+                    .stdout
+                    .fill_buf()
+                    .await
+                    .map_err(|error| format!("read MCP frame failed: {error}"))?;
+                if available.is_empty() {
+                    if bytes.is_empty() {
+                        return Err("mcp process closed stdout".to_owned());
                     }
-                },
-                {
-                    "name": "list_repos",
-                    "description": "List repositories"
+                    (Vec::new(), 0, true)
+                } else if let Some(index) = available.iter().position(|byte| *byte == b'\n') {
+                    (available[..=index].to_vec(), index + 1, true)
+                } else {
+                    (available.to_vec(), available.len(), false)
                 }
-            ]
-        }));
-
-        let spec = ActionSpec {
-            name: "mcp__github".to_string(),
-            kind: "mcp_server".to_string(),
-            description: None,
-            category: None,
-            config: json!({
-                "server_name": "github",
-                "command": "sh",
-                "args": ["-c", script],
-            }),
-            interface: None,
-        };
-
-        let tools = probe_mcp_server_tools(&spec).await.expect("probe tools");
-        assert_eq!(tools.len(), 2);
-        assert_eq!(tools[0].name, "create_issue");
-        assert_eq!(tools[0].description, "Create a GitHub issue");
-        assert!(tools[0].input_schema.get("properties").is_some());
-        assert_eq!(tools[1].name, "list_repos");
-        // list_repos has no inputSchema, should default to {"type": "object"}
-        assert_eq!(tools[1].input_schema, json!({"type": "object"}));
-    }
-
-    #[tokio::test]
-    async fn probe_mcp_server_tools_respects_enabled_disabled_filter() {
-        let script = build_mock_mcp_stdio_script(json!({
-            "tools": [
-                { "name": "allowed_tool", "description": "ok" },
-                { "name": "blocked_tool", "description": "nope" }
-            ]
-        }));
-
-        let spec = ActionSpec {
-            name: "mcp__filtered".to_string(),
-            kind: "mcp_server".to_string(),
-            description: None,
-            category: None,
-            config: json!({
-                "server_name": "filtered",
-                "command": "sh",
-                "args": ["-c", script],
-                "disabled_tools": ["blocked_tool"]
-            }),
-            interface: None,
-        };
-
-        let tools = probe_mcp_server_tools(&spec).await.expect("probe tools");
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name, "allowed_tool");
-    }
-
-    #[tokio::test]
-    async fn mcp_tool_action_calls_tool_directly() {
-        let script = build_mock_mcp_stdio_script(json!({
-            "content": [{"type": "text", "text": "issue created"}],
-            "is_error": false
-        }));
-
-        let spec = ActionSpec {
-            name: "mcp__github__create_issue".to_string(),
-            kind: "mcp_tool".to_string(),
-            description: Some("Create a GitHub issue".to_string()),
-            category: None,
-            config: json!({
-                "server_name": "github",
-                "command": "sh",
-                "args": ["-c", script],
-                "tool_name": "create_issue",
-                "tool_input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "repo": { "type": "string" },
-                        "title": { "type": "string" }
-                    },
-                    "required": ["repo", "title"]
-                }
-            }),
-            interface: None,
-        };
-
-        let action = McpToolAction::from_spec(&spec).expect("build mcp_tool action");
-        assert_eq!(action.name(), "mcp__github__create_issue");
-        assert_eq!(action.tool_name, "create_issue");
-
-        // Verify metadata uses the tool's input schema
-        let meta = action.metadata();
-        assert!(meta.input_schema.get("properties").is_some());
-        assert!(meta.has_capability("mcp"));
-
-        let result = action
-            .run(
-                ActionInput::with_params(json!({
-                    "repo": "foo/bar",
-                    "title": "Bug report"
-                })),
-                test_ctx(),
-            )
-            .await;
-
-        match result {
-            ActionResult::Success { exports } => {
-                let result_val = exports.get("result").expect("result export");
-                assert!(result_val.get("content").is_some());
+            };
+            if bytes.len().saturating_add(chunk.len()) > self.max_frame_bytes {
+                return Err(format!(
+                    "MCP response line exceeds the {} byte limit",
+                    self.max_frame_bytes
+                ));
             }
-            other => panic!("expected success, got {:?}", other),
+            bytes.extend_from_slice(&chunk);
+            self.stdout.consume(consumed);
+            if complete {
+                return String::from_utf8(bytes)
+                    .map_err(|error| format!("MCP response is not UTF-8: {error}"));
+            }
         }
     }
+}
 
-    #[tokio::test]
-    async fn run_call_over_stdio_invokes_tool_and_returns_payload() {
-        let script = build_mock_mcp_stdio_script(json!({
-            "content":[{"type":"text","text":"pong"}],
-            "is_error": false
-        }));
+fn attach_stateless_request_metadata(mut params: Value) -> Result<Value, StdioMcpRequestError> {
+    let object = params.as_object_mut().ok_or_else(|| {
+        StdioMcpRequestError::Protocol("MCP request params must be an object".to_owned())
+    })?;
+    if object.contains_key("_meta") {
+        return Err(StdioMcpRequestError::Protocol(
+            "MCP caller cannot override Host request metadata".to_owned(),
+        ));
+    }
+    object.insert(
+        "_meta".to_owned(),
+        json!({
+            "io.modelcontextprotocol/protocolVersion": MCP_STATELESS_PROTOCOL_2026_07_28,
+            "io.modelcontextprotocol/clientInfo": {
+                "name": "orchestral",
+                "version": env!("CARGO_PKG_VERSION")
+            },
+            "io.modelcontextprotocol/clientCapabilities": {}
+        }),
+    );
+    Ok(params)
+}
 
-        let spec = ActionSpec {
-            name: "mcp__alpha".to_string(),
-            kind: "mcp_server".to_string(),
-            description: None,
-            category: None,
-            config: json!({
-                "server_name": "alpha",
-                "command": "sh",
-                "args": ["-c", script],
-                "enabled_tools": ["ping"]
-            }),
-            interface: None,
-        };
-        let action = McpServerAction::from_spec(&spec).expect("build action");
-        let result = action
-            .run(
-                ActionInput::with_params(json!({
-                    "operation":"call",
-                    "tool":"ping",
-                    "arguments":{"x":1}
-                })),
-                test_ctx(),
-            )
-            .await;
+#[cfg(unix)]
+fn isolate_mcp_process_group(command: &mut Command) {
+    command.process_group(0);
+}
 
-        match result {
-            ActionResult::Success { exports } => {
-                assert_eq!(exports.get("server"), Some(&json!("alpha")));
-                assert_eq!(exports.get("operation"), Some(&json!("call")));
-                assert_eq!(exports.get("tool"), Some(&json!("ping")));
-                assert_eq!(
-                    exports
-                        .get("result")
-                        .and_then(|v| v.get("content"))
-                        .and_then(|v| v.as_array())
-                        .map(|v| !v.is_empty()),
-                    Some(true)
-                );
-            }
-            other => panic!("expected success result, got {:?}", other),
+#[cfg(not(unix))]
+fn isolate_mcp_process_group(_command: &mut Command) {}
+
+async fn terminate_mcp_process_tree(child: &mut Child, process_group_id: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(process_group_id) = process_group_id.filter(|id| *id <= i32::MAX as u32) {
+        // SAFETY: this child was spawned as leader of a fresh process group.
+        unsafe {
+            libc::kill(-(process_group_id as i32), libc::SIGKILL);
         }
     }
-
-    // --- Error propagation tests ---
-
-    #[tokio::test]
-    async fn tool_call_surfaces_jsonrpc_error_as_action_error() {
-        let script = build_mock_mcp_stdio_error_script(json!({
-            "code": -32000,
-            "message": "upstream refused the request"
-        }));
-
-        let spec = ActionSpec {
-            name: "mcp__alpha".to_string(),
-            kind: "mcp_server".to_string(),
-            description: None,
-            category: None,
-            config: json!({
-                "server_name": "alpha",
-                "command": "sh",
-                "args": ["-c", script],
-                "enabled_tools": ["ping"]
-            }),
-            interface: None,
-        };
-        let action = McpServerAction::from_spec(&spec).expect("build action");
-        let result = action
-            .run(
-                ActionInput::with_params(json!({
-                    "operation": "call",
-                    "tool": "ping",
-                    "arguments": {}
-                })),
-                test_ctx(),
-            )
-            .await;
-
-        match result {
-            ActionResult::Error { message } => {
-                let lowered = message.to_lowercase();
-                assert!(
-                    lowered.contains("rpc") || lowered.contains("error"),
-                    "{message}"
-                );
-                assert!(
-                    message.contains("upstream refused"),
-                    "error message should carry the server's reason, got: {message}"
-                );
-            }
-            other => panic!("expected Error for JSON-RPC error, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn tool_call_rejects_disabled_tool_before_reaching_server() {
-        let spec = ActionSpec {
-            name: "mcp__alpha".to_string(),
-            kind: "mcp_server".to_string(),
-            description: None,
-            category: None,
-            config: json!({
-                "server_name": "alpha",
-                // Intentionally point to a non-existent binary — if the guard fails to
-                // short-circuit, spawning the server would surface a different error.
-                "command": "/nonexistent/mcp-server-binary",
-                "args": [],
-                "enabled_tools": ["allowed_tool"],
-                "disabled_tools": ["blocked_tool"]
-            }),
-            interface: None,
-        };
-        let action = McpServerAction::from_spec(&spec).expect("build action");
-
-        let result = action
-            .run(
-                ActionInput::with_params(json!({
-                    "operation": "call",
-                    "tool": "blocked_tool",
-                    "arguments": {}
-                })),
-                test_ctx(),
-            )
-            .await;
-
-        match result {
-            ActionResult::Error { message } => {
-                assert!(
-                    message.contains("blocked_tool") && message.to_lowercase().contains("disabled"),
-                    "expected disabled-tool error, got: {message}"
-                );
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn call_operation_requires_tool_parameter() {
-        let spec = ActionSpec {
-            name: "mcp__alpha".to_string(),
-            kind: "mcp_server".to_string(),
-            description: None,
-            category: None,
-            config: json!({
-                "server_name": "alpha",
-                "command": "/nonexistent/mcp-server-binary",
-                "args": [],
-            }),
-            interface: None,
-        };
-        let action = McpServerAction::from_spec(&spec).expect("build action");
-        let result = action
-            .run(
-                ActionInput::with_params(json!({"operation": "call"})),
-                test_ctx(),
-            )
-            .await;
-
-        match result {
-            ActionResult::Error { message } => {
-                assert!(
-                    message.to_lowercase().contains("tool"),
-                    "error should mention missing tool param, got: {message}"
-                );
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn unknown_operation_returns_structured_error() {
-        let spec = ActionSpec {
-            name: "mcp__alpha".to_string(),
-            kind: "mcp_server".to_string(),
-            description: None,
-            category: None,
-            config: json!({
-                "server_name": "alpha",
-                "command": "/nonexistent/mcp-server-binary",
-                "args": [],
-            }),
-            interface: None,
-        };
-        let action = McpServerAction::from_spec(&spec).expect("build action");
-        let result = action
-            .run(
-                ActionInput::with_params(json!({"operation": "reboot_universe"})),
-                test_ctx(),
-            )
-            .await;
-
-        match result {
-            ActionResult::Error { message } => {
-                assert!(
-                    message.contains("reboot_universe"),
-                    "error should echo the unknown operation, got: {message}"
-                );
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn stdio_server_spawn_failure_maps_to_error() {
-        let spec = ActionSpec {
-            name: "mcp__alpha".to_string(),
-            kind: "mcp_server".to_string(),
-            description: None,
-            category: None,
-            config: json!({
-                "server_name": "alpha",
-                // Use an executable that is guaranteed not to exist.
-                "command": "/definitely/not/a/binary/that/exists",
-                "args": [],
-                "startup_timeout_ms": 500,
-                "enabled_tools": ["ping"]
-            }),
-            interface: None,
-        };
-        let action = McpServerAction::from_spec(&spec).expect("build action");
-        let result = action
-            .run(
-                ActionInput::with_params(json!({
-                    "operation": "call",
-                    "tool": "ping",
-                    "arguments": {}
-                })),
-                test_ctx(),
-            )
-            .await;
-
-        assert!(
-            matches!(result, ActionResult::Error { .. }),
-            "stdio spawn failure should map to ActionResult::Error, got {result:?}"
-        );
-    }
+    #[cfg(not(unix))]
+    let _ = process_group_id;
+    let _ = child.kill().await;
+    let _ = timeout(Duration::from_secs(1), child.wait()).await;
 }

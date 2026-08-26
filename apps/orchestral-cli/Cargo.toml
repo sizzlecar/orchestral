@@ -13,8 +13,13 @@ readme = "../../README.md"
 [dependencies]
 orchestral-core = { workspace = true }
 orchestral-runtime = { workspace = true }
+orchestral-agent-journal-fs = { path = "../../plugins/orchestral-agent-journal-fs" }
+orchestral-blob-fs = { path = "../../plugins/orchestral-blob-fs" }
+orchestral-model-gemini = { workspace = true }
+orchestral-model-openai = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }

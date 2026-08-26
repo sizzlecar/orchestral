@@ -3,22 +3,11 @@ name = "orchestral-examples"
 version = "0.1.0"
 edition = "2021"
 publish = false
+autoexamples = false
 
 [[example]]
-name = "basic_usage"
-path = "basic_usage.rs"
-
-[[example]]
-name = "runtime_pipeline"
-path = "runtime_pipeline.rs"
-
-[[example]]
-name = "llm_planner"
-path = "llm_planner.rs"
-
-[[example]]
-name = "config_loading"
-path = "config_loading.rs"
+name = "agent_session"
+path = "agent_session.rs"
 
 [dependencies]
 orchestral-core = { path = "../core/orchestral-core" }
@@ -28,3 +17,5 @@ async-trait = "0.1"
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures-util = "0.3"
+tokio-util = "0.7"

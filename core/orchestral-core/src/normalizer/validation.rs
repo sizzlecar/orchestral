@@ -1,10 +1,7 @@
 use crate::executor::ExecutionDag;
 use crate::types::{Plan, StepKind};
 
-use super::{
-    agent::validate_agent_params, implicit::parse_step_binding_source, NormalizeError,
-    PlanNormalizer, ValidationError,
-};
+use super::{implicit::parse_step_binding_source, NormalizeError, PlanNormalizer, ValidationError};
 
 impl PlanNormalizer {
     pub(super) fn validate_basic(&self, plan: &Plan) -> Result<(), ValidationError> {
@@ -30,7 +27,6 @@ impl PlanNormalizer {
                     ));
                 }
             }
-
             for binding in &step.io_bindings {
                 let (source_step, source_key) = match parse_step_binding_source(&binding.from) {
                     Some(parts) => parts,
@@ -68,8 +64,6 @@ impl PlanNormalizer {
                     }
                 }
             }
-
-            validate_agent_params(step)?;
         }
 
         if !self.known_actions.is_empty() {

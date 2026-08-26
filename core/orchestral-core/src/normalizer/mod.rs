@@ -9,17 +9,15 @@
 //! - Repair common LLM planning errors
 //! - Produce an executable DAG for the executor
 
-mod agent;
 mod implicit;
 mod validation;
 
 use thiserror::Error;
 
-use crate::action::ActionMeta;
 use crate::executor::ExecutionDag;
 use crate::types::Plan;
 
-use self::implicit::{fix_control_flow_dependencies, output_keys_from_schema, ActionContract};
+use self::implicit::{fix_control_flow_dependencies, ActionContract};
 
 /// Validation errors
 #[derive(Debug, Error)]
@@ -44,9 +42,6 @@ pub enum ValidationError {
 
     #[error("Step '{0}' binds from '{1}' but does not depend on that step")]
     IoBindingMissingDependency(String, String),
-
-    #[error("Invalid agent params in step '{0}': {1}")]
-    InvalidAgentParams(String, String),
 }
 
 /// Fix errors
@@ -128,13 +123,6 @@ impl PlanNormalizer {
     pub fn register_action(&mut self, name: impl Into<String>) {
         let name = name.into();
         self.known_actions.entry(name).or_default();
-    }
-
-    /// Register a known action with metadata-derived contract.
-    pub fn register_action_meta(&mut self, meta: &ActionMeta) {
-        let output_keys = output_keys_from_schema(&meta.output_schema);
-        self.known_actions
-            .insert(meta.name.clone(), ActionContract { output_keys });
     }
 
     /// Normalize a plan
@@ -250,322 +238,11 @@ mod tests {
     }
 
     #[test]
-    fn test_normalizer_populates_exports_from_action_output_schema() {
-        let mut normalizer = PlanNormalizer::new();
-        normalizer.register_action_meta(&ActionMeta::new("write_doc", "write").with_output_schema(
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "bytes": { "type": "integer" }
-                },
-                "required": ["path", "bytes"]
-            }),
-        ));
-
-        let plan = Plan::new("exports", vec![Step::action("s1", "write_doc")]);
-        let normalized = normalizer.normalize(plan).expect("normalize");
-        let step = normalized.plan.get_step("s1").expect("s1");
-        assert_eq!(step.exports, vec!["path".to_string(), "bytes".to_string()]);
-    }
-
-    #[test]
     fn test_normalizer_infers_wait_user_kind_from_action_name() {
         let normalizer = PlanNormalizer::new();
         let plan = Plan::new("wait", vec![Step::action("s1", "wait_user")]);
         let normalized = normalizer.normalize(plan).expect("normalize");
         let step = normalized.plan.get_step("s1").expect("s1");
         assert_eq!(step.kind, StepKind::WaitUser);
-    }
-
-    #[test]
-    fn test_normalizer_infers_agent_kind_and_applies_default_iterations() {
-        let normalizer = PlanNormalizer::new();
-        let plan = Plan::new(
-            "agent",
-            vec![Step::action("s1", "agent").with_params(json!({
-                "goal": "inspect workbook structure",
-                "allowed_actions": ["file_read", "shell"],
-                "output_keys": ["inspection"]
-            }))],
-        );
-
-        let normalized = normalizer.normalize(plan).expect("normalize");
-        let step = normalized.plan.get_step("s1").expect("s1");
-        assert_eq!(step.kind, StepKind::Agent);
-        assert_eq!(
-            step.params
-                .get("max_iterations")
-                .and_then(|v| v.as_u64())
-                .expect("max_iterations"),
-            5
-        );
-    }
-
-    #[test]
-    fn test_normalizer_rejects_agent_params_without_goal() {
-        let normalizer = PlanNormalizer::new();
-        let plan = Plan::new(
-            "agent-invalid",
-            vec![Step::agent("s1").with_params(json!({
-                "allowed_actions": ["file_read"],
-                "max_iterations": 3,
-                "output_keys": ["summary"]
-            }))],
-        );
-
-        let err = normalizer
-            .normalize(plan)
-            .expect_err("expected validation error");
-        match err {
-            NormalizeError::Validation(ValidationError::InvalidAgentParams(step_id, reason)) => {
-                assert_eq!(step_id, "s1");
-                assert!(reason.contains("goal"));
-            }
-            other => panic!("unexpected error: {other}"),
-        }
-    }
-
-    #[test]
-    fn test_normalizer_rejects_agent_params_when_iterations_out_of_range() {
-        let normalizer = PlanNormalizer::new();
-        let plan = Plan::new(
-            "agent-invalid",
-            vec![Step::agent("s1").with_params(json!({
-                "goal": "inspect",
-                "allowed_actions": ["file_read"],
-                "max_iterations": 99,
-                "output_keys": ["summary"]
-            }))],
-        );
-
-        let err = normalizer
-            .normalize(plan)
-            .expect_err("expected validation error");
-        match err {
-            NormalizeError::Validation(ValidationError::InvalidAgentParams(step_id, reason)) => {
-                assert_eq!(step_id, "s1");
-                assert!(reason.contains("max_iterations"));
-            }
-            other => panic!("unexpected error: {other}"),
-        }
-    }
-
-    #[test]
-    fn test_normalizer_populates_agent_exports_from_output_keys() {
-        let normalizer = PlanNormalizer::new();
-        let plan = Plan::new(
-            "agent-exports",
-            vec![Step::agent("s1").with_params(json!({
-                "goal": "inspect",
-                "allowed_actions": ["file_read"],
-                "max_iterations": 3,
-                "output_keys": ["summary", "next_step"]
-            }))],
-        );
-
-        let normalized = normalizer.normalize(plan).expect("normalize");
-        let step = normalized.plan.get_step("s1").expect("s1");
-        assert_eq!(
-            step.exports,
-            vec!["summary".to_string(), "next_step".to_string()]
-        );
-    }
-
-    #[test]
-    fn test_normalizer_applies_leaf_agent_defaults() {
-        let normalizer = PlanNormalizer::new();
-        let plan = Plan::new(
-            "leaf-defaults",
-            vec![Step::leaf_agent("s1").with_params(json!({
-                "mode": "leaf",
-                "goal": "derive a patch",
-                "output_keys": ["change_spec"]
-            }))],
-        );
-
-        let normalized = normalizer.normalize(plan).expect("normalize");
-        let step = normalized.plan.get_step("s1").expect("s1");
-        assert_eq!(step.kind, StepKind::Agent);
-        assert_eq!(
-            step.params.get("allowed_actions"),
-            Some(&json!(["json_stdout"]))
-        );
-        assert_eq!(step.params.get("max_iterations"), Some(&json!(1)));
-        assert_eq!(step.params.get("result_slot"), Some(&json!("leaf_result")));
-        assert_eq!(
-            step.params
-                .pointer("/output_rules/change_spec/candidates/0/slot"),
-            Some(&json!("leaf_result"))
-        );
-        assert!(step
-            .params
-            .get("goal")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default()
-            .contains("Use only the provided bound inputs."));
-    }
-
-    #[test]
-    fn test_normalizer_converts_legacy_output_rules_array_for_leaf_agents() {
-        let normalizer = PlanNormalizer::new();
-        let plan = Plan::new(
-            "legacy-output-rules",
-            vec![Step::leaf_agent("s1").with_params(json!({
-                "mode": "leaf",
-                "goal": "derive fill specification",
-                "output_keys": ["fill_specification"],
-                "output_rules": [
-                    {
-                        "slot": "fill_specification",
-                        "candidates": [
-                            {
-                                "slot": "leaf_result",
-                                "path": "fill_specification",
-                                "requires": { "action": "json_stdout" }
-                            }
-                        ]
-                    }
-                ]
-            }))],
-        );
-
-        let normalized = normalizer.normalize(plan).expect("normalize");
-        let step = normalized.plan.get_step("s1").expect("s1");
-        assert_eq!(
-            step.params
-                .pointer("/output_rules/fill_specification/candidates/0/path"),
-            Some(&json!("fill_specification"))
-        );
-    }
-
-    #[test]
-    fn test_normalizer_repairs_malformed_leaf_output_rules_entries() {
-        let normalizer = PlanNormalizer::new();
-        let plan = Plan::new(
-            "malformed-leaf-output-rules",
-            vec![Step::leaf_agent("s1").with_params(json!({
-                "mode": "leaf",
-                "goal": "derive fill specification",
-                "output_keys": ["fill_specification", "excel_path"],
-                "output_rules": {
-                    "fill_specification": "fill_specification",
-                    "excel_path": {
-                        "candidates": [
-                            {
-                                "path": "excel_path"
-                            }
-                        ]
-                    }
-                }
-            }))],
-        );
-
-        let normalized = normalizer.normalize(plan).expect("normalize");
-        let step = normalized.plan.get_step("s1").expect("s1");
-        assert_eq!(
-            step.params
-                .pointer("/output_rules/fill_specification/candidates/0/slot"),
-            Some(&json!("leaf_result"))
-        );
-        assert_eq!(
-            step.params
-                .pointer("/output_rules/excel_path/candidates/0/slot"),
-            Some(&json!("leaf_result"))
-        );
-    }
-
-    #[test]
-    fn test_normalizer_repairs_leaf_agent_with_file_read_actions_to_explore() {
-        let normalizer = PlanNormalizer::new();
-        let plan = Plan::new(
-            "repair-leaf-agent",
-            vec![Step::agent("s1").with_params(json!({
-                "mode": "leaf",
-                "goal": "derive a patch",
-                "allowed_actions": ["file_read", "json_stdout"],
-                "max_iterations": 3,
-                "output_keys": ["change_spec"]
-            }))],
-        );
-
-        let normalized = normalizer.normalize(plan).expect("normalize");
-        let step = normalized.plan.get_step("s1").expect("s1");
-        assert_eq!(step.params.get("mode"), Some(&json!("explore")));
-        assert_eq!(step.params.get("max_iterations"), Some(&json!(3)));
-        assert!(step.params.get("result_slot").is_none());
-    }
-
-    #[test]
-    fn test_normalizer_rejects_leaf_agent_with_shell_actions() {
-        let normalizer = PlanNormalizer::new();
-        let plan = Plan::new(
-            "invalid-leaf-agent",
-            vec![Step::agent("s1").with_params(json!({
-                "mode": "leaf",
-                "goal": "derive a patch",
-                "allowed_actions": ["shell"],
-                "max_iterations": 1,
-                "result_slot": "leaf_result",
-                "output_keys": ["change_spec"]
-            }))],
-        );
-
-        let err = normalizer
-            .normalize(plan)
-            .expect_err("expected validation error");
-        match err {
-            NormalizeError::Validation(ValidationError::InvalidAgentParams(step_id, reason)) => {
-                assert_eq!(step_id, "s1");
-                assert!(reason.contains("json_stdout"));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_normalizer_rejects_explore_agent_with_side_effect_sensitive_outputs() {
-        let normalizer = PlanNormalizer::new();
-        let plan = Plan::new(
-            "invalid-explore-agent",
-            vec![Step::agent("s1").with_params(json!({
-                "goal": "inspect and update workbook",
-                "allowed_actions": ["shell", "file_write"],
-                "max_iterations": 5,
-                "output_keys": ["updated_file_path", "summary"],
-                "output_rules": {
-                    "updated_file_path": {
-                        "candidates": [
-                            {
-                                "slot": "fill_result",
-                                "path": "updated_file_path",
-                                "requires": {
-                                    "action": "file_write"
-                                }
-                            }
-                        ]
-                    },
-                    "summary": {
-                        "candidates": [
-                            {
-                                "slot": "fill_result",
-                                "path": "summary"
-                            }
-                        ]
-                    }
-                }
-            }))],
-        );
-
-        let err = normalizer
-            .normalize(plan)
-            .expect_err("expected validation error");
-        match err {
-            NormalizeError::Validation(ValidationError::InvalidAgentParams(step_id, reason)) => {
-                assert_eq!(step_id, "s1");
-                assert!(reason.contains("side-effect-sensitive outputs"));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
     }
 }

@@ -1,0 +1,1265 @@
+use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use orchestral_core::agent_protocol::wire::RunId;
+use orchestral_core::io::{
+    BlobHead, BlobId, BlobIoError, BlobMeta, BlobRead, BlobStore, BlobWriteRequest,
+};
+use orchestral_core::tool_effect::{
+    replay_tool_effect, InMemoryToolEffectJournalStore, PreparedToolEffect,
+    ToolAuthorizationEvidence, ToolEffectAttemptId, ToolEffectEvent, ToolEffectEventDraft,
+    ToolEffectEventId, ToolEffectJournalStore, ToolEffectKey, ToolEffectPhase,
+};
+use orchestral_core::tool_protocol::{
+    ApprovalPolicy, EffectScope, EffectiveToolPolicy, EnvironmentPolicy, FilesystemPolicy,
+    HostApprovalIssuer, HostApprovalVerifier, HostToolPolicy, InMemoryApprovalCapabilityStore,
+    ModelToolSchema, NetworkPolicy, ProcessPolicy, RunToolGrant, SandboxPolicy, ToolCallId,
+    ToolConcurrency, ToolDescriptor, ToolId, ToolIdempotency, ToolInvocation, ToolOutcome,
+    ToolOutput, ToolPolicyBounds, ToolRestriction,
+};
+use orchestral_runtime::{
+    tools::{
+        guarded_artifact_read_descriptor, guarded_file_read_descriptor,
+        guarded_pty_close_descriptor, guarded_pty_create_descriptor, guarded_pty_list_descriptor,
+        guarded_pty_read_descriptor, guarded_pty_write_descriptor, guarded_shell_descriptor,
+        GuardedArtifactReadExecutor, GuardedFileReadExecutor, GuardedPtyCloseExecutor,
+        GuardedPtyCreateExecutor, GuardedPtyListExecutor, GuardedPtyReadExecutor,
+        GuardedPtyWriteExecutor, GuardedShellExecutor, GUARDED_PTY_SANDBOX_PROFILE,
+        GUARDED_SHELL_SANDBOX_PROFILE,
+    },
+    GuardedToolExecution, GuardedToolExecutor, GuardedToolResult, GuardedToolRuntime,
+    HookDispatchMode, HookError, HookExecutionPolicy, HookFailurePolicy, HookRegistry,
+    InMemoryBlobStore, PtyProcessManager, RuntimeHook, RuntimeHookContext,
+    RuntimeHookEventEnvelope, ToolArtifactStore,
+};
+use serde_json::json;
+use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
+
+const SIGNING_KEY: &[u8] = b"0123456789abcdef0123456789abcdef";
+
+fn strings(values: &[&str]) -> BTreeSet<String> {
+    values.iter().map(|value| (*value).to_owned()).collect()
+}
+
+fn effects(values: &[EffectScope]) -> BTreeSet<EffectScope> {
+    values.iter().copied().collect()
+}
+
+fn policy(approval: ApprovalPolicy) -> ToolPolicyBounds {
+    ToolPolicyBounds {
+        allowed_effects: effects(&[EffectScope::Process]),
+        approval,
+        sandbox: SandboxPolicy {
+            required: false,
+            allowed_profiles: strings(&["strict"]),
+        },
+        process: ProcessPolicy {
+            allowed_programs: strings(&["echo"]),
+            allow_shell_expression: false,
+        },
+        filesystem: FilesystemPolicy::default(),
+        network: NetworkPolicy::default(),
+        environment: EnvironmentPolicy::default(),
+        allowed_credentials: BTreeSet::new(),
+        max_timeout_ms: Some(2_000),
+        max_output_bytes: Some(1_024),
+    }
+}
+
+fn descriptor(bounds: ToolPolicyBounds, concurrency: ToolConcurrency) -> ToolDescriptor {
+    ToolDescriptor {
+        tool_id: ToolId::new("test/echo"),
+        model_schema: ModelToolSchema {
+            name: "echo".to_owned(),
+            description: "Echo one value".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["value"],
+                "properties": { "value": { "type": "string" } },
+                "additionalProperties": false
+            }),
+        },
+        output_schema: json!({
+            "type": "object",
+            "required": ["result"],
+            "properties": { "result": { "type": "string" } },
+            "additionalProperties": false
+        }),
+        effect_scopes: effects(&[EffectScope::Process]),
+        restriction: ToolRestriction { bounds },
+        idempotency: ToolIdempotency::IdempotentWithKey,
+        concurrency,
+    }
+}
+
+fn invocation(value: &str) -> ToolInvocation {
+    ToolInvocation {
+        run_id: RunId::new("run-1"),
+        call_id: ToolCallId::new("call-1"),
+        tool_id: ToolId::new("test/echo"),
+        arguments: json!({ "value": value }),
+    }
+}
+
+fn runtime(bounds: ToolPolicyBounds) -> GuardedToolRuntime<InMemoryApprovalCapabilityStore> {
+    let verifier =
+        HostApprovalVerifier::new(SIGNING_KEY, InMemoryApprovalCapabilityStore::default()).unwrap();
+    GuardedToolRuntime::new(HostToolPolicy { bounds }, verifier).unwrap()
+}
+
+fn runtime_with_effect_journal(
+    bounds: ToolPolicyBounds,
+    journal: Arc<dyn ToolEffectJournalStore>,
+) -> GuardedToolRuntime<InMemoryApprovalCapabilityStore> {
+    let verifier =
+        HostApprovalVerifier::new(SIGNING_KEY, InMemoryApprovalCapabilityStore::default()).unwrap();
+    GuardedToolRuntime::new_with_effect_journal(HostToolPolicy { bounds }, verifier, journal)
+        .unwrap()
+}
+
+fn runtime_with_artifacts(
+    bounds: ToolPolicyBounds,
+    journal: Arc<dyn ToolEffectJournalStore>,
+    artifacts: ToolArtifactStore,
+) -> GuardedToolRuntime<InMemoryApprovalCapabilityStore> {
+    let verifier =
+        HostApprovalVerifier::new(SIGNING_KEY, InMemoryApprovalCapabilityStore::default()).unwrap();
+    GuardedToolRuntime::new_with_effect_journal_and_artifacts(
+        HostToolPolicy { bounds },
+        verifier,
+        journal,
+        artifacts,
+    )
+    .unwrap()
+}
+
+struct EchoExecutor {
+    calls: AtomicUsize,
+    delay: Duration,
+}
+
+struct SelectiveArtifactHook {
+    fail_event: &'static str,
+    events: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl RuntimeHook for SelectiveArtifactHook {
+    fn id(&self) -> &'static str {
+        "selective_artifact_hook"
+    }
+
+    async fn on_event(
+        &self,
+        event: &RuntimeHookEventEnvelope,
+        _context: &RuntimeHookContext,
+    ) -> Result<(), HookError> {
+        self.events
+            .lock()
+            .expect("artifact hook events lock")
+            .push(event.event_type.clone());
+        if event.event_type == self.fail_event {
+            return Err(HookError::new(format!(
+                "rejected {} for test",
+                event.event_type
+            )));
+        }
+        Ok(())
+    }
+}
+
+struct RejectingBlobStore;
+
+#[async_trait]
+impl BlobStore for RejectingBlobStore {
+    async fn write(&self, _request: BlobWriteRequest) -> Result<BlobMeta, BlobIoError> {
+        Err(BlobIoError::Io(
+            "injected artifact write failure".to_owned(),
+        ))
+    }
+
+    async fn read(&self, blob_id: &BlobId) -> Result<BlobRead, BlobIoError> {
+        Err(BlobIoError::NotFound(blob_id.to_string()))
+    }
+
+    async fn head(&self, blob_id: &BlobId) -> Result<BlobHead, BlobIoError> {
+        Err(BlobIoError::NotFound(blob_id.to_string()))
+    }
+
+    async fn delete(&self, _blob_id: &BlobId) -> Result<bool, BlobIoError> {
+        Ok(false)
+    }
+}
+
+async fn invoke_oversized_with_artifact_hook(
+    failure_policy: HookFailurePolicy,
+    fail_event: &'static str,
+    store: Arc<dyn BlobStore>,
+) -> (GuardedToolResult, Vec<String>) {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let hooks = Arc::new(HookRegistry::new());
+    hooks
+        .set_policy(HookExecutionPolicy {
+            mode: HookDispatchMode::Sequential,
+            failure_policy,
+            timeout: None,
+        })
+        .await;
+    hooks
+        .register(Arc::new(SelectiveArtifactHook {
+            fail_event,
+            events: events.clone(),
+        }))
+        .await;
+
+    let mut bounds = policy(ApprovalPolicy::NotRequired);
+    bounds.max_output_bytes = Some(64);
+    let artifacts = ToolArtifactStore::new(store, 4 * 1024, 80)
+        .unwrap()
+        .with_hooks(hooks);
+    let runtime = runtime_with_artifacts(
+        bounds.clone(),
+        Arc::new(InMemoryToolEffectJournalStore::default()),
+        artifacts,
+    );
+    runtime
+        .register(
+            descriptor(bounds.clone(), ToolConcurrency::ParallelSafe),
+            Arc::new(EchoExecutor {
+                calls: AtomicUsize::new(0),
+                delay: Duration::ZERO,
+            }),
+        )
+        .unwrap();
+    let result = runtime
+        .invoke(
+            invocation(&"x".repeat(512)),
+            RunToolGrant { bounds },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    let recorded = events.lock().expect("artifact hook events lock").clone();
+    (result, recorded)
+}
+
+#[async_trait]
+impl GuardedToolExecutor for EchoExecutor {
+    async fn execute(&self, execution: GuardedToolExecution) -> ToolOutcome {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(self.delay).await;
+        ToolOutcome::Completed {
+            output: json!({ "result": execution.invocation.arguments["value"].clone() }).into(),
+        }
+    }
+}
+
+async fn seed_effect_trace(
+    journal: &Arc<InMemoryToolEffectJournalStore>,
+    bounds: &ToolPolicyBounds,
+    observed: Option<ToolOutcome>,
+) -> ToolEffectKey {
+    let invocation = invocation("hello");
+    let descriptor = descriptor(bounds.clone(), ToolConcurrency::ParallelSafe);
+    let effective = EffectiveToolPolicy::resolve(
+        &HostToolPolicy {
+            bounds: bounds.clone(),
+        },
+        &RunToolGrant {
+            bounds: bounds.clone(),
+        },
+        &descriptor.restriction,
+    )
+    .unwrap();
+    let prepared = PreparedToolEffect {
+        args_digest: invocation.args_digest().unwrap(),
+        invocation,
+        policy_digest: effective.digest().unwrap(),
+        descriptor_digest: descriptor.digest().unwrap(),
+        idempotency: descriptor.idempotency,
+        effect_scopes: descriptor.effect_scopes,
+    };
+    let key = prepared.key();
+    journal
+        .append(
+            0,
+            ToolEffectEventDraft {
+                event_id: ToolEffectEventId::new("seed-prepared"),
+                key: key.clone(),
+                payload: ToolEffectEvent::Prepared { effect: prepared },
+            },
+        )
+        .await
+        .unwrap();
+    journal
+        .append(
+            1,
+            ToolEffectEventDraft {
+                event_id: ToolEffectEventId::new("seed-invoked"),
+                key: key.clone(),
+                payload: ToolEffectEvent::Invoked {
+                    attempt_id: ToolEffectAttemptId::new("seed-attempt"),
+                    authorization: ToolAuthorizationEvidence::Policy,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    if let Some(outcome) = observed {
+        journal
+            .append(
+                2,
+                ToolEffectEventDraft {
+                    event_id: ToolEffectEventId::new("seed-observed"),
+                    key: key.clone(),
+                    payload: ToolEffectEvent::Observed { outcome },
+                },
+            )
+            .await
+            .unwrap();
+    }
+    key
+}
+
+#[tokio::test]
+async fn approval_required_never_calls_executor() {
+    let bounds = policy(ApprovalPolicy::Required);
+    let runtime = runtime(bounds.clone());
+    let executor = Arc::new(EchoExecutor {
+        calls: AtomicUsize::new(0),
+        delay: Duration::ZERO,
+    });
+    runtime
+        .register(
+            descriptor(bounds.clone(), ToolConcurrency::ParallelSafe),
+            executor.clone(),
+        )
+        .unwrap();
+
+    let projected = runtime.model_tool_schemas().unwrap();
+    assert_eq!(projected.len(), 1);
+    assert_eq!(projected[0].name, "echo");
+
+    let result = runtime
+        .invoke(
+            invocation("hello"),
+            RunToolGrant { bounds },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    let GuardedToolResult::ApprovalRequired { binding, .. } = result else {
+        panic!("expected an approval request");
+    };
+    assert_eq!(binding.requested_scopes, effects(&[EffectScope::Process]));
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn guarded_shell_executes_only_after_exact_approval_inside_the_host_sandbox() {
+    let workspace = std::fs::canonicalize(std::env::current_dir().unwrap())
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let executable = std::fs::canonicalize("/bin/echo")
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let declared_effects = effects(&[
+        EffectScope::Process,
+        EffectScope::FilesystemRead,
+        EffectScope::FilesystemWrite,
+        EffectScope::EnvironmentRead,
+        EffectScope::ExternalSideEffect,
+    ]);
+    let bounds = ToolPolicyBounds {
+        allowed_effects: declared_effects,
+        approval: ApprovalPolicy::Required,
+        sandbox: SandboxPolicy {
+            required: true,
+            allowed_profiles: strings(&[GUARDED_SHELL_SANDBOX_PROFILE]),
+        },
+        process: ProcessPolicy {
+            allowed_programs: BTreeSet::from([executable.clone()]),
+            allow_shell_expression: false,
+        },
+        filesystem: FilesystemPolicy {
+            readable_roots: BTreeSet::from([workspace.clone()]),
+            writable_roots: BTreeSet::from([workspace]),
+        },
+        network: NetworkPolicy::default(),
+        environment: EnvironmentPolicy::default(),
+        allowed_credentials: BTreeSet::new(),
+        max_timeout_ms: Some(2_000),
+        max_output_bytes: Some(4 * 1024),
+    };
+    let runtime = runtime(bounds.clone());
+    runtime
+        .register(
+            guarded_shell_descriptor(ToolRestriction {
+                bounds: bounds.clone(),
+            }),
+            Arc::new(GuardedShellExecutor),
+        )
+        .unwrap();
+    let invocation = ToolInvocation {
+        run_id: RunId::new("guarded-shell-run"),
+        call_id: ToolCallId::new("guarded-shell-call"),
+        tool_id: ToolId::new("orchestral/shell_exec/v1"),
+        arguments: json!({ "command": executable, "args": ["hello"] }),
+    };
+    let first = runtime
+        .invoke(
+            invocation.clone(),
+            RunToolGrant {
+                bounds: bounds.clone(),
+            },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    let GuardedToolResult::ApprovalRequired { binding, summary } = first else {
+        panic!("guarded shell must request approval before execution")
+    };
+    assert!(summary.contains("/bin/echo"));
+    assert!(summary.contains("hello"));
+    let capability = HostApprovalIssuer::new(SIGNING_KEY)
+        .unwrap()
+        .issue(binding, i64::MAX)
+        .unwrap();
+    let result = runtime
+        .invoke(
+            invocation,
+            RunToolGrant { bounds },
+            Some(capability),
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Completed { output: ToolOutput::Inline(ref output) },
+            cached: false,
+        } if output["stdout"] == json!("hello")
+            && output["sandboxed"] == json!(true)
+            && output["sandbox_backend"] == json!("macos_seatbelt")
+    ));
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn guarded_pty_tools_are_run_scoped_and_cancel_closes_the_process() {
+    let workspace = std::fs::canonicalize(std::env::current_dir().unwrap())
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let executable = std::fs::canonicalize("/bin/cat")
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let bounds = ToolPolicyBounds {
+        allowed_effects: effects(&[
+            EffectScope::Process,
+            EffectScope::FilesystemRead,
+            EffectScope::FilesystemWrite,
+            EffectScope::EnvironmentRead,
+            EffectScope::ExternalSideEffect,
+        ]),
+        approval: ApprovalPolicy::NotRequired,
+        sandbox: SandboxPolicy {
+            required: false,
+            allowed_profiles: strings(&[GUARDED_PTY_SANDBOX_PROFILE]),
+        },
+        process: ProcessPolicy {
+            allowed_programs: BTreeSet::from([executable.clone()]),
+            allow_shell_expression: false,
+        },
+        filesystem: FilesystemPolicy {
+            readable_roots: BTreeSet::from([workspace.clone()]),
+            writable_roots: BTreeSet::from([workspace]),
+        },
+        network: NetworkPolicy::default(),
+        environment: EnvironmentPolicy::default(),
+        allowed_credentials: BTreeSet::new(),
+        max_timeout_ms: Some(2_000),
+        max_output_bytes: Some(16 * 1024),
+    };
+    let runtime = runtime(bounds.clone());
+    let manager = Arc::new(PtyProcessManager::new(16 * 1024, Duration::from_secs(60)).unwrap());
+    let restriction = || ToolRestriction {
+        bounds: bounds.clone(),
+    };
+    runtime
+        .register(
+            guarded_pty_create_descriptor(restriction()),
+            Arc::new(GuardedPtyCreateExecutor::new(manager.clone())),
+        )
+        .unwrap();
+    runtime
+        .register(
+            guarded_pty_write_descriptor(restriction()),
+            Arc::new(GuardedPtyWriteExecutor::new(manager.clone())),
+        )
+        .unwrap();
+    runtime
+        .register(
+            guarded_pty_read_descriptor(restriction()),
+            Arc::new(GuardedPtyReadExecutor::new(manager.clone())),
+        )
+        .unwrap();
+    runtime
+        .register(
+            guarded_pty_close_descriptor(restriction()),
+            Arc::new(GuardedPtyCloseExecutor::new(manager.clone())),
+        )
+        .unwrap();
+    runtime
+        .register(
+            guarded_pty_list_descriptor(restriction()),
+            Arc::new(GuardedPtyListExecutor::new(manager.clone())),
+        )
+        .unwrap();
+    let root = CancellationToken::new();
+    let create = ToolInvocation {
+        run_id: RunId::new("pty-run"),
+        call_id: ToolCallId::new("create-1"),
+        tool_id: ToolId::new("orchestral/pty_create/v1"),
+        arguments: json!({ "command": executable }),
+    };
+    let GuardedToolResult::ApprovalRequired { binding, summary } = runtime
+        .invoke(
+            create.clone(),
+            RunToolGrant {
+                bounds: bounds.clone(),
+            },
+            None,
+            root.clone(),
+        )
+        .await
+    else {
+        panic!("PTY create must require approval")
+    };
+    assert!(summary.contains("/bin/cat"));
+    let create_capability = HostApprovalIssuer::new(SIGNING_KEY)
+        .unwrap()
+        .issue(binding, i64::MAX)
+        .unwrap();
+    let created = runtime
+        .invoke(
+            create,
+            RunToolGrant {
+                bounds: bounds.clone(),
+            },
+            Some(create_capability),
+            root.clone(),
+        )
+        .await;
+    assert!(matches!(
+        created,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Completed { output: ToolOutput::Inline(ref output) },
+            ..
+        } if output["process_id"] == json!("pty:create-1")
+    ));
+
+    let write = ToolInvocation {
+        run_id: RunId::new("pty-run"),
+        call_id: ToolCallId::new("write-1"),
+        tool_id: ToolId::new("orchestral/pty_write/v1"),
+        arguments: json!({ "process_id": "pty:create-1", "input": "hello\n" }),
+    };
+    let GuardedToolResult::ApprovalRequired { binding, .. } = runtime
+        .invoke(
+            write.clone(),
+            RunToolGrant {
+                bounds: bounds.clone(),
+            },
+            None,
+            root.clone(),
+        )
+        .await
+    else {
+        panic!("PTY write must require approval")
+    };
+    let write_capability = HostApprovalIssuer::new(SIGNING_KEY)
+        .unwrap()
+        .issue(binding, i64::MAX)
+        .unwrap();
+    assert!(matches!(
+        runtime
+            .invoke(
+                write,
+                RunToolGrant {
+                    bounds: bounds.clone(),
+                },
+                Some(write_capability),
+                root.clone(),
+            )
+            .await,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Completed { .. },
+            ..
+        }
+    ));
+
+    let read = runtime
+        .invoke(
+            ToolInvocation {
+                run_id: RunId::new("pty-run"),
+                call_id: ToolCallId::new("read-1"),
+                tool_id: ToolId::new("orchestral/pty_read/v1"),
+                arguments: json!({
+                    "process_id": "pty:create-1",
+                    "timeout_ms": 1_000,
+                    "settle_ms": 50
+                }),
+            },
+            RunToolGrant {
+                bounds: bounds.clone(),
+            },
+            None,
+            root.clone(),
+        )
+        .await;
+    assert!(matches!(
+        read,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Completed { output: ToolOutput::Inline(ref output) },
+            ..
+        } if output["output"].as_str().is_some_and(|output| output.contains("hello"))
+    ));
+
+    let cross_run = runtime
+        .invoke(
+            ToolInvocation {
+                run_id: RunId::new("other-run"),
+                call_id: ToolCallId::new("cross-read"),
+                tool_id: ToolId::new("orchestral/pty_read/v1"),
+                arguments: json!({ "process_id": "pty:create-1", "timeout_ms": 10 }),
+            },
+            RunToolGrant {
+                bounds: bounds.clone(),
+            },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(
+        cross_run,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Rejected { ref code, .. },
+            ..
+        } if code == "pty_process_not_found"
+    ));
+
+    root.cancel();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if manager.list(&RunId::new("pty-run")).unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Run cancellation closes owned PTY processes");
+}
+
+#[tokio::test]
+async fn concurrent_and_replayed_call_executes_once_and_conflict_is_rejected() {
+    let bounds = policy(ApprovalPolicy::NotRequired);
+    let runtime = Arc::new(runtime(bounds.clone()));
+    let executor = Arc::new(EchoExecutor {
+        calls: AtomicUsize::new(0),
+        delay: Duration::from_millis(30),
+    });
+    runtime
+        .register(
+            descriptor(bounds.clone(), ToolConcurrency::GlobalSerial),
+            executor.clone(),
+        )
+        .unwrap();
+    let root = CancellationToken::new();
+
+    let mut tasks = Vec::new();
+    for _ in 0..12 {
+        let runtime = runtime.clone();
+        let grant = RunToolGrant {
+            bounds: bounds.clone(),
+        };
+        let cancellation = root.clone();
+        tasks.push(tokio::spawn(async move {
+            runtime
+                .invoke(invocation("hello"), grant, None, cancellation)
+                .await
+        }));
+    }
+
+    let mut uncached = 0;
+    for task in tasks {
+        match task.await.unwrap() {
+            GuardedToolResult::Outcome {
+                outcome: ToolOutcome::Completed { output },
+                cached,
+            } => {
+                assert_eq!(output, json!({ "result": "hello" }).into());
+                if !cached {
+                    uncached += 1;
+                }
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+    assert_eq!(uncached, 1);
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+
+    let conflict = runtime
+        .invoke(invocation("different"), RunToolGrant { bounds }, None, root)
+        .await;
+    let GuardedToolResult::Outcome {
+        outcome: ToolOutcome::Rejected { code, .. },
+        ..
+    } = conflict
+    else {
+        panic!("expected call identity conflict");
+    };
+    assert_eq!(code, "call_identity_conflict");
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn committed_effect_replays_across_a_new_tool_runtime_without_execution() {
+    let bounds = policy(ApprovalPolicy::NotRequired);
+    let journal = Arc::new(InMemoryToolEffectJournalStore::default());
+    let first = runtime_with_effect_journal(bounds.clone(), journal.clone());
+    let first_executor = Arc::new(EchoExecutor {
+        calls: AtomicUsize::new(0),
+        delay: Duration::ZERO,
+    });
+    first
+        .register(
+            descriptor(bounds.clone(), ToolConcurrency::ParallelSafe),
+            first_executor.clone(),
+        )
+        .unwrap();
+    let first_result = first
+        .invoke(
+            invocation("hello"),
+            RunToolGrant {
+                bounds: bounds.clone(),
+            },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(
+        first_result,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Completed { .. },
+            cached: false,
+        }
+    ));
+    assert_eq!(first_executor.calls.load(Ordering::SeqCst), 1);
+    drop(first);
+
+    let second = runtime_with_effect_journal(bounds.clone(), journal.clone());
+    let second_executor = Arc::new(EchoExecutor {
+        calls: AtomicUsize::new(0),
+        delay: Duration::ZERO,
+    });
+    second
+        .register(
+            descriptor(bounds.clone(), ToolConcurrency::ParallelSafe),
+            second_executor.clone(),
+        )
+        .unwrap();
+    let replayed = second
+        .invoke(
+            invocation("hello"),
+            RunToolGrant { bounds },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert!(matches!(
+        replayed,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Completed { output: ToolOutput::Inline(ref output) },
+            cached: true,
+        } if output == &json!({ "result": "hello" })
+    ));
+    assert_eq!(second_executor.calls.load(Ordering::SeqCst), 0);
+    let key = ToolEffectKey::new(RunId::new("run-1"), ToolCallId::new("call-1"));
+    let projection = replay_tool_effect(&key, &journal.load_effect(&key).await.unwrap())
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        projection.phase,
+        ToolEffectPhase::Committed { .. }
+    ));
+}
+
+#[tokio::test]
+async fn oversized_output_is_spilled_verified_and_replayed_as_one_artifact_reference() {
+    let mut bounds = policy(ApprovalPolicy::NotRequired);
+    bounds.max_output_bytes = Some(64);
+    let journal = Arc::new(InMemoryToolEffectJournalStore::default());
+    let artifacts =
+        ToolArtifactStore::new(Arc::new(InMemoryBlobStore::default()), 4 * 1024, 80).unwrap();
+    let first = runtime_with_artifacts(bounds.clone(), journal.clone(), artifacts.clone());
+    let first_executor = Arc::new(EchoExecutor {
+        calls: AtomicUsize::new(0),
+        delay: Duration::ZERO,
+    });
+    first
+        .register(
+            descriptor(bounds.clone(), ToolConcurrency::ParallelSafe),
+            first_executor.clone(),
+        )
+        .unwrap();
+    let large = "x".repeat(512);
+    let invocation = invocation(&large);
+    let first_result = first
+        .invoke(
+            invocation.clone(),
+            RunToolGrant {
+                bounds: bounds.clone(),
+            },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    let GuardedToolResult::Outcome {
+        outcome:
+            ToolOutcome::Completed {
+                output: ToolOutput::Artifact(artifact),
+            },
+        cached: false,
+    } = first_result
+    else {
+        panic!("oversized result must be replaced by one Artifact reference")
+    };
+    assert!(artifact.summary.contains("Preview:"));
+    assert!(artifact.summary.len() < large.len());
+    let bytes = artifacts.resolve(&artifact).await.unwrap();
+    let resolved: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(resolved, json!({ "result": large }));
+    assert_eq!(
+        artifact.artifact.digest,
+        orchestral_core::agent_protocol::wire::Digest::sha256(&bytes)
+    );
+    assert_eq!(first_executor.calls.load(Ordering::SeqCst), 1);
+
+    let read_bounds = ToolPolicyBounds {
+        allowed_effects: effects(&[EffectScope::ArtifactRead]),
+        approval: ApprovalPolicy::NotRequired,
+        max_timeout_ms: Some(1_000),
+        max_output_bytes: Some(8 * 1024),
+        ..ToolPolicyBounds::default()
+    };
+    let reader = runtime_with_artifacts(
+        read_bounds.clone(),
+        Arc::new(InMemoryToolEffectJournalStore::default()),
+        artifacts.clone(),
+    );
+    reader
+        .register(
+            guarded_artifact_read_descriptor(ToolRestriction {
+                bounds: read_bounds.clone(),
+            }),
+            Arc::new(GuardedArtifactReadExecutor::new(artifacts.clone())),
+        )
+        .unwrap();
+    let read_result = reader
+        .invoke(
+            ToolInvocation {
+                run_id: RunId::new("artifact-read-run"),
+                call_id: ToolCallId::new("artifact-read-call"),
+                tool_id: ToolId::new("orchestral/artifact_read/v1"),
+                arguments: json!({
+                    "artifact_ref": artifact.artifact.artifact_ref,
+                    "digest": artifact.artifact.digest,
+                    "media_type": artifact.media_type,
+                    "byte_size": artifact.byte_size,
+                    "max_bytes": 32,
+                }),
+            },
+            RunToolGrant {
+                bounds: read_bounds,
+            },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(
+        read_result,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Completed {
+                output: ToolOutput::Inline(ref output),
+            },
+            ..
+        } if output["content"].as_str().is_some_and(|content| content.starts_with("{\"result\":\""))
+            && output["complete"] == json!(false)
+    ));
+    drop(first);
+
+    let second = runtime_with_artifacts(bounds.clone(), journal.clone(), artifacts.clone());
+    let second_executor = Arc::new(EchoExecutor {
+        calls: AtomicUsize::new(0),
+        delay: Duration::ZERO,
+    });
+    second
+        .register(
+            descriptor(bounds.clone(), ToolConcurrency::ParallelSafe),
+            second_executor.clone(),
+        )
+        .unwrap();
+    let replayed = second
+        .invoke(
+            invocation,
+            RunToolGrant { bounds },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(
+        replayed,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Completed {
+                output: ToolOutput::Artifact(ref replayed),
+            },
+            cached: true,
+        } if replayed == &artifact
+    ));
+    assert_eq!(second_executor.calls.load(Ordering::SeqCst), 0);
+    let key = ToolEffectKey::new(RunId::new("run-1"), ToolCallId::new("call-1"));
+    let projection = replay_tool_effect(&key, &journal.load_effect(&key).await.unwrap())
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        projection.phase,
+        ToolEffectPhase::Committed {
+            outcome: ToolOutcome::Completed {
+                output: ToolOutput::Artifact(_),
+            },
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn artifact_put_commit_and_fail_hooks_are_fail_open_when_configured() {
+    for fail_event in ["artifact.put", "artifact.commit"] {
+        let (result, events) = invoke_oversized_with_artifact_hook(
+            HookFailurePolicy::FailOpen,
+            fail_event,
+            Arc::new(InMemoryBlobStore::default()),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            GuardedToolResult::Outcome {
+                outcome: ToolOutcome::Completed {
+                    output: ToolOutput::Artifact(_),
+                },
+                cached: false,
+            }
+        ));
+        assert_eq!(events, ["artifact.put", "artifact.commit"]);
+    }
+
+    let (result, events) = invoke_oversized_with_artifact_hook(
+        HookFailurePolicy::FailOpen,
+        "artifact.fail",
+        Arc::new(RejectingBlobStore),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Failed {
+                ref code,
+                ref message,
+                ..
+            },
+            cached: false,
+        } if code == "artifact_persistence_failed"
+            && message.contains("injected artifact write failure")
+    ));
+    assert_eq!(events, ["artifact.put", "artifact.fail"]);
+}
+
+#[tokio::test]
+async fn artifact_put_commit_and_fail_hooks_are_fail_closed_when_configured() {
+    let cases: [(&str, Arc<dyn BlobStore>, &[&str]); 3] = [
+        (
+            "artifact.put",
+            Arc::new(InMemoryBlobStore::default()),
+            &["artifact.put", "artifact.fail"],
+        ),
+        (
+            "artifact.commit",
+            Arc::new(InMemoryBlobStore::default()),
+            &["artifact.put", "artifact.commit", "artifact.fail"],
+        ),
+        (
+            "artifact.fail",
+            Arc::new(RejectingBlobStore),
+            &["artifact.put", "artifact.fail"],
+        ),
+    ];
+
+    for (fail_event, store, expected_events) in cases {
+        let (result, events) =
+            invoke_oversized_with_artifact_hook(HookFailurePolicy::FailClosed, fail_event, store)
+                .await;
+        assert!(matches!(
+            result,
+            GuardedToolResult::Outcome {
+                outcome: ToolOutcome::Failed {
+                    ref code,
+                    ref message,
+                    ..
+                },
+                cached: false,
+            } if code == "artifact_persistence_failed" && message.contains(fail_event)
+        ));
+        assert_eq!(events, expected_events, "event mismatch for {fail_event}");
+    }
+}
+
+#[tokio::test]
+async fn invoked_without_observation_becomes_unknown_and_is_never_reexecuted() {
+    let bounds = policy(ApprovalPolicy::NotRequired);
+    let journal = Arc::new(InMemoryToolEffectJournalStore::default());
+    let key = seed_effect_trace(&journal, &bounds, None).await;
+    let runtime = runtime_with_effect_journal(bounds.clone(), journal.clone());
+    let executor = Arc::new(EchoExecutor {
+        calls: AtomicUsize::new(0),
+        delay: Duration::ZERO,
+    });
+    runtime
+        .register(
+            descriptor(bounds.clone(), ToolConcurrency::ParallelSafe),
+            executor.clone(),
+        )
+        .unwrap();
+
+    let result = runtime
+        .invoke(
+            invocation("hello"),
+            RunToolGrant { bounds },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::UnknownEffect { .. },
+            cached: true,
+        }
+    ));
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+    let projection = replay_tool_effect(&key, &journal.load_effect(&key).await.unwrap())
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        projection.phase,
+        ToolEffectPhase::UnknownEffect { .. }
+    ));
+}
+
+#[tokio::test]
+async fn observed_effect_is_committed_after_restart_without_reexecution() {
+    let bounds = policy(ApprovalPolicy::NotRequired);
+    let journal = Arc::new(InMemoryToolEffectJournalStore::default());
+    let observed = ToolOutcome::Completed {
+        output: json!({ "result": "hello" }).into(),
+    };
+    let key = seed_effect_trace(&journal, &bounds, Some(observed.clone())).await;
+    let runtime = runtime_with_effect_journal(bounds.clone(), journal.clone());
+    let executor = Arc::new(EchoExecutor {
+        calls: AtomicUsize::new(0),
+        delay: Duration::ZERO,
+    });
+    runtime
+        .register(
+            descriptor(bounds.clone(), ToolConcurrency::ParallelSafe),
+            executor.clone(),
+        )
+        .unwrap();
+
+    let result = runtime
+        .invoke(
+            invocation("hello"),
+            RunToolGrant { bounds },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        GuardedToolResult::Outcome {
+            outcome,
+            cached: true,
+        } if outcome == observed
+    ));
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+    let projection = replay_tool_effect(&key, &journal.load_effect(&key).await.unwrap())
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        projection.phase,
+        ToolEffectPhase::Committed { .. }
+    ));
+}
+
+struct CancelExecutor {
+    calls: AtomicUsize,
+    active: Arc<AtomicUsize>,
+    started: Notify,
+}
+
+struct ActiveGuard(Arc<AtomicUsize>);
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl GuardedToolExecutor for CancelExecutor {
+    async fn execute(&self, execution: GuardedToolExecution) -> ToolOutcome {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.active.fetch_add(1, Ordering::SeqCst);
+        let _active = ActiveGuard(self.active.clone());
+        self.started.notify_one();
+        execution.cancellation.cancelled().await;
+        ToolOutcome::Cancelled
+    }
+}
+
+#[tokio::test]
+async fn run_cancellation_reaches_executor_and_closes_the_call() {
+    let bounds = policy(ApprovalPolicy::NotRequired);
+    let runtime = Arc::new(runtime(bounds.clone()));
+    let active = Arc::new(AtomicUsize::new(0));
+    let executor = Arc::new(CancelExecutor {
+        calls: AtomicUsize::new(0),
+        active: active.clone(),
+        started: Notify::new(),
+    });
+    runtime
+        .register(
+            descriptor(bounds.clone(), ToolConcurrency::PerRunSerial),
+            executor.clone(),
+        )
+        .unwrap();
+
+    let root = CancellationToken::new();
+    let task = {
+        let runtime = runtime.clone();
+        let cancellation = root.clone();
+        tokio::spawn(async move {
+            runtime
+                .invoke(
+                    invocation("wait"),
+                    RunToolGrant { bounds },
+                    None,
+                    cancellation,
+                )
+                .await
+        })
+    };
+    executor.started.notified().await;
+    root.cancel();
+
+    let result = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("cancellation should close the invocation")
+        .unwrap();
+    assert!(matches!(
+        result,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Cancelled,
+            cached: false,
+        }
+    ));
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn guarded_file_read_uses_effective_roots_without_model_authority_fields() {
+    let root =
+        std::env::temp_dir().join(format!("orchestral-guarded-read-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("hello.txt");
+    std::fs::write(&file, "hello from guarded file").unwrap();
+    let root = std::fs::canonicalize(&root).unwrap();
+    let bounds = ToolPolicyBounds {
+        allowed_effects: effects(&[EffectScope::FilesystemRead]),
+        approval: ApprovalPolicy::NotRequired,
+        sandbox: SandboxPolicy {
+            required: false,
+            allowed_profiles: strings(&["workspace_read"]),
+        },
+        process: ProcessPolicy::default(),
+        filesystem: FilesystemPolicy {
+            readable_roots: strings(&[root.to_string_lossy().as_ref()]),
+            writable_roots: BTreeSet::new(),
+        },
+        network: NetworkPolicy::default(),
+        environment: EnvironmentPolicy::default(),
+        allowed_credentials: BTreeSet::new(),
+        max_timeout_ms: Some(1_000),
+        max_output_bytes: Some(64 * 1024),
+    };
+    let runtime = runtime(bounds.clone());
+    let descriptor = guarded_file_read_descriptor(ToolRestriction {
+        bounds: bounds.clone(),
+    });
+    assert!(descriptor.model_schema.input_schema["properties"]
+        .get("approval")
+        .is_none());
+    assert!(descriptor.model_schema.input_schema["properties"]
+        .get("sandbox_mode")
+        .is_none());
+    runtime
+        .register(descriptor, Arc::new(GuardedFileReadExecutor))
+        .unwrap();
+
+    let result = runtime
+        .invoke(
+            ToolInvocation {
+                run_id: RunId::new("guarded-file-run"),
+                call_id: ToolCallId::new("guarded-file-call"),
+                tool_id: ToolId::new("orchestral/file_read/v1"),
+                arguments: json!({ "path": file.to_string_lossy() }),
+            },
+            RunToolGrant { bounds },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Completed { output: ToolOutput::Inline(ref output) },
+            ..
+        } if output["content"] == json!("hello from guarded file")
+    ));
+    std::fs::remove_dir_all(root).unwrap();
+}

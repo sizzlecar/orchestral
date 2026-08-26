@@ -1,0 +1,2538 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OrchestralAgentProtocolV1WireBundle",
+  "description": "A schema-only root that gathers the independently transported v1 messages\ninto one deterministic document and one shared `$defs` namespace.",
+  "type": "object",
+  "properties": {
+    "admission": {
+      "$ref": "#/$defs/AgentAdmission"
+    },
+    "command_ack": {
+      "$ref": "#/$defs/CommandAck"
+    },
+    "command_ack_state": {
+      "$ref": "#/$defs/CommandAckState"
+    },
+    "command_envelope": {
+      "$ref": "#/$defs/AgentCommandEnvelope"
+    },
+    "descriptor_envelope": {
+      "$ref": "#/$defs/AgentDescriptorEnvelope"
+    },
+    "execution_ref": {
+      "$ref": "#/$defs/AgentExecutionRef"
+    },
+    "journal_record": {
+      "$ref": "#/$defs/AgentJournalRecord"
+    },
+    "protocol_error": {
+      "$ref": "#/$defs/AgentProtocolError"
+    },
+    "provider_command_disposition": {
+      "$ref": "#/$defs/ProviderCommandDisposition"
+    },
+    "provider_stream_item": {
+      "$ref": "#/$defs/AgentProviderStreamItem"
+    },
+    "rejection": {
+      "$ref": "#/$defs/AgentRejection"
+    },
+    "run_envelope": {
+      "$ref": "#/$defs/AgentRunEnvelope"
+    },
+    "run_state": {
+      "$ref": "#/$defs/AgentRunState"
+    },
+    "run_view": {
+      "$ref": "#/$defs/AgentRunView"
+    },
+    "start_request": {
+      "$ref": "#/$defs/AgentStartRequest"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "run_envelope",
+    "descriptor_envelope",
+    "start_request",
+    "command_envelope",
+    "provider_stream_item",
+    "journal_record",
+    "command_ack",
+    "command_ack_state",
+    "provider_command_disposition",
+    "protocol_error",
+    "rejection",
+    "admission",
+    "execution_ref",
+    "run_state",
+    "run_view"
+  ],
+  "$defs": {
+    "AgentAdmission": {
+      "description": "Final resource admission after the adapter has resolved every binding that\nmust be available before native work starts.",
+      "type": "object",
+      "properties": {
+        "skipped_optional_bindings": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ResourceBindingSkip"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "AgentCapabilities": {
+      "description": "Capabilities are promises and must be checked by conformance tests.",
+      "type": "object",
+      "properties": {
+        "controls": {
+          "$ref": "#/$defs/ControlCapabilities"
+        },
+        "effect_mediation": {
+          "$ref": "#/$defs/EffectMediation"
+        },
+        "pending_request_kinds": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/PendingRequestKind"
+          },
+          "uniqueItems": true
+        },
+        "resources": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ResourceCapability"
+          }
+        },
+        "session_reuse": {
+          "type": "boolean"
+        },
+        "structured_output": {
+          "type": "boolean"
+        },
+        "supported_limits": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/RunLimitKind"
+          },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "session_reuse",
+        "structured_output",
+        "controls",
+        "effect_mediation"
+      ]
+    },
+    "AgentCommand": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "content": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Content"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "steer"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "content"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "response": {
+              "$ref": "#/$defs/RequestResolution"
+            },
+            "type": {
+              "type": "string",
+              "const": "resolve_request"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "response"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "cancel"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "reason"
+          ]
+        }
+      ]
+    },
+    "AgentCommandEnvelope": {
+      "type": "object",
+      "properties": {
+        "command_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "command_id": {
+          "$ref": "#/$defs/CommandId"
+        },
+        "payload": {
+          "$ref": "#/$defs/AgentCommand"
+        },
+        "request_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RequestId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "run_id": {
+          "$ref": "#/$defs/RunId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "command_id",
+        "run_id",
+        "payload",
+        "command_digest"
+      ]
+    },
+    "AgentDelivery": {
+      "type": "object",
+      "properties": {
+        "artifacts": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ArtifactRefWithDigest"
+          }
+        },
+        "delivery_id": {
+          "$ref": "#/$defs/DeliveryId"
+        },
+        "final_response": {
+          "$ref": "#/$defs/Content"
+        },
+        "outputs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/NamedOutput"
+          }
+        },
+        "provenance": {
+          "$ref": "#/$defs/Provenance"
+        },
+        "run_id": {
+          "$ref": "#/$defs/RunId"
+        },
+        "spec_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "unresolved_issues": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "usage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UsageReport"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "delivery_id",
+        "run_id",
+        "spec_digest",
+        "final_response",
+        "provenance"
+      ]
+    },
+    "AgentDescriptor": {
+      "type": "object",
+      "properties": {
+        "accepted_content_types": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "agent_id": {
+          "$ref": "#/$defs/AgentId"
+        },
+        "capabilities": {
+          "$ref": "#/$defs/AgentCapabilities"
+        },
+        "extensions": {
+          "type": "object",
+          "additionalProperties": false,
+          "default": {},
+          "patternProperties": {
+            "^[^/][^/]*/[\\s\\S]+$": true
+          }
+        },
+        "provider_id": {
+          "$ref": "#/$defs/AgentProviderId"
+        },
+        "supported_protocol_versions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProtocolVersion"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "provider_id",
+        "agent_id",
+        "supported_protocol_versions",
+        "accepted_content_types",
+        "capabilities"
+      ]
+    },
+    "AgentDescriptorEnvelope": {
+      "description": "Immutable capability promise selected for a Run. A Provider configuration\nchange must produce a new descriptor digest (and normally a new binding).",
+      "type": "object",
+      "properties": {
+        "descriptor": {
+          "$ref": "#/$defs/AgentDescriptor"
+        },
+        "descriptor_digest": {
+          "$ref": "#/$defs/Digest"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "descriptor",
+        "descriptor_digest"
+      ]
+    },
+    "AgentEvent": {
+      "description": "Durable, normalized state event payload.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "session_id": {
+              "$ref": "#/$defs/AgentSessionId"
+            },
+            "spec_digest": {
+              "$ref": "#/$defs/Digest"
+            },
+            "type": {
+              "type": "string",
+              "const": "run_accepted"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "session_id",
+            "spec_digest"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "skip": {
+              "$ref": "#/$defs/ResourceBindingSkip"
+            },
+            "type": {
+              "type": "string",
+              "const": "resource_binding_skipped"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "skip"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "run_started"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "command": {
+              "$ref": "#/$defs/AgentCommandEnvelope"
+            },
+            "type": {
+              "type": "string",
+              "const": "command_received"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "command"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "command_id": {
+              "$ref": "#/$defs/CommandId"
+            },
+            "outcome": {
+              "$ref": "#/$defs/ProviderCommandOutcome"
+            },
+            "type": {
+              "type": "string",
+              "const": "command_disposition_recorded"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "command_id",
+            "outcome"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "content": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Content"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "input_committed"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "content"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "content": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Content"
+              }
+            },
+            "output_id": {
+              "$ref": "#/$defs/OutputId"
+            },
+            "type": {
+              "type": "string",
+              "const": "output_committed"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "output_id",
+            "content"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "request": {
+              "$ref": "#/$defs/PendingRequest"
+            },
+            "type": {
+              "type": "string",
+              "const": "request_opened"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "request"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "request_id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "resolution": {
+              "$ref": "#/$defs/RequestResolution"
+            },
+            "resolution_digest": {
+              "$ref": "#/$defs/Digest"
+            },
+            "type": {
+              "type": "string",
+              "const": "request_resolved"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "request_id",
+            "resolution",
+            "resolution_digest"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "stop_requested"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "reason"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "delivery": {
+              "$ref": "#/$defs/AgentDelivery"
+            },
+            "type": {
+              "type": "string",
+              "const": "delivery_committed"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "delivery"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "partial_delivery": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PartialDelivery"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "reason": {
+              "$ref": "#/$defs/IncompleteReason"
+            },
+            "type": {
+              "type": "string",
+              "const": "run_incomplete"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "reason"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "failure": {
+              "$ref": "#/$defs/AgentFailure"
+            },
+            "type": {
+              "type": "string",
+              "const": "run_failed"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "failure"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "run_cancelled"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "reason"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "last_confirmed_seq": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "reason": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "continuity_lost"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "last_confirmed_seq",
+            "reason"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "proof": {
+              "$ref": "#/$defs/ReconciliationProof"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "continuity_restored"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "proof",
+            "reason"
+          ]
+        }
+      ]
+    },
+    "AgentEventAuthority": {
+      "description": "Authenticated origin stored beside a normalized journal event. Authority is\nHost journal metadata, not a field supplied by an Agent Provider.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "authority": {
+              "type": "string",
+              "const": "provider"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "authority"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "authority": {
+              "type": "string",
+              "const": "host"
+            },
+            "reconciliation_proof_ref": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ReconciliationProofRef"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "authority"
+          ]
+        }
+      ]
+    },
+    "AgentEventDraft": {
+      "description": "Unsequenced durable fact submitted to the host journal.",
+      "type": "object",
+      "properties": {
+        "causation_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "event_id": {
+          "$ref": "#/$defs/AgentEventId"
+        },
+        "payload": {
+          "$ref": "#/$defs/AgentEvent"
+        },
+        "run_id": {
+          "$ref": "#/$defs/RunId"
+        },
+        "source_fingerprint": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Digest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "event_id",
+        "run_id",
+        "payload"
+      ]
+    },
+    "AgentEventEnvelope": {
+      "type": "object",
+      "properties": {
+        "causation_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "event_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "event_id": {
+          "$ref": "#/$defs/AgentEventId"
+        },
+        "payload": {
+          "$ref": "#/$defs/AgentEvent"
+        },
+        "run_id": {
+          "$ref": "#/$defs/RunId"
+        },
+        "run_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "source_fingerprint": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Digest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "event_id",
+        "run_id",
+        "run_seq",
+        "event_digest",
+        "payload"
+      ]
+    },
+    "AgentEventId": {
+      "description": "Stable normalized Agent event identifier.",
+      "type": "string"
+    },
+    "AgentExecutionRef": {
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "$ref": "#/$defs/AgentId"
+        },
+        "binding_ref": {
+          "$ref": "#/$defs/ProviderBindingRef"
+        },
+        "descriptor_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "provider_id": {
+          "$ref": "#/$defs/AgentProviderId"
+        },
+        "run_id": {
+          "$ref": "#/$defs/RunId"
+        },
+        "session_id": {
+          "$ref": "#/$defs/AgentSessionId"
+        },
+        "spec_digest": {
+          "$ref": "#/$defs/Digest"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "provider_id",
+        "agent_id",
+        "binding_ref",
+        "descriptor_digest",
+        "session_id",
+        "run_id",
+        "spec_digest"
+      ]
+    },
+    "AgentFailure": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "details": {
+          "default": null
+        },
+        "message": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message",
+        "retryable"
+      ]
+    },
+    "AgentId": {
+      "description": "Agent implementation/profile identifier within a provider.",
+      "type": "string"
+    },
+    "AgentJournalRecord": {
+      "description": "Durable input to replay. `run_seq`, the event digest, and authority must be\ncommitted atomically by the Host journal.",
+      "type": "object",
+      "properties": {
+        "authority": {
+          "$ref": "#/$defs/AgentEventAuthority"
+        },
+        "draft_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "event": {
+          "$ref": "#/$defs/AgentEventEnvelope"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "authority",
+        "draft_digest",
+        "event"
+      ]
+    },
+    "AgentProtocolError": {
+      "description": "Structured protocol failure. This is distinct from an Agent run failure.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/AgentProtocolErrorCode"
+        },
+        "details": {
+          "default": null
+        },
+        "message": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message",
+        "retryable"
+      ]
+    },
+    "AgentProtocolErrorCode": {
+      "description": "Stable protocol error code suitable for RPC adapters.",
+      "type": "string",
+      "enum": [
+        "invalid_spec",
+        "invalid_digest",
+        "unsupported_protocol",
+        "unsupported",
+        "run_id_conflict",
+        "run_not_found",
+        "command_not_found",
+        "request_not_found",
+        "request_type_mismatch",
+        "invalid_transition",
+        "sequence_conflict",
+        "sequence_gap",
+        "duplicate_conflict",
+        "terminal_run",
+        "provider_unavailable",
+        "serialization",
+        "internal"
+      ]
+    },
+    "AgentProviderId": {
+      "description": "Public Agent provider identifier.",
+      "type": "string"
+    },
+    "AgentProviderStreamItem": {
+      "description": "Provider observation before Host journal sequencing. The Provider supplies a\nstable event ID; only the Host journal may assign normalized `run_seq`.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "channel": {
+              "type": "string",
+              "const": "event"
+            },
+            "item": {
+              "$ref": "#/$defs/AgentEventDraft"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "channel",
+            "item"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "channel": {
+              "type": "string",
+              "const": "telemetry"
+            },
+            "item": {
+              "$ref": "#/$defs/AgentTelemetryEnvelope"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "channel",
+            "item"
+          ]
+        }
+      ]
+    },
+    "AgentRejection": {
+      "description": "A start rejection does not create an Agent execution.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/AgentRejectionCode"
+        },
+        "details": {
+          "default": null
+        },
+        "message": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message",
+        "retryable"
+      ]
+    },
+    "AgentRejectionCode": {
+      "type": "string",
+      "enum": [
+        "invalid_spec",
+        "unsupported_protocol",
+        "unsupported_capability",
+        "unsupported_resource",
+        "run_id_conflict",
+        "session_conflict",
+        "provider_unavailable"
+      ]
+    },
+    "AgentRunEnvelope": {
+      "description": "Digest-bearing transport envelope. Keeping the digest outside the spec\navoids a self-referential canonical representation.",
+      "type": "object",
+      "properties": {
+        "spec": {
+          "$ref": "#/$defs/AgentRunSpec"
+        },
+        "spec_digest": {
+          "$ref": "#/$defs/Digest"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "spec",
+        "spec_digest"
+      ]
+    },
+    "AgentRunSpec": {
+      "description": "Immutable execution boundary for one logical Agent run.",
+      "type": "object",
+      "properties": {
+        "extensions": {
+          "type": "object",
+          "additionalProperties": false,
+          "default": {},
+          "patternProperties": {
+            "^[^/][^/]*/[\\s\\S]+$": true
+          }
+        },
+        "input": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Content"
+          }
+        },
+        "limits": {
+          "$ref": "#/$defs/RunLimits",
+          "default": {
+            "deadline_unix_ms": null,
+            "max_cost": null,
+            "max_input_tokens": null,
+            "max_model_steps": null,
+            "max_output_tokens": null,
+            "max_tool_calls": null
+          }
+        },
+        "output_schema": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SchemaRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "resources": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ResourceBinding"
+          }
+        },
+        "run_id": {
+          "$ref": "#/$defs/RunId"
+        },
+        "session_id": {
+          "$ref": "#/$defs/AgentSessionId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "session_id",
+        "run_id",
+        "input"
+      ]
+    },
+    "AgentRunState": {
+      "description": "Public state derived from phase, continuity authority, and pending requests.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "accepted"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "running"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "pending_request_ids": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/RequestId"
+              }
+            },
+            "state": {
+              "type": "string",
+              "const": "waiting"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "state",
+            "pending_request_ids"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "stopping"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "last_confirmed_seq": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "reason": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string",
+              "const": "unknown"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "state",
+            "last_confirmed_seq",
+            "reason"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "terminal"
+            },
+            "terminal": {
+              "$ref": "#/$defs/AgentTerminalState"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "state",
+            "terminal"
+          ]
+        }
+      ]
+    },
+    "AgentRunView": {
+      "description": "Stable, bounded Host read model for `inspect(run)`. Unbounded committed\noutput history is read separately through journal pagination bounded by\n`last_run_seq`.",
+      "type": "object",
+      "properties": {
+        "admission": {
+          "$ref": "#/$defs/AgentAdmission"
+        },
+        "delivery": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentDelivery"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "execution": {
+          "$ref": "#/$defs/AgentExecutionRef"
+        },
+        "last_run_seq": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "partial_delivery": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PartialDelivery"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "pending_requests": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/PendingRequest"
+          }
+        },
+        "state": {
+          "$ref": "#/$defs/AgentRunState"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "execution",
+        "admission",
+        "state"
+      ]
+    },
+    "AgentSessionId": {
+      "description": "Orchestral conversation container identifier.",
+      "type": "string"
+    },
+    "AgentStartRequest": {
+      "description": "Host-selected immutable Provider contract for starting a run. Binding the\ndescriptor in the request prevents describe/start time-of-check drift.",
+      "type": "object",
+      "properties": {
+        "expected_descriptor_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "provider_binding": {
+          "$ref": "#/$defs/ProviderBindingRef"
+        },
+        "run": {
+          "$ref": "#/$defs/AgentRunEnvelope"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "run",
+        "provider_binding",
+        "expected_descriptor_digest"
+      ]
+    },
+    "AgentTelemetry": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "delta": {
+              "$ref": "#/$defs/Content"
+            },
+            "output_id": {
+              "$ref": "#/$defs/OutputId"
+            },
+            "type": {
+              "type": "string",
+              "const": "output_delta"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "output_id",
+            "delta"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "fraction": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double",
+              "default": null
+            },
+            "message": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "progress_reported"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "namespace": {
+              "type": "string",
+              "pattern": "^[^/][^/]*/[\\s\\S]+$"
+            },
+            "type": {
+              "type": "string",
+              "const": "extension"
+            },
+            "value": true
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "namespace",
+            "value"
+          ]
+        }
+      ]
+    },
+    "AgentTelemetryEnvelope": {
+      "description": "Best-effort telemetry never drives [`AgentRunState`].",
+      "type": "object",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/AgentTelemetry"
+        },
+        "provider_seq": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "run_id": {
+          "$ref": "#/$defs/RunId"
+        },
+        "telemetry_id": {
+          "$ref": "#/$defs/TelemetryId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "telemetry_id",
+        "run_id",
+        "payload"
+      ]
+    },
+    "AgentTerminalState": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "delivery_id": {
+              "$ref": "#/$defs/DeliveryId"
+            },
+            "type": {
+              "type": "string",
+              "const": "delivered"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "delivery_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "reason": {
+              "$ref": "#/$defs/IncompleteReason"
+            },
+            "type": {
+              "type": "string",
+              "const": "incomplete"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "reason"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "cancelled"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "reason"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "failure": {
+              "$ref": "#/$defs/AgentFailure"
+            },
+            "type": {
+              "type": "string",
+              "const": "failed"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "failure"
+          ]
+        }
+      ]
+    },
+    "ApprovalDecision": {
+      "type": "string",
+      "enum": [
+        "allow",
+        "deny"
+      ]
+    },
+    "ApprovalGrantRef": {
+      "description": "Approval grant reference issued by the host.",
+      "type": "string"
+    },
+    "ArtifactRef": {
+      "description": "Artifact identifier independent of physical storage.",
+      "type": "string"
+    },
+    "ArtifactRefWithDigest": {
+      "type": "object",
+      "properties": {
+        "artifact_ref": {
+          "$ref": "#/$defs/ArtifactRef"
+        },
+        "digest": {
+          "$ref": "#/$defs/Digest"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "artifact_ref",
+        "digest"
+      ]
+    },
+    "BindingRequirement": {
+      "type": "string",
+      "enum": [
+        "required",
+        "optional"
+      ]
+    },
+    "CancelSupport": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "unsupported"
+          ]
+        },
+        {
+          "description": "The provider accepts cancellation but cannot prove the final native state.",
+          "type": "string",
+          "const": "best_effort"
+        },
+        {
+          "description": "The provider emits an authoritative cancellation or competing terminal.\nA disconnect/Unknown outcome does not satisfy this capability.",
+          "type": "string",
+          "const": "confirmed"
+        }
+      ]
+    },
+    "CommandAck": {
+      "description": "Host control API acknowledgement derived only from committed journal facts.",
+      "type": "object",
+      "properties": {
+        "command_id": {
+          "$ref": "#/$defs/CommandId"
+        },
+        "duplicate": {
+          "type": "boolean"
+        },
+        "run_id": {
+          "$ref": "#/$defs/RunId"
+        },
+        "state": {
+          "$ref": "#/$defs/CommandAckState"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "command_id",
+        "run_id",
+        "duplicate",
+        "state"
+      ]
+    },
+    "CommandAckState": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "recorded_seq": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "state": {
+              "type": "string",
+              "const": "accepted"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "state",
+            "recorded_seq"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "applied_seq": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "recorded_seq": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "state": {
+              "type": "string",
+              "const": "applied"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "state",
+            "recorded_seq",
+            "applied_seq"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "code": {
+              "$ref": "#/$defs/AgentProtocolErrorCode"
+            },
+            "message": {
+              "type": "string"
+            },
+            "recorded_seq": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "state": {
+              "type": "string",
+              "const": "rejected"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "state",
+            "recorded_seq",
+            "code",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "feature": {
+              "type": "string"
+            },
+            "recorded_seq": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "state": {
+              "type": "string",
+              "const": "unsupported"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "state",
+            "recorded_seq",
+            "feature"
+          ]
+        }
+      ]
+    },
+    "CommandId": {
+      "description": "Idempotency identifier for a control command.",
+      "type": "string"
+    },
+    "Content": {
+      "description": "Provider-neutral content block.",
+      "type": "object",
+      "properties": {
+        "body": {
+          "$ref": "#/$defs/ContentBody"
+        },
+        "media_type": {
+          "type": "string"
+        },
+        "schema_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SchemaRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "media_type",
+        "body"
+      ]
+    },
+    "ContentBody": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "inline"
+            },
+            "value": true
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "artifact"
+            },
+            "value": {
+              "$ref": "#/$defs/ArtifactRefWithDigest"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "value"
+          ]
+        }
+      ]
+    },
+    "ControlCapabilities": {
+      "type": "object",
+      "properties": {
+        "cancel": {
+          "$ref": "#/$defs/CancelSupport"
+        },
+        "recover": {
+          "description": "Provider-native stream recovery. Host journal replay is always a\nseparate Orchestral responsibility.",
+          "type": "boolean"
+        },
+        "steer": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "steer",
+        "cancel",
+        "recover"
+      ]
+    },
+    "DeliveryId": {
+      "description": "Agent delivery identifier.",
+      "type": "string"
+    },
+    "Digest": {
+      "description": "Hex-encoded SHA-256 digest used for immutable protocol bindings.",
+      "type": "string"
+    },
+    "EffectMediation": {
+      "type": "string",
+      "enum": [
+        "none",
+        "host_mediated",
+        "provider_managed"
+      ]
+    },
+    "IncompleteReason": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "limit": {
+              "$ref": "#/$defs/RunLimitKind"
+            },
+            "type": {
+              "type": "string",
+              "const": "limit_reached"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "limit"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "interrupted"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "reason"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "provider_ended"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "reason"
+          ]
+        }
+      ]
+    },
+    "MoneyAmount": {
+      "type": "object",
+      "properties": {
+        "currency": {
+          "description": "ISO 4217-style uppercase currency code, for example `USD`.",
+          "type": "string"
+        },
+        "microunits": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "currency",
+        "microunits"
+      ]
+    },
+    "NamedOutput": {
+      "type": "object",
+      "properties": {
+        "content": {
+          "$ref": "#/$defs/Content"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "content"
+      ]
+    },
+    "OutputId": {
+      "description": "Stable committed output identifier.",
+      "type": "string"
+    },
+    "PartialDelivery": {
+      "description": "Partial output attached to an incomplete run. It cannot be accepted as a\nsuccessful [`AgentDelivery`] because the types are intentionally distinct.",
+      "type": "object",
+      "properties": {
+        "artifacts": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ArtifactRefWithDigest"
+          }
+        },
+        "outputs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/NamedOutput"
+          }
+        },
+        "partial_delivery_id": {
+          "$ref": "#/$defs/PartialDeliveryId"
+        },
+        "provenance": {
+          "$ref": "#/$defs/Provenance"
+        },
+        "response": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Content"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "run_id": {
+          "$ref": "#/$defs/RunId"
+        },
+        "spec_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "unresolved_issues": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "usage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UsageReport"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "partial_delivery_id",
+        "run_id",
+        "spec_digest",
+        "provenance"
+      ]
+    },
+    "PartialDeliveryId": {
+      "description": "Explicitly non-final partial delivery identifier.",
+      "type": "string"
+    },
+    "PendingRequest": {
+      "type": "object",
+      "properties": {
+        "blocking": {
+          "type": "boolean"
+        },
+        "payload": {
+          "$ref": "#/$defs/PendingRequestPayload"
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "request_id",
+        "blocking",
+        "payload"
+      ]
+    },
+    "PendingRequestKind": {
+      "type": "string",
+      "enum": [
+        "input",
+        "approval",
+        "external_action"
+      ]
+    },
+    "PendingRequestPayload": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "input_schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SchemaRef"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "prompt": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Content"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "input"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "prompt"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "operation_digest": {
+              "$ref": "#/$defs/Digest"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "requested_scope": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "approval"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "operation_digest",
+            "requested_scope",
+            "reason"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "arguments": true,
+            "name": {
+              "type": "string"
+            },
+            "result_schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SchemaRef"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "type": {
+              "type": "string",
+              "const": "external_action"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "name",
+            "arguments"
+          ]
+        }
+      ]
+    },
+    "ProtocolVersion": {
+      "description": "Version of the public Agent Protocol wire contract.",
+      "type": "object",
+      "properties": {
+        "major": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "minor": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "major",
+        "minor"
+      ]
+    },
+    "Provenance": {
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "$ref": "#/$defs/AgentId"
+        },
+        "extensions": {
+          "type": "object",
+          "additionalProperties": false,
+          "default": {},
+          "patternProperties": {
+            "^[^/][^/]*/[\\s\\S]+$": true
+          }
+        },
+        "provider_id": {
+          "$ref": "#/$defs/AgentProviderId"
+        },
+        "supporting_event_ids": {
+          "description": "Non-authoritative trace hints. Every ID must name a prior durable event\nin this Run; existence does not prove that the event caused the output.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/AgentEventId"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "provider_id",
+        "agent_id"
+      ]
+    },
+    "ProviderBindingRef": {
+      "description": "Stable host-side provider binding; never a provider-native session id.",
+      "type": "string"
+    },
+    "ProviderCommandDisposition": {
+      "description": "Provider-native response. It never contains Host journal sequence numbers\nand cannot claim that a causal effect has been durably applied.",
+      "type": "object",
+      "properties": {
+        "command_id": {
+          "$ref": "#/$defs/CommandId"
+        },
+        "duplicate": {
+          "type": "boolean"
+        },
+        "outcome": {
+          "$ref": "#/$defs/ProviderCommandOutcome"
+        },
+        "run_id": {
+          "$ref": "#/$defs/RunId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "command_id",
+        "run_id",
+        "outcome",
+        "duplicate"
+      ]
+    },
+    "ProviderCommandOutcome": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "outcome": {
+              "type": "string",
+              "const": "accepted"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "outcome"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "code": {
+              "$ref": "#/$defs/AgentProtocolErrorCode"
+            },
+            "message": {
+              "type": "string"
+            },
+            "outcome": {
+              "type": "string",
+              "const": "rejected"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "outcome",
+            "code",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "feature": {
+              "type": "string"
+            },
+            "outcome": {
+              "type": "string",
+              "const": "unsupported"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "outcome",
+            "feature"
+          ]
+        }
+      ]
+    },
+    "ReconciliationProof": {
+      "type": "object",
+      "properties": {
+        "authoritative_snapshot_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "evidence_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "last_confirmed_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "loss_event_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "proof_ref": {
+          "$ref": "#/$defs/ReconciliationProofRef"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "proof_ref",
+        "last_confirmed_seq",
+        "loss_event_digest",
+        "authoritative_snapshot_digest",
+        "evidence_digest"
+      ]
+    },
+    "ReconciliationProofRef": {
+      "description": "Host-side reconciliation record reference.",
+      "type": "string"
+    },
+    "RequestId": {
+      "description": "Correlation identifier for a blocking or non-blocking request.",
+      "type": "string"
+    },
+    "RequestResolution": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "content": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Content"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "input"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "content"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "decision": {
+              "$ref": "#/$defs/ApprovalDecision"
+            },
+            "grant_ref": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ApprovalGrantRef"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "type": {
+              "type": "string",
+              "const": "approval"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "decision"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "result": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Content"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "external_result"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "result"
+          ]
+        }
+      ]
+    },
+    "ResourceBinding": {
+      "description": "Immutable resource visibility binding. It never conveys effect authority.",
+      "type": "object",
+      "properties": {
+        "binding_id": {
+          "$ref": "#/$defs/ResourceBindingId"
+        },
+        "mode": {
+          "$ref": "#/$defs/ResourceBindingMode"
+        },
+        "requirement": {
+          "$ref": "#/$defs/BindingRequirement"
+        },
+        "resource": {
+          "$ref": "#/$defs/ResourceRef"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "binding_id",
+        "resource",
+        "requirement",
+        "mode"
+      ]
+    },
+    "ResourceBindingId": {
+      "description": "One resource binding in a run specification.",
+      "type": "string"
+    },
+    "ResourceBindingMode": {
+      "type": "string",
+      "enum": [
+        "snapshot",
+        "on_demand"
+      ]
+    },
+    "ResourceBindingSkip": {
+      "type": "object",
+      "properties": {
+        "binding_id": {
+          "$ref": "#/$defs/ResourceBindingId"
+        },
+        "code": {
+          "$ref": "#/$defs/ResourceBindingSkipCode"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "binding_id",
+        "code",
+        "reason"
+      ]
+    },
+    "ResourceBindingSkipCode": {
+      "type": "string",
+      "enum": [
+        "unsupported_kind",
+        "unsupported_mode",
+        "capacity_exceeded",
+        "resolution_failed"
+      ]
+    },
+    "ResourceCapability": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/ResourceKind"
+        },
+        "max_bindings": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "default": null,
+          "minimum": 0
+        },
+        "modes": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ResourceBindingMode"
+          },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind"
+      ]
+    },
+    "ResourceId": {
+      "description": "Opaque resource identifier resolved by the host or adapter.",
+      "type": "string"
+    },
+    "ResourceKind": {
+      "description": "Open, namespaced resource kind such as `workspace-view/v1`.\n\nMCP is intentionally not a kind: an MCP adapter publishes ordinary tools\ninto a `tool-catalog` resource. Skill and tool domain types remain separate.",
+      "type": "string"
+    },
+    "ResourceRef": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/ResourceId"
+        },
+        "kind": {
+          "$ref": "#/$defs/ResourceKind"
+        },
+        "revision": {
+          "$ref": "#/$defs/ResourceRevision"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "id",
+        "revision"
+      ]
+    },
+    "ResourceRevision": {
+      "description": "Immutable resource snapshot/generation identifier.",
+      "type": "string"
+    },
+    "RunId": {
+      "description": "One logical Agent execution within a session.",
+      "type": "string"
+    },
+    "RunLimitKind": {
+      "type": "string",
+      "enum": [
+        "deadline",
+        "model_steps",
+        "tool_calls",
+        "input_tokens",
+        "output_tokens",
+        "cost"
+      ]
+    },
+    "RunLimits": {
+      "description": "Limits have protocol meaning only when a provider declares support.",
+      "type": "object",
+      "properties": {
+        "deadline_unix_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "default": null
+        },
+        "max_cost": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoneyAmount"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "max_input_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "max_model_steps": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "max_output_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "max_tool_calls": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "SchemaRef": {
+      "description": "Immutable Host/adapter-resolved structured-output schema snapshot.",
+      "type": "string"
+    },
+    "TelemetryId": {
+      "description": "Stable telemetry item identifier.",
+      "type": "string"
+    },
+    "UsageReport": {
+      "type": "object",
+      "properties": {
+        "cost": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoneyAmount"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "input_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "output_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "tool_calls": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,6 +1,6 @@
 use crate::types::{Plan, Step, StepId, StepKind};
 
-use super::{agent::agent_output_keys, PlanNormalizer};
+use super::PlanNormalizer;
 
 #[derive(Debug, Default, Clone)]
 pub(super) struct ActionContract {
@@ -20,15 +20,8 @@ impl PlanNormalizer {
             let original_exports = step.exports.clone();
             let original_params = step.params.clone();
             infer_special_step_kind(step);
-            super::agent::apply_agent_defaults(step);
             derive_depends_on_from_bindings(step);
             derive_depends_on_from_param_templates(step, &known_step_ids);
-
-            if step.kind == StepKind::Agent {
-                if let Some(keys) = agent_output_keys(step) {
-                    step.exports = keys;
-                }
-            }
 
             if let Some(contract) = self.known_actions.get(&step.action) {
                 if !contract.output_keys.is_empty() {
@@ -129,7 +122,6 @@ fn infer_special_step_kind(step: &mut Step) {
     match step.action.as_str() {
         "wait_user" => step.kind = StepKind::WaitUser,
         "wait_event" => step.kind = StepKind::WaitEvent,
-        "agent" => step.kind = StepKind::Agent,
         _ => {}
     }
 }
@@ -234,29 +226,4 @@ pub(super) fn parse_step_binding_source(value: &str) -> Option<(String, &str)> {
         return None;
     }
     Some((source_step.to_string(), source_key))
-}
-
-pub(super) fn output_keys_from_schema(schema: &serde_json::Value) -> Vec<String> {
-    let Some(schema_obj) = schema.as_object() else {
-        return Vec::new();
-    };
-
-    let required: Vec<String> = schema_obj
-        .get("required")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|item| item.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
-    if !required.is_empty() {
-        return required;
-    }
-
-    schema_obj
-        .get("properties")
-        .and_then(|v| v.as_object())
-        .map(|props| props.keys().cloned().collect())
-        .unwrap_or_default()
 }

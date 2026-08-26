@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use serde_json::Value;
 
 pub(super) const MAX_LOG_TEXT_CHARS: usize = 2_000;
@@ -17,13 +15,4 @@ pub(super) fn truncate_for_log(input: &str, max_chars: usize) -> String {
 
 pub(super) fn truncate_json_for_log(value: &Value, max_chars: usize) -> String {
     truncate_for_log(&value.to_string(), max_chars)
-}
-
-pub(super) fn truncate_json_map_for_log(map: &HashMap<String, Value>, max_chars: usize) -> String {
-    let as_value = Value::Object(
-        map.iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect::<serde_json::Map<String, Value>>(),
-    );
-    truncate_json_for_log(&as_value, max_chars)
 }

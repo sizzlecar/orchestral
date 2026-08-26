@@ -1,10 +1,7 @@
-mod channel;
+mod agent;
 mod cli;
 mod envfile;
 mod runtime;
-mod scenario;
-mod theme;
-mod tui;
 
 use clap::Parser;
 

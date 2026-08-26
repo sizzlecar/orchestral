@@ -1,44 +1,54 @@
 //! # Orchestral Runtime
 //!
-//! Thread Runtime with concurrency, interruption, scheduling, LLM planners,
-//! built-in actions, context building, and application-layer API.
+//! Agent Protocol control plane, Generic Agent, guarded tools, and context.
 
-pub mod action;
-pub mod agent;
+pub mod agent_control;
+pub mod agent_sdk;
 pub mod api;
-mod bootstrap;
-mod concurrency;
-pub mod context;
-mod interaction;
-#[allow(dead_code)]
-mod interpreter;
-mod orchestrator;
-pub mod planner;
-pub mod sdk;
-pub mod session;
+pub mod approval_bridge;
+pub mod generic_agent;
+mod in_memory_blob;
+pub mod pty_process;
+pub mod session_context;
 pub mod skill;
-#[cfg(test)]
-mod system_prompts;
-mod thread;
-mod thread_runtime;
+pub mod tool_runtime;
+pub mod tools;
+pub mod workflow_strategy;
 
-pub use bootstrap::{
-    BootstrapError, DefaultRuntimeComponentFactory, InMemoryBlobStore, RuntimeApp,
-};
-pub use concurrency::{
-    ConcurrencyDecision, ConcurrencyPolicy, DefaultConcurrencyPolicy, MergeConcurrencyPolicy,
-    ParallelConcurrencyPolicy, QueueConcurrencyPolicy, RejectWhenBusyConcurrencyPolicy,
-    RunningState,
-};
-pub use interaction::{Interaction, InteractionId, InteractionState};
+pub use agent_control::{AgentControlError, AgentControlEvent, AgentController};
+pub use agent_sdk::{AgentClient, AgentRunHandle, AgentSdkError, AgentTurn};
+pub use approval_bridge::{AgentApprovalBridge, ApprovalBridgeError, InMemoryHostApprovalBroker};
+pub use generic_agent::{GenericAgentConfig, InternalGenericAgentProvider};
+pub use in_memory_blob::InMemoryBlobStore;
 pub use orchestral_core::spi::{
-    ComponentRegistry, HookDispatchMode, HookExecutionPolicy, HookFailurePolicy, HookRegistry,
-    RuntimeBuildRequest, RuntimeComponentFactory, RuntimeHook, RuntimeHookContext,
-    RuntimeHookEventEnvelope, SpiError, SpiMeta, StoreBundle,
+    ComponentRegistry, HookDispatchError, HookDispatchMode, HookError, HookExecutionPolicy,
+    HookFailurePolicy, HookRegistry, RuntimeBuildRequest, RuntimeComponentFactory, RuntimeHook,
+    RuntimeHookContext, RuntimeHookEventEnvelope, SpiError, SpiMeta,
 };
-pub use orchestrator::{Orchestrator, OrchestratorError, OrchestratorResult};
-pub use thread::{Thread, ThreadId};
-pub use thread_runtime::{HandleEventResult, RuntimeError, ThreadRuntime, ThreadRuntimeConfig};
+pub use pty_process::{
+    PtyProcessError, PtyProcessId, PtyProcessManager, PtyReadResult, PtySpawnSpec,
+};
+pub use session_context::{
+    AgentSessionCompactor, AgentSessionContextEngine, AgentSessionSummarizer, JsonSizeTokenMeter,
+    ModelTokenMeter, SessionCompactionInput, SessionCompactionPolicy, SessionContextError,
+    SessionContextProjection, SessionContextRequest, SessionSummary,
+};
+pub use skill::{
+    ActivatedSkillSet, SkillActivationOutcome, SkillActivationPolicy, SkillActivationRequest,
+    SkillConflict, SkillHostProfile, SkillRoot, SkillRuntime, SkillRuntimeError,
+};
+pub use tool_runtime::{
+    AgentToolRuntime, GuardedToolExecution, GuardedToolExecutor, GuardedToolResult,
+    GuardedToolRuntime, ToolArtifactError, ToolArtifactStore, ToolRuntimeError,
+};
+pub use tools::{
+    GuardedMcpServerConfig, McpServerConnectionManager, McpServerHealth, McpToolsAdapterError,
+    McpToolsAdapterRegistry,
+};
+pub use workflow_strategy::{
+    RunBoundGuardedToolPort, WorkflowExecutionError, WorkflowExecutionRequest,
+    WorkflowExecutionSnapshot, WorkflowExecutionStrategy,
+};
 
 // Re-export core types for convenience
 pub use orchestral_core::prelude::*;

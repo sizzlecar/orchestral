@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use crate::store::WorkingSet;
 use crate::types::Step;
+use crate::workflow_state::WorkingSet;
 
 pub(super) fn bind_param_value(params: &mut Value, key: &str, value: &Value) -> Result<(), String> {
     match params {
@@ -110,7 +110,7 @@ fn render_param_template(template: &str, ws: &WorkingSet, root: &Value) -> Resul
 }
 
 fn lookup_working_set_value(ws: &WorkingSet, key: &str) -> Option<Value> {
-    if let Some(value) = ws.get_task(key) {
+    if let Some(value) = ws.get_workflow(key) {
         return Some(value.clone());
     }
 
@@ -128,7 +128,7 @@ fn lookup_working_set_value(ws: &WorkingSet, key: &str) -> Option<Value> {
     }
 
     for (consumed, candidate) in checkpoints.into_iter().rev() {
-        let Some(base) = ws.get_task(&candidate) else {
+        let Some(base) = ws.get_workflow(&candidate) else {
             continue;
         };
         if let Some(value) = resolve_value_segments(base, &segments[consumed..]) {
@@ -155,7 +155,7 @@ fn lookup_template_value(root: &Value, key: &str) -> Option<Value> {
 fn synthesize_task_object_binding(ws: &WorkingSet, key: &str) -> Option<Value> {
     let prefix = format!("{key}.");
     let mut object = serde_json::Map::new();
-    for (candidate, value) in ws.export_task_data() {
+    for (candidate, value) in ws.export_workflow_data() {
         let Some(remainder) = candidate.strip_prefix(&prefix) else {
             continue;
         };
@@ -303,7 +303,7 @@ mod tests {
     #[test]
     fn test_resolve_param_templates_supports_bracket_index_and_string_path_accessor() {
         let mut ws = WorkingSet::new();
-        ws.set_task(
+        ws.set_workflow(
             "locate.artifact_candidates",
             json!(["docs/report.xlsx", "docs/backup.xlsx"]),
         );
@@ -319,7 +319,7 @@ mod tests {
     #[test]
     fn test_resolve_param_templates_keeps_legacy_dot_index_lookup() {
         let mut ws = WorkingSet::new();
-        ws.set_task(
+        ws.set_workflow(
             "locate.artifact_candidates",
             json!(["docs/report.xlsx", "docs/backup.xlsx"]),
         );
@@ -335,14 +335,14 @@ mod tests {
     #[test]
     fn test_resolve_param_templates_synthesizes_step_object_from_exported_fields() {
         let mut ws = WorkingSet::new();
-        ws.set_task(
+        ws.set_workflow(
             "assess_patches.continuation",
             json!({
                 "status": "commit_ready",
                 "patch_spec": { "fills": [{ "cell": "F5", "value": "done" }] }
             }),
         );
-        ws.set_task(
+        ws.set_workflow(
             "assess_patches.summary",
             json!("Spreadsheet probe ready for commit."),
         );
@@ -367,8 +367,8 @@ mod tests {
     #[test]
     fn test_render_working_set_template_renders_nested_scalar_bindings() {
         let mut ws = WorkingSet::new();
-        ws.set_task("inspect.selected_region.row_count", json!(7));
-        ws.set_task("inspect.max_column", json!(11));
+        ws.set_workflow("inspect.selected_region.row_count", json!(7));
+        ws.set_workflow("inspect.max_column", json!(11));
 
         let rendered = render_working_set_template(
             "共有 {{inspect.selected_region.row_count}} 行，最大列 {{inspect.max_column}}。",

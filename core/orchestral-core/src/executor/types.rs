@@ -1,49 +1,43 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
-use crate::action::{Action, ActionResult, ApprovalRequest};
-use crate::planner::{PlannerRuntimeInfo, SkillInstruction};
-use crate::spi::lifecycle::LifecycleHookRegistry;
-use crate::store::WorkingSet;
-use crate::types::{Step, StepId, TaskId};
+use crate::types::{StepId, StepKind, WorkflowId};
+use crate::workflow_state::WorkingSet;
 
-/// Action registry for looking up actions by name
-pub struct ActionRegistry {
-    actions: HashMap<String, Arc<dyn Action>>,
+use super::StepOutcome;
+
+/// Fully resolved request presented to a run-scoped step execution boundary.
+///
+/// The request contains execution data only. Run authority, Tool grants, and
+/// approval capabilities must be captured by the Host-owned port rather than
+/// placed in model- or planner-controlled step parameters.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StepExecutionRequest {
+    /// Logical Step identity from the normalized Plan.
+    pub step_id: StepId,
+    /// Control semantics declared by the normalized Step.
+    pub step_kind: StepKind,
+    /// Planner-selected action/tool name.
+    pub action: String,
+    /// Identity of this concrete attempt, stable for the duration of the call.
+    pub execution_id: String,
+    /// Parameters after WorkingSet bindings and templates have been resolved.
+    pub resolved_params: Value,
 }
 
-impl ActionRegistry {
-    /// Create a new empty registry
-    pub fn new() -> Self {
-        Self {
-            actions: HashMap::new(),
-        }
-    }
-
-    /// Register an action
-    pub fn register(&mut self, action: Arc<dyn Action>) {
-        self.actions.insert(action.name().to_string(), action);
-    }
-
-    /// Get an action by name
-    pub fn get(&self, name: &str) -> Option<Arc<dyn Action>> {
-        self.actions.get(name).cloned()
-    }
-
-    /// Get all action names
-    pub fn names(&self) -> Vec<String> {
-        self.actions.keys().cloned().collect()
-    }
-}
-
-impl Default for ActionRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
+/// The mandatory run-scoped execution seam for every executable DAG Step.
+#[async_trait]
+pub trait StepExecutionPort: Send + Sync {
+    /// Execute one fully resolved Step without falling back to legacy dispatch.
+    async fn execute_step(
+        &self,
+        request: StepExecutionRequest,
+        ctx: &ExecutorContext,
+    ) -> StepOutcome;
 }
 
 /// Executor context
@@ -51,48 +45,44 @@ pub struct ExecutorContext {
     /// Working set for inter-step communication
     pub working_set: Arc<RwLock<WorkingSet>>,
     /// Task ID
-    pub task_id: TaskId,
+    pub workflow_id: WorkflowId,
+    /// Root cancellation token for this execution.
+    ///
+    /// Every action receives a child of this token so cancelling the execution
+    /// is propagated without allowing one action to cancel its siblings.
+    pub cancellation_token: CancellationToken,
     /// Optional execution progress reporter.
     pub progress_reporter: Option<Arc<dyn ExecutionProgressReporter>>,
-    /// Runtime host information (OS, arch, shell, python) for platform-aware execution.
-    pub runtime_info: Option<PlannerRuntimeInfo>,
-    /// Activated skill instructions for this execution turn.
-    pub skill_instructions: Vec<SkillInstruction>,
-    /// Lifecycle hooks for SDK pipeline observation/interception.
-    pub lifecycle_hooks: Option<Arc<LifecycleHookRegistry>>,
-    /// Thread ID for lifecycle hook context.
-    pub thread_id: Option<String>,
+    /// Host-owned execution boundary for this Run. It is mandatory so the DAG
+    /// cannot fall back to an unguarded Action or nested Agent executor.
+    pub step_execution_port: Arc<dyn StepExecutionPort>,
 }
 
 impl ExecutorContext {
     /// Create a new executor context
-    pub fn new(task_id: impl Into<TaskId>, working_set: Arc<RwLock<WorkingSet>>) -> Self {
+    pub fn new(
+        workflow_id: impl Into<WorkflowId>,
+        working_set: Arc<RwLock<WorkingSet>>,
+        step_execution_port: Arc<dyn StepExecutionPort>,
+    ) -> Self {
         Self {
-            task_id: task_id.into(),
+            workflow_id: workflow_id.into(),
             working_set,
+            cancellation_token: CancellationToken::new(),
             progress_reporter: None,
-            runtime_info: None,
-            skill_instructions: Vec::new(),
-            lifecycle_hooks: None,
-            thread_id: None,
+            step_execution_port,
         }
+    }
+
+    /// Attach the root cancellation token owned by the execution caller.
+    pub fn with_cancellation_token(mut self, cancellation_token: CancellationToken) -> Self {
+        self.cancellation_token = cancellation_token;
+        self
     }
 
     /// Attach a realtime execution progress reporter.
     pub fn with_progress_reporter(mut self, reporter: Arc<dyn ExecutionProgressReporter>) -> Self {
         self.progress_reporter = Some(reporter);
-        self
-    }
-
-    /// Attach runtime host information for platform-aware execution.
-    pub fn with_runtime_info(mut self, info: PlannerRuntimeInfo) -> Self {
-        self.runtime_info = Some(info);
-        self
-    }
-
-    /// Attach activated skill instructions for this execution turn.
-    pub fn with_skill_instructions(mut self, skills: Vec<SkillInstruction>) -> Self {
-        self.skill_instructions = skills;
         self
     }
 }
@@ -105,11 +95,7 @@ pub enum ExecutionResult {
     /// Execution failed
     Failed { step_id: StepId, error: String },
     /// Waiting for user input
-    WaitingUser {
-        step_id: StepId,
-        prompt: String,
-        approval: Option<ApprovalRequest>,
-    },
+    WaitingUser { step_id: StepId, prompt: String },
     /// Waiting for external event
     WaitingEvent { step_id: StepId, event_type: String },
 }
@@ -117,10 +103,10 @@ pub enum ExecutionResult {
 /// Realtime execution progress event.
 #[derive(Debug, Clone)]
 pub struct ExecutionProgressEvent {
-    pub task_id: TaskId,
+    pub workflow_id: WorkflowId,
     pub step_id: Option<StepId>,
     pub action: Option<String>,
-    /// Phase label, e.g. step_started/step_completed/task_completed.
+    /// Phase label, e.g. step_started/step_completed/workflow_completed.
     pub phase: String,
     /// Optional human-readable message.
     pub message: Option<String>,
@@ -130,13 +116,13 @@ pub struct ExecutionProgressEvent {
 
 impl ExecutionProgressEvent {
     pub fn new(
-        task_id: impl Into<TaskId>,
+        workflow_id: impl Into<WorkflowId>,
         step_id: Option<StepId>,
         action: Option<String>,
         phase: impl Into<String>,
     ) -> Self {
         Self {
-            task_id: task_id.into(),
+            workflow_id: workflow_id.into(),
             step_id,
             action,
             phase: phase.into(),
@@ -160,31 +146,4 @@ impl ExecutionProgressEvent {
 #[async_trait]
 pub trait ExecutionProgressReporter: Send + Sync {
     async fn report(&self, event: ExecutionProgressEvent) -> Result<(), String>;
-}
-
-/// Runtime-provided executor for `StepKind::Agent`.
-#[async_trait]
-pub trait AgentStepExecutor: Send + Sync {
-    async fn execute_agent_step(
-        &self,
-        step: &Step,
-        resolved_params: serde_json::Value,
-        execution_id: &str,
-        ctx: &ExecutorContext,
-        action_registry: Arc<RwLock<ActionRegistry>>,
-    ) -> ActionResult;
-}
-
-pub type ActionPreflightHook = Arc<dyn Fn(&str, &Value) -> Option<String> + Send + Sync>;
-
-#[derive(Clone, Default)]
-pub struct ActionExecutionOptions {
-    pub preflight_hook: Option<ActionPreflightHook>,
-}
-
-impl ActionExecutionOptions {
-    pub fn with_preflight_hook(mut self, hook: ActionPreflightHook) -> Self {
-        self.preflight_hook = Some(hook);
-        self
-    }
 }

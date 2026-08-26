@@ -1,0 +1,2780 @@
+//! Provider-neutral Generic Agent implementation.
+//!
+//! Tools are optional and can only enter through the Host-owned guarded Tool
+//! runtime. A model tool call never carries authority by itself.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use async_trait::async_trait;
+use futures_util::{stream, StreamExt};
+use orchestral_core::agent_protocol::{
+    spi::{AgentProvider, AgentProviderStream, AgentStart, AgentStartError},
+    wire::{
+        AgentAdmission, AgentCapabilities, AgentCommand, AgentCommandEnvelope, AgentDelivery,
+        AgentDescriptor, AgentDescriptorEnvelope, AgentEvent, AgentEventDraft, AgentEventId,
+        AgentExecutionRef, AgentFailure, AgentId, AgentProtocolError, AgentProtocolErrorCode,
+        AgentProviderId, AgentProviderStreamItem, AgentRejection, AgentRejectionCode,
+        AgentStartRequest, AgentTelemetry, AgentTelemetryEnvelope, ApprovalDecision,
+        BindingRequirement, CancelSupport, CommandId, Content, ContentBody, ControlCapabilities,
+        DeliveryId, Digest, EffectMediation, IncompleteReason, OutputId, PartialDelivery,
+        PartialDeliveryId, PendingRequest, PendingRequestKind, PendingRequestPayload, Provenance,
+        ProviderCommandDisposition, ProviderCommandOutcome, RequestId, RequestResolution,
+        ResourceBindingMode, ResourceBindingSkip, ResourceBindingSkipCode, ResourceCapability,
+        ResourceKind, RunId, RunLimitKind, TelemetryId, UsageReport,
+    },
+    AGENT_PROTOCOL_V1,
+};
+use orchestral_core::agent_session::{
+    AgentSessionError, AgentSessionEvent, AgentSessionEventDraft, AgentSessionEventId,
+    AgentSessionJournalStore, InMemoryAgentSessionJournalStore,
+};
+use orchestral_core::executor::{ExecutionProgressEvent, ExecutionProgressReporter};
+use orchestral_core::model_protocol::{
+    ModelBackend, ModelContent, ModelError, ModelErrorCode, ModelEvent, ModelFinishReason,
+    ModelMessage, ModelRequest, ModelRequestId, ModelRole, ModelToolCallId, ModelToolDefinition,
+    ModelUsage,
+};
+use orchestral_core::tool_protocol::{
+    ApprovalBinding, ApprovalCapability, RunToolGrant, ToolCallId, ToolInvocation, ToolOutcome,
+    ToolOutput,
+};
+use orchestral_core::types::{Plan, WorkflowId};
+use serde::Deserialize;
+use tokio::sync::{broadcast, oneshot};
+use tokio_util::sync::CancellationToken;
+
+use crate::approval_bridge::AgentApprovalBridge;
+use crate::skill::{
+    ActivatedSkillSet, SkillActivationOutcome, SkillActivationRequest, SkillRuntime,
+};
+use crate::tool_runtime::{AgentToolRuntime, GuardedToolResult, ToolRuntimeError};
+use crate::workflow_strategy::{WorkflowExecutionRequest, WorkflowExecutionStrategy};
+use crate::{
+    AgentSessionContextEngine, JsonSizeTokenMeter, ModelTokenMeter, SessionContextError,
+    SessionContextRequest,
+};
+
+const WORKFLOW_TOOL_NAME: &str = "orchestral_workflow";
+const SKILL_ACTIVATE_TOOL_NAME: &str = "orchestral_skill_activate";
+
+#[derive(Debug, Clone)]
+pub struct GenericAgentConfig {
+    pub provider_id: AgentProviderId,
+    pub agent_id: AgentId,
+    pub system_prompt: String,
+    pub stream_buffer: usize,
+    pub max_model_rounds: u64,
+    pub max_tool_calls: u64,
+    pub max_context_tokens: u64,
+    pub reserved_output_tokens: u64,
+}
+
+impl GenericAgentConfig {
+    pub fn new(provider_id: impl Into<String>, agent_id: impl Into<String>) -> Self {
+        Self {
+            provider_id: AgentProviderId::new(provider_id),
+            agent_id: AgentId::new(agent_id),
+            system_prompt: "You are a helpful, precise assistant.".to_owned(),
+            stream_buffer: 128,
+            max_model_rounds: 8,
+            max_tool_calls: 32,
+            max_context_tokens: 128 * 1024,
+            reserved_output_tokens: 4 * 1024,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct InternalGenericAgentProvider {
+    inner: Arc<GenericInner>,
+}
+
+struct GenericInner {
+    backend: Arc<dyn ModelBackend>,
+    descriptor: AgentDescriptorEnvelope,
+    config: GenericAgentConfig,
+    tools: Option<GenericTools>,
+    skills: Option<Arc<SkillRuntime>>,
+    session_journal: Arc<dyn AgentSessionJournalStore>,
+    context_engine: AgentSessionContextEngine,
+    config_digest: Digest,
+    state: Mutex<GenericState>,
+}
+
+struct GenericTools {
+    runtime: Arc<dyn AgentToolRuntime>,
+    run_grant: RunToolGrant,
+    model_definitions: Vec<ModelToolDefinition>,
+    workflow: Option<Arc<WorkflowExecutionStrategy>>,
+    approval_bridge: Option<Arc<dyn AgentApprovalBridge>>,
+}
+
+#[derive(Default)]
+struct GenericState {
+    runs: BTreeMap<RunId, GenericRun>,
+    sessions: BTreeMap<orchestral_core::agent_protocol::wire::AgentSessionId, GenericSession>,
+}
+
+#[derive(Default)]
+struct GenericSession {
+    active_run: Option<RunId>,
+}
+
+struct GenericRun {
+    request: AgentStartRequest,
+    execution: AgentExecutionRef,
+    admission: AgentAdmission,
+    durable_events: Vec<AgentEventDraft>,
+    sender: broadcast::Sender<AgentProviderStreamItem>,
+    terminal: bool,
+    cancellation: CancellationToken,
+    cancel_command: Option<(CommandId, String)>,
+    commands: BTreeMap<CommandId, StoredCommand>,
+    pending_approvals: BTreeMap<RequestId, PendingApproval>,
+}
+
+struct PendingApproval {
+    binding: ApprovalBinding,
+    responder: Option<oneshot::Sender<ApprovalResponse>>,
+}
+
+struct ApprovalResponse {
+    command_id: CommandId,
+    resolution: RequestResolution,
+    capability: Option<ApprovalCapability>,
+}
+
+struct StoredCommand {
+    digest: Digest,
+    outcome: ProviderCommandOutcome,
+}
+
+impl InternalGenericAgentProvider {
+    pub fn new(
+        backend: Arc<dyn ModelBackend>,
+        config: GenericAgentConfig,
+    ) -> Result<Self, AgentProtocolError> {
+        Self::build(
+            backend,
+            config,
+            None,
+            None,
+            Arc::new(InMemoryAgentSessionJournalStore::default()),
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+    }
+
+    pub fn new_with_session_journal(
+        backend: Arc<dyn ModelBackend>,
+        config: GenericAgentConfig,
+        session_journal: Arc<dyn AgentSessionJournalStore>,
+        token_meter: Arc<dyn ModelTokenMeter>,
+    ) -> Result<Self, AgentProtocolError> {
+        Self::build(backend, config, None, None, session_journal, token_meter)
+    }
+
+    pub fn new_with_tools(
+        backend: Arc<dyn ModelBackend>,
+        config: GenericAgentConfig,
+        runtime: Arc<dyn AgentToolRuntime>,
+        run_grant: RunToolGrant,
+    ) -> Result<Self, AgentProtocolError> {
+        Self::build(
+            backend,
+            config,
+            Some(configure_tools(runtime, run_grant, None, None)?),
+            None,
+            Arc::new(InMemoryAgentSessionJournalStore::default()),
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+    }
+
+    pub fn new_with_tools_and_session_journal(
+        backend: Arc<dyn ModelBackend>,
+        config: GenericAgentConfig,
+        runtime: Arc<dyn AgentToolRuntime>,
+        run_grant: RunToolGrant,
+        session_journal: Arc<dyn AgentSessionJournalStore>,
+        token_meter: Arc<dyn ModelTokenMeter>,
+    ) -> Result<Self, AgentProtocolError> {
+        Self::build(
+            backend,
+            config,
+            Some(configure_tools(runtime, run_grant, None, None)?),
+            None,
+            session_journal,
+            token_meter,
+        )
+    }
+
+    /// Enables Host-mediated approval while keeping capability issuance out of
+    /// both the model and the Generic Agent implementation.
+    pub fn new_with_tools_approval_and_session_journal(
+        backend: Arc<dyn ModelBackend>,
+        config: GenericAgentConfig,
+        runtime: Arc<dyn AgentToolRuntime>,
+        run_grant: RunToolGrant,
+        approval_bridge: Arc<dyn AgentApprovalBridge>,
+        session_journal: Arc<dyn AgentSessionJournalStore>,
+        token_meter: Arc<dyn ModelTokenMeter>,
+    ) -> Result<Self, AgentProtocolError> {
+        Self::build(
+            backend,
+            config,
+            Some(configure_tools(
+                runtime,
+                run_grant,
+                None,
+                Some(approval_bridge),
+            )?),
+            None,
+            session_journal,
+            token_meter,
+        )
+    }
+
+    /// Enables explicit complex-workflow selection while retaining one Generic
+    /// Agent loop and the same guarded Tool Runtime for direct and DAG calls.
+    pub fn new_with_workflow_and_session_journal(
+        backend: Arc<dyn ModelBackend>,
+        config: GenericAgentConfig,
+        runtime: Arc<dyn AgentToolRuntime>,
+        run_grant: RunToolGrant,
+        workflow: Arc<WorkflowExecutionStrategy>,
+        session_journal: Arc<dyn AgentSessionJournalStore>,
+        token_meter: Arc<dyn ModelTokenMeter>,
+    ) -> Result<Self, AgentProtocolError> {
+        if !workflow.uses_tool_runtime(&runtime) {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidSpec,
+                "Generic Agent and Workflow must share one guarded Tool Runtime",
+            ));
+        }
+        Self::build(
+            backend,
+            config,
+            Some(configure_tools(runtime, run_grant, Some(workflow), None)?),
+            None,
+            session_journal,
+            token_meter,
+        )
+    }
+
+    /// Enables the independent Skill Context Plane. The catalog must still be
+    /// bound into each Run before descriptors or activation are visible.
+    pub fn new_with_skills_and_session_journal(
+        backend: Arc<dyn ModelBackend>,
+        config: GenericAgentConfig,
+        skills: Arc<SkillRuntime>,
+        session_journal: Arc<dyn AgentSessionJournalStore>,
+        token_meter: Arc<dyn ModelTokenMeter>,
+    ) -> Result<Self, AgentProtocolError> {
+        Self::build(
+            backend,
+            config,
+            None,
+            Some(skills),
+            session_journal,
+            token_meter,
+        )
+    }
+
+    /// Composition-root constructor for the ordinary CLI/API Agent: Skill
+    /// context and guarded Tools remain separate runtimes sharing only the
+    /// Generic Agent loop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_tools_approval_skills_and_session_journal(
+        backend: Arc<dyn ModelBackend>,
+        config: GenericAgentConfig,
+        runtime: Arc<dyn AgentToolRuntime>,
+        run_grant: RunToolGrant,
+        approval_bridge: Arc<dyn AgentApprovalBridge>,
+        skills: Arc<SkillRuntime>,
+        session_journal: Arc<dyn AgentSessionJournalStore>,
+        token_meter: Arc<dyn ModelTokenMeter>,
+    ) -> Result<Self, AgentProtocolError> {
+        Self::build(
+            backend,
+            config,
+            Some(configure_tools(
+                runtime,
+                run_grant,
+                None,
+                Some(approval_bridge),
+            )?),
+            Some(skills),
+            session_journal,
+            token_meter,
+        )
+    }
+
+    fn build(
+        backend: Arc<dyn ModelBackend>,
+        config: GenericAgentConfig,
+        tools: Option<GenericTools>,
+        skills: Option<Arc<SkillRuntime>>,
+        session_journal: Arc<dyn AgentSessionJournalStore>,
+        token_meter: Arc<dyn ModelTokenMeter>,
+    ) -> Result<Self, AgentProtocolError> {
+        let model_descriptor = backend.descriptor();
+        model_descriptor.validate().map_err(model_protocol_error)?;
+        if (tools.is_some() || skills.is_some()) && !model_descriptor.capabilities.tool_calls {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::Unsupported,
+                "configured ModelBackend does not support model function calls",
+            ));
+        }
+        if skills.is_some()
+            && tools.as_ref().is_some_and(|tools| {
+                tools
+                    .model_definitions
+                    .iter()
+                    .any(|definition| definition.name == SKILL_ACTIVATE_TOOL_NAME)
+            })
+        {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidSpec,
+                format!(
+                    "reserved Generic Agent function name is already registered: {SKILL_ACTIVATE_TOOL_NAME}"
+                ),
+            ));
+        }
+        if config.stream_buffer == 0
+            || config.max_model_rounds == 0
+            || config.max_tool_calls == 0
+            || config.max_context_tokens == 0
+            || config.reserved_output_tokens >= config.max_context_tokens
+        {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidSpec,
+                "Generic Agent buffers and loop limits must be non-zero",
+            ));
+        }
+        let has_tools = tools.is_some();
+        let has_approval = tools
+            .as_ref()
+            .and_then(|tools| tools.approval_bridge.as_ref())
+            .is_some();
+        let mut supported_limits =
+            BTreeSet::from([RunLimitKind::ModelSteps, RunLimitKind::InputTokens]);
+        if has_tools {
+            supported_limits.insert(RunLimitKind::ToolCalls);
+        }
+        let descriptor = AgentDescriptorEnvelope::seal(AgentDescriptor {
+            provider_id: config.provider_id.clone(),
+            agent_id: config.agent_id.clone(),
+            supported_protocol_versions: vec![AGENT_PROTOCOL_V1],
+            accepted_content_types: BTreeSet::from(["text/plain".to_owned()]),
+            capabilities: AgentCapabilities {
+                session_reuse: true,
+                structured_output: false,
+                controls: ControlCapabilities {
+                    steer: false,
+                    cancel: CancelSupport::Confirmed,
+                    recover: true,
+                },
+                pending_request_kinds: has_approval
+                    .then(|| BTreeSet::from([PendingRequestKind::Approval]))
+                    .unwrap_or_default(),
+                supported_limits,
+                resources: skills
+                    .as_ref()
+                    .map(|_| {
+                        vec![ResourceCapability {
+                            kind: ResourceKind::new(
+                                orchestral_core::skill_protocol::SKILL_CATALOG_RESOURCE_KIND_V1,
+                            ),
+                            modes: BTreeSet::from([ResourceBindingMode::Snapshot]),
+                            max_bindings: Some(1),
+                        }]
+                    })
+                    .unwrap_or_default(),
+                effect_mediation: if has_tools {
+                    EffectMediation::HostMediated
+                } else {
+                    EffectMediation::None
+                },
+            },
+            extensions: Default::default(),
+        })?;
+        let config_digest = generic_config_digest(
+            &config,
+            &model_descriptor.backend_id,
+            tools
+                .as_ref()
+                .map(|tools| tools.model_definitions.as_slice()),
+            skills.as_ref().map(|skills| skills.catalog()),
+            has_approval,
+        )?;
+        let context_engine = AgentSessionContextEngine::new(session_journal.clone(), token_meter);
+        Ok(Self {
+            inner: Arc::new(GenericInner {
+                backend,
+                descriptor,
+                config,
+                tools,
+                skills,
+                session_journal,
+                context_engine,
+                config_digest,
+                state: Mutex::new(GenericState::default()),
+            }),
+        })
+    }
+
+    fn state(&self) -> MutexGuard<'_, GenericState> {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn stream_for(run: &GenericRun) -> AgentProviderStream {
+        let receiver = run.sender.subscribe();
+        let replay = run
+            .durable_events
+            .clone()
+            .into_iter()
+            .map(|draft| Ok(AgentProviderStreamItem::Event(Box::new(draft))));
+        let replay_stream = stream::iter(replay);
+        if run.terminal {
+            return replay_stream.boxed();
+        }
+        let live = stream::unfold(receiver, |mut receiver| async move {
+            loop {
+                match receiver.recv().await {
+                    Ok(item) => return Some((Ok(item), receiver)),
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        return Some((
+                            Err(AgentProtocolError::new(
+                                AgentProtocolErrorCode::SequenceGap,
+                                format!("Generic Agent stream subscriber lagged by {skipped}"),
+                            )),
+                            receiver,
+                        ));
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        });
+        replay_stream.chain(live).boxed()
+    }
+
+    fn rejection(code: AgentRejectionCode, message: impl Into<String>) -> AgentStartError {
+        AgentStartError::Rejected(AgentRejection::new(code, message))
+    }
+}
+
+#[async_trait]
+impl AgentProvider for InternalGenericAgentProvider {
+    fn describe(&self) -> AgentDescriptorEnvelope {
+        self.inner.descriptor.clone()
+    }
+
+    async fn start(&self, request: AgentStartRequest) -> Result<AgentStart, AgentStartError> {
+        request
+            .validate_for_descriptor(&self.inner.descriptor)
+            .map_err(|error| {
+                Self::rejection(AgentRejectionCode::RunIdConflict, error.to_string())
+            })?;
+        let mut compatibility = self
+            .inner
+            .descriptor
+            .descriptor
+            .check_run_compatibility(&request.run)
+            .map_err(AgentStartError::Rejected)?;
+        let run_skills = resolve_run_skill_binding(
+            self.inner.skills.as_ref(),
+            &request,
+            &mut compatibility.skipped_optional_bindings,
+        )?;
+        let admission = AgentAdmission {
+            skipped_optional_bindings: compatibility.skipped_optional_bindings.clone(),
+        };
+        admission
+            .validate_against(&request.run, &compatibility)
+            .map_err(|error| Self::rejection(AgentRejectionCode::InvalidSpec, error.to_string()))?;
+        let user_message = agent_input_message(&request)
+            .map_err(|error| Self::rejection(AgentRejectionCode::InvalidSpec, error.to_string()))?;
+        let execution =
+            AgentExecutionRef::for_start(&request, &self.inner.descriptor).map_err(|error| {
+                Self::rejection(AgentRejectionCode::RunIdConflict, error.to_string())
+            })?;
+
+        let (stream, cancellation) = {
+            let mut state = self.state();
+            if let Some(existing) = state.runs.get(&request.run.spec.run_id) {
+                if existing.execution != execution || existing.request != request {
+                    return Err(Self::rejection(
+                        AgentRejectionCode::RunIdConflict,
+                        "run_id already belongs to another immutable start",
+                    ));
+                }
+                return Ok(AgentStart {
+                    execution: existing.execution.clone(),
+                    admission: existing.admission.clone(),
+                    stream: Self::stream_for(existing),
+                });
+            }
+
+            let session = state
+                .sessions
+                .entry(request.run.spec.session_id.clone())
+                .or_default();
+            if session.active_run.is_some() {
+                return Err(Self::rejection(
+                    AgentRejectionCode::SessionConflict,
+                    "Generic Agent permits one active Run per session",
+                ));
+            }
+            session.active_run = Some(request.run.spec.run_id.clone());
+
+            let (sender, _) = broadcast::channel(self.inner.config.stream_buffer);
+            let cancellation = CancellationToken::new();
+            let run = GenericRun {
+                request: request.clone(),
+                execution: execution.clone(),
+                admission: admission.clone(),
+                durable_events: Vec::new(),
+                sender,
+                terminal: false,
+                cancellation: cancellation.clone(),
+                cancel_command: None,
+                commands: BTreeMap::new(),
+                pending_approvals: BTreeMap::new(),
+            };
+            let stream = Self::stream_for(&run);
+            state.runs.insert(request.run.spec.run_id.clone(), run);
+            (stream, cancellation)
+        };
+
+        let input_event = AgentSessionEventDraft {
+            event_id: AgentSessionEventId::new(format!(
+                "generic-{}-input",
+                request.run.spec.run_id.as_str()
+            )),
+            session_id: request.run.spec.session_id.clone(),
+            run_id: request.run.spec.run_id.clone(),
+            payload: AgentSessionEvent::RunInputCommitted {
+                message: user_message.clone(),
+            },
+        };
+        let model_definitions = model_definitions_for_run(&self.inner, run_skills.is_some());
+        let system_message = system_message_for_run(&self.inner.config, run_skills.as_deref());
+        let context_result = async {
+            self.inner.session_journal.append(input_event).await?;
+            let backend_context_limit = self
+                .inner
+                .backend
+                .descriptor()
+                .capabilities
+                .max_context_tokens
+                .unwrap_or(self.inner.config.max_context_tokens)
+                .min(self.inner.config.max_context_tokens);
+            let max_context_tokens = request
+                .run
+                .spec
+                .limits
+                .max_input_tokens
+                .map(|limit| {
+                    limit
+                        .saturating_add(self.inner.config.reserved_output_tokens)
+                        .min(backend_context_limit)
+                })
+                .unwrap_or(backend_context_limit);
+            self.inner
+                .context_engine
+                .project(SessionContextRequest {
+                    session_id: request.run.spec.session_id.clone(),
+                    current_run_id: request.run.spec.run_id.clone(),
+                    system_message,
+                    tools: model_definitions.clone(),
+                    max_context_tokens,
+                    reserved_output_tokens: self.inner.config.reserved_output_tokens,
+                    config_digest: self.inner.config_digest.clone(),
+                    allowed_skill_digests: run_skills
+                        .as_ref()
+                        .map(|skills| {
+                            skills
+                                .catalog()
+                                .skills
+                                .iter()
+                                .map(|descriptor| {
+                                    (descriptor.skill_id.clone(), descriptor.digest.clone())
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                })
+                .await
+        }
+        .await;
+
+        let model_messages = match context_result {
+            Ok(context) => context.messages,
+            Err(error) => {
+                let inner = self.inner.clone();
+                let failed_request = request.clone();
+                let failed_user_message = user_message.clone();
+                tokio::spawn(async move {
+                    fail_before_model(
+                        inner,
+                        &failed_request,
+                        &failed_user_message,
+                        session_failure(error),
+                    );
+                });
+                return Ok(AgentStart {
+                    execution,
+                    admission,
+                    stream,
+                });
+            }
+        };
+
+        let inner = self.inner.clone();
+        let run_admission = admission.clone();
+        tokio::spawn(async move {
+            execute_model_run(
+                inner,
+                request,
+                run_admission,
+                user_message,
+                model_messages,
+                model_definitions,
+                run_skills,
+                cancellation,
+            )
+            .await;
+        });
+        Ok(AgentStart {
+            execution,
+            admission,
+            stream,
+        })
+    }
+
+    async fn command(
+        &self,
+        execution: &AgentExecutionRef,
+        command: AgentCommandEnvelope,
+    ) -> Result<ProviderCommandDisposition, AgentProtocolError> {
+        command.verify_digest()?;
+        let approval_bridge = self
+            .inner
+            .tools
+            .as_ref()
+            .and_then(|tools| tools.approval_bridge.clone());
+
+        let (request_id, resolution, binding) = {
+            let mut state = self.state();
+            let run = state.runs.get_mut(&command.run_id).ok_or_else(|| {
+                AgentProtocolError::new(AgentProtocolErrorCode::RunNotFound, "run does not exist")
+            })?;
+            validate_execution_and_duplicate(run, execution, &command)?;
+            if let Some(existing) = run.commands.get(&command.command_id) {
+                return Ok(ProviderCommandDisposition {
+                    command_id: command.command_id,
+                    run_id: command.run_id,
+                    outcome: existing.outcome.clone(),
+                    duplicate: true,
+                });
+            }
+
+            match &command.payload {
+                AgentCommand::Cancel { .. } if run.terminal => {
+                    return Ok(record_command(
+                        run,
+                        &command,
+                        ProviderCommandOutcome::Rejected {
+                            code: AgentProtocolErrorCode::TerminalRun,
+                            message: "Run is already terminal".to_owned(),
+                        },
+                    ));
+                }
+                AgentCommand::Cancel { .. } if run.cancel_command.is_some() => {
+                    return Ok(record_command(
+                        run,
+                        &command,
+                        ProviderCommandOutcome::Rejected {
+                            code: AgentProtocolErrorCode::InvalidTransition,
+                            message: "cancellation is already in progress".to_owned(),
+                        },
+                    ));
+                }
+                AgentCommand::Cancel { reason } => {
+                    run.cancel_command = Some((command.command_id.clone(), reason.clone()));
+                    run.cancellation.cancel();
+                    return Ok(record_command(
+                        run,
+                        &command,
+                        ProviderCommandOutcome::Accepted,
+                    ));
+                }
+                AgentCommand::Steer { .. } => {
+                    return Ok(record_command(
+                        run,
+                        &command,
+                        ProviderCommandOutcome::Unsupported {
+                            feature: "steer".to_owned(),
+                        },
+                    ));
+                }
+                AgentCommand::ResolveRequest { response } => {
+                    let Some(request_id) = command.request_id.as_ref() else {
+                        unreachable!("validated ResolveRequest always carries request_id")
+                    };
+                    if run.terminal {
+                        return Ok(record_command(
+                            run,
+                            &command,
+                            ProviderCommandOutcome::Rejected {
+                                code: AgentProtocolErrorCode::TerminalRun,
+                                message: "Run is already terminal".to_owned(),
+                            },
+                        ));
+                    }
+                    if !matches!(response, RequestResolution::Approval { .. }) {
+                        return Ok(record_command(
+                            run,
+                            &command,
+                            ProviderCommandOutcome::Rejected {
+                                code: AgentProtocolErrorCode::RequestTypeMismatch,
+                                message: "Generic Agent is waiting for an approval resolution"
+                                    .to_owned(),
+                            },
+                        ));
+                    }
+                    let Some(pending) = run.pending_approvals.get(request_id) else {
+                        return Ok(record_command(
+                            run,
+                            &command,
+                            ProviderCommandOutcome::Rejected {
+                                code: AgentProtocolErrorCode::RequestNotFound,
+                                message: "approval request is not pending".to_owned(),
+                            },
+                        ));
+                    };
+                    if approval_bridge.is_none() {
+                        return Ok(record_command(
+                            run,
+                            &command,
+                            ProviderCommandOutcome::Unsupported {
+                                feature: "approval".to_owned(),
+                            },
+                        ));
+                    }
+                    (
+                        request_id.clone(),
+                        response.clone(),
+                        pending.binding.clone(),
+                    )
+                }
+                _ => {
+                    return Ok(record_command(
+                        run,
+                        &command,
+                        ProviderCommandOutcome::Unsupported {
+                            feature: "unknown_command".to_owned(),
+                        },
+                    ));
+                }
+            }
+        };
+
+        let bridge = approval_bridge.expect("approval bridge presence was checked");
+        let capability = match &resolution {
+            RequestResolution::Approval {
+                decision: ApprovalDecision::Allow,
+                grant_ref: Some(grant_ref),
+            } => match bridge.resolve(&request_id, grant_ref, &binding).await {
+                Ok(capability) => Some(capability),
+                Err(error) => {
+                    let mut state = self.state();
+                    let run = state.runs.get_mut(&command.run_id).ok_or_else(|| {
+                        AgentProtocolError::new(
+                            AgentProtocolErrorCode::RunNotFound,
+                            "run disappeared while resolving approval",
+                        )
+                    })?;
+                    return Ok(record_command(
+                        run,
+                        &command,
+                        ProviderCommandOutcome::Rejected {
+                            code: AgentProtocolErrorCode::InvalidSpec,
+                            message: error.to_string(),
+                        },
+                    ));
+                }
+            },
+            RequestResolution::Approval {
+                decision: ApprovalDecision::Deny,
+                grant_ref: None,
+            } => None,
+            _ => unreachable!("command shape and approval kind were validated"),
+        };
+
+        let mut state = self.state();
+        let run = state.runs.get_mut(&command.run_id).ok_or_else(|| {
+            AgentProtocolError::new(
+                AgentProtocolErrorCode::RunNotFound,
+                "run disappeared while resolving approval",
+            )
+        })?;
+        validate_execution_and_duplicate(run, execution, &command)?;
+        if let Some(existing) = run.commands.get(&command.command_id) {
+            return Ok(ProviderCommandDisposition {
+                command_id: command.command_id,
+                run_id: command.run_id,
+                outcome: existing.outcome.clone(),
+                duplicate: true,
+            });
+        }
+        let Some(mut pending) = run.pending_approvals.remove(&request_id) else {
+            return Ok(record_command(
+                run,
+                &command,
+                ProviderCommandOutcome::Rejected {
+                    code: AgentProtocolErrorCode::RequestNotFound,
+                    message: "approval request is no longer pending".to_owned(),
+                },
+            ));
+        };
+        if pending.binding != binding {
+            return Ok(record_command(
+                run,
+                &command,
+                ProviderCommandOutcome::Rejected {
+                    code: AgentProtocolErrorCode::InvalidDigest,
+                    message: "approval binding changed while resolving request".to_owned(),
+                },
+            ));
+        }
+        let delivered = pending.responder.take().is_some_and(|responder| {
+            responder
+                .send(ApprovalResponse {
+                    command_id: command.command_id.clone(),
+                    resolution,
+                    capability,
+                })
+                .is_ok()
+        });
+        let outcome = if delivered {
+            ProviderCommandOutcome::Accepted
+        } else {
+            ProviderCommandOutcome::Rejected {
+                code: AgentProtocolErrorCode::InvalidTransition,
+                message: "approval waiter is no longer active".to_owned(),
+            }
+        };
+        Ok(record_command(run, &command, outcome))
+    }
+
+    fn recover(
+        &self,
+        execution: &AgentExecutionRef,
+    ) -> Result<AgentProviderStream, AgentProtocolError> {
+        let state = self.state();
+        let run = state.runs.get(&execution.run_id).ok_or_else(|| {
+            AgentProtocolError::new(AgentProtocolErrorCode::RunNotFound, "run does not exist")
+        })?;
+        if run.execution != *execution {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::RunIdConflict,
+                "execution reference does not match the Generic Agent Run",
+            ));
+        }
+        Ok(Self::stream_for(run))
+    }
+}
+
+fn validate_execution_and_duplicate(
+    run: &GenericRun,
+    execution: &AgentExecutionRef,
+    command: &AgentCommandEnvelope,
+) -> Result<(), AgentProtocolError> {
+    if run.execution != *execution {
+        return Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::RunIdConflict,
+            "execution reference does not match the Generic Agent Run",
+        ));
+    }
+    if let Some(existing) = run.commands.get(&command.command_id) {
+        if existing.digest != command.command_digest {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::DuplicateConflict,
+                "command_id was reused with different content",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn record_command(
+    run: &mut GenericRun,
+    command: &AgentCommandEnvelope,
+    outcome: ProviderCommandOutcome,
+) -> ProviderCommandDisposition {
+    run.commands.insert(
+        command.command_id.clone(),
+        StoredCommand {
+            digest: command.command_digest.clone(),
+            outcome: outcome.clone(),
+        },
+    );
+    ProviderCommandDisposition {
+        command_id: command.command_id.clone(),
+        run_id: command.run_id.clone(),
+        outcome,
+        duplicate: false,
+    }
+}
+
+async fn execute_model_run(
+    inner: Arc<GenericInner>,
+    request: AgentStartRequest,
+    admission: AgentAdmission,
+    user_message: ModelMessage,
+    mut model_messages: Vec<ModelMessage>,
+    model_tools: Vec<ModelToolDefinition>,
+    run_skills: Option<Arc<SkillRuntime>>,
+    cancellation: CancellationToken,
+) {
+    let run_id = request.run.spec.run_id.clone();
+    for (index, skip) in admission.skipped_optional_bindings.into_iter().enumerate() {
+        publish_durable(
+            &inner,
+            &run_id,
+            AgentEventDraft {
+                event_id: AgentEventId::new(format!(
+                    "generic-{}-resource-skip-{}",
+                    run_id.as_str(),
+                    index + 1
+                )),
+                run_id: run_id.clone(),
+                causation_id: None,
+                source_fingerprint: None,
+                payload: AgentEvent::ResourceBindingSkipped { skip },
+            },
+        );
+    }
+    let started_event_id = AgentEventId::new(format!("generic-{}-started", run_id.as_str()));
+    publish_durable(
+        &inner,
+        &run_id,
+        AgentEventDraft {
+            event_id: started_event_id.clone(),
+            run_id: run_id.clone(),
+            causation_id: None,
+            source_fingerprint: None,
+            payload: AgentEvent::RunStarted,
+        },
+    );
+
+    let model_round_limit = request
+        .run
+        .spec
+        .limits
+        .max_model_steps
+        .unwrap_or(inner.config.max_model_rounds)
+        .min(inner.config.max_model_rounds);
+    let tool_call_limit = request
+        .run
+        .spec
+        .limits
+        .max_tool_calls
+        .unwrap_or(inner.config.max_tool_calls)
+        .min(inner.config.max_tool_calls);
+    let mut total_usage = ModelUsage::default();
+    let mut has_usage = false;
+    let mut tool_call_count = 0;
+    let mut last_response = String::new();
+    let mut supporting_event_ids = vec![started_event_id.clone()];
+
+    'model_rounds: for round in 1..=model_round_limit {
+        let model_request = ModelRequest {
+            request_id: ModelRequestId::new(format!("model-{}-{round}", run_id.as_str())),
+            messages: model_messages.clone(),
+            tools: model_tools.clone(),
+            output_schema: None,
+            max_output_tokens: request.run.spec.limits.max_output_tokens,
+            extensions: Default::default(),
+        };
+        let mut model_stream = match tokio::select! {
+            _ = cancellation.cancelled() => {
+                emit_cancel(&inner, &request, &user_message);
+                return;
+            }
+            result = inner.backend.start(model_request.clone(), cancellation.clone()) => result,
+        } {
+            Ok(stream) => stream,
+            Err(error) => {
+                if cancellation.is_cancelled() {
+                    emit_cancel(&inner, &request, &user_message);
+                } else {
+                    emit_failure(&inner, &request, &user_message, model_failure(error));
+                }
+                return;
+            }
+        };
+
+        let mut expected_sequence = 1;
+        let mut response = String::new();
+        let mut round_usage = None;
+        let mut tool_calls = Vec::<PendingModelToolCall>::new();
+        loop {
+            let item = tokio::select! {
+                _ = cancellation.cancelled() => {
+                    emit_cancel(&inner, &request, &user_message);
+                    return;
+                }
+                item = model_stream.next() => item,
+            };
+            let event = match item {
+                Some(Ok(event)) => event,
+                Some(Err(error)) => {
+                    emit_failure(&inner, &request, &user_message, model_failure(error));
+                    return;
+                }
+                None => {
+                    emit_failure(
+                        &inner,
+                        &request,
+                        &user_message,
+                        agent_failure(
+                            "model_stream_ended",
+                            "model stream ended without Finish",
+                            true,
+                        ),
+                    );
+                    return;
+                }
+            };
+            if let Err(error) = event.validate_for(&model_request.request_id, expected_sequence) {
+                emit_failure(&inner, &request, &user_message, model_failure(error));
+                return;
+            }
+            expected_sequence += 1;
+            match event.payload {
+                ModelEvent::TextDelta { delta } => {
+                    response.push_str(&delta);
+                    publish_telemetry(
+                        &inner,
+                        &run_id,
+                        AgentTelemetryEnvelope {
+                            telemetry_id: TelemetryId::new(format!(
+                                "generic-{}-round-{round}-delta-{}",
+                                run_id.as_str(),
+                                event.sequence
+                            )),
+                            run_id: run_id.clone(),
+                            provider_seq: Some(event.sequence),
+                            payload: AgentTelemetry::OutputDelta {
+                                output_id: OutputId::new(format!(
+                                    "generic-{}-response",
+                                    run_id.as_str()
+                                )),
+                                delta: Content::text(delta),
+                            },
+                        },
+                    );
+                }
+                ModelEvent::ToolCallStart { call_id, name } => {
+                    if tool_calls.iter().any(|call| call.call_id == call_id) {
+                        emit_failure(
+                            &inner,
+                            &request,
+                            &user_message,
+                            model_event_failure("duplicate model Tool call id"),
+                        );
+                        return;
+                    }
+                    tool_calls.push(PendingModelToolCall {
+                        call_id,
+                        name,
+                        arguments: String::new(),
+                        ended: false,
+                    });
+                }
+                ModelEvent::ToolCallArgumentsDelta { call_id, delta } => {
+                    let Some(call) = tool_calls
+                        .iter_mut()
+                        .find(|call| call.call_id == call_id && !call.ended)
+                    else {
+                        emit_failure(
+                            &inner,
+                            &request,
+                            &user_message,
+                            model_event_failure("Tool arguments arrived before start or after end"),
+                        );
+                        return;
+                    };
+                    call.arguments.push_str(&delta);
+                }
+                ModelEvent::ToolCallEnd { call_id } => {
+                    let Some(call) = tool_calls
+                        .iter_mut()
+                        .find(|call| call.call_id == call_id && !call.ended)
+                    else {
+                        emit_failure(
+                            &inner,
+                            &request,
+                            &user_message,
+                            model_event_failure("Tool call ended without one active start"),
+                        );
+                        return;
+                    };
+                    call.ended = true;
+                }
+                ModelEvent::Usage { usage: observed } => round_usage = Some(observed),
+                ModelEvent::Finish { reason } => {
+                    let committed_usage = round_usage.take();
+                    if let Some(observed) = committed_usage.clone() {
+                        merge_usage(&mut total_usage, observed);
+                        has_usage = true;
+                    }
+                    match reason {
+                        ModelFinishReason::Stop
+                            if tool_calls.is_empty() && !response.is_empty() =>
+                        {
+                            if let Err(failure) = append_session_event(
+                                &inner,
+                                AgentSessionEventDraft {
+                                    event_id: AgentSessionEventId::new(format!(
+                                        "generic-{}-output",
+                                        run_id.as_str()
+                                    )),
+                                    session_id: request.run.spec.session_id.clone(),
+                                    run_id: run_id.clone(),
+                                    payload: AgentSessionEvent::RunOutputCommitted {
+                                        request_id: model_request.request_id.clone(),
+                                        message: ModelMessage::text(
+                                            ModelRole::Assistant,
+                                            response.clone(),
+                                        ),
+                                        usage: committed_usage,
+                                    },
+                                },
+                            )
+                            .await
+                            {
+                                emit_failure(&inner, &request, &user_message, failure);
+                                return;
+                            }
+                            emit_delivery(
+                                &inner,
+                                &request,
+                                user_message,
+                                response,
+                                has_usage.then_some(total_usage),
+                                tool_call_count,
+                                supporting_event_ids,
+                            );
+                            return;
+                        }
+                        ModelFinishReason::Length => {
+                            emit_incomplete(
+                                &inner,
+                                &request,
+                                &user_message,
+                                response,
+                                has_usage.then_some(total_usage),
+                                tool_call_count,
+                                started_event_id,
+                                RunLimitKind::OutputTokens,
+                                "model output limit reached",
+                            );
+                            return;
+                        }
+                        ModelFinishReason::Cancelled => {
+                            emit_cancel(&inner, &request, &user_message);
+                            return;
+                        }
+                        ModelFinishReason::ToolCalls | ModelFinishReason::Stop
+                            if !tool_calls.is_empty() => {}
+                        _ => {
+                            emit_failure(
+                                &inner,
+                                &request,
+                                &user_message,
+                                agent_failure(
+                                    "model_incomplete",
+                                    format!(
+                                        "model ended without a deliverable response: {reason:?}"
+                                    ),
+                                    false,
+                                ),
+                            );
+                            return;
+                        }
+                    }
+
+                    if tool_calls.iter().any(|call| !call.ended) {
+                        emit_failure(
+                            &inner,
+                            &request,
+                            &user_message,
+                            model_event_failure("model finished with an incomplete Tool call"),
+                        );
+                        return;
+                    }
+                    let mut assistant_content = Vec::new();
+                    if !response.is_empty() {
+                        last_response = response.clone();
+                        assistant_content.push(ModelContent::Text {
+                            text: response.clone(),
+                        });
+                    }
+                    let mut parsed_calls = Vec::with_capacity(tool_calls.len());
+                    for call in tool_calls {
+                        let arguments = match parse_tool_arguments(&call) {
+                            Ok(arguments) => arguments,
+                            Err(failure) => {
+                                emit_failure(&inner, &request, &user_message, failure);
+                                return;
+                            }
+                        };
+                        assistant_content.push(ModelContent::ToolCall {
+                            call_id: call.call_id.clone(),
+                            name: call.name.clone(),
+                            arguments: arguments.clone(),
+                        });
+                        parsed_calls.push((call, arguments));
+                    }
+                    let assistant_message = ModelMessage {
+                        role: ModelRole::Assistant,
+                        content: assistant_content,
+                    };
+
+                    let mut tool_results = Vec::with_capacity(parsed_calls.len());
+                    let mut activated_context_messages = Vec::new();
+                    for (call, arguments) in parsed_calls {
+                        if call.name == SKILL_ACTIVATE_TOOL_NAME {
+                            let Some(skills) = run_skills.as_ref() else {
+                                emit_failure(
+                                    &inner,
+                                    &request,
+                                    &user_message,
+                                    agent_failure(
+                                        "skill_catalog_unavailable",
+                                        "model requested Skill activation without a bound Skill catalog",
+                                        false,
+                                    ),
+                                );
+                                return;
+                            };
+                            let observation = match execute_skill_activation(
+                                &inner,
+                                &request,
+                                skills,
+                                round,
+                                &call.call_id,
+                                arguments,
+                            )
+                            .await
+                            {
+                                Ok(observation) => observation,
+                                Err(failure) => {
+                                    emit_failure(&inner, &request, &user_message, failure);
+                                    return;
+                                }
+                            };
+                            if let Some(message) = observation.context_message {
+                                activated_context_messages.push(message);
+                            }
+                            tool_results.push(ModelContent::ToolResult {
+                                call_id: call.call_id,
+                                result: observation.result,
+                                is_error: observation.is_error,
+                            });
+                            continue;
+                        }
+                        let Some(tools) = inner.tools.as_ref() else {
+                            emit_failure(
+                                &inner,
+                                &request,
+                                &user_message,
+                                agent_failure(
+                                    "tool_runtime_unavailable",
+                                    "model requested an effect Tool but this Agent has no Host Tool runtime",
+                                    false,
+                                ),
+                            );
+                            return;
+                        };
+                        if tool_call_count >= tool_call_limit {
+                            emit_incomplete(
+                                &inner,
+                                &request,
+                                &user_message,
+                                last_response,
+                                has_usage.then_some(total_usage),
+                                tool_call_count,
+                                started_event_id,
+                                RunLimitKind::ToolCalls,
+                                "Tool call limit reached",
+                            );
+                            return;
+                        }
+                        tool_call_count += 1;
+                        if call.name == WORKFLOW_TOOL_NAME {
+                            let remaining_tool_calls =
+                                tool_call_limit.saturating_sub(tool_call_count);
+                            if remaining_tool_calls == 0 {
+                                emit_incomplete(
+                                    &inner,
+                                    &request,
+                                    &user_message,
+                                    last_response,
+                                    has_usage.then_some(total_usage),
+                                    tool_call_count,
+                                    started_event_id,
+                                    RunLimitKind::ToolCalls,
+                                    "Workflow has no remaining Tool call budget",
+                                );
+                                return;
+                            }
+                            let observation = match execute_workflow_call(
+                                inner.clone(),
+                                tools,
+                                &run_id,
+                                &call.call_id,
+                                arguments,
+                                remaining_tool_calls,
+                                cancellation.clone(),
+                            )
+                            .await
+                            {
+                                WorkflowCallExecution::Observed(observation) => observation,
+                                WorkflowCallExecution::Cancelled => {
+                                    emit_cancel(&inner, &request, &user_message);
+                                    return;
+                                }
+                            };
+                            tool_call_count =
+                                tool_call_count.saturating_add(observation.tool_calls);
+                            let workflow_event_id = publish_workflow_output(
+                                &inner,
+                                &run_id,
+                                round,
+                                &call.call_id,
+                                observation.result.clone(),
+                            );
+                            supporting_event_ids.push(workflow_event_id);
+                            tool_results.push(ModelContent::ToolResult {
+                                call_id: call.call_id,
+                                result: observation.result,
+                                is_error: observation.is_error,
+                            });
+                            continue;
+                        }
+                        let tool_id = match tools.runtime.resolve_tool_id(&call.name) {
+                            Ok(Some(tool_id)) => tool_id,
+                            Ok(None) => {
+                                emit_failure(
+                                    &inner,
+                                    &request,
+                                    &user_message,
+                                    agent_failure(
+                                        "tool_not_found",
+                                        format!("model requested an unknown Tool: {}", call.name),
+                                        false,
+                                    ),
+                                );
+                                return;
+                            }
+                            Err(error) => {
+                                emit_failure(
+                                    &inner,
+                                    &request,
+                                    &user_message,
+                                    agent_failure(
+                                        "tool_runtime_unavailable",
+                                        error.to_string(),
+                                        true,
+                                    ),
+                                );
+                                return;
+                            }
+                        };
+                        let invocation = ToolInvocation {
+                            run_id: run_id.clone(),
+                            call_id: ToolCallId::new(call.call_id.as_str()),
+                            tool_id,
+                            arguments,
+                        };
+                        let result = tools
+                            .runtime
+                            .invoke(
+                                invocation.clone(),
+                                tools.run_grant.clone(),
+                                None,
+                                cancellation.clone(),
+                            )
+                            .await;
+                        let result = match result {
+                            GuardedToolResult::ApprovalRequired { binding, summary } => {
+                                match await_tool_approval(
+                                    inner.clone(),
+                                    tools,
+                                    &run_id,
+                                    round,
+                                    &call.call_id,
+                                    binding,
+                                    summary,
+                                    cancellation.clone(),
+                                )
+                                .await
+                                {
+                                    ApprovalWaitOutcome::Allowed(capability) => {
+                                        tools
+                                            .runtime
+                                            .invoke(
+                                                invocation,
+                                                tools.run_grant.clone(),
+                                                Some(capability),
+                                                cancellation.clone(),
+                                            )
+                                            .await
+                                    }
+                                    ApprovalWaitOutcome::Denied => GuardedToolResult::Outcome {
+                                        outcome: ToolOutcome::Rejected {
+                                            code: "approval_denied".to_owned(),
+                                            message: "Host denied this Tool invocation".to_owned(),
+                                        },
+                                        cached: false,
+                                    },
+                                    ApprovalWaitOutcome::Cancelled => {
+                                        emit_cancel(&inner, &request, &user_message);
+                                        return;
+                                    }
+                                    ApprovalWaitOutcome::Failed(failure) => {
+                                        emit_failure(&inner, &request, &user_message, failure);
+                                        return;
+                                    }
+                                }
+                            }
+                            result => result,
+                        };
+                        match result {
+                            GuardedToolResult::ApprovalRequired { binding, .. } => {
+                                emit_failure(
+                                    &inner,
+                                    &request,
+                                    &user_message,
+                                    AgentFailure {
+                                        code: "approval_capability_rejected".to_owned(),
+                                        message: "Tool still requires approval after the Host resolved the exact request".to_owned(),
+                                        retryable: false,
+                                        details: serde_json::to_value(binding)
+                                            .unwrap_or(serde_json::Value::Null),
+                                    },
+                                );
+                                return;
+                            }
+                            GuardedToolResult::Outcome {
+                                outcome: ToolOutcome::UnknownEffect { .. },
+                                ..
+                            } if cancellation.is_cancelled() => {
+                                // The effect journal deliberately retains UnknownEffect, while
+                                // the Agent Run still observes the user's cancellation as its
+                                // terminal control outcome. A late Tool result is never accepted.
+                                emit_cancel(&inner, &request, &user_message);
+                                return;
+                            }
+                            GuardedToolResult::Outcome {
+                                outcome: ToolOutcome::UnknownEffect { message },
+                                ..
+                            } => {
+                                emit_failure(
+                                    &inner,
+                                    &request,
+                                    &user_message,
+                                    agent_failure("tool_unknown_effect", message, false),
+                                );
+                                return;
+                            }
+                            GuardedToolResult::Outcome {
+                                outcome: ToolOutcome::Cancelled,
+                                ..
+                            } if cancellation.is_cancelled() => {
+                                emit_cancel(&inner, &request, &user_message);
+                                return;
+                            }
+                            GuardedToolResult::Outcome { outcome, .. } => {
+                                let (result, is_error) = model_tool_result(outcome);
+                                tool_results.push(ModelContent::ToolResult {
+                                    call_id: call.call_id,
+                                    result,
+                                    is_error,
+                                });
+                            }
+                        }
+                    }
+                    let tool_message = ModelMessage {
+                        role: ModelRole::Tool,
+                        content: tool_results,
+                    };
+                    if let Err(failure) = append_session_event(
+                        &inner,
+                        AgentSessionEventDraft {
+                            event_id: AgentSessionEventId::new(format!(
+                                "generic-{}-tool-exchange-{round}",
+                                run_id.as_str()
+                            )),
+                            session_id: request.run.spec.session_id.clone(),
+                            run_id: run_id.clone(),
+                            payload: AgentSessionEvent::ToolExchangeCommitted {
+                                request_id: model_request.request_id.clone(),
+                                assistant: assistant_message.clone(),
+                                tool: tool_message.clone(),
+                                usage: committed_usage,
+                            },
+                        },
+                    )
+                    .await
+                    {
+                        emit_failure(&inner, &request, &user_message, failure);
+                        return;
+                    }
+                    model_messages.extend(activated_context_messages);
+                    model_messages.push(assistant_message);
+                    model_messages.push(tool_message);
+                    continue 'model_rounds;
+                }
+                _ => {
+                    emit_failure(
+                        &inner,
+                        &request,
+                        &user_message,
+                        agent_failure(
+                            "unknown_model_event",
+                            "model backend emitted an unsupported event",
+                            false,
+                        ),
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    emit_incomplete(
+        &inner,
+        &request,
+        &user_message,
+        last_response,
+        has_usage.then_some(total_usage),
+        tool_call_count,
+        started_event_id,
+        RunLimitKind::ModelSteps,
+        "model step limit reached",
+    );
+}
+
+enum ApprovalWaitOutcome {
+    Allowed(ApprovalCapability),
+    Denied,
+    Cancelled,
+    Failed(AgentFailure),
+}
+
+async fn await_tool_approval(
+    inner: Arc<GenericInner>,
+    tools: &GenericTools,
+    run_id: &RunId,
+    round: u64,
+    model_call_id: &ModelToolCallId,
+    binding: ApprovalBinding,
+    summary: String,
+    cancellation: CancellationToken,
+) -> ApprovalWaitOutcome {
+    let Some(bridge) = tools.approval_bridge.clone() else {
+        return ApprovalWaitOutcome::Failed(AgentFailure {
+            code: "approval_interaction_not_connected".to_owned(),
+            message:
+                "Tool requires Host approval, but this Agent has no approval interaction bridge"
+                    .to_owned(),
+            retryable: false,
+            details: serde_json::to_value(binding).unwrap_or(serde_json::Value::Null),
+        });
+    };
+    if binding.run_id != *run_id || binding.call_id.as_str() != model_call_id.as_str() {
+        return ApprovalWaitOutcome::Failed(agent_failure(
+            "approval_binding_mismatch",
+            "Tool Runtime returned an approval binding for another invocation",
+            false,
+        ));
+    }
+    let operation_digest = match binding.digest() {
+        Ok(digest) => digest,
+        Err(error) => {
+            return ApprovalWaitOutcome::Failed(agent_failure(
+                "approval_binding_invalid",
+                error.to_string(),
+                false,
+            ));
+        }
+    };
+    let requested_scope = match approval_scope_names(&binding) {
+        Ok(scopes) => scopes,
+        Err(failure) => return ApprovalWaitOutcome::Failed(failure),
+    };
+    let request_id = RequestId::new(format!(
+        "approval:{}:{round}:{}",
+        run_id.as_str(),
+        model_call_id.as_str()
+    ));
+    if let Err(error) = bridge.stage(&request_id, binding.clone()).await {
+        return ApprovalWaitOutcome::Failed(agent_failure(
+            "approval_bridge",
+            error.to_string(),
+            true,
+        ));
+    }
+
+    let (responder, response) = oneshot::channel();
+    let registration = {
+        let mut state = inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match state.runs.get_mut(run_id) {
+            None => Err(agent_failure(
+                "approval_run_missing",
+                "Run disappeared before its approval request was opened",
+                true,
+            )),
+            Some(run) if run.terminal || run.pending_approvals.contains_key(&request_id) => {
+                Err(agent_failure(
+                    "approval_request_conflict",
+                    "approval request identity is no longer available",
+                    false,
+                ))
+            }
+            Some(run) => {
+                run.pending_approvals.insert(
+                    request_id.clone(),
+                    PendingApproval {
+                        binding: binding.clone(),
+                        responder: Some(responder),
+                    },
+                );
+                Ok(())
+            }
+        }
+    };
+    if let Err(failure) = registration {
+        let _ = bridge.clear(&request_id).await;
+        return ApprovalWaitOutcome::Failed(failure);
+    }
+    publish_durable(
+        &inner,
+        run_id,
+        AgentEventDraft {
+            event_id: AgentEventId::new(format!(
+                "generic-{}-approval-{round}-{}-opened",
+                run_id.as_str(),
+                model_call_id.as_str()
+            )),
+            run_id: run_id.clone(),
+            causation_id: None,
+            source_fingerprint: None,
+            payload: AgentEvent::RequestOpened {
+                request: PendingRequest {
+                    request_id: request_id.clone(),
+                    blocking: true,
+                    payload: PendingRequestPayload::Approval {
+                        operation_digest,
+                        requested_scope,
+                        reason: summary,
+                    },
+                },
+            },
+        },
+    );
+
+    let response = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => None,
+        response = response => Some(response),
+    };
+    let Some(response) = response else {
+        remove_pending_approval(&inner, run_id, &request_id);
+        let _ = bridge.clear(&request_id).await;
+        return ApprovalWaitOutcome::Cancelled;
+    };
+    let response = match response {
+        Ok(response) => response,
+        Err(_) => {
+            remove_pending_approval(&inner, run_id, &request_id);
+            let _ = bridge.clear(&request_id).await;
+            return ApprovalWaitOutcome::Failed(agent_failure(
+                "approval_waiter_closed",
+                "approval response channel closed before resolution",
+                true,
+            ));
+        }
+    };
+    let resolution_digest = match response.resolution.digest() {
+        Ok(digest) => digest,
+        Err(error) => {
+            let _ = bridge.clear(&request_id).await;
+            return ApprovalWaitOutcome::Failed(agent_failure(
+                "approval_resolution_invalid",
+                error.to_string(),
+                false,
+            ));
+        }
+    };
+    publish_durable(
+        &inner,
+        run_id,
+        AgentEventDraft {
+            event_id: AgentEventId::new(format!(
+                "generic-{}-approval-{round}-{}-resolved",
+                run_id.as_str(),
+                model_call_id.as_str()
+            )),
+            run_id: run_id.clone(),
+            causation_id: Some(response.command_id),
+            source_fingerprint: None,
+            payload: AgentEvent::RequestResolved {
+                request_id: request_id.clone(),
+                resolution: response.resolution.clone(),
+                resolution_digest,
+            },
+        },
+    );
+    if let Err(error) = bridge.clear(&request_id).await {
+        return ApprovalWaitOutcome::Failed(agent_failure(
+            "approval_bridge",
+            error.to_string(),
+            true,
+        ));
+    }
+    match (response.resolution, response.capability) {
+        (
+            RequestResolution::Approval {
+                decision: ApprovalDecision::Allow,
+                ..
+            },
+            Some(capability),
+        ) => ApprovalWaitOutcome::Allowed(capability),
+        (
+            RequestResolution::Approval {
+                decision: ApprovalDecision::Deny,
+                ..
+            },
+            None,
+        ) => ApprovalWaitOutcome::Denied,
+        _ => ApprovalWaitOutcome::Failed(agent_failure(
+            "approval_resolution_invalid",
+            "approval resolution and capability do not agree",
+            false,
+        )),
+    }
+}
+
+fn remove_pending_approval(inner: &GenericInner, run_id: &RunId, request_id: &RequestId) {
+    let mut state = inner
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(run) = state.runs.get_mut(run_id) {
+        run.pending_approvals.remove(request_id);
+    }
+}
+
+fn approval_scope_names(binding: &ApprovalBinding) -> Result<Vec<String>, AgentFailure> {
+    binding
+        .requested_scopes
+        .iter()
+        .map(|scope| {
+            serde_json::to_value(scope)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .ok_or_else(|| {
+                    agent_failure(
+                        "approval_scope_invalid",
+                        "Tool effect scope could not be represented in Agent Protocol",
+                        false,
+                    )
+                })
+        })
+        .collect()
+}
+
+struct SkillCallObservation {
+    result: serde_json::Value,
+    is_error: bool,
+    context_message: Option<ModelMessage>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillActivateArguments {
+    name: String,
+    expected_digest: Digest,
+    reason: String,
+}
+
+async fn execute_skill_activation(
+    inner: &GenericInner,
+    request: &AgentStartRequest,
+    skills: &SkillRuntime,
+    round: u64,
+    call_id: &ModelToolCallId,
+    arguments: serde_json::Value,
+) -> Result<SkillCallObservation, AgentFailure> {
+    let parsed = match serde_json::from_value::<SkillActivateArguments>(arguments) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return Ok(SkillCallObservation {
+                result: serde_json::json!({
+                    "code": "skill_activation_arguments_invalid",
+                    "message": error.to_string(),
+                }),
+                is_error: true,
+                context_message: None,
+            })
+        }
+    };
+    let records = inner
+        .session_journal
+        .load_session(&request.run.spec.session_id)
+        .await
+        .map_err(session_journal_failure)?;
+    let active = ActivatedSkillSet::replay(&records)
+        .map_err(|error| agent_failure("skill_session_state", error.to_string(), false))?;
+    match skills.activate(
+        SkillActivationRequest {
+            name: parsed.name,
+            expected_digest: parsed.expected_digest,
+            reason: parsed.reason,
+        },
+        &active,
+    ) {
+        Ok(SkillActivationOutcome::Activated(activation)) => {
+            append_session_event(
+                inner,
+                AgentSessionEventDraft {
+                    event_id: AgentSessionEventId::new(format!(
+                        "generic-{}-skill-{}-{}",
+                        request.run.spec.run_id.as_str(),
+                        round,
+                        call_id.as_str()
+                    )),
+                    session_id: request.run.spec.session_id.clone(),
+                    run_id: request.run.spec.run_id.clone(),
+                    payload: AgentSessionEvent::SkillActivated {
+                        activation: activation.clone(),
+                    },
+                },
+            )
+            .await?;
+            let descriptor = &activation.package.descriptor;
+            Ok(SkillCallObservation {
+                result: serde_json::json!({
+                    "status": "activated",
+                    "name": descriptor.name,
+                    "skill_id": descriptor.skill_id,
+                    "version": descriptor.version,
+                    "digest": descriptor.digest,
+                    "source": descriptor.source,
+                    "trust": descriptor.trust,
+                }),
+                is_error: false,
+                context_message: Some(crate::session_context::skill_activation_message(
+                    &activation,
+                )),
+            })
+        }
+        Ok(SkillActivationOutcome::AlreadyActive(descriptor)) => Ok(SkillCallObservation {
+            result: serde_json::json!({
+                "status": "already_active",
+                "name": descriptor.name,
+                "skill_id": descriptor.skill_id,
+                "digest": descriptor.digest,
+            }),
+            is_error: false,
+            context_message: None,
+        }),
+        Err(error) => Ok(SkillCallObservation {
+            result: serde_json::json!({
+                "code": "skill_activation_rejected",
+                "message": error.to_string(),
+            }),
+            is_error: true,
+            context_message: None,
+        }),
+    }
+}
+
+struct PendingModelToolCall {
+    call_id: ModelToolCallId,
+    name: String,
+    arguments: String,
+    ended: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowToolArguments {
+    plan: Plan,
+}
+
+struct GenericWorkflowProgressReporter {
+    inner: Arc<GenericInner>,
+    run_id: RunId,
+    workflow_id: WorkflowId,
+    total_steps: u64,
+    completed_steps: AtomicU64,
+    sequence: AtomicU64,
+}
+
+impl GenericWorkflowProgressReporter {
+    fn new(
+        inner: Arc<GenericInner>,
+        run_id: RunId,
+        workflow_id: WorkflowId,
+        total_steps: usize,
+    ) -> Self {
+        Self {
+            inner,
+            run_id,
+            workflow_id,
+            total_steps: total_steps as u64,
+            completed_steps: AtomicU64::new(0),
+            sequence: AtomicU64::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl ExecutionProgressReporter for GenericWorkflowProgressReporter {
+    async fn report(&self, event: ExecutionProgressEvent) -> Result<(), String> {
+        if event.workflow_id != self.workflow_id {
+            return Err("workflow progress crossed an Agent Run task boundary".to_owned());
+        }
+        let completed = match event.phase.as_str() {
+            "step_completed" => self.completed_steps.fetch_add(1, Ordering::AcqRel) + 1,
+            "workflow_completed" => {
+                self.completed_steps
+                    .store(self.total_steps, Ordering::Release);
+                self.total_steps
+            }
+            _ => self.completed_steps.load(Ordering::Acquire),
+        };
+        let fraction = (self.total_steps > 0)
+            .then_some((completed.min(self.total_steps) as f64) / (self.total_steps as f64));
+        let target = event
+            .step_id
+            .as_ref()
+            .map(|step_id| format!(" [{}]", step_id.as_str()))
+            .unwrap_or_default();
+        let message = event
+            .message
+            .unwrap_or_else(|| format!("workflow {}{}", event.phase, target));
+        let sequence = self.sequence.fetch_add(1, Ordering::AcqRel) + 1;
+        publish_telemetry(
+            &self.inner,
+            &self.run_id,
+            AgentTelemetryEnvelope {
+                telemetry_id: TelemetryId::new(format!(
+                    "generic-{}-workflow-progress-{sequence}",
+                    self.run_id.as_str()
+                )),
+                run_id: self.run_id.clone(),
+                provider_seq: None,
+                payload: AgentTelemetry::ProgressReported { message, fraction },
+            },
+        );
+        Ok(())
+    }
+}
+
+struct WorkflowCallObservation {
+    result: serde_json::Value,
+    is_error: bool,
+    tool_calls: u64,
+}
+
+enum WorkflowCallExecution {
+    Observed(WorkflowCallObservation),
+    Cancelled,
+}
+
+async fn execute_workflow_call(
+    inner: Arc<GenericInner>,
+    tools: &GenericTools,
+    run_id: &RunId,
+    call_id: &ModelToolCallId,
+    arguments: serde_json::Value,
+    remaining_tool_calls: u64,
+    cancellation: CancellationToken,
+) -> WorkflowCallExecution {
+    let parsed = match serde_json::from_value::<WorkflowToolArguments>(arguments) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return WorkflowCallExecution::Observed(WorkflowCallObservation {
+                result: workflow_error("invalid_workflow", error.to_string()),
+                is_error: true,
+                tool_calls: 0,
+            })
+        }
+    };
+    let Some(workflow) = tools.workflow.as_ref() else {
+        return WorkflowCallExecution::Observed(WorkflowCallObservation {
+            result: workflow_error(
+                "workflow_unavailable",
+                "Generic Agent has no configured Workflow execution strategy",
+            ),
+            is_error: true,
+            tool_calls: 0,
+        });
+    };
+    let workflow_id = WorkflowId::new(format!("workflow:{}:{}", run_id.as_str(), call_id.as_str()));
+    let reporter = Arc::new(GenericWorkflowProgressReporter::new(
+        inner,
+        run_id.clone(),
+        workflow_id.clone(),
+        parsed.plan.steps.len(),
+    ));
+    let request = WorkflowExecutionRequest::new(
+        run_id.clone(),
+        workflow_id,
+        parsed.plan,
+        tools.run_grant.clone(),
+    )
+    .with_cancellation(cancellation.clone())
+    .with_progress_reporter(reporter)
+    .with_max_tool_calls(remaining_tool_calls);
+    let snapshot = match workflow.execute(request).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return WorkflowCallExecution::Observed(WorkflowCallObservation {
+                result: workflow_error("workflow_rejected", error.to_string()),
+                is_error: true,
+                tool_calls: 0,
+            })
+        }
+    };
+    if cancellation.is_cancelled() {
+        return WorkflowCallExecution::Cancelled;
+    }
+    let tool_calls = snapshot.tool_calls;
+    let (result, is_error) = snapshot.tool_result();
+    WorkflowCallExecution::Observed(WorkflowCallObservation {
+        result,
+        is_error,
+        tool_calls,
+    })
+}
+
+fn workflow_error(code: &str, message: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({
+        "status": "rejected",
+        "code": code,
+        "message": message.into(),
+    })
+}
+
+fn publish_workflow_output(
+    inner: &GenericInner,
+    run_id: &RunId,
+    round: u64,
+    call_id: &ModelToolCallId,
+    result: serde_json::Value,
+) -> AgentEventId {
+    let event_id = AgentEventId::new(format!(
+        "generic-{}-workflow-{round}-{}",
+        run_id.as_str(),
+        call_id.as_str()
+    ));
+    publish_durable(
+        inner,
+        run_id,
+        AgentEventDraft {
+            event_id: event_id.clone(),
+            run_id: run_id.clone(),
+            causation_id: None,
+            source_fingerprint: None,
+            payload: AgentEvent::OutputCommitted {
+                output_id: OutputId::new(format!(
+                    "generic-{}-workflow-{round}-{}",
+                    run_id.as_str(),
+                    call_id.as_str()
+                )),
+                content: vec![Content {
+                    media_type: "application/json".to_owned(),
+                    schema_id: None,
+                    body: ContentBody::Inline(result),
+                }],
+            },
+        },
+    );
+    event_id
+}
+
+fn parse_tool_arguments(call: &PendingModelToolCall) -> Result<serde_json::Value, AgentFailure> {
+    let raw = if call.arguments.trim().is_empty() {
+        "{}"
+    } else {
+        call.arguments.as_str()
+    };
+    let arguments = serde_json::from_str::<serde_json::Value>(raw).map_err(|error| {
+        agent_failure(
+            "invalid_tool_arguments",
+            format!(
+                "model emitted invalid JSON arguments for {}: {error}",
+                call.name
+            ),
+            false,
+        )
+    })?;
+    if !arguments.is_object() {
+        return Err(agent_failure(
+            "invalid_tool_arguments",
+            format!(
+                "model Tool arguments for {} must be a JSON object",
+                call.name
+            ),
+            false,
+        ));
+    }
+    Ok(arguments)
+}
+
+fn model_tool_result(outcome: ToolOutcome) -> (serde_json::Value, bool) {
+    match outcome {
+        ToolOutcome::Completed {
+            output: ToolOutput::Inline(output),
+        } => (output, false),
+        ToolOutcome::Completed {
+            output: ToolOutput::Artifact(artifact),
+        } => (
+            serde_json::json!({
+                "kind": "artifact",
+                "artifact": artifact.artifact,
+                "media_type": artifact.media_type,
+                "byte_size": artifact.byte_size,
+                "summary": artifact.summary,
+            }),
+            false,
+        ),
+        other => (
+            serde_json::to_value(other).unwrap_or_else(|error| {
+                serde_json::json!({
+                    "status": "failed",
+                    "code": "tool_result_serialization",
+                    "message": error.to_string(),
+                })
+            }),
+            true,
+        ),
+    }
+}
+
+fn merge_usage(total: &mut ModelUsage, observed: ModelUsage) {
+    total.input_tokens = add_optional(total.input_tokens, observed.input_tokens);
+    total.output_tokens = add_optional(total.output_tokens, observed.output_tokens);
+}
+
+fn add_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.saturating_add(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn agent_input_message(request: &AgentStartRequest) -> Result<ModelMessage, AgentProtocolError> {
+    let mut content = Vec::with_capacity(request.run.spec.input.len());
+    for item in &request.run.spec.input {
+        match (&item.media_type[..], &item.body) {
+            ("text/plain", ContentBody::Inline(serde_json::Value::String(text)))
+                if !text.is_empty() =>
+            {
+                content.push(ModelContent::Text { text: text.clone() });
+            }
+            _ => {
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::InvalidSpec,
+                    "text-first Generic Agent accepts inline text/plain input only",
+                ));
+            }
+        }
+    }
+    Ok(ModelMessage {
+        role: ModelRole::User,
+        content,
+    })
+}
+
+fn publish_durable(inner: &GenericInner, run_id: &RunId, draft: AgentEventDraft) {
+    let mut state = inner
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(run) = state.runs.get_mut(run_id) else {
+        return;
+    };
+    if run.terminal {
+        return;
+    }
+    let terminal = matches!(
+        draft.payload,
+        AgentEvent::DeliveryCommitted { .. }
+            | AgentEvent::RunIncomplete { .. }
+            | AgentEvent::RunFailed { .. }
+            | AgentEvent::RunCancelled { .. }
+    );
+    run.durable_events.push(draft.clone());
+    run.terminal = terminal;
+    let _ = run
+        .sender
+        .send(AgentProviderStreamItem::Event(Box::new(draft)));
+}
+
+fn publish_telemetry(inner: &GenericInner, run_id: &RunId, telemetry: AgentTelemetryEnvelope) {
+    let state = inner
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(run) = state.runs.get(run_id) {
+        if !run.terminal {
+            let _ = run
+                .sender
+                .send(AgentProviderStreamItem::Telemetry(telemetry));
+        }
+    }
+}
+
+fn emit_delivery(
+    inner: &GenericInner,
+    request: &AgentStartRequest,
+    user_message: ModelMessage,
+    response: String,
+    usage: Option<ModelUsage>,
+    tool_calls: u64,
+    mut supporting_event_ids: Vec<AgentEventId>,
+) {
+    let run_id = &request.run.spec.run_id;
+    let output_event_id = AgentEventId::new(format!("generic-{}-output", run_id.as_str()));
+    publish_durable(
+        inner,
+        run_id,
+        AgentEventDraft {
+            event_id: output_event_id.clone(),
+            run_id: run_id.clone(),
+            causation_id: None,
+            source_fingerprint: None,
+            payload: AgentEvent::OutputCommitted {
+                output_id: OutputId::new(format!("generic-{}-response", run_id.as_str())),
+                content: vec![Content::text(response.clone())],
+            },
+        },
+    );
+    supporting_event_ids.push(output_event_id);
+    publish_durable(
+        inner,
+        run_id,
+        AgentEventDraft {
+            event_id: AgentEventId::new(format!("generic-{}-delivered", run_id.as_str())),
+            run_id: run_id.clone(),
+            causation_id: None,
+            source_fingerprint: None,
+            payload: AgentEvent::DeliveryCommitted {
+                delivery: AgentDelivery {
+                    delivery_id: DeliveryId::new(format!("generic-{}-delivery", run_id.as_str())),
+                    run_id: run_id.clone(),
+                    spec_digest: request.run.spec_digest.clone(),
+                    final_response: Content::text(response.clone()),
+                    outputs: Vec::new(),
+                    artifacts: Vec::new(),
+                    unresolved_issues: Vec::new(),
+                    usage: agent_usage(usage, tool_calls),
+                    provenance: provenance(inner, supporting_event_ids),
+                },
+            },
+        },
+    );
+    let _ = user_message;
+    finish_session(inner, request);
+}
+
+fn emit_incomplete(
+    inner: &GenericInner,
+    request: &AgentStartRequest,
+    _user_message: &ModelMessage,
+    response: String,
+    usage: Option<ModelUsage>,
+    tool_calls: u64,
+    started_event_id: AgentEventId,
+    limit: RunLimitKind,
+    unresolved_issue: &str,
+) {
+    let run_id = &request.run.spec.run_id;
+    let partial_delivery = (!response.is_empty()).then(|| PartialDelivery {
+        partial_delivery_id: PartialDeliveryId::new(format!("generic-{}-partial", run_id.as_str())),
+        run_id: run_id.clone(),
+        spec_digest: request.run.spec_digest.clone(),
+        response: Some(Content::text(response)),
+        outputs: Vec::new(),
+        artifacts: Vec::new(),
+        unresolved_issues: vec![unresolved_issue.to_owned()],
+        usage: agent_usage(usage, tool_calls),
+        provenance: provenance(inner, vec![started_event_id]),
+    });
+    publish_durable(
+        inner,
+        run_id,
+        AgentEventDraft {
+            event_id: AgentEventId::new(format!("generic-{}-incomplete", run_id.as_str())),
+            run_id: run_id.clone(),
+            causation_id: None,
+            source_fingerprint: None,
+            payload: AgentEvent::RunIncomplete {
+                reason: IncompleteReason::LimitReached { limit },
+                partial_delivery,
+            },
+        },
+    );
+    finish_session(inner, request);
+}
+
+fn emit_failure(
+    inner: &GenericInner,
+    request: &AgentStartRequest,
+    _user_message: &ModelMessage,
+    failure: AgentFailure,
+) {
+    let run_id = &request.run.spec.run_id;
+    publish_durable(
+        inner,
+        run_id,
+        AgentEventDraft {
+            event_id: AgentEventId::new(format!("generic-{}-failed", run_id.as_str())),
+            run_id: run_id.clone(),
+            causation_id: None,
+            source_fingerprint: None,
+            payload: AgentEvent::RunFailed { failure },
+        },
+    );
+    finish_session(inner, request);
+}
+
+fn emit_cancel(inner: &GenericInner, request: &AgentStartRequest, user_message: &ModelMessage) {
+    let run_id = &request.run.spec.run_id;
+    let cancellation = {
+        let state = inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .runs
+            .get(run_id)
+            .and_then(|run| run.cancel_command.clone())
+    };
+    if let Some((command_id, reason)) = cancellation {
+        publish_durable(
+            inner,
+            run_id,
+            AgentEventDraft {
+                event_id: AgentEventId::new(format!("generic-{}-stop", run_id.as_str())),
+                run_id: run_id.clone(),
+                causation_id: Some(command_id),
+                source_fingerprint: None,
+                payload: AgentEvent::StopRequested {
+                    reason: reason.clone(),
+                },
+            },
+        );
+        publish_durable(
+            inner,
+            run_id,
+            AgentEventDraft {
+                event_id: AgentEventId::new(format!("generic-{}-cancelled", run_id.as_str())),
+                run_id: run_id.clone(),
+                causation_id: None,
+                source_fingerprint: None,
+                payload: AgentEvent::RunCancelled { reason },
+            },
+        );
+    } else {
+        emit_failure(
+            inner,
+            request,
+            user_message,
+            AgentFailure {
+                code: "unexpected_model_cancellation".to_owned(),
+                message: "model request cancelled without an Agent Cancel command".to_owned(),
+                retryable: true,
+                details: serde_json::Value::Null,
+            },
+        );
+        return;
+    }
+    finish_session(inner, request);
+}
+
+fn finish_session(inner: &GenericInner, request: &AgentStartRequest) {
+    let mut state = inner
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let session = state
+        .sessions
+        .entry(request.run.spec.session_id.clone())
+        .or_default();
+    if session.active_run.as_ref() == Some(&request.run.spec.run_id) {
+        session.active_run = None;
+    }
+}
+
+fn provenance(inner: &GenericInner, supporting_event_ids: Vec<AgentEventId>) -> Provenance {
+    Provenance {
+        provider_id: inner.config.provider_id.clone(),
+        agent_id: inner.config.agent_id.clone(),
+        supporting_event_ids,
+        extensions: Default::default(),
+    }
+}
+
+fn agent_usage(usage: Option<ModelUsage>, tool_calls: u64) -> Option<UsageReport> {
+    if usage.is_none() && tool_calls == 0 {
+        return None;
+    }
+    let usage = usage.unwrap_or_default();
+    Some(UsageReport {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        tool_calls: (tool_calls > 0).then_some(tool_calls),
+        cost: None,
+    })
+}
+
+fn agent_failure(
+    code: impl Into<String>,
+    message: impl Into<String>,
+    retryable: bool,
+) -> AgentFailure {
+    AgentFailure {
+        code: code.into(),
+        message: message.into(),
+        retryable,
+        details: serde_json::Value::Null,
+    }
+}
+
+fn model_event_failure(message: impl Into<String>) -> AgentFailure {
+    agent_failure("model_protocol", message, false)
+}
+
+fn resolve_run_skill_binding(
+    configured: Option<&Arc<SkillRuntime>>,
+    request: &AgentStartRequest,
+    skipped: &mut Vec<ResourceBindingSkip>,
+) -> Result<Option<Arc<SkillRuntime>>, AgentStartError> {
+    let Some(skills) = configured else {
+        return Ok(None);
+    };
+    let skipped_ids = skipped
+        .iter()
+        .map(|skip| skip.binding_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut resolved = None;
+    for binding in request.run.spec.resources.iter().filter(|binding| {
+        binding.resource.kind.as_str()
+            == orchestral_core::skill_protocol::SKILL_CATALOG_RESOURCE_KIND_V1
+            && !skipped_ids.contains(&binding.binding_id)
+    }) {
+        let matches = binding.resource.id == skills.catalog().resource_id
+            && binding.resource.revision.as_str() == skills.catalog().revision.as_str();
+        if matches {
+            resolved = Some(skills.clone());
+            continue;
+        }
+        let reason = format!(
+            "Skill catalog binding does not match Host snapshot id={} revision={}",
+            skills.catalog().resource_id,
+            skills.catalog().revision
+        );
+        if binding.requirement == BindingRequirement::Required {
+            return Err(InternalGenericAgentProvider::rejection(
+                AgentRejectionCode::UnsupportedResource,
+                reason,
+            ));
+        }
+        skipped.push(ResourceBindingSkip {
+            binding_id: binding.binding_id.clone(),
+            code: ResourceBindingSkipCode::ResolutionFailed,
+            reason,
+        });
+    }
+    Ok(resolved)
+}
+
+fn model_definitions_for_run(
+    inner: &GenericInner,
+    skill_catalog_bound: bool,
+) -> Vec<ModelToolDefinition> {
+    let mut definitions = inner
+        .tools
+        .as_ref()
+        .map(|tools| tools.model_definitions.clone())
+        .unwrap_or_default();
+    if skill_catalog_bound {
+        definitions.push(skill_activate_definition());
+    }
+    definitions
+}
+
+fn system_message_for_run(
+    config: &GenericAgentConfig,
+    skills: Option<&SkillRuntime>,
+) -> Option<ModelMessage> {
+    let mut sections = Vec::new();
+    if !config.system_prompt.trim().is_empty() {
+        sections.push(config.system_prompt.clone());
+    }
+    if let Some(skills) = skills {
+        sections.push(skills.descriptor_context());
+    }
+    (!sections.is_empty()).then(|| ModelMessage::text(ModelRole::System, sections.join("\n\n")))
+}
+
+fn configure_tools(
+    runtime: Arc<dyn AgentToolRuntime>,
+    run_grant: RunToolGrant,
+    workflow: Option<Arc<WorkflowExecutionStrategy>>,
+    approval_bridge: Option<Arc<dyn AgentApprovalBridge>>,
+) -> Result<GenericTools, AgentProtocolError> {
+    run_grant.bounds.validate().map_err(|error| {
+        AgentProtocolError::new(AgentProtocolErrorCode::InvalidSpec, error.message)
+    })?;
+    let mut model_definitions = runtime
+        .model_tool_schemas()
+        .map_err(tool_runtime_error)?
+        .into_iter()
+        .map(|schema| ModelToolDefinition {
+            name: schema.name,
+            description: schema.description,
+            input_schema: schema.input_schema,
+        })
+        .collect::<Vec<_>>();
+    if model_definitions.is_empty() {
+        return Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidSpec,
+            "tool-enabled Generic Agent requires at least one registered Tool",
+        ));
+    }
+    if workflow.is_some() {
+        if model_definitions
+            .iter()
+            .any(|definition| definition.name == WORKFLOW_TOOL_NAME)
+        {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidSpec,
+                format!(
+                    "reserved Generic Agent Tool name is already registered: {WORKFLOW_TOOL_NAME}"
+                ),
+            ));
+        }
+        model_definitions.push(workflow_tool_definition());
+    }
+    Ok(GenericTools {
+        runtime,
+        run_grant,
+        model_definitions,
+        workflow,
+        approval_bridge,
+    })
+}
+
+fn skill_activate_definition() -> ModelToolDefinition {
+    ModelToolDefinition {
+        name: SKILL_ACTIVATE_TOOL_NAME.to_owned(),
+        description: "Activate one immutable Skill descriptor for this Session. This loads instructions into context only; it does not grant Tool or MCP permissions.".to_owned(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "required": ["name", "expected_digest", "reason"],
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Exact descriptor name from the bound Skill catalog"
+                },
+                "expected_digest": {
+                    "type": "string",
+                    "pattern": "^[0-9a-fA-F]{64}$",
+                    "description": "Exact immutable digest shown in the descriptor"
+                },
+                "reason": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Why this Skill is relevant to the current user task"
+                }
+            },
+            "additionalProperties": false
+        }),
+    }
+}
+
+fn workflow_tool_definition() -> ModelToolDefinition {
+    ModelToolDefinition {
+        name: WORKFLOW_TOOL_NAME.to_owned(),
+        description: "Execute a dependency-aware workflow for a complex task. Prefer a direct answer or one ordinary Tool for simple work.".to_owned(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "required": ["plan"],
+            "properties": {
+                "plan": {
+                    "type": "object",
+                    "required": ["goal", "steps"],
+                    "properties": {
+                        "goal": { "type": "string", "minLength": 1 },
+                        "steps": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "required": ["id", "action"],
+                                "properties": {
+                                    "id": { "type": "string", "minLength": 1 },
+                                    "action": { "type": "string", "minLength": 1 },
+                                    "kind": { "type": "string", "enum": ["action", "system"] },
+                                    "depends_on": { "type": "array", "items": { "type": "string" } },
+                                    "exports": { "type": "array", "items": { "type": "string" } },
+                                    "io_bindings": { "type": "array" },
+                                    "params": {}
+                                },
+                                "additionalProperties": false
+                            }
+                        },
+                        "confidence": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+                        "on_complete": { "type": ["string", "null"] },
+                        "on_failure": { "type": ["string", "null"] }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "additionalProperties": false
+        }),
+    }
+}
+
+fn generic_config_digest(
+    config: &GenericAgentConfig,
+    backend_id: &str,
+    tools: Option<&[ModelToolDefinition]>,
+    skills: Option<&orchestral_core::skill_protocol::SkillCatalogDescriptor>,
+    approval_enabled: bool,
+) -> Result<Digest, AgentProtocolError> {
+    let value = serde_json::json!({
+        "provider_id": config.provider_id,
+        "agent_id": config.agent_id,
+        "system_prompt": config.system_prompt,
+        "backend_id": backend_id,
+        "max_model_rounds": config.max_model_rounds,
+        "max_tool_calls": config.max_tool_calls,
+        "max_context_tokens": config.max_context_tokens,
+        "reserved_output_tokens": config.reserved_output_tokens,
+        "tools": tools.unwrap_or_default(),
+        "skill_catalog": skills,
+        "approval_enabled": approval_enabled,
+    });
+    let bytes = serde_jcs::to_vec(&value).map_err(|error| {
+        AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidSpec,
+            format!("could not digest Generic Agent configuration: {error}"),
+        )
+    })?;
+    Ok(Digest::sha256(bytes))
+}
+
+async fn append_session_event(
+    inner: &GenericInner,
+    draft: AgentSessionEventDraft,
+) -> Result<(), AgentFailure> {
+    inner
+        .session_journal
+        .append(draft)
+        .await
+        .map(|_| ())
+        .map_err(session_journal_failure)
+}
+
+fn session_journal_failure(error: AgentSessionError) -> AgentFailure {
+    agent_failure("session_journal", error.to_string(), true)
+}
+
+fn session_failure(error: SessionContextError) -> AgentFailure {
+    match error {
+        SessionContextError::ContextOverflow { used, budget } => AgentFailure {
+            code: "context_overflow".to_owned(),
+            message: format!("pinned model context uses {used} tokens but budget is {budget}"),
+            retryable: false,
+            details: serde_json::json!({ "used": used, "budget": budget }),
+        },
+        other => agent_failure("session_context", other.to_string(), true),
+    }
+}
+
+fn fail_before_model(
+    inner: Arc<GenericInner>,
+    request: &AgentStartRequest,
+    user_message: &ModelMessage,
+    failure: AgentFailure,
+) {
+    let run_id = &request.run.spec.run_id;
+    let started_event_id = AgentEventId::new(format!("generic-{}-started", run_id.as_str()));
+    publish_durable(
+        &inner,
+        run_id,
+        AgentEventDraft {
+            event_id: started_event_id.clone(),
+            run_id: run_id.clone(),
+            causation_id: None,
+            source_fingerprint: None,
+            payload: AgentEvent::RunStarted,
+        },
+    );
+    emit_failure(&inner, request, user_message, failure);
+}
+
+fn model_protocol_error(error: ModelError) -> AgentProtocolError {
+    let code = match error.code {
+        ModelErrorCode::InvalidRequest => AgentProtocolErrorCode::InvalidSpec,
+        ModelErrorCode::Unsupported => AgentProtocolErrorCode::Unsupported,
+        ModelErrorCode::Protocol => AgentProtocolErrorCode::InvalidTransition,
+        ModelErrorCode::Unavailable
+        | ModelErrorCode::RateLimited
+        | ModelErrorCode::Authentication
+        | ModelErrorCode::Cancelled
+        | ModelErrorCode::Internal => AgentProtocolErrorCode::ProviderUnavailable,
+        _ => AgentProtocolErrorCode::ProviderUnavailable,
+    };
+    AgentProtocolError::new(code, error.message)
+        .with_retryable(error.retryable)
+        .with_details(error.details)
+}
+
+fn tool_runtime_error(error: ToolRuntimeError) -> AgentProtocolError {
+    AgentProtocolError::new(
+        AgentProtocolErrorCode::ProviderUnavailable,
+        error.to_string(),
+    )
+}
+
+fn model_failure(error: ModelError) -> AgentFailure {
+    AgentFailure {
+        code: format!("model_{:?}", error.code).to_lowercase(),
+        message: error.message,
+        retryable: error.retryable,
+        details: error.details,
+    }
+}
