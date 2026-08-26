@@ -933,6 +933,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "orchestral-mcp-streamable-http"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "futures-util",
+ "orchestral-core",
+ "reqwest",
+ "serde_jcs",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "orchestral-model-gemini"
 version = "0.2.0"
 dependencies = [
