@@ -235,6 +235,7 @@ enum GenericRecoveryContinuation {
         request: PendingRequest,
         binding: Option<ApprovalBinding>,
         committed_response: Option<ApprovalResponse>,
+        resolved_response: Option<ApprovalResponse>,
         response: Option<oneshot::Receiver<ApprovalResponse>>,
     },
 }
@@ -1433,6 +1434,7 @@ fn stage_approval_recovery(
     let approval_request_id =
         approval_request_id(stored.registration.run_id(), round, &call.call_id);
     let mut opened_request = None;
+    let mut resolved_response = None;
     for event in &recovery_events {
         match &event.payload {
             AgentEvent::RequestOpened { request } if request.request_id == approval_request_id => {
@@ -1449,12 +1451,30 @@ fn stage_approval_recovery(
             }
             AgentEvent::RequestResolved {
                 request_id: resolved,
+                resolution,
                 ..
             } if resolved == &approval_request_id => {
-                return Err(AgentProtocolError::new(
-                    AgentProtocolErrorCode::Unsupported,
-                    "observed approval recovery cannot yet continue after RequestResolved",
-                ));
+                if opened_request.is_none()
+                    || resolved_response.is_some()
+                    || !matches!(resolution, RequestResolution::Approval { .. })
+                {
+                    return Err(AgentProtocolError::new(
+                        AgentProtocolErrorCode::InvalidDigest,
+                        "recovered approval resolution does not match its pending request",
+                    ));
+                }
+                let command_id = event.causation_id.clone().ok_or_else(|| {
+                    AgentProtocolError::new(
+                        AgentProtocolErrorCode::InvalidDigest,
+                        "recovered approval resolution has no causating command",
+                    )
+                })?;
+                resolved_response = Some(recovered_approval_response(
+                    &stored.records,
+                    &approval_request_id,
+                    &command_id,
+                    resolution,
+                )?);
             }
             AgentEvent::RequestOpened { .. } | AgentEvent::RequestResolved { .. } => {
                 return Err(AgentProtocolError::new(
@@ -1486,6 +1506,7 @@ fn stage_approval_recovery(
             request,
             binding: None,
             committed_response: None,
+            resolved_response,
             response: None,
         },
     )
@@ -1641,6 +1662,80 @@ fn validate_recovered_input_resolution(
     Ok(())
 }
 
+fn recovered_approval_response(
+    records: &[crate::generic_agent_checkpoint::GenericCheckpointRecord],
+    request_id: &RequestId,
+    command_id: &CommandId,
+    resolution: &RequestResolution,
+) -> Result<ApprovalResponse, AgentProtocolError> {
+    let mut matching = None;
+    for record in records {
+        let GenericCheckpointEvent::CommandCommitted {
+            command,
+            outcome,
+            approval_capability,
+        } = &record.payload
+        else {
+            continue;
+        };
+        if &command.command_id != command_id {
+            continue;
+        }
+        if matching.is_some() {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidDigest,
+                "recovered approval resolution has duplicate causating commands",
+            ));
+        }
+        let matches_resolution = matches!(
+            &command.payload,
+            AgentCommand::ResolveRequest { response } if response == resolution
+        );
+        if outcome != &ProviderCommandOutcome::Accepted
+            || command.request_id.as_ref() != Some(request_id)
+            || !matches_resolution
+        {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidDigest,
+                "recovered approval resolution does not match its accepted command",
+            ));
+        }
+        let valid_capability = matches!(
+            (resolution, approval_capability),
+            (
+                RequestResolution::Approval {
+                    decision: ApprovalDecision::Allow,
+                    ..
+                },
+                Some(_)
+            ) | (
+                RequestResolution::Approval {
+                    decision: ApprovalDecision::Deny,
+                    ..
+                },
+                None
+            )
+        );
+        if !valid_capability {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidDigest,
+                "recovered approval resolution has inconsistent capability evidence",
+            ));
+        }
+        matching = Some(ApprovalResponse {
+            command_id: command.command_id.clone(),
+            resolution: resolution.clone(),
+            capability: approval_capability.clone(),
+        });
+    }
+    matching.ok_or_else(|| {
+        AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidDigest,
+            "recovered approval resolution has no unique accepted command",
+        )
+    })
+}
+
 fn stage_loop_recovery(
     inner: Arc<GenericInner>,
     stored: StoredGenericAgentRun,
@@ -1721,6 +1816,7 @@ fn stage_loop_recovery(
             round,
             call,
             committed_response,
+            resolved_response,
             ..
         } => {
             let expected_request_id = approval_request_id(&run_id, *round, &call.call_id);
@@ -1757,6 +1853,12 @@ fn stage_loop_recovery(
                 return Err(AgentProtocolError::new(
                     AgentProtocolErrorCode::InvalidDigest,
                     "accepted request resolution crossed the recovered approval boundary",
+                ));
+            }
+            if committed_response.is_some() && resolved_response.is_some() {
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::InvalidDigest,
+                    "recovered approval resolution was both pending and already applied",
                 ));
             }
         }
@@ -1945,6 +2047,7 @@ fn stage_loop_recovery(
             request: opened_request,
             binding,
             committed_response,
+            resolved_response,
             response,
             ..
         } = &mut continuation
@@ -1956,16 +2059,20 @@ fn stage_loop_recovery(
                 call,
                 arguments,
                 opened_request,
-                committed_response.is_none(),
+                committed_response.is_none() && resolved_response.is_none(),
                 cancellation.clone(),
             )
             .await?;
-            if committed_response.as_ref().is_some_and(|response| {
-                response
-                    .capability
-                    .as_ref()
-                    .is_some_and(|capability| capability.claims.binding != prepared.binding)
-            }) {
+            if committed_response
+                .as_ref()
+                .or(resolved_response.as_ref())
+                .is_some_and(|response| {
+                    response
+                        .capability
+                        .as_ref()
+                        .is_some_and(|capability| capability.claims.binding != prepared.binding)
+                })
+            {
                 return Err(AgentProtocolError::new(
                     AgentProtocolErrorCode::InvalidDigest,
                     "persisted approval capability does not match the reconstructed binding",
@@ -2101,6 +2208,7 @@ fn stage_loop_recovery(
                     arguments,
                     binding,
                     committed_response,
+                    resolved_response,
                     response,
                     ..
                 } => {
@@ -2122,6 +2230,7 @@ fn stage_loop_recovery(
                         arguments,
                         binding.expect("recovered approval binding was prepared"),
                         committed_response,
+                        resolved_response,
                         response,
                     )
                     .await;
@@ -3240,6 +3349,7 @@ async fn resume_observed_approval(
     arguments: serde_json::Value,
     binding: ApprovalBinding,
     committed_response: Option<ApprovalResponse>,
+    resolved_response: Option<ApprovalResponse>,
     response: Option<oneshot::Receiver<ApprovalResponse>>,
 ) {
     let run_id = request.run.spec.run_id.clone();
@@ -3277,7 +3387,9 @@ async fn resume_observed_approval(
     }
     seed.tool_call_count = seed.tool_call_count.saturating_add(1);
 
-    let approval = if let Some(committed_response) = committed_response {
+    let approval = if let Some(resolved_response) = resolved_response {
+        approval_response_outcome(resolved_response)
+    } else if let Some(committed_response) = committed_response {
         commit_approval_response(
             &inner,
             bridge.as_ref(),
@@ -4112,7 +4224,7 @@ async fn commit_approval_response(
                 model_call_id.as_str()
             )),
             run_id: run_id.clone(),
-            causation_id: Some(response.command_id),
+            causation_id: Some(response.command_id.clone()),
             source_fingerprint: None,
             payload: AgentEvent::RequestResolved {
                 request_id: request_id.clone(),
@@ -4135,6 +4247,10 @@ async fn commit_approval_response(
             true,
         ));
     }
+    approval_response_outcome(response)
+}
+
+fn approval_response_outcome(response: ApprovalResponse) -> ApprovalWaitOutcome {
     match (response.resolution, response.capability) {
         (
             RequestResolution::Approval {
