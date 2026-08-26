@@ -783,86 +783,98 @@ impl AgentProvider for InternalGenericAgentProvider {
 
             match &command.payload {
                 AgentCommand::Cancel { .. } if run.terminal => {
-                    return Ok(record_command(
+                    return record_command(
+                        &self.inner,
                         run,
                         &command,
                         ProviderCommandOutcome::Rejected {
                             code: AgentProtocolErrorCode::TerminalRun,
                             message: "Run is already terminal".to_owned(),
                         },
-                    ));
+                    );
                 }
                 AgentCommand::Cancel { .. } if run.cancel_command.is_some() => {
-                    return Ok(record_command(
+                    return record_command(
+                        &self.inner,
                         run,
                         &command,
                         ProviderCommandOutcome::Rejected {
                             code: AgentProtocolErrorCode::InvalidTransition,
                             message: "cancellation is already in progress".to_owned(),
                         },
-                    ));
+                    );
                 }
                 AgentCommand::Cancel { reason } => {
-                    run.cancel_command = Some((command.command_id.clone(), reason.clone()));
-                    run.cancellation.cancel();
-                    return Ok(record_command(
+                    let disposition = record_command(
+                        &self.inner,
                         run,
                         &command,
                         ProviderCommandOutcome::Accepted,
-                    ));
+                    )?;
+                    run.cancel_command = Some((command.command_id.clone(), reason.clone()));
+                    run.cancellation.cancel();
+                    return Ok(disposition);
                 }
                 AgentCommand::Steer { .. } if run.terminal => {
-                    return Ok(record_command(
+                    return record_command(
+                        &self.inner,
                         run,
                         &command,
                         ProviderCommandOutcome::Rejected {
                             code: AgentProtocolErrorCode::TerminalRun,
                             message: "Run is already terminal".to_owned(),
                         },
-                    ));
+                    );
                 }
                 AgentCommand::Steer { .. } if run.cancel_command.is_some() => {
-                    return Ok(record_command(
+                    return record_command(
+                        &self.inner,
                         run,
                         &command,
                         ProviderCommandOutcome::Rejected {
                             code: AgentProtocolErrorCode::InvalidTransition,
                             message: "Run cancellation is already in progress".to_owned(),
                         },
-                    ));
+                    );
                 }
                 AgentCommand::Steer { content } => {
                     let message = match agent_content_message(content) {
                         Ok(message) => message,
                         Err(error) => {
-                            return Ok(record_command(
+                            return record_command(
+                                &self.inner,
                                 run,
                                 &command,
                                 ProviderCommandOutcome::Rejected {
                                     code: error.code,
                                     message: error.message,
                                 },
-                            ));
+                            );
                         }
                     };
                     if run.queued_steers.len() >= self.inner.config.stream_buffer {
-                        return Ok(record_command(
+                        return record_command(
+                            &self.inner,
                             run,
                             &command,
                             ProviderCommandOutcome::Rejected {
                                 code: AgentProtocolErrorCode::InvalidTransition,
                                 message: "Steer input buffer is full".to_owned(),
                             },
-                        ));
+                        );
                     }
+                    let disposition = record_command(
+                        &self.inner,
+                        run,
+                        &command,
+                        ProviderCommandOutcome::Accepted,
+                    )?;
                     run.queued_steers.push_back(QueuedSteer {
                         command_id: command.command_id.clone(),
                         content: content.clone(),
                         message,
                     });
                     let signal = run.steer_signal.clone();
-                    let disposition =
-                        record_command(run, &command, ProviderCommandOutcome::Accepted);
                     drop(state);
                     signal.send_modify(|generation| {
                         *generation = generation.saturating_add(1);
@@ -874,56 +886,77 @@ impl AgentProvider for InternalGenericAgentProvider {
                         unreachable!("validated ResolveRequest always carries request_id")
                     };
                     if run.terminal {
-                        return Ok(record_command(
+                        return record_command(
+                            &self.inner,
                             run,
                             &command,
                             ProviderCommandOutcome::Rejected {
                                 code: AgentProtocolErrorCode::TerminalRun,
                                 message: "Run is already terminal".to_owned(),
                             },
-                        ));
+                        );
                     }
                     if let RequestResolution::Input { content } = response {
                         if let Err(error) = agent_content_message(content) {
-                            return Ok(record_command(
+                            return record_command(
+                                &self.inner,
                                 run,
                                 &command,
                                 ProviderCommandOutcome::Rejected {
                                     code: error.code,
                                     message: error.message,
                                 },
-                            ));
+                            );
                         }
-                        let Some(mut pending) = run.pending_inputs.remove(request_id) else {
-                            return Ok(record_command(
+                        let Some(pending) = run.pending_inputs.get(request_id) else {
+                            return record_command(
+                                &self.inner,
                                 run,
                                 &command,
                                 ProviderCommandOutcome::Rejected {
                                     code: AgentProtocolErrorCode::RequestNotFound,
                                     message: "input request is not pending".to_owned(),
                                 },
-                            ));
+                            );
                         };
-                        let delivered = pending.responder.take().is_some_and(|responder| {
-                            responder
-                                .send(InputResponse {
-                                    command_id: command.command_id.clone(),
-                                    resolution: response.clone(),
-                                })
-                                .is_ok()
-                        });
-                        let outcome = if delivered {
-                            ProviderCommandOutcome::Accepted
-                        } else {
-                            ProviderCommandOutcome::Rejected {
-                                code: AgentProtocolErrorCode::InvalidTransition,
-                                message: "input waiter is no longer active".to_owned(),
-                            }
-                        };
-                        return Ok(record_command(run, &command, outcome));
+                        if !pending
+                            .responder
+                            .as_ref()
+                            .is_some_and(|responder| !responder.is_closed())
+                        {
+                            let disposition = record_command(
+                                &self.inner,
+                                run,
+                                &command,
+                                ProviderCommandOutcome::Rejected {
+                                    code: AgentProtocolErrorCode::InvalidTransition,
+                                    message: "input waiter is no longer active".to_owned(),
+                                },
+                            )?;
+                            run.pending_inputs.remove(request_id);
+                            return Ok(disposition);
+                        }
+                        let disposition = record_command(
+                            &self.inner,
+                            run,
+                            &command,
+                            ProviderCommandOutcome::Accepted,
+                        )?;
+                        let mut pending = run
+                            .pending_inputs
+                            .remove(request_id)
+                            .expect("pending input was checked before its command commit");
+                        if let Some(responder) = pending.responder.take() {
+                            let _ = responder.send(InputResponse {
+                                command_id: command.command_id.clone(),
+                                resolution: response.clone(),
+                            });
+                        }
+                        return Ok(disposition);
                     }
                     if !matches!(response, RequestResolution::Approval { .. }) {
-                        return Ok(record_command(
+                        return record_command(
+                            &self.inner,
                             run,
                             &command,
                             ProviderCommandOutcome::Rejected {
@@ -932,26 +965,28 @@ impl AgentProvider for InternalGenericAgentProvider {
                                     "request resolution kind is not pending in this Generic Agent"
                                         .to_owned(),
                             },
-                        ));
+                        );
                     }
                     let Some(pending) = run.pending_approvals.get(request_id) else {
-                        return Ok(record_command(
+                        return record_command(
+                            &self.inner,
                             run,
                             &command,
                             ProviderCommandOutcome::Rejected {
                                 code: AgentProtocolErrorCode::RequestNotFound,
                                 message: "approval request is not pending".to_owned(),
                             },
-                        ));
+                        );
                     };
                     if approval_bridge.is_none() {
-                        return Ok(record_command(
+                        return record_command(
+                            &self.inner,
                             run,
                             &command,
                             ProviderCommandOutcome::Unsupported {
                                 feature: "approval".to_owned(),
                             },
-                        ));
+                        );
                     }
                     (
                         request_id.clone(),
@@ -960,13 +995,14 @@ impl AgentProvider for InternalGenericAgentProvider {
                     )
                 }
                 _ => {
-                    return Ok(record_command(
+                    return record_command(
+                        &self.inner,
                         run,
                         &command,
                         ProviderCommandOutcome::Unsupported {
                             feature: "unknown_command".to_owned(),
                         },
-                    ));
+                    );
                 }
             }
         };
@@ -986,14 +1022,15 @@ impl AgentProvider for InternalGenericAgentProvider {
                             "run disappeared while resolving approval",
                         )
                     })?;
-                    return Ok(record_command(
+                    return record_command(
+                        &self.inner,
                         run,
                         &command,
                         ProviderCommandOutcome::Rejected {
                             code: AgentProtocolErrorCode::InvalidSpec,
                             message: error.to_string(),
                         },
-                    ));
+                    );
                 }
             },
             RequestResolution::Approval {
@@ -1019,44 +1056,59 @@ impl AgentProvider for InternalGenericAgentProvider {
                 duplicate: true,
             });
         }
-        let Some(mut pending) = run.pending_approvals.remove(&request_id) else {
-            return Ok(record_command(
+        let Some(pending) = run.pending_approvals.get(&request_id) else {
+            return record_command(
+                &self.inner,
                 run,
                 &command,
                 ProviderCommandOutcome::Rejected {
                     code: AgentProtocolErrorCode::RequestNotFound,
                     message: "approval request is no longer pending".to_owned(),
                 },
-            ));
+            );
         };
         if pending.binding != binding {
-            return Ok(record_command(
+            return record_command(
+                &self.inner,
                 run,
                 &command,
                 ProviderCommandOutcome::Rejected {
                     code: AgentProtocolErrorCode::InvalidDigest,
                     message: "approval binding changed while resolving request".to_owned(),
                 },
-            ));
+            );
         }
-        let delivered = pending.responder.take().is_some_and(|responder| {
-            responder
-                .send(ApprovalResponse {
-                    command_id: command.command_id.clone(),
-                    resolution,
-                    capability,
-                })
-                .is_ok()
-        });
-        let outcome = if delivered {
-            ProviderCommandOutcome::Accepted
-        } else {
-            ProviderCommandOutcome::Rejected {
-                code: AgentProtocolErrorCode::InvalidTransition,
-                message: "approval waiter is no longer active".to_owned(),
-            }
-        };
-        Ok(record_command(run, &command, outcome))
+        if !pending
+            .responder
+            .as_ref()
+            .is_some_and(|responder| !responder.is_closed())
+        {
+            let disposition = record_command(
+                &self.inner,
+                run,
+                &command,
+                ProviderCommandOutcome::Rejected {
+                    code: AgentProtocolErrorCode::InvalidTransition,
+                    message: "approval waiter is no longer active".to_owned(),
+                },
+            )?;
+            run.pending_approvals.remove(&request_id);
+            return Ok(disposition);
+        }
+        let disposition =
+            record_command(&self.inner, run, &command, ProviderCommandOutcome::Accepted)?;
+        let mut pending = run
+            .pending_approvals
+            .remove(&request_id)
+            .expect("pending approval was checked before its command commit");
+        if let Some(responder) = pending.responder.take() {
+            let _ = responder.send(ApprovalResponse {
+                command_id: command.command_id.clone(),
+                resolution,
+                capability,
+            });
+        }
+        Ok(disposition)
     }
 
     async fn recover(
@@ -1101,10 +1153,27 @@ fn validate_execution_and_duplicate(
 }
 
 fn record_command(
+    inner: &GenericInner,
     run: &mut GenericRun,
     command: &AgentCommandEnvelope,
     outcome: ProviderCommandOutcome,
-) -> ProviderCommandDisposition {
+) -> Result<ProviderCommandDisposition, AgentProtocolError> {
+    if let Err(failure) = append_checkpoint_to_run(
+        inner,
+        run,
+        &command.run_id,
+        GenericCheckpointEventId::new(format!(
+            "generic-{}-command-{}",
+            command.run_id.as_str(),
+            command.command_id.as_str()
+        )),
+        GenericCheckpointEvent::CommandCommitted {
+            command: command.clone(),
+            outcome: outcome.clone(),
+        },
+    ) {
+        return Err(poison_run_after_checkpoint_failure(run, failure));
+    }
     run.commands.insert(
         command.command_id.clone(),
         StoredCommand {
@@ -1112,12 +1181,12 @@ fn record_command(
             outcome: outcome.clone(),
         },
     );
-    ProviderCommandDisposition {
+    Ok(ProviderCommandDisposition {
         command_id: command.command_id.clone(),
         run_id: command.run_id.clone(),
         outcome,
         duplicate: false,
-    }
+    })
 }
 
 async fn execute_model_run(
@@ -2967,8 +3036,7 @@ fn publish_durable(inner: &GenericInner, run_id: &RunId, draft: AgentEventDraft)
         return false;
     }
     if let Err(failure) = checkpoint_provider_events(inner, run, run_id, &[draft.clone()]) {
-        run.terminal = true;
-        let _ = run.sender.send(Err(checkpoint_stream_error(failure)));
+        poison_run_after_checkpoint_failure(run, failure);
         return false;
     }
     let terminal = matches!(
@@ -3068,8 +3136,7 @@ fn try_emit_delivery(
     if let Err(failure) =
         checkpoint_provider_events(inner, run, run_id, &[output.clone(), delivery.clone()])
     {
-        run.terminal = true;
-        let _ = run.sender.send(Err(checkpoint_stream_error(failure)));
+        poison_run_after_checkpoint_failure(run, failure);
         return DeliveryCommit::CheckpointFailed;
     }
     run.durable_events.push(output.clone());
@@ -3529,6 +3596,17 @@ fn checkpoint_stream_error(failure: AgentFailure) -> AgentProtocolError {
     AgentProtocolError::new(AgentProtocolErrorCode::ProviderUnavailable, failure.message)
         .with_retryable(failure.retryable)
         .with_details(failure.details)
+}
+
+fn poison_run_after_checkpoint_failure(
+    run: &mut GenericRun,
+    failure: AgentFailure,
+) -> AgentProtocolError {
+    let error = checkpoint_stream_error(failure);
+    run.terminal = true;
+    run.cancellation.cancel();
+    let _ = run.sender.send(Err(error.clone()));
+    error
 }
 
 fn checkpoint_start_error(error: GenericCheckpointError) -> AgentStartError {

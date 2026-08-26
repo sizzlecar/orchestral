@@ -11,7 +11,8 @@ use orchestral_core::{
         wire::{
             AgentCommand, AgentCommandEnvelope, AgentEvent, AgentEventAuthority, AgentRunEnvelope,
             AgentSessionId, AgentTelemetry, ApprovalDecision, CommandAckState, CommandId, Content,
-            ContentBody, PendingRequestKind, ProviderBindingRef, RequestResolution, RunId,
+            ContentBody, PendingRequestKind, ProviderBindingRef, ProviderCommandOutcome,
+            RequestResolution, RunId,
         },
         AGENT_PROTOCOL_V1,
     },
@@ -61,6 +62,12 @@ struct FailingProviderEventCheckpointStore {
     provider_event_attempts: AtomicUsize,
 }
 
+#[derive(Default)]
+struct FailingCommandCheckpointStore {
+    inner: InMemoryGenericAgentCheckpointStore,
+    command_attempts: AtomicUsize,
+}
+
 impl GenericAgentCheckpointStore for FailingProviderEventCheckpointStore {
     fn load_run(
         &self,
@@ -89,6 +96,40 @@ impl GenericAgentCheckpointStore for FailingProviderEventCheckpointStore {
             self.provider_event_attempts.fetch_add(1, Ordering::SeqCst);
             return Err(GenericCheckpointError::Unavailable(
                 "injected Provider event WAL failure".to_owned(),
+            ));
+        }
+        self.inner.append(run_id, expected_previous, draft)
+    }
+}
+
+impl GenericAgentCheckpointStore for FailingCommandCheckpointStore {
+    fn load_run(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Option<StoredGenericAgentRun>, GenericCheckpointError> {
+        self.inner.load_run(run_id)
+    }
+
+    fn create_run(
+        &self,
+        registration: GenericAgentRunRegistration,
+    ) -> Result<CreateGenericRunOutcome, GenericCheckpointError> {
+        self.inner.create_run(registration)
+    }
+
+    fn append(
+        &self,
+        run_id: &RunId,
+        expected_previous: u64,
+        draft: GenericCheckpointDraft,
+    ) -> Result<AppendGenericCheckpointOutcome, GenericCheckpointError> {
+        if matches!(
+            &draft.payload,
+            GenericCheckpointEvent::CommandCommitted { .. }
+        ) {
+            self.command_attempts.fetch_add(1, Ordering::SeqCst);
+            return Err(GenericCheckpointError::Unavailable(
+                "injected command WAL failure".to_owned(),
             ));
         }
         self.inner.append(run_id, expected_previous, draft)
@@ -1206,12 +1247,16 @@ async fn sdk_and_api_share_the_same_agent_event_semantics() {
 
 #[tokio::test]
 async fn controller_cancel_terminates_a_generic_agent_model_run() {
+    let run_id = RunId::new("cancel-run");
+    let checkpoint_store = Arc::new(InMemoryGenericAgentCheckpointStore::default());
     let provider = Arc::new(
         InternalGenericAgentProvider::new(
             Arc::new(BlockingModel),
             GenericAgentConfig::new("internal-provider", "generic-agent"),
         )
-        .expect("Generic Agent accepts the neutral backend"),
+        .expect("Generic Agent accepts the neutral backend")
+        .with_checkpoint_store(checkpoint_store.clone())
+        .expect("private WAL binds before the Provider is shared"),
     );
     let controller = Arc::new(
         AgentController::new(provider, ProviderBindingRef::new("generic-binding"))
@@ -1220,7 +1265,7 @@ async fn controller_cancel_terminates_a_generic_agent_model_run() {
     let run = AgentRunEnvelope::new(
         AGENT_PROTOCOL_V1,
         AgentSessionId::new("cancel-session"),
-        RunId::new("cancel-run"),
+        run_id.clone(),
         vec![Content::text("wait")],
     )
     .expect("valid text Run");
@@ -1244,7 +1289,7 @@ async fn controller_cancel_terminates_a_generic_agent_model_run() {
     .await
     .expect("Run reaches Running before cancellation");
 
-    controller
+    let ack = controller
         .cancel(&execution.run_id, "user interrupted the conversation")
         .await
         .expect("cancel command is accepted");
@@ -1258,10 +1303,113 @@ async fn controller_cancel_terminates_a_generic_agent_model_run() {
 
     assert_eq!(view.state.status(), AgentRunStatus::Cancelled);
     assert!(view.delivery.is_none());
+    let stored = checkpoint_store
+        .load_run(&run_id)
+        .expect("private WAL remains readable")
+        .expect("cancelled Run remains durable");
+    let projection = stored.validate().expect("cancelled WAL replays");
+    assert_eq!(projection.phase, GenericCheckpointPhase::Terminal);
+    let command = projection
+        .commands
+        .get(&ack.command_id)
+        .expect("cancel command is committed before cancellation is applied");
+    assert!(matches!(
+        &command.command.payload,
+        AgentCommand::Cancel { reason } if reason == "user interrupted the conversation"
+    ));
+    assert_eq!(command.outcome, ProviderCommandOutcome::Accepted);
+}
+
+#[tokio::test]
+async fn command_wal_failure_applies_no_command_effect_and_forces_unknown() {
+    let run_id = RunId::new("command-wal-failure-run");
+    let checkpoint_store = Arc::new(FailingCommandCheckpointStore::default());
+    let provider = Arc::new(
+        InternalGenericAgentProvider::new(
+            Arc::new(BlockingModel),
+            GenericAgentConfig::new("internal-provider", "generic-agent"),
+        )
+        .expect("Generic Agent accepts the neutral backend")
+        .with_checkpoint_store(checkpoint_store.clone())
+        .expect("failing private WAL binds before the Provider is shared"),
+    );
+    let controller = Arc::new(
+        AgentController::new(
+            provider,
+            ProviderBindingRef::new("command-wal-failure-binding"),
+        )
+        .expect("controller binds the Generic Agent"),
+    );
+    let run = AgentRunEnvelope::new(
+        AGENT_PROTOCOL_V1,
+        AgentSessionId::new("command-wal-failure-session"),
+        run_id.clone(),
+        vec![Content::text("wait for a cancellation whose WAL will fail")],
+    )
+    .expect("valid text Run");
+
+    let execution = controller.start(run).await.expect("Run starts");
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if controller
+                .inspect(&run_id)
+                .await
+                .expect("Run remains inspectable")
+                .state
+                .status()
+                == AgentRunStatus::Running
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Run reaches Running before the injected failure");
+
+    assert!(controller
+        .cancel(&run_id, "this command must not be applied")
+        .await
+        .is_err());
+    let wait_error = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        controller.wait_for_terminal(&execution.run_id),
+    )
+    .await
+    .expect("command WAL failure is observed promptly")
+    .expect_err("an uncommitted command cannot produce a terminal cancellation");
+    assert!(matches!(
+        wait_error,
+        AgentControlError::ContinuityUnknown(ref actual) if actual == &run_id
+    ));
+
+    let host_journal = controller
+        .events(&run_id, 0)
+        .await
+        .expect("Host journal remains readable");
+    assert!(host_journal.iter().all(|record| !matches!(
+        &record.event.payload,
+        AgentEvent::CommandDispositionRecorded { .. }
+            | AgentEvent::StopRequested { .. }
+            | AgentEvent::RunCancelled { .. }
+    )));
+    assert_eq!(checkpoint_store.command_attempts.load(Ordering::SeqCst), 1);
+    let stored = checkpoint_store
+        .load_run(&run_id)
+        .expect("private WAL remains readable")
+        .expect("private Run registration remains durable");
+    let projection = stored.validate().expect("committed WAL prefix replays");
+    assert!(projection.commands.is_empty());
+    assert!(matches!(
+        projection.phase,
+        GenericCheckpointPhase::ModelAttemptOpen { .. }
+    ));
 }
 
 #[tokio::test]
 async fn one_hundred_steers_are_committed_in_order_without_crossing_the_run() {
+    let run_id = RunId::new("steer-run");
+    let checkpoint_store = Arc::new(InMemoryGenericAgentCheckpointStore::default());
     let model = Arc::new(SteerAccumulatingModel {
         rounds: AtomicUsize::new(0),
         first_started: Notify::new(),
@@ -1271,7 +1419,9 @@ async fn one_hundred_steers_are_committed_in_order_without_crossing_the_run() {
     config.stream_buffer = 128;
     let provider = Arc::new(
         InternalGenericAgentProvider::new(model.clone(), config)
-            .expect("steer-capable Generic Agent starts"),
+            .expect("steer-capable Generic Agent starts")
+            .with_checkpoint_store(checkpoint_store.clone())
+            .expect("private WAL binds before the Provider is shared"),
     );
     assert!(provider.describe().descriptor.capabilities.controls.steer);
     let controller = Arc::new(
@@ -1280,10 +1430,7 @@ async fn one_hundred_steers_are_committed_in_order_without_crossing_the_run() {
     );
     let client = AgentClient::new(controller.clone(), AgentSessionId::new("steer-session"));
     let handle = client
-        .start_with_run_id(
-            RunId::new("steer-run"),
-            vec![Content::text("initial input")],
-        )
+        .start_with_run_id(run_id.clone(), vec![Content::text("initial input")])
         .await
         .expect("Run starts");
     tokio::time::timeout(
@@ -1347,6 +1494,36 @@ async fn one_hundred_steers_are_committed_in_order_without_crossing_the_run() {
             .map(|index| format!("steer-{index:03}"))
             .collect::<Vec<_>>()
     );
+
+    let stored = checkpoint_store
+        .load_run(&run_id)
+        .expect("private WAL remains readable")
+        .expect("steered Run remains durable");
+    let projection = stored.validate().expect("steered WAL replays");
+    assert_eq!(projection.phase, GenericCheckpointPhase::Terminal);
+    assert_eq!(projection.commands.len(), 100);
+    assert!(projection
+        .commands
+        .values()
+        .all(|checkpoint| checkpoint.outcome == ProviderCommandOutcome::Accepted));
+    let checkpointed_steers = stored
+        .records
+        .iter()
+        .filter_map(|record| match &record.payload {
+            GenericCheckpointEvent::CommandCommitted { command, .. } => match &command.payload {
+                AgentCommand::Steer { content } => content.first().and_then(|content| {
+                    if let ContentBody::Inline(serde_json::Value::String(text)) = &content.body {
+                        Some(text.clone())
+                    } else {
+                        None
+                    }
+                }),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(checkpointed_steers, committed);
 }
 
 #[tokio::test]
