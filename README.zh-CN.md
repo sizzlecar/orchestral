@@ -13,7 +13,9 @@
   Recovery，以及唯一终态投影。
 - **Generic Agent**：CLI、SDK、API 共用同一套 AI 中立的
   `Model → Tool/Workflow → Model` 循环。
-- **模型适配器**：OpenAI-compatible 与 Gemini Native 统一实现 `ModelBackend` 合同。
+- **模型适配器**：OpenAI-compatible 与 Gemini Native 统一实现
+  [`ModelBackend` 合同](testing/orchestral-model-protocol-testkit/README.md)并通过同一
+  conformance suite。
 - **Guarded Tool Runtime**：Host 持有权限策略、审批 capability、取消、Effect Journal、
   Artifact spill，并对 `UnknownEffect` 保守停机。
 - **两套独立扩展面**：Skill 只把受信任指令加入 Context；MCP Tool 只进入 Action Plane，

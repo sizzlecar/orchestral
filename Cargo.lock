@@ -940,6 +940,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "orchestral-core",
+ "orchestral-model-protocol-testkit",
  "reqwest",
  "serde_json",
  "tokio",
@@ -954,7 +955,20 @@ dependencies = [
  "bytes",
  "futures-util",
  "orchestral-core",
+ "orchestral-model-protocol-testkit",
  "reqwest",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "orchestral-model-protocol-testkit"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "orchestral-core",
  "serde_json",
  "tokio",
  "tokio-util",

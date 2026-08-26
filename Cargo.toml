@@ -19,6 +19,7 @@ members = [
 
     # Protocol conformance (external-consumer boundary)
     "testing/orchestral-agent-protocol-testkit",
+    "testing/orchestral-model-protocol-testkit",
 ]
 
 [workspace.package]
@@ -67,6 +68,7 @@ orchestral-core = { path = "core/orchestral-core", version = "0.2.0" }
 orchestral-runtime = { path = "core/orchestral-runtime", version = "0.2.0" }
 orchestral-model-gemini = { path = "plugins/orchestral-model-gemini", version = "0.2.0" }
 orchestral-model-openai = { path = "plugins/orchestral-model-openai", version = "0.2.0" }
+orchestral-model-protocol-testkit = { path = "testing/orchestral-model-protocol-testkit" }
 
 [workspace.dependencies.tokio-test]
 version = "0.4"

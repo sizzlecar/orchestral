@@ -398,10 +398,13 @@ impl GeminiStreamState {
         if self.terminated {
             return Ok(());
         }
-        let reason = self
+        let mut reason = self
             .finish_reason
             .clone()
             .unwrap_or(ModelFinishReason::Stop);
+        if self.next_call > 0 && reason == ModelFinishReason::Stop {
+            reason = ModelFinishReason::ToolCalls;
+        }
         if !self.emitted_content && reason != ModelFinishReason::ContentFilter {
             return Err(ModelError::protocol(
                 "Gemini stream contained neither text nor function calls",
@@ -746,6 +749,58 @@ fn map_http_error(status: StatusCode, body: &[u8]) -> ModelError {
 mod tests {
     use super::*;
     use orchestral_core::model_protocol::{ModelRequestId, ModelToolDefinition};
+    use orchestral_model_protocol_testkit::{
+        ModelConformanceSuite, ModelFixtureFactory, ModelFixtureResponse, ModelFixtureScenario,
+    };
+
+    struct GeminiConformanceFixture;
+
+    impl ModelFixtureFactory for GeminiConformanceFixture {
+        fn adapter_name(&self) -> &'static str {
+            "gemini-native"
+        }
+
+        fn backend(
+            &self,
+            _scenario: ModelFixtureScenario,
+            endpoint: &str,
+        ) -> Result<std::sync::Arc<dyn ModelBackend>, ModelError> {
+            GeminiModelBackend::new(GeminiModelConfig {
+                backend_id: "gemini-conformance".to_owned(),
+                endpoint: endpoint.to_owned(),
+                api_key: "fixture-key".to_owned(),
+                model: "fixture-model".to_owned(),
+                temperature: 0.0,
+                default_max_output_tokens: 64,
+                max_context_tokens: Some(8_192),
+                timeout: Duration::from_secs(1),
+                max_buffered_events: 128,
+            })
+            .map(|backend| std::sync::Arc::new(backend) as std::sync::Arc<dyn ModelBackend>)
+        }
+
+        fn response(&self, scenario: ModelFixtureScenario) -> ModelFixtureResponse {
+            let body = match scenario {
+                ModelFixtureScenario::Text => concat!(
+                    "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello \"}]}}]}\n\n",
+                    "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"world\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":7,\"candidatesTokenCount\":2}}\n\n"
+                )
+                .as_bytes()
+                .to_vec(),
+                ModelFixtureScenario::Tool => concat!(
+                    "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{",
+                    "\"id\":\"call-1\",\"name\":\"echo\",\"args\":{\"value\":\"hello\"}}}]},",
+                    "\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":8,",
+                    "\"candidatesTokenCount\":3}}\n\n"
+                )
+                .as_bytes()
+                .to_vec(),
+                ModelFixtureScenario::Malformed => b"data: not-json\n\n".to_vec(),
+                ModelFixtureScenario::Stalled => return ModelFixtureResponse::Stall,
+            };
+            ModelFixtureResponse::Complete(body)
+        }
+    }
 
     fn request() -> ModelRequest {
         ModelRequest {
@@ -760,6 +815,14 @@ mod tests {
             max_output_tokens: Some(128),
             extensions: BTreeMap::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn passes_shared_model_backend_conformance_suite() {
+        let report = ModelConformanceSuite::default()
+            .run(&GeminiConformanceFixture)
+            .await;
+        assert!(report.is_conformant(), "{:#?}", report.results());
     }
 
     #[test]
@@ -854,7 +917,7 @@ mod tests {
         assert!(matches!(
             events.last().map(|event| &event.payload),
             Some(ModelEvent::Finish {
-                reason: ModelFinishReason::Stop
+                reason: ModelFinishReason::ToolCalls
             })
         ));
     }

@@ -15,7 +15,8 @@ Provider-neutral runtime for running one Agent safely, durably, and interactivel
 - **Generic Agent** — one provider-neutral `Model → Tool/Workflow → Model` loop shared by
   CLI, SDK, and API surfaces.
 - **Model adapters** — OpenAI-compatible and Gemini-native protocols behind the same
-  `ModelBackend` contract.
+  [`ModelBackend` contract](testing/orchestral-model-protocol-testkit/README.md) and conformance
+  suite.
 - **Guarded Tool Runtime** — Host-owned policy, approval capabilities, cancellation, effect
   journaling, artifact spill, and conservative `UnknownEffect` handling.
 - **Two distinct extension planes** — Skills add trusted instructions to Context; MCP tools
