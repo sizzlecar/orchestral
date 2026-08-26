@@ -161,6 +161,7 @@ struct PendingInput {
     responder: Option<oneshot::Sender<InputResponse>>,
 }
 
+#[derive(Clone)]
 struct InputResponse {
     command_id: CommandId,
     resolution: RequestResolution,
@@ -205,6 +206,7 @@ enum GenericRecoveryContinuation {
         arguments: serde_json::Value,
         prompt: String,
         request_open: bool,
+        committed_response: Option<InputResponse>,
         response: Option<oneshot::Receiver<InputResponse>>,
     },
 }
@@ -1340,6 +1342,7 @@ fn stage_input_recovery(
             arguments,
             prompt,
             request_open,
+            committed_response: None,
             response: None,
         },
     )
@@ -1361,13 +1364,56 @@ fn stage_loop_recovery(
     let user_message = agent_input_message(&request)?;
     let run_skills = resolve_recovery_skill_binding(&inner, &registration)?;
     let model_definitions = model_definitions_for_run(&inner, run_skills.is_some());
-    let (commands, queued_steers) =
+    let (commands, queued_steers, mut pending_resolutions) =
         reconstruct_recovery_commands(&stored.records, &recovery_events)?;
+    match &mut continuation {
+        GenericRecoveryContinuation::ModelLoop { .. } if !pending_resolutions.is_empty() => {
+            let pending = pending_resolutions
+                .values()
+                .next()
+                .expect("non-empty pending resolution map was checked");
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidTransition,
+                "stable recovery cannot apply an accepted request resolution",
+            )
+            .with_details(serde_json::json!({
+                "boundary": "accepted_resolution_pending",
+                "command_id": pending.command_id,
+            })));
+        }
+        GenericRecoveryContinuation::Input {
+            round,
+            call,
+            request_open,
+            committed_response,
+            ..
+        } => {
+            let expected_request_id = input_request_id(&run_id, *round, &call.call_id);
+            *committed_response = pending_resolutions.remove(&expected_request_id);
+            if !pending_resolutions.is_empty() {
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::InvalidDigest,
+                    "accepted request resolution crossed the recovered input boundary",
+                ));
+            }
+            if let Some(response) = committed_response {
+                if !*request_open || !matches!(response.resolution, RequestResolution::Input { .. })
+                {
+                    return Err(AgentProtocolError::new(
+                        AgentProtocolErrorCode::InvalidDigest,
+                        "accepted resolution does not match the recovered pending input request",
+                    ));
+                }
+            }
+        }
+        GenericRecoveryContinuation::ModelLoop { .. } => {}
+    }
     let mut pending_inputs = BTreeMap::new();
     if let GenericRecoveryContinuation::Input {
         round,
         call,
         request_open: true,
+        committed_response: None,
         response,
         ..
     } = &mut continuation
@@ -1534,10 +1580,11 @@ fn stage_loop_recovery(
                     arguments,
                     prompt,
                     request_open,
+                    committed_response,
                     response,
                     ..
                 } => {
-                    resume_fresh_observed_input(
+                    resume_observed_input(
                         inner,
                         request,
                         admission,
@@ -1555,6 +1602,7 @@ fn stage_loop_recovery(
                         arguments,
                         prompt,
                         request_open,
+                        committed_response,
                         response,
                     )
                     .await;
@@ -1585,7 +1633,14 @@ fn resolve_recovery_skill_binding(
 fn reconstruct_recovery_commands(
     records: &[crate::generic_agent_checkpoint::GenericCheckpointRecord],
     recovery_events: &[AgentEventDraft],
-) -> Result<(BTreeMap<CommandId, StoredCommand>, VecDeque<QueuedSteer>), AgentProtocolError> {
+) -> Result<
+    (
+        BTreeMap<CommandId, StoredCommand>,
+        VecDeque<QueuedSteer>,
+        BTreeMap<RequestId, InputResponse>,
+    ),
+    AgentProtocolError,
+> {
     let applied_commands = recovery_events
         .iter()
         .filter_map(|event| {
@@ -1601,6 +1656,7 @@ fn reconstruct_recovery_commands(
         .collect::<BTreeSet<_>>();
     let mut commands = BTreeMap::new();
     let mut queued_steers = VecDeque::new();
+    let mut pending_resolutions = BTreeMap::new();
     for record in records {
         let GenericCheckpointEvent::CommandCommitted { command, outcome } = &record.payload else {
             continue;
@@ -1626,26 +1682,37 @@ fn reconstruct_recovery_commands(
                     "command_id": command.command_id,
                 })))
             }
-            AgentCommand::Steer { content }
-                if !applied_commands.contains(&command.command_id) =>
-            {
+            AgentCommand::Steer { content } if !applied_commands.contains(&command.command_id) => {
                 queued_steers.push_back(QueuedSteer {
                     command_id: command.command_id.clone(),
                     content: content.clone(),
                     message: agent_content_message(content)?,
                 })
             }
-            AgentCommand::ResolveRequest { .. }
+            AgentCommand::ResolveRequest { response }
                 if !applied_commands.contains(&command.command_id) =>
             {
-                return Err(AgentProtocolError::new(
-                    AgentProtocolErrorCode::InvalidTransition,
-                    "stable recovery cannot guess whether an accepted request resolution was delivered",
-                )
-                .with_details(serde_json::json!({
-                    "boundary": "accepted_resolution_pending",
-                    "command_id": command.command_id,
-                })))
+                let request_id = command.request_id.clone().ok_or_else(|| {
+                    AgentProtocolError::new(
+                        AgentProtocolErrorCode::InvalidDigest,
+                        "accepted request resolution has no request identity",
+                    )
+                })?;
+                if pending_resolutions
+                    .insert(
+                        request_id,
+                        InputResponse {
+                            command_id: command.command_id.clone(),
+                            resolution: response.clone(),
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(AgentProtocolError::new(
+                        AgentProtocolErrorCode::InvalidDigest,
+                        "multiple accepted resolutions target the same pending request",
+                    ));
+                }
             }
             AgentCommand::Steer { .. } | AgentCommand::ResolveRequest { .. } => {}
             _ => {
@@ -1656,7 +1723,7 @@ fn reconstruct_recovery_commands(
             }
         }
     }
-    Ok((commands, queued_steers))
+    Ok((commands, queued_steers, pending_resolutions))
 }
 
 fn validate_execution_and_duplicate(
@@ -2617,7 +2684,7 @@ async fn execute_model_run(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn resume_fresh_observed_input(
+async fn resume_observed_input(
     inner: Arc<GenericInner>,
     request: AgentStartRequest,
     admission: AgentAdmission,
@@ -2635,6 +2702,7 @@ async fn resume_fresh_observed_input(
     arguments: serde_json::Value,
     prompt: String,
     request_open: bool,
+    committed_response: Option<InputResponse>,
     response: Option<oneshot::Receiver<InputResponse>>,
 ) {
     let run_id = request.run.spec.run_id.clone();
@@ -2657,7 +2725,16 @@ async fn resume_fresh_observed_input(
         role: ModelRole::Assistant,
         content: assistant_content,
     };
-    let input = if request_open {
+    let input = if let Some(committed_response) = committed_response {
+        commit_input_response(
+            &inner,
+            &run_id,
+            round,
+            &call.call_id,
+            input_request_id(&run_id, round, &call.call_id),
+            committed_response,
+        )
+    } else if request_open {
         await_recovered_agent_input(
             inner.clone(),
             &run_id,
