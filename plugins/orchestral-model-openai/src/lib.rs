@@ -467,7 +467,7 @@ impl OpenAiStreamState {
                 "OpenAI stream contained neither text nor Tool calls",
             ));
         }
-        let reason = self.finish_reason.clone().unwrap_or_else(|| {
+        let reason = self.finish_reason.clone().unwrap_or({
             if self.calls.is_empty() {
                 ModelFinishReason::Stop
             } else {
@@ -777,11 +777,7 @@ fn cancelled_error() -> ModelError {
 }
 
 fn map_transport_error(error: reqwest::Error) -> ModelError {
-    if error.is_timeout() {
-        ModelError::new(ModelErrorCode::Unavailable, error.to_string()).with_retryable(true)
-    } else {
-        ModelError::new(ModelErrorCode::Unavailable, error.to_string()).with_retryable(true)
-    }
+    ModelError::new(ModelErrorCode::Unavailable, error.to_string()).with_retryable(true)
 }
 
 fn map_http_error(status: StatusCode, body: &[u8]) -> ModelError {
