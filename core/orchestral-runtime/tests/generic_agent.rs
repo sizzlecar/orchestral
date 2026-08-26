@@ -11,22 +11,29 @@ use orchestral_core::{
         wire::{
             AgentCommand, AgentCommandEnvelope, AgentEvent, AgentEventAuthority,
             AgentProtocolErrorCode, AgentProviderStreamItem, AgentRunEnvelope, AgentSessionId,
-            AgentStartRequest, AgentTelemetry, ApprovalDecision, CommandAckState, CommandId,
-            Content, ContentBody, PendingRequestKind, PendingRequestPayload, ProviderBindingRef,
-            ProviderCommandOutcome, RequestResolution, RunId,
+            AgentStartRequest, AgentTelemetry, ApprovalDecision, BindingRequirement,
+            CommandAckState, CommandId, Content, ContentBody, PendingRequestKind,
+            PendingRequestPayload, ProviderBindingRef, ProviderCommandOutcome, RequestResolution,
+            ResourceBinding, ResourceBindingId, ResourceBindingMode, ResourceId, ResourceKind,
+            ResourceRef, ResourceRevision, RunId,
         },
         AGENT_PROTOCOL_V1,
     },
     agent_session::{
-        AgentSessionEvent, AgentSessionJournalStore, InMemoryAgentSessionJournalStore,
+        AgentSessionEvent, AgentSessionEventDraft, AgentSessionEventId, AgentSessionJournalStore,
+        InMemoryAgentSessionJournalStore,
     },
     executor::Executor,
     model_protocol::{
         ModelBackend, ModelCapabilities, ModelContent, ModelDescriptor, ModelError, ModelEvent,
-        ModelEventId, ModelFinishReason, ModelRequest, ModelRole, ModelStream, ModelStreamEvent,
-        ModelToolCallId,
+        ModelEventId, ModelFinishReason, ModelMessage, ModelRequest, ModelRequestId, ModelRole,
+        ModelStream, ModelStreamEvent, ModelToolCallId,
     },
     normalizer::PlanNormalizer,
+    skill_protocol::{
+        SkillCompatibility, SkillDependencies, SkillId, SkillPackage, SkillSource, SkillSourceKind,
+        SkillTrustLevel, SKILL_CATALOG_RESOURCE_KIND_V1,
+    },
     tool_effect::InMemoryToolEffectJournalStore,
     tool_protocol::{
         ApprovalPolicy, EffectScope, HostApprovalVerifier, HostToolPolicy,
@@ -36,13 +43,15 @@ use orchestral_core::{
     },
 };
 use orchestral_runtime::{
-    api::AgentApi, AgentClient, AgentControlError, AgentControlEvent, AgentController,
-    AppendGenericCheckpointOutcome, CreateGenericRunOutcome, GenericAgentCheckpointStore,
-    GenericAgentConfig, GenericAgentRunRegistration, GenericCheckpointDraft,
-    GenericCheckpointError, GenericCheckpointEvent, GenericCheckpointPhase, GuardedToolExecution,
-    GuardedToolExecutor, GuardedToolResult, GuardedToolRuntime, InMemoryBlobStore,
-    InMemoryGenericAgentCheckpointStore, InMemoryHostApprovalBroker, InternalGenericAgentProvider,
-    JsonSizeTokenMeter, StoredGenericAgentRun, ToolArtifactStore, WorkflowExecutionStrategy,
+    api::AgentApi, ActivatedSkillSet, AgentClient, AgentControlError, AgentControlEvent,
+    AgentController, AppendGenericCheckpointOutcome, CreateGenericRunOutcome,
+    GenericAgentCheckpointStore, GenericAgentConfig, GenericAgentRunRegistration,
+    GenericCheckpointDraft, GenericCheckpointError, GenericCheckpointEvent, GenericCheckpointPhase,
+    GuardedToolExecution, GuardedToolExecutor, GuardedToolResult, GuardedToolRuntime,
+    InMemoryBlobStore, InMemoryGenericAgentCheckpointStore, InMemoryHostApprovalBroker,
+    InternalGenericAgentProvider, JsonSizeTokenMeter, SkillActivationOutcome,
+    SkillActivationPolicy, SkillActivationRequest, SkillHostProfile, SkillRuntime,
+    StoredGenericAgentRun, ToolArtifactStore, WorkflowExecutionStrategy,
 };
 use serde_json::json;
 use tokio::sync::Notify;
@@ -622,6 +631,14 @@ struct ArtifactLoopModel {
     rounds: AtomicUsize,
     large_value: String,
 }
+
+struct SkillRecoveryModel {
+    rounds: AtomicUsize,
+    digest: String,
+}
+
+const RECOVERY_SKILL_INSTRUCTIONS: &str =
+    "RECOVERY SKILL: preserve the durable activation result exactly once.";
 
 struct ApprovalLoopModel {
     rounds: AtomicUsize,
@@ -1255,6 +1272,118 @@ impl ModelBackend for ArtifactLoopModel {
             Ok(ModelStreamEvent {
                 request_id,
                 event_id: ModelEventId::new("artifact-answer-finish"),
+                sequence: 2,
+                payload: ModelEvent::Finish {
+                    reason: ModelFinishReason::Stop,
+                },
+            }),
+        ])))
+    }
+}
+
+#[async_trait]
+impl ModelBackend for SkillRecoveryModel {
+    fn descriptor(&self) -> ModelDescriptor {
+        ModelDescriptor {
+            backend_id: "skill-recovery-model".to_owned(),
+            capabilities: ModelCapabilities {
+                streaming: true,
+                tool_calls: true,
+                ..ModelCapabilities::default()
+            },
+            extensions: Default::default(),
+        }
+    }
+
+    async fn start(
+        &self,
+        request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelStream, ModelError> {
+        request.validate()?;
+        assert!(request
+            .tools
+            .iter()
+            .any(|tool| tool.name == "orchestral_skill_activate"));
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        let request_id = request.request_id;
+        if round == 0 {
+            let arguments = json!({
+                "name": "recovery-skill",
+                "expected_digest": self.digest,
+                "reason": "recover the exact Skill activation"
+            })
+            .to_string();
+            return Ok(Box::pin(stream::iter([
+                Ok(ModelStreamEvent {
+                    request_id: request_id.clone(),
+                    event_id: ModelEventId::new("skill-recovery-start"),
+                    sequence: 1,
+                    payload: ModelEvent::ToolCallStart {
+                        call_id: ModelToolCallId::new("activate-recovery-skill"),
+                        name: "orchestral_skill_activate".to_owned(),
+                    },
+                }),
+                Ok(ModelStreamEvent {
+                    request_id: request_id.clone(),
+                    event_id: ModelEventId::new("skill-recovery-arguments"),
+                    sequence: 2,
+                    payload: ModelEvent::ToolCallArgumentsDelta {
+                        call_id: ModelToolCallId::new("activate-recovery-skill"),
+                        delta: arguments,
+                    },
+                }),
+                Ok(ModelStreamEvent {
+                    request_id: request_id.clone(),
+                    event_id: ModelEventId::new("skill-recovery-end"),
+                    sequence: 3,
+                    payload: ModelEvent::ToolCallEnd {
+                        call_id: ModelToolCallId::new("activate-recovery-skill"),
+                    },
+                }),
+                Ok(ModelStreamEvent {
+                    request_id,
+                    event_id: ModelEventId::new("skill-recovery-finish"),
+                    sequence: 4,
+                    payload: ModelEvent::Finish {
+                        reason: ModelFinishReason::ToolCalls,
+                    },
+                }),
+            ])));
+        }
+
+        assert!(request.messages.iter().any(|message| {
+            message.content.iter().any(|content| {
+                matches!(content, ModelContent::Text { text }
+                    if text.contains(RECOVERY_SKILL_INSTRUCTIONS))
+            })
+        }));
+        assert!(request.messages.iter().any(|message| {
+            message.role == ModelRole::Tool
+                && message.content.iter().any(|content| {
+                    matches!(
+                        content,
+                        ModelContent::ToolResult {
+                            call_id,
+                            result,
+                            is_error: false,
+                        } if call_id.as_str() == "activate-recovery-skill"
+                            && result["status"] == json!("activated")
+                    )
+                })
+        }));
+        Ok(Box::pin(stream::iter([
+            Ok(ModelStreamEvent {
+                request_id: request_id.clone(),
+                event_id: ModelEventId::new("skill-recovery-answer"),
+                sequence: 1,
+                payload: ModelEvent::TextDelta {
+                    delta: "Skill recovery completed".to_owned(),
+                },
+            }),
+            Ok(ModelStreamEvent {
+                request_id,
+                event_id: ModelEventId::new("skill-recovery-answer-finish"),
                 sequence: 2,
                 payload: ModelEvent::Finish {
                     reason: ModelFinishReason::Stop,
@@ -3976,6 +4105,276 @@ enum DirectEffectRecoveryState {
     Fresh,
     Committed,
     Unknown,
+}
+
+#[derive(Clone, Copy)]
+enum SkillRecoveryState {
+    Fresh,
+    ActivationCommitted,
+    ExchangeCommitted,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn observed_skill_activation_recovers_from_each_durable_session_boundary() {
+    for state in [
+        SkillRecoveryState::Fresh,
+        SkillRecoveryState::ActivationCommitted,
+        SkillRecoveryState::ExchangeCommitted,
+    ] {
+        run_skill_recovery(state).await;
+    }
+}
+
+async fn run_skill_recovery(state: SkillRecoveryState) {
+    let suffix = match state {
+        SkillRecoveryState::Fresh => "fresh",
+        SkillRecoveryState::ActivationCommitted => "activation",
+        SkillRecoveryState::ExchangeCommitted => "exchange",
+    };
+    let run_id = RunId::new(format!("skill-{suffix}-recovery-run"));
+    let session_id = AgentSessionId::new(format!("skill-{suffix}-recovery-session"));
+    let skills = Arc::new(recovery_skill_runtime());
+    let digest = skills.catalog().skills[0].digest.clone();
+    let checkpoint_store = Arc::new(AckLostAfterModelObservationCheckpointStore::default());
+    let session_journal = Arc::new(InMemoryAgentSessionJournalStore::default());
+    let host_journal = Arc::new(InMemoryAgentJournalStore::default());
+    let config = GenericAgentConfig::new("internal-provider", "generic-agent");
+    let first_provider = Arc::new(
+        InternalGenericAgentProvider::new_with_skills_and_session_journal(
+            Arc::new(SkillRecoveryModel {
+                rounds: AtomicUsize::new(0),
+                digest: digest.to_string(),
+            }),
+            config.clone(),
+            skills.clone(),
+            session_journal.clone(),
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+        .expect("first Skill-capable Generic Agent starts")
+        .with_checkpoint_store(checkpoint_store.clone())
+        .expect("private WAL binds before the Provider is shared"),
+    );
+    let first_controller = Arc::new(
+        AgentController::with_journal_store(
+            first_provider,
+            ProviderBindingRef::new("skill-recovery-binding"),
+            host_journal.clone(),
+        )
+        .expect("first controller binds"),
+    );
+    let execution = first_controller
+        .start(bound_skill_recovery_run(
+            &skills,
+            session_id.clone(),
+            run_id.clone(),
+        ))
+        .await
+        .expect("Skill recovery Run starts");
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        first_controller.wait_for_terminal(&execution.run_id),
+    )
+    .await
+    .expect("lost model-observation acknowledgement reaches the Host")
+    .expect_err("observed Skill call is not terminal");
+    assert!(matches!(
+        error,
+        AgentControlError::ContinuityUnknown(ref actual) if actual == &run_id
+    ));
+    drop(first_controller);
+
+    if matches!(
+        state,
+        SkillRecoveryState::ActivationCommitted | SkillRecoveryState::ExchangeCommitted
+    ) {
+        let activation = match skills
+            .activate(
+                SkillActivationRequest {
+                    name: "recovery-skill".to_owned(),
+                    expected_digest: digest.clone(),
+                    reason: "recover the exact Skill activation".to_owned(),
+                },
+                &ActivatedSkillSet::default(),
+            )
+            .expect("bound Skill remains activatable")
+        {
+            SkillActivationOutcome::Activated(activation) => activation,
+            SkillActivationOutcome::AlreadyActive(_) => {
+                panic!("fresh Session cannot already contain the Skill")
+            }
+        };
+        session_journal
+            .append(AgentSessionEventDraft {
+                event_id: AgentSessionEventId::new(format!(
+                    "generic-{}-skill-1-activate-recovery-skill",
+                    run_id.as_str()
+                )),
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+                payload: AgentSessionEvent::SkillActivated {
+                    activation: Box::new(activation.clone()),
+                },
+            })
+            .await
+            .expect("Skill activation is durably seeded");
+        if matches!(state, SkillRecoveryState::ExchangeCommitted) {
+            let descriptor = &activation.package.descriptor;
+            let arguments = json!({
+                "name": "recovery-skill",
+                "expected_digest": digest,
+                "reason": "recover the exact Skill activation"
+            });
+            session_journal
+                .append(AgentSessionEventDraft {
+                    event_id: AgentSessionEventId::new(format!(
+                        "generic-{}-tool-exchange-1",
+                        run_id.as_str()
+                    )),
+                    session_id: session_id.clone(),
+                    run_id: run_id.clone(),
+                    payload: AgentSessionEvent::ToolExchangeCommitted {
+                        request_id: ModelRequestId::new(format!("model-{}-1", run_id.as_str())),
+                        assistant: ModelMessage {
+                            role: ModelRole::Assistant,
+                            content: vec![ModelContent::ToolCall {
+                                call_id: ModelToolCallId::new("activate-recovery-skill"),
+                                name: "orchestral_skill_activate".to_owned(),
+                                arguments,
+                            }],
+                        },
+                        tool: ModelMessage {
+                            role: ModelRole::Tool,
+                            content: vec![ModelContent::ToolResult {
+                                call_id: ModelToolCallId::new("activate-recovery-skill"),
+                                result: json!({
+                                    "status": "activated",
+                                    "name": descriptor.name,
+                                    "skill_id": descriptor.skill_id,
+                                    "version": descriptor.version,
+                                    "digest": descriptor.digest,
+                                    "source": descriptor.source,
+                                    "trust": descriptor.trust,
+                                }),
+                                is_error: false,
+                            }],
+                        },
+                        usage: None,
+                    },
+                })
+                .await
+                .expect("Skill Tool exchange is durably seeded");
+        }
+    }
+    checkpoint_store.allow_recovery_writes();
+
+    let replacement_model = Arc::new(SkillRecoveryModel {
+        rounds: AtomicUsize::new(1),
+        digest: skills.catalog().skills[0].digest.to_string(),
+    });
+    let replacement_provider = Arc::new(
+        InternalGenericAgentProvider::new_with_skills_and_session_journal(
+            replacement_model.clone(),
+            config,
+            skills,
+            session_journal.clone(),
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+        .expect("replacement Skill-capable Generic Agent starts")
+        .with_checkpoint_store(checkpoint_store.clone())
+        .expect("replacement Provider binds the same private WAL"),
+    );
+    let replacement_controller = Arc::new(
+        AgentController::with_journal_store(
+            replacement_provider,
+            ProviderBindingRef::new("skill-recovery-binding"),
+            host_journal,
+        )
+        .expect("replacement controller binds"),
+    );
+    replacement_controller
+        .recover(&run_id)
+        .await
+        .expect("observed Skill activation is recoverable");
+    let view = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        replacement_controller.wait_for_terminal(&run_id),
+    )
+    .await
+    .expect("Skill recovery reaches a terminal promptly")
+    .expect("Skill recovery remains authoritative");
+    assert_eq!(view.state.status(), AgentRunStatus::Delivered);
+    assert_eq!(replacement_model.rounds.load(Ordering::SeqCst), 2);
+    let records = session_journal
+        .load_session(&session_id)
+        .await
+        .expect("recovered Skill Session remains readable");
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record.payload, AgentSessionEvent::SkillActivated { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(
+                record.payload,
+                AgentSessionEvent::ToolExchangeCommitted { .. }
+            ))
+            .count(),
+        1
+    );
+}
+
+fn recovery_skill_runtime() -> SkillRuntime {
+    let package = SkillPackage::seal(
+        SkillId::new("recovery-skill"),
+        "recovery-skill",
+        "Recovery Skill",
+        Some("1.0.0".to_owned()),
+        SkillSource {
+            kind: SkillSourceKind::BuiltIn,
+            locator: "builtin:recovery-skill".to_owned(),
+        },
+        SkillTrustLevel::BuiltIn,
+        SkillCompatibility::default(),
+        SkillDependencies::default(),
+        RECOVERY_SKILL_INSTRUCTIONS,
+    )
+    .expect("valid recovery Skill package");
+    SkillRuntime::from_packages(
+        ResourceId::new("recovery-skills"),
+        vec![package],
+        SkillHostProfile::current(),
+        SkillActivationPolicy::default(),
+    )
+    .expect("valid recovery Skill catalog")
+}
+
+fn bound_skill_recovery_run(
+    skills: &SkillRuntime,
+    session_id: AgentSessionId,
+    run_id: RunId,
+) -> AgentRunEnvelope {
+    let mut run = AgentRunEnvelope::new(
+        AGENT_PROTOCOL_V1,
+        session_id,
+        run_id,
+        vec![Content::text("recover this Skill activation")],
+    )
+    .expect("valid Skill recovery Run");
+    run.spec.resources = vec![ResourceBinding {
+        binding_id: ResourceBindingId::new("skills"),
+        resource: ResourceRef {
+            kind: ResourceKind::new(SKILL_CATALOG_RESOURCE_KIND_V1),
+            id: skills.catalog().resource_id.clone(),
+            revision: ResourceRevision::new(skills.catalog().revision.as_str()),
+        },
+        requirement: BindingRequirement::Required,
+        mode: ResourceBindingMode::Snapshot,
+    }];
+    AgentRunEnvelope::seal(run.spec).expect("Skill recovery binding reseals")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
