@@ -192,6 +192,21 @@ struct GenericExecutionSeed {
     supporting_event_ids: Vec<AgentEventId>,
 }
 
+enum GenericRecoveryContinuation {
+    ModelLoop {
+        restore_initial_input: bool,
+    },
+    FreshInput {
+        round: u64,
+        request_id: ModelRequestId,
+        request_digest: Digest,
+        observation: GenericModelObservation,
+        call: GenericObservedToolCall,
+        arguments: serde_json::Value,
+        prompt: String,
+    },
+}
+
 impl GenericExecutionSeed {
     fn fresh() -> Self {
         Self {
@@ -1147,19 +1162,30 @@ impl AgentProvider for InternalGenericAgentProvider {
                 "request_id": request_id,
             }))),
             GenericCheckpointPhase::ModelAttemptObserved {
-                round, request_id, ..
-            } => Err(AgentProtocolError::new(
-                AgentProtocolErrorCode::Unsupported,
-                "Generic Agent recovery has a durable model observation but cannot yet reconstruct its continuation",
-            )
-            .with_details(serde_json::json!({
-                "boundary": "model_attempt_observed",
-                "round": round,
-                "request_id": request_id,
-            }))),
-            GenericCheckpointPhase::Stable(boundary) => {
-                stage_loop_recovery(self.inner.clone(), stored, boundary, recovery_events, false)
-            }
+                boundary,
+                round,
+                request_id,
+                request_digest,
+                observation,
+            } => stage_fresh_input_recovery(
+                self.inner.clone(),
+                stored,
+                boundary,
+                round,
+                request_id,
+                request_digest,
+                observation,
+                recovery_events,
+            ),
+            GenericCheckpointPhase::Stable(boundary) => stage_loop_recovery(
+                self.inner.clone(),
+                stored,
+                boundary,
+                recovery_events,
+                GenericRecoveryContinuation::ModelLoop {
+                    restore_initial_input: false,
+                },
+            ),
             GenericCheckpointPhase::Prepared => stage_loop_recovery(
                 self.inner.clone(),
                 stored,
@@ -1171,7 +1197,9 @@ impl AgentProvider for InternalGenericAgentProvider {
                     supporting_event_ids: Vec::new(),
                 },
                 recovery_events,
-                true,
+                GenericRecoveryContinuation::ModelLoop {
+                    restore_initial_input: true,
+                },
             ),
         }
     }
@@ -1205,12 +1233,95 @@ fn checkpoint_recovery_events(
     Ok(events)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn stage_fresh_input_recovery(
+    inner: Arc<GenericInner>,
+    stored: StoredGenericAgentRun,
+    boundary: GenericLoopBoundary,
+    round: u64,
+    request_id: ModelRequestId,
+    request_digest: Digest,
+    observation: GenericModelObservation,
+    recovery_events: Vec<AgentEventDraft>,
+) -> Result<AgentRecovery, AgentProtocolError> {
+    if recovery_events.iter().any(|event| {
+        matches!(
+            &event.payload,
+            AgentEvent::RequestOpened { .. } | AgentEvent::RequestResolved { .. }
+        )
+    }) {
+        return Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::Unsupported,
+            "observed model recovery cannot yet reattach an interaction that was already opened",
+        )
+        .with_details(serde_json::json!({
+            "boundary": "observed_interaction_open",
+            "round": round,
+            "request_id": request_id,
+        })));
+    }
+    if !matches!(
+        observation.finish_reason,
+        ModelFinishReason::ToolCalls | ModelFinishReason::Stop
+    ) || observation.tool_calls.len() != 1
+    {
+        return Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::Unsupported,
+            "observed model recovery currently requires one fresh input request",
+        )
+        .with_details(serde_json::json!({
+            "boundary": "model_attempt_observed",
+            "round": round,
+            "request_id": request_id,
+        })));
+    }
+    let call = observation
+        .tool_calls
+        .first()
+        .cloned()
+        .expect("one observed Tool call was checked");
+    if call.name != REQUEST_INPUT_TOOL_NAME || !call.ended {
+        return Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::Unsupported,
+            "observed model recovery currently supports only a complete input request",
+        )
+        .with_details(serde_json::json!({
+            "boundary": "model_attempt_observed",
+            "round": round,
+            "request_id": request_id,
+        })));
+    }
+    let pending_call = PendingModelToolCall {
+        call_id: call.call_id.clone(),
+        name: call.name.clone(),
+        arguments: call.arguments.clone(),
+        ended: call.ended,
+    };
+    let arguments = parse_tool_arguments(&pending_call).map_err(observed_recovery_error)?;
+    let prompt = parse_input_request(arguments.clone()).map_err(observed_recovery_error)?;
+    stage_loop_recovery(
+        inner,
+        stored,
+        boundary,
+        recovery_events,
+        GenericRecoveryContinuation::FreshInput {
+            round,
+            request_id,
+            request_digest,
+            observation,
+            call,
+            arguments,
+            prompt,
+        },
+    )
+}
+
 fn stage_loop_recovery(
     inner: Arc<GenericInner>,
     stored: StoredGenericAgentRun,
     boundary: GenericLoopBoundary,
     recovery_events: Vec<AgentEventDraft>,
-    restore_initial_input: bool,
+    continuation: GenericRecoveryContinuation,
 ) -> Result<AgentRecovery, AgentProtocolError> {
     let checkpoint_seq = stored.last_checkpoint_seq();
     let registration = stored.registration;
@@ -1269,6 +1380,12 @@ fn stage_loop_recovery(
     let replay = InternalGenericAgentProvider::stream_for(&run);
 
     Ok(AgentRecovery::staged(replay, async move {
+        let restore_initial_input = matches!(
+            &continuation,
+            GenericRecoveryContinuation::ModelLoop {
+                restore_initial_input: true
+            }
+        );
         let initial_input = restore_initial_input.then(|| user_message.clone());
         let model_messages = project_model_messages(
             &inner,
@@ -1279,6 +1396,25 @@ fn stage_loop_recovery(
         )
         .await
         .map_err(session_context_recovery_error)?;
+        if let GenericRecoveryContinuation::FreshInput {
+            round,
+            request_id,
+            request_digest,
+            ..
+        } = &continuation
+        {
+            let rebuilt =
+                model_request_for_round(&request, *round, &model_messages, &model_definitions);
+            if rebuilt.request_id != *request_id
+                || model_request_digest(&rebuilt).map_err(checkpoint_stream_error)?
+                    != *request_digest
+            {
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::InvalidDigest,
+                    "recovered model request no longer matches the observed private WAL attempt",
+                ));
+            }
+        }
         {
             let mut state = inner
                 .state
@@ -1326,19 +1462,52 @@ fn stage_loop_recovery(
         }
 
         tokio::spawn(async move {
-            execute_model_run(
-                inner,
-                request,
-                admission,
-                user_message,
-                model_messages,
-                model_definitions,
-                run_skills,
-                seed,
-                cancellation,
-                steer_updates,
-            )
-            .await;
+            match continuation {
+                GenericRecoveryContinuation::ModelLoop { .. } => {
+                    execute_model_run(
+                        inner,
+                        request,
+                        admission,
+                        user_message,
+                        model_messages,
+                        model_definitions,
+                        run_skills,
+                        seed,
+                        cancellation,
+                        steer_updates,
+                    )
+                    .await;
+                }
+                GenericRecoveryContinuation::FreshInput {
+                    round,
+                    request_id,
+                    observation,
+                    call,
+                    arguments,
+                    prompt,
+                    ..
+                } => {
+                    resume_fresh_observed_input(
+                        inner,
+                        request,
+                        admission,
+                        user_message,
+                        model_messages,
+                        model_definitions,
+                        run_skills,
+                        seed,
+                        cancellation,
+                        steer_updates,
+                        round,
+                        request_id,
+                        observation,
+                        call,
+                        arguments,
+                        prompt,
+                    )
+                    .await;
+                }
+            }
         });
         Ok(())
     }))
@@ -1649,14 +1818,7 @@ async fn execute_model_run(
             emit_failure(&inner, &request, &user_message, failure);
             return;
         }
-        let model_request = ModelRequest {
-            request_id: ModelRequestId::new(format!("model-{}-{round}", run_id.as_str())),
-            messages: model_messages.clone(),
-            tools: model_tools.clone(),
-            output_schema: None,
-            max_output_tokens: request.run.spec.limits.max_output_tokens,
-            extensions: Default::default(),
-        };
+        let model_request = model_request_for_round(&request, round, &model_messages, &model_tools);
         if let Err(failure) = commit_model_attempt(&inner, &run_id, round, &model_request) {
             emit_failure(&inner, &request, &user_message, failure);
             return;
@@ -2400,6 +2562,125 @@ async fn execute_model_run(
         RunLimitKind::ModelSteps,
         "model step limit reached",
     );
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resume_fresh_observed_input(
+    inner: Arc<GenericInner>,
+    request: AgentStartRequest,
+    admission: AgentAdmission,
+    user_message: ModelMessage,
+    mut model_messages: Vec<ModelMessage>,
+    model_tools: Vec<ModelToolDefinition>,
+    run_skills: Option<Arc<SkillRuntime>>,
+    mut seed: GenericExecutionSeed,
+    cancellation: CancellationToken,
+    steer_updates: watch::Receiver<u64>,
+    round: u64,
+    model_request_id: ModelRequestId,
+    observation: GenericModelObservation,
+    call: GenericObservedToolCall,
+    arguments: serde_json::Value,
+    prompt: String,
+) {
+    let run_id = request.run.spec.run_id.clone();
+    if let Some(usage) = observation.usage.clone() {
+        merge_usage(&mut seed.total_usage, usage);
+    }
+    let mut assistant_content = Vec::new();
+    if !observation.response.is_empty() {
+        seed.last_response = observation.response.clone();
+        assistant_content.push(ModelContent::Text {
+            text: observation.response,
+        });
+    }
+    assistant_content.push(ModelContent::ToolCall {
+        call_id: call.call_id.clone(),
+        name: call.name,
+        arguments,
+    });
+    let assistant_message = ModelMessage {
+        role: ModelRole::Assistant,
+        content: assistant_content,
+    };
+    let result = match await_agent_input(
+        inner.clone(),
+        &run_id,
+        round,
+        &call.call_id,
+        prompt,
+        cancellation.clone(),
+    )
+    .await
+    {
+        InputWaitOutcome::Resolved(result) => result,
+        InputWaitOutcome::Cancelled => {
+            emit_cancel(&inner, &request, &user_message);
+            return;
+        }
+        InputWaitOutcome::Failed(failure) => {
+            emit_failure(&inner, &request, &user_message, failure);
+            return;
+        }
+    };
+    let tool_message = ModelMessage {
+        role: ModelRole::Tool,
+        content: vec![ModelContent::ToolResult {
+            call_id: call.call_id,
+            result,
+            is_error: false,
+        }],
+    };
+    if let Err(failure) = append_session_event(
+        &inner,
+        AgentSessionEventDraft {
+            event_id: AgentSessionEventId::new(format!(
+                "generic-{}-tool-exchange-{round}",
+                run_id.as_str()
+            )),
+            session_id: request.run.spec.session_id.clone(),
+            run_id: run_id.clone(),
+            payload: AgentSessionEvent::ToolExchangeCommitted {
+                request_id: model_request_id,
+                assistant: assistant_message.clone(),
+                tool: tool_message.clone(),
+                usage: observation.usage,
+            },
+        },
+    )
+    .await
+    {
+        emit_failure(&inner, &request, &user_message, failure);
+        return;
+    }
+    model_messages.push(assistant_message);
+    model_messages.push(tool_message);
+    seed.next_model_round = round.saturating_add(1);
+    if let Err(failure) = commit_loop_boundary(
+        &inner,
+        &run_id,
+        seed.next_model_round,
+        &seed.total_usage,
+        seed.tool_call_count,
+        &seed.last_response,
+        &seed.supporting_event_ids,
+    ) {
+        emit_failure(&inner, &request, &user_message, failure);
+        return;
+    }
+    execute_model_run(
+        inner,
+        request,
+        admission,
+        user_message,
+        model_messages,
+        model_tools,
+        run_skills,
+        seed,
+        cancellation,
+        steer_updates,
+    )
+    .await;
 }
 
 #[derive(Deserialize)]
@@ -3279,13 +3560,6 @@ fn commit_model_attempt(
     round: u64,
     request: &ModelRequest,
 ) -> Result<(), AgentFailure> {
-    let request_bytes = serde_jcs::to_vec(request).map_err(|error| {
-        agent_failure(
-            "generic_checkpoint",
-            format!("could not digest model request: {error}"),
-            true,
-        )
-    })?;
     append_checkpoint(
         inner,
         run_id,
@@ -3293,9 +3567,40 @@ fn commit_model_attempt(
         GenericCheckpointEvent::ModelAttemptStarted {
             round,
             request_id: request.request_id.clone(),
-            request_digest: Digest::sha256(request_bytes),
+            request_digest: model_request_digest(request)?,
         },
     )
+}
+
+fn model_request_for_round(
+    request: &AgentStartRequest,
+    round: u64,
+    messages: &[ModelMessage],
+    tools: &[ModelToolDefinition],
+) -> ModelRequest {
+    ModelRequest {
+        request_id: ModelRequestId::new(format!(
+            "model-{}-{round}",
+            request.run.spec.run_id.as_str()
+        )),
+        messages: messages.to_vec(),
+        tools: tools.to_vec(),
+        output_schema: None,
+        max_output_tokens: request.run.spec.limits.max_output_tokens,
+        extensions: Default::default(),
+    }
+}
+
+fn model_request_digest(request: &ModelRequest) -> Result<Digest, AgentFailure> {
+    serde_jcs::to_vec(request)
+        .map(Digest::sha256)
+        .map_err(|error| {
+            agent_failure(
+                "generic_checkpoint",
+                format!("could not digest model request: {error}"),
+                true,
+            )
+        })
 }
 
 fn commit_model_observation(
@@ -4083,6 +4388,17 @@ fn checkpoint_recovery_error(error: GenericCheckpointError) -> AgentProtocolErro
             format!("Generic Agent private WAL cannot be trusted for recovery: {other}"),
         ),
     }
+}
+
+fn observed_recovery_error(failure: AgentFailure) -> AgentProtocolError {
+    AgentProtocolError::new(
+        AgentProtocolErrorCode::InvalidDigest,
+        format!(
+            "observed Generic Agent continuation is invalid: {}",
+            failure.message
+        ),
+    )
+    .with_details(failure.details)
 }
 
 fn recovery_start_error(error: AgentStartError) -> AgentProtocolError {
