@@ -63,6 +63,13 @@ pub struct AgentRunOptions {
     pub no_skills: bool,
 }
 
+struct CliJournalStores {
+    run: Arc<dyn AgentJournalStore>,
+    session: Arc<dyn AgentSessionJournalStore>,
+    effect: Arc<dyn ToolEffectJournalStore>,
+    checkpoint: Arc<dyn GenericAgentCheckpointStore>,
+}
+
 pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
     let config_path = prepare_runtime_config_path(options.config, &options.model_overrides)?;
     let config = load_config(&config_path)
@@ -97,25 +104,30 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
     {
         agent_config.system_prompt = system_prompt;
     }
-    let (run_journal, session_journal, effect_journal, generic_checkpoint_journal): (
-        Arc<dyn AgentJournalStore>,
-        Arc<dyn AgentSessionJournalStore>,
-        Arc<dyn ToolEffectJournalStore>,
-        Arc<dyn GenericAgentCheckpointStore>,
-    ) = match config.journal.backend.as_str() {
-        "memory" => (
-            Arc::new(InMemoryAgentJournalStore::default()),
-            Arc::new(InMemoryAgentSessionJournalStore::default()),
-            Arc::new(InMemoryToolEffectJournalStore::default()),
-            Arc::new(InMemoryGenericAgentCheckpointStore::default()),
-        ),
+    let CliJournalStores {
+        run: run_journal,
+        session: session_journal,
+        effect: effect_journal,
+        checkpoint: generic_checkpoint_journal,
+    } = match config.journal.backend.as_str() {
+        "memory" => CliJournalStores {
+            run: Arc::new(InMemoryAgentJournalStore::default()),
+            session: Arc::new(InMemoryAgentSessionJournalStore::default()),
+            effect: Arc::new(InMemoryToolEffectJournalStore::default()),
+            checkpoint: Arc::new(InMemoryGenericAgentCheckpointStore::default()),
+        },
         "filesystem" | "fs" => {
             let root = config.journal.root_dir.as_str();
             let store = Arc::new(
                 FileAgentJournalStore::open(root)
                     .with_context(|| format!("open Agent Journal at '{root}'"))?,
             );
-            (store.clone(), store.clone(), store.clone(), store)
+            CliJournalStores {
+                run: store.clone(),
+                session: store.clone(),
+                effect: store.clone(),
+                checkpoint: store,
+            }
         }
         backend => bail!("unsupported Agent Journal backend for CLI: {backend}"),
     };
@@ -307,6 +319,11 @@ fn build_cli_tool_runtime(
         .iter()
         .flat_map(|server| server.environment.keys().cloned())
         .collect();
+    let writable_roots = if shell_enabled || mcp_enabled {
+        BTreeSet::from([workspace.clone()])
+    } else {
+        BTreeSet::new()
+    };
     let bounds = ToolPolicyBounds {
         allowed_effects,
         approval: ApprovalPolicy::NotRequired,
@@ -324,9 +341,7 @@ fn build_cli_tool_runtime(
         },
         filesystem: FilesystemPolicy {
             readable_roots: BTreeSet::from([workspace.clone()]),
-            writable_roots: (shell_enabled || mcp_enabled)
-                .then(|| BTreeSet::from([workspace]))
-                .unwrap_or_default(),
+            writable_roots,
         },
         network: NetworkPolicy::default(),
         environment: EnvironmentPolicy {
