@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use futures_util::stream;
 use futures_util::StreamExt;
 use orchestral_core::agent_protocol::{
-    spi::{AgentProvider, AgentProviderStream, AgentStart, AgentStartError},
+    spi::{AgentProvider, AgentProviderStream, AgentRecoveryRequest, AgentStart, AgentStartError},
     wire::{
         AgentAdmission, AgentCapabilities, AgentCommandEnvelope, AgentDescriptor,
         AgentDescriptorEnvelope, AgentEventDraft, AgentExecutionRef, AgentId, AgentProtocolError,
@@ -416,10 +416,11 @@ impl AgentProvider for DeterministicProvider {
         })
     }
 
-    fn recover(
+    async fn recover(
         &self,
-        execution: &AgentExecutionRef,
+        request: AgentRecoveryRequest,
     ) -> Result<AgentProviderStream, AgentProtocolError> {
+        request.validate_for(&self.descriptor)?;
         if !self.descriptor.descriptor.capabilities.controls.recover {
             return Err(AgentProtocolError::new(
                 AgentProtocolErrorCode::Unsupported,
@@ -432,10 +433,10 @@ impl AgentProvider for DeterministicProvider {
                 "deterministic fixture state lock is poisoned",
             )
         })?;
-        let stored = state.runs.get(&execution.run_id).ok_or_else(|| {
+        let stored = state.runs.get(&request.execution.run_id).ok_or_else(|| {
             AgentProtocolError::new(AgentProtocolErrorCode::RunNotFound, "run does not exist")
         })?;
-        if stored.execution != *execution {
+        if stored.execution != request.execution {
             return Err(AgentProtocolError::new(
                 AgentProtocolErrorCode::RunIdConflict,
                 "execution reference does not match the stored immutable Run",

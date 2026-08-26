@@ -22,6 +22,39 @@ pub struct AgentStart {
     pub stream: AgentProviderStream,
 }
 
+/// Immutable Host evidence supplied when reconnecting an existing logical Run.
+///
+/// A Provider may reattach native work or reconstruct its private state, but it
+/// must preserve the same start/execution identity and must not duplicate
+/// externally observable effects. The Host separately verifies the replayed
+/// Provider event prefix before restoring continuity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentRecoveryRequest {
+    pub start_request: AgentStartRequest,
+    pub execution: AgentExecutionRef,
+}
+
+impl AgentRecoveryRequest {
+    pub fn new(
+        start_request: AgentStartRequest,
+        execution: AgentExecutionRef,
+        descriptor: &AgentDescriptorEnvelope,
+    ) -> Result<Self, AgentProtocolError> {
+        execution.validate_for(&start_request, descriptor)?;
+        Ok(Self {
+            start_request,
+            execution,
+        })
+    }
+
+    pub fn validate_for(
+        &self,
+        descriptor: &AgentDescriptorEnvelope,
+    ) -> Result<(), AgentProtocolError> {
+        self.execution.validate_for(&self.start_request, descriptor)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum AgentStartError {
@@ -64,8 +97,8 @@ pub trait AgentProvider: Send + Sync {
     /// Provider-native cursors remain adapter-private. Normalized
     /// `events(after_run_seq)` replay belongs to the Host Agent journal, not
     /// this SPI. Replayed drafts must retain stable event IDs for exact dedupe.
-    fn recover(
+    async fn recover(
         &self,
-        execution: &AgentExecutionRef,
+        request: AgentRecoveryRequest,
     ) -> Result<AgentProviderStream, AgentProtocolError>;
 }

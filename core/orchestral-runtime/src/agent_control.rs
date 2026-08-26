@@ -16,7 +16,8 @@ use orchestral_core::agent_protocol::{
     },
     spi::{
         AgentJournalStore, AgentJournalStoreError, AgentProvider, AgentProviderStream,
-        AgentRunRegistration, AgentStartError, InMemoryAgentJournalStore, StoredAgentRun,
+        AgentRecoveryRequest, AgentRunRegistration, AgentStartError, InMemoryAgentJournalStore,
+        StoredAgentRun,
     },
     wire::{
         AgentCommand, AgentCommandEnvelope, AgentEvent, AgentEventAuthority, AgentEventDraft,
@@ -414,7 +415,13 @@ impl AgentController {
     ) -> Result<AgentRunView, AgentControlError> {
         let slot = self.run_slot(run_id).await?;
         let _recovery_guard = slot.recovery_gate.lock().await;
-        let (execution, expected_provider_prefix, last_confirmed_seq, loss_event_digest) = {
+        let (
+            start_request,
+            execution,
+            expected_provider_prefix,
+            last_confirmed_seq,
+            loss_event_digest,
+        ) = {
             let entry = slot.entry.lock().await;
             let AgentRunState::Unknown {
                 last_confirmed_seq, ..
@@ -455,6 +462,7 @@ impl AgentController {
                 .map(|record| (record.event.event_id.clone(), record.draft_digest.clone()))
                 .collect::<Vec<_>>();
             (
+                entry.request.clone(),
                 entry.execution.clone(),
                 prefix,
                 last_confirmed_seq,
@@ -462,7 +470,9 @@ impl AgentController {
             )
         };
 
-        let mut stream = self.provider.recover(&execution)?;
+        let recovery =
+            AgentRecoveryRequest::new(start_request, execution.clone(), &self.descriptor)?;
+        let mut stream = self.provider.recover(recovery).await?;
         let mut matched_digests = Vec::with_capacity(expected_provider_prefix.len());
         for (expected_event_id, expected_draft_digest) in &expected_provider_prefix {
             loop {

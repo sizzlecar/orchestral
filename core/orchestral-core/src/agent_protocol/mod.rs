@@ -43,7 +43,9 @@ pub mod spi {
         AgentJournalStore, AgentJournalStoreError, AgentRunRegistration, AppendAgentRecordOutcome,
         CreateAgentRunOutcome, InMemoryAgentJournalStore, StoredAgentRun,
     };
-    pub use super::provider::{AgentProvider, AgentProviderStream, AgentStart, AgentStartError};
+    pub use super::provider::{
+        AgentProvider, AgentProviderStream, AgentRecoveryRequest, AgentStart, AgentStartError,
+    };
     pub use super::types::AgentCompatibility;
 }
 

@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use futures_util::TryStreamExt;
 use orchestral_core::agent_protocol::{
     reference::{AgentRunReducer, AgentRunStatus, ApplyOutcome},
-    spi::{AgentProvider, AgentStartError},
+    spi::{AgentProvider, AgentRecoveryRequest, AgentStartError},
     wire::{
         AgentAdmission, AgentDelivery, AgentDescriptorEnvelope, AgentEvent, AgentEventDraft,
         AgentEventId, AgentProtocolError, AgentProtocolErrorCode, AgentProviderStreamItem,
@@ -537,11 +537,16 @@ async fn recover_unsupported_when_undeclared(
             "recover=false contract case was selected for a recover=true descriptor".to_owned(),
         ));
     }
+    let start_request = scenario.start_request;
     let start = provider
-        .start(scenario.start_request)
+        .start(start_request.clone())
         .await
         .map_err(|error| CaseFailure::Failed(format!("start before recover failed: {error}")))?;
-    match provider.recover(&start.execution) {
+    let recovery = AgentRecoveryRequest::new(start_request, start.execution.clone(), &descriptor)
+        .map_err(|error| {
+        CaseFailure::Failed(format!("recovery request was invalid: {error}"))
+    })?;
+    match provider.recover(recovery).await {
         Err(error) if error.code == AgentProtocolErrorCode::Unsupported => Ok(()),
         Err(error) => Err(CaseFailure::Failed(format!(
             "recover=false returned {:?} instead of Unsupported",
@@ -568,7 +573,9 @@ async fn recover_stable_when_declared(
         .map_err(|error| CaseFailure::Failed(format!("start before recover failed: {error}")))?;
     let execution = start.execution.clone();
     let initial = collect_provider_drafts(start.stream, "initial stream").await?;
-    let recovered_stream = provider.recover(&execution).map_err(|error| {
+    let recovery = AgentRecoveryRequest::new(scenario.start_request, execution, &descriptor)
+        .map_err(|error| CaseFailure::Failed(format!("recovery request was invalid: {error}")))?;
+    let recovered_stream = provider.recover(recovery).await.map_err(|error| {
         CaseFailure::Failed(format!(
             "recover=true returned {:?} instead of a stream: {error}",
             error.code

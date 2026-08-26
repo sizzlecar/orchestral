@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
 use orchestral_core::agent_protocol::{
-    spi::{AgentProvider, AgentProviderStream, AgentStart, AgentStartError},
+    spi::{AgentProvider, AgentProviderStream, AgentRecoveryRequest, AgentStart, AgentStartError},
     wire::{
         AgentAdmission, AgentCapabilities, AgentCommand, AgentCommandEnvelope, AgentDelivery,
         AgentDescriptor, AgentDescriptorEnvelope, AgentEvent, AgentEventDraft, AgentEventId,
@@ -991,18 +991,19 @@ impl AgentProvider for InternalGenericAgentProvider {
         Ok(record_command(run, &command, outcome))
     }
 
-    fn recover(
+    async fn recover(
         &self,
-        execution: &AgentExecutionRef,
+        request: AgentRecoveryRequest,
     ) -> Result<AgentProviderStream, AgentProtocolError> {
+        request.validate_for(&self.inner.descriptor)?;
         let state = self.state();
-        let run = state.runs.get(&execution.run_id).ok_or_else(|| {
+        let run = state.runs.get(&request.execution.run_id).ok_or_else(|| {
             AgentProtocolError::new(AgentProtocolErrorCode::RunNotFound, "run does not exist")
         })?;
-        if run.execution != *execution {
+        if run.execution != request.execution || run.request != request.start_request {
             return Err(AgentProtocolError::new(
                 AgentProtocolErrorCode::RunIdConflict,
-                "execution reference does not match the Generic Agent Run",
+                "recovery identity does not match the Generic Agent Run",
             ));
         }
         Ok(Self::stream_for(run))
