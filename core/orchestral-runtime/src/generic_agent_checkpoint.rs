@@ -159,6 +159,15 @@ pub enum GenericCheckpointEvent {
         request_id: ModelRequestId,
         observation: GenericModelObservation,
     },
+    /// Written before entering the Workflow DAG executor. Once present, a
+    /// missing durable Workflow output is intentionally outcome-unknown and
+    /// must never be reconstructed by rerunning the DAG.
+    WorkflowAttemptStarted {
+        round: u64,
+        request_id: ModelRequestId,
+        call_id: ModelToolCallId,
+        arguments_digest: Digest,
+    },
     CommandCommitted {
         command: AgentCommandEnvelope,
         outcome: ProviderCommandOutcome,
@@ -212,6 +221,22 @@ impl GenericCheckpointEvent {
                     ));
                 }
                 observation.validate()?;
+            }
+            Self::WorkflowAttemptStarted {
+                round,
+                request_id,
+                call_id,
+                arguments_digest,
+            } => {
+                if *round == 0
+                    || request_id.is_empty()
+                    || call_id.is_empty()
+                    || !arguments_digest.is_sha256()
+                {
+                    return Err(GenericCheckpointError::InvalidData(
+                        "workflow attempt requires model, call, and argument identities".to_owned(),
+                    ));
+                }
             }
             Self::CommandCommitted {
                 command,
@@ -423,6 +448,15 @@ pub enum GenericCheckpointPhase {
         request_digest: Digest,
         observation: GenericModelObservation,
     },
+    WorkflowAttemptOpen {
+        boundary: GenericLoopBoundary,
+        round: u64,
+        request_id: ModelRequestId,
+        request_digest: Digest,
+        observation: GenericModelObservation,
+        call_id: ModelToolCallId,
+        arguments_digest: Digest,
+    },
     Terminal,
 }
 
@@ -495,6 +529,7 @@ pub fn replay_generic_agent_checkpoint(
                     GenericCheckpointPhase::Prepared if *next_model_round == 1 => {}
                     GenericCheckpointPhase::ModelAttemptOpen { round, .. }
                     | GenericCheckpointPhase::ModelAttemptObserved { round, .. }
+                    | GenericCheckpointPhase::WorkflowAttemptOpen { round, .. }
                         if *next_model_round > *round => {}
                     _ => {
                         return Err(GenericCheckpointError::InvalidData(
@@ -559,6 +594,49 @@ pub fn replay_generic_agent_checkpoint(
                     request_id: request_id.clone(),
                     request_digest: request_digest.clone(),
                     observation: observation.clone(),
+                };
+            }
+            GenericCheckpointEvent::WorkflowAttemptStarted {
+                round,
+                request_id,
+                call_id,
+                arguments_digest,
+            } => {
+                let GenericCheckpointPhase::ModelAttemptObserved {
+                    boundary,
+                    round: observed_round,
+                    request_id: observed_request_id,
+                    request_digest,
+                    observation,
+                } = &phase
+                else {
+                    return Err(GenericCheckpointError::InvalidData(
+                        "workflow attempt did not begin from an observed model call".to_owned(),
+                    ));
+                };
+                let matching_call = observation.tool_calls.iter().find(|call| {
+                    call.call_id == *call_id
+                        && call.name == "orchestral_workflow"
+                        && call.ended
+                        && Digest::sha256(call.arguments.as_bytes()) == *arguments_digest
+                });
+                if round != observed_round
+                    || request_id != observed_request_id
+                    || matching_call.is_none()
+                {
+                    return Err(GenericCheckpointError::InvalidData(
+                        "workflow attempt identity does not match its observed model call"
+                            .to_owned(),
+                    ));
+                }
+                phase = GenericCheckpointPhase::WorkflowAttemptOpen {
+                    boundary: boundary.clone(),
+                    round: *round,
+                    request_id: request_id.clone(),
+                    request_digest: request_digest.clone(),
+                    observation: observation.clone(),
+                    call_id: call_id.clone(),
+                    arguments_digest: arguments_digest.clone(),
                 };
             }
             GenericCheckpointEvent::CommandCommitted {

@@ -185,6 +185,13 @@ struct AckLostAfterModelObservationCheckpointStore {
     unavailable: AtomicBool,
 }
 
+#[derive(Default)]
+struct AckLostAfterWorkflowStartCheckpointStore {
+    inner: InMemoryGenericAgentCheckpointStore,
+    acknowledgement_lost: AtomicBool,
+    unavailable: AtomicBool,
+}
+
 impl AckLostAfterInputOpenCheckpointStore {
     fn allow_recovery_writes(&self) {
         self.unavailable.store(false, Ordering::SeqCst);
@@ -210,6 +217,12 @@ impl AckLostAfterApprovalResolveCheckpointStore {
 }
 
 impl AckLostAfterModelObservationCheckpointStore {
+    fn allow_recovery_writes(&self) {
+        self.unavailable.store(false, Ordering::SeqCst);
+    }
+}
+
+impl AckLostAfterWorkflowStartCheckpointStore {
     fn allow_recovery_writes(&self) {
         self.unavailable.store(false, Ordering::SeqCst);
     }
@@ -498,6 +511,47 @@ impl GenericAgentCheckpointStore for AckLostAfterModelObservationCheckpointStore
             self.unavailable.store(true, Ordering::SeqCst);
             return Err(GenericCheckpointError::Unavailable(
                 "model observation commit acknowledgement was lost".to_owned(),
+            ));
+        }
+        Ok(outcome)
+    }
+}
+
+impl GenericAgentCheckpointStore for AckLostAfterWorkflowStartCheckpointStore {
+    fn load_run(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Option<StoredGenericAgentRun>, GenericCheckpointError> {
+        self.inner.load_run(run_id)
+    }
+
+    fn create_run(
+        &self,
+        registration: GenericAgentRunRegistration,
+    ) -> Result<CreateGenericRunOutcome, GenericCheckpointError> {
+        self.inner.create_run(registration)
+    }
+
+    fn append(
+        &self,
+        run_id: &RunId,
+        expected_previous: u64,
+        draft: GenericCheckpointDraft,
+    ) -> Result<AppendGenericCheckpointOutcome, GenericCheckpointError> {
+        if self.unavailable.load(Ordering::SeqCst) {
+            return Err(GenericCheckpointError::Unavailable(
+                "simulated Provider process loss after durable Workflow start".to_owned(),
+            ));
+        }
+        let loses_acknowledgement = matches!(
+            &draft.payload,
+            GenericCheckpointEvent::WorkflowAttemptStarted { .. }
+        );
+        let outcome = self.inner.append(run_id, expected_previous, draft)?;
+        if loses_acknowledgement && !self.acknowledgement_lost.swap(true, Ordering::SeqCst) {
+            self.unavailable.store(true, Ordering::SeqCst);
+            return Err(GenericCheckpointError::Unavailable(
+                "Workflow start commit acknowledgement was lost".to_owned(),
             ));
         }
         Ok(outcome)
@@ -4117,6 +4171,253 @@ enum SkillRecoveryState {
     Fresh,
     ActivationCommitted,
     ExchangeCommitted,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn observed_workflow_starts_once_after_recovery() {
+    let run_id = RunId::new("workflow-observed-recovery-run");
+    let session_id = AgentSessionId::new("workflow-observed-recovery-session");
+    let checkpoint_store = Arc::new(AckLostAfterModelObservationCheckpointStore::default());
+    let session_journal = Arc::new(InMemoryAgentSessionJournalStore::default());
+    let host_journal = Arc::new(InMemoryAgentJournalStore::default());
+    let bounds = ToolPolicyBounds {
+        approval: ApprovalPolicy::NotRequired,
+        max_timeout_ms: Some(5_000),
+        max_output_bytes: Some(16 * 1024),
+        ..ToolPolicyBounds::default()
+    };
+    let echo = Arc::new(EchoTool {
+        calls: AtomicUsize::new(0),
+    });
+    let runtime = durable_direct_runtime(
+        &bounds,
+        Arc::new(InMemoryToolEffectJournalStore::default()),
+        echo.clone(),
+    );
+    let config = GenericAgentConfig::new("internal-provider", "generic-agent");
+    let first_provider = Arc::new(
+        InternalGenericAgentProvider::new_with_workflow_and_session_journal(
+            Arc::new(WorkflowLoopModel {
+                rounds: AtomicUsize::new(0),
+            }),
+            config.clone(),
+            runtime.clone(),
+            RunToolGrant {
+                bounds: bounds.clone(),
+            },
+            workflow_recovery_strategy(runtime.clone()),
+            session_journal.clone(),
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+        .expect("first Workflow-capable Agent starts")
+        .with_checkpoint_store(checkpoint_store.clone())
+        .expect("private WAL binds before the Provider is shared"),
+    );
+    let first_controller = Arc::new(
+        AgentController::with_journal_store(
+            first_provider,
+            ProviderBindingRef::new("workflow-recovery-binding"),
+            host_journal.clone(),
+        )
+        .expect("first Workflow controller binds"),
+    );
+    let execution = first_controller
+        .start(
+            AgentRunEnvelope::new(
+                AGENT_PROTOCOL_V1,
+                session_id.clone(),
+                run_id.clone(),
+                vec![Content::text("recover the observed Workflow")],
+            )
+            .expect("valid Workflow recovery Run"),
+        )
+        .await
+        .expect("Workflow recovery Run starts");
+    let error = first_controller
+        .wait_for_terminal(&execution.run_id)
+        .await
+        .expect_err("lost observation acknowledgement leaves continuity unknown");
+    assert!(matches!(
+        error,
+        AgentControlError::ContinuityUnknown(ref actual) if actual == &run_id
+    ));
+    assert_eq!(echo.calls.load(Ordering::SeqCst), 0);
+    drop(first_controller);
+    checkpoint_store.allow_recovery_writes();
+
+    let replacement_model = Arc::new(WorkflowLoopModel {
+        rounds: AtomicUsize::new(1),
+    });
+    let replacement_provider = Arc::new(
+        InternalGenericAgentProvider::new_with_workflow_and_session_journal(
+            replacement_model.clone(),
+            config,
+            runtime.clone(),
+            RunToolGrant { bounds },
+            workflow_recovery_strategy(runtime),
+            session_journal.clone(),
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+        .expect("replacement Workflow-capable Agent starts")
+        .with_checkpoint_store(checkpoint_store.clone())
+        .expect("replacement Provider binds the same private WAL"),
+    );
+    let replacement_controller = Arc::new(
+        AgentController::with_journal_store(
+            replacement_provider,
+            ProviderBindingRef::new("workflow-recovery-binding"),
+            host_journal,
+        )
+        .expect("replacement Workflow controller binds"),
+    );
+    replacement_controller
+        .recover(&run_id)
+        .await
+        .expect("unstarted observed Workflow is recoverable");
+    let view = replacement_controller
+        .wait_for_terminal(&run_id)
+        .await
+        .expect("recovered Workflow delivers");
+    assert_eq!(view.state.status(), AgentRunStatus::Delivered);
+    assert_eq!(echo.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(replacement_model.rounds.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        session_journal
+            .load_session(&session_id)
+            .await
+            .expect("Workflow Session remains readable")
+            .iter()
+            .filter(|record| matches!(
+                record.payload,
+                AgentSessionEvent::ToolExchangeCommitted { .. }
+            ))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn durable_workflow_start_fence_never_reruns_an_unknown_dag() {
+    let run_id = RunId::new("workflow-start-fence-run");
+    let checkpoint_store = Arc::new(AckLostAfterWorkflowStartCheckpointStore::default());
+    let session_journal = Arc::new(InMemoryAgentSessionJournalStore::default());
+    let host_journal = Arc::new(InMemoryAgentJournalStore::default());
+    let bounds = ToolPolicyBounds {
+        approval: ApprovalPolicy::NotRequired,
+        max_timeout_ms: Some(5_000),
+        max_output_bytes: Some(16 * 1024),
+        ..ToolPolicyBounds::default()
+    };
+    let echo = Arc::new(EchoTool {
+        calls: AtomicUsize::new(0),
+    });
+    let runtime = durable_direct_runtime(
+        &bounds,
+        Arc::new(InMemoryToolEffectJournalStore::default()),
+        echo.clone(),
+    );
+    let config = GenericAgentConfig::new("internal-provider", "generic-agent");
+    let first_provider = Arc::new(
+        InternalGenericAgentProvider::new_with_workflow_and_session_journal(
+            Arc::new(WorkflowLoopModel {
+                rounds: AtomicUsize::new(0),
+            }),
+            config.clone(),
+            runtime.clone(),
+            RunToolGrant {
+                bounds: bounds.clone(),
+            },
+            workflow_recovery_strategy(runtime.clone()),
+            session_journal.clone(),
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+        .expect("first fenced Workflow Agent starts")
+        .with_checkpoint_store(checkpoint_store.clone())
+        .expect("private WAL binds before the Provider is shared"),
+    );
+    let first_controller = Arc::new(
+        AgentController::with_journal_store(
+            first_provider,
+            ProviderBindingRef::new("workflow-fence-binding"),
+            host_journal.clone(),
+        )
+        .expect("first fenced Workflow controller binds"),
+    );
+    let execution = first_controller
+        .start(
+            AgentRunEnvelope::new(
+                AGENT_PROTOCOL_V1,
+                AgentSessionId::new("workflow-start-fence-session"),
+                run_id.clone(),
+                vec![Content::text("fence the Workflow before execution")],
+            )
+            .expect("valid fenced Workflow Run"),
+        )
+        .await
+        .expect("fenced Workflow Run starts");
+    let error = first_controller
+        .wait_for_terminal(&execution.run_id)
+        .await
+        .expect_err("lost Workflow fence acknowledgement leaves continuity unknown");
+    assert!(matches!(
+        error,
+        AgentControlError::ContinuityUnknown(ref actual) if actual == &run_id
+    ));
+    assert_eq!(echo.calls.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        checkpoint_store
+            .load_run(&run_id)
+            .expect("private WAL remains readable")
+            .expect("private Run remains registered")
+            .validate()
+            .expect("private WAL remains valid")
+            .phase,
+        GenericCheckpointPhase::WorkflowAttemptOpen { .. }
+    ));
+    drop(first_controller);
+    checkpoint_store.allow_recovery_writes();
+
+    let replacement_model = Arc::new(WorkflowLoopModel {
+        rounds: AtomicUsize::new(1),
+    });
+    let replacement_provider = Arc::new(
+        InternalGenericAgentProvider::new_with_workflow_and_session_journal(
+            replacement_model.clone(),
+            config,
+            runtime.clone(),
+            RunToolGrant { bounds },
+            workflow_recovery_strategy(runtime),
+            session_journal,
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+        .expect("replacement fenced Workflow Agent starts")
+        .with_checkpoint_store(checkpoint_store)
+        .expect("replacement Provider binds the same private WAL"),
+    );
+    let replacement_controller = Arc::new(
+        AgentController::with_journal_store(
+            replacement_provider,
+            ProviderBindingRef::new("workflow-fence-binding"),
+            host_journal,
+        )
+        .expect("replacement fenced Workflow controller binds"),
+    );
+    let recovery = replacement_controller.recover(&run_id).await;
+    assert!(recovery.is_err());
+    assert_eq!(echo.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(replacement_model.rounds.load(Ordering::SeqCst), 1);
+}
+
+fn workflow_recovery_strategy(
+    runtime: Arc<GuardedToolRuntime<InMemoryApprovalCapabilityStore>>,
+) -> Arc<WorkflowExecutionStrategy> {
+    let mut normalizer = PlanNormalizer::new();
+    normalizer.register_action("echo");
+    Arc::new(WorkflowExecutionStrategy::new(
+        Arc::new(normalizer),
+        Arc::new(Executor::new()),
+        runtime,
+    ))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
