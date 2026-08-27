@@ -57,8 +57,9 @@ Gemini Native。
 
 ## Opt-in live smoke
 
-默认测试不访问网络。显式提供 endpoint、model 和 key 后可验证两个 production Adapter 的
-真实协议/wiring；任务质量单独观察，不作为形式化正确性证明。
+默认测试不访问网络。显式提供 endpoint、model 和 credential 后可验证两个 production
+Adapter 的真实协议/wiring；任务质量单独观察，不作为形式化正确性证明。Gemini Native
+支持 Developer API 的 API key，也支持 Vertex AI 的短期 OAuth Bearer token。
 
 ```bash
 ORCHESTRAL_LIVE_MODEL_SMOKE=1 \
@@ -73,6 +74,33 @@ ORCHESTRAL_GEMINI_LIVE_MODEL=your-model \
 GOOGLE_API_KEY=... \
 cargo test -p orchestral-model-gemini --test live_smoke -- --ignored --nocapture
 ```
+
+使用 Google Cloud service account 时，不把 credential 文件交给 Adapter；先在调用进程中
+换取短期 token，再分别验证原生 Gemini 与 Google 的 OpenAI-compatible endpoint：
+
+```bash
+export GOOGLE_OAUTH_ACCESS_TOKEN="$(
+  CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE=/path/to/service-account.json \
+  gcloud auth print-access-token --quiet
+)"
+
+ORCHESTRAL_LIVE_MODEL_SMOKE=1 \
+ORCHESTRAL_GEMINI_LIVE_ENDPOINT="https://aiplatform.googleapis.com/v1/projects/$PROJECT_ID/locations/global/publishers/google" \
+ORCHESTRAL_GEMINI_LIVE_MODEL=gemini-3.1-pro-preview \
+cargo test -p orchestral-model-gemini --test live_smoke -- --ignored --nocapture
+
+ORCHESTRAL_LIVE_MODEL_SMOKE=1 \
+ORCHESTRAL_OPENAI_LIVE_ENDPOINT="https://aiplatform.googleapis.com/v1/projects/$PROJECT_ID/locations/global/endpoints/openapi" \
+ORCHESTRAL_OPENAI_LIVE_MODEL=google/gemini-3.5-flash \
+OPENAI_API_KEY="$GOOGLE_OAUTH_ACCESS_TOKEN" \
+cargo test -p orchestral-model-openai --test live_smoke -- --ignored --nocapture
+
+unset GOOGLE_OAUTH_ACCESS_TOKEN
+```
+
+2026-08-27 的 M5.4 验收已实际执行上述两条协议链路：Gemini Native 使用
+`gemini-3.1-pro-preview`，OpenAI-compatible 使用 `google/gemini-3.5-flash`；两项均为
+`1 passed, 0 failed`。credential、私钥和 token 均未进入仓库或测试输出。
 
 仓库的 `Live Model Smoke` 手动 workflow 运行同一组 ignored tests；触发前必须配置
 `OPENAI_API_KEY` 与 `GOOGLE_API_KEY` repository secrets，并在 dispatch 输入中显式指定
