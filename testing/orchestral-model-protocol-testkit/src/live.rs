@@ -33,7 +33,10 @@ pub async fn run_live_text_smoke(
         )],
         tools: Vec::new(),
         output_schema: None,
-        max_output_tokens: Some(64),
+        // Reasoning models may spend part of the output budget on hidden
+        // thinking before emitting visible text. Keep this large enough for a
+        // protocol smoke without making the prompt itself provider-specific.
+        max_output_tokens: Some(512),
         extensions: Default::default(),
     };
     request

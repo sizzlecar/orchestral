@@ -40,7 +40,7 @@ use orchestral_mcp_streamable_http::{
     ResolvedCredentialHeader, StreamableHttpMcpTransportConfig, StreamableHttpMcpTransportFactory,
     DEFAULT_MAX_MCP_HTTP_FRAME_BYTES,
 };
-use orchestral_model_gemini::{GeminiModelBackend, GeminiModelConfig};
+use orchestral_model_gemini::{GeminiAuthentication, GeminiModelBackend, GeminiModelConfig};
 use orchestral_model_openai::{OpenAiCompatibleBackend, OpenAiCompatibleConfig};
 use orchestral_runtime::tools::{
     guarded_artifact_read_descriptor, guarded_file_read_descriptor, GuardedArtifactReadExecutor,
@@ -810,9 +810,10 @@ fn build_model_backend(
                     endpoint: backend.endpoint.clone().unwrap_or_else(|| {
                         "https://generativelanguage.googleapis.com/v1beta".to_owned()
                     }),
-                    api_key,
+                    authentication: GeminiAuthentication::ApiKey(api_key),
                     model: model.to_owned(),
                     temperature,
+                    thinking_level: None,
                     default_max_output_tokens: max_output_tokens,
                     max_context_tokens,
                     timeout,

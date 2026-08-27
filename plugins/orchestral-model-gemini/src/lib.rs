@@ -14,17 +14,58 @@ use orchestral_core::model_protocol::{
     ModelRole, ModelStream, ModelStreamEvent, ModelTokenAccounting, ModelTokenMeter,
     ModelTokenMeterDescriptor, ModelToolCallId, ModelToolDefinition, ModelUsage,
 };
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, RequestBuilder, StatusCode};
 use serde_json::{json, Map, Value};
 use tokio_util::sync::CancellationToken;
+
+#[derive(Clone)]
+pub enum GeminiAuthentication {
+    ApiKey(String),
+    BearerToken(String),
+}
+
+impl GeminiAuthentication {
+    fn is_valid(&self) -> bool {
+        match self {
+            Self::ApiKey(value) | Self::BearerToken(value) => !value.trim().is_empty(),
+        }
+    }
+
+    fn apply(&self, request: RequestBuilder) -> RequestBuilder {
+        match self {
+            Self::ApiKey(value) => request.header("x-goog-api-key", value),
+            Self::BearerToken(value) => request.bearer_auth(value),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum GeminiThinkingLevel {
+    Minimal,
+    Low,
+    Medium,
+    High,
+}
+
+impl GeminiThinkingLevel {
+    fn as_wire_value(self) -> &'static str {
+        match self {
+            Self::Minimal => "MINIMAL",
+            Self::Low => "LOW",
+            Self::Medium => "MEDIUM",
+            Self::High => "HIGH",
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct GeminiModelConfig {
     pub backend_id: String,
     pub endpoint: String,
-    pub api_key: String,
+    pub authentication: GeminiAuthentication,
     pub model: String,
     pub temperature: f32,
+    pub thinking_level: Option<GeminiThinkingLevel>,
     pub default_max_output_tokens: u64,
     pub max_context_tokens: Option<u64>,
     pub timeout: Duration,
@@ -36,7 +77,7 @@ impl GeminiModelConfig {
         let model = self.model.strip_prefix("models/").unwrap_or(&self.model);
         if self.backend_id.trim().is_empty()
             || self.endpoint.trim().is_empty()
-            || self.api_key.trim().is_empty()
+            || !self.authentication.is_valid()
             || model.is_empty()
             || !model.chars().all(|character| {
                 character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
@@ -88,6 +129,12 @@ impl GeminiModelBackend {
                     .unwrap_or(self.config.default_max_output_tokens)),
             ),
         ]);
+        if let Some(thinking_level) = self.config.thinking_level {
+            generation.insert(
+                "thinkingConfig".to_owned(),
+                json!({"thinkingLevel": thinking_level.as_wire_value()}),
+            );
+        }
         if let Some(schema) = &request.output_schema {
             generation.insert(
                 "responseMimeType".to_owned(),
@@ -126,6 +173,9 @@ impl ModelTokenMeter for GeminiModelBackend {
         let config = serde_json::to_vec(&(
             &self.config.model,
             self.config.temperature.to_bits(),
+            self.config
+                .thinking_level
+                .map(GeminiThinkingLevel::as_wire_value),
             self.config.default_max_output_tokens,
         ))
         .expect("Gemini token meter scalar configuration is serializable");
@@ -191,9 +241,8 @@ impl ModelBackend for GeminiModelBackend {
         let response = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(cancelled_error()),
-            response = self.client
-                .post(self.config.stream_url())
-                .header("x-goog-api-key", &self.config.api_key)
+            response = self.config.authentication
+                .apply(self.client.post(self.config.stream_url()))
                 .json(&body)
                 .send() => response,
         }
@@ -796,6 +845,46 @@ mod tests {
         ModelStreamStressCase, ModelStreamStressFault, ModelStreamStressSuite,
     };
 
+    #[test]
+    fn authentication_modes_set_only_the_selected_header() {
+        let client = Client::new();
+        let api_key_request = GeminiAuthentication::ApiKey("fixture-key".to_owned())
+            .apply(client.post("http://127.0.0.1"))
+            .build()
+            .unwrap();
+        assert_eq!(
+            api_key_request
+                .headers()
+                .get("x-goog-api-key")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "fixture-key"
+        );
+        assert!(!api_key_request.headers().contains_key("authorization"));
+
+        let bearer_request = GeminiAuthentication::BearerToken("fixture-token".to_owned())
+            .apply(client.post("http://127.0.0.1"))
+            .build()
+            .unwrap();
+        assert_eq!(
+            bearer_request
+                .headers()
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer fixture-token"
+        );
+        assert!(!bearer_request.headers().contains_key("x-goog-api-key"));
+    }
+
+    #[test]
+    fn authentication_rejects_empty_credentials() {
+        assert!(!GeminiAuthentication::ApiKey("  ".to_owned()).is_valid());
+        assert!(!GeminiAuthentication::BearerToken(String::new()).is_valid());
+    }
+
     struct GeminiConformanceFixture;
 
     impl ModelFixtureFactory for GeminiConformanceFixture {
@@ -811,9 +900,10 @@ mod tests {
             GeminiModelBackend::new(GeminiModelConfig {
                 backend_id: "gemini-conformance".to_owned(),
                 endpoint: endpoint.to_owned(),
-                api_key: "fixture-key".to_owned(),
+                authentication: GeminiAuthentication::ApiKey("fixture-key".to_owned()),
                 model: "fixture-model".to_owned(),
                 temperature: 0.0,
+                thinking_level: None,
                 default_max_output_tokens: 64,
                 max_context_tokens: Some(8_192),
                 timeout: Duration::from_secs(1),
@@ -865,9 +955,10 @@ mod tests {
         let backend = GeminiModelBackend::new(GeminiModelConfig {
             backend_id: "gemini-meter-gate".to_owned(),
             endpoint: "http://127.0.0.1".to_owned(),
-            api_key: "fixture-key".to_owned(),
+            authentication: GeminiAuthentication::ApiKey("fixture-key".to_owned()),
             model: "fixture-model".to_owned(),
             temperature: 0.2,
+            thinking_level: Some(GeminiThinkingLevel::Low),
             default_max_output_tokens: 256,
             max_context_tokens: Some(32_768),
             timeout: Duration::from_secs(1),
@@ -879,6 +970,13 @@ mod tests {
         assert_eq!(
             descriptor.accounting,
             ModelTokenAccounting::ConservativeUpperBound
+        );
+        assert_eq!(
+            backend
+                .build_request_body(&request())
+                .unwrap()
+                .pointer("/generationConfig/thinkingConfig/thinkingLevel"),
+            Some(&json!("LOW"))
         );
 
         let mut state = 0xbb67_ae85_84ca_a73b_u64;
