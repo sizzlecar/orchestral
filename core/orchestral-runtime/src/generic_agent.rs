@@ -59,9 +59,7 @@ use crate::generic_agent_checkpoint::{
     GenericModelContextTrace, GenericModelObservation, GenericObservedToolCall,
     InMemoryGenericAgentCheckpointStore, StoredGenericAgentRun,
 };
-use crate::skill::{
-    ActivatedSkillSet, SkillActivationOutcome, SkillActivationRequest, SkillRuntime,
-};
+use crate::skill::{ActivatedSkillSet, SkillActivationOutcome, SkillRuntime};
 use crate::tool_runtime::{AgentToolRuntime, GuardedToolResult, ToolRuntimeError};
 use crate::workflow_strategy::{WorkflowExecutionRequest, WorkflowExecutionStrategy};
 use crate::{
@@ -71,7 +69,7 @@ use crate::{
 };
 
 const WORKFLOW_TOOL_NAME: &str = "orchestral_workflow";
-const SKILL_ACTIVATE_TOOL_NAME: &str = "orchestral_skill_activate";
+const SKILL_READ_TOOL_NAME: &str = "skill_read";
 const REQUEST_INPUT_TOOL_NAME: &str = "orchestral_request_input";
 const TOOL_ACTIVITY_TELEMETRY_NAMESPACE: &str = "orchestral/tool_activity/v1";
 const RUN_STOP_RUNNING: u8 = 0;
@@ -182,7 +180,16 @@ impl GenericAgentConfig {
         Self {
             provider_id: AgentProviderId::new(provider_id),
             agent_id: AgentId::new(agent_id),
-            system_prompt: "You are a helpful, precise assistant.".to_owned(),
+            system_prompt: concat!(
+                "You are Orchestral, a provider-neutral agent running in a local application. ",
+                "You and the user share a Host-provided workspace. Work toward the user's ",
+                "requested outcome using the supplied context and Tools. Tool definitions and ",
+                "Host policy are authoritative capability boundaries. Inspect available ",
+                "evidence before making claims, take relevant reversible actions when the ",
+                "request is clear, and ask only when a material choice or required fact cannot ",
+                "be derived."
+            )
+            .to_owned(),
             stream_buffer: 128,
             max_model_rounds: 8,
             max_tool_calls: 32,
@@ -630,7 +637,7 @@ impl InternalGenericAgentProvider {
         }
         if let Some(conflict) = tools.as_ref().and_then(|tools| {
             tools.model_definitions.iter().find_map(|definition| {
-                [SKILL_ACTIVATE_TOOL_NAME, REQUEST_INPUT_TOOL_NAME]
+                [SKILL_READ_TOOL_NAME, REQUEST_INPUT_TOOL_NAME]
                     .contains(&definition.name.as_str())
                     .then(|| definition.name.clone())
             })
@@ -1578,7 +1585,7 @@ fn stage_observed_recovery(
     };
     let arguments = parse_tool_arguments(&pending_call).map_err(observed_recovery_error)?;
     if call.name != REQUEST_INPUT_TOOL_NAME {
-        if call.name == SKILL_ACTIVATE_TOOL_NAME {
+        if call.name == SKILL_READ_TOOL_NAME {
             return stage_skill_recovery(
                 inner,
                 stored,
@@ -4477,7 +4484,7 @@ async fn execute_model_run(execution: ModelRunExecution) {
                             });
                             continue;
                         }
-                        if call.name == SKILL_ACTIVATE_TOOL_NAME {
+                        if call.name == SKILL_READ_TOOL_NAME {
                             let Some(skills) = run_skills.as_ref() else {
                                 emit_failure(
                                     &inner,
@@ -4485,13 +4492,13 @@ async fn execute_model_run(execution: ModelRunExecution) {
                                     &user_message,
                                     agent_failure(
                                         "skill_catalog_unavailable",
-                                        "model requested Skill activation without a bound Skill catalog",
+                                        "model requested a Skill read without a bound Skill catalog",
                                         false,
                                     ),
                                 );
                                 return;
                             };
-                            let observation = match execute_skill_activation(
+                            let observation = match execute_skill_read(
                                 &inner,
                                 &request,
                                 skills,
@@ -5366,7 +5373,7 @@ async fn resume_observed_skill(
             );
             return;
         };
-        match execute_skill_activation(
+        match execute_skill_read(
             &inner,
             &request,
             skills,
@@ -6117,7 +6124,7 @@ async fn prepare_recovered_skill(
             format!("recovered Skill state is invalid: {error}"),
         )
     })?;
-    let evaluation = evaluate_skill_activation(skills, arguments.clone(), &active);
+    let evaluation = evaluate_skill_read(skills, arguments.clone(), &active);
     match (&activation_record, &evaluation.activation) {
         (
             Some(AgentSessionRecord {
@@ -6998,13 +7005,11 @@ struct SkillActivationEvaluation {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SkillActivateArguments {
+struct SkillReadArguments {
     name: String,
-    expected_digest: Digest,
-    reason: String,
 }
 
-async fn execute_skill_activation(
+async fn execute_skill_read(
     inner: &GenericInner,
     request: &AgentStartRequest,
     skills: &SkillRuntime,
@@ -7019,7 +7024,7 @@ async fn execute_skill_activation(
         .map_err(session_journal_failure)?;
     let active = ActivatedSkillSet::replay(&records)
         .map_err(|error| agent_failure("skill_session_state", error.to_string(), false))?;
-    let evaluation = evaluate_skill_activation(skills, arguments, &active);
+    let evaluation = evaluate_skill_read(skills, arguments, &active);
     if let Some(activation) = evaluation.activation {
         append_session_event(
             inner,
@@ -7050,18 +7055,18 @@ fn skill_activation_event_id(
     ))
 }
 
-fn evaluate_skill_activation(
+fn evaluate_skill_read(
     skills: &SkillRuntime,
     arguments: serde_json::Value,
     active: &ActivatedSkillSet,
 ) -> SkillActivationEvaluation {
-    let parsed = match serde_json::from_value::<SkillActivateArguments>(arguments) {
+    let parsed = match serde_json::from_value::<SkillReadArguments>(arguments) {
         Ok(parsed) => parsed,
         Err(error) => {
             return SkillActivationEvaluation {
                 observation: SkillCallObservation {
                     result: serde_json::json!({
-                        "code": "skill_activation_arguments_invalid",
+                        "code": "skill_read_arguments_invalid",
                         "message": error.to_string(),
                     }),
                     is_error: true,
@@ -7071,20 +7076,13 @@ fn evaluate_skill_activation(
             }
         }
     };
-    match skills.activate(
-        SkillActivationRequest {
-            name: parsed.name,
-            expected_digest: parsed.expected_digest,
-            reason: parsed.reason,
-        },
-        active,
-    ) {
+    match skills.read_for_context(&parsed.name, active) {
         Ok(SkillActivationOutcome::Activated(activation)) => {
             let descriptor = &activation.package.descriptor;
             SkillActivationEvaluation {
                 observation: SkillCallObservation {
                     result: serde_json::json!({
-                        "status": "activated",
+                        "status": "loaded",
                         "name": descriptor.name,
                         "skill_id": descriptor.skill_id,
                         "version": descriptor.version,
@@ -7103,7 +7101,7 @@ fn evaluate_skill_activation(
         Ok(SkillActivationOutcome::AlreadyActive(descriptor)) => SkillActivationEvaluation {
             observation: SkillCallObservation {
                 result: serde_json::json!({
-                    "status": "already_active",
+                    "status": "already_loaded",
                     "name": descriptor.name,
                     "skill_id": descriptor.skill_id,
                     "digest": descriptor.digest,
@@ -7116,7 +7114,7 @@ fn evaluate_skill_activation(
         Err(error) => SkillActivationEvaluation {
             observation: SkillCallObservation {
                 result: serde_json::json!({
-                    "code": "skill_activation_rejected",
+                    "code": "skill_read_failed",
                     "message": error.to_string(),
                 }),
                 is_error: true,
@@ -8681,7 +8679,7 @@ fn model_definitions_for_run(
         definitions.push(request_input_definition());
     }
     if skill_catalog_bound {
-        definitions.push(skill_activate_definition());
+        definitions.push(skill_read_definition());
     }
     definitions
 }
@@ -8771,28 +8769,18 @@ fn configure_tools(
     })
 }
 
-fn skill_activate_definition() -> ModelToolDefinition {
+fn skill_read_definition() -> ModelToolDefinition {
     ModelToolDefinition {
-        name: SKILL_ACTIVATE_TOOL_NAME.to_owned(),
-        description: "Activate one immutable Skill descriptor for this Session. This loads instructions into context only; it does not grant Tool or MCP permissions.".to_owned(),
+        name: SKILL_READ_TOOL_NAME.to_owned(),
+        description: "Read one Host-discovered Skill instruction document into context. Reading instructions does not grant Tool or MCP authority.".to_owned(),
         input_schema: serde_json::json!({
             "type": "object",
-            "required": ["name", "expected_digest", "reason"],
+            "required": ["name"],
             "properties": {
                 "name": {
                     "type": "string",
                     "minLength": 1,
                     "description": "Exact descriptor name from the bound Skill catalog"
-                },
-                "expected_digest": {
-                    "type": "string",
-                    "pattern": "^[0-9a-fA-F]{64}$",
-                    "description": "Exact immutable digest shown in the descriptor"
-                },
-                "reason": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "Why this Skill is relevant to the current user task"
                 }
             },
             "additionalProperties": false

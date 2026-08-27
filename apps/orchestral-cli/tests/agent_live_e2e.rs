@@ -106,17 +106,6 @@ impl TestWorkspace {
         });
     }
 
-    fn configure_skill_directory(&self, relative: &str) {
-        self.rewrite_config(|config| {
-            config
-                .replace("auto_discover: true", "auto_discover: false")
-                .replace(
-                    "  directories: []",
-                    &format!("  directories:\n    - {relative}"),
-                )
-        });
-    }
-
     fn configure_mcp_server(&self, endpoint: &str) {
         self.rewrite_config(|config| {
             config.replace(
@@ -575,74 +564,100 @@ fn local_cli_reads_patches_and_runs_a_guarded_verification() {
 }
 
 #[test]
-fn local_cli_activates_a_skill_and_reprojects_its_instructions() {
+fn local_cli_auto_discovers_reads_and_uses_a_workspace_skill() {
     const DESCRIPTOR_MARKER: &str = "E2E skill descriptor marker";
     const INSTRUCTION_MARKER: &str = "SKILL_E2E_INSTRUCTION_雪豹_7319";
+    const RESULT_MARKER: &str = "SKILL_E2E_RESULT_云鲸_4827";
 
     let workspace = TestWorkspace::new("skill-entrypoint");
-    let skill_directory = workspace.path("fixture-skills/e2e-skill");
+    let skill_directory = workspace.path("skills/e2e-skill");
     fs::create_dir_all(&skill_directory).expect("create Skill fixture directory");
     fs::write(
         skill_directory.join("SKILL.md"),
         format!(
-            "---\nname: e2e-skill\ndescription: {DESCRIPTOR_MARKER}\nversion: 1.0.0\n---\nFollow this private instruction marker: {INSTRUCTION_MARKER}\n"
+            "---\nname: e2e-skill\ndescription: {DESCRIPTOR_MARKER}\nversion: 1.0.0\n---\nPrivate instruction {INSTRUCTION_MARKER}: read verification.txt with file_read, then report its exact content.\n"
         ),
     )
     .expect("write Skill fixture");
-    workspace.configure_skill_directory("fixture-skills");
+    fs::write(
+        workspace.path("verification.txt"),
+        format!("{RESULT_MARKER}\n"),
+    )
+    .expect("write Skill verification fixture");
+    let skill_path = skill_directory
+        .join("SKILL.md")
+        .canonicalize()
+        .expect("canonical Skill fixture path")
+        .to_string_lossy()
+        .to_string();
 
     let (model_endpoint, model_server) = spawn_fixture_http_server(vec![
-        Box::new(|request| {
-            let digest = skill_digest_from_model_request(&request.body, "e2e-skill");
+        Box::new(move |request| {
+            let context = model_request_text(&request.body);
+            assert!(context.contains("A Skill is a set of local instructions"));
+            assert!(context.contains(&skill_path));
+            assert!(!context.contains("call orchestral_skill_activate"));
+            assert!(model_request_has_tool(&request.body, "skill_read"));
+            assert!(!model_request_has_tool(
+                &request.body,
+                "orchestral_skill_activate"
+            ));
             openai_tool_response(
-                "activate-e2e-skill",
-                "orchestral_skill_activate",
-                json!({
-                    "name": "e2e-skill",
-                    "expected_digest": digest,
-                    "reason": "the user explicitly requested the E2E Skill"
-                }),
+                "read-e2e-skill",
+                "skill_read",
+                json!({ "name": "e2e-skill" }),
             )
         }),
-        Box::new(|_| openai_text_response("SKILL_E2E_OK")),
+        Box::new(|request| {
+            let context = model_request_text(&request.body);
+            assert!(context.contains(INSTRUCTION_MARKER));
+            assert!(context.contains("\"status\":\"loaded\""));
+            openai_tool_response(
+                "read-verification",
+                "file_read",
+                json!({ "path": "verification.txt" }),
+            )
+        }),
+        Box::new(|request| {
+            assert!(model_request_text(&request.body).contains(RESULT_MARKER));
+            openai_text_response(RESULT_MARKER)
+        }),
     ]);
     workspace.configure_local_openai(&model_endpoint);
 
     let output = run_to_completion(
-        local_agent_command(
+        local_default_agent_command(
             &workspace,
             "skill-entrypoint-session",
-            "Use the requested Skill, then return only the exact success marker.",
-            "Activate e2e-skill and complete its instructions.",
+            "Use e2e-skill and complete its instructions without asking me for a command.",
             true,
             false,
         ),
         LOCAL_PROCESS_TIMEOUT,
     );
     assert!(output.status.success(), "{}", output.stderr_text());
-    assert_eq!(output.stdout_text().trim(), "SKILL_E2E_OK");
+    assert_eq!(output.stdout_text().trim(), RESULT_MARKER);
     output.assert_no_ansi();
 
     let requests = model_server.join().expect("join local model server");
-    assert_eq!(requests.len(), 2);
-    assert!(model_request_has_tool(
-        &requests[0].body,
-        "orchestral_skill_activate"
-    ));
+    assert_eq!(requests.len(), 3);
+    assert!(model_request_has_tool(&requests[0].body, "skill_read"));
     assert_single_apply_patch_tool(&requests[0].body);
     let first_context = model_request_text(&requests[0].body);
     assert!(first_context.contains(DESCRIPTOR_MARKER));
     assert!(!first_context.contains(INSTRUCTION_MARKER));
     let second_context = model_request_text(&requests[1].body);
     assert!(second_context.contains(INSTRUCTION_MARKER));
-    assert!(second_context.contains("\"status\":\"activated\""));
+    assert!(second_context.contains("\"status\":\"loaded\""));
 
     let records = session_records(&workspace);
     assert_eq!(payload_count(&records, "skill_activated"), 1);
     let exchanges = tool_exchanges(&records);
-    assert_eq!(exchanges.len(), 1);
-    assert_eq!(tool_name(exchanges[0]), Some("orchestral_skill_activate"));
+    assert_eq!(exchanges.len(), 2);
+    assert_eq!(tool_name(exchanges[0]), Some("skill_read"));
+    assert_eq!(tool_name(exchanges[1]), Some("file_read"));
     assert_eq!(tool_result_is_error(exchanges[0]), Some(false));
+    assert_eq!(tool_result_is_error(exchanges[1]), Some(false));
 }
 
 #[test]
@@ -880,6 +895,79 @@ fn live_coding_agent_reads_patches_and_verifies_the_change() {
         read < patch && patch < verify,
         "unexpected Tool trace: {trace:?}"
     );
+}
+
+#[test]
+#[ignore = "spends real Google Vertex quota; requires ADC or a service-account credential"]
+fn live_agent_discovers_reads_and_uses_a_workspace_skill() {
+    let _guard = live_test_guard();
+    const MARKER: &str = "LIVE_SKILL_PROVENANCE_海豚_6142";
+
+    let workspace = TestWorkspace::new("live-skill-provenance");
+    let skill_directory = workspace.path("skills/origin-inspector");
+    fs::create_dir_all(&skill_directory).expect("create live Skill directory");
+    fs::write(
+        skill_directory.join("SKILL.md"),
+        concat!(
+            "---\n",
+            "name: origin-inspector\n",
+            "description: Inspect this workspace Skill's provenance and verify its local evidence\n",
+            "version: 1.0.0\n",
+            "---\n",
+            "Read skill-evidence.txt with file_read. Report the Skill source path and the exact evidence content.\n",
+        ),
+    )
+    .expect("write live Skill");
+    fs::write(workspace.path("skill-evidence.txt"), format!("{MARKER}\n"))
+        .expect("write live Skill evidence");
+
+    let mut command = root_command(&workspace);
+    command
+        .arg("--backend")
+        .arg("google")
+        .arg("--model")
+        .arg(live_model())
+        .arg("--temperature")
+        .arg("0")
+        .arg("--session-id")
+        .arg("live-skill-provenance-session")
+        .arg("--no-mcp");
+    if let Some(path) = explicit_live_credential() {
+        command.arg("--credential-file").arg(path);
+    } else {
+        assert!(
+            standard_adc_is_available(),
+            "live E2E requires Google credentials"
+        );
+    }
+    command.arg("origin-inspector 这个 Skill 从哪里来的？使用它完成验证。");
+
+    let output = run_to_completion(command, PROCESS_TIMEOUT);
+    assert!(output.status.success(), "{}", output.stderr_text());
+    let final_output = output.stdout_text();
+    assert!(final_output.contains(MARKER), "{final_output}");
+    assert!(
+        final_output.contains("skills/origin-inspector/SKILL.md"),
+        "{final_output}"
+    );
+    output.assert_no_ansi();
+
+    let records = session_records(&workspace);
+    let trace = tool_exchanges(&records)
+        .iter()
+        .filter_map(|exchange| {
+            tool_name(exchange).map(|name| (name, tool_result_is_error(exchange)))
+        })
+        .collect::<Vec<_>>();
+    let skill_read = trace
+        .iter()
+        .position(|(name, error)| *name == "skill_read" && *error == Some(false))
+        .expect("live run omitted skill_read");
+    let file_read = trace
+        .iter()
+        .position(|(name, error)| *name == "file_read" && *error == Some(false))
+        .expect("live run omitted file_read");
+    assert!(skill_read < file_read, "unexpected Tool trace: {trace:?}");
 }
 
 #[test]
@@ -1214,6 +1302,34 @@ fn local_agent_command(
         .arg(session_id)
         .arg("--system-prompt")
         .arg(system_prompt);
+    if disable_mcp {
+        command.arg("--no-mcp");
+    }
+    if disable_skills {
+        command.arg("--no-skills");
+    }
+    command.arg(prompt);
+    command
+}
+
+fn local_default_agent_command(
+    workspace: &TestWorkspace,
+    session_id: &str,
+    prompt: &str,
+    disable_mcp: bool,
+    disable_skills: bool,
+) -> Command {
+    let mut command = root_command(workspace);
+    command
+        .env("OPENAI_API_KEY", "fixture-key")
+        .arg("--backend")
+        .arg("openai")
+        .arg("--model")
+        .arg("fixture-model")
+        .arg("--temperature")
+        .arg("0")
+        .arg("--session-id")
+        .arg(session_id);
     if disable_mcp {
         command.arg("--no-mcp");
     }
@@ -1775,26 +1891,6 @@ fn model_request_text(request: &Value) -> String {
         .filter_map(|message| message["content"].as_str())
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn skill_digest_from_model_request(request: &Value, name: &str) -> String {
-    let context = model_request_text(request);
-    let descriptor = context
-        .lines()
-        .find(|line| line.contains(&format!("- name={name} ")))
-        .unwrap_or_else(|| panic!("model request omitted Skill descriptor '{name}': {context}"));
-    let digest = descriptor
-        .split_once(" digest=")
-        .and_then(|(_, rest)| rest.split_whitespace().next())
-        .unwrap_or_else(|| panic!("Skill descriptor omitted its digest: {descriptor}"));
-    assert_eq!(digest.len(), 64, "Skill digest is not SHA-256");
-    assert!(
-        digest
-            .chars()
-            .all(|character| character.is_ascii_hexdigit()),
-        "Skill digest is not hexadecimal"
-    );
-    digest.to_owned()
 }
 
 fn repository_root() -> PathBuf {

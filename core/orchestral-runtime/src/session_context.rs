@@ -381,15 +381,13 @@ pub(crate) fn skill_activation_message(
     ModelMessage::text(
         ModelRole::System,
         format!(
-            "Activated Skill (immutable Session context)\nname: {}\nskill_id: {}\nsource: {:?}:{}\ntrust: {:?}\nversion: {}\ndigest: {}\nactivation_reason: {}\n\nInstructions:\n{}",
+            "Loaded Skill (immutable instruction context)\nname: {}\nskill_id: {}\nsource: {:?}:{}\nversion: {}\ndigest: {}\n\nInstructions:\n{}",
             descriptor.name,
             descriptor.skill_id,
             descriptor.source.kind,
             descriptor.source.locator,
-            descriptor.trust,
             version,
             descriptor.digest,
-            activation.reason,
             activation.package.instructions
         ),
     )

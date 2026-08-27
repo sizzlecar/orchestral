@@ -31,7 +31,7 @@ use orchestral_runtime::{
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-const SKILL_FUNCTION: &str = "orchestral_skill_activate";
+const SKILL_FUNCTION: &str = "skill_read";
 const SECRET_INSTRUCTIONS: &str = "SECRET WORKFLOW: calculate twice, then verify the artifact.";
 
 struct SkillActivationModel {
@@ -74,9 +74,7 @@ impl ModelBackend for SkillActivationModel {
             assert!(system.contains(&self.digest));
             assert!(!system.contains(SECRET_INSTRUCTIONS));
             let arguments = json!({
-                "name": "xlsx",
-                "expected_digest": self.digest,
-                "reason": "the user asked for spreadsheet work"
+                "name": "xlsx"
             })
             .to_string();
             return Ok(Box::pin(stream::iter([
@@ -125,7 +123,7 @@ impl ModelBackend for SkillActivationModel {
                     matches!(
                         content,
                         ModelContent::ToolResult { result, is_error: false, .. }
-                            if result.get("status") == Some(&json!("activated"))
+                            if result.get("status") == Some(&json!("loaded"))
                     )
                 })
         }));
@@ -264,7 +262,7 @@ async fn bound_skill_activates_into_context_and_replays_after_provider_restart()
         Some("1.0.0")
     );
     assert_eq!(activation.package.descriptor.digest, digest);
-    assert_eq!(activation.reason, "the user asked for spreadsheet work");
+    assert_eq!(activation.reason, "selected through skill_read");
 
     drop(first_controller);
     let unbound_provider = Arc::new(

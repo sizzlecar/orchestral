@@ -256,20 +256,20 @@ impl SkillRuntime {
     /// Descriptor-only text. Full instructions are never returned here.
     pub fn descriptor_context(&self) -> String {
         let mut output = String::from(
-            "Available Skills (descriptors only; call orchestral_skill_activate before following any Skill instructions):\n",
+            "## Skills\nA Skill is a set of local instructions stored in a `SKILL.md` file. Each entry includes its name, description, and source path. Call `skill_read` with the Skill name before following its instructions.\n\n### Available Skills\n",
         );
         for descriptor in &self.catalog.skills {
-            let version = descriptor.version.as_deref().unwrap_or("unversioned");
             output.push_str(&format!(
-                "- name={} id={} version={} digest={} trust={:?} description={}\n",
+                "- {}: {} (file: {}; digest: {})\n",
                 descriptor.name,
-                descriptor.skill_id,
-                version,
-                descriptor.digest,
-                descriptor.trust,
-                descriptor.description.replace(['\r', '\n'], " ")
+                descriptor.description.replace(['\r', '\n'], " "),
+                descriptor.source.locator,
+                descriptor.digest
             ));
         }
+        output.push_str(
+            "\n### Skill Rules\n- If the user names a Skill or the task clearly matches its description, read the smallest relevant set.\n- Use the listed source path when reporting provenance or resolving files referenced by the Skill.\n- A Skill supplies instructions only. Tool schemas and Host policy remain authoritative for every effect.\n",
+        );
         for conflict in &self.conflicts {
             output.push_str(&format!(
                 "- conflict name={} selected={} shadowed={}\n",
@@ -277,6 +277,44 @@ impl SkillRuntime {
             ));
         }
         output
+    }
+
+    /// Loads immutable instructions into model context. This operation is a
+    /// context read, not an effect or authority transition, so provenance,
+    /// compatibility, and dependency metadata cannot block it.
+    pub fn read_for_context(
+        &self,
+        name: &str,
+        active: &ActivatedSkillSet,
+    ) -> Result<SkillActivationOutcome, SkillRuntimeError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(SkillRuntimeError::InvalidRequest(
+                "Skill name must not be empty".to_owned(),
+            ));
+        }
+        let package = self
+            .packages_by_name
+            .get(name)
+            .ok_or_else(|| SkillRuntimeError::NotFound(name.to_owned()))?;
+        let descriptor = &package.descriptor;
+        if let Some(previous) = active.digest_for(&descriptor.skill_id) {
+            return if previous == &descriptor.digest {
+                Ok(SkillActivationOutcome::AlreadyActive(descriptor.clone()))
+            } else {
+                Err(SkillRuntimeError::DigestChanged {
+                    name: descriptor.name.clone(),
+                })
+            };
+        }
+        let activation = SkillActivation {
+            package: package.clone(),
+            reason: "selected through skill_read".to_owned(),
+        };
+        activation
+            .validate()
+            .map_err(|error| SkillRuntimeError::InvalidPackage(error.to_string()))?;
+        Ok(SkillActivationOutcome::Activated(activation))
     }
 
     pub fn activate(

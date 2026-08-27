@@ -53,8 +53,8 @@ use orchestral_runtime::{
     InMemoryBlobStore, InMemoryGenericAgentCheckpointStore, InMemoryHostApprovalBroker,
     InternalGenericAgentProvider, JsonSizeTokenMeter, ModelCostPolicy, SessionCompactionInput,
     SessionCompactionPolicy, SessionContextError, SessionSummarizerDescriptor,
-    SkillActivationOutcome, SkillActivationPolicy, SkillActivationRequest, SkillHostProfile,
-    SkillRuntime, StoredGenericAgentRun, ToolArtifactStore, WorkflowExecutionStrategy,
+    SkillActivationOutcome, SkillActivationPolicy, SkillHostProfile, SkillRuntime,
+    StoredGenericAgentRun, ToolArtifactStore, WorkflowExecutionStrategy,
 };
 use serde_json::json;
 use tokio::sync::Notify;
@@ -814,7 +814,6 @@ struct ArtifactLoopModel {
 
 struct SkillRecoveryModel {
     rounds: AtomicUsize,
-    digest: String,
     round_two_messages: Arc<Mutex<Option<Vec<ModelMessage>>>>,
 }
 
@@ -1695,17 +1694,12 @@ impl ModelBackend for SkillRecoveryModel {
         _cancellation: CancellationToken,
     ) -> Result<ModelStream, ModelError> {
         request.validate()?;
-        assert!(request
-            .tools
-            .iter()
-            .any(|tool| tool.name == "orchestral_skill_activate"));
+        assert!(request.tools.iter().any(|tool| tool.name == "skill_read"));
         let round = self.rounds.fetch_add(1, Ordering::SeqCst);
         let request_id = request.request_id;
         if round == 0 {
             let arguments = json!({
-                "name": "recovery-skill",
-                "expected_digest": self.digest,
-                "reason": "recover the exact Skill activation"
+                "name": "recovery-skill"
             })
             .to_string();
             return Ok(Box::pin(stream::iter([
@@ -1715,7 +1709,7 @@ impl ModelBackend for SkillRecoveryModel {
                     sequence: 1,
                     payload: ModelEvent::ToolCallStart {
                         call_id: ModelToolCallId::new("activate-recovery-skill"),
-                        name: "orchestral_skill_activate".to_owned(),
+                        name: "skill_read".to_owned(),
                         extensions: Default::default(),
                     },
                 }),
@@ -1767,7 +1761,7 @@ impl ModelBackend for SkillRecoveryModel {
                             result,
                             is_error: false,
                         } if call_id.as_str() == "activate-recovery-skill"
-                            && result["status"] == json!("activated")
+                            && result["status"] == json!("loaded")
                     )
                 })
         }));
@@ -5025,7 +5019,6 @@ async fn run_uninterrupted_skill_activation() -> Vec<ModelMessage> {
     let round_two_messages = Arc::new(Mutex::new(None));
     let model = Arc::new(SkillRecoveryModel {
         rounds: AtomicUsize::new(0),
-        digest: skills.catalog().skills[0].digest.to_string(),
         round_two_messages: round_two_messages.clone(),
     });
     let provider = Arc::new(
@@ -5072,7 +5065,6 @@ async fn run_skill_recovery(state: SkillRecoveryState) -> Vec<ModelMessage> {
     let run_id = RunId::new(format!("skill-{suffix}-recovery-run"));
     let session_id = AgentSessionId::new(format!("skill-{suffix}-recovery-session"));
     let skills = Arc::new(recovery_skill_runtime());
-    let digest = skills.catalog().skills[0].digest.clone();
     let checkpoint_store = Arc::new(AckLostAfterModelObservationCheckpointStore::default());
     let session_journal = Arc::new(InMemoryAgentSessionJournalStore::default());
     let host_journal = Arc::new(InMemoryAgentJournalStore::default());
@@ -5081,7 +5073,6 @@ async fn run_skill_recovery(state: SkillRecoveryState) -> Vec<ModelMessage> {
         InternalGenericAgentProvider::new_with_skills_and_session_journal(
             Arc::new(SkillRecoveryModel {
                 rounds: AtomicUsize::new(0),
-                digest: digest.to_string(),
                 round_two_messages: Arc::new(Mutex::new(None)),
             }),
             config.clone(),
@@ -5127,14 +5118,7 @@ async fn run_skill_recovery(state: SkillRecoveryState) -> Vec<ModelMessage> {
         SkillRecoveryState::ActivationCommitted | SkillRecoveryState::ExchangeCommitted
     ) {
         let activation = match skills
-            .activate(
-                SkillActivationRequest {
-                    name: "recovery-skill".to_owned(),
-                    expected_digest: digest.clone(),
-                    reason: "recover the exact Skill activation".to_owned(),
-                },
-                &ActivatedSkillSet::default(),
-            )
+            .read_for_context("recovery-skill", &ActivatedSkillSet::default())
             .expect("bound Skill remains activatable")
         {
             SkillActivationOutcome::Activated(activation) => activation,
@@ -5159,9 +5143,7 @@ async fn run_skill_recovery(state: SkillRecoveryState) -> Vec<ModelMessage> {
         if matches!(state, SkillRecoveryState::ExchangeCommitted) {
             let descriptor = &activation.package.descriptor;
             let arguments = json!({
-                "name": "recovery-skill",
-                "expected_digest": digest,
-                "reason": "recover the exact Skill activation"
+                "name": "recovery-skill"
             });
             session_journal
                 .append(AgentSessionEventDraft {
@@ -5177,7 +5159,7 @@ async fn run_skill_recovery(state: SkillRecoveryState) -> Vec<ModelMessage> {
                             role: ModelRole::Assistant,
                             content: vec![ModelContent::ToolCall {
                                 call_id: ModelToolCallId::new("activate-recovery-skill"),
-                                name: "orchestral_skill_activate".to_owned(),
+                                name: "skill_read".to_owned(),
                                 arguments,
                                 extensions: Default::default(),
                             }],
@@ -5187,7 +5169,7 @@ async fn run_skill_recovery(state: SkillRecoveryState) -> Vec<ModelMessage> {
                             content: vec![ModelContent::ToolResult {
                                 call_id: ModelToolCallId::new("activate-recovery-skill"),
                                 result: json!({
-                                    "status": "activated",
+                                    "status": "loaded",
                                     "name": descriptor.name,
                                     "skill_id": descriptor.skill_id,
                                     "version": descriptor.version,
@@ -5211,7 +5193,6 @@ async fn run_skill_recovery(state: SkillRecoveryState) -> Vec<ModelMessage> {
     let round_two_messages = Arc::new(Mutex::new(None));
     let replacement_model = Arc::new(SkillRecoveryModel {
         rounds: AtomicUsize::new(1),
-        digest: skills.catalog().skills[0].digest.to_string(),
         round_two_messages: round_two_messages.clone(),
     });
     let replacement_provider = Arc::new(

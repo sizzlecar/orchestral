@@ -129,8 +129,17 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
                 .and_then(|profile| profile.system_prompt.clone())
         })
     {
-        agent_config.system_prompt = system_prompt;
+        agent_config.system_prompt.push_str(
+            "\n\nAdditional Host-configured instructions (these refine, but do not replace, the Agent contract):\n",
+        );
+        agent_config.system_prompt.push_str(system_prompt.trim());
     }
+    let workspace = std::fs::canonicalize(std::env::current_dir().context("resolve workspace")?)
+        .context("canonicalize Agent workspace")?;
+    agent_config.system_prompt.push_str(&format!(
+        "\n\n<environment_context>\n  <cwd>{}</cwd>\n</environment_context>",
+        workspace.display()
+    ));
     let CliJournalStores {
         run: run_journal,
         session: session_journal,
