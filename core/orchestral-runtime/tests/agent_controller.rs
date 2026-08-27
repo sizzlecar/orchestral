@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use orchestral_agent_protocol_testkit::{
@@ -124,6 +125,44 @@ async fn controller_drives_provider_stream_into_one_inspectable_terminal_run() {
             .await
             .expect("run remains inspectable"),
         terminal
+    );
+}
+
+#[tokio::test]
+async fn one_thousand_fake_provider_runs_keep_control_plane_p95_below_100ms() {
+    const RUNS: usize = 1_000;
+    let mut latencies = Vec::with_capacity(RUNS);
+
+    for _ in 0..RUNS {
+        let factory = ScriptedStatelessFactory::conformant().expect("fixture descriptor");
+        let scenario = ProviderScenario::standard(&factory.descriptor()).expect("fixture scenario");
+        let provider = factory.create(scenario.clone(), TestProbes::default());
+        let controller = Arc::new(
+            AgentController::new(
+                provider,
+                ProviderBindingRef::new("latency-conformance-binding"),
+            )
+            .expect("controller binds the fake Provider"),
+        );
+
+        let started = Instant::now();
+        let execution = controller
+            .start(scenario.start_request.run)
+            .await
+            .expect("fake Run starts");
+        let terminal = controller
+            .wait_for_terminal(&execution.run_id)
+            .await
+            .expect("fake Run reaches terminal");
+        latencies.push(started.elapsed());
+        assert_eq!(terminal.state.status(), AgentRunStatus::Delivered);
+    }
+
+    latencies.sort_unstable();
+    let p95 = latencies[(RUNS * 95).div_ceil(100) - 1];
+    assert!(
+        p95 <= Duration::from_millis(100),
+        "Agent Protocol control-plane p95 was {p95:?}"
     );
 }
 
