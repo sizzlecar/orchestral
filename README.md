@@ -87,6 +87,15 @@ cargo run -p orchestral-examples --example agent_session
 See [`examples/agent_session.rs`](examples/agent_session.rs) for the minimal composition of a
 `ModelBackend`, `InternalGenericAgentProvider`, `AgentController`, and `AgentClient`.
 
+## Versioned contracts
+
+- [Agent Protocol v1](docs/agent-foundation/agent-protocol-v1.md)
+- [Model Protocol v1](docs/agent-foundation/model-protocol-v1.md)
+- [Guarded Tool Runtime v1](docs/agent-foundation/tool-runtime-v1.md) and
+  [Tool Artifact v1](docs/agent-foundation/tool-artifact-v1.md)
+- [Skill Runtime v1](docs/agent-foundation/skill-runtime-v1.md)
+- [MCP Tools Adapter v1](docs/agent-foundation/mcp-tools-adapter-v1.md)
+
 ## Project structure
 
 ```text
@@ -116,8 +125,8 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 - This is not yet a Goal Compiler, Task Broker, or multi-Agent scheduler.
 - `DeliveryCommitted` means the Agent delivered an output; it does not mean an external goal was
   independently satisfied or verified.
-- MCP stdio tools use the guarded Action path. Streamable HTTP and the remaining quantitative
-  security/recovery gates are not yet release-complete.
+- MCP is intentionally Tools-only in Foundation v1; Resources, Prompts, subscriptions, and other
+  MCP surfaces are outside this contract.
 - The typed Plan/DAG implementation is an optional execution strategy inside one Agent, not the
   top-level product entry point.
 

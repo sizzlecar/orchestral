@@ -1,6 +1,6 @@
 [package]
 name = "orchestral-runtime"
-description = "Thread Runtime with concurrency, interruption, scheduling, LLM planners, actions, and API for Orchestral"
+description = "Provider-neutral Agent control plane, Generic Agent, durable context, and guarded Tool runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

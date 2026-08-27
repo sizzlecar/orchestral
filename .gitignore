@@ -25,7 +25,9 @@ target/
 .env.local
 .venv/
 
-/docs/
+/docs/*
+!/docs/agent-foundation/
+!/docs/agent-foundation/*.md
 logs/
 
 *.db

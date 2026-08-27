@@ -84,6 +84,15 @@ cargo run -p orchestral-examples --example agent_session
 最小组合方式见 [`examples/agent_session.rs`](examples/agent_session.rs)：它把
 `ModelBackend`、`InternalGenericAgentProvider`、`AgentController` 与 `AgentClient` 连接起来。
 
+## 版本化合同
+
+- [Agent Protocol v1](docs/agent-foundation/agent-protocol-v1.md)
+- [Model Protocol v1](docs/agent-foundation/model-protocol-v1.md)
+- [Guarded Tool Runtime v1](docs/agent-foundation/tool-runtime-v1.md) 与
+  [Tool Artifact v1](docs/agent-foundation/tool-artifact-v1.md)
+- [Skill Runtime v1](docs/agent-foundation/skill-runtime-v1.md)
+- [MCP Tools Adapter v1](docs/agent-foundation/mcp-tools-adapter-v1.md)
+
 ## 项目结构
 
 ```text
@@ -111,8 +120,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 - 当前不是 Goal Compiler、Task Broker 或多 Agent Scheduler。
 - `DeliveryCommitted` 只表示 Agent 已交付输出，不代表外部目标已经被独立满足或验证。
-- MCP stdio Tool 已走统一 Guarded Action 路径；Streamable HTTP 与剩余量化安全/恢复 gate
-  尚未达到发布完成标准。
+- Foundation v1 的 MCP 范围有意限定为 Tools；Resources、Prompts、订阅等表面不属于该合同。
 - 类型化 Plan/DAG 是单 Agent 内部的可选执行策略，不是产品顶层入口。
 
 ## 许可证
