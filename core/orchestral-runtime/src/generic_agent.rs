@@ -25,8 +25,8 @@ use orchestral_core::agent_protocol::{
         DeliveryId, Digest, EffectMediation, IncompleteReason, OutputId, PartialDelivery,
         PartialDeliveryId, PendingRequest, PendingRequestKind, PendingRequestPayload, Provenance,
         ProviderCommandDisposition, ProviderCommandOutcome, RequestId, RequestResolution,
-        ResourceBindingId, ResourceBindingMode, ResourceBindingSkip, ResourceBindingSkipCode,
-        ResourceCapability, ResourceKind, RunId, RunLimitKind, TelemetryId, UsageReport,
+        ResourceBindingMode, ResourceBindingSkip, ResourceBindingSkipCode, ResourceCapability,
+        ResourceKind, RunId, RunLimitKind, TelemetryId, UsageReport,
     },
     AGENT_PROTOCOL_V1,
 };
@@ -208,7 +208,6 @@ struct StoredCommand {
 }
 
 struct GenericExecutionSeed {
-    published_resource_skips: BTreeSet<ResourceBindingId>,
     run_started: bool,
     next_model_round: u64,
     total_usage: ModelUsage,
@@ -292,7 +291,6 @@ enum GenericRecoveryContinuation {
 impl GenericExecutionSeed {
     fn fresh() -> Self {
         Self {
-            published_resource_skips: BTreeSet::new(),
             run_started: false,
             next_model_round: 1,
             total_usage: ModelUsage::default(),
@@ -808,12 +806,10 @@ impl AgentProvider for InternalGenericAgentProvider {
         }
 
         let inner = self.inner.clone();
-        let run_admission = admission.clone();
         tokio::spawn(async move {
             execute_model_run(ModelRunExecution {
                 inner,
                 request,
-                admission: run_admission,
                 user_message,
                 model_messages,
                 model_tools: model_definitions,
@@ -2465,13 +2461,6 @@ fn stage_loop_recovery(
         );
         *response = Some(receiver);
     }
-    let published_resource_skips = recovery_events
-        .iter()
-        .filter_map(|event| match &event.payload {
-            AgentEvent::ResourceBindingSkipped { skip } => Some(skip.binding_id.clone()),
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
     let run_started = recovery_events
         .iter()
         .any(|event| matches!(&event.payload, AgentEvent::RunStarted));
@@ -2481,7 +2470,6 @@ fn stage_loop_recovery(
         supporting_event_ids.push(started_event_id);
     }
     let seed = GenericExecutionSeed {
-        published_resource_skips,
         run_started,
         next_model_round: boundary.next_model_round,
         total_usage: boundary.usage,
@@ -3083,7 +3071,6 @@ fn stage_loop_recovery(
                     execute_model_run(ModelRunExecution {
                         inner,
                         request,
-                        admission,
                         user_message,
                         model_messages,
                         model_tools: model_definitions,
@@ -3110,7 +3097,6 @@ fn stage_loop_recovery(
                     resume_observed_input(
                         inner,
                         request,
-                        admission,
                         user_message,
                         model_messages,
                         model_definitions,
@@ -3147,7 +3133,6 @@ fn stage_loop_recovery(
                     resume_observed_approval(
                         inner,
                         request,
-                        admission,
                         user_message,
                         model_messages,
                         model_definitions,
@@ -3180,7 +3165,6 @@ fn stage_loop_recovery(
                     resume_observed_skill(
                         inner,
                         request,
-                        admission,
                         user_message,
                         model_messages,
                         model_definitions,
@@ -3210,7 +3194,6 @@ fn stage_loop_recovery(
                     resume_observed_workflow(
                         inner,
                         request,
-                        admission,
                         user_message,
                         model_messages,
                         model_definitions,
@@ -3240,7 +3223,6 @@ fn stage_loop_recovery(
                     resume_observed_workflow_output(
                         inner,
                         request,
-                        admission,
                         user_message,
                         model_messages,
                         model_definitions,
@@ -3270,7 +3252,6 @@ fn stage_loop_recovery(
                     resume_observed_tool(
                         inner,
                         request,
-                        admission,
                         user_message,
                         model_messages,
                         model_definitions,
@@ -3564,7 +3545,6 @@ async fn project_committed_model_messages(
 struct ModelRunExecution {
     inner: Arc<GenericInner>,
     request: AgentStartRequest,
-    admission: AgentAdmission,
     user_message: ModelMessage,
     model_messages: Vec<ModelMessage>,
     model_tools: Vec<ModelToolDefinition>,
@@ -3578,7 +3558,6 @@ async fn execute_model_run(execution: ModelRunExecution) {
     let ModelRunExecution {
         inner,
         request,
-        admission,
         user_message,
         mut model_messages,
         model_tools,
@@ -3589,7 +3568,6 @@ async fn execute_model_run(execution: ModelRunExecution) {
     } = execution;
     let run_id = request.run.spec.run_id.clone();
     let GenericExecutionSeed {
-        published_resource_skips,
         run_started,
         next_model_round,
         mut total_usage,
@@ -3598,27 +3576,6 @@ async fn execute_model_run(execution: ModelRunExecution) {
         mut supporting_event_ids,
     } = seed;
     let started_event_id = AgentEventId::new(format!("generic-{}-started", run_id.as_str()));
-    for (index, skip) in admission.skipped_optional_bindings.into_iter().enumerate() {
-        if !published_resource_skips.contains(&skip.binding_id)
-            && !publish_durable(
-                &inner,
-                &run_id,
-                AgentEventDraft {
-                    event_id: AgentEventId::new(format!(
-                        "generic-{}-resource-skip-{}",
-                        run_id.as_str(),
-                        index + 1
-                    )),
-                    run_id: run_id.clone(),
-                    causation_id: None,
-                    source_fingerprint: None,
-                    payload: AgentEvent::ResourceBindingSkipped { skip },
-                },
-            )
-        {
-            return;
-        }
-    }
     if !run_started
         && !publish_durable(
             &inner,
@@ -4463,7 +4420,6 @@ async fn execute_model_run(execution: ModelRunExecution) {
 async fn resume_observed_workflow_output(
     inner: Arc<GenericInner>,
     request: AgentStartRequest,
-    admission: AgentAdmission,
     user_message: ModelMessage,
     mut model_messages: Vec<ModelMessage>,
     model_tools: Vec<ModelToolDefinition>,
@@ -4555,7 +4511,6 @@ async fn resume_observed_workflow_output(
     execute_model_run(ModelRunExecution {
         inner,
         request,
-        admission,
         user_message,
         model_messages,
         model_tools,
@@ -4571,7 +4526,6 @@ async fn resume_observed_workflow_output(
 async fn resume_observed_workflow(
     inner: Arc<GenericInner>,
     request: AgentStartRequest,
-    admission: AgentAdmission,
     user_message: ModelMessage,
     _model_messages: Vec<ModelMessage>,
     model_tools: Vec<ModelToolDefinition>,
@@ -4764,7 +4718,6 @@ async fn resume_observed_workflow(
     execute_model_run(ModelRunExecution {
         inner,
         request,
-        admission,
         user_message,
         model_messages,
         model_tools,
@@ -4780,7 +4733,6 @@ async fn resume_observed_workflow(
 async fn resume_observed_skill(
     inner: Arc<GenericInner>,
     request: AgentStartRequest,
-    admission: AgentAdmission,
     user_message: ModelMessage,
     mut model_messages: Vec<ModelMessage>,
     model_tools: Vec<ModelToolDefinition>,
@@ -4820,7 +4772,6 @@ async fn resume_observed_skill(
         execute_model_run(ModelRunExecution {
             inner,
             request,
-            admission,
             user_message,
             model_messages,
             model_tools,
@@ -4924,7 +4875,6 @@ async fn resume_observed_skill(
     execute_model_run(ModelRunExecution {
         inner,
         request,
-        admission,
         user_message,
         model_messages,
         model_tools,
@@ -4940,7 +4890,6 @@ async fn resume_observed_skill(
 async fn resume_observed_approval(
     inner: Arc<GenericInner>,
     request: AgentStartRequest,
-    admission: AgentAdmission,
     user_message: ModelMessage,
     model_messages: Vec<ModelMessage>,
     model_tools: Vec<ModelToolDefinition>,
@@ -5011,7 +4960,6 @@ async fn resume_observed_approval(
         execute_model_run(ModelRunExecution {
             inner,
             request,
-            admission,
             user_message,
             model_messages,
             model_tools,
@@ -5086,7 +5034,6 @@ async fn resume_observed_approval(
     continue_observed_tool(
         inner,
         request,
-        admission,
         user_message,
         model_messages,
         model_tools,
@@ -5108,7 +5055,6 @@ async fn resume_observed_approval(
 async fn resume_observed_tool(
     inner: Arc<GenericInner>,
     request: AgentStartRequest,
-    admission: AgentAdmission,
     user_message: ModelMessage,
     model_messages: Vec<ModelMessage>,
     model_tools: Vec<ModelToolDefinition>,
@@ -5162,7 +5108,6 @@ async fn resume_observed_tool(
         execute_model_run(ModelRunExecution {
             inner,
             request,
-            admission,
             user_message,
             model_messages,
             model_tools,
@@ -5245,7 +5190,6 @@ async fn resume_observed_tool(
     continue_observed_tool(
         inner,
         request,
-        admission,
         user_message,
         model_messages,
         model_tools,
@@ -5267,7 +5211,6 @@ async fn resume_observed_tool(
 async fn continue_observed_tool(
     inner: Arc<GenericInner>,
     request: AgentStartRequest,
-    admission: AgentAdmission,
     user_message: ModelMessage,
     _model_messages: Vec<ModelMessage>,
     model_tools: Vec<ModelToolDefinition>,
@@ -5382,7 +5325,6 @@ async fn continue_observed_tool(
     execute_model_run(ModelRunExecution {
         inner,
         request,
-        admission,
         user_message,
         model_messages,
         model_tools,
@@ -5630,7 +5572,6 @@ async fn prepare_recovered_skill(
 async fn resume_observed_input(
     inner: Arc<GenericInner>,
     request: AgentStartRequest,
-    admission: AgentAdmission,
     user_message: ModelMessage,
     mut model_messages: Vec<ModelMessage>,
     model_tools: Vec<ModelToolDefinition>,
@@ -5756,7 +5697,6 @@ async fn resume_observed_input(
     execute_model_run(ModelRunExecution {
         inner,
         request,
-        admission,
         user_message,
         model_messages,
         model_tools,

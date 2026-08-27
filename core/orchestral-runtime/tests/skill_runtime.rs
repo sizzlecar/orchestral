@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures_util::stream;
@@ -42,6 +42,12 @@ struct SkillActivationModel {
 struct RecoveredSkillModel;
 
 struct UnboundCatalogModel;
+
+struct SkillVisibilityModel {
+    starts: AtomicUsize,
+    digest: String,
+    violations: Mutex<Vec<String>>,
+}
 
 #[async_trait]
 impl ModelBackend for SkillActivationModel {
@@ -161,6 +167,43 @@ impl ModelBackend for UnboundCatalogModel {
         assert!(!system.contains("Spreadsheet workflow"));
         assert!(!system.contains(SECRET_INSTRUCTIONS));
         answer_stream(request.request_id, "no catalog bound")
+    }
+}
+
+#[async_trait]
+impl ModelBackend for SkillVisibilityModel {
+    fn descriptor(&self) -> ModelDescriptor {
+        function_capable_descriptor("skill-visibility-model")
+    }
+
+    async fn start(
+        &self,
+        request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelStream, ModelError> {
+        request.validate()?;
+        let input = user_text(&request.messages);
+        let expect_bound = match input.as_str() {
+            "catalog-bound" => true,
+            "catalog-unbound" => false,
+            other => panic!("unexpected visibility probe input: {other}"),
+        };
+        let system = system_text(&request.messages);
+        let descriptor_visible = system.contains("Spreadsheet workflow");
+        let digest_visible = system.contains(&self.digest);
+        let activation_visible = request.tools.iter().any(|tool| tool.name == SKILL_FUNCTION);
+        let instructions_visible = system.contains(SECRET_INSTRUCTIONS);
+        if descriptor_visible != expect_bound
+            || digest_visible != expect_bound
+            || activation_visible != expect_bound
+            || instructions_visible
+        {
+            self.violations.lock().unwrap().push(format!(
+                "input={input} descriptor={descriptor_visible} digest={digest_visible} activation={activation_visible} instructions={instructions_visible}"
+            ));
+        }
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        answer_stream(request.request_id, "visibility checked")
     }
 }
 
@@ -303,6 +346,86 @@ async fn configured_but_unbound_skill_catalog_is_invisible_to_the_model() {
     assert_eq!(view.state.status(), AgentRunStatus::Delivered);
 }
 
+#[tokio::test]
+async fn one_thousand_run_bindings_never_leak_unactivated_skill_instructions() {
+    const CASES: usize = 1_000;
+
+    let skills = Arc::new(skill_runtime());
+    let model = Arc::new(SkillVisibilityModel {
+        starts: AtomicUsize::new(0),
+        digest: skills.catalog().skills[0].digest.to_string(),
+        violations: Mutex::new(Vec::new()),
+    });
+    let provider = Arc::new(
+        InternalGenericAgentProvider::new_with_skills_and_session_journal(
+            model.clone(),
+            GenericAgentConfig::new("internal-provider", "generic-agent"),
+            skills.clone(),
+            Arc::new(InMemoryAgentSessionJournalStore::default()),
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+        .unwrap(),
+    );
+    let controller =
+        Arc::new(AgentController::new(provider, ProviderBindingRef::new("skill-binding")).unwrap());
+    let mut expected_model_starts = 0;
+
+    for index in 0..CASES {
+        let mode = index % 4;
+        let mut run = AgentRunEnvelope::new(
+            AGENT_PROTOCOL_V1,
+            AgentSessionId::new(format!("visibility-session-{index}")),
+            RunId::new(format!("visibility-run-{index}")),
+            vec![Content::text(if mode == 0 {
+                "catalog-bound"
+            } else {
+                "catalog-unbound"
+            })],
+        )
+        .unwrap();
+        if mode != 1 {
+            run.spec.resources = vec![ResourceBinding {
+                binding_id: ResourceBindingId::new("skills"),
+                resource: ResourceRef {
+                    kind: ResourceKind::new(SKILL_CATALOG_RESOURCE_KIND_V1),
+                    id: skills.catalog().resource_id.clone(),
+                    revision: if mode == 0 {
+                        ResourceRevision::new(skills.catalog().revision.as_str())
+                    } else {
+                        ResourceRevision::new(format!("{:064x}", index + 1))
+                    },
+                },
+                requirement: if mode == 3 {
+                    BindingRequirement::Required
+                } else {
+                    BindingRequirement::Optional
+                },
+                mode: ResourceBindingMode::Snapshot,
+            }];
+            run = AgentRunEnvelope::seal(run.spec).unwrap();
+        }
+
+        let started = controller.start(run).await;
+        if mode == 3 {
+            assert!(started.is_err(), "required mismatched binding was accepted");
+            continue;
+        }
+        expected_model_starts += 1;
+        let execution = started.unwrap();
+        let view = match controller.wait_for_terminal(&execution.run_id).await {
+            Ok(view) => view,
+            Err(error) => panic!(
+                "visibility run failed: {error:?}; events={:?}",
+                controller.events(&execution.run_id, 0).await.unwrap()
+            ),
+        };
+        assert_eq!(view.state.status(), AgentRunStatus::Delivered);
+    }
+
+    assert_eq!(model.starts.load(Ordering::SeqCst), expected_model_starts);
+    assert_eq!(*model.violations.lock().unwrap(), Vec::<String>::new());
+}
+
 fn skill_runtime() -> SkillRuntime {
     let package = SkillPackage::seal(
         SkillId::new("xlsx"),
@@ -370,6 +493,21 @@ fn system_text(messages: &[ModelMessage]) -> String {
     messages
         .iter()
         .filter(|message| message.role == ModelRole::System)
+        .flat_map(|message| message.content.iter())
+        .filter_map(|content| match content {
+            ModelContent::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn user_text(messages: &[ModelMessage]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == ModelRole::User)
+        .into_iter()
         .flat_map(|message| message.content.iter())
         .filter_map(|content| match content {
             ModelContent::Text { text } => Some(text.as_str()),

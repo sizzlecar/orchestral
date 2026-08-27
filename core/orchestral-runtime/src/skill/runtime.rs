@@ -568,6 +568,9 @@ pub enum SkillRuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orchestral_core::agent_protocol::wire::{AgentSessionId, RunId};
+    use orchestral_core::agent_session::{AgentSessionEventDraft, AgentSessionEventId};
+    use orchestral_core::tool_protocol::{HostToolPolicy, RunToolGrant, ToolPolicyBounds};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -596,7 +599,7 @@ mod tests {
     }
 
     #[test]
-    fn conflict_precedence_is_deterministic_and_visible() {
+    fn one_thousand_conflict_resolutions_are_deterministic_and_visible() {
         let low = temp_dir("low");
         let high = temp_dir("high");
         write_skill(&low, "demo", "demo", "low instructions");
@@ -617,25 +620,27 @@ mod tests {
                 required: true,
             },
         ];
-        let first = SkillRuntime::discover(
+        let baseline = SkillRuntime::discover(
             ResourceId::new("skills"),
             &roots,
             SkillHostProfile::current(),
             SkillActivationPolicy::default(),
         )
         .unwrap();
-        let second = SkillRuntime::discover(
-            ResourceId::new("skills"),
-            &roots,
-            SkillHostProfile::current(),
-            SkillActivationPolicy::default(),
-        )
-        .unwrap();
-        assert_eq!(first.catalog(), second.catalog());
-        assert_eq!(first.conflicts(), second.conflicts());
-        assert_eq!(first.conflicts().len(), 1);
+        for _ in 0..1_000 {
+            let observed = SkillRuntime::discover(
+                ResourceId::new("skills"),
+                &roots,
+                SkillHostProfile::current(),
+                SkillActivationPolicy::default(),
+            )
+            .unwrap();
+            assert_eq!(baseline.catalog(), observed.catalog());
+            assert_eq!(baseline.conflicts(), observed.conflicts());
+        }
+        assert_eq!(baseline.conflicts().len(), 1);
         let canonical_high = high.canonicalize().unwrap();
-        assert!(first.conflicts()[0]
+        assert!(baseline.conflicts()[0]
             .selected_source
             .starts_with(canonical_high.to_string_lossy().as_ref()));
         let _ = fs::remove_dir_all(low);
@@ -702,5 +707,239 @@ mod tests {
             &ActivatedSkillSet::default(),
         );
         assert!(matches!(result, Err(SkillRuntimeError::Untrusted(_))));
+    }
+
+    #[test]
+    fn one_thousand_activations_are_complete_descriptor_only_and_never_expand_authority() {
+        for index in 0..1_000 {
+            let name = format!("skill-{index}");
+            let tool = format!("tool-{index}");
+            let mcp_server = format!("mcp-{index}");
+            let instructions = format!("FULL-INSTRUCTIONS-SENTINEL-{index}");
+            let reason = format!("activation-reason-{index}");
+            let locator = format!("configured:/skills/{name}/SKILL.md");
+            let package = SkillPackage::seal(
+                SkillId::new(&name),
+                &name,
+                format!("descriptor-{index}"),
+                Some(format!("1.0.{index}")),
+                SkillSource {
+                    kind: SkillSourceKind::UserConfigured,
+                    locator: locator.clone(),
+                },
+                SkillTrustLevel::UserTrusted,
+                SkillCompatibility::default(),
+                SkillDependencies {
+                    tools: BTreeSet::from([tool.clone()]),
+                    mcp_servers: BTreeSet::from([mcp_server.clone()]),
+                },
+                &instructions,
+            )
+            .unwrap();
+            let expected_digest = package.descriptor.digest.clone();
+            let expected_skill_id = package.descriptor.skill_id.clone();
+            let mut host_profile = SkillHostProfile::current();
+            host_profile.available_tools.insert(tool);
+            host_profile.available_mcp_servers.insert(mcp_server);
+            let runtime = SkillRuntime::from_packages(
+                ResourceId::new(format!("catalog-{index}")),
+                vec![package],
+                host_profile,
+                SkillActivationPolicy::default(),
+            )
+            .unwrap();
+
+            let descriptor_context = runtime.descriptor_context();
+            assert!(descriptor_context.contains(&name));
+            assert!(descriptor_context.contains(expected_digest.as_str()));
+            assert!(!descriptor_context.contains(&instructions));
+
+            let mut authority = ToolPolicyBounds::default();
+            authority
+                .allowed_credentials
+                .insert(format!("credential-{index}"));
+            authority
+                .environment
+                .allowed_variables
+                .insert(format!("ENV_{index}"));
+            let host_policy = HostToolPolicy {
+                bounds: authority.clone(),
+            };
+            let run_grant = RunToolGrant { bounds: authority };
+            let host_policy_before = host_policy.clone();
+            let run_grant_before = run_grant.clone();
+
+            let outcome = runtime
+                .activate(
+                    SkillActivationRequest {
+                        name: name.clone(),
+                        expected_digest: expected_digest.clone(),
+                        reason: reason.clone(),
+                    },
+                    &ActivatedSkillSet::default(),
+                )
+                .unwrap();
+            assert_eq!(host_policy, host_policy_before);
+            assert_eq!(run_grant, run_grant_before);
+
+            let SkillActivationOutcome::Activated(activation) = outcome else {
+                panic!("fresh Skill unexpectedly reported AlreadyActive");
+            };
+            assert_eq!(activation.package.descriptor.skill_id, expected_skill_id);
+            assert_eq!(activation.package.descriptor.source.locator, locator);
+            assert_eq!(
+                activation.package.descriptor.trust,
+                SkillTrustLevel::UserTrusted
+            );
+            assert_eq!(
+                activation.package.descriptor.version.as_deref(),
+                Some(format!("1.0.{index}").as_str())
+            );
+            assert_eq!(activation.package.descriptor.digest, expected_digest);
+            assert_eq!(activation.reason, reason);
+
+            let record = AgentSessionRecord::seal(
+                AgentSessionEventDraft {
+                    event_id: AgentSessionEventId::new(format!("skill-activated-{index}")),
+                    session_id: AgentSessionId::new(format!("session-{index}")),
+                    run_id: RunId::new(format!("run-{index}")),
+                    payload: AgentSessionEvent::SkillActivated {
+                        activation: Box::new(activation),
+                    },
+                },
+                1,
+            )
+            .unwrap();
+            record.validate().unwrap();
+            assert!(matches!(
+                record.payload,
+                AgentSessionEvent::SkillActivated { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn one_thousand_variants_of_each_forbidden_activation_class_are_rejected() {
+        for index in 0..1_000 {
+            let name = format!("skill-{index}");
+            let untrusted = test_package(
+                &name,
+                SkillTrustLevel::WorkspaceUntrusted,
+                SkillCompatibility::default(),
+                "untrusted instructions",
+            );
+            let untrusted_digest = untrusted.descriptor.digest.clone();
+            let untrusted_runtime = SkillRuntime::from_packages(
+                ResourceId::new(format!("untrusted-catalog-{index}")),
+                vec![untrusted],
+                SkillHostProfile::current(),
+                SkillActivationPolicy::default(),
+            )
+            .unwrap();
+            assert!(matches!(
+                untrusted_runtime.activate(
+                    SkillActivationRequest {
+                        name: name.clone(),
+                        expected_digest: untrusted_digest,
+                        reason: "must remain denied".to_owned(),
+                    },
+                    &ActivatedSkillSet::default(),
+                ),
+                Err(SkillRuntimeError::Untrusted(_))
+            ));
+
+            let incompatible = test_package(
+                &name,
+                SkillTrustLevel::UserTrusted,
+                SkillCompatibility {
+                    operating_systems: BTreeSet::from([format!("unsupported-os-{index}")]),
+                    ..SkillCompatibility::default()
+                },
+                "incompatible instructions",
+            );
+            let incompatible_digest = incompatible.descriptor.digest.clone();
+            let incompatible_runtime = SkillRuntime::from_packages(
+                ResourceId::new(format!("incompatible-catalog-{index}")),
+                vec![incompatible],
+                SkillHostProfile::current(),
+                SkillActivationPolicy::default(),
+            )
+            .unwrap();
+            assert!(matches!(
+                incompatible_runtime.activate(
+                    SkillActivationRequest {
+                        name: name.clone(),
+                        expected_digest: incompatible_digest,
+                        reason: "must remain denied".to_owned(),
+                    },
+                    &ActivatedSkillSet::default(),
+                ),
+                Err(SkillRuntimeError::Incompatible(_))
+            ));
+
+            let previous = test_package(
+                &name,
+                SkillTrustLevel::UserTrusted,
+                SkillCompatibility::default(),
+                "previous instructions",
+            );
+            let replacement = test_package(
+                &name,
+                SkillTrustLevel::UserTrusted,
+                SkillCompatibility::default(),
+                "replacement instructions",
+            );
+            let mut active = ActivatedSkillSet::default();
+            active.by_id.insert(
+                previous.descriptor.skill_id.clone(),
+                previous.descriptor.digest,
+            );
+            let replacement_digest = replacement.descriptor.digest.clone();
+            let replacement_runtime = SkillRuntime::from_packages(
+                ResourceId::new(format!("replacement-catalog-{index}")),
+                vec![replacement],
+                SkillHostProfile::current(),
+                SkillActivationPolicy::default(),
+            )
+            .unwrap();
+            assert!(matches!(
+                replacement_runtime.activate(
+                    SkillActivationRequest {
+                        name,
+                        expected_digest: replacement_digest,
+                        reason: "replacement was not confirmed".to_owned(),
+                    },
+                    &active,
+                ),
+                Err(SkillRuntimeError::DigestChanged { .. })
+            ));
+        }
+    }
+
+    fn test_package(
+        name: &str,
+        trust: SkillTrustLevel,
+        compatibility: SkillCompatibility,
+        instructions: &str,
+    ) -> SkillPackage {
+        SkillPackage::seal(
+            SkillId::new(name),
+            name,
+            format!("{name} description"),
+            Some("1.0.0".to_owned()),
+            SkillSource {
+                kind: if trust == SkillTrustLevel::WorkspaceUntrusted {
+                    SkillSourceKind::Workspace
+                } else {
+                    SkillSourceKind::UserConfigured
+                },
+                locator: format!("configured:/skills/{name}/SKILL.md"),
+            },
+            trust,
+            compatibility,
+            SkillDependencies::default(),
+            instructions,
+        )
+        .unwrap()
     }
 }
