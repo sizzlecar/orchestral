@@ -991,12 +991,16 @@ impl McpToolsAdapterRegistry {
             }
         }
 
-        let existing_names = runtime
-            .model_tool_schemas()
-            .map_err(McpToolsAdapterError::ToolRuntime)?
-            .into_iter()
-            .map(|schema| schema.name)
-            .collect::<BTreeSet<_>>();
+        let existing_names = match runtime.model_tool_schemas() {
+            Ok(schemas) => schemas
+                .into_iter()
+                .map(|schema| schema.name)
+                .collect::<BTreeSet<_>>(),
+            Err(error) => {
+                shutdown_mcp_managers(&managers).await;
+                return Err(McpToolsAdapterError::ToolRuntime(error));
+            }
+        };
         let mut registrations = Vec::new();
         let mut model_names = BTreeSet::new();
         for manager in managers.values() {
@@ -1005,16 +1009,20 @@ impl McpToolsAdapterRegistry {
                 let server = sanitize_mcp_identifier(manager.config.server_id.as_str());
                 let tool_name = sanitize_mcp_identifier(&tool.name);
                 if !sanitized_names.insert(tool_name.clone()) {
-                    return Err(McpToolsAdapterError::Conflict(format!(
+                    let error = McpToolsAdapterError::Conflict(format!(
                         "MCP server '{}' has Tool names that collide after namespacing",
                         manager.config.server_id
-                    )));
+                    ));
+                    shutdown_mcp_managers(&managers).await;
+                    return Err(error);
                 }
                 let model_name = format!("mcp__{server}__{tool_name}");
                 if existing_names.contains(&model_name) || !model_names.insert(model_name.clone()) {
-                    return Err(McpToolsAdapterError::Conflict(format!(
+                    let error = McpToolsAdapterError::Conflict(format!(
                         "MCP model Tool name collides: {model_name}"
-                    )));
+                    ));
+                    shutdown_mcp_managers(&managers).await;
+                    return Err(error);
                 }
                 let descriptor = ToolDescriptor {
                     tool_id: ToolId::new(format!("mcp/{server}/{tool_name}/v1")),
@@ -1045,9 +1053,10 @@ impl McpToolsAdapterRegistry {
                     idempotency: ToolIdempotency::NonIdempotent,
                     concurrency: ToolConcurrency::GlobalSerial,
                 };
-                descriptor
-                    .validate()
-                    .map_err(|error| McpToolsAdapterError::Protocol(error.to_string()))?;
+                if let Err(error) = descriptor.validate() {
+                    shutdown_mcp_managers(&managers).await;
+                    return Err(McpToolsAdapterError::Protocol(error.to_string()));
+                }
                 registrations.push((
                     descriptor,
                     Arc::new(GuardedMcpToolExecutor {
@@ -1059,9 +1068,10 @@ impl McpToolsAdapterRegistry {
         }
         let tool_count = registrations.len();
         for (descriptor, executor) in registrations {
-            runtime
-                .register(descriptor, executor)
-                .map_err(McpToolsAdapterError::ToolRuntime)?;
+            if let Err(error) = runtime.register(descriptor, executor) {
+                shutdown_mcp_managers(&managers).await;
+                return Err(McpToolsAdapterError::ToolRuntime(error));
+            }
         }
         Ok(Self {
             managers,
@@ -1886,21 +1896,38 @@ mod mcp_header_tests {
 #[cfg(test)]
 mod mcp_lifecycle_gate_tests {
     use super::*;
+    use crate::tool_runtime::{GuardedToolResult, ToolArtifactStore};
+    use crate::InMemoryBlobStore;
+    use orchestral_core::agent_protocol::wire::RunId;
+    use orchestral_core::tool_effect::{
+        replay_tool_effect, InMemoryToolEffectJournalStore, ToolEffectJournalStore, ToolEffectKey,
+        ToolEffectPhase,
+    };
+    use orchestral_core::tool_protocol::{
+        HostApprovalIssuer, HostApprovalVerifier, HostToolPolicy, InMemoryApprovalCapabilityStore,
+        RunToolGrant, ToolCallId, ToolInvocation, ToolOutput, ToolPolicyBounds,
+    };
     use std::future::pending;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::time::Instant;
     use tokio::sync::Notify;
 
     const GATE_CASES: usize = 1_000;
+    const GATE_SIGNING_KEY: &[u8] = b"0123456789abcdef0123456789abcdef";
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum FaultStage {
+        Healthy,
         Connect,
         Discover,
         Initialize,
         List,
         Call,
         BodyDecode,
+        ReconnectStable,
+        SchemaChanged,
+        NameConflict,
+        LargeResult,
     }
 
     struct FaultState {
@@ -1910,6 +1937,8 @@ mod mcp_lifecycle_gate_tests {
         active_connections: AtomicUsize,
         active_requests: AtomicUsize,
         closes: AtomicUsize,
+        explicit_closes: AtomicUsize,
+        tool_call_dispatches: AtomicUsize,
         completed_call_responses: AtomicUsize,
         entered: Notify,
     }
@@ -1923,6 +1952,8 @@ mod mcp_lifecycle_gate_tests {
                 active_connections: AtomicUsize::new(0),
                 active_requests: AtomicUsize::new(0),
                 closes: AtomicUsize::new(0),
+                explicit_closes: AtomicUsize::new(0),
+                tool_call_dispatches: AtomicUsize::new(0),
                 completed_call_responses: AtomicUsize::new(0),
                 entered: Notify::new(),
             })
@@ -1962,10 +1993,15 @@ mod mcp_lifecycle_gate_tests {
         fn new(stage: FaultStage) -> Arc<Self> {
             let kind = match stage {
                 FaultStage::Discover | FaultStage::BodyDecode => McpTransportKind::StreamableHttp,
-                FaultStage::Connect
+                FaultStage::Healthy
+                | FaultStage::Connect
                 | FaultStage::Initialize
                 | FaultStage::List
-                | FaultStage::Call => McpTransportKind::Stdio,
+                | FaultStage::Call
+                | FaultStage::ReconnectStable
+                | FaultStage::SchemaChanged
+                | FaultStage::NameConflict
+                | FaultStage::LargeResult => McpTransportKind::Stdio,
             };
             let (effect_scopes, process_programs, network_targets) = match kind {
                 McpTransportKind::Stdio => (
@@ -1998,6 +2034,13 @@ mod mcp_lifecycle_gate_tests {
                 state: FaultState::new(stage),
             })
         }
+
+        fn with_authority(authority: McpTransportAuthority) -> Arc<Self> {
+            Arc::new(Self {
+                authority,
+                state: FaultState::new(FaultStage::Healthy),
+            })
+        }
     }
 
     #[async_trait]
@@ -2007,7 +2050,7 @@ mod mcp_lifecycle_gate_tests {
         }
 
         async fn connect(&self) -> Result<Box<dyn McpTransportConnection>, McpTransportError> {
-            self.state.connects.fetch_add(1, Ordering::SeqCst);
+            let generation = self.state.connects.fetch_add(1, Ordering::SeqCst) + 1;
             if self.state.stage == FaultStage::Connect {
                 self.state.active_connects.fetch_add(1, Ordering::SeqCst);
                 let _guard = ActiveCounter::Connect(self.state.clone());
@@ -2019,6 +2062,7 @@ mod mcp_lifecycle_gate_tests {
                 kind: self.authority.kind,
                 state: self.state.clone(),
                 closed: AtomicBool::new(false),
+                generation,
             }))
         }
     }
@@ -2027,6 +2071,7 @@ mod mcp_lifecycle_gate_tests {
         kind: McpTransportKind,
         state: Arc<FaultState>,
         closed: AtomicBool,
+        generation: usize,
     }
 
     impl FaultConnection {
@@ -2037,17 +2082,20 @@ mod mcp_lifecycle_gate_tests {
             pending().await
         }
 
-        fn release(&self) {
+        fn release(&self, explicit: bool) {
             if !self.closed.swap(true, Ordering::SeqCst) {
                 self.state.active_connections.fetch_sub(1, Ordering::SeqCst);
                 self.state.closes.fetch_add(1, Ordering::SeqCst);
+                if explicit {
+                    self.state.explicit_closes.fetch_add(1, Ordering::SeqCst);
+                }
             }
         }
     }
 
     impl Drop for FaultConnection {
         fn drop(&mut self) {
-            self.release();
+            self.release(false);
         }
     }
 
@@ -2091,29 +2139,71 @@ mod mcp_lifecycle_gate_tests {
                     "serverInfo": {"name": "fault", "version": "1"}
                 })),
                 "tools/list" if self.state.stage == FaultStage::List => self.block_request().await,
-                "tools/list" => Ok(json!({
+                "tools/list" if self.state.stage == FaultStage::NameConflict => Ok(json!({
                     "resultType": "complete",
                     "ttlMs": 1_000,
                     "cacheScope": "private",
-                    "tools": [{
-                        "name": "echo",
-                        "description": "echo",
-                        "inputSchema": {
-                            "type": "object",
-                            "additionalProperties": false
-                        }
-                    }]
+                    "tools": [
+                        {"name": "a.b", "inputSchema": {"type": "object"}},
+                        {"name": "a b", "inputSchema": {"type": "object"}}
+                    ]
                 })),
+                "tools/list" => {
+                    let echo_schema =
+                        if self.state.stage == FaultStage::SchemaChanged && self.generation > 1 {
+                            json!({
+                                "type": "object",
+                                "properties": {"changed": {"type": "boolean"}},
+                                "additionalProperties": false
+                            })
+                        } else {
+                            json!({"type": "object", "additionalProperties": false})
+                        };
+                    Ok(json!({
+                        "resultType": "complete",
+                        "ttlMs": 1_000,
+                        "cacheScope": "private",
+                        "tools": [
+                            {"name": "echo", "description": "echo", "inputSchema": echo_schema},
+                            {"name": "beta", "description": "beta", "inputSchema": {
+                                "type": "object", "additionalProperties": false
+                            }},
+                            {"name": "hidden", "description": "hidden", "inputSchema": {
+                                "type": "object", "additionalProperties": false
+                            }}
+                        ]
+                    }))
+                }
                 "tools/call"
                     if matches!(self.state.stage, FaultStage::Call | FaultStage::BodyDecode) =>
                 {
                     self.block_request().await
                 }
-                "tools/call" => Ok(json!({
-                    "resultType": "complete",
-                    "content": [{"type": "text", "text": "ok"}],
-                    "isError": false
-                })),
+                "tools/call" => {
+                    self.state
+                        .tool_call_dispatches
+                        .fetch_add(1, Ordering::SeqCst);
+                    if matches!(
+                        self.state.stage,
+                        FaultStage::ReconnectStable | FaultStage::SchemaChanged
+                    ) && self.generation == 1
+                    {
+                        Err(McpTransportError::Transport(
+                            "injected disconnect".to_owned(),
+                        ))
+                    } else {
+                        let text = if self.state.stage == FaultStage::LargeResult {
+                            "large-mcp-result/".repeat(256)
+                        } else {
+                            "ok".to_owned()
+                        };
+                        Ok(json!({
+                            "resultType": "complete",
+                            "content": [{"type": "text", "text": text}],
+                            "isError": false
+                        }))
+                    }
+                }
                 other => Err(McpTransportError::Protocol(format!(
                     "unexpected fault transport method: {other}"
                 ))),
@@ -2136,7 +2226,7 @@ mod mcp_lifecycle_gate_tests {
         }
 
         async fn close(&self) -> Result<(), McpTransportError> {
-            self.release();
+            self.release(true);
             Ok(())
         }
     }
@@ -2162,6 +2252,484 @@ mod mcp_lifecycle_gate_tests {
 
     fn assert_unknown_effect(result: Result<Value, GuardedMcpCallError>) {
         assert!(matches!(result, Err(GuardedMcpCallError::UnknownEffect(_))));
+    }
+
+    fn authority_bounds(authority: &McpTransportAuthority) -> ToolPolicyBounds {
+        let mut bounds = ToolPolicyBounds {
+            allowed_effects: authority.effect_scopes.clone(),
+            approval: ApprovalPolicy::Required,
+            max_timeout_ms: Some(30_000),
+            max_output_bytes: Some(64 * 1024),
+            ..ToolPolicyBounds::default()
+        };
+        bounds.process.allowed_programs = authority.process_programs.clone();
+        bounds.network.allowed_targets = authority.network_targets.clone();
+        bounds.environment.allowed_variables = authority.environment_variables.clone();
+        bounds.allowed_credentials = authority.credential_references.clone();
+        bounds
+    }
+
+    fn gate_runtime(
+        bounds: ToolPolicyBounds,
+        journal: Arc<InMemoryToolEffectJournalStore>,
+    ) -> Arc<GuardedToolRuntime<InMemoryApprovalCapabilityStore>> {
+        let verifier =
+            HostApprovalVerifier::new(GATE_SIGNING_KEY, InMemoryApprovalCapabilityStore::default())
+                .unwrap();
+        Arc::new(
+            GuardedToolRuntime::new_with_effect_journal(
+                HostToolPolicy { bounds },
+                verifier,
+                journal,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn gate_runtime_with_artifacts(
+        bounds: ToolPolicyBounds,
+        journal: Arc<InMemoryToolEffectJournalStore>,
+        artifacts: ToolArtifactStore,
+    ) -> Arc<GuardedToolRuntime<InMemoryApprovalCapabilityStore>> {
+        let verifier =
+            HostApprovalVerifier::new(GATE_SIGNING_KEY, InMemoryApprovalCapabilityStore::default())
+                .unwrap();
+        Arc::new(
+            GuardedToolRuntime::new_with_effect_journal_and_artifacts(
+                HostToolPolicy { bounds },
+                verifier,
+                journal,
+                artifacts,
+            )
+            .unwrap(),
+        )
+    }
+
+    async fn invoke_with_approval(
+        runtime: &GuardedToolRuntime<InMemoryApprovalCapabilityStore>,
+        invocation: ToolInvocation,
+        grant: RunToolGrant,
+    ) -> GuardedToolResult {
+        let GuardedToolResult::ApprovalRequired { binding, .. } = runtime
+            .invoke(
+                invocation.clone(),
+                grant.clone(),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+        else {
+            panic!("MCP invocation bypassed exact Host approval");
+        };
+        let capability = HostApprovalIssuer::new(GATE_SIGNING_KEY)
+            .unwrap()
+            .issue(binding, i64::MAX)
+            .unwrap();
+        runtime
+            .invoke(
+                invocation,
+                grant,
+                Some(capability),
+                CancellationToken::new(),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn one_thousand_mcp_calls_are_journaled_filtered_and_share_one_connection() {
+        let factory = FaultFactory::new(FaultStage::Healthy);
+        let mut config = fault_config(factory.clone(), Duration::from_secs(2));
+        config.server_id = McpServerId::new("gate");
+        config.enabled_tools =
+            BTreeSet::from(["echo".to_owned(), "beta".to_owned(), "hidden".to_owned()]);
+        config.disabled_tools = BTreeSet::from(["hidden".to_owned()]);
+        let bounds = authority_bounds(factory.authority());
+        let journal = Arc::new(InMemoryToolEffectJournalStore::default());
+        let runtime = gate_runtime(bounds.clone(), journal.clone());
+        let registry = McpToolsAdapterRegistry::register(
+            runtime.as_ref(),
+            vec![config],
+            ToolRestriction {
+                bounds: bounds.clone(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let manager = registry.manager(&McpServerId::new("gate")).unwrap();
+
+        assert_eq!(registry.tool_count(), 2);
+        assert_eq!(
+            manager
+                .snapshot()
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["beta", "echo"])
+        );
+        assert!(runtime
+            .resolve_tool_id("mcp__gate__hidden")
+            .unwrap()
+            .is_none());
+
+        let mut committed = 0;
+        for index in 0..GATE_CASES {
+            let dispatches_before = factory.state.tool_call_dispatches.load(Ordering::SeqCst);
+            for rejected_name in ["hidden", "stale-cached-tool"] {
+                assert!(matches!(
+                    manager
+                        .invoke(rejected_name, json!({}), CancellationToken::new())
+                        .await,
+                    Err(GuardedMcpCallError::Rejected(_))
+                ));
+            }
+            assert_eq!(
+                factory.state.tool_call_dispatches.load(Ordering::SeqCst),
+                dispatches_before
+            );
+
+            let tool = if index % 2 == 0 { "echo" } else { "beta" };
+            let run_id = RunId::new("m4-mcp-gate");
+            let call_id = ToolCallId::new(format!("call-{index}"));
+            let invocation = ToolInvocation {
+                run_id: run_id.clone(),
+                call_id: call_id.clone(),
+                tool_id: ToolId::new(format!("mcp/gate/{tool}/v1")),
+                arguments: json!({}),
+            };
+            let result = invoke_with_approval(
+                runtime.as_ref(),
+                invocation,
+                RunToolGrant {
+                    bounds: bounds.clone(),
+                },
+            )
+            .await;
+            assert!(matches!(
+                result,
+                GuardedToolResult::Outcome {
+                    outcome: ToolOutcome::Completed {
+                        output: ToolOutput::Inline(_)
+                    },
+                    cached: false,
+                }
+            ));
+
+            let key = ToolEffectKey::new(run_id, call_id);
+            let records = journal.load_effect(&key).await.unwrap();
+            let projection = replay_tool_effect(&key, &records).unwrap().unwrap();
+            assert!(matches!(
+                projection.phase,
+                ToolEffectPhase::Committed { .. }
+            ));
+            committed += 1;
+        }
+
+        assert_eq!(
+            factory.state.tool_call_dispatches.load(Ordering::SeqCst),
+            committed
+        );
+        assert_eq!(factory.state.connects.load(Ordering::SeqCst), 1);
+        assert_eq!(manager.connection_generation(), 1);
+        assert_eq!(factory.state.active_connections.load(Ordering::SeqCst), 1);
+        registry.shutdown().await;
+        factory.state.assert_released();
+        assert_eq!(factory.state.explicit_closes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn one_thousand_oversized_mcp_results_keep_only_verified_artifact_summaries() {
+        let factory = FaultFactory::new(FaultStage::LargeResult);
+        let mut config = fault_config(factory.clone(), Duration::from_secs(2));
+        config.server_id = McpServerId::new("spill-gate");
+        config.enabled_tools = BTreeSet::from(["echo".to_owned()]);
+        let mut bounds = authority_bounds(factory.authority());
+        bounds.max_output_bytes = Some(128);
+        let journal = Arc::new(InMemoryToolEffectJournalStore::default());
+        let artifacts =
+            ToolArtifactStore::new(Arc::new(InMemoryBlobStore::default()), 128 * 1024, 96).unwrap();
+        let runtime =
+            gate_runtime_with_artifacts(bounds.clone(), journal.clone(), artifacts.clone());
+        let registry = McpToolsAdapterRegistry::register(
+            runtime.as_ref(),
+            vec![config],
+            ToolRestriction {
+                bounds: bounds.clone(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        for index in 0..GATE_CASES {
+            let run_id = RunId::new("m4-mcp-spill-gate");
+            let call_id = ToolCallId::new(format!("spill-{index}"));
+            let result = invoke_with_approval(
+                runtime.as_ref(),
+                ToolInvocation {
+                    run_id: run_id.clone(),
+                    call_id: call_id.clone(),
+                    tool_id: ToolId::new("mcp/spill-gate/echo/v1"),
+                    arguments: json!({}),
+                },
+                RunToolGrant {
+                    bounds: bounds.clone(),
+                },
+            )
+            .await;
+            let GuardedToolResult::Outcome {
+                outcome:
+                    ToolOutcome::Completed {
+                        output: ToolOutput::Artifact(artifact),
+                    },
+                cached: false,
+            } = result
+            else {
+                panic!("oversized MCP output escaped artifact spill")
+            };
+            artifact.validate().unwrap();
+            assert!(!artifact.summary.trim().is_empty());
+            assert!(artifact.byte_size > 128);
+            let bytes = artifacts.resolve(&artifact).await.unwrap();
+            let resolved: Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(resolved["result"]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("large-mcp-result/")));
+
+            let key = ToolEffectKey::new(run_id, call_id);
+            let projection = replay_tool_effect(&key, &journal.load_effect(&key).await.unwrap())
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                projection.phase,
+                ToolEffectPhase::Committed {
+                    outcome: ToolOutcome::Completed {
+                        output: ToolOutput::Artifact(_)
+                    },
+                    ..
+                }
+            ));
+        }
+        assert_eq!(
+            factory.state.tool_call_dispatches.load(Ordering::SeqCst),
+            GATE_CASES
+        );
+        registry.shutdown().await;
+        factory.state.assert_released();
+    }
+
+    #[tokio::test]
+    async fn one_thousand_unauthorized_environment_and_credential_bindings_connect_zero_times() {
+        let mut baseline_error = None;
+        for index in 0..GATE_CASES {
+            let authority = if index % 2 == 0 {
+                McpTransportAuthority {
+                    kind: McpTransportKind::Stdio,
+                    binding_digest: Digest::sha256(format!("unauthorized-env-{index}")),
+                    effect_scopes: BTreeSet::from([
+                        EffectScope::Process,
+                        EffectScope::FilesystemRead,
+                        EffectScope::FilesystemWrite,
+                        EffectScope::ExternalSideEffect,
+                        EffectScope::SecretRead,
+                    ]),
+                    process_programs: BTreeSet::from(["/fault/mcp".to_owned()]),
+                    network_targets: BTreeSet::new(),
+                    environment_variables: BTreeSet::from([format!("SENTINEL_ENV_{index}")]),
+                    credential_references: BTreeSet::new(),
+                }
+            } else {
+                McpTransportAuthority {
+                    kind: McpTransportKind::StreamableHttp,
+                    binding_digest: Digest::sha256(format!("unauthorized-credential-{index}")),
+                    effect_scopes: BTreeSet::from([
+                        EffectScope::Network,
+                        EffectScope::ExternalSideEffect,
+                        EffectScope::SecretRead,
+                    ]),
+                    process_programs: BTreeSet::new(),
+                    network_targets: BTreeSet::from(["http://127.0.0.1/fault-mcp".to_owned()]),
+                    environment_variables: BTreeSet::new(),
+                    credential_references: BTreeSet::from([format!("env:SENTINEL_TOKEN_{index}")]),
+                }
+            };
+            authority.validate().unwrap();
+            let factory = FaultFactory::with_authority(authority);
+            let mut config = fault_config(factory.clone(), Duration::from_secs(1));
+            config.server_id = McpServerId::new("authority-gate");
+            let mut restriction_bounds = authority_bounds(factory.authority());
+            restriction_bounds.environment.allowed_variables.clear();
+            restriction_bounds.allowed_credentials.clear();
+            let runtime = gate_runtime(
+                restriction_bounds.clone(),
+                Arc::new(InMemoryToolEffectJournalStore::default()),
+            );
+            let result = McpToolsAdapterRegistry::register(
+                runtime.as_ref(),
+                vec![config],
+                ToolRestriction {
+                    bounds: restriction_bounds,
+                },
+                CancellationToken::new(),
+            )
+            .await;
+            let error = match result {
+                Err(McpToolsAdapterError::InvalidConfig(message)) => message,
+                Err(other) => panic!("unexpected authority rejection: {other:?}"),
+                Ok(registry) => {
+                    registry.shutdown().await;
+                    panic!("unauthorized MCP authority reached connect")
+                }
+            };
+            if let Some(baseline) = &baseline_error {
+                assert_eq!(&error, baseline);
+            } else {
+                baseline_error = Some(error);
+            }
+            assert_eq!(factory.state.connects.load(Ordering::SeqCst), 0);
+            factory.state.assert_released();
+        }
+    }
+
+    #[tokio::test]
+    async fn one_thousand_disconnects_reconnect_once_and_schema_drift_never_calls_stale_tools() {
+        for stage in [FaultStage::ReconnectStable, FaultStage::SchemaChanged] {
+            let mut baseline_schema_error = None;
+            for _ in 0..GATE_CASES {
+                let factory = FaultFactory::new(stage);
+                let manager = connect_result(
+                    fault_config(factory.clone(), Duration::from_secs(1)),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+                assert_unknown_effect(
+                    manager
+                        .invoke("echo", json!({}), CancellationToken::new())
+                        .await,
+                );
+                assert_eq!(manager.health(), McpServerHealth::Degraded);
+                factory.state.assert_released();
+                assert_eq!(factory.state.explicit_closes.load(Ordering::SeqCst), 1);
+
+                let second = manager
+                    .invoke("echo", json!({}), CancellationToken::new())
+                    .await;
+                match stage {
+                    FaultStage::ReconnectStable => {
+                        assert!(second.is_ok());
+                        assert_eq!(manager.connection_generation(), 2);
+                        assert_eq!(factory.state.active_connections.load(Ordering::SeqCst), 1);
+                        assert_eq!(factory.state.tool_call_dispatches.load(Ordering::SeqCst), 2);
+                        manager.shutdown().await;
+                        assert_eq!(factory.state.explicit_closes.load(Ordering::SeqCst), 2);
+                    }
+                    FaultStage::SchemaChanged => {
+                        let message = match second {
+                            Err(GuardedMcpCallError::Failed(message)) => message,
+                            _ => panic!("schema drift did not fail closed"),
+                        };
+                        if let Some(baseline) = &baseline_schema_error {
+                            assert_eq!(&message, baseline);
+                        } else {
+                            baseline_schema_error = Some(message);
+                        }
+                        assert_eq!(manager.connection_generation(), 1);
+                        assert_eq!(factory.state.tool_call_dispatches.load(Ordering::SeqCst), 1);
+                        assert_eq!(factory.state.explicit_closes.load(Ordering::SeqCst), 2);
+                    }
+                    _ => unreachable!(),
+                }
+                assert_eq!(factory.state.connects.load(Ordering::SeqCst), 2);
+                factory.state.assert_released();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn one_thousand_required_start_and_name_conflicts_are_deterministic_and_clean() {
+        let start_factory = FaultFactory::new(FaultStage::Connect);
+        let start_config = fault_config(start_factory.clone(), Duration::from_millis(1));
+        let start_bounds = authority_bounds(start_factory.authority());
+        let start_runtime = gate_runtime(
+            start_bounds.clone(),
+            Arc::new(InMemoryToolEffectJournalStore::default()),
+        );
+        let mut baseline_start_error = None;
+        for _ in 0..GATE_CASES {
+            let result = McpToolsAdapterRegistry::register(
+                start_runtime.as_ref(),
+                vec![start_config.clone()],
+                ToolRestriction {
+                    bounds: start_bounds.clone(),
+                },
+                CancellationToken::new(),
+            )
+            .await;
+            let error = match result {
+                Err(error) => error.to_string(),
+                Ok(registry) => {
+                    registry.shutdown().await;
+                    panic!("required MCP startup failure was silently skipped")
+                }
+            };
+            if let Some(baseline) = &baseline_start_error {
+                assert_eq!(&error, baseline);
+            } else {
+                baseline_start_error = Some(error);
+            }
+            start_factory.state.assert_released();
+        }
+        assert_eq!(
+            start_factory.state.connects.load(Ordering::SeqCst),
+            GATE_CASES
+        );
+
+        let conflict_factory = FaultFactory::new(FaultStage::NameConflict);
+        let conflict_config = fault_config(conflict_factory.clone(), Duration::from_secs(1));
+        let conflict_bounds = authority_bounds(conflict_factory.authority());
+        let conflict_runtime = gate_runtime(
+            conflict_bounds.clone(),
+            Arc::new(InMemoryToolEffectJournalStore::default()),
+        );
+        let mut baseline_conflict_error = None;
+        for _ in 0..GATE_CASES {
+            let result = McpToolsAdapterRegistry::register(
+                conflict_runtime.as_ref(),
+                vec![conflict_config.clone()],
+                ToolRestriction {
+                    bounds: conflict_bounds.clone(),
+                },
+                CancellationToken::new(),
+            )
+            .await;
+            let error = match result {
+                Err(McpToolsAdapterError::Conflict(message)) => message,
+                Err(other) => panic!("unexpected name conflict result: {other:?}"),
+                Ok(registry) => {
+                    registry.shutdown().await;
+                    panic!("MCP name collision was silently registered")
+                }
+            };
+            if let Some(baseline) = &baseline_conflict_error {
+                assert_eq!(&error, baseline);
+            } else {
+                baseline_conflict_error = Some(error);
+            }
+            conflict_factory.state.assert_released();
+        }
+        assert_eq!(
+            conflict_factory.state.connects.load(Ordering::SeqCst),
+            GATE_CASES
+        );
+        assert_eq!(
+            conflict_factory
+                .state
+                .explicit_closes
+                .load(Ordering::SeqCst),
+            GATE_CASES
+        );
     }
 
     #[tokio::test]
