@@ -2112,9 +2112,13 @@ mod tests {
         )
         .expect("template reducer initializes");
 
+        let mut delivered_traces = 0usize;
+        let mut pending_terminal_traces = 0usize;
+        let mut resolved_request_traces = 0usize;
         for case in 0_u64..10_000 {
             let mut online = template.clone();
-            let mut records = Vec::with_capacity(4);
+            let mut records = Vec::with_capacity(8);
+            let mut online_snapshots = Vec::with_capacity(8);
             records.push(apply_host(
                 &mut online,
                 AgentEvent::RunAccepted {
@@ -2122,33 +2126,119 @@ mod tests {
                     spec_digest: run.spec_digest.clone(),
                 },
             ));
+            online_snapshots.push(online.snapshot().clone());
             records.push(apply(&mut online, AgentEvent::RunStarted, None));
-            records.push(apply(
-                &mut online,
-                AgentEvent::OutputCommitted {
-                    output_id: OutputId::new(format!("output-{case}")),
-                    content: vec![Content::text(format!("value-{case}"))],
-                },
-                None,
-            ));
-            let mut delivered = delivery(&run);
-            delivered.delivery_id = DeliveryId::new(format!("delivery-{case}"));
-            records.push(apply(
-                &mut online,
-                AgentEvent::DeliveryCommitted {
-                    delivery: delivered,
-                },
-                None,
-            ));
+            online_snapshots.push(online.snapshot().clone());
+
+            if case % 3 != 0 {
+                let request_id = RequestId::new(format!("request-{case}"));
+                records.push(apply(
+                    &mut online,
+                    AgentEvent::RequestOpened {
+                        request: PendingRequest {
+                            request_id: request_id.clone(),
+                            blocking: true,
+                            payload: PendingRequestPayload::Input {
+                                prompt: vec![Content::text(format!("input-{case}"))],
+                                input_schema: None,
+                            },
+                        },
+                    },
+                    None,
+                ));
+                online_snapshots.push(online.snapshot().clone());
+                assert_eq!(online.state().status(), AgentRunStatus::Waiting);
+
+                if case % 3 == 1 {
+                    records.push(apply(
+                        &mut online,
+                        AgentEvent::RunFailed {
+                            failure: AgentFailure {
+                                code: "generated_pending_failure".to_owned(),
+                                message: format!("pending trace {case} stopped"),
+                                retryable: false,
+                                details: serde_json::Value::Null,
+                            },
+                        },
+                        None,
+                    ));
+                    online_snapshots.push(online.snapshot().clone());
+                    pending_terminal_traces += 1;
+                } else {
+                    let resolution = RequestResolution::Input {
+                        content: vec![Content::text(format!("resolution-{case}"))],
+                    };
+                    let resolve = command(
+                        &online,
+                        &format!("resolve-{case}"),
+                        Some(request_id.clone()),
+                        AgentCommand::ResolveRequest {
+                            response: resolution.clone(),
+                        },
+                    );
+                    records.push(apply_host_causal(
+                        &mut online,
+                        AgentEvent::CommandReceived {
+                            command: resolve.clone(),
+                        },
+                        resolve.command_id.clone(),
+                    ));
+                    online_snapshots.push(online.snapshot().clone());
+                    records.push(apply(
+                        &mut online,
+                        AgentEvent::CommandDispositionRecorded {
+                            command_id: resolve.command_id.clone(),
+                            outcome: ProviderCommandOutcome::Accepted,
+                        },
+                        Some(resolve.command_id.clone()),
+                    ));
+                    online_snapshots.push(online.snapshot().clone());
+                    records.push(apply(
+                        &mut online,
+                        AgentEvent::RequestResolved {
+                            request_id,
+                            resolution: resolution.clone(),
+                            resolution_digest: resolution.digest().expect("resolution digest"),
+                        },
+                        Some(resolve.command_id),
+                    ));
+                    online_snapshots.push(online.snapshot().clone());
+                    resolved_request_traces += 1;
+                }
+            }
+
+            if !online.state().is_terminal() {
+                records.push(apply(
+                    &mut online,
+                    AgentEvent::OutputCommitted {
+                        output_id: OutputId::new(format!("output-{case}")),
+                        content: vec![Content::text(format!("value-{case}"))],
+                    },
+                    None,
+                ));
+                online_snapshots.push(online.snapshot().clone());
+                let mut delivered = delivery(&run);
+                delivered.delivery_id = DeliveryId::new(format!("delivery-{case}"));
+                records.push(apply(
+                    &mut online,
+                    AgentEvent::DeliveryCommitted {
+                        delivery: delivered,
+                    },
+                    None,
+                ));
+                online_snapshots.push(online.snapshot().clone());
+                delivered_traces += 1;
+            }
 
             let mut replayed = template.clone();
-            for record in &records {
+            for (record, expected_snapshot) in records.iter().zip(&online_snapshots) {
                 assert!(matches!(
                     replayed
                         .replay_journal_record(record.clone())
                         .expect("legal record replays"),
                     ApplyOutcome::Applied
                 ));
+                assert_eq!(replayed.snapshot(), expected_snapshot);
             }
             assert_eq!(replayed.snapshot(), online.snapshot());
             assert_eq!(
@@ -2170,5 +2260,9 @@ mod tests {
                 ));
             }
         }
+        assert_eq!(delivered_traces + pending_terminal_traces, 10_000);
+        assert!(delivered_traces > 6_000);
+        assert!(pending_terminal_traces > 3_000);
+        assert!(resolved_request_traces > 3_000);
     }
 }
