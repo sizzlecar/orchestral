@@ -11,11 +11,12 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::agent_protocol::wire::{AgentSessionId, Digest, RunId};
+use crate::agent_protocol::wire::{AgentSessionId, ArtifactRefWithDigest, Digest, RunId};
 use crate::model_protocol::{
     ModelContent, ModelMessage, ModelRequestId, ModelRole, ModelToolCallId, ModelUsage,
 };
 use crate::skill_protocol::SkillActivation;
+use crate::tool_protocol::ToolCallId;
 
 macro_rules! string_id {
     ($name:ident) => {
@@ -82,8 +83,20 @@ pub enum AgentSessionEvent {
         request_id: ModelRequestId,
         assistant: ModelMessage,
         tool: ModelMessage,
+        /// Artifact identities are retained even when ordinary history would
+        /// otherwise be evicted. Every entry must also occur in `tool`.
+        retained_artifacts: Vec<ArtifactRefWithDigest>,
         #[serde(default)]
         usage: Option<ModelUsage>,
+    },
+    /// Host safety fact emitted when an effect may have happened but cannot be
+    /// observed authoritatively. It remains pinned until a future explicit
+    /// reconciliation protocol supersedes it.
+    EffectUncertaintyCommitted {
+        effect_call_id: ToolCallId,
+        model_call_id: ModelToolCallId,
+        tool_name: String,
+        message: String,
     },
     RunOutputCommitted {
         request_id: ModelRequestId,
@@ -149,6 +162,7 @@ impl AgentSessionEvent {
                 request_id,
                 assistant,
                 tool,
+                retained_artifacts,
                 ..
             } => {
                 if request_id.is_empty() {
@@ -157,6 +171,24 @@ impl AgentSessionEvent {
                     ));
                 }
                 validate_tool_exchange(assistant, tool)?;
+                validate_retained_artifacts(tool, retained_artifacts)?;
+            }
+            Self::EffectUncertaintyCommitted {
+                effect_call_id,
+                model_call_id,
+                tool_name,
+                message,
+            } => {
+                if effect_call_id.is_empty()
+                    || model_call_id.is_empty()
+                    || tool_name.trim().is_empty()
+                    || message.trim().is_empty()
+                {
+                    return Err(AgentSessionError::InvalidEvent(
+                        "effect uncertainty requires call identities, Tool name, and message"
+                            .to_owned(),
+                    ));
+                }
             }
             Self::SkillActivated { activation } => activation
                 .validate()
@@ -476,6 +508,53 @@ fn validate_tool_exchange(
     Ok(())
 }
 
+fn validate_retained_artifacts(
+    tool: &ModelMessage,
+    retained_artifacts: &[ArtifactRefWithDigest],
+) -> Result<(), AgentSessionError> {
+    let mut identities = BTreeSet::new();
+    for artifact in retained_artifacts {
+        artifact
+            .validate_integrity()
+            .map_err(|error| AgentSessionError::InvalidEvent(error.to_string()))?;
+        if !identities.insert(artifact.artifact_ref.as_str()) {
+            return Err(AgentSessionError::InvalidEvent(
+                "retained Artifact identities must be unique".to_owned(),
+            ));
+        }
+        let expected = serde_json::to_value(artifact)
+            .map_err(|error| AgentSessionError::InvalidEvent(error.to_string()))?;
+        let present = tool.content.iter().any(|content| {
+            matches!(
+                content,
+                ModelContent::ToolResult { result, .. }
+                    if json_contains_value(result, &expected)
+            )
+        });
+        if !present {
+            return Err(AgentSessionError::InvalidEvent(
+                "retained Artifact must occur in the atomic Tool result".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn json_contains_value(value: &serde_json::Value, expected: &serde_json::Value) -> bool {
+    if value == expected {
+        return true;
+    }
+    match value {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|candidate| json_contains_value(candidate, expected)),
+        serde_json::Value::Object(values) => values
+            .values()
+            .any(|candidate| json_contains_value(candidate, expected)),
+        _ => false,
+    }
+}
+
 fn canonical_digest<T: Serialize + ?Sized>(value: &T) -> Result<Digest, AgentSessionError> {
     let bytes = serde_jcs::to_vec(value)
         .map_err(|error| AgentSessionError::InvalidEvent(error.to_string()))?;
@@ -536,9 +615,49 @@ mod tests {
                     is_error: false,
                 }],
             },
+            retained_artifacts: Vec::new(),
             usage: None,
         };
         assert!(event.validate().is_err());
+    }
+
+    #[test]
+    fn retained_artifact_must_be_digest_bound_inside_the_atomic_tool_result() {
+        let artifact = ArtifactRefWithDigest {
+            artifact_ref: crate::agent_protocol::wire::ArtifactRef::new("artifact-1"),
+            digest: Digest::sha256("artifact-bytes"),
+        };
+        let event = AgentSessionEvent::ToolExchangeCommitted {
+            request_id: ModelRequestId::new("request-1"),
+            assistant: ModelMessage {
+                role: ModelRole::Assistant,
+                content: vec![ModelContent::ToolCall {
+                    call_id: ModelToolCallId::new("call-1"),
+                    name: "read".to_owned(),
+                    arguments: serde_json::json!({}),
+                }],
+            },
+            tool: ModelMessage {
+                role: ModelRole::Tool,
+                content: vec![ModelContent::ToolResult {
+                    call_id: ModelToolCallId::new("call-1"),
+                    result: serde_json::json!({"artifact": artifact.clone()}),
+                    is_error: false,
+                }],
+            },
+            retained_artifacts: vec![artifact.clone()],
+            usage: None,
+        };
+        assert!(event.validate().is_ok());
+
+        let mut mismatched = event;
+        if let AgentSessionEvent::ToolExchangeCommitted {
+            retained_artifacts, ..
+        } = &mut mismatched
+        {
+            retained_artifacts[0].digest = Digest::sha256("different-bytes");
+        }
+        assert!(mismatched.validate().is_err());
     }
 
     #[test]

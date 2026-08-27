@@ -242,7 +242,10 @@ fn replay_groups(
                 );
             }
             AgentSessionEvent::ToolExchangeCommitted {
-                assistant, tool, ..
+                assistant,
+                tool,
+                retained_artifacts,
+                ..
             } => {
                 groups.insert(
                     record.session_seq,
@@ -250,7 +253,28 @@ fn replay_groups(
                         key: record.session_seq,
                         source: single_range(record.session_seq),
                         messages: vec![assistant.clone(), tool.clone()],
-                        pinned: record.run_id == *current_run_id,
+                        pinned: record.run_id == *current_run_id || !retained_artifacts.is_empty(),
+                    },
+                );
+            }
+            AgentSessionEvent::EffectUncertaintyCommitted {
+                effect_call_id,
+                model_call_id,
+                tool_name,
+                message,
+            } => {
+                groups.insert(
+                    record.session_seq,
+                    MessageGroup {
+                        key: record.session_seq,
+                        source: single_range(record.session_seq),
+                        messages: vec![effect_uncertainty_message(
+                            effect_call_id,
+                            model_call_id,
+                            tool_name,
+                            message,
+                        )],
+                        pinned: true,
                     },
                 );
             }
@@ -367,6 +391,21 @@ pub(crate) fn skill_activation_message(
             descriptor.digest,
             activation.reason,
             activation.package.instructions
+        ),
+    )
+}
+
+fn effect_uncertainty_message(
+    effect_call_id: &orchestral_core::tool_protocol::ToolCallId,
+    model_call_id: &orchestral_core::model_protocol::ModelToolCallId,
+    tool_name: &str,
+    message: &str,
+) -> ModelMessage {
+    ModelMessage::text(
+        ModelRole::System,
+        format!(
+            "HOST SAFETY FACT: unresolved Tool effect; never retry automatically.\neffect_call_id: {}\nmodel_call_id: {}\ntool: {}\nobservation: {}\nresolution: explicit Host reconciliation is required",
+            effect_call_id, model_call_id, tool_name, message
         ),
     )
 }
@@ -520,18 +559,51 @@ pub fn select_compaction_source(
         }
     }
     let source_len = records.len().saturating_sub(policy.keep_recent_records);
-    let source = &records[..source_len];
-    if source.len() < policy.minimum_source_records
-        || source.iter().any(|record| {
-            record.run_id == *current_run_id
-                || matches!(record.payload, AgentSessionEvent::SkillActivated { .. })
+    let shadowed = records
+        .iter()
+        .filter_map(|record| match &record.payload {
+            AgentSessionEvent::CompactionCommitted { source, .. } => Some(source),
+            _ => None,
         })
-    {
-        return None;
+        .collect::<Vec<_>>();
+    let mut segment_start = None;
+    let mut segment_end = 0;
+    for record in &records[..source_len] {
+        let is_shadowed = shadowed
+            .iter()
+            .any(|source| source.contains(record.session_seq));
+        let is_barrier = record.run_id == *current_run_id
+            || match &record.payload {
+                AgentSessionEvent::SkillActivated { .. }
+                | AgentSessionEvent::EffectUncertaintyCommitted { .. } => true,
+                AgentSessionEvent::ToolExchangeCommitted {
+                    retained_artifacts, ..
+                } => !retained_artifacts.is_empty(),
+                _ => false,
+            };
+        if is_shadowed || is_barrier {
+            if let Some(start) = segment_start {
+                if segment_end - start + 1 >= policy.minimum_source_records as u64 {
+                    return Some(SessionSourceRange {
+                        first_session_seq: start,
+                        last_session_seq: segment_end,
+                    });
+                }
+            }
+            segment_start = None;
+            continue;
+        }
+        segment_start.get_or_insert(record.session_seq);
+        segment_end = record.session_seq;
     }
-    Some(SessionSourceRange {
-        first_session_seq: 1,
-        last_session_seq: source.last()?.session_seq,
+    segment_start.and_then(|start| {
+        if segment_end - start + 1 >= policy.minimum_source_records as u64 {
+            return Some(SessionSourceRange {
+                first_session_seq: start,
+                last_session_seq: segment_end,
+            });
+        }
+        None
     })
 }
 
@@ -969,10 +1041,12 @@ impl AgentSessionCompactor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orchestral_core::agent_protocol::wire::{ArtifactRef, ArtifactRefWithDigest};
     use orchestral_core::agent_session::{
         AgentSessionEvent, AgentSessionEventDraft, InMemoryAgentSessionJournalStore,
     };
     use orchestral_core::model_protocol::{ModelContent, ModelRequestId, ModelToolCallId};
+    use orchestral_core::tool_protocol::ToolCallId;
     use serde_json::json;
 
     struct FixedSummarizer;
@@ -1130,6 +1204,7 @@ mod tests {
                             is_error: false,
                         }],
                     },
+                    retained_artifacts: Vec::new(),
                     usage: None,
                 },
             })
@@ -1402,7 +1477,7 @@ mod tests {
             let old_tail = ModelMessage::text(ModelRole::User, format!("old-tail-{case}"));
             let current_input =
                 ModelMessage::text(ModelRole::User, format!("current-input-{case}"));
-            let mut records = Vec::with_capacity(7);
+            let mut records = Vec::with_capacity(9);
             push_session_record(
                 &mut records,
                 &session_id,
@@ -1421,6 +1496,7 @@ mod tests {
                     request_id: ModelRequestId::new(format!("old-request-{case}")),
                     assistant: old_assistant.clone(),
                     tool: old_tool.clone(),
+                    retained_artifacts: Vec::new(),
                     usage: None,
                 },
             );
@@ -1456,6 +1532,18 @@ mod tests {
 
             let current_exchange = (case % 2 == 0).then(|| {
                 let call_id = ModelToolCallId::new(format!("current-call-{case}"));
+                let retained_artifacts = if case % 4 == 0 {
+                    vec![ArtifactRefWithDigest {
+                        artifact_ref: ArtifactRef::new(format!("replay-artifact-{case}")),
+                        digest: Digest::sha256(format!("replay-artifact-bytes-{case}")),
+                    }]
+                } else {
+                    Vec::new()
+                };
+                let result = retained_artifacts.first().map_or_else(
+                    || json!({ "current_result": case + 1 }),
+                    |artifact| json!({"kind": "artifact", "artifact": artifact}),
+                );
                 (
                     ModelMessage {
                         role: ModelRole::Assistant,
@@ -1469,13 +1557,14 @@ mod tests {
                         role: ModelRole::Tool,
                         content: vec![ModelContent::ToolResult {
                             call_id,
-                            result: json!({ "current_result": case + 1 }),
+                            result,
                             is_error: false,
                         }],
                     },
+                    retained_artifacts,
                 )
             });
-            if let Some((assistant, tool)) = &current_exchange {
+            if let Some((assistant, tool, retained_artifacts)) = &current_exchange {
                 push_session_record(
                     &mut records,
                     &session_id,
@@ -1485,6 +1574,7 @@ mod tests {
                         request_id: ModelRequestId::new(format!("current-request-{case}")),
                         assistant: assistant.clone(),
                         tool: tool.clone(),
+                        retained_artifacts: retained_artifacts.clone(),
                         usage: None,
                     },
                 );
@@ -1518,6 +1608,25 @@ mod tests {
                 );
                 compacted_traces += 1;
             }
+            let uncertainty = (case % 5 == 0).then(|| {
+                let effect_call_id = ToolCallId::new(format!("replay-effect-{case}"));
+                let model_call_id = ModelToolCallId::new(format!("replay-model-call-{case}"));
+                let tool_name = "replay-effect-tool".to_owned();
+                let message = "effect acknowledgement missing".to_owned();
+                push_session_record(
+                    &mut records,
+                    &session_id,
+                    &old_run_id,
+                    case,
+                    AgentSessionEvent::EffectUncertaintyCommitted {
+                        effect_call_id: effect_call_id.clone(),
+                        model_call_id: model_call_id.clone(),
+                        tool_name: tool_name.clone(),
+                        message: message.clone(),
+                    },
+                );
+                effect_uncertainty_message(&effect_call_id, &model_call_id, &tool_name, &message)
+            });
             validate_session_trace(&session_id, &records).unwrap();
 
             let persisted_bytes = serde_json::to_vec(&records).unwrap();
@@ -1540,9 +1649,12 @@ mod tests {
                     current_input,
                 ]
             };
-            if let Some((assistant, tool)) = current_exchange {
+            if let Some((assistant, tool, _)) = current_exchange {
                 online.push(assistant);
                 online.push(tool);
+            }
+            if let Some(uncertainty) = uncertainty {
+                online.insert(usize::from(compacted), uncertainty);
             }
             assert_eq!(replayed, online);
             let replayed_calls = replayed
@@ -1632,17 +1744,32 @@ mod tests {
                 assert_eq!(first, second);
 
                 let source_len = record_count.saturating_sub(keep_recent_records);
-                let expected = (record_count >= minimum_source_records + keep_recent_records
-                    && current_sequence as usize > source_len)
-                    .then_some(SessionSourceRange {
+                let expected = if record_count < minimum_source_records + keep_recent_records {
+                    None
+                } else if current_sequence as usize > source_len {
+                    Some(SessionSourceRange {
                         first_session_seq: 1,
                         last_session_seq: source_len as u64,
-                    });
+                    })
+                } else if current_sequence.saturating_sub(1) >= minimum_source_records as u64 {
+                    Some(SessionSourceRange {
+                        first_session_seq: 1,
+                        last_session_seq: current_sequence - 1,
+                    })
+                } else if source_len as u64 - current_sequence >= minimum_source_records as u64 {
+                    Some(SessionSourceRange {
+                        first_session_seq: current_sequence + 1,
+                        last_session_seq: source_len as u64,
+                    })
+                } else {
+                    None
+                };
                 assert_eq!(first, expected);
 
                 if let Some(source) = first {
                     source.validate().unwrap();
-                    let source_records = &records[..source.last_session_seq as usize];
+                    let source_records = &records
+                        [(source.first_session_seq - 1) as usize..source.last_session_seq as usize];
                     assert!(source_records.len() >= minimum_source_records);
                     assert!(source_records
                         .iter()
@@ -1661,9 +1788,111 @@ mod tests {
         assert!(deferred > 0);
     }
 
+    #[test]
+    fn compaction_advances_around_artifact_and_uncertain_effect_barriers() {
+        let session_id = AgentSessionId::new("barrier-session");
+        let old_run_id = RunId::new("barrier-old-run");
+        let current_run_id = RunId::new("barrier-current-run");
+        let artifact = ArtifactRefWithDigest {
+            artifact_ref: ArtifactRef::new("barrier-artifact"),
+            digest: Digest::sha256("barrier-artifact-bytes"),
+        };
+        let artifact_call = ModelToolCallId::new("barrier-artifact-call");
+        let artifact_exchange = AgentSessionEvent::ToolExchangeCommitted {
+            request_id: ModelRequestId::new("barrier-artifact-request"),
+            assistant: ModelMessage {
+                role: ModelRole::Assistant,
+                content: vec![ModelContent::ToolCall {
+                    call_id: artifact_call.clone(),
+                    name: "artifact_source".to_owned(),
+                    arguments: json!({}),
+                }],
+            },
+            tool: ModelMessage {
+                role: ModelRole::Tool,
+                content: vec![ModelContent::ToolResult {
+                    call_id: artifact_call,
+                    result: json!({"artifact": artifact.clone()}),
+                    is_error: false,
+                }],
+            },
+            retained_artifacts: vec![artifact],
+            usage: None,
+        };
+        let mut records = Vec::new();
+        for sequence in 1..=12_u64 {
+            let payload = match sequence {
+                4 => artifact_exchange.clone(),
+                8 => AgentSessionEvent::EffectUncertaintyCommitted {
+                    effect_call_id: ToolCallId::new("barrier-effect"),
+                    model_call_id: ModelToolCallId::new("barrier-model-call"),
+                    tool_name: "dangerous_tool".to_owned(),
+                    message: "effect may have happened".to_owned(),
+                },
+                _ => AgentSessionEvent::RunInputCommitted {
+                    message: ModelMessage::text(
+                        ModelRole::User,
+                        format!("barrier-history-{sequence}"),
+                    ),
+                },
+            };
+            push_session_record(&mut records, &session_id, &old_run_id, sequence, payload);
+        }
+        let policy = SessionCompactionPolicy {
+            minimum_source_records: 3,
+            keep_recent_records: 2,
+        };
+        let first = select_compaction_source(&records, &current_run_id, &policy).unwrap();
+        assert_eq!(
+            first,
+            SessionSourceRange {
+                first_session_seq: 1,
+                last_session_seq: 3,
+            }
+        );
+        let source_digest = session_range_digest(&records, &first).unwrap();
+        push_session_record(
+            &mut records,
+            &session_id,
+            &old_run_id,
+            "first-compaction",
+            AgentSessionEvent::CompactionCommitted {
+                source: first,
+                source_digest,
+                policy_digest: policy.digest().unwrap(),
+                summary_config_digest: Digest::sha256("barrier-summary-config"),
+                summary: ModelMessage::text(ModelRole::System, "first barrier summary"),
+                strategy: "barrier-test".to_owned(),
+                model: None,
+                version: "1".to_owned(),
+            },
+        );
+        for sequence in 14..=18_u64 {
+            push_session_record(
+                &mut records,
+                &session_id,
+                &old_run_id,
+                sequence,
+                AgentSessionEvent::RunInputCommitted {
+                    message: ModelMessage::text(
+                        ModelRole::User,
+                        format!("post-compaction-{sequence}"),
+                    ),
+                },
+            );
+        }
+        let second = select_compaction_source(&records, &current_run_id, &policy).unwrap();
+        assert_eq!(
+            second,
+            SessionSourceRange {
+                first_session_seq: 5,
+                last_session_seq: 7,
+            }
+        );
+    }
+
     #[tokio::test]
-    async fn ten_thousand_generated_context_budgets_never_overflow_or_evict_a_fittable_recent_prefix(
-    ) {
+    async fn ten_thousand_generated_long_histories_retain_every_fittable_safety_and_task_anchor() {
         const HISTORIES: usize = 100;
         const CONFIGS_PER_HISTORY: usize = 100;
 
@@ -1715,6 +1944,7 @@ mod tests {
                                 is_error: false,
                             }],
                         },
+                        retained_artifacts: Vec::new(),
                         usage: None,
                     }
                 } else {
@@ -1734,6 +1964,58 @@ mod tests {
                 )
                 .await;
             }
+            let artifact = ArtifactRefWithDigest {
+                artifact_ref: ArtifactRef::new(format!("artifact-{history_index}")),
+                digest: Digest::sha256(format!("artifact-bytes-{history_index}")),
+            };
+            let artifact_call_id = ModelToolCallId::new(format!("artifact-call-{history_index}"));
+            append_session_payload(
+                &store,
+                &session_id,
+                &old_run_id,
+                format!("budget-artifact-{history_index}"),
+                AgentSessionEvent::ToolExchangeCommitted {
+                    request_id: ModelRequestId::new(format!("artifact-request-{history_index}")),
+                    assistant: ModelMessage {
+                        role: ModelRole::Assistant,
+                        content: vec![ModelContent::ToolCall {
+                            call_id: artifact_call_id.clone(),
+                            name: "artifact_source".to_owned(),
+                            arguments: json!({}),
+                        }],
+                    },
+                    tool: ModelMessage {
+                        role: ModelRole::Tool,
+                        content: vec![ModelContent::ToolResult {
+                            call_id: artifact_call_id,
+                            result: json!({
+                                "kind": "artifact",
+                                "artifact": artifact.clone(),
+                                "summary": "bounded generated Artifact"
+                            }),
+                            is_error: false,
+                        }],
+                    },
+                    retained_artifacts: vec![artifact.clone()],
+                    usage: None,
+                },
+            )
+            .await;
+            let uncertain_effect_call = format!("uncertain-effect-{history_index}");
+            let uncertain_model_call = format!("uncertain-model-call-{history_index}");
+            append_session_payload(
+                &store,
+                &session_id,
+                &old_run_id,
+                format!("budget-uncertain-effect-{history_index}"),
+                AgentSessionEvent::EffectUncertaintyCommitted {
+                    effect_call_id: ToolCallId::new(&uncertain_effect_call),
+                    model_call_id: ModelToolCallId::new(&uncertain_model_call),
+                    tool_name: "generated_effect".to_owned(),
+                    message: "dispatch acknowledgement was lost".to_owned(),
+                },
+            )
+            .await;
             append_session_payload(
                 &store,
                 &session_id,
@@ -1747,6 +2029,40 @@ mod tests {
                 },
             )
             .await;
+            for (kind, tool_name) in [
+                ("pending-input", "orchestral_request_input"),
+                ("pending-approval", "approval_guarded_tool"),
+            ] {
+                let call_id = ModelToolCallId::new(format!("{kind}-call-{history_index}"));
+                append_session_payload(
+                    &store,
+                    &session_id,
+                    &current_run_id,
+                    format!("budget-{kind}-{history_index}"),
+                    AgentSessionEvent::ToolExchangeCommitted {
+                        request_id: ModelRequestId::new(format!("{kind}-request-{history_index}")),
+                        assistant: ModelMessage {
+                            role: ModelRole::Assistant,
+                            content: vec![ModelContent::ToolCall {
+                                call_id: call_id.clone(),
+                                name: tool_name.to_owned(),
+                                arguments: json!({"marker": kind}),
+                            }],
+                        },
+                        tool: ModelMessage {
+                            role: ModelRole::Tool,
+                            content: vec![ModelContent::ToolResult {
+                                call_id,
+                                result: json!({"status": "resolved", "marker": kind}),
+                                is_error: false,
+                            }],
+                        },
+                        retained_artifacts: Vec::new(),
+                        usage: None,
+                    },
+                )
+                .await;
+            }
 
             let records = store.load_session(&session_id).await.unwrap();
             let groups = replay_groups(&records, &current_run_id, &BTreeMap::new()).unwrap();
@@ -1835,6 +2151,14 @@ mod tests {
                     })
                     .collect::<BTreeSet<_>>();
                 assert!(pinned.is_subset(&selected));
+                let rendered = serde_json::to_string(&projection.messages).unwrap();
+                assert!(rendered.contains("stable system policy"));
+                assert!(rendered.contains(&format!("current-task-{history_index}")));
+                assert!(rendered.contains(artifact.artifact_ref.as_str()));
+                assert!(rendered.contains(&uncertain_effect_call));
+                assert!(rendered.contains(&uncertain_model_call));
+                assert!(rendered.contains(&format!("pending-input-call-{history_index}")));
+                assert!(rendered.contains(&format!("pending-approval-call-{history_index}")));
                 let eligible_history = old_keys
                     .iter()
                     .take(history_limit)

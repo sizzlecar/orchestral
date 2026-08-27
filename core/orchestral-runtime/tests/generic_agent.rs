@@ -5086,6 +5086,7 @@ async fn run_skill_recovery(state: SkillRecoveryState) -> Vec<ModelMessage> {
                                 is_error: false,
                             }],
                         },
+                        retained_artifacts: Vec::new(),
                         usage: None,
                     },
                 })
@@ -5427,15 +5428,31 @@ async fn run_direct_tool_recovery(effect_state: DirectEffectRecoveryState) {
             assert_eq!(view.state.status(), AgentRunStatus::Failed);
             assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
             assert_eq!(replacement_model.rounds.load(Ordering::SeqCst), 1);
-            assert!(session_journal
+            let records = session_journal
                 .load_session(&session_id)
                 .await
-                .expect("failed Session Journal remains readable")
-                .iter()
-                .all(|record| !matches!(
-                    &record.payload,
-                    AgentSessionEvent::ToolExchangeCommitted { .. }
-                )));
+                .expect("failed Session Journal remains readable");
+            assert!(records.iter().all(|record| !matches!(
+                &record.payload,
+                AgentSessionEvent::ToolExchangeCommitted { .. }
+            )));
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|record| matches!(
+                        &record.payload,
+                        AgentSessionEvent::EffectUncertaintyCommitted {
+                            effect_call_id,
+                            model_call_id,
+                            tool_name,
+                            ..
+                        } if effect_call_id.as_str() == "echo-call"
+                            && model_call_id.as_str() == "echo-call"
+                            && tool_name == "echo"
+                    ))
+                    .count(),
+                1
+            );
         }
     }
     assert_eq!(
@@ -7272,14 +7289,24 @@ async fn generic_agent_journals_only_artifact_reference_and_summary_for_large_to
     assert!(records.iter().any(|record| {
         matches!(
             &record.payload,
-            AgentSessionEvent::ToolExchangeCommitted { tool, .. }
+            AgentSessionEvent::ToolExchangeCommitted {
+                tool,
+                retained_artifacts,
+                ..
+            }
                 if tool.content.iter().any(|content| matches!(
                     content,
                     ModelContent::ToolResult { result, is_error: false, .. }
                         if result["kind"] == json!("artifact")
                             && result["artifact"]["artifact_ref"].as_str().is_some()
                             && result["summary"].as_str().is_some()
-                ))
+                )) && retained_artifacts.len() == 1
+                    && retained_artifacts[0].artifact_ref.as_str()
+                        == tool.content.iter().find_map(|content| match content {
+                            ModelContent::ToolResult { result, .. } =>
+                                result["artifact"]["artifact_ref"].as_str(),
+                            _ => None,
+                        }).unwrap()
         )
     }));
 }

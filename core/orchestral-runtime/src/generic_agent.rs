@@ -21,12 +21,13 @@ use orchestral_core::agent_protocol::{
         AgentExecutionRef, AgentFailure, AgentId, AgentProtocolError, AgentProtocolErrorCode,
         AgentProviderId, AgentProviderStreamItem, AgentRejection, AgentRejectionCode,
         AgentStartRequest, AgentTelemetry, AgentTelemetryEnvelope, ApprovalDecision,
-        BindingRequirement, CancelSupport, CommandId, Content, ContentBody, ControlCapabilities,
-        DeliveryId, Digest, EffectMediation, IncompleteReason, OutputId, PartialDelivery,
-        PartialDeliveryId, PendingRequest, PendingRequestKind, PendingRequestPayload, Provenance,
-        ProviderCommandDisposition, ProviderCommandOutcome, RequestId, RequestResolution,
-        ResourceBindingMode, ResourceBindingSkip, ResourceBindingSkipCode, ResourceCapability,
-        ResourceKind, RunId, RunLimitKind, TelemetryId, UsageReport,
+        ArtifactRefWithDigest, BindingRequirement, CancelSupport, CommandId, Content, ContentBody,
+        ControlCapabilities, DeliveryId, Digest, EffectMediation, IncompleteReason, OutputId,
+        PartialDelivery, PartialDeliveryId, PendingRequest, PendingRequestKind,
+        PendingRequestPayload, Provenance, ProviderCommandDisposition, ProviderCommandOutcome,
+        RequestId, RequestResolution, ResourceBindingMode, ResourceBindingSkip,
+        ResourceBindingSkipCode, ResourceCapability, ResourceKind, RunId, RunLimitKind,
+        TelemetryId, UsageReport,
     },
     AGENT_PROTOCOL_V1,
 };
@@ -2601,6 +2602,7 @@ fn stage_loop_recovery(
                 *round,
                 request_id,
                 expected_exchange.as_ref(),
+                &[],
                 observation.usage.as_ref(),
             )
             .await?;
@@ -2686,12 +2688,18 @@ fn stage_loop_recovery(
                 )?,
                 None => None,
             };
+            let expected_retained_artifacts = prepared
+                .replayed_outcome
+                .as_ref()
+                .map(retained_artifacts_for_outcome)
+                .unwrap_or_default();
             let session_exchange_seq = recovered_tool_exchange_committed(
                 &inner,
                 &request,
                 *round,
                 request_id,
                 expected_exchange.as_ref(),
+                &expected_retained_artifacts,
                 observation.usage.as_ref(),
             )
             .await?;
@@ -2930,6 +2938,7 @@ fn stage_loop_recovery(
                 *round,
                 request_id,
                 Some(&expected_exchange),
+                &[],
                 observation.usage.as_ref(),
             )
             .await?;
@@ -3035,6 +3044,7 @@ fn stage_loop_recovery(
                         "Session Tool exchange cannot be backed by an unknown effect",
                     ));
                 }
+                let retained_artifacts = retained_artifacts_for_outcome(&outcome);
                 let (result, is_error) = model_tool_result(outcome);
                 let (assistant, tool) = observed_tool_exchange_messages(
                     observation,
@@ -3047,6 +3057,7 @@ fn stage_loop_recovery(
                     request_id: request_id.clone(),
                     assistant,
                     tool,
+                    retained_artifacts,
                     usage: observation.usage.clone(),
                 };
                 if record.payload != expected_payload {
@@ -4098,6 +4109,7 @@ async fn execute_model_run(execution: ModelRunExecution) {
                     };
 
                     let mut tool_results = Vec::with_capacity(parsed_calls.len());
+                    let mut retained_artifacts = BTreeMap::<String, ArtifactRefWithDigest>::new();
                     for (call, arguments) in parsed_calls {
                         if cancellation.is_cancelled() {
                             emit_cancel(&inner, &request, &user_message);
@@ -4254,6 +4266,19 @@ async fn execute_model_run(execution: ModelRunExecution) {
                                     return;
                                 }
                                 WorkflowCallExecution::UnknownEffect(message) => {
+                                    if let Err(failure) = append_effect_uncertainty(
+                                        &inner,
+                                        &request,
+                                        round,
+                                        &call.call_id,
+                                        WORKFLOW_TOOL_NAME,
+                                        &message,
+                                    )
+                                    .await
+                                    {
+                                        emit_failure(&inner, &request, &user_message, failure);
+                                        return;
+                                    }
                                     emit_failure(
                                         &inner,
                                         &request,
@@ -4393,12 +4418,25 @@ async fn execute_model_run(execution: ModelRunExecution) {
                                 return;
                             }
                             GuardedToolResult::Outcome {
-                                outcome: ToolOutcome::UnknownEffect { .. },
+                                outcome: ToolOutcome::UnknownEffect { message },
                                 ..
                             } if cancellation.is_cancelled() => {
                                 // The effect journal deliberately retains UnknownEffect, while
                                 // the Agent Run still observes the user's cancellation as its
                                 // terminal control outcome. A late Tool result is never accepted.
+                                if let Err(failure) = append_effect_uncertainty(
+                                    &inner,
+                                    &request,
+                                    round,
+                                    &call.call_id,
+                                    &call.name,
+                                    &message,
+                                )
+                                .await
+                                {
+                                    emit_failure(&inner, &request, &user_message, failure);
+                                    return;
+                                }
                                 emit_cancel(&inner, &request, &user_message);
                                 return;
                             }
@@ -4406,6 +4444,19 @@ async fn execute_model_run(execution: ModelRunExecution) {
                                 outcome: ToolOutcome::UnknownEffect { message },
                                 ..
                             } => {
+                                if let Err(failure) = append_effect_uncertainty(
+                                    &inner,
+                                    &request,
+                                    round,
+                                    &call.call_id,
+                                    &call.name,
+                                    &message,
+                                )
+                                .await
+                                {
+                                    emit_failure(&inner, &request, &user_message, failure);
+                                    return;
+                                }
                                 emit_failure(
                                     &inner,
                                     &request,
@@ -4422,6 +4473,12 @@ async fn execute_model_run(execution: ModelRunExecution) {
                                 return;
                             }
                             GuardedToolResult::Outcome { outcome, .. } => {
+                                for artifact in retained_artifacts_for_outcome(&outcome) {
+                                    retained_artifacts.insert(
+                                        artifact.artifact_ref.as_str().to_owned(),
+                                        artifact,
+                                    );
+                                }
                                 let (result, is_error) = model_tool_result(outcome);
                                 tool_results.push(ModelContent::ToolResult {
                                     call_id: call.call_id,
@@ -4448,6 +4505,7 @@ async fn execute_model_run(execution: ModelRunExecution) {
                                 request_id: model_request.request_id.clone(),
                                 assistant: assistant_message.clone(),
                                 tool: tool_message.clone(),
+                                retained_artifacts: retained_artifacts.into_values().collect(),
                                 usage: committed_usage,
                             },
                         },
@@ -4571,6 +4629,7 @@ async fn resume_observed_workflow_output(
                     request_id: model_request_id,
                     assistant: assistant_message,
                     tool: tool_message,
+                    retained_artifacts: Vec::new(),
                     usage: observation.usage,
                 },
             },
@@ -4733,6 +4792,19 @@ async fn resume_observed_workflow(
             return;
         }
         WorkflowCallExecution::UnknownEffect(message) => {
+            if let Err(failure) = append_effect_uncertainty(
+                &inner,
+                &request,
+                round,
+                &call.call_id,
+                WORKFLOW_TOOL_NAME,
+                &message,
+            )
+            .await
+            {
+                emit_failure(&inner, &request, &user_message, failure);
+                return;
+            }
             emit_failure(
                 &inner,
                 &request,
@@ -4779,6 +4851,7 @@ async fn resume_observed_workflow(
                 request_id: model_request_id,
                 assistant: assistant_message,
                 tool: tool_message,
+                retained_artifacts: Vec::new(),
                 usage: observation.usage,
             },
         },
@@ -4936,6 +5009,7 @@ async fn resume_observed_skill(
                 request_id: model_request_id,
                 assistant: assistant_message.clone(),
                 tool: tool_message.clone(),
+                retained_artifacts: Vec::new(),
                 usage: observation.usage,
             },
         },
@@ -5326,7 +5400,7 @@ async fn continue_observed_tool(
     guarded: GuardedToolResult,
 ) {
     let run_id = request.run.spec.run_id.clone();
-    let (result, is_error) = match guarded {
+    let (result, is_error, retained_artifacts) = match guarded {
         GuardedToolResult::ApprovalRequired { binding, .. } => {
             emit_failure(
                 &inner,
@@ -5344,9 +5418,22 @@ async fn continue_observed_tool(
             return;
         }
         GuardedToolResult::Outcome {
-            outcome: ToolOutcome::UnknownEffect { .. },
+            outcome: ToolOutcome::UnknownEffect { message },
             ..
         } if cancellation.is_cancelled() => {
+            if let Err(failure) = append_effect_uncertainty(
+                &inner,
+                &request,
+                round,
+                &call.call_id,
+                &call.name,
+                &message,
+            )
+            .await
+            {
+                emit_failure(&inner, &request, &user_message, failure);
+                return;
+            }
             emit_cancel(&inner, &request, &user_message);
             return;
         }
@@ -5354,6 +5441,19 @@ async fn continue_observed_tool(
             outcome: ToolOutcome::UnknownEffect { message },
             ..
         } => {
+            if let Err(failure) = append_effect_uncertainty(
+                &inner,
+                &request,
+                round,
+                &call.call_id,
+                &call.name,
+                &message,
+            )
+            .await
+            {
+                emit_failure(&inner, &request, &user_message, failure);
+                return;
+            }
             emit_failure(
                 &inner,
                 &request,
@@ -5369,7 +5469,11 @@ async fn continue_observed_tool(
             emit_cancel(&inner, &request, &user_message);
             return;
         }
-        GuardedToolResult::Outcome { outcome, .. } => model_tool_result(outcome),
+        GuardedToolResult::Outcome { outcome, .. } => {
+            let retained_artifacts = retained_artifacts_for_outcome(&outcome);
+            let (result, is_error) = model_tool_result(outcome);
+            (result, is_error, retained_artifacts)
+        }
     };
     let (assistant_message, tool_message) =
         observed_tool_exchange_messages(&observation, &call, &arguments, &result, is_error);
@@ -5386,6 +5490,7 @@ async fn continue_observed_tool(
                 request_id: model_request_id,
                 assistant: assistant_message.clone(),
                 tool: tool_message.clone(),
+                retained_artifacts,
                 usage: observation.usage,
             },
         },
@@ -5507,6 +5612,7 @@ async fn recovered_tool_exchange_committed(
     round: u64,
     request_id: &ModelRequestId,
     expected_messages: Option<&(ModelMessage, ModelMessage)>,
+    retained_artifacts: &[ArtifactRefWithDigest],
     usage: Option<&ModelUsage>,
 ) -> Result<Option<u64>, AgentProtocolError> {
     let Some(record) = recovered_tool_exchange_record(inner, request, round, request_id).await?
@@ -5523,6 +5629,7 @@ async fn recovered_tool_exchange_committed(
         request_id: request_id.clone(),
         assistant: assistant.clone(),
         tool: tool.clone(),
+        retained_artifacts: retained_artifacts.to_vec(),
         usage: usage.cloned(),
     };
     if record.payload != expected_payload {
@@ -5651,6 +5758,7 @@ async fn prepare_recovered_skill(
             request_id: request_id.clone(),
             assistant,
             tool,
+            retained_artifacts: Vec::new(),
             usage: observation.usage.clone(),
         };
         if record.payload != expected {
@@ -5757,6 +5865,7 @@ async fn resume_observed_input(
                     request_id: model_request_id,
                     assistant: assistant_message.clone(),
                     tool: tool_message.clone(),
+                    retained_artifacts: Vec::new(),
                     usage: observation.usage,
                 },
             },
@@ -7036,6 +7145,15 @@ fn model_tool_result(outcome: ToolOutcome) -> (serde_json::Value, bool) {
     }
 }
 
+fn retained_artifacts_for_outcome(outcome: &ToolOutcome) -> Vec<ArtifactRefWithDigest> {
+    match outcome {
+        ToolOutcome::Completed {
+            output: ToolOutput::Artifact(artifact),
+        } => vec![artifact.artifact.clone()],
+        _ => Vec::new(),
+    }
+}
+
 fn merge_usage(total: &mut ModelUsage, observed: ModelUsage) {
     total.input_tokens = add_optional(total.input_tokens, observed.input_tokens);
     total.output_tokens = add_optional(total.output_tokens, observed.output_tokens);
@@ -8049,6 +8167,35 @@ async fn append_session_event(
         .await
         .map(|_| ())
         .map_err(session_journal_failure)
+}
+
+async fn append_effect_uncertainty(
+    inner: &GenericInner,
+    request: &AgentStartRequest,
+    round: u64,
+    model_call_id: &ModelToolCallId,
+    tool_name: &str,
+    message: &str,
+) -> Result<(), AgentFailure> {
+    append_session_event(
+        inner,
+        AgentSessionEventDraft {
+            event_id: AgentSessionEventId::new(format!(
+                "generic-{}-effect-uncertainty-{round}-{}",
+                request.run.spec.run_id.as_str(),
+                model_call_id.as_str()
+            )),
+            session_id: request.run.spec.session_id.clone(),
+            run_id: request.run.spec.run_id.clone(),
+            payload: AgentSessionEvent::EffectUncertaintyCommitted {
+                effect_call_id: ToolCallId::new(model_call_id.as_str()),
+                model_call_id: model_call_id.clone(),
+                tool_name: tool_name.to_owned(),
+                message: message.to_owned(),
+            },
+        },
+    )
+    .await
 }
 
 fn session_journal_failure(error: AgentSessionError) -> AgentFailure {
