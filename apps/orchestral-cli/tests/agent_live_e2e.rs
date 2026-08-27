@@ -17,6 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(120);
+const LIVE_CODING_PROCESS_TIMEOUT: Duration = Duration::from_secs(240);
 const LOCAL_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 const APPROVAL_PROMPT: &str = "Allow this exact operation? [y/N]";
 
@@ -69,6 +70,35 @@ impl TestWorkspace {
                     "kind: openai\n      endpoint: {endpoint}\n      api_key_env: OPENAI_API_KEY"
                 ),
             )
+        });
+    }
+
+    fn disable_shell(&self) {
+        self.rewrite_config(|config| {
+            config.replace(
+                "tools:\n  max_timeout_ms: 30000\n  max_output_bytes: 1048576\n  shell:\n    enabled: true",
+                "tools:\n  max_timeout_ms: 30000\n  max_output_bytes: 1048576\n  shell:\n    enabled: false",
+            )
+        });
+    }
+
+    fn configure_shell_allowed_programs(&self, programs: &[&str]) {
+        self.rewrite_config(|mut config| {
+            let start_marker = "    allowed_programs:\n";
+            let start = config
+                .find(start_marker)
+                .expect("CLI config has a shell allowlist");
+            let end = config[start..]
+                .find("\n\nmcp:")
+                .map(|offset| start + offset)
+                .expect("CLI config shell allowlist ends before MCP config");
+            let mut replacement = start_marker.to_owned();
+            for program in programs {
+                replacement.push_str(&format!("      - {program}\n"));
+            }
+            replacement.pop();
+            config.replace_range(start..end, &replacement);
+            config
         });
     }
 
@@ -196,6 +226,200 @@ fn terminal_model_failure_is_non_zero_and_preserves_the_reason() {
 }
 
 #[test]
+fn local_cli_creates_and_verifies_a_file_with_shell_disabled() {
+    const CONTEXT_MARKER: &str = "需求上下文=雪豹-7319🧩";
+    const GENERATED_CONTENT: &str = "generated from 雪豹-7319🧩\n";
+
+    let workspace = TestWorkspace::new("patch-without-shell");
+    fs::write(
+        workspace.path("request.txt"),
+        format!("{CONTEXT_MARKER}\nCreate generated.txt from this request.\n"),
+    )
+    .expect("write patch request fixture");
+    workspace.disable_shell();
+
+    let (model_endpoint, model_server) = spawn_fixture_http_server(vec![
+        Box::new(|request| {
+            assert_eq!(
+                model_request_tool_names(&request.body),
+                vec![
+                    "apply_patch",
+                    "artifact_read",
+                    "file_read",
+                    "orchestral_request_input"
+                ]
+            );
+            openai_tool_response("read-request", "file_read", json!({"path": "request.txt"}))
+        }),
+        Box::new(|request| {
+            assert!(model_request_text(&request.body).contains(CONTEXT_MARKER));
+            openai_tool_response(
+                "create-generated",
+                "apply_patch",
+                json!({
+                    "patch": concat!(
+                        "*** Begin Patch\n",
+                        "*** Add File: generated.txt\n",
+                        "+generated from 雪豹-7319🧩\n",
+                        "*** End Patch"
+                    )
+                }),
+            )
+        }),
+        Box::new(|request| {
+            let context = model_request_text(&request.body);
+            assert!(context.contains("\"operation\":\"add\""), "{context}");
+            openai_tool_response(
+                "verify-generated",
+                "file_read",
+                json!({"path": "generated.txt"}),
+            )
+        }),
+        Box::new(|request| {
+            assert!(model_request_text(&request.body).contains(GENERATED_CONTENT.trim_end()));
+            openai_text_response("PATCH_WITHOUT_SHELL_OK")
+        }),
+    ]);
+    workspace.configure_local_openai(&model_endpoint);
+
+    let output = run_to_completion(
+        local_agent_command(
+            &workspace,
+            "patch-without-shell-session",
+            concat!(
+                "Use workspace Tools to inspect the request, make the requested file change, ",
+                "verify the resulting file, then report only the success marker."
+            ),
+            "Read request.txt, implement its request, and verify the result.",
+            true,
+            true,
+        ),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    assert!(output.status.success(), "{}", output.stderr_text());
+    assert_eq!(output.stdout_text().trim(), "PATCH_WITHOUT_SHELL_OK");
+    assert_eq!(
+        fs::read_to_string(workspace.path("generated.txt")).unwrap(),
+        GENERATED_CONTENT
+    );
+    output.assert_no_ansi();
+
+    let requests = model_server.join().expect("join local model server");
+    assert_eq!(requests.len(), 4);
+    let records = session_records(&workspace);
+    let exchanges = tool_exchanges(&records);
+    assert_eq!(exchanges.len(), 3);
+    assert_eq!(tool_name(exchanges[0]), Some("file_read"));
+    assert_eq!(tool_name(exchanges[1]), Some("apply_patch"));
+    assert_eq!(tool_name(exchanges[2]), Some("file_read"));
+    assert!(exchanges
+        .iter()
+        .all(|exchange| tool_result_is_error(exchange) == Some(false)));
+}
+
+#[test]
+fn local_cli_reads_patches_and_runs_a_guarded_verification() {
+    let workspace = TestWorkspace::new("patch-and-verify");
+    fs::create_dir_all(workspace.path("src")).expect("create source directory");
+    fs::write(
+        workspace.path("src/lib.rs"),
+        "pub fn answer() -> u32 { 41 }\n",
+    )
+    .expect("write buggy source fixture");
+
+    let (model_endpoint, model_server) = spawn_fixture_http_server(vec![
+        Box::new(|request| {
+            assert!(model_request_has_tool(&request.body, "file_read"));
+            assert!(model_request_has_tool(&request.body, "apply_patch"));
+            assert!(model_request_has_tool(&request.body, "shell"));
+            openai_tool_response(
+                "read-buggy-source",
+                "file_read",
+                json!({"path": "src/lib.rs"}),
+            )
+        }),
+        Box::new(|request| {
+            assert!(model_request_text(&request.body).contains("answer() -> u32 { 41 }"));
+            openai_tool_response(
+                "fix-answer",
+                "apply_patch",
+                json!({
+                    "patch": concat!(
+                        "*** Begin Patch\n",
+                        "*** Update File: src/lib.rs\n",
+                        "@@\n",
+                        "-pub fn answer() -> u32 { 41 }\n",
+                        "+pub fn answer() -> u32 { 42 }\n",
+                        "*** End Patch"
+                    )
+                }),
+            )
+        }),
+        Box::new(|request| {
+            let context = model_request_text(&request.body);
+            assert!(context.contains("\"operation\":\"update\""), "{context}");
+            let rg = model_allowed_program(&request.body, "rg");
+            openai_tool_response(
+                "verify-fixed-source",
+                "shell",
+                json!({
+                    "command": rg,
+                    "args": [
+                        "--fixed-strings",
+                        "pub fn answer() -> u32 { 42 }",
+                        "src/lib.rs"
+                    ],
+                    "fail_on_non_zero": true
+                }),
+            )
+        }),
+        Box::new(|request| {
+            let context = model_request_text(&request.body);
+            assert!(context.contains("\"status\":0"), "{context}");
+            openai_text_response("PATCH_AND_VERIFY_OK")
+        }),
+    ]);
+    workspace.configure_local_openai(&model_endpoint);
+
+    let output = run_with_approval(
+        local_agent_command(
+            &workspace,
+            "patch-and-verify-session",
+            concat!(
+                "Inspect the source, fix the requested behavior with the file mutation Tool, ",
+                "run a guarded verification, then report only the success marker."
+            ),
+            "Fix answer() so it returns the documented answer 42, then verify the change.",
+            true,
+            true,
+        ),
+        true,
+        None,
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    assert!(output.status.success(), "{}", output.stderr_text());
+    assert_eq!(output.stdout_text().trim(), "PATCH_AND_VERIFY_OK");
+    assert_eq!(
+        fs::read_to_string(workspace.path("src/lib.rs")).unwrap(),
+        "pub fn answer() -> u32 { 42 }\n"
+    );
+    assert!(output.stderr_text().contains(APPROVAL_PROMPT));
+    output.assert_no_ansi();
+
+    let requests = model_server.join().expect("join local model server");
+    assert_eq!(requests.len(), 4);
+    let records = session_records(&workspace);
+    let exchanges = tool_exchanges(&records);
+    assert_eq!(exchanges.len(), 3);
+    assert_eq!(tool_name(exchanges[0]), Some("file_read"));
+    assert_eq!(tool_name(exchanges[1]), Some("apply_patch"));
+    assert_eq!(tool_name(exchanges[2]), Some("shell"));
+    assert!(exchanges
+        .iter()
+        .all(|exchange| tool_result_is_error(exchange) == Some(false)));
+}
+
+#[test]
 fn local_cli_activates_a_skill_and_reprojects_its_instructions() {
     const DESCRIPTOR_MARKER: &str = "E2E skill descriptor marker";
     const INSTRUCTION_MARKER: &str = "SKILL_E2E_INSTRUCTION_雪豹_7319";
@@ -250,6 +474,7 @@ fn local_cli_activates_a_skill_and_reprojects_its_instructions() {
         &requests[0].body,
         "orchestral_skill_activate"
     ));
+    assert_single_apply_patch_tool(&requests[0].body);
     let first_context = model_request_text(&requests[0].body);
     assert!(first_context.contains(DESCRIPTOR_MARKER));
     assert!(!first_context.contains(INSTRUCTION_MARKER));
@@ -351,6 +576,7 @@ fn local_cli_discovers_calls_and_journals_an_mcp_tool() {
         &model_requests[0].body,
         "mcp__fixture__lookup_marker"
     ));
+    assert_single_apply_patch_tool(&model_requests[0].body);
     assert!(model_request_text(&model_requests[1].body).contains(MCP_RESULT_MARKER));
 
     let mcp_requests = mcp_server.join().expect("join local MCP server");
@@ -434,6 +660,71 @@ fn live_agent_recovers_after_a_failed_file_read() {
     assert_eq!(tool_result_is_error(exchanges[1]), Some(false));
     assert_ne!(exchanges[0]["request_id"], exchanges[1]["request_id"]);
     assert!(checkpoint_event_count(&workspace, "model_attempt_started") >= 3);
+}
+
+#[test]
+#[ignore = "spends real Google Vertex quota; requires ADC or a service-account credential"]
+fn live_coding_agent_reads_patches_and_verifies_the_change() {
+    let _guard = live_test_guard();
+    let workspace = TestWorkspace::new("live-coding-patch");
+    fs::create_dir_all(workspace.path("src")).expect("create live source directory");
+    fs::write(
+        workspace.path("src/lib.rs"),
+        "pub fn answer() -> u32 { 41 }\n",
+    )
+    .expect("write live buggy source");
+    workspace.configure_shell_allowed_programs(&["rg"]);
+
+    let output = run_with_approval(
+        live_command(
+            &workspace,
+            "live-coding-patch-session",
+            concat!(
+                "For coding tasks, inspect the target before editing, make the smallest scoped ",
+                "change through the file mutation Tool, and ground the final report in a ",
+                "successful verification observation."
+            ),
+            concat!(
+                "Fix src/lib.rs so answer() returns 42. Inspect it first, use apply_patch, then ",
+                "use the available rg command as a guarded verification before finishing."
+            ),
+        ),
+        true,
+        None,
+        LIVE_CODING_PROCESS_TIMEOUT,
+    );
+    assert!(output.status.success(), "{}", output.stderr_text());
+    assert!(!output.stdout_text().trim().is_empty());
+    output.assert_no_ansi();
+
+    let source = fs::read_to_string(workspace.path("src/lib.rs")).expect("read fixed source");
+    assert!(source.contains("42"), "source was not fixed: {source}");
+    assert!(!source.contains("41"), "stale bug remains: {source}");
+
+    let records = session_records(&workspace);
+    let exchanges = tool_exchanges(&records);
+    let trace = exchanges
+        .iter()
+        .filter_map(|exchange| {
+            tool_name(exchange).map(|name| (name, tool_result_is_error(exchange)))
+        })
+        .collect::<Vec<_>>();
+    let read = trace
+        .iter()
+        .position(|(name, error)| *name == "file_read" && *error == Some(false))
+        .expect("live coding run omitted file_read");
+    let patch = trace
+        .iter()
+        .position(|(name, error)| *name == "apply_patch" && *error == Some(false))
+        .expect("live coding run omitted apply_patch");
+    let verify = trace
+        .iter()
+        .position(|(name, error)| *name == "shell" && *error == Some(false))
+        .expect("live coding run omitted guarded verification");
+    assert!(
+        read < patch && patch < verify,
+        "unexpected Tool trace: {trace:?}"
+    );
 }
 
 #[test]
@@ -703,20 +994,23 @@ fn run_with_approval(
     let stderr_reader = thread::spawn(move || read_with_updates(stderr, stderr_updates));
 
     let started = Instant::now();
-    let mut approval_sent = false;
+    let mut approvals_sent = 0_usize;
     let mut exited = None;
     while started.elapsed() < timeout {
         if let Ok(bytes) = receiver.recv_timeout(Duration::from_millis(100)) {
             let text = String::from_utf8_lossy(&bytes);
-            if !approval_sent && text.contains(APPROVAL_PROMPT) {
-                if let Some(target) = target {
-                    assert!(!target.exists(), "effect happened before exact approval");
+            let observed_prompts = text.matches(APPROVAL_PROMPT).count();
+            while approvals_sent < observed_prompts {
+                if approvals_sent == 0 {
+                    if let Some(target) = target {
+                        assert!(!target.exists(), "effect happened before exact approval");
+                    }
                 }
                 stdin
                     .write_all(if allow { b"y\n" } else { b"n\n" })
                     .expect("answer approval prompt");
                 stdin.flush().expect("flush approval answer");
-                approval_sent = true;
+                approvals_sent += 1;
             }
         }
         if let Some(status) = child.try_wait().expect("poll approval child") {
@@ -736,7 +1030,7 @@ fn run_with_approval(
         stderr: stderr_reader.join().expect("join stderr reader"),
     };
     assert!(
-        approval_sent,
+        approvals_sent > 0,
         "CLI never opened an approval request (status={}):\nstdout:\n{}\nstderr:\n{}",
         output.status,
         output.stdout_text(),
@@ -904,7 +1198,7 @@ fn spawn_fixture_http_server(
                 }
             };
             stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
+                .set_read_timeout(Some(Duration::from_secs(20)))
                 .expect("bound fixture read timeout");
             stream
                 .set_write_timeout(Some(Duration::from_secs(5)))
@@ -1043,6 +1337,51 @@ fn model_request_has_tool(request: &Value, name: &str) -> bool {
             .iter()
             .any(|tool| tool["function"]["name"].as_str() == Some(name))
     })
+}
+
+fn model_request_tool_names(request: &Value) -> Vec<&str> {
+    let mut names = request["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    names
+}
+
+fn assert_single_apply_patch_tool(request: &Value) {
+    assert_eq!(
+        model_request_tool_names(request)
+            .into_iter()
+            .filter(|name| *name == "apply_patch")
+            .count(),
+        1,
+        "apply_patch must survive composition exactly once"
+    );
+}
+
+fn model_allowed_program(request: &Value, program: &str) -> String {
+    let description = request["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|tool| tool["function"]["name"].as_str() == Some("shell"))
+        .and_then(|tool| tool["function"]["description"].as_str())
+        .unwrap_or_else(|| panic!("model request omitted the guarded shell descriptor"));
+    let (_, programs) = description
+        .rsplit_once("Allowed programs: ")
+        .unwrap_or_else(|| panic!("shell descriptor omitted its allowlist: {description}"));
+    programs
+        .split(", ")
+        .find(|candidate| {
+            Path::new(candidate)
+                .file_stem()
+                .and_then(|name| name.to_str())
+                == Some(program)
+        })
+        .unwrap_or_else(|| panic!("shell descriptor omitted '{program}': {description}"))
+        .to_owned()
 }
 
 fn model_request_text(request: &Value) -> String {

@@ -45,8 +45,8 @@ use orchestral_model_gemini::{
 };
 use orchestral_model_openai::{OpenAiCompatibleBackend, OpenAiCompatibleConfig};
 use orchestral_runtime::tools::{
-    guarded_artifact_read_descriptor, guarded_file_read_descriptor, GuardedArtifactReadExecutor,
-    GuardedFileReadExecutor,
+    guarded_apply_patch_descriptor, guarded_artifact_read_descriptor, guarded_file_read_descriptor,
+    GuardedApplyPatchExecutor, GuardedArtifactReadExecutor, GuardedFileReadExecutor,
 };
 use orchestral_runtime::{
     AgentClient, AgentControlEvent, AgentController, AgentToolRuntime,
@@ -335,12 +335,14 @@ fn build_cli_tool_runtime(
             .iter()
             .flat_map(GuardedMcpServerConfig::allowed_programs),
     );
-    let mut allowed_effects =
-        BTreeSet::from([EffectScope::FilesystemRead, EffectScope::ArtifactRead]);
+    let mut allowed_effects = BTreeSet::from([
+        EffectScope::FilesystemRead,
+        EffectScope::FilesystemWrite,
+        EffectScope::ArtifactRead,
+    ]);
     if shell_enabled {
         allowed_effects.extend([
             EffectScope::Process,
-            EffectScope::FilesystemWrite,
             EffectScope::EnvironmentRead,
             EffectScope::ExternalSideEffect,
         ]);
@@ -362,11 +364,7 @@ fn build_cli_tool_runtime(
         .iter()
         .flat_map(GuardedMcpServerConfig::sandbox_profiles)
         .collect::<BTreeSet<_>>();
-    let writable_roots = if shell_enabled || mcp_effects.contains(&EffectScope::FilesystemWrite) {
-        BTreeSet::from([workspace.clone()])
-    } else {
-        BTreeSet::new()
-    };
+    let writable_roots = BTreeSet::from([workspace.clone()]);
     let bounds = ToolPolicyBounds {
         allowed_effects,
         approval: ApprovalPolicy::NotRequired,
@@ -437,6 +435,17 @@ fn build_cli_tool_runtime(
             Arc::new(GuardedFileReadExecutor),
         )
         .context("register guarded file_read Tool")?;
+    runtime
+        .register(
+            guarded_apply_patch_descriptor(ToolRestriction {
+                bounds: bounds.clone(),
+            }),
+            Arc::new(
+                GuardedApplyPatchExecutor::new(&workspace)
+                    .context("open apply_patch workspace capability")?,
+            ),
+        )
+        .context("register guarded apply_patch Tool")?;
     if shell_enabled {
         runtime
             .register(
