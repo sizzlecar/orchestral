@@ -109,6 +109,8 @@ pub struct AgentConfig {
     pub max_context_tokens: u64,
     #[serde(default = "default_reserved_output_tokens")]
     pub reserved_output_tokens: u64,
+    #[serde(default)]
+    pub compaction: AgentCompactionConfig,
 }
 
 impl Default for AgentConfig {
@@ -125,8 +127,46 @@ impl Default for AgentConfig {
             history_limit: default_history_limit(),
             max_context_tokens: default_max_context_tokens(),
             reserved_output_tokens: default_reserved_output_tokens(),
+            compaction: AgentCompactionConfig::default(),
         }
     }
+}
+
+/// Host-owned Session compaction policy for the Generic Agent composition.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCompactionConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_compaction_minimum_source_records")]
+    pub minimum_source_records: usize,
+    #[serde(default = "default_compaction_keep_recent_records")]
+    pub keep_recent_records: usize,
+    #[serde(default = "default_compaction_summary_chars")]
+    pub summary_max_chars: usize,
+}
+
+impl Default for AgentCompactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            minimum_source_records: default_compaction_minimum_source_records(),
+            keep_recent_records: default_compaction_keep_recent_records(),
+            summary_max_chars: default_compaction_summary_chars(),
+        }
+    }
+}
+
+fn default_compaction_minimum_source_records() -> usize {
+    32
+}
+
+fn default_compaction_keep_recent_records() -> usize {
+    16
+}
+
+fn default_compaction_summary_chars() -> usize {
+    16 * 1024
 }
 
 fn default_stream_buffer() -> usize {

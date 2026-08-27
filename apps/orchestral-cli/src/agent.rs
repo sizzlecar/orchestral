@@ -47,11 +47,12 @@ use orchestral_runtime::tools::{
     GuardedFileReadExecutor,
 };
 use orchestral_runtime::{
-    AgentClient, AgentControlEvent, AgentController, AgentToolRuntime, GenericAgentCheckpointStore,
-    GenericAgentConfig, GuardedMcpServerConfig, GuardedToolRuntime, InMemoryBlobStore,
+    AgentClient, AgentControlEvent, AgentController, AgentToolRuntime,
+    DeterministicExtractiveSessionSummarizer, GenericAgentCheckpointStore, GenericAgentConfig,
+    GuardedMcpServerConfig, GuardedToolRuntime, InMemoryBlobStore,
     InMemoryGenericAgentCheckpointStore, InMemoryHostApprovalBroker, InternalGenericAgentProvider,
-    JsonSizeTokenMeter, McpToolsAdapterRegistry, SkillActivationPolicy, SkillHostProfile,
-    SkillRoot, SkillRuntime, StdioMcpTransportFactory, ToolArtifactStore,
+    JsonSizeTokenMeter, McpToolsAdapterRegistry, SessionCompactionPolicy, SkillActivationPolicy,
+    SkillHostProfile, SkillRoot, SkillRuntime, StdioMcpTransportFactory, ToolArtifactStore,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
@@ -194,9 +195,28 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
             Arc::new(JsonSizeTokenMeter::default()),
         ),
     }
-    .context("create Generic Agent provider")?
-    .with_checkpoint_store(generic_checkpoint_journal)
-    .context("bind Generic Agent private checkpoint journal")?;
+    .context("create Generic Agent provider")?;
+    let provider = if config.agent.compaction.enabled {
+        provider
+            .with_session_compaction(
+                Arc::new(
+                    DeterministicExtractiveSessionSummarizer::new(
+                        config.agent.compaction.summary_max_chars,
+                    )
+                    .context("configure deterministic Session summarizer")?,
+                ),
+                SessionCompactionPolicy {
+                    minimum_source_records: config.agent.compaction.minimum_source_records,
+                    keep_recent_records: config.agent.compaction.keep_recent_records,
+                },
+            )
+            .context("bind Generic Agent Session compaction")?
+    } else {
+        provider
+    };
+    let provider = provider
+        .with_checkpoint_store(generic_checkpoint_journal)
+        .context("bind Generic Agent private checkpoint journal")?;
     let provider = Arc::new(provider);
     let controller = Arc::new(
         AgentController::with_journal_store(

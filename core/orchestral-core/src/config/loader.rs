@@ -46,6 +46,19 @@ fn validate_config(config: &OrchestralConfig) -> Result<(), ConfigError> {
     if config.agent.reserved_output_tokens >= config.agent.max_context_tokens {
         return invalid("agent.reserved_output_tokens must be below max_context_tokens");
     }
+    if config.agent.compaction.enabled
+        && (config.agent.compaction.minimum_source_records == 0
+            || config.agent.compaction.keep_recent_records == 0
+            || config.agent.compaction.summary_max_chars < 256
+            || config
+                .agent
+                .compaction
+                .minimum_source_records
+                .checked_add(config.agent.compaction.keep_recent_records)
+                .is_none())
+    {
+        return invalid("enabled Agent compaction limits are invalid");
+    }
     if config.tools.max_timeout_ms == 0 || config.tools.max_output_bytes == 0 {
         return invalid("Tool limits must be positive");
     }
@@ -194,6 +207,18 @@ mod tests {
             validate_config(&config),
             Err(ConfigError::Invalid(message)) if message.contains("allowed_programs")
         ));
+    }
+
+    #[test]
+    fn enabled_session_compaction_requires_bounded_positive_limits() {
+        let mut config = OrchestralConfig::default();
+        config.agent.compaction.summary_max_chars = 255;
+        assert!(matches!(
+            validate_config(&config),
+            Err(ConfigError::Invalid(message)) if message.contains("compaction")
+        ));
+        config.agent.compaction.enabled = false;
+        assert!(validate_config(&config).is_ok());
     }
 
     #[test]
