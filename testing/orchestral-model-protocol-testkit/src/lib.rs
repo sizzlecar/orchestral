@@ -5,9 +5,14 @@
 //! cancellation assertions for every model family.
 
 mod fake;
+mod stress;
 mod suite;
 
 pub use fake::ScriptedModelFixture;
+pub use stress::{
+    ModelStreamStressCase, ModelStreamStressFault, ModelStreamStressReport, ModelStreamStressSuite,
+    DEFAULT_MODEL_STREAM_STRESS_CASES,
+};
 pub use suite::{
     ModelConformanceCase, ModelConformanceReport, ModelConformanceResult, ModelConformanceSuite,
     ModelFixtureFactory, ModelFixtureResponse, ModelFixtureScenario,

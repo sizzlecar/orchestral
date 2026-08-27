@@ -809,6 +809,7 @@ mod tests {
     use orchestral_core::model_protocol::{ModelRequestId, ModelToolDefinition};
     use orchestral_model_protocol_testkit::{
         ModelConformanceSuite, ModelFixtureFactory, ModelFixtureResponse, ModelFixtureScenario,
+        ModelStreamStressCase, ModelStreamStressFault, ModelStreamStressSuite,
     };
 
     struct OpenAiConformanceFixture;
@@ -884,6 +885,84 @@ mod tests {
             .run(&OpenAiConformanceFixture)
             .await;
         assert!(report.is_conformant(), "{:#?}", report.results());
+    }
+
+    fn stress_request(case: &ModelStreamStressCase) -> ModelRequest {
+        let mut request = request();
+        request.request_id = case.request_id();
+        request
+    }
+
+    fn stress_wire(case: &ModelStreamStressCase) -> Vec<u8> {
+        let fragments = case.text_fragments();
+        let data = |value: Value| format!("data: {}\n\n", value);
+        match case.fault() {
+            ModelStreamStressFault::MalformedFrame => format!(
+                "{}data: not-json\n\n{}",
+                data(json!({"choices":[{"delta":{"content": fragments[0]}}]})),
+                data(json!({"choices":[{"delta":{"content":"must-not-arrive"},"finish_reason":"stop"}]})),
+            )
+            .into_bytes(),
+            ModelStreamStressFault::BufferedBurst if case.index() % 10 == 3 => data(json!({
+                "choices": [{"delta": {"tool_calls": [
+                    {"index": 0, "id": "burst-a", "function": {"name": "echo", "arguments": "{}"}},
+                    {"index": 1, "id": "burst-b", "function": {"name": "echo", "arguments": "{}"}}
+                ]}}]
+            }))
+            .into_bytes(),
+            ModelStreamStressFault::BufferedBurst => (0..5)
+                .map(|index| {
+                    data(json!({
+                        "choices": [{"delta": {"content": format!("burst-{index}")}}]
+                    }))
+                })
+                .collect::<String>()
+                .into_bytes(),
+            ModelStreamStressFault::None
+            | ModelStreamStressFault::ExtraAfterTerminal
+            | ModelStreamStressFault::CancelBeforePoll => {
+                let mut body = format!(
+                    "{}{}{}data: [DONE]\n\n",
+                    data(json!({"choices":[{"delta":{"content": fragments[0]}}]})),
+                    data(json!({"choices":[{"delta":{"content": fragments[1]},"finish_reason":"stop"}]})),
+                    data(json!({"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":2}})),
+                );
+                if case.fault() == ModelStreamStressFault::ExtraAfterTerminal {
+                    body.push_str(&data(json!({
+                        "choices": [{"delta": {"content": "must-not-arrive"}}]
+                    })));
+                    body.push_str("data: [DONE]\n\n");
+                }
+                body.into_bytes()
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ten_thousand_chunk_fault_and_backpressure_plans_preserve_openai_stream_invariants() {
+        let report = ModelStreamStressSuite::default()
+            .run("openai-compatible", |case| {
+                let cancellation = CancellationToken::new();
+                if case.cancel_before_poll() {
+                    cancellation.cancel();
+                }
+                let chunks = case
+                    .split_wire(&stress_wire(case))
+                    .into_iter()
+                    .map(|chunk| Ok::<Bytes, reqwest::Error>(Bytes::from(chunk)));
+                Ok(openai_event_stream(
+                    stress_request(case),
+                    futures_util::stream::iter(chunks).boxed(),
+                    cancellation,
+                    case.max_buffered_events(),
+                ))
+            })
+            .await;
+        assert!(report.is_conformant(), "{report:#?}");
+        assert_eq!(report.total_cases(), 10_000);
+        assert_eq!(report.successful_cases(), 4_000);
+        assert_eq!(report.protocol_failures(), 4_000);
+        assert_eq!(report.cancellations(), 2_000);
     }
 
     #[test]
