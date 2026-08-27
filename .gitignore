@@ -37,4 +37,5 @@ __pycache__/
 *.py
 .orchestral
 configs/*.runtime.override.yaml
+configs/*.agent.override.yaml
 quan-search-bff

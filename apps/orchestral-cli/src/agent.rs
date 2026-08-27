@@ -40,7 +40,9 @@ use orchestral_mcp_streamable_http::{
     ResolvedCredentialHeader, StreamableHttpMcpTransportConfig, StreamableHttpMcpTransportFactory,
     DEFAULT_MAX_MCP_HTTP_FRAME_BYTES,
 };
-use orchestral_model_gemini::{GeminiAuthentication, GeminiModelBackend, GeminiModelConfig};
+use orchestral_model_gemini::{
+    GeminiAuthentication, GeminiModelBackend, GeminiModelConfig, GoogleCloudAccessTokenProvider,
+};
 use orchestral_model_openai::{OpenAiCompatibleBackend, OpenAiCompatibleConfig};
 use orchestral_runtime::tools::{
     guarded_artifact_read_descriptor, guarded_file_read_descriptor, GuardedArtifactReadExecutor,
@@ -58,11 +60,15 @@ use orchestral_runtime::{
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
 
+use crate::google_auth::{
+    google_adc_is_explicitly_requested, resolve_google_vertex_auth, GoogleCredentialSource,
+};
 use crate::runtime::client::prepare_runtime_config_path;
 use crate::runtime::ModelOverrides;
 
 pub struct AgentRunOptions {
     pub config: Option<PathBuf>,
+    pub credential_file: Option<PathBuf>,
     pub model_overrides: ModelOverrides,
     pub session_id: Option<String>,
     pub system_prompt: Option<String>,
@@ -79,7 +85,11 @@ struct CliJournalStores {
 }
 
 pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
-    let config_path = prepare_runtime_config_path(options.config, &options.model_overrides)?;
+    let config_path = prepare_runtime_config_path(
+        options.config,
+        &options.model_overrides,
+        options.credential_file.as_deref(),
+    )?;
     let config = load_config(&config_path)
         .with_context(|| format!("load Generic Agent config '{}'", config_path.display()))?;
     let (backend, profile, model, temperature) = resolve_model(&config)?;
@@ -93,6 +103,7 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
         temperature,
         max_output_tokens,
         config.agent.stream_buffer,
+        options.credential_file.as_deref(),
     )?;
 
     let mut agent_config = GenericAgentConfig::new("orchestral/internal", "generic-agent");
@@ -796,21 +807,66 @@ fn build_model_backend(
     temperature: f32,
     max_output_tokens: u64,
     max_buffered_events: usize,
+    credential_file: Option<&std::path::Path>,
 ) -> anyhow::Result<(Arc<dyn ModelBackend>, Arc<dyn ModelTokenMeter>)> {
-    let api_key = backend
-        .resolve_api_key()
-        .with_context(|| format!("resolve API key for backend '{}'", backend.name))?;
     let timeout = Duration::from_secs(backend.get_config("timeout_secs").unwrap_or(60));
     let max_context_tokens = backend.get_config("max_context_tokens");
     match backend.kind.trim().to_ascii_lowercase().as_str() {
         "google" | "gemini" => {
+            let auth_mode = backend
+                .get_config::<String>("auth")
+                .unwrap_or_else(|| "auto".to_owned())
+                .trim()
+                .to_ascii_lowercase();
+            if !matches!(auth_mode.as_str(), "auto" | "api_key" | "adc") {
+                bail!(
+                    "unsupported Google auth mode '{auth_mode}'; expected auto, api_key, or adc"
+                );
+            }
+            let explicit_adc = auth_mode == "adc"
+                || google_adc_is_explicitly_requested(credential_file, backend);
+            let api_key = (auth_mode != "adc")
+                .then(|| backend.resolve_api_key().ok())
+                .flatten();
+            let vertex_plan = if explicit_adc || api_key.is_none() {
+                resolve_google_vertex_auth(credential_file, backend)?
+            } else {
+                None
+            };
+            let (authentication, endpoint) = if let Some(plan) = vertex_plan {
+                let provider = match &plan.source {
+                    GoogleCredentialSource::ServiceAccountFile(path) => {
+                        GoogleCloudAccessTokenProvider::from_service_account_file(path)
+                    }
+                    GoogleCredentialSource::ApplicationDefault => {
+                        GoogleCloudAccessTokenProvider::application_default()
+                    }
+                }
+                .context("initialize Google Cloud authentication")?;
+                (
+                    GeminiAuthentication::AccessTokenProvider(Arc::new(provider)),
+                    backend.endpoint.clone().unwrap_or_else(|| plan.endpoint()),
+                )
+            } else if let Some(api_key) = api_key {
+                (
+                    GeminiAuthentication::ApiKey(api_key),
+                    backend.endpoint.clone().unwrap_or_else(|| {
+                        "https://generativelanguage.googleapis.com/v1beta".to_owned()
+                    }),
+                )
+            } else {
+                bail!(
+                    "no Google credentials found for backend '{}'; use --credential-file, \
+                     GOOGLE_APPLICATION_CREDENTIALS, `gcloud auth application-default login`, \
+                     or GOOGLE_API_KEY",
+                    backend.name
+                );
+            };
             let backend = Arc::new(
                 GeminiModelBackend::new(GeminiModelConfig {
                     backend_id: format!("google-gemini/{}", backend.name),
-                    endpoint: backend.endpoint.clone().unwrap_or_else(|| {
-                        "https://generativelanguage.googleapis.com/v1beta".to_owned()
-                    }),
-                    authentication: GeminiAuthentication::ApiKey(api_key),
+                    endpoint,
+                    authentication,
                     model: model.to_owned(),
                     temperature,
                     thinking_level: None,
@@ -824,6 +880,9 @@ fn build_model_backend(
             Ok((backend.clone(), backend))
         }
         "openai" | "openrouter" | "deepseek" | "groq" | "xai" | "mistral" => {
+            let api_key = backend
+                .resolve_api_key()
+                .with_context(|| format!("resolve API key for backend '{}'", backend.name))?;
             let endpoint = backend.endpoint.clone().or_else(|| match backend.kind.as_str() {
                 "openai" => Some("https://api.openai.com/v1".to_owned()),
                 "deepseek" => Some("https://api.deepseek.com".to_owned()),

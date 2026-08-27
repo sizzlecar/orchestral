@@ -1,12 +1,18 @@
 //! Gemini-native HTTP adapter for the canonical Orchestral Model Protocol.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use futures_util::{stream, StreamExt};
+use google_cloud_auth::credentials::service_account::{
+    AccessSpecifier, Builder as ServiceAccountBuilder,
+};
+use google_cloud_auth::credentials::{AccessTokenCredentials, Builder as GoogleCredentialsBuilder};
 use orchestral_core::agent_protocol::wire::Digest;
 use orchestral_core::model_protocol::{
     ModelBackend, ModelCapabilities, ModelContent, ModelDescriptor, ModelError, ModelErrorCode,
@@ -18,25 +24,121 @@ use reqwest::{Client, RequestBuilder, StatusCode};
 use serde_json::{json, Map, Value};
 use tokio_util::sync::CancellationToken;
 
+const GOOGLE_CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
+
+#[async_trait]
+pub trait GeminiAccessTokenProvider: Send + Sync {
+    async fn access_token(&self) -> Result<String, ModelError>;
+}
+
 #[derive(Clone)]
 pub enum GeminiAuthentication {
     ApiKey(String),
     BearerToken(String),
+    AccessTokenProvider(Arc<dyn GeminiAccessTokenProvider>),
 }
 
 impl GeminiAuthentication {
     fn is_valid(&self) -> bool {
         match self {
             Self::ApiKey(value) | Self::BearerToken(value) => !value.trim().is_empty(),
+            Self::AccessTokenProvider(_) => true,
         }
     }
 
-    fn apply(&self, request: RequestBuilder) -> RequestBuilder {
+    async fn apply(
+        &self,
+        request: RequestBuilder,
+        cancellation: &CancellationToken,
+    ) -> Result<RequestBuilder, ModelError> {
         match self {
-            Self::ApiKey(value) => request.header("x-goog-api-key", value),
-            Self::BearerToken(value) => request.bearer_auth(value),
+            Self::ApiKey(value) => Ok(request.header("x-goog-api-key", value)),
+            Self::BearerToken(value) => Ok(request.bearer_auth(value)),
+            Self::AccessTokenProvider(provider) => {
+                let token = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return Err(cancelled_error()),
+                    token = provider.access_token() => token?,
+                };
+                if token.trim().is_empty() {
+                    return Err(ModelError::new(
+                        ModelErrorCode::Authentication,
+                        "Google access-token provider returned an empty token",
+                    ));
+                }
+                Ok(request.bearer_auth(token))
+            }
         }
     }
+}
+
+/// Google ADC/service-account bridge for Gemini's dynamic bearer-token mode.
+///
+/// The Google SDK owns token caching and refresh. The Gemini adapter asks for a
+/// token for every model request, so long-running Agent sessions do not retain an
+/// expired access token.
+#[derive(Clone, Debug)]
+pub struct GoogleCloudAccessTokenProvider {
+    credentials: AccessTokenCredentials,
+}
+
+impl GoogleCloudAccessTokenProvider {
+    /// Resolve Google's standard Application Default Credentials chain.
+    pub fn application_default() -> Result<Self, ModelError> {
+        let credentials = GoogleCredentialsBuilder::default()
+            .with_scopes([GOOGLE_CLOUD_PLATFORM_SCOPE])
+            .build_access_token_credentials()
+            .map_err(|error| {
+                google_authentication_error("resolve Application Default Credentials", error)
+            })?;
+        Ok(Self { credentials })
+    }
+
+    /// Load an explicitly supplied service-account key without changing process
+    /// environment variables or exposing the key outside this provider.
+    pub fn from_service_account_file(path: impl AsRef<Path>) -> Result<Self, ModelError> {
+        let path = path.as_ref();
+        let bytes = std::fs::read(path).map_err(|error| {
+            google_authentication_error(
+                &format!("read Google credential file '{}'", path.display()),
+                error,
+            )
+        })?;
+        let value = serde_json::from_slice(&bytes).map_err(|error| {
+            google_authentication_error(
+                &format!("parse Google credential file '{}'", path.display()),
+                error,
+            )
+        })?;
+        let credentials = ServiceAccountBuilder::new(value)
+            .with_access_specifier(AccessSpecifier::from_scopes([GOOGLE_CLOUD_PLATFORM_SCOPE]))
+            .build_access_token_credentials()
+            .map_err(|error| {
+                google_authentication_error(
+                    &format!("load service-account credential '{}'", path.display()),
+                    error,
+                )
+            })?;
+        Ok(Self { credentials })
+    }
+}
+
+#[async_trait]
+impl GeminiAccessTokenProvider for GoogleCloudAccessTokenProvider {
+    async fn access_token(&self) -> Result<String, ModelError> {
+        self.credentials
+            .access_token()
+            .await
+            .map(|token| token.token)
+            .map_err(|error| google_authentication_error("acquire Google access token", error))
+    }
+}
+
+fn google_authentication_error(context: &str, error: impl std::fmt::Display) -> ModelError {
+    ModelError::new(
+        ModelErrorCode::Authentication,
+        format!("{context}: {error}"),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -238,13 +340,16 @@ impl ModelBackend for GeminiModelBackend {
         request.validate()?;
         self.descriptor().validate()?;
         let body = self.build_request_body(&request)?;
+        let http_request = self
+            .config
+            .authentication
+            .apply(self.client.post(self.config.stream_url()), &cancellation)
+            .await?
+            .json(&body);
         let response = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(cancelled_error()),
-            response = self.config.authentication
-                .apply(self.client.post(self.config.stream_url()))
-                .json(&body)
-                .send() => response,
+            response = http_request.send() => response,
         }
         .map_err(map_transport_error)?;
         let status = response.status();
@@ -845,11 +950,14 @@ mod tests {
         ModelStreamStressCase, ModelStreamStressFault, ModelStreamStressSuite,
     };
 
-    #[test]
-    fn authentication_modes_set_only_the_selected_header() {
+    #[tokio::test]
+    async fn authentication_modes_set_only_the_selected_header() {
         let client = Client::new();
+        let cancellation = CancellationToken::new();
         let api_key_request = GeminiAuthentication::ApiKey("fixture-key".to_owned())
-            .apply(client.post("http://127.0.0.1"))
+            .apply(client.post("http://127.0.0.1"), &cancellation)
+            .await
+            .unwrap()
             .build()
             .unwrap();
         assert_eq!(
@@ -864,7 +972,9 @@ mod tests {
         assert!(!api_key_request.headers().contains_key("authorization"));
 
         let bearer_request = GeminiAuthentication::BearerToken("fixture-token".to_owned())
-            .apply(client.post("http://127.0.0.1"))
+            .apply(client.post("http://127.0.0.1"), &cancellation)
+            .await
+            .unwrap()
             .build()
             .unwrap();
         assert_eq!(
@@ -877,6 +987,47 @@ mod tests {
             "Bearer fixture-token"
         );
         assert!(!bearer_request.headers().contains_key("x-goog-api-key"));
+    }
+
+    struct CountingTokenProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl GeminiAccessTokenProvider for CountingTokenProvider {
+        async fn access_token(&self) -> Result<String, ModelError> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            Ok(format!("dynamic-token-{call}"))
+        }
+    }
+
+    #[tokio::test]
+    async fn dynamic_token_provider_is_resolved_for_every_request() {
+        let provider = Arc::new(CountingTokenProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let authentication = GeminiAuthentication::AccessTokenProvider(provider.clone());
+        let client = Client::new();
+        let cancellation = CancellationToken::new();
+
+        for expected in ["Bearer dynamic-token-1", "Bearer dynamic-token-2"] {
+            let request = authentication
+                .apply(client.post("http://127.0.0.1"), &cancellation)
+                .await
+                .unwrap()
+                .build()
+                .unwrap();
+            assert_eq!(
+                request
+                    .headers()
+                    .get("authorization")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                expected
+            );
+        }
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]

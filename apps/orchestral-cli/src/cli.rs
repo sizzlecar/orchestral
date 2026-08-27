@@ -17,6 +17,9 @@ pub struct Cli {
     config: Option<PathBuf>,
     #[arg(long)]
     env_file: Option<PathBuf>,
+    /// Provider credential document. For Google, this accepts a service-account JSON key.
+    #[arg(long, value_name = "PATH")]
+    credential_file: Option<PathBuf>,
     #[arg(long)]
     backend: Option<String>,
     #[arg(long)]
@@ -59,6 +62,7 @@ impl Cli {
         let model_overrides = self.model_overrides();
         crate::agent::run(crate::agent::AgentRunOptions {
             config: self.config,
+            credential_file: self.credential_file,
             model_overrides,
             session_id: self.session_id,
             system_prompt: self.system_prompt,

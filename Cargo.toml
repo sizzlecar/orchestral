@@ -54,6 +54,7 @@ thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+google-cloud-auth = "1.16.0"
 
 # Utilities
 uuid = { version = "1", features = ["v4", "serde"] }

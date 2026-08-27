@@ -5,6 +5,8 @@ use anyhow::{bail, Context};
 use orchestral_core::config::{load_config, OrchestralConfig};
 use serde_yaml::{Mapping, Value as YamlValue};
 
+use crate::google_auth::has_google_credentials;
+
 use super::{
     ModelOverrides, GENERATED_CONFIG_DIR, GENERATED_CONFIG_FILE, GENERATED_OVERRIDE_CONFIG_SUFFIX,
 };
@@ -12,9 +14,15 @@ use super::{
 pub(crate) fn prepare_runtime_config_path(
     explicit: Option<PathBuf>,
     model_overrides: &ModelOverrides,
+    credential_file: Option<&Path>,
 ) -> anyhow::Result<PathBuf> {
     let base_path = resolve_runtime_config_path(explicit)?;
-    let automatic = auto_override_model_if_needed(&base_path).unwrap_or_default();
+    let automatic = if model_overrides.backend.is_some() || model_overrides.model_profile.is_some()
+    {
+        ModelOverrides::default()
+    } else {
+        auto_override_model_if_needed(&base_path, credential_file).unwrap_or_default()
+    };
     let effective = merge_model_overrides(model_overrides, &automatic);
     if effective.is_empty() {
         return Ok(base_path);
@@ -22,7 +30,10 @@ pub(crate) fn prepare_runtime_config_path(
     write_overridden_runtime_config(&base_path, &effective)
 }
 
-fn auto_override_model_if_needed(config_path: &Path) -> Option<ModelOverrides> {
+fn auto_override_model_if_needed(
+    config_path: &Path,
+    credential_file: Option<&Path>,
+) -> Option<ModelOverrides> {
     let config = load_config(config_path).ok()?;
     let backend_name = config
         .agent
@@ -30,10 +41,14 @@ fn auto_override_model_if_needed(config_path: &Path) -> Option<ModelOverrides> {
         .as_deref()
         .or(config.providers.default_backend.as_deref())?;
     let backend = config.providers.get_backend(backend_name)?;
-    if backend.resolve_api_key().is_ok() {
+    let is_google = matches!(
+        backend.kind.trim().to_ascii_lowercase().as_str(),
+        "google" | "gemini"
+    );
+    if backend.resolve_api_key().is_ok() || (is_google && has_google_credentials(credential_file)) {
         return None;
     }
-    let (detected_backend, detected_profile) = detect_default_model_profile();
+    let (detected_backend, detected_profile) = detect_default_model_profile(credential_file);
     (detected_backend != backend_name).then(|| ModelOverrides {
         backend: Some(detected_backend.to_owned()),
         model_profile: Some(detected_profile.to_owned()),
@@ -182,7 +197,7 @@ fn set_yaml_key(mapping: &mut Mapping, key: &str, value: YamlValue) {
 }
 
 fn embedded_default_config() -> String {
-    let (backend, profile) = detect_default_model_profile();
+    let (backend, profile) = detect_default_model_profile(None);
     format!(
         r#"version: 1
 
@@ -285,8 +300,9 @@ observability:
     )
 }
 
-fn detect_default_model_profile() -> (&'static str, &'static str) {
-    if has_any_env(&["GOOGLE_API_KEY", "GEMINI_API_KEY"]) {
+fn detect_default_model_profile(credential_file: Option<&Path>) -> (&'static str, &'static str) {
+    if has_any_env(&["GOOGLE_API_KEY", "GEMINI_API_KEY"]) || has_google_credentials(credential_file)
+    {
         ("google", "gemini-2.5-flash")
     } else if has_env("OPENAI_API_KEY") {
         ("openai", "gpt-4o-mini")

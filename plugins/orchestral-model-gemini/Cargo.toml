@@ -12,6 +12,7 @@ orchestral-core = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }
+google-cloud-auth = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
