@@ -55,13 +55,13 @@ export OPENAI_API_KEY="..."
 Run one turn:
 
 ```bash
-cargo run -p orchestral-cli -- run "Summarize the public API of this repository"
+cargo run -p orchestral-cli -- agent "Summarize the public API of this repository"
 ```
 
 Start an interactive Agent Session:
 
 ```bash
-cargo run -p orchestral-cli -- run
+cargo run -p orchestral-cli -- agent
 ```
 
 The CLI discovers `configs/orchestral.cli.yaml` by default. Use `--config`, `--backend`,

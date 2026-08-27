@@ -23,7 +23,7 @@ echo "[1/2] running scripted CLI multi-turn session"
 echo "      config=${CONFIG_PATH} thread_id=${THREAD_ID}"
 (
   cd "${ROOT_DIR}"
-  RUST_LOG=error cargo run -p orchestral-cli -- run \
+  RUST_LOG=error cargo run -p orchestral-cli -- agent \
     --config "${CONFIG_PATH}" \
     --thread-id "${THREAD_ID}" \
     --script "${INPUT_FILE}"

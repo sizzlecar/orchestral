@@ -20,7 +20,7 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Start an Agent conversation, optionally with one initial turn
-    Run(AgentArgs),
+    Agent(AgentArgs),
 }
 
 #[derive(Debug, Args, Clone, Default)]
@@ -67,7 +67,7 @@ impl AgentArgs {
 impl Cli {
     pub async fn run(self) -> anyhow::Result<()> {
         let args = match self.command {
-            Some(Command::Run(args)) => args,
+            Some(Command::Agent(args)) => args,
             None => AgentArgs::default(),
         };
         if let Some(env_file) = &args.env_file {
@@ -91,5 +91,25 @@ impl Cli {
 fn ensure_log_filter(verbose: bool) {
     if !verbose && env::var("RUST_LOG").is_err() {
         env::set_var("RUST_LOG", "info");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Command};
+
+    #[test]
+    fn agent_is_the_only_explicit_conversation_entrypoint() {
+        let parsed = Cli::try_parse_from(["orchestral", "agent", "inspect this repository"])
+            .expect("the Agent entrypoint must parse");
+        let Some(Command::Agent(args)) = parsed.command else {
+            panic!("explicit Agent command must select the Agent surface");
+        };
+        assert_eq!(args.input, ["inspect this repository"]);
+
+        assert!(Cli::try_parse_from(["orchestral", "run", "legacy input"]).is_err());
+        assert!(Cli::try_parse_from(["orchestral", "scenario"]).is_err());
     }
 }

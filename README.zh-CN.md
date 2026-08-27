@@ -54,13 +54,13 @@ export OPENAI_API_KEY="..."
 执行单轮任务：
 
 ```bash
-cargo run -p orchestral-cli -- run "总结这个仓库的公共 API"
+cargo run -p orchestral-cli -- agent "总结这个仓库的公共 API"
 ```
 
 进入交互式 Agent Session：
 
 ```bash
-cargo run -p orchestral-cli -- run
+cargo run -p orchestral-cli -- agent
 ```
 
 CLI 默认发现 `configs/orchestral.cli.yaml`。可以用 `--config`、`--backend`、
