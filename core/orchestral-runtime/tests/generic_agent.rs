@@ -12,10 +12,10 @@ use orchestral_core::{
             AgentCommand, AgentCommandEnvelope, AgentEvent, AgentEventAuthority,
             AgentProtocolErrorCode, AgentProviderStreamItem, AgentRunEnvelope, AgentSessionId,
             AgentStartRequest, AgentTelemetry, ApprovalDecision, BindingRequirement,
-            CommandAckState, CommandId, Content, ContentBody, IncompleteReason, PendingRequestKind,
-            PendingRequestPayload, ProviderBindingRef, ProviderCommandOutcome, RequestResolution,
-            ResourceBinding, ResourceBindingId, ResourceBindingMode, ResourceId, ResourceKind,
-            ResourceRef, ResourceRevision, RunId, RunLimitKind,
+            CommandAckState, CommandId, Content, ContentBody, Digest, IncompleteReason,
+            PendingRequestKind, PendingRequestPayload, ProviderBindingRef, ProviderCommandOutcome,
+            RequestResolution, ResourceBinding, ResourceBindingId, ResourceBindingMode, ResourceId,
+            ResourceKind, ResourceRef, ResourceRevision, RunId, RunLimitKind,
         },
         AGENT_PROTOCOL_V1,
     },
@@ -27,7 +27,8 @@ use orchestral_core::{
     model_protocol::{
         ModelBackend, ModelCapabilities, ModelContent, ModelDescriptor, ModelError, ModelEvent,
         ModelEventId, ModelFinishReason, ModelMessage, ModelRequest, ModelRequestId, ModelRole,
-        ModelStream, ModelStreamEvent, ModelToolCallId,
+        ModelStream, ModelStreamEvent, ModelTokenAccounting, ModelTokenMeter,
+        ModelTokenMeterDescriptor, ModelToolCallId, ModelToolDefinition,
     },
     normalizer::PlanNormalizer,
     skill_protocol::{
@@ -81,6 +82,29 @@ struct RecoveryAfterRestoreModel {
 struct RecoveryIdentityModel {
     revision: &'static str,
     starts: Arc<AtomicUsize>,
+}
+
+struct FixedOverheadTokenMeter(u64);
+
+impl ModelTokenMeter for FixedOverheadTokenMeter {
+    fn meter_descriptor(&self) -> ModelTokenMeterDescriptor {
+        ModelTokenMeterDescriptor {
+            strategy: "test/canonical-json-with-overhead".to_owned(),
+            version: "1".to_owned(),
+            accounting: ModelTokenAccounting::ConservativeUpperBound,
+            config_digest: Digest::sha256(self.0.to_be_bytes()),
+        }
+    }
+
+    fn count_request_input(
+        &self,
+        messages: &[ModelMessage],
+        tools: &[ModelToolDefinition],
+    ) -> Result<u64, ModelError> {
+        let bytes = serde_jcs::to_vec(&(messages, tools))
+            .map_err(|error| ModelError::invalid_request(error.to_string()))?;
+        Ok((bytes.len() as u64).saturating_add(self.0))
+    }
 }
 
 struct PreparedRecoveryModel {
@@ -6192,7 +6216,7 @@ async fn private_wal_recovery_is_bound_to_model_and_tool_authority() {
             starts: starts.clone(),
         }),
         config.clone(),
-        base_runtime,
+        base_runtime.clone(),
         RunToolGrant {
             bounds: narrower_grant_bounds,
         },
@@ -6210,6 +6234,32 @@ async fn private_wal_recovery_is_bound_to_model_and_tool_authority() {
         .await
     {
         Ok(_) => panic!("changed Run Tool grant must not resume the Run"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, AgentProtocolErrorCode::RunIdConflict);
+
+    let changed_meter = InternalGenericAgentProvider::new_with_tools_and_session_journal(
+        Arc::new(RecoveryIdentityModel {
+            revision: "v1",
+            starts: starts.clone(),
+        }),
+        config.clone(),
+        base_runtime.clone(),
+        base_grant.clone(),
+        session_journal.clone(),
+        Arc::new(FixedOverheadTokenMeter(128)),
+    )
+    .expect("replacement token meter is internally valid")
+    .with_checkpoint_store(checkpoint_store.clone())
+    .expect("replacement token meter sees the same private WAL");
+    let error = match changed_meter
+        .recover(
+            AgentRecoveryRequest::new(request.clone(), execution.clone(), &descriptor)
+                .expect("recovery request identity is valid"),
+        )
+        .await
+    {
+        Ok(_) => panic!("changed token accounting contract must not resume the Run"),
         Err(error) => error,
     };
     assert_eq!(error.code, AgentProtocolErrorCode::RunIdConflict);

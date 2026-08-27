@@ -30,6 +30,7 @@ pub use generic_agent_checkpoint::{
     StoredGenericAgentRun,
 };
 pub use in_memory_blob::InMemoryBlobStore;
+pub use orchestral_core::model_protocol::{ModelTokenMeter, ModelTokenMeterDescriptor};
 pub use orchestral_core::spi::{
     ComponentRegistry, HookDispatchError, HookDispatchMode, HookError, HookExecutionPolicy,
     HookFailurePolicy, HookRegistry, RuntimeBuildRequest, RuntimeComponentFactory, RuntimeHook,
@@ -40,9 +41,9 @@ pub use pty_process::{
 };
 pub use session_context::{
     AgentSessionCompactor, AgentSessionContextEngine, AgentSessionSummarizer,
-    DeterministicExtractiveSessionSummarizer, JsonSizeTokenMeter, ModelTokenMeter,
-    SessionCompactionGroup, SessionCompactionInput, SessionCompactionPolicy, SessionContextError,
-    SessionContextProjection, SessionContextRequest, SessionSummarizerDescriptor,
+    DeterministicExtractiveSessionSummarizer, JsonSizeTokenMeter, SessionCompactionGroup,
+    SessionCompactionInput, SessionCompactionPolicy, SessionContextError, SessionContextProjection,
+    SessionContextRequest, SessionSummarizerDescriptor,
 };
 pub use skill::{
     ActivatedSkillSet, SkillActivationOutcome, SkillActivationPolicy, SkillActivationRequest,

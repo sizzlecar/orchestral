@@ -15,6 +15,8 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+use crate::agent_protocol::wire::Digest;
+
 pub type ModelStream = BoxStream<'static, Result<ModelStreamEvent, ModelError>>;
 
 macro_rules! string_id {
@@ -67,6 +69,55 @@ pub struct ModelDescriptor {
     pub capabilities: ModelCapabilities,
     #[serde(default)]
     pub extensions: BTreeMap<String, Value>,
+}
+
+/// Strength of the token count exposed by a model-family adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelTokenAccounting {
+    /// The adapter uses the provider's exact tokenizer/counting contract.
+    Exact,
+    /// The adapter deliberately over-counts the provider wire representation.
+    ConservativeUpperBound,
+}
+
+/// Immutable identity of the token accounting strategy used to build model
+/// context. The descriptor is bound into the Generic Agent configuration
+/// digest so recovery cannot silently select history with a different meter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelTokenMeterDescriptor {
+    pub strategy: String,
+    pub version: String,
+    pub accounting: ModelTokenAccounting,
+    pub config_digest: Digest,
+}
+
+impl ModelTokenMeterDescriptor {
+    pub fn validate(&self) -> Result<(), ModelError> {
+        if self.strategy.trim().is_empty()
+            || self.version.trim().is_empty()
+            || !self.config_digest.is_sha256()
+        {
+            return Err(ModelError::invalid_request(
+                "invalid model token meter descriptor",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Model-family token accounting boundary. A production adapter must provide
+/// either its exact tokenizer or a documented conservative upper bound over
+/// the provider-specific serialized request input.
+pub trait ModelTokenMeter: Send + Sync {
+    fn meter_descriptor(&self) -> ModelTokenMeterDescriptor;
+
+    fn count_request_input(
+        &self,
+        messages: &[ModelMessage],
+        tools: &[ModelToolDefinition],
+    ) -> Result<u64, ModelError>;
 }
 
 impl ModelDescriptor {

@@ -10,7 +10,10 @@ use orchestral_core::agent_session::{
     AgentSessionEventDraft, AgentSessionEventId, AgentSessionJournalStore, AgentSessionRecord,
     SessionSourceRange,
 };
-use orchestral_core::model_protocol::{ModelContent, ModelMessage, ModelRole, ModelToolDefinition};
+use orchestral_core::model_protocol::{
+    ModelContent, ModelError, ModelMessage, ModelRole, ModelTokenAccounting, ModelTokenMeter,
+    ModelTokenMeterDescriptor, ModelToolDefinition,
+};
 use orchestral_core::skill_protocol::SkillId;
 use serde::{Deserialize, Serialize};
 
@@ -27,26 +30,15 @@ pub enum SessionContextError {
     Compaction(String),
 }
 
-/// Model-family token accounting boundary. Production adapters should provide
-/// their tokenizer; the JSON meter is a deterministic fallback for tests and
-/// conservative configuration, not a claim of provider-exact accounting.
-pub trait ModelTokenMeter: Send + Sync {
-    fn count_request_input(
-        &self,
-        messages: &[ModelMessage],
-        tools: &[ModelToolDefinition],
-    ) -> Result<u64, SessionContextError>;
-}
-
 pub struct JsonSizeTokenMeter {
     bytes_per_token: u64,
 }
 
 impl JsonSizeTokenMeter {
     pub fn new(bytes_per_token: u64) -> Result<Self, SessionContextError> {
-        if bytes_per_token == 0 {
+        if bytes_per_token != 1 {
             return Err(SessionContextError::InvalidRequest(
-                "bytes_per_token must be positive".to_owned(),
+                "the conservative JSON fallback requires exactly one byte per token".to_owned(),
             ));
         }
         Ok(Self { bytes_per_token })
@@ -55,18 +47,33 @@ impl JsonSizeTokenMeter {
 
 impl Default for JsonSizeTokenMeter {
     fn default() -> Self {
-        Self { bytes_per_token: 3 }
+        // One UTF-8/JSON byte per token is intentionally pessimistic. This
+        // fallback is safe for unknown families; supported production
+        // adapters replace it with their provider-wire upper bound.
+        Self { bytes_per_token: 1 }
     }
 }
 
 impl ModelTokenMeter for JsonSizeTokenMeter {
+    fn meter_descriptor(&self) -> ModelTokenMeterDescriptor {
+        ModelTokenMeterDescriptor {
+            strategy: "canonical-json-size".to_owned(),
+            version: "1".to_owned(),
+            accounting: ModelTokenAccounting::ConservativeUpperBound,
+            config_digest: Digest::sha256(format!(
+                "canonical-json-size/v1\0bytes_per_token={}",
+                self.bytes_per_token
+            )),
+        }
+    }
+
     fn count_request_input(
         &self,
         messages: &[ModelMessage],
         tools: &[ModelToolDefinition],
-    ) -> Result<u64, SessionContextError> {
+    ) -> Result<u64, ModelError> {
         let bytes = serde_jcs::to_vec(&(messages, tools)).map_err(|error| {
-            SessionContextError::InvalidRequest(format!(
+            ModelError::invalid_request(format!(
                 "could not serialize model context for metering: {error}"
             ))
         })?;
@@ -149,9 +156,7 @@ impl AgentSessionContextEngine {
             .map(|group| group.key)
             .collect::<BTreeSet<_>>();
         let pinned_messages = assemble_messages(&request.system_message, &groups, &selected);
-        let pinned_tokens = self
-            .token_meter
-            .count_request_input(&pinned_messages, &request.tools)?;
+        let pinned_tokens = self.count_request_input(&pinned_messages, &request.tools)?;
         if pinned_tokens > input_budget {
             return Err(SessionContextError::ContextOverflow {
                 used: pinned_tokens,
@@ -168,18 +173,12 @@ impl AgentSessionContextEngine {
             let mut candidate = selected.clone();
             candidate.insert(group.key);
             let messages = assemble_messages(&request.system_message, &groups, &candidate);
-            if self
-                .token_meter
-                .count_request_input(&messages, &request.tools)?
-                <= input_budget
-            {
+            if self.count_request_input(&messages, &request.tools)? <= input_budget {
                 selected = candidate;
             }
         }
         let messages = assemble_messages(&request.system_message, &groups, &selected);
-        let used_input_tokens = self
-            .token_meter
-            .count_request_input(&messages, &request.tools)?;
+        let used_input_tokens = self.count_request_input(&messages, &request.tools)?;
         let mut included_ranges = Vec::new();
         let mut deferred_ranges = Vec::new();
         for group in groups.values() {
@@ -198,6 +197,20 @@ impl AgentSessionContextEngine {
             through_session_seq: records.last().map(|record| record.session_seq).unwrap_or(0),
             config_digest: request.config_digest,
         })
+    }
+
+    fn count_request_input(
+        &self,
+        messages: &[ModelMessage],
+        tools: &[ModelToolDefinition],
+    ) -> Result<u64, SessionContextError> {
+        self.token_meter
+            .count_request_input(messages, tools)
+            .map_err(|error| {
+                SessionContextError::InvalidRequest(format!(
+                    "model token meter rejected Context input: {error}"
+                ))
+            })
     }
 }
 

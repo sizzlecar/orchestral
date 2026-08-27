@@ -65,8 +65,8 @@ use crate::tool_runtime::{AgentToolRuntime, GuardedToolResult, ToolRuntimeError}
 use crate::workflow_strategy::{WorkflowExecutionRequest, WorkflowExecutionStrategy};
 use crate::{
     AgentSessionCompactor, AgentSessionContextEngine, AgentSessionSummarizer, JsonSizeTokenMeter,
-    ModelTokenMeter, SessionCompactionPolicy, SessionContextError, SessionContextProjection,
-    SessionContextRequest, SessionSummarizerDescriptor,
+    ModelTokenMeter, ModelTokenMeterDescriptor, SessionCompactionPolicy, SessionContextError,
+    SessionContextProjection, SessionContextRequest, SessionSummarizerDescriptor,
 };
 
 const WORKFLOW_TOOL_NAME: &str = "orchestral_workflow";
@@ -530,6 +530,10 @@ impl InternalGenericAgentProvider {
     ) -> Result<Self, AgentProtocolError> {
         let model_descriptor = backend.descriptor();
         model_descriptor.validate().map_err(model_protocol_error)?;
+        let token_meter_descriptor = token_meter.meter_descriptor();
+        token_meter_descriptor
+            .validate()
+            .map_err(model_protocol_error)?;
         if (tools.is_some() || skills.is_some()) && !model_descriptor.capabilities.tool_calls {
             return Err(AgentProtocolError::new(
                 AgentProtocolErrorCode::Unsupported,
@@ -621,6 +625,7 @@ impl InternalGenericAgentProvider {
         let config_digest = generic_config_digest(
             &config,
             &model_descriptor,
+            &token_meter_descriptor,
             tools.as_ref(),
             skills.as_ref().map(|skills| skills.catalog()),
             has_approval,
@@ -7971,6 +7976,7 @@ fn workflow_tool_definition() -> ModelToolDefinition {
 fn generic_config_digest(
     config: &GenericAgentConfig,
     model_descriptor: &orchestral_core::model_protocol::ModelDescriptor,
+    token_meter: &ModelTokenMeterDescriptor,
     tools: Option<&GenericTools>,
     skills: Option<&orchestral_core::skill_protocol::SkillCatalogDescriptor>,
     approval_enabled: bool,
@@ -7992,6 +7998,7 @@ fn generic_config_digest(
         "agent_id": config.agent_id,
         "system_prompt": config.system_prompt,
         "model_descriptor": model_descriptor,
+        "token_meter": token_meter,
         "max_model_rounds": config.max_model_rounds,
         "max_tool_calls": config.max_tool_calls,
         "history_limit": config.history_limit,

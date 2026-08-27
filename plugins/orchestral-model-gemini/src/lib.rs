@@ -7,10 +7,12 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use futures_util::{stream, StreamExt};
+use orchestral_core::agent_protocol::wire::Digest;
 use orchestral_core::model_protocol::{
     ModelBackend, ModelCapabilities, ModelContent, ModelDescriptor, ModelError, ModelErrorCode,
-    ModelEvent, ModelEventId, ModelFinishReason, ModelMessage, ModelRequest, ModelRole,
-    ModelStream, ModelStreamEvent, ModelToolCallId, ModelUsage,
+    ModelEvent, ModelEventId, ModelFinishReason, ModelMessage, ModelRequest, ModelRequestId,
+    ModelRole, ModelStream, ModelStreamEvent, ModelTokenAccounting, ModelTokenMeter,
+    ModelTokenMeterDescriptor, ModelToolCallId, ModelToolDefinition, ModelUsage,
 };
 use reqwest::{Client, StatusCode};
 use serde_json::{json, Map, Value};
@@ -116,6 +118,46 @@ impl GeminiModelBackend {
             );
         }
         Ok(Value::Object(body))
+    }
+}
+
+impl ModelTokenMeter for GeminiModelBackend {
+    fn meter_descriptor(&self) -> ModelTokenMeterDescriptor {
+        let config = serde_json::to_vec(&(
+            &self.config.model,
+            self.config.temperature.to_bits(),
+            self.config.default_max_output_tokens,
+        ))
+        .expect("Gemini token meter scalar configuration is serializable");
+        ModelTokenMeterDescriptor {
+            strategy: "google-gemini/wire-json-upper-bound".to_owned(),
+            version: "1".to_owned(),
+            accounting: ModelTokenAccounting::ConservativeUpperBound,
+            config_digest: Digest::sha256(config),
+        }
+    }
+
+    fn count_request_input(
+        &self,
+        messages: &[ModelMessage],
+        tools: &[ModelToolDefinition],
+    ) -> Result<u64, ModelError> {
+        let request = ModelRequest {
+            request_id: ModelRequestId::new("token-meter"),
+            messages: messages.to_vec(),
+            tools: tools.to_vec(),
+            output_schema: None,
+            max_output_tokens: None,
+            extensions: BTreeMap::new(),
+        };
+        let body = self.build_request_body(&request)?;
+        let wire_bytes = serde_json::to_vec(&body)
+            .map_err(|error| ModelError::invalid_request(error.to_string()))?
+            .len() as u64;
+        Ok(wire_bytes
+            .saturating_add(64)
+            .saturating_add((messages.len() as u64).saturating_mul(16))
+            .saturating_add((tools.len() as u64).saturating_mul(32)))
     }
 }
 
@@ -815,6 +857,65 @@ mod tests {
             output_schema: None,
             max_output_tokens: Some(128),
             extensions: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn ten_thousand_gemini_wire_requests_never_exceed_the_metered_upper_bound() {
+        let backend = GeminiModelBackend::new(GeminiModelConfig {
+            backend_id: "gemini-meter-gate".to_owned(),
+            endpoint: "http://127.0.0.1".to_owned(),
+            api_key: "fixture-key".to_owned(),
+            model: "fixture-model".to_owned(),
+            temperature: 0.2,
+            default_max_output_tokens: 256,
+            max_context_tokens: Some(32_768),
+            timeout: Duration::from_secs(1),
+            max_buffered_events: 8,
+        })
+        .unwrap();
+        let descriptor = backend.meter_descriptor();
+        descriptor.validate().unwrap();
+        assert_eq!(
+            descriptor.accounting,
+            ModelTokenAccounting::ConservativeUpperBound
+        );
+
+        let mut state = 0xbb67_ae85_84ca_a73b_u64;
+        for case in 0..10_000_u64 {
+            state = state
+                .wrapping_mul(2_862_933_555_777_941_757)
+                .wrapping_add(3_037_000_493);
+            let text = format!(
+                "case={case}; nonce={state:016x}; {}",
+                "wire-context-安全".repeat((state as usize % 17) + 1)
+            );
+            let messages = vec![ModelMessage::text(ModelRole::User, text)];
+            let tools = if state & 1 == 0 {
+                vec![ModelToolDefinition {
+                    name: format!("tool_{}", case % 13),
+                    description: "Generated tool for token accounting".to_owned(),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}}
+                    }),
+                }]
+            } else {
+                Vec::new()
+            };
+            let actual = ModelRequest {
+                request_id: ModelRequestId::new(format!("meter-{case}")),
+                messages: messages.clone(),
+                tools: tools.clone(),
+                output_schema: None,
+                max_output_tokens: None,
+                extensions: BTreeMap::new(),
+            };
+            let wire_bytes = serde_json::to_vec(&backend.build_request_body(&actual).unwrap())
+                .unwrap()
+                .len() as u64;
+            let upper_bound = backend.count_request_input(&messages, &tools).unwrap();
+            assert!(upper_bound >= wire_bytes, "case {case} under-counted");
         }
     }
 

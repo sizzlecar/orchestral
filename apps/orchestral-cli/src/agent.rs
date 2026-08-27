@@ -51,7 +51,7 @@ use orchestral_runtime::{
     DeterministicExtractiveSessionSummarizer, GenericAgentCheckpointStore, GenericAgentConfig,
     GuardedMcpServerConfig, GuardedToolRuntime, InMemoryBlobStore,
     InMemoryGenericAgentCheckpointStore, InMemoryHostApprovalBroker, InternalGenericAgentProvider,
-    JsonSizeTokenMeter, McpToolsAdapterRegistry, SessionCompactionPolicy, SkillActivationPolicy,
+    McpToolsAdapterRegistry, ModelTokenMeter, SessionCompactionPolicy, SkillActivationPolicy,
     SkillHostProfile, SkillRoot, SkillRuntime, StdioMcpTransportFactory, ToolArtifactStore,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -86,7 +86,7 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
         .as_ref()
         .and_then(|profile| profile.max_tokens)
         .unwrap_or(8_192) as u64;
-    let model_backend = build_model_backend(
+    let (model_backend, token_meter) = build_model_backend(
         &backend,
         &model,
         temperature,
@@ -182,7 +182,7 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
                 approval_broker.clone(),
                 skills,
                 session_journal,
-                Arc::new(JsonSizeTokenMeter::default()),
+                token_meter,
             )
         }
         None => InternalGenericAgentProvider::new_with_tools_approval_and_session_journal(
@@ -192,7 +192,7 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
             run_grant,
             approval_broker.clone(),
             session_journal,
-            Arc::new(JsonSizeTokenMeter::default()),
+            token_meter,
         ),
     }
     .context("create Generic Agent provider")?;
@@ -785,29 +785,32 @@ fn build_model_backend(
     temperature: f32,
     max_output_tokens: u64,
     max_buffered_events: usize,
-) -> anyhow::Result<Arc<dyn ModelBackend>> {
+) -> anyhow::Result<(Arc<dyn ModelBackend>, Arc<dyn ModelTokenMeter>)> {
     let api_key = backend
         .resolve_api_key()
         .with_context(|| format!("resolve API key for backend '{}'", backend.name))?;
     let timeout = Duration::from_secs(backend.get_config("timeout_secs").unwrap_or(60));
     let max_context_tokens = backend.get_config("max_context_tokens");
     match backend.kind.trim().to_ascii_lowercase().as_str() {
-        "google" | "gemini" => Ok(Arc::new(
-            GeminiModelBackend::new(GeminiModelConfig {
-                backend_id: format!("google-gemini/{}", backend.name),
-                endpoint: backend.endpoint.clone().unwrap_or_else(|| {
-                    "https://generativelanguage.googleapis.com/v1beta".to_owned()
-                }),
-                api_key,
-                model: model.to_owned(),
-                temperature,
-                default_max_output_tokens: max_output_tokens,
-                max_context_tokens,
-                timeout,
-                max_buffered_events,
-            })
-            .context("build Gemini ModelBackend")?,
-        )),
+        "google" | "gemini" => {
+            let backend = Arc::new(
+                GeminiModelBackend::new(GeminiModelConfig {
+                    backend_id: format!("google-gemini/{}", backend.name),
+                    endpoint: backend.endpoint.clone().unwrap_or_else(|| {
+                        "https://generativelanguage.googleapis.com/v1beta".to_owned()
+                    }),
+                    api_key,
+                    model: model.to_owned(),
+                    temperature,
+                    default_max_output_tokens: max_output_tokens,
+                    max_context_tokens,
+                    timeout,
+                    max_buffered_events,
+                })
+                .context("build Gemini ModelBackend")?,
+            );
+            Ok((backend.clone(), backend))
+        }
         "openai" | "openrouter" | "deepseek" | "groq" | "xai" | "mistral" => {
             let endpoint = backend.endpoint.clone().or_else(|| match backend.kind.as_str() {
                 "openai" => Some("https://api.openai.com/v1".to_owned()),
@@ -819,7 +822,7 @@ fn build_model_backend(
                     backend.name
                 )
             })?;
-            Ok(Arc::new(
+            let backend = Arc::new(
                 OpenAiCompatibleBackend::new(OpenAiCompatibleConfig {
                     backend_id: format!("openai-compatible/{}", backend.name),
                     endpoint,
@@ -835,7 +838,8 @@ fn build_model_backend(
                     max_buffered_events,
                 })
                 .context("build OpenAI-compatible ModelBackend")?,
-            ))
+            );
+            Ok((backend.clone(), backend))
         }
         kind => bail!(
             "unsupported ModelBackend kind '{kind}'; supported protocol families are OpenAI-compatible and Gemini Native"
