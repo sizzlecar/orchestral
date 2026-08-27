@@ -1,0 +1,28 @@
+---
+source: apps/orchestral-cli/src/tui/render.rs
+expression: "render_to_string(&state, 80, 24)"
+---
+ Orchestral  session-stream / gpt-5.6                             waiting input
+┌ Conversation ────────────────────────────────────────────────────────────────┐
+│ ┌ Input requested ─────────────────────────────────────────────────────────┐ │
+│ │ Which package should receive the compatibility fix?                      │ │
+│ │                                                                          │ │
+│ │ Type the response below, then press Enter                                │ │
+│ │                                                                          │ │
+│ │                                                                          │ │
+│ │                                                                          │ │
+│ └──────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│ Agent › Agent 边界。🚀▌                                                      │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌ Response ────────────────────────────────────────────────────────────────────┐
+│ orchestral-runtime                                                           │
+│ 保留协议兼容性                                                               │
+└──────────────────────────────────────────────────────────────────────────────┘
+ Enter send  Ctrl+C cancel  PgUp/PgDn scroll  Esc quit

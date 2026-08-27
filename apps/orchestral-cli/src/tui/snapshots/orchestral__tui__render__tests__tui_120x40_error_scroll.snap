@@ -1,0 +1,44 @@
+---
+source: apps/orchestral-cli/src/tui/render.rs
+expression: "render_to_string(&state, 120, 40)"
+---
+ Orchestral  session-history / deepseek-chat                                                                     failed
+┌ Conversation ────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                                                                                                      │
+│ You   › Turn 15: inspect module_15 中文                                                                              │
+│                                                                                                                      │
+│ Agent › Observation 16: a deliberately long line exercises wrapping and historical scrolling across a wide terminal  │
+│ viewport.                                                                                                            │
+│                                                                                                                      │
+│ Tool ✓ file_read crates/runtime/src/lib.rs                                                                           │
+│                                                                                                                      │
+│ Agent › Observation 17: a deliberately long line exercises wrapping and historical scrolling across a wide terminal  │
+│ viewport.                                                                                                            │
+│                                                                                                                      │
+│ Error › MCP lookup timed out; the Agent continued with local context                                                 │
+│                                                                                                                      │
+│ Agent › Observation 18: a deliberately long line exercises wrapping and historical scrolling across a wide terminal  │
+│ viewport.                                                                                                            │
+│                                                                                                                      │
+│ Agent › Observation 19: a deliberately long line exercises wrapping and historical scrolling across a wide terminal  │
+│ viewport.                                                                                                            │
+│                                                                                                                      │
+│ You   › Turn 20: inspect module_20 中文                                                                              │
+│                                                                                                                      │
+│ Agent › Observation 21: a deliberately long line exercises wrapping and historical scrolling across a wide terminal  │
+│ viewport.                                                                                                            │
+│                                                                                                                      │
+│ Agent › Observation 22: a deliberately long line exercises wrapping and historical scrolling across a wide terminal  │
+│ viewport.                                                                                                            │
+│                                                                                                                      │
+│ Agent › Observation 23: a deliberately long line exercises wrapping and historical scrolling across a wide terminal  │
+│ viewport.                                                                                                            │
+│                                                                                                                      │
+│ Agent › Observation 24: a deliberately long line exercises wrapping and historical scrolling across a wide terminal  │
+│ viewport.                                                                                                            │
+│                                                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ retry with fresh context                                                                                             │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ Enter send  Shift+Enter newline  PgUp/PgDn scroll  Esc quit
