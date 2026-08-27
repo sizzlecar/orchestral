@@ -100,6 +100,7 @@ pub enum AgentSessionEvent {
         source: SessionSourceRange,
         source_digest: Digest,
         policy_digest: Digest,
+        summary_config_digest: Digest,
         summary: ModelMessage,
         strategy: String,
         #[serde(default)]
@@ -164,6 +165,7 @@ impl AgentSessionEvent {
                 source,
                 source_digest,
                 policy_digest,
+                summary_config_digest,
                 summary,
                 strategy,
                 model,
@@ -172,12 +174,13 @@ impl AgentSessionEvent {
                 source.validate()?;
                 if !source_digest.is_sha256()
                     || !policy_digest.is_sha256()
+                    || !summary_config_digest.is_sha256()
                     || strategy.trim().is_empty()
                     || version.trim().is_empty()
                     || model.as_ref().is_some_and(|model| model.trim().is_empty())
                 {
                     return Err(AgentSessionError::InvalidEvent(
-                        "compaction requires source and policy digests, strategy, and version"
+                        "compaction requires source, policy, and summary config digests, strategy, and version"
                             .to_owned(),
                     ));
                 }
@@ -534,6 +537,24 @@ mod tests {
                 }],
             },
             usage: None,
+        };
+        assert!(event.validate().is_err());
+    }
+
+    #[test]
+    fn compaction_rejects_an_unbound_summary_configuration() {
+        let event = AgentSessionEvent::CompactionCommitted {
+            source: SessionSourceRange {
+                first_session_seq: 1,
+                last_session_seq: 2,
+            },
+            source_digest: Digest::sha256("source"),
+            policy_digest: Digest::sha256("policy"),
+            summary_config_digest: Digest::new("not-a-digest"),
+            summary: ModelMessage::text(ModelRole::System, "summary"),
+            strategy: "extractive".to_owned(),
+            model: None,
+            version: "1".to_owned(),
         };
         assert!(event.validate().is_err());
     }

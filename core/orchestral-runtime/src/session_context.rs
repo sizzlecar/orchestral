@@ -528,24 +528,47 @@ pub struct SessionCompactionInput {
     pub messages: Vec<ModelMessage>,
 }
 
-pub struct SessionSummary {
-    pub message: ModelMessage,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSummarizerDescriptor {
     pub strategy: String,
     pub model: Option<String>,
     pub version: String,
+    pub config_digest: Digest,
+}
+
+impl SessionSummarizerDescriptor {
+    pub fn validate(&self) -> Result<(), SessionContextError> {
+        if self.strategy.trim().is_empty()
+            || self.version.trim().is_empty()
+            || self
+                .model
+                .as_ref()
+                .is_some_and(|model| model.trim().is_empty())
+            || !self.config_digest.is_sha256()
+        {
+            return Err(SessionContextError::InvalidRequest(
+                "Session summarizer descriptor is invalid".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
 pub trait AgentSessionSummarizer: Send + Sync {
+    fn descriptor(&self) -> SessionSummarizerDescriptor;
+
     async fn summarize(
         &self,
         input: SessionCompactionInput,
-    ) -> Result<SessionSummary, SessionContextError>;
+    ) -> Result<ModelMessage, SessionContextError>;
 }
 
 pub struct AgentSessionCompactor {
     journal: Arc<dyn AgentSessionJournalStore>,
     summarizer: Arc<dyn AgentSessionSummarizer>,
+    summarizer_descriptor: SessionSummarizerDescriptor,
     policy: SessionCompactionPolicy,
 }
 
@@ -556,11 +579,22 @@ impl AgentSessionCompactor {
         policy: SessionCompactionPolicy,
     ) -> Result<Self, SessionContextError> {
         policy.validate()?;
+        let summarizer_descriptor = summarizer.descriptor();
+        summarizer_descriptor.validate()?;
         Ok(Self {
             journal,
             summarizer,
+            summarizer_descriptor,
             policy,
         })
+    }
+
+    pub fn policy(&self) -> &SessionCompactionPolicy {
+        &self.policy
+    }
+
+    pub fn summarizer_descriptor(&self) -> &SessionSummarizerDescriptor {
+        &self.summarizer_descriptor
     }
 
     pub async fn compact_if_needed(
@@ -591,7 +625,7 @@ impl AgentSessionCompactor {
                 messages,
             })
             .await?;
-        summary.message.validate().map_err(|error| {
+        summary.validate().map_err(|error| {
             SessionContextError::Compaction(format!("invalid summary message: {error}"))
         })?;
         let event_id = AgentSessionEventId::new(format!(
@@ -610,10 +644,11 @@ impl AgentSessionCompactor {
                     source,
                     source_digest,
                     policy_digest,
-                    summary: summary.message,
-                    strategy: summary.strategy,
-                    model: summary.model,
-                    version: summary.version,
+                    summary_config_digest: self.summarizer_descriptor.config_digest.clone(),
+                    summary,
+                    strategy: self.summarizer_descriptor.strategy.clone(),
+                    model: self.summarizer_descriptor.model.clone(),
+                    version: self.summarizer_descriptor.version.clone(),
                 },
             })
             .await?;
@@ -634,19 +669,23 @@ mod tests {
 
     #[async_trait]
     impl AgentSessionSummarizer for FixedSummarizer {
-        async fn summarize(
-            &self,
-            input: SessionCompactionInput,
-        ) -> Result<SessionSummary, SessionContextError> {
-            Ok(SessionSummary {
-                message: ModelMessage::text(
-                    ModelRole::System,
-                    format!("summary of {} messages", input.messages.len()),
-                ),
+        fn descriptor(&self) -> SessionSummarizerDescriptor {
+            SessionSummarizerDescriptor {
                 strategy: "fixed-test-summary".to_owned(),
                 model: None,
                 version: "1".to_owned(),
-            })
+                config_digest: Digest::sha256("fixed-test-summary/v1"),
+            }
+        }
+
+        async fn summarize(
+            &self,
+            input: SessionCompactionInput,
+        ) -> Result<ModelMessage, SessionContextError> {
+            Ok(ModelMessage::text(
+                ModelRole::System,
+                format!("summary of {} messages", input.messages.len()),
+            ))
         }
     }
 
@@ -832,15 +871,17 @@ mod tests {
             .await
             .unwrap()
             .expect("old prefix is compacted");
-        let (source, source_digest, persisted_policy_digest) = match &compacted.payload {
-            AgentSessionEvent::CompactionCommitted {
-                source,
-                source_digest,
-                policy_digest,
-                ..
-            } => (source, source_digest, policy_digest),
-            _ => panic!("expected compaction record"),
-        };
+        let (source, source_digest, persisted_policy_digest, summary_config_digest) =
+            match &compacted.payload {
+                AgentSessionEvent::CompactionCommitted {
+                    source,
+                    source_digest,
+                    policy_digest,
+                    summary_config_digest,
+                    ..
+                } => (source, source_digest, policy_digest, summary_config_digest),
+                _ => panic!("expected compaction record"),
+            };
         assert_eq!(source.first_session_seq, 1);
         assert_eq!(source.last_session_seq, 5);
         let records = store
@@ -852,6 +893,10 @@ mod tests {
             *source_digest
         );
         assert_eq!(*persisted_policy_digest, policy_digest);
+        assert_eq!(
+            *summary_config_digest,
+            Digest::sha256("fixed-test-summary/v1")
+        );
         assert!(compactor
             .compact_if_needed(&AgentSessionId::new("session-1"), &RunId::new("current"),)
             .await

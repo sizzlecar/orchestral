@@ -50,9 +50,9 @@ use orchestral_runtime::{
     GuardedToolExecution, GuardedToolExecutor, GuardedToolResult, GuardedToolRuntime,
     InMemoryBlobStore, InMemoryGenericAgentCheckpointStore, InMemoryHostApprovalBroker,
     InternalGenericAgentProvider, JsonSizeTokenMeter, SessionCompactionInput,
-    SessionCompactionPolicy, SessionContextError, SessionSummary, SkillActivationOutcome,
-    SkillActivationPolicy, SkillActivationRequest, SkillHostProfile, SkillRuntime,
-    StoredGenericAgentRun, ToolArtifactStore, WorkflowExecutionStrategy,
+    SessionCompactionPolicy, SessionContextError, SessionSummarizerDescriptor,
+    SkillActivationOutcome, SkillActivationPolicy, SkillActivationRequest, SkillHostProfile,
+    SkillRuntime, StoredGenericAgentRun, ToolArtifactStore, WorkflowExecutionStrategy,
 };
 use serde_json::json;
 use tokio::sync::Notify;
@@ -2180,20 +2180,29 @@ impl ModelBackend for RestartSessionModel {
 
 #[async_trait]
 impl orchestral_runtime::AgentSessionSummarizer for RecordingSessionSummarizer {
+    fn descriptor(&self) -> SessionSummarizerDescriptor {
+        SessionSummarizerDescriptor {
+            strategy: "recording-integration-summary".to_owned(),
+            model: None,
+            version: "1".to_owned(),
+            config_digest: orchestral_core::agent_protocol::wire::Digest::sha256(
+                "recording-integration-summary/v1",
+            ),
+        }
+    }
+
     async fn summarize(
         &self,
         input: SessionCompactionInput,
-    ) -> Result<SessionSummary, SessionContextError> {
+    ) -> Result<ModelMessage, SessionContextError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(input.source.first_session_seq, 1);
         assert_eq!(input.source.last_session_seq, 2);
         assert_eq!(input.messages.len(), 2);
-        Ok(SessionSummary {
-            message: ModelMessage::text(ModelRole::System, "durable compaction summary marker"),
-            strategy: "recording-integration-summary".to_owned(),
-            model: None,
-            version: "1".to_owned(),
-        })
+        Ok(ModelMessage::text(
+            ModelRole::System,
+            "durable compaction summary marker",
+        ))
     }
 }
 
@@ -7652,6 +7661,8 @@ async fn bound_session_compaction_runs_before_a_real_model_round_and_is_durable(
         keep_recent_records: 1,
     };
     let expected_policy_digest = policy.digest().unwrap();
+    let expected_summary_config_digest =
+        orchestral_core::agent_protocol::wire::Digest::sha256("recording-integration-summary/v1");
     let provider = Arc::new(
         InternalGenericAgentProvider::new_with_session_journal(
             model.clone(),
@@ -7700,18 +7711,26 @@ async fn bound_session_compaction_runs_before_a_real_model_round_and_is_durable(
             AgentSessionEvent::CompactionCommitted {
                 source,
                 policy_digest,
+                summary_config_digest,
                 strategy,
                 version,
                 ..
-            } => Some((source, policy_digest, strategy, version)),
+            } => Some((
+                source,
+                policy_digest,
+                summary_config_digest,
+                strategy,
+                version,
+            )),
             _ => None,
         })
         .expect("model-round compaction is a durable Session fact");
     assert_eq!(compaction.0.first_session_seq, 1);
     assert_eq!(compaction.0.last_session_seq, 2);
     assert_eq!(*compaction.1, expected_policy_digest);
-    assert_eq!(compaction.2, "recording-integration-summary");
-    assert_eq!(compaction.3, "1");
+    assert_eq!(*compaction.2, expected_summary_config_digest);
+    assert_eq!(compaction.3, "recording-integration-summary");
+    assert_eq!(compaction.4, "1");
     assert_eq!(summarizer_calls.load(Ordering::SeqCst), 1);
     assert_eq!(model.requests.load(Ordering::SeqCst), 2);
 }

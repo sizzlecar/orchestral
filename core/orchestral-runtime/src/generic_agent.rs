@@ -66,7 +66,7 @@ use crate::workflow_strategy::{WorkflowExecutionRequest, WorkflowExecutionStrate
 use crate::{
     AgentSessionCompactor, AgentSessionContextEngine, AgentSessionSummarizer, JsonSizeTokenMeter,
     ModelTokenMeter, SessionCompactionPolicy, SessionContextError, SessionContextProjection,
-    SessionContextRequest,
+    SessionContextRequest, SessionSummarizerDescriptor,
 };
 
 const WORKFLOW_TOOL_NAME: &str = "orchestral_workflow";
@@ -346,13 +346,17 @@ impl InternalGenericAgentProvider {
                 "Session compaction is already bound",
             ));
         }
-        let config_digest = bind_session_compaction_config_digest(&inner.config_digest, &policy)?;
         let compactor =
             AgentSessionCompactor::new(inner.session_journal.clone(), summarizer, policy).map_err(
                 |error| {
                     AgentProtocolError::new(AgentProtocolErrorCode::InvalidSpec, error.to_string())
                 },
             )?;
+        let config_digest = bind_session_compaction_config_digest(
+            &inner.config_digest,
+            compactor.policy(),
+            compactor.summarizer_descriptor(),
+        )?;
         inner.config_digest = config_digest;
         inner.session_compactor = Some(Arc::new(compactor));
         Ok(self)
@@ -8011,11 +8015,13 @@ fn generic_config_digest(
 fn bind_session_compaction_config_digest(
     base_config_digest: &Digest,
     policy: &SessionCompactionPolicy,
+    summarizer: &SessionSummarizerDescriptor,
 ) -> Result<Digest, AgentProtocolError> {
     let value = serde_json::json!({
         "contract": "generic-agent-session-compaction/v1",
         "base_config_digest": base_config_digest,
         "policy": policy,
+        "summarizer": summarizer,
     });
     let bytes = serde_jcs::to_vec(&value).map_err(|error| {
         AgentProtocolError::new(

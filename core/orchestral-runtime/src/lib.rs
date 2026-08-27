@@ -41,7 +41,7 @@ pub use pty_process::{
 pub use session_context::{
     AgentSessionCompactor, AgentSessionContextEngine, AgentSessionSummarizer, JsonSizeTokenMeter,
     ModelTokenMeter, SessionCompactionInput, SessionCompactionPolicy, SessionContextError,
-    SessionContextProjection, SessionContextRequest, SessionSummary,
+    SessionContextProjection, SessionContextRequest, SessionSummarizerDescriptor,
 };
 pub use skill::{
     ActivatedSkillSet, SkillActivationOutcome, SkillActivationPolicy, SkillActivationRequest,
