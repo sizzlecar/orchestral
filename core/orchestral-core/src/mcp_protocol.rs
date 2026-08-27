@@ -68,6 +68,9 @@ pub struct McpTransportAuthority {
     pub binding_digest: Digest,
     pub effect_scopes: BTreeSet<EffectScope>,
     pub process_programs: BTreeSet<String>,
+    pub filesystem_read_roots: BTreeSet<String>,
+    pub filesystem_write_roots: BTreeSet<String>,
+    pub sandbox_profiles: BTreeSet<String>,
     pub network_targets: BTreeSet<String>,
     pub environment_variables: BTreeSet<String>,
     pub credential_references: BTreeSet<String>,
@@ -78,6 +81,9 @@ impl McpTransportAuthority {
         let invalid = self
             .process_programs
             .iter()
+            .chain(self.filesystem_read_roots.iter())
+            .chain(self.filesystem_write_roots.iter())
+            .chain(self.sandbox_profiles.iter())
             .chain(self.network_targets.iter())
             .chain(self.environment_variables.iter())
             .chain(self.credential_references.iter())
@@ -88,17 +94,20 @@ impl McpTransportAuthority {
             ));
         }
         let required_effects = match self.kind {
-            McpTransportKind::Stdio => BTreeSet::from([
-                EffectScope::Process,
-                EffectScope::FilesystemRead,
-                EffectScope::FilesystemWrite,
-                EffectScope::ExternalSideEffect,
-            ]),
+            McpTransportKind::Stdio => {
+                BTreeSet::from([EffectScope::Process, EffectScope::ExternalSideEffect])
+            }
             McpTransportKind::StreamableHttp => {
                 BTreeSet::from([EffectScope::Network, EffectScope::ExternalSideEffect])
             }
         };
+        let filesystem_authority_matches = self.kind != McpTransportKind::Stdio
+            || (self.effect_scopes.contains(&EffectScope::FilesystemRead)
+                != self.filesystem_read_roots.is_empty()
+                && self.effect_scopes.contains(&EffectScope::FilesystemWrite)
+                    != self.filesystem_write_roots.is_empty());
         if !required_effects.is_subset(&self.effect_scopes)
+            || !filesystem_authority_matches
             || (!self.credential_references.is_empty()
                 && !self.effect_scopes.contains(&EffectScope::SecretRead))
         {
@@ -108,16 +117,21 @@ impl McpTransportAuthority {
         }
         match self.kind {
             McpTransportKind::Stdio
-                if self.process_programs.len() != 1 || !self.network_targets.is_empty() =>
+                if self.process_programs.len() != 1
+                    || self.filesystem_read_roots.is_empty()
+                    || self.sandbox_profiles.len() != 1
+                    || !self.network_targets.is_empty() =>
             {
                 Err(McpProtocolError::Invalid(
-                    "stdio MCP transport authority requires one program and no network target"
-                        .to_owned(),
+                    "stdio MCP transport authority requires one program, readable roots, one sandbox profile, and no network target".to_owned(),
                 ))
             }
             McpTransportKind::StreamableHttp
                 if self.network_targets.len() != 1
                     || !self.process_programs.is_empty()
+                    || !self.filesystem_read_roots.is_empty()
+                    || !self.filesystem_write_roots.is_empty()
+                    || !self.sandbox_profiles.is_empty()
                     || !self.environment_variables.is_empty() =>
             {
                 Err(McpProtocolError::Invalid(

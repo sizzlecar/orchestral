@@ -52,7 +52,8 @@ use orchestral_runtime::{
     GuardedMcpServerConfig, GuardedToolRuntime, InMemoryBlobStore,
     InMemoryGenericAgentCheckpointStore, InMemoryHostApprovalBroker, InternalGenericAgentProvider,
     McpToolsAdapterRegistry, ModelTokenMeter, SessionCompactionPolicy, SkillActivationPolicy,
-    SkillHostProfile, SkillRoot, SkillRuntime, StdioMcpTransportFactory, ToolArtifactStore,
+    SkillHostProfile, SkillRoot, SkillRuntime, StdioMcpSandboxPolicy, StdioMcpTransportFactory,
+    ToolArtifactStore,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
@@ -345,6 +346,10 @@ fn build_cli_tool_runtime(
         .iter()
         .flat_map(GuardedMcpServerConfig::credential_references)
         .collect();
+    let mcp_sandbox_profiles = mcp_configs
+        .iter()
+        .flat_map(GuardedMcpServerConfig::sandbox_profiles)
+        .collect::<BTreeSet<_>>();
     let writable_roots = if shell_enabled || mcp_effects.contains(&EffectScope::FilesystemWrite) {
         BTreeSet::from([workspace.clone()])
     } else {
@@ -359,7 +364,10 @@ fn build_cli_tool_runtime(
                 "workspace_read".to_owned(),
                 orchestral_runtime::tools::GUARDED_SHELL_SANDBOX_PROFILE.to_owned(),
                 orchestral_runtime::tools::GUARDED_PTY_SANDBOX_PROFILE.to_owned(),
-            ]),
+            ])
+            .union(&mcp_sandbox_profiles)
+            .cloned()
+            .collect(),
         },
         process: ProcessPolicy {
             allowed_programs,
@@ -615,6 +623,8 @@ fn configured_mcp_servers(
     if !config.mcp.enabled {
         return Ok(Vec::new());
     }
+    let workspace = std::fs::canonicalize(std::env::current_dir().context("resolve workspace")?)
+        .context("canonicalize workspace")?;
     let mut servers = Vec::new();
     for spec in config.mcp.servers.iter().filter(|server| server.enabled) {
         let transport = (|| -> anyhow::Result<Arc<dyn McpTransportFactory>> {
@@ -627,6 +637,7 @@ fn configured_mcp_servers(
                         env.iter()
                             .map(|(key, value)| (key.clone(), value.clone()))
                             .collect(),
+                        StdioMcpSandboxPolicy::workspace(workspace.clone()),
                     )?))
                 }
                 McpTransportSpec::StreamableHttp {

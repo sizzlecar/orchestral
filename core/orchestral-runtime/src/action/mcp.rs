@@ -26,11 +26,13 @@ use tokio_util::sync::CancellationToken;
 use crate::tool_runtime::{
     GuardedToolExecution, GuardedToolExecutor, GuardedToolRuntime, ToolRuntimeError,
 };
+use crate::tools::shell_sandbox::{sandbox_command, ShellSandboxPolicy};
 
 const DEFAULT_MCP_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SAFE_MCP_HEADER_INTEGER: u64 = 9_007_199_254_740_991;
 const MCP_TRANSPORT_CLOSE_TIMEOUT: Duration = Duration::from_millis(750);
 const MCP_PROCESS_REAP_TIMEOUT: Duration = Duration::from_millis(500);
+pub const MCP_STDIO_SANDBOX_PROFILE: &str = "orchestral.mcp.stdio.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum McpHeaderValueKind {
@@ -226,6 +228,71 @@ fn invalid_mcp_header_value(binding: &McpHeaderBinding) -> String {
     )
 }
 
+/// Immutable Host filesystem boundary for one stdio MCP server process.
+#[derive(Debug, Clone)]
+pub struct StdioMcpSandboxPolicy {
+    cwd: PathBuf,
+    readable_roots: BTreeSet<PathBuf>,
+    writable_roots: BTreeSet<PathBuf>,
+}
+
+impl StdioMcpSandboxPolicy {
+    pub fn workspace(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        Self {
+            cwd: root.clone(),
+            readable_roots: BTreeSet::from([root.clone()]),
+            writable_roots: BTreeSet::from([root]),
+        }
+    }
+
+    fn normalize(self) -> Result<Self, McpToolsAdapterError> {
+        let cwd = canonical_mcp_directory(&self.cwd, "cwd")?;
+        let readable_roots = self
+            .readable_roots
+            .iter()
+            .map(|root| canonical_mcp_directory(root, "readable root"))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let writable_roots = self
+            .writable_roots
+            .iter()
+            .map(|root| canonical_mcp_directory(root, "writable root"))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if readable_roots.is_empty()
+            || writable_roots.is_empty()
+            || !writable_roots.iter().any(|root| cwd.starts_with(root))
+        {
+            return Err(McpToolsAdapterError::InvalidConfig(
+                "MCP stdio sandbox requires readable/writable roots and a writable cwd".to_owned(),
+            ));
+        }
+        Ok(Self {
+            cwd,
+            readable_roots,
+            writable_roots,
+        })
+    }
+}
+
+fn canonical_mcp_directory(
+    path: &std::path::Path,
+    label: &str,
+) -> Result<PathBuf, McpToolsAdapterError> {
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        McpToolsAdapterError::InvalidConfig(format!(
+            "canonicalize MCP stdio sandbox {label} '{}' failed: {error}",
+            path.display()
+        ))
+    })?;
+    if !canonical.is_dir() {
+        return Err(McpToolsAdapterError::InvalidConfig(format!(
+            "MCP stdio sandbox {label} '{}' is not a directory",
+            path.display()
+        )));
+    }
+    Ok(canonical)
+}
+
 /// Built-in stdio transport factory. External transports implement the core
 /// [`McpTransportFactory`] SPI from a plugin and are injected by the Host.
 #[derive(Debug, Clone)]
@@ -233,6 +300,7 @@ pub struct StdioMcpTransportFactory {
     program: PathBuf,
     args: Vec<String>,
     environment: BTreeMap<String, String>,
+    sandbox: StdioMcpSandboxPolicy,
     authority: McpTransportAuthority,
 }
 
@@ -241,6 +309,7 @@ impl StdioMcpTransportFactory {
         program: PathBuf,
         args: Vec<String>,
         environment: BTreeMap<String, String>,
+        sandbox: StdioMcpSandboxPolicy,
     ) -> Result<Self, McpToolsAdapterError> {
         let canonical_program = program.canonicalize().ok();
         if !program.is_absolute()
@@ -254,6 +323,7 @@ impl StdioMcpTransportFactory {
                 "invalid guarded MCP stdio transport".to_owned(),
             ));
         }
+        let sandbox = sandbox.normalize()?;
         let mut effect_scopes = BTreeSet::from([
             EffectScope::Process,
             EffectScope::FilesystemRead,
@@ -268,6 +338,10 @@ impl StdioMcpTransportFactory {
             "program": program.to_string_lossy(),
             "args": args,
             "environmentNames": environment.keys().collect::<Vec<_>>(),
+            "cwd": sandbox.cwd.to_string_lossy(),
+            "readableRoots": sandbox.readable_roots.iter().map(|root| root.to_string_lossy()).collect::<Vec<_>>(),
+            "writableRoots": sandbox.writable_roots.iter().map(|root| root.to_string_lossy()).collect::<Vec<_>>(),
+            "sandboxProfile": MCP_STDIO_SANDBOX_PROFILE,
             "maxFrameBytes": DEFAULT_MCP_MAX_FRAME_BYTES,
         });
         let binding_digest = Digest::sha256(
@@ -279,6 +353,17 @@ impl StdioMcpTransportFactory {
             binding_digest,
             effect_scopes,
             process_programs: BTreeSet::from([program.to_string_lossy().to_string()]),
+            filesystem_read_roots: sandbox
+                .readable_roots
+                .iter()
+                .map(|root| root.to_string_lossy().into_owned())
+                .collect(),
+            filesystem_write_roots: sandbox
+                .writable_roots
+                .iter()
+                .map(|root| root.to_string_lossy().into_owned())
+                .collect(),
+            sandbox_profiles: BTreeSet::from([MCP_STDIO_SANDBOX_PROFILE.to_owned()]),
             network_targets: BTreeSet::new(),
             environment_variables: environment.keys().cloned().collect(),
             credential_references: BTreeSet::new(),
@@ -290,6 +375,7 @@ impl StdioMcpTransportFactory {
             program,
             args,
             environment,
+            sandbox,
             authority,
         })
     }
@@ -302,15 +388,29 @@ impl McpTransportFactory for StdioMcpTransportFactory {
     }
 
     async fn connect(&self) -> Result<Box<dyn McpTransportConnection>, McpTransportError> {
-        let environment = self
+        let command = sandbox_command(
+            self.program.to_string_lossy().into_owned(),
+            self.args.clone(),
+            &self.sandbox.cwd,
+            &ShellSandboxPolicy {
+                readable_roots: self.sandbox.readable_roots.iter().cloned().collect(),
+                writable_roots: self.sandbox.writable_roots.iter().cloned().collect(),
+                allowed_programs: vec![self.program.clone()],
+                linux_bwrap_path: None,
+            },
+        )
+        .map_err(McpTransportError::Transport)?;
+        let mut environment = self
             .environment
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect::<HashMap<_, _>>();
+        environment.extend(command.env);
         StdioMcpTransport::connect(
-            self.program.to_string_lossy().as_ref(),
-            &self.args,
+            &command.program,
+            &command.args,
             &environment,
+            &self.sandbox.cwd,
         )
         .await
         .map(|transport| Box::new(transport) as Box<dyn McpTransportConnection>)
@@ -387,6 +487,18 @@ impl GuardedMcpServerConfig {
 
     pub fn allowed_network_targets(&self) -> BTreeSet<String> {
         self.transport.authority().network_targets.clone()
+    }
+
+    pub fn filesystem_read_roots(&self) -> BTreeSet<String> {
+        self.transport.authority().filesystem_read_roots.clone()
+    }
+
+    pub fn filesystem_write_roots(&self) -> BTreeSet<String> {
+        self.transport.authority().filesystem_write_roots.clone()
+    }
+
+    pub fn sandbox_profiles(&self) -> BTreeSet<String> {
+        self.transport.authority().sandbox_profiles.clone()
     }
 
     pub fn environment_names(&self) -> BTreeSet<String> {
@@ -955,6 +1067,9 @@ impl McpToolsAdapterRegistry {
                 )));
             }
             let programs = config.allowed_programs();
+            let read_roots = config.filesystem_read_roots();
+            let write_roots = config.filesystem_write_roots();
+            let sandbox_profiles = config.sandbox_profiles();
             let network_targets = config.allowed_network_targets();
             let environment = config.environment_names();
             let credentials = config.credential_references();
@@ -962,6 +1077,10 @@ impl McpToolsAdapterRegistry {
                 .effect_scopes()
                 .is_subset(&restriction.bounds.allowed_effects)
                 || !programs.is_subset(&restriction.bounds.process.allowed_programs)
+                || !read_roots.is_subset(&restriction.bounds.filesystem.readable_roots)
+                || !write_roots.is_subset(&restriction.bounds.filesystem.writable_roots)
+                || !sandbox_profiles.is_subset(&restriction.bounds.sandbox.allowed_profiles)
+                || (!sandbox_profiles.is_empty() && !restriction.bounds.sandbox.required)
                 || !network_targets.is_subset(&restriction.bounds.network.allowed_targets)
                 || !environment.is_subset(&restriction.bounds.environment.allowed_variables)
                 || !credentials.is_subset(&restriction.bounds.allowed_credentials)
@@ -1144,10 +1263,17 @@ impl GuardedToolExecutor for GuardedMcpToolExecutor {
         }
         let bounds = execution.effective_policy.bounds();
         let programs = self.manager.config.allowed_programs();
+        let read_roots = self.manager.config.filesystem_read_roots();
+        let write_roots = self.manager.config.filesystem_write_roots();
+        let sandbox_profiles = self.manager.config.sandbox_profiles();
         let network_targets = self.manager.config.allowed_network_targets();
         let environment = self.manager.config.environment_names();
         let credentials = self.manager.config.credential_references();
         if !programs.is_subset(&bounds.process.allowed_programs)
+            || !read_roots.is_subset(&bounds.filesystem.readable_roots)
+            || !write_roots.is_subset(&bounds.filesystem.writable_roots)
+            || !sandbox_profiles.is_subset(&bounds.sandbox.allowed_profiles)
+            || (!sandbox_profiles.is_empty() && !bounds.sandbox.required)
             || !network_targets.is_subset(&bounds.network.allowed_targets)
             || !environment.is_subset(&bounds.environment.allowed_variables)
             || !credentials.is_subset(&bounds.allowed_credentials)
@@ -1503,12 +1629,14 @@ impl StdioMcpTransport {
         command: &str,
         args: &[String],
         env: &HashMap<String, String>,
+        cwd: &std::path::Path,
     ) -> Result<Self, String> {
         let mut cmd = Command::new(command);
         cmd.args(args);
         // MCP stdio servers receive only the Host-configured environment.
         cmd.env_clear();
         cmd.envs(env);
+        cmd.current_dir(cwd);
         isolate_mcp_process_group(&mut cmd);
         cmd.kill_on_drop(true)
             .stdin(std::process::Stdio::piped())
@@ -2021,12 +2149,26 @@ mod mcp_lifecycle_gate_tests {
                 ),
                 _ => unreachable!("fault factory only selects v1 transport kinds"),
             };
+            let (filesystem_read_roots, filesystem_write_roots, sandbox_profiles) = match kind {
+                McpTransportKind::Stdio => (
+                    BTreeSet::from(["/fault/read".to_owned()]),
+                    BTreeSet::from(["/fault/write".to_owned()]),
+                    BTreeSet::from([MCP_STDIO_SANDBOX_PROFILE.to_owned()]),
+                ),
+                McpTransportKind::StreamableHttp => {
+                    (BTreeSet::new(), BTreeSet::new(), BTreeSet::new())
+                }
+                _ => unreachable!("fault factory only selects v1 transport kinds"),
+            };
             Arc::new(Self {
                 authority: McpTransportAuthority {
                     kind,
                     binding_digest: Digest::sha256(format!("fault-stage-{stage:?}")),
                     effect_scopes,
                     process_programs,
+                    filesystem_read_roots,
+                    filesystem_write_roots,
+                    sandbox_profiles,
                     network_targets,
                     environment_variables: BTreeSet::new(),
                     credential_references: BTreeSet::new(),
@@ -2263,6 +2405,10 @@ mod mcp_lifecycle_gate_tests {
             ..ToolPolicyBounds::default()
         };
         bounds.process.allowed_programs = authority.process_programs.clone();
+        bounds.filesystem.readable_roots = authority.filesystem_read_roots.clone();
+        bounds.filesystem.writable_roots = authority.filesystem_write_roots.clone();
+        bounds.sandbox.allowed_profiles = authority.sandbox_profiles.clone();
+        bounds.sandbox.required = !authority.sandbox_profiles.is_empty();
         bounds.network.allowed_targets = authority.network_targets.clone();
         bounds.environment.allowed_variables = authority.environment_variables.clone();
         bounds.allowed_credentials = authority.credential_references.clone();
@@ -2535,6 +2681,9 @@ mod mcp_lifecycle_gate_tests {
                         EffectScope::SecretRead,
                     ]),
                     process_programs: BTreeSet::from(["/fault/mcp".to_owned()]),
+                    filesystem_read_roots: BTreeSet::from(["/fault/read".to_owned()]),
+                    filesystem_write_roots: BTreeSet::from(["/fault/write".to_owned()]),
+                    sandbox_profiles: BTreeSet::from([MCP_STDIO_SANDBOX_PROFILE.to_owned()]),
                     network_targets: BTreeSet::new(),
                     environment_variables: BTreeSet::from([format!("SENTINEL_ENV_{index}")]),
                     credential_references: BTreeSet::new(),
@@ -2549,6 +2698,9 @@ mod mcp_lifecycle_gate_tests {
                         EffectScope::SecretRead,
                     ]),
                     process_programs: BTreeSet::new(),
+                    filesystem_read_roots: BTreeSet::new(),
+                    filesystem_write_roots: BTreeSet::new(),
+                    sandbox_profiles: BTreeSet::new(),
                     network_targets: BTreeSet::from(["http://127.0.0.1/fault-mcp".to_owned()]),
                     environment_variables: BTreeSet::new(),
                     credential_references: BTreeSet::from([format!("env:SENTINEL_TOKEN_{index}")]),
