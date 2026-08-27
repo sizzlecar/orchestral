@@ -625,6 +625,24 @@ mod tests {
             .unwrap();
     }
 
+    async fn append_session_payload(
+        store: &Arc<InMemoryAgentSessionJournalStore>,
+        session_id: &AgentSessionId,
+        run_id: &RunId,
+        event_id: String,
+        payload: AgentSessionEvent,
+    ) {
+        store
+            .append(AgentSessionEventDraft {
+                event_id: AgentSessionEventId::new(event_id),
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+                payload,
+            })
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn newest_history_cannot_be_evicted_by_older_messages() {
         let store = Arc::new(InMemoryAgentSessionJournalStore::default());
@@ -814,5 +832,211 @@ mod tests {
         assert!(rendered[0].contains("summary of 5 messages"));
         assert!(!rendered.join(" ").contains("old-1"));
         assert!(rendered.last().unwrap().contains("current-input"));
+    }
+
+    #[tokio::test]
+    async fn ten_thousand_generated_context_budgets_never_overflow_or_evict_a_fittable_recent_prefix(
+    ) {
+        const HISTORIES: usize = 100;
+        const CONFIGS_PER_HISTORY: usize = 100;
+
+        let store = Arc::new(InMemoryAgentSessionJournalStore::default());
+        let meter = Arc::new(JsonSizeTokenMeter::new(1).unwrap());
+        let engine = AgentSessionContextEngine::new(store.clone(), meter.clone());
+        let system = ModelMessage::text(ModelRole::System, "stable system policy");
+        let tools = vec![ModelToolDefinition {
+            name: "inspect".to_owned(),
+            description: "Inspect one generated value".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["value"],
+                "properties": { "value": { "type": "string" } },
+                "additionalProperties": false
+            }),
+        }];
+        let mut seed = 0xA6E7_5E55_D15C_A11Du64;
+        let mut successful = 0usize;
+        let mut overflowed = 0usize;
+
+        for history_index in 0..HISTORIES {
+            let session_id = AgentSessionId::new(format!("budget-session-{history_index}"));
+            let old_run_id = RunId::new(format!("budget-old-{history_index}"));
+            let current_run_id = RunId::new(format!("budget-current-{history_index}"));
+            for sequence in 1..=12u64 {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                let width = 12 + (seed % 96) as usize;
+                let payload = if sequence % 3 == 0 {
+                    let call_id =
+                        ModelToolCallId::new(format!("budget-call-{history_index}-{sequence}"));
+                    AgentSessionEvent::ToolExchangeCommitted {
+                        request_id: ModelRequestId::new(format!(
+                            "budget-request-{history_index}-{sequence}"
+                        )),
+                        assistant: ModelMessage {
+                            role: ModelRole::Assistant,
+                            content: vec![ModelContent::ToolCall {
+                                call_id: call_id.clone(),
+                                name: "inspect".to_owned(),
+                                arguments: json!({ "value": "x".repeat(width) }),
+                            }],
+                        },
+                        tool: ModelMessage {
+                            role: ModelRole::Tool,
+                            content: vec![ModelContent::ToolResult {
+                                call_id,
+                                result: json!({ "observed": "y".repeat(width / 2 + 1) }),
+                                is_error: false,
+                            }],
+                        },
+                        usage: None,
+                    }
+                } else {
+                    AgentSessionEvent::RunInputCommitted {
+                        message: ModelMessage::text(
+                            ModelRole::User,
+                            format!("history-{history_index}-{sequence}-{}", "z".repeat(width)),
+                        ),
+                    }
+                };
+                append_session_payload(
+                    &store,
+                    &session_id,
+                    &old_run_id,
+                    format!("budget-event-{history_index}-{sequence}"),
+                    payload,
+                )
+                .await;
+            }
+            append_session_payload(
+                &store,
+                &session_id,
+                &current_run_id,
+                format!("budget-current-event-{history_index}"),
+                AgentSessionEvent::RunInputCommitted {
+                    message: ModelMessage::text(
+                        ModelRole::User,
+                        format!("current-task-{history_index}"),
+                    ),
+                },
+            )
+            .await;
+
+            let records = store.load_session(&session_id).await.unwrap();
+            let groups = replay_groups(&records, &current_run_id, &BTreeMap::new()).unwrap();
+            let pinned = groups
+                .values()
+                .filter(|group| group.pinned)
+                .map(|group| group.key)
+                .collect::<BTreeSet<_>>();
+            let pinned_tokens = meter
+                .count_request_input(
+                    &assemble_messages(&Some(system.clone()), &groups, &pinned),
+                    &tools,
+                )
+                .unwrap();
+            let old_keys = groups
+                .values()
+                .rev()
+                .filter(|group| !group.pinned)
+                .map(|group| group.key)
+                .collect::<Vec<_>>();
+            let mut recent = pinned.clone();
+            let mut recent_prefixes = Vec::new();
+            for key in old_keys {
+                recent.insert(key);
+                recent_prefixes.push((
+                    recent.clone(),
+                    meter
+                        .count_request_input(
+                            &assemble_messages(&Some(system.clone()), &groups, &recent),
+                            &tools,
+                        )
+                        .unwrap(),
+                ));
+            }
+
+            for config_index in 0..CONFIGS_PER_HISTORY {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                let max_context_tokens = 320 + seed % 4_681;
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                let reserved_output_tokens = 1 + seed % (max_context_tokens - 1);
+                let input_budget = max_context_tokens - reserved_output_tokens;
+                let config_digest =
+                    Digest::sha256(format!("budget-config-{history_index}-{config_index}"));
+                let projected = engine
+                    .project(SessionContextRequest {
+                        session_id: session_id.clone(),
+                        current_run_id: current_run_id.clone(),
+                        through_session_seq: None,
+                        system_message: Some(system.clone()),
+                        tools: tools.clone(),
+                        max_context_tokens,
+                        reserved_output_tokens,
+                        config_digest: config_digest.clone(),
+                        allowed_skill_digests: BTreeMap::new(),
+                    })
+                    .await;
+
+                if input_budget < pinned_tokens {
+                    assert!(matches!(
+                        projected,
+                        Err(SessionContextError::ContextOverflow { used, budget })
+                            if used == pinned_tokens && budget == input_budget
+                    ));
+                    overflowed += 1;
+                    continue;
+                }
+
+                let projection = projected.expect("fittable pinned context projects");
+                let actual = meter
+                    .count_request_input(&projection.messages, &tools)
+                    .unwrap();
+                assert_eq!(actual, projection.used_input_tokens);
+                assert!(actual <= input_budget);
+                assert_eq!(projection.input_budget_tokens, input_budget);
+                assert_eq!(projection.config_digest, config_digest);
+                assert_eq!(projection.through_session_seq, records.len() as u64);
+                let selected = projection
+                    .included_ranges
+                    .iter()
+                    .map(|range| {
+                        assert_eq!(range.first_session_seq, range.last_session_seq);
+                        range.first_session_seq
+                    })
+                    .collect::<BTreeSet<_>>();
+                assert!(pinned.is_subset(&selected));
+                if let Some((required, _)) = recent_prefixes
+                    .iter()
+                    .rev()
+                    .find(|(_, tokens)| *tokens <= input_budget)
+                {
+                    assert!(required.is_subset(&selected));
+                }
+                let calls = projection
+                    .messages
+                    .iter()
+                    .flat_map(|message| message.content.iter())
+                    .filter_map(|content| match content {
+                        ModelContent::ToolCall { call_id, .. } => Some(call_id.clone()),
+                        _ => None,
+                    })
+                    .collect::<BTreeSet<_>>();
+                let results = projection
+                    .messages
+                    .iter()
+                    .flat_map(|message| message.content.iter())
+                    .filter_map(|content| match content {
+                        ModelContent::ToolResult { call_id, .. } => Some(call_id.clone()),
+                        _ => None,
+                    })
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(calls, results);
+                successful += 1;
+            }
+        }
+
+        assert_eq!(successful + overflowed, HISTORIES * CONFIGS_PER_HISTORY);
+        assert!(successful > 0);
+        assert!(overflowed > 0);
     }
 }

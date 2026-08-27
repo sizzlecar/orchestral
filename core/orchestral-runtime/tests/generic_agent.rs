@@ -749,6 +749,12 @@ struct ToolLoopModel {
     rounds: AtomicUsize,
 }
 
+struct BudgetGuardToolLoopModel {
+    rounds: AtomicUsize,
+    oversized_dispatches: AtomicUsize,
+    input_budget: u64,
+}
+
 struct ArtifactLoopModel {
     rounds: AtomicUsize,
     large_value: String,
@@ -1314,6 +1320,94 @@ impl ModelBackend for ToolLoopModel {
             Ok(ModelStreamEvent {
                 request_id,
                 event_id: ModelEventId::new("answer-finish"),
+                sequence: 2,
+                payload: ModelEvent::Finish {
+                    reason: ModelFinishReason::Stop,
+                },
+            }),
+        ])))
+    }
+}
+
+#[async_trait]
+impl ModelBackend for BudgetGuardToolLoopModel {
+    fn descriptor(&self) -> ModelDescriptor {
+        ModelDescriptor {
+            backend_id: "budget-guard-tool-loop-model".to_owned(),
+            capabilities: ModelCapabilities {
+                streaming: true,
+                tool_calls: true,
+                max_context_tokens: Some(self.input_budget + 500),
+                ..ModelCapabilities::default()
+            },
+            extensions: Default::default(),
+        }
+    }
+
+    async fn start(
+        &self,
+        request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelStream, ModelError> {
+        request.validate()?;
+        let input_tokens = serde_jcs::to_vec(&(&request.messages, &request.tools))
+            .expect("test request is serializable")
+            .len() as u64;
+        if input_tokens > self.input_budget {
+            self.oversized_dispatches.fetch_add(1, Ordering::SeqCst);
+        }
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        let request_id = request.request_id;
+        if round == 0 {
+            return Ok(Box::pin(stream::iter([
+                Ok(ModelStreamEvent {
+                    request_id: request_id.clone(),
+                    event_id: ModelEventId::new("budget-tool-start"),
+                    sequence: 1,
+                    payload: ModelEvent::ToolCallStart {
+                        call_id: ModelToolCallId::new("budget-tool-call"),
+                        name: "echo".to_owned(),
+                    },
+                }),
+                Ok(ModelStreamEvent {
+                    request_id: request_id.clone(),
+                    event_id: ModelEventId::new("budget-tool-arguments"),
+                    sequence: 2,
+                    payload: ModelEvent::ToolCallArgumentsDelta {
+                        call_id: ModelToolCallId::new("budget-tool-call"),
+                        delta: r#"{"value":"expand context"}"#.to_owned(),
+                    },
+                }),
+                Ok(ModelStreamEvent {
+                    request_id: request_id.clone(),
+                    event_id: ModelEventId::new("budget-tool-end"),
+                    sequence: 3,
+                    payload: ModelEvent::ToolCallEnd {
+                        call_id: ModelToolCallId::new("budget-tool-call"),
+                    },
+                }),
+                Ok(ModelStreamEvent {
+                    request_id,
+                    event_id: ModelEventId::new("budget-tool-finish"),
+                    sequence: 4,
+                    payload: ModelEvent::Finish {
+                        reason: ModelFinishReason::ToolCalls,
+                    },
+                }),
+            ])));
+        }
+        Ok(Box::pin(stream::iter([
+            Ok(ModelStreamEvent {
+                request_id: request_id.clone(),
+                event_id: ModelEventId::new("budget-answer"),
+                sequence: 1,
+                payload: ModelEvent::TextDelta {
+                    delta: "oversized request reached backend".to_owned(),
+                },
+            }),
+            Ok(ModelStreamEvent {
+                request_id,
+                event_id: ModelEventId::new("budget-answer-finish"),
                 sequence: 2,
                 payload: ModelEvent::Finish {
                     reason: ModelFinishReason::Stop,
@@ -6802,6 +6896,122 @@ async fn generic_agent_executes_model_tools_only_through_the_guarded_runtime() {
         ContentBody::Inline(serde_json::Value::String(ref text))
             if text == "tool said hello"
     ));
+}
+
+#[tokio::test]
+async fn every_model_round_reprojects_context_before_backend_dispatch() {
+    const MAX_CONTEXT_TOKENS: u64 = 3_000;
+    const RESERVED_OUTPUT_TOKENS: u64 = 500;
+    const INPUT_BUDGET_TOKENS: u64 = MAX_CONTEXT_TOKENS - RESERVED_OUTPUT_TOKENS;
+
+    let bounds = ToolPolicyBounds {
+        approval: ApprovalPolicy::NotRequired,
+        max_timeout_ms: Some(1_000),
+        max_output_bytes: Some(10_000),
+        ..ToolPolicyBounds::default()
+    };
+    let verifier = HostApprovalVerifier::new(
+        b"0123456789abcdef0123456789abcdef",
+        InMemoryApprovalCapabilityStore::default(),
+    )
+    .unwrap();
+    let runtime = Arc::new(
+        GuardedToolRuntime::new(
+            HostToolPolicy {
+                bounds: bounds.clone(),
+            },
+            verifier,
+        )
+        .unwrap(),
+    );
+    runtime
+        .register(
+            ToolDescriptor {
+                tool_id: ToolId::new("test/budget-echo"),
+                model_schema: ModelToolSchema {
+                    name: "echo".to_owned(),
+                    description: "Return a deliberately large result".to_owned(),
+                    input_schema: json!({
+                        "type": "object",
+                        "required": ["value"],
+                        "properties": { "value": { "type": "string" } },
+                        "additionalProperties": false
+                    }),
+                },
+                output_schema: json!({
+                    "type": "object",
+                    "required": ["result"],
+                    "properties": { "result": { "type": "string" } },
+                    "additionalProperties": false
+                }),
+                effect_scopes: BTreeSet::new(),
+                restriction: ToolRestriction {
+                    bounds: bounds.clone(),
+                },
+                idempotency: ToolIdempotency::IdempotentWithKey,
+                concurrency: ToolConcurrency::ParallelSafe,
+            },
+            Arc::new(LargeResultTool {
+                value: "large-inline-result/".repeat(300),
+            }),
+        )
+        .unwrap();
+    let model = Arc::new(BudgetGuardToolLoopModel {
+        rounds: AtomicUsize::new(0),
+        oversized_dispatches: AtomicUsize::new(0),
+        input_budget: INPUT_BUDGET_TOKENS,
+    });
+    let mut config = GenericAgentConfig::new("internal-provider", "generic-agent");
+    config.max_context_tokens = MAX_CONTEXT_TOKENS;
+    config.reserved_output_tokens = RESERVED_OUTPUT_TOKENS;
+    config.max_model_rounds = 3;
+    let provider = Arc::new(
+        InternalGenericAgentProvider::new_with_tools_and_session_journal(
+            model.clone(),
+            config,
+            runtime,
+            RunToolGrant { bounds },
+            Arc::new(InMemoryAgentSessionJournalStore::default()),
+            Arc::new(JsonSizeTokenMeter::new(1).unwrap()),
+        )
+        .unwrap(),
+    );
+    let controller = Arc::new(
+        AgentController::new(provider, ProviderBindingRef::new("generic-binding")).unwrap(),
+    );
+    let run_id = RunId::new("context-budget-run");
+    let execution = controller
+        .start(
+            AgentRunEnvelope::new(
+                AGENT_PROTOCOL_V1,
+                AgentSessionId::new("context-budget-session"),
+                run_id.clone(),
+                vec![Content::text("call the large echo tool")],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let view = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        controller.wait_for_terminal(&execution.run_id),
+    )
+    .await
+    .expect("context overflow reaches a terminal boundary")
+    .unwrap();
+
+    assert_eq!(view.state.status(), AgentRunStatus::Failed);
+    assert_eq!(model.rounds.load(Ordering::SeqCst), 1);
+    assert_eq!(model.oversized_dispatches.load(Ordering::SeqCst), 0);
+    assert!(controller
+        .events(&run_id, 0)
+        .await
+        .unwrap()
+        .iter()
+        .any(|record| matches!(
+            &record.event.payload,
+            AgentEvent::RunFailed { failure } if failure.code == "context_overflow"
+        )));
 }
 
 #[tokio::test]

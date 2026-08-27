@@ -3625,6 +3625,22 @@ async fn execute_model_run(execution: ModelRunExecution) {
             emit_failure(&inner, &request, &user_message, failure);
             return;
         }
+        model_messages = match project_model_messages(
+            &inner,
+            &request,
+            &model_tools,
+            run_skills.as_deref(),
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(messages) => messages,
+            Err(error) => {
+                emit_failure(&inner, &request, &user_message, session_failure(error));
+                return;
+            }
+        };
         let model_request = model_request_for_round(&request, round, &model_messages, &model_tools);
         if let Err(failure) = commit_model_attempt(&inner, &run_id, round, &model_request) {
             emit_failure(&inner, &request, &user_message, failure);
