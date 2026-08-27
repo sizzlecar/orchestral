@@ -862,6 +862,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
                             &effective_policy,
                             &approval_binding,
                             approval.as_ref(),
+                            &run_cancellation,
                         )
                         .await
                     {
@@ -937,6 +938,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
         effective_policy: &EffectiveToolPolicy,
         approval_binding: &ApprovalBinding,
         approval: Option<&ApprovalCapability>,
+        run_cancellation: &CancellationToken,
     ) -> Result<DurableInvocationStart, GuardedToolResult> {
         let prepared = PreparedToolEffect {
             invocation: invocation.clone(),
@@ -989,6 +991,16 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
             }
             match projection.phase {
                 ToolEffectPhase::Prepared => {
+                    // Prepared records contain intent only. Cancellation here
+                    // proves the executor never crossed the durable Invoked
+                    // boundary, while prior Invoked/Observed/Committed phases
+                    // below still retain their conservative replay semantics.
+                    if run_cancellation.is_cancelled() {
+                        return Err(GuardedToolResult::Outcome {
+                            outcome: ToolOutcome::Cancelled,
+                            cached: false,
+                        });
+                    }
                     let (verified_approval, authorization) = if effective_policy.requires_approval()
                     {
                         let Some(capability) = approval else {

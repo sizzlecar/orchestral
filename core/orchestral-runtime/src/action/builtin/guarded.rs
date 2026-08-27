@@ -22,7 +22,8 @@ use crate::tool_runtime::{GuardedToolExecution, GuardedToolExecutor};
 use crate::tools::shell_sandbox::{sandbox_command, ShellSandboxPolicy};
 
 use super::support::{
-    build_allowlisted_env, read_stream_limited, stderr_preview, truncate_utf8_lossy,
+    build_allowlisted_env, canonical_roots, read_stream_limited, stderr_preview,
+    truncate_utf8_lossy,
 };
 
 pub const GUARDED_SHELL_SANDBOX_PROFILE: &str = "orchestral.shell.exec.v1";
@@ -38,9 +39,7 @@ impl GuardedToolExecutor for GuardedFileReadExecutor {
         }
         let bounds = execution.effective_policy.bounds();
         let roots = match canonical_roots(&bounds.filesystem.readable_roots) {
-            Ok(roots) if !roots.is_empty() => {
-                roots.into_iter().map(PathBuf::from).collect::<Vec<_>>()
-            }
+            Ok(roots) if !roots.is_empty() => roots,
             Ok(_) => {
                 return rejected(
                     "filesystem_root_denied",
@@ -291,15 +290,14 @@ impl GuardedToolExecutor for GuardedShellExecutor {
             }
             Err(message) => return rejected("shell_write_root_invalid", message),
         };
-        let cwd = PathBuf::from(
-            writable_roots
-                .first()
-                .or_else(|| readable_roots.first())
-                .expect("non-empty roots were checked"),
-        );
+        let cwd = writable_roots
+            .first()
+            .or_else(|| readable_roots.first())
+            .expect("non-empty roots were checked")
+            .clone();
         let sandbox_policy = ShellSandboxPolicy {
-            readable_roots: readable_roots.iter().map(PathBuf::from).collect(),
-            writable_roots: writable_roots.iter().map(PathBuf::from).collect(),
+            readable_roots: readable_roots.clone(),
+            writable_roots: writable_roots.clone(),
             allowed_programs: bounds
                 .process
                 .allowed_programs
@@ -553,17 +551,6 @@ pub(super) fn canonical_allowed_program(
         ));
     }
     Ok(canonical)
-}
-
-pub(super) fn canonical_roots(roots: &BTreeSet<String>) -> Result<Vec<String>, String> {
-    roots
-        .iter()
-        .map(|root| {
-            std::fs::canonicalize(PathBuf::from(root))
-                .map(|path| path.to_string_lossy().to_string())
-                .map_err(|error| format!("canonicalize policy root '{root}' failed: {error}"))
-        })
-        .collect()
 }
 
 fn string_arguments(arguments: &Value) -> Result<Vec<String>, String> {

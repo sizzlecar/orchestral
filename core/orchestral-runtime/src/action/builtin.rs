@@ -2,8 +2,12 @@
 mod guarded;
 #[path = "builtin/guarded_artifact.rs"]
 mod guarded_artifact;
+#[path = "builtin/guarded_patch.rs"]
+mod guarded_patch;
 #[path = "builtin/guarded_pty.rs"]
 mod guarded_pty;
+#[path = "builtin/patch_parser.rs"]
+mod patch_parser;
 #[path = "builtin/support.rs"]
 mod support;
 pub use self::guarded::{
@@ -11,6 +15,7 @@ pub use self::guarded::{
     GuardedShellExecutor, GUARDED_SHELL_SANDBOX_PROFILE,
 };
 pub use self::guarded_artifact::{guarded_artifact_read_descriptor, GuardedArtifactReadExecutor};
+pub use self::guarded_patch::{guarded_apply_patch_descriptor, GuardedApplyPatchExecutor};
 pub use self::guarded_pty::{
     guarded_pty_close_descriptor, guarded_pty_create_descriptor, guarded_pty_list_descriptor,
     guarded_pty_read_descriptor, guarded_pty_write_descriptor, GuardedPtyCloseExecutor,

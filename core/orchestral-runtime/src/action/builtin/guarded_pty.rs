@@ -15,8 +15,8 @@ use serde_json::{json, Value};
 use crate::pty_process::{PtyProcessError, PtyProcessId, PtyProcessManager, PtySpawnSpec};
 use crate::tool_runtime::{GuardedToolExecution, GuardedToolExecutor};
 
-use super::guarded::{canonical_allowed_program, canonical_roots};
-use super::support::build_allowlisted_env;
+use super::guarded::canonical_allowed_program;
+use super::support::{build_allowlisted_env, canonical_roots};
 use crate::tools::shell_sandbox::{sandbox_command, ShellSandboxPolicy};
 
 pub const GUARDED_PTY_SANDBOX_PROFILE: &str = "orchestral.pty.process.v1";
@@ -143,15 +143,14 @@ impl GuardedToolExecutor for GuardedPtyCreateExecutor {
             }
             Err(message) => return rejected("pty_write_root_invalid", message),
         };
-        let cwd = PathBuf::from(
-            writable_roots
-                .first()
-                .or_else(|| readable_roots.first())
-                .expect("non-empty roots were checked"),
-        );
+        let cwd = writable_roots
+            .first()
+            .or_else(|| readable_roots.first())
+            .expect("non-empty roots were checked")
+            .clone();
         let sandbox_policy = ShellSandboxPolicy {
-            readable_roots: readable_roots.iter().map(PathBuf::from).collect(),
-            writable_roots: writable_roots.iter().map(PathBuf::from).collect(),
+            readable_roots: readable_roots.clone(),
+            writable_roots: writable_roots.clone(),
             allowed_programs: bounds
                 .process
                 .allowed_programs

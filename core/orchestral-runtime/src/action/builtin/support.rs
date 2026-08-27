@@ -1,6 +1,19 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::PathBuf;
 
 use tokio::io::AsyncReadExt;
+
+/// Canonicalize Host-owned filesystem roots once before target checks.
+/// Model-visible paths never participate in this normalization.
+pub(super) fn canonical_roots(roots: &BTreeSet<String>) -> Result<Vec<PathBuf>, String> {
+    roots
+        .iter()
+        .map(|root| {
+            std::fs::canonicalize(PathBuf::from(root))
+                .map_err(|error| format!("canonicalize policy root '{root}' failed: {error}"))
+        })
+        .collect()
+}
 
 /// Build the exact process environment authorized by the Host.
 ///

@@ -508,6 +508,63 @@ async fn approval_required_never_calls_executor() {
     assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
 }
 
+#[tokio::test]
+async fn pre_dispatch_cancellation_stays_prepared_and_can_be_safely_retried() {
+    let bounds = policy(ApprovalPolicy::NotRequired);
+    let journal = Arc::new(InMemoryToolEffectJournalStore::default());
+    let runtime = runtime_with_effect_journal(bounds.clone(), journal.clone());
+    let executor = Arc::new(EchoExecutor {
+        calls: AtomicUsize::new(0),
+        delay: Duration::ZERO,
+    });
+    let mut tool = descriptor(bounds.clone(), ToolConcurrency::ParallelSafe);
+    tool.idempotency = ToolIdempotency::NonIdempotent;
+    runtime.register(tool, executor.clone()).unwrap();
+    let call = invocation("cancel-before-invoke");
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+
+    let cancelled = runtime
+        .invoke(
+            call.clone(),
+            RunToolGrant {
+                bounds: bounds.clone(),
+            },
+            None,
+            cancellation,
+        )
+        .await;
+    assert!(matches!(
+        cancelled,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Cancelled,
+            cached: false,
+        }
+    ));
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+    let key = ToolEffectKey::new(call.run_id.clone(), call.call_id.clone());
+    let records = journal.load_effect(&key).await.unwrap();
+    let projection = replay_tool_effect(&key, &records).unwrap().unwrap();
+    assert!(matches!(projection.phase, ToolEffectPhase::Prepared));
+
+    let retried = runtime
+        .invoke(
+            call,
+            RunToolGrant { bounds },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(
+        retried,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Completed { .. },
+            cached: false,
+        }
+    ));
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+}
+
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn guarded_shell_executes_only_after_exact_approval_inside_the_host_sandbox() {
