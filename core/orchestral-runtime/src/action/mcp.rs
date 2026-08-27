@@ -29,6 +29,8 @@ use crate::tool_runtime::{
 
 const DEFAULT_MCP_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SAFE_MCP_HEADER_INTEGER: u64 = 9_007_199_254_740_991;
+const MCP_TRANSPORT_CLOSE_TIMEOUT: Duration = Duration::from_millis(750);
+const MCP_PROCESS_REAP_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum McpHeaderValueKind {
@@ -608,7 +610,7 @@ async fn connect_guarded_mcp_session(
     config: &GuardedMcpServerConfig,
     cancellation: &CancellationToken,
 ) -> Result<McpTransportSession, McpToolsAdapterError> {
-    let mut session = spawn_guarded_mcp_session(config).await?;
+    let mut session = spawn_guarded_mcp_session(config, cancellation).await?;
     let probe = tokio::select! {
         biased;
         _ = cancellation.cancelled() => {
@@ -634,7 +636,7 @@ async fn connect_guarded_mcp_session(
             if config.transport_kind() != McpTransportKind::Stdio {
                 return Err(mcp_request_adapter_error(error));
             }
-            session = spawn_guarded_mcp_session(config).await?;
+            session = spawn_guarded_mcp_session(config, cancellation).await?;
         }
         Ok(Err(error)) => {
             let _ = session.shutdown().await;
@@ -649,7 +651,7 @@ async fn connect_guarded_mcp_session(
             }
             // A legacy stdio server may wait forever for initialize instead of
             // rejecting server/discover. Restart it before legacy fallback.
-            session = spawn_guarded_mcp_session(config).await?;
+            session = spawn_guarded_mcp_session(config, cancellation).await?;
         }
     }
     let initialized = tokio::select! {
@@ -680,13 +682,23 @@ async fn connect_guarded_mcp_session(
 
 async fn spawn_guarded_mcp_session(
     config: &GuardedMcpServerConfig,
+    cancellation: &CancellationToken,
 ) -> Result<McpTransportSession, McpToolsAdapterError> {
-    let connection = config
-        .transport
-        .connect()
-        .await
-        .map_err(mcp_request_adapter_error)?;
+    let connection = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Err(McpToolsAdapterError::Cancelled),
+        result = timeout(config.startup_timeout, config.transport.connect()) => match result {
+            Ok(Ok(connection)) => connection,
+            Ok(Err(error)) => return Err(mcp_request_adapter_error(error)),
+            Err(_) => {
+                return Err(McpToolsAdapterError::Transport(
+                    "MCP transport connect timed out".to_owned(),
+                ));
+            }
+        },
+    };
     if connection.kind() != config.transport_kind() {
+        let _ = timeout(MCP_TRANSPORT_CLOSE_TIMEOUT, connection.close()).await;
         return Err(McpToolsAdapterError::InvalidConfig(format!(
             "MCP transport factory for '{}' returned a connection of the wrong kind",
             config.server_id
@@ -1403,10 +1415,10 @@ impl McpTransportSession {
     }
 
     async fn shutdown(&mut self) -> Result<(), String> {
-        self.connection
-            .close()
-            .await
-            .map_err(|error| error.to_string())
+        match timeout(MCP_TRANSPORT_CLOSE_TIMEOUT, self.connection.close()).await {
+            Ok(result) => result.map_err(|error| error.to_string()),
+            Err(_) => Err("MCP transport close timed out".to_owned()),
+        }
     }
 
     async fn cancel_request(&self, request_id: u64, reason: &str) {
@@ -1779,7 +1791,7 @@ async fn terminate_mcp_process_tree(child: &mut Child, process_group_id: Option<
     #[cfg(not(unix))]
     let _ = process_group_id;
     let _ = child.kill().await;
-    let _ = timeout(Duration::from_secs(1), child.wait()).await;
+    let _ = timeout(MCP_PROCESS_REAP_TIMEOUT, child.wait()).await;
 }
 
 #[cfg(test)]
@@ -1868,5 +1880,437 @@ mod mcp_header_tests {
             &json!({"value": MAX_SAFE_MCP_HEADER_INTEGER + 1})
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod mcp_lifecycle_gate_tests {
+    use super::*;
+    use std::future::pending;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::time::Instant;
+    use tokio::sync::Notify;
+
+    const GATE_CASES: usize = 1_000;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum FaultStage {
+        Connect,
+        Discover,
+        Initialize,
+        List,
+        Call,
+        BodyDecode,
+    }
+
+    struct FaultState {
+        stage: FaultStage,
+        connects: AtomicUsize,
+        active_connects: AtomicUsize,
+        active_connections: AtomicUsize,
+        active_requests: AtomicUsize,
+        closes: AtomicUsize,
+        completed_call_responses: AtomicUsize,
+        entered: Notify,
+    }
+
+    impl FaultState {
+        fn new(stage: FaultStage) -> Arc<Self> {
+            Arc::new(Self {
+                stage,
+                connects: AtomicUsize::new(0),
+                active_connects: AtomicUsize::new(0),
+                active_connections: AtomicUsize::new(0),
+                active_requests: AtomicUsize::new(0),
+                closes: AtomicUsize::new(0),
+                completed_call_responses: AtomicUsize::new(0),
+                entered: Notify::new(),
+            })
+        }
+
+        fn assert_released(&self) {
+            assert_eq!(self.active_connects.load(Ordering::SeqCst), 0);
+            assert_eq!(self.active_connections.load(Ordering::SeqCst), 0);
+            assert_eq!(self.active_requests.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    enum ActiveCounter {
+        Connect(Arc<FaultState>),
+        Request(Arc<FaultState>),
+    }
+
+    impl Drop for ActiveCounter {
+        fn drop(&mut self) {
+            match self {
+                Self::Connect(state) => {
+                    state.active_connects.fetch_sub(1, Ordering::SeqCst);
+                }
+                Self::Request(state) => {
+                    state.active_requests.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+
+    struct FaultFactory {
+        authority: McpTransportAuthority,
+        state: Arc<FaultState>,
+    }
+
+    impl FaultFactory {
+        fn new(stage: FaultStage) -> Arc<Self> {
+            let kind = match stage {
+                FaultStage::Discover | FaultStage::BodyDecode => McpTransportKind::StreamableHttp,
+                FaultStage::Connect
+                | FaultStage::Initialize
+                | FaultStage::List
+                | FaultStage::Call => McpTransportKind::Stdio,
+            };
+            let (effect_scopes, process_programs, network_targets) = match kind {
+                McpTransportKind::Stdio => (
+                    BTreeSet::from([
+                        EffectScope::Process,
+                        EffectScope::FilesystemRead,
+                        EffectScope::FilesystemWrite,
+                        EffectScope::ExternalSideEffect,
+                    ]),
+                    BTreeSet::from(["/fault/mcp".to_owned()]),
+                    BTreeSet::new(),
+                ),
+                McpTransportKind::StreamableHttp => (
+                    BTreeSet::from([EffectScope::Network, EffectScope::ExternalSideEffect]),
+                    BTreeSet::new(),
+                    BTreeSet::from(["http://127.0.0.1/fault-mcp".to_owned()]),
+                ),
+                _ => unreachable!("fault factory only selects v1 transport kinds"),
+            };
+            Arc::new(Self {
+                authority: McpTransportAuthority {
+                    kind,
+                    binding_digest: Digest::sha256(format!("fault-stage-{stage:?}")),
+                    effect_scopes,
+                    process_programs,
+                    network_targets,
+                    environment_variables: BTreeSet::new(),
+                    credential_references: BTreeSet::new(),
+                },
+                state: FaultState::new(stage),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl McpTransportFactory for FaultFactory {
+        fn authority(&self) -> &McpTransportAuthority {
+            &self.authority
+        }
+
+        async fn connect(&self) -> Result<Box<dyn McpTransportConnection>, McpTransportError> {
+            self.state.connects.fetch_add(1, Ordering::SeqCst);
+            if self.state.stage == FaultStage::Connect {
+                self.state.active_connects.fetch_add(1, Ordering::SeqCst);
+                let _guard = ActiveCounter::Connect(self.state.clone());
+                self.state.entered.notify_one();
+                return pending().await;
+            }
+            self.state.active_connections.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(FaultConnection {
+                kind: self.authority.kind,
+                state: self.state.clone(),
+                closed: AtomicBool::new(false),
+            }))
+        }
+    }
+
+    struct FaultConnection {
+        kind: McpTransportKind,
+        state: Arc<FaultState>,
+        closed: AtomicBool,
+    }
+
+    impl FaultConnection {
+        async fn block_request(&self) -> Result<Value, McpTransportError> {
+            self.state.active_requests.fetch_add(1, Ordering::SeqCst);
+            let _guard = ActiveCounter::Request(self.state.clone());
+            self.state.entered.notify_one();
+            pending().await
+        }
+
+        fn release(&self) {
+            if !self.closed.swap(true, Ordering::SeqCst) {
+                self.state.active_connections.fetch_sub(1, Ordering::SeqCst);
+                self.state.closes.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    impl Drop for FaultConnection {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    #[async_trait]
+    impl McpTransportConnection for FaultConnection {
+        fn kind(&self) -> McpTransportKind {
+            self.kind
+        }
+
+        fn cancellation(&self) -> McpTransportCancellation {
+            McpTransportCancellation::DropExchange
+        }
+
+        async fn request(
+            &self,
+            request: McpTransportRequest,
+            _cancellation: CancellationToken,
+        ) -> Result<Value, McpTransportError> {
+            let is_tool_call = request.method == "tools/call";
+            let result = match request.method.as_str() {
+                "server/discover" if self.state.stage == FaultStage::Discover => {
+                    self.block_request().await
+                }
+                "server/discover" if self.state.stage == FaultStage::Initialize => {
+                    Err(McpTransportError::Rpc {
+                        code: -32601,
+                        message: "legacy server".to_owned(),
+                    })
+                }
+                "server/discover" => Ok(json!({
+                    "supportedVersions": [MCP_STATELESS_PROTOCOL_2026_07_28],
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "fault", "version": "1"}
+                })),
+                "initialize" if self.state.stage == FaultStage::Initialize => {
+                    self.block_request().await
+                }
+                "initialize" => Ok(json!({
+                    "protocolVersion": MCP_LATEST_LEGACY_PROTOCOL,
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "fault", "version": "1"}
+                })),
+                "tools/list" if self.state.stage == FaultStage::List => self.block_request().await,
+                "tools/list" => Ok(json!({
+                    "resultType": "complete",
+                    "ttlMs": 1_000,
+                    "cacheScope": "private",
+                    "tools": [{
+                        "name": "echo",
+                        "description": "echo",
+                        "inputSchema": {
+                            "type": "object",
+                            "additionalProperties": false
+                        }
+                    }]
+                })),
+                "tools/call"
+                    if matches!(self.state.stage, FaultStage::Call | FaultStage::BodyDecode) =>
+                {
+                    self.block_request().await
+                }
+                "tools/call" => Ok(json!({
+                    "resultType": "complete",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "isError": false
+                })),
+                other => Err(McpTransportError::Protocol(format!(
+                    "unexpected fault transport method: {other}"
+                ))),
+            };
+            if result.is_ok() && is_tool_call {
+                self.state
+                    .completed_call_responses
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            result
+        }
+
+        async fn notification(
+            &self,
+            _method: &str,
+            _params: Value,
+            _cancellation: CancellationToken,
+        ) -> Result<(), McpTransportError> {
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<(), McpTransportError> {
+            self.release();
+            Ok(())
+        }
+    }
+
+    fn fault_config(factory: Arc<FaultFactory>, deadline: Duration) -> GuardedMcpServerConfig {
+        GuardedMcpServerConfig {
+            server_id: McpServerId::new(format!("fault-{:?}", factory.state.stage)),
+            required: true,
+            transport: factory,
+            startup_timeout: deadline,
+            tool_timeout: deadline,
+            enabled_tools: BTreeSet::new(),
+            disabled_tools: BTreeSet::new(),
+        }
+    }
+
+    async fn connect_result(
+        config: GuardedMcpServerConfig,
+        cancellation: CancellationToken,
+    ) -> Result<Arc<McpServerConnectionManager>, McpToolsAdapterError> {
+        McpServerConnectionManager::connect(config, cancellation).await
+    }
+
+    fn assert_unknown_effect(result: Result<Value, GuardedMcpCallError>) {
+        assert!(matches!(result, Err(GuardedMcpCallError::UnknownEffect(_))));
+    }
+
+    #[tokio::test]
+    async fn one_thousand_deadlines_per_mcp_stage_never_escape_or_leak_a_session() {
+        let startup_stages = [
+            FaultStage::Connect,
+            FaultStage::Discover,
+            FaultStage::Initialize,
+            FaultStage::List,
+        ];
+        for stage in startup_stages {
+            let factory = FaultFactory::new(stage);
+            let config = fault_config(factory.clone(), Duration::from_millis(1));
+            let mut baseline_error = None;
+            for _ in 0..GATE_CASES {
+                let error = match connect_result(config.clone(), CancellationToken::new()).await {
+                    Ok(manager) => {
+                        manager.shutdown().await;
+                        panic!("fault stage {stage:?} escaped its deadline")
+                    }
+                    Err(error) => error.to_string(),
+                };
+                if let Some(baseline) = &baseline_error {
+                    assert_eq!(&error, baseline);
+                } else {
+                    baseline_error = Some(error);
+                }
+                factory.state.assert_released();
+            }
+            assert_eq!(factory.state.connects.load(Ordering::SeqCst), GATE_CASES);
+        }
+
+        for stage in [FaultStage::Call, FaultStage::BodyDecode] {
+            let factory = FaultFactory::new(stage);
+            let config = fault_config(factory.clone(), Duration::from_millis(1));
+            let mut baseline_error = None;
+            for _ in 0..GATE_CASES {
+                let manager = connect_result(config.clone(), CancellationToken::new())
+                    .await
+                    .unwrap();
+                let result = manager
+                    .invoke("echo", json!({}), CancellationToken::new())
+                    .await;
+                let message = match &result {
+                    Err(GuardedMcpCallError::UnknownEffect(message)) => message.clone(),
+                    _ => panic!("fault stage {stage:?} did not become UnknownEffect"),
+                };
+                if let Some(baseline) = &baseline_error {
+                    assert_eq!(&message, baseline);
+                } else {
+                    baseline_error = Some(message);
+                }
+                assert_unknown_effect(result);
+                assert_eq!(manager.health(), McpServerHealth::Degraded);
+                assert_eq!(
+                    factory
+                        .state
+                        .completed_call_responses
+                        .load(Ordering::SeqCst),
+                    0
+                );
+                factory.state.assert_released();
+            }
+            assert_eq!(factory.state.connects.load(Ordering::SeqCst), GATE_CASES);
+        }
+    }
+
+    #[tokio::test]
+    async fn one_thousand_connect_read_and_call_cancellations_release_within_one_second() {
+        let mut connect_latencies = Vec::with_capacity(GATE_CASES);
+        let mut read_latencies = Vec::with_capacity(GATE_CASES);
+        let mut call_latencies = Vec::with_capacity(GATE_CASES);
+
+        for _ in 0..GATE_CASES {
+            let factory = FaultFactory::new(FaultStage::Connect);
+            let config = fault_config(factory.clone(), Duration::from_secs(30));
+            let cancellation = CancellationToken::new();
+            let task_cancellation = cancellation.clone();
+            let task = tokio::spawn(async move { connect_result(config, task_cancellation).await });
+            factory.state.entered.notified().await;
+            let started = Instant::now();
+            cancellation.cancel();
+            let result = timeout(Duration::from_secs(1), task)
+                .await
+                .expect("MCP connect cancellation exceeded one second")
+                .unwrap();
+            assert!(matches!(result, Err(McpToolsAdapterError::Cancelled)));
+            connect_latencies.push(started.elapsed());
+            factory.state.assert_released();
+        }
+
+        for _ in 0..GATE_CASES {
+            let factory = FaultFactory::new(FaultStage::List);
+            let config = fault_config(factory.clone(), Duration::from_secs(30));
+            let cancellation = CancellationToken::new();
+            let task_cancellation = cancellation.clone();
+            let task = tokio::spawn(async move { connect_result(config, task_cancellation).await });
+            factory.state.entered.notified().await;
+            let started = Instant::now();
+            cancellation.cancel();
+            let result = timeout(Duration::from_secs(1), task)
+                .await
+                .expect("MCP read cancellation exceeded one second")
+                .unwrap();
+            assert!(matches!(result, Err(McpToolsAdapterError::Cancelled)));
+            read_latencies.push(started.elapsed());
+            factory.state.assert_released();
+        }
+
+        for _ in 0..GATE_CASES {
+            let factory = FaultFactory::new(FaultStage::Call);
+            let manager = connect_result(
+                fault_config(factory.clone(), Duration::from_secs(30)),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let cancellation = CancellationToken::new();
+            let task_cancellation = cancellation.clone();
+            let task =
+                tokio::spawn(
+                    async move { manager.invoke("echo", json!({}), task_cancellation).await },
+                );
+            factory.state.entered.notified().await;
+            let started = Instant::now();
+            cancellation.cancel();
+            let result = timeout(Duration::from_secs(1), task)
+                .await
+                .expect("MCP call cancellation exceeded one second")
+                .unwrap();
+            assert_unknown_effect(result);
+            call_latencies.push(started.elapsed());
+            assert_eq!(
+                factory
+                    .state
+                    .completed_call_responses
+                    .load(Ordering::SeqCst),
+                0
+            );
+            factory.state.assert_released();
+        }
+
+        assert!(p99(&mut connect_latencies) <= Duration::from_secs(1));
+        assert!(p99(&mut read_latencies) <= Duration::from_secs(1));
+        assert!(p99(&mut call_latencies) <= Duration::from_secs(1));
+    }
+
+    fn p99(latencies: &mut [Duration]) -> Duration {
+        latencies.sort_unstable();
+        latencies[(latencies.len() * 99).div_ceil(100) - 1]
     }
 }
