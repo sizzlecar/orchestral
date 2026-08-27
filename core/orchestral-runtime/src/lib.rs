@@ -39,8 +39,9 @@ pub use pty_process::{
     PtyProcessError, PtyProcessId, PtyProcessManager, PtyReadResult, PtySpawnSpec,
 };
 pub use session_context::{
-    AgentSessionCompactor, AgentSessionContextEngine, AgentSessionSummarizer, JsonSizeTokenMeter,
-    ModelTokenMeter, SessionCompactionInput, SessionCompactionPolicy, SessionContextError,
+    AgentSessionCompactor, AgentSessionContextEngine, AgentSessionSummarizer,
+    DeterministicExtractiveSessionSummarizer, JsonSizeTokenMeter, ModelTokenMeter,
+    SessionCompactionGroup, SessionCompactionInput, SessionCompactionPolicy, SessionContextError,
     SessionContextProjection, SessionContextRequest, SessionSummarizerDescriptor,
 };
 pub use skill::{

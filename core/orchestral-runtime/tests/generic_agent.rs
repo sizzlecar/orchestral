@@ -2198,7 +2198,8 @@ impl orchestral_runtime::AgentSessionSummarizer for RecordingSessionSummarizer {
         self.calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(input.source.first_session_seq, 1);
         assert_eq!(input.source.last_session_seq, 2);
-        assert_eq!(input.messages.len(), 2);
+        assert_eq!(input.groups.len(), 2);
+        assert_eq!(input.focus_messages.len(), 1);
         Ok(ModelMessage::text(
             ModelRole::System,
             "durable compaction summary marker",
