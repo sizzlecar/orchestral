@@ -14,6 +14,10 @@ use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use portable_pty::{
+    native_pty_system, Child as PtyChild, CommandBuilder, ExitStatus as PtyExitStatus, MasterPty,
+    PtySize,
+};
 use serde_json::{json, Value};
 
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(120);
@@ -223,6 +227,157 @@ fn terminal_model_failure_is_non_zero_and_preserves_the_reason() {
         "{stderr}"
     );
     output.assert_no_ansi();
+}
+
+#[test]
+fn tui_pty_resolves_input_and_approval_then_cancels_another_run() {
+    let workspace = TestWorkspace::new("tui-control");
+    let (model_endpoint, model_server) = spawn_fixture_http_server(vec![
+        Box::new(|request| {
+            assert!(model_request_has_tool(
+                &request.body,
+                "orchestral_request_input"
+            ));
+            openai_tool_response(
+                "ask-target",
+                "orchestral_request_input",
+                json!({"prompt": "INPUT_REQUEST_MARKER_7319"}),
+            )
+        }),
+        Box::new(|request| {
+            assert!(model_request_text(&request.body).contains("runtime-core"));
+            openai_text_response("INPUT_RESOLVED_OK")
+        }),
+        Box::new(|request| {
+            let pwd = model_allowed_program(&request.body, "pwd");
+            openai_tool_response(
+                "approval-pwd",
+                "shell",
+                json!({
+                    "command": pwd,
+                    "args": [],
+                    "fail_on_non_zero": true
+                }),
+            )
+        }),
+        Box::new(|request| {
+            assert!(model_request_text(&request.body).contains("\"status\":0"));
+            openai_text_response("APPROVAL_RESOLVED_OK")
+        }),
+        Box::new(|_| {
+            openai_tool_response(
+                "cancel-input",
+                "orchestral_request_input",
+                json!({"prompt": "CANCEL_REQUEST_MARKER_4827"}),
+            )
+        }),
+    ]);
+    workspace.configure_local_openai(&model_endpoint);
+
+    let mut tui = PtyHarness::spawn(local_tui_command(
+        &workspace,
+        "tui-control-session",
+        "Follow the requested interaction exactly and keep final markers unchanged.",
+    ));
+    tui.wait_for_text("\u{1b}[?2004h", LOCAL_PROCESS_TIMEOUT);
+    tui.resize(100, 30);
+    tui.send_paste("start the input flow");
+    tui.wait_for_text("INPUT_REQUEST_MARKER_7319", LOCAL_PROCESS_TIMEOUT);
+    tui.send_paste("runtime-core");
+    tui.wait_for_text("INPUT_RESOLVED_OK", LOCAL_PROCESS_TIMEOUT);
+    tui.wait_for_text_count("delivered", 1, LOCAL_PROCESS_TIMEOUT);
+
+    tui.send_paste("start the approval flow");
+    tui.wait_for_text("Effects:", LOCAL_PROCESS_TIMEOUT);
+    tui.send(b"a");
+    tui.wait_for_text("APPROVAL_RESOLVED_OK", LOCAL_PROCESS_TIMEOUT);
+    tui.wait_for_text_count("delivered", 2, LOCAL_PROCESS_TIMEOUT);
+
+    tui.send_paste("start the cancellation flow");
+    tui.wait_for_text("CANCEL_REQUEST_MARKER_4827", LOCAL_PROCESS_TIMEOUT);
+    tui.send(&[0x03]);
+    tui.wait_for_text("cancelled", LOCAL_PROCESS_TIMEOUT);
+    tui.send(&[0x1b]);
+    tui.wait_for_text("\u{1b}[?1049l", LOCAL_PROCESS_TIMEOUT);
+
+    let output = tui.finish(LOCAL_PROCESS_TIMEOUT);
+    assert!(output.status.success(), "{}", output.text());
+    assert!(
+        output.text().contains("shell completed"),
+        "{}",
+        output.text()
+    );
+    output.assert_terminal_restored();
+    let requests = model_server.join().expect("join TUI model server");
+    assert_eq!(requests.len(), 5);
+    assert_eq!(run_payload_count(&workspace, "request_opened"), 3);
+    assert_eq!(run_payload_count(&workspace, "request_resolved"), 2);
+    assert_eq!(run_payload_count(&workspace, "run_cancelled"), 1);
+}
+
+#[test]
+fn tui_pty_restores_terminal_after_agent_failure() {
+    let workspace = TestWorkspace::new("tui-failure");
+    let (model_endpoint, model_server) = spawn_fixture_http_server(vec![Box::new(|_| {
+        openai_tool_response("unknown-call", "not_a_registered_tool", json!({}))
+    })]);
+    workspace.configure_local_openai(&model_endpoint);
+
+    let mut tui = PtyHarness::spawn(local_tui_command(
+        &workspace,
+        "tui-failure-session",
+        "Exercise the model response without changing its Tool call.",
+    ));
+    tui.wait_for_text("\u{1b}[?2004h", LOCAL_PROCESS_TIMEOUT);
+    tui.send_paste("trigger the fixture failure");
+    tui.wait_for_text("tool_not_found", LOCAL_PROCESS_TIMEOUT);
+    tui.send(&[0x1b]);
+    tui.wait_for_text("\u{1b}[?1049l", LOCAL_PROCESS_TIMEOUT);
+
+    let output = tui.finish(LOCAL_PROCESS_TIMEOUT);
+    assert!(output.status.success(), "{}", output.text());
+    output.assert_terminal_restored();
+    assert_eq!(
+        model_server
+            .join()
+            .expect("join failure model server")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn piped_prompt_is_headless_and_stdout_contains_only_final_delivery() {
+    const PIPE_PROMPT: &str = "PIPE_INPUT_MARKER_雪豹_7319";
+    let workspace = TestWorkspace::new("headless-pipe");
+    let (model_endpoint, model_server) = spawn_fixture_http_server(vec![Box::new(|request| {
+        assert!(model_request_text(&request.body).contains(PIPE_PROMPT));
+        openai_text_response("PIPE_FINAL_ONLY")
+    })]);
+    workspace.configure_local_openai(&model_endpoint);
+
+    let mut command = root_command(&workspace);
+    command
+        .env("OPENAI_API_KEY", "fixture-key")
+        .arg("--backend")
+        .arg("openai")
+        .arg("--model")
+        .arg("fixture-model")
+        .arg("--temperature")
+        .arg("0")
+        .arg("--session-id")
+        .arg("headless-pipe-session")
+        .arg("--no-mcp")
+        .arg("--no-skills");
+    let output = run_with_piped_input(command, PIPE_PROMPT.as_bytes(), LOCAL_PROCESS_TIMEOUT);
+
+    assert!(output.status.success(), "{}", output.stderr_text());
+    assert_eq!(output.stdout_text(), "PIPE_FINAL_ONLY\n");
+    output.assert_no_ansi();
+    assert_eq!(
+        model_server.join().expect("join piped model server").len(),
+        1
+    );
 }
 
 #[test]
@@ -822,6 +977,213 @@ fn base_command(workspace: &TestWorkspace) -> Command {
     command
 }
 
+fn local_tui_command(
+    workspace: &TestWorkspace,
+    session_id: &str,
+    system_prompt: &str,
+) -> CommandBuilder {
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_orchestral"));
+    command.cwd(&workspace.root);
+    command.env("OPENAI_API_KEY", "fixture-key");
+    command.args([
+        "--config",
+        workspace
+            .path("orchestral.yaml")
+            .to_str()
+            .expect("TUI config path is UTF-8"),
+        "--backend",
+        "openai",
+        "--model",
+        "fixture-model",
+        "--temperature",
+        "0",
+        "--session-id",
+        session_id,
+        "--system-prompt",
+        system_prompt,
+        "--no-mcp",
+        "--no-skills",
+    ]);
+    command
+}
+
+struct PtyHarness {
+    master: Box<dyn MasterPty + Send>,
+    child: Box<dyn PtyChild + Send + Sync>,
+    writer: Option<Box<dyn Write + Send>>,
+    updates: mpsc::Receiver<Vec<u8>>,
+    reader: JoinHandle<Vec<u8>>,
+    latest: Vec<u8>,
+}
+
+struct PtyOutput {
+    status: PtyExitStatus,
+    bytes: Vec<u8>,
+}
+
+impl PtyOutput {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.bytes).into_owned()
+    }
+
+    fn assert_terminal_restored(&self) {
+        for sequence in [
+            b"\x1b[?1049h".as_slice(),
+            b"\x1b[?1049l".as_slice(),
+            b"\x1b[?2004h".as_slice(),
+            b"\x1b[?2004l".as_slice(),
+            b"\x1b[?25l".as_slice(),
+            b"\x1b[?25h".as_slice(),
+        ] {
+            assert!(
+                self.bytes
+                    .windows(sequence.len())
+                    .any(|part| part == sequence),
+                "terminal sequence {:?} was missing from PTY output:\n{}",
+                String::from_utf8_lossy(sequence),
+                self.text()
+            );
+        }
+        let leave = self
+            .bytes
+            .windows(b"\x1b[?1049l".len())
+            .rposition(|part| part == b"\x1b[?1049l")
+            .expect("alternate-screen leave sequence");
+        let enter = self
+            .bytes
+            .windows(b"\x1b[?1049h".len())
+            .rposition(|part| part == b"\x1b[?1049h")
+            .expect("alternate-screen enter sequence");
+        assert!(leave > enter, "alternate screen was not left after entry");
+    }
+}
+
+impl PtyHarness {
+    fn spawn(command: CommandBuilder) -> Self {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("open TUI PTY");
+        let reader = pair
+            .master
+            .try_clone_reader()
+            .expect("clone TUI PTY reader");
+        let writer = pair.master.take_writer().expect("take TUI PTY writer");
+        let child = pair
+            .slave
+            .spawn_command(command)
+            .expect("spawn orchestral in TUI PTY");
+        drop(pair.slave);
+        let (updates, receiver) = mpsc::channel();
+        let reader = thread::spawn(move || read_pty_with_updates(reader, updates));
+        Self {
+            master: pair.master,
+            child,
+            writer: Some(writer),
+            updates: receiver,
+            reader,
+            latest: Vec::new(),
+        }
+    }
+
+    fn resize(&self, cols: u16, rows: u16) {
+        self.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("resize TUI PTY");
+    }
+
+    fn send(&mut self, bytes: &[u8]) {
+        let writer = self.writer.as_mut().expect("TUI writer remains open");
+        writer.write_all(bytes).expect("write TUI input");
+        writer.flush().expect("flush TUI input");
+    }
+
+    fn send_paste(&mut self, text: &str) {
+        self.send(format!("\x1b[200~{text}\x1b[201~\r").as_bytes());
+    }
+
+    fn wait_for_text(&mut self, marker: &str, timeout: Duration) {
+        self.wait_for_text_count(marker, 1, timeout);
+    }
+
+    fn wait_for_text_count(&mut self, marker: &str, count: usize, timeout: Duration) {
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            if String::from_utf8_lossy(&self.latest)
+                .matches(marker)
+                .count()
+                >= count
+            {
+                return;
+            }
+            match self.updates.recv_timeout(Duration::from_millis(100)) {
+                Ok(bytes) => self.latest = bytes,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            if let Some(status) = self.child.try_wait().expect("poll TUI child") {
+                panic!(
+                    "TUI exited before marker {marker:?} with {status:?}:\n{}",
+                    String::from_utf8_lossy(&self.latest)
+                );
+            }
+        }
+        panic!(
+            "TUI did not render marker {marker:?} {count} time(s) within {timeout:?}:\n{}",
+            String::from_utf8_lossy(&self.latest)
+        );
+    }
+
+    fn finish(mut self, timeout: Duration) -> PtyOutput {
+        self.writer.take();
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) = self.child.try_wait().expect("poll TUI child") {
+                break status;
+            }
+            if started.elapsed() >= timeout {
+                let _ = self.child.kill();
+                panic!(
+                    "TUI did not exit within {timeout:?}:\n{}",
+                    String::from_utf8_lossy(&self.latest)
+                );
+            }
+            if let Ok(bytes) = self.updates.recv_timeout(Duration::from_millis(50)) {
+                self.latest = bytes;
+            }
+        };
+        drop(self.master);
+        let bytes = self.reader.join().expect("join TUI PTY reader");
+        PtyOutput { status, bytes }
+    }
+}
+
+fn read_pty_with_updates(
+    mut reader: Box<dyn Read + Send>,
+    updates: mpsc::Sender<Vec<u8>>,
+) -> Vec<u8> {
+    let mut all = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) | Err(_) => return all,
+            Ok(count) => {
+                all.extend_from_slice(&buffer[..count]);
+                let _ = updates.send(all.clone());
+            }
+        }
+    }
+}
+
 fn root_command(workspace: &TestWorkspace) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_orchestral"));
     command
@@ -963,6 +1325,27 @@ fn well_known_adc_path() -> Option<PathBuf> {
 fn run_to_completion(mut command: Command, timeout: Duration) -> ProcessOutput {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn().expect("spawn orchestral CLI");
+    let stdout = child.stdout.take().expect("capture stdout");
+    let stderr = child.stderr.take().expect("capture stderr");
+    let stdout_reader = thread::spawn(move || read_all(stdout));
+    let stderr_reader = thread::spawn(move || read_all(stderr));
+    let status = wait_for_child(&mut child, timeout);
+    ProcessOutput {
+        status,
+        stdout: stdout_reader.join().expect("join stdout reader"),
+        stderr: stderr_reader.join().expect("join stderr reader"),
+    }
+}
+
+fn run_with_piped_input(mut command: Command, input: &[u8], timeout: Duration) -> ProcessOutput {
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn piped orchestral CLI");
+    let mut stdin = child.stdin.take().expect("capture piped stdin");
+    stdin.write_all(input).expect("write piped Agent input");
+    drop(stdin);
     let stdout = child.stdout.take().expect("capture stdout");
     let stderr = child.stderr.take().expect("capture stderr");
     let stdout_reader = thread::spawn(move || read_all(stdout));
