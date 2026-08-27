@@ -58,15 +58,56 @@ Run one turn:
 cargo run -p orchestral-cli -- "Summarize the public API of this repository"
 ```
 
-Start an interactive Agent Session:
+Start a full-screen interactive Agent Session:
 
 ```bash
 cargo run -p orchestral-cli --
 ```
 
-The CLI discovers `configs/orchestral.cli.yaml` by default. Use `--config`, `--backend`,
-`--model-profile`, or `--model` for explicit selection. `--session-id` gives multiple turns a
-stable durable Session identity; `--no-mcp` and `--no-skills` disable those planes.
+The root command is the Agent entry point; there is no `agent` subcommand. Entry mode is
+deterministic:
+
+| Invocation | Mode |
+| --- | --- |
+| `orchestral` with terminal stdin and stdout | Multi-turn TUI |
+| `orchestral "fix the bug"` | One-turn Headless |
+| `printf 'fix the bug' \| orchestral` | One-turn Headless |
+
+Headless stdout contains only the final Delivery, so it is safe to pipe into another command;
+progress and errors use stderr. In the TUI, Enter sends or steers, Shift/Alt+Enter inserts a
+newline, `a`/`d` resolves an approval, Ctrl-C cancels the active Run, PageUp/PageDown or the mouse
+wheel scrolls, and Esc exits. Paste, resize, CJK, and emoji are supported.
+
+The CLI discovers `.orchestral/config.yaml`, `.orchestral/config.yml`,
+`configs/orchestral.cli.yaml`, then `orchestral.yaml`; if none exists it creates
+`.orchestral/config.yaml`. Use `--config`, `--backend`, `--model-profile`, or `--model` for
+explicit selection. For example:
+
+```bash
+orchestral --backend deepseek --model deepseek-chat "inspect this crate"
+orchestral --backend google --model gemini-3.1-pro-preview "inspect this crate"
+```
+
+OpenAI-compatible providers use their configured key environment variable. Google supports
+`GOOGLE_API_KEY` for the Gemini API and the standard Application Default Credentials chain for
+Vertex AI: `GOOGLE_APPLICATION_CREDENTIALS`, the file created by
+`gcloud auth application-default login` (`~/.config/gcloud/application_default_credentials.json`
+on Unix), or an attached Google Cloud service account. `--credential-file PATH` is a convenience
+override for a service-account JSON key; a Vertex project must resolve from the credential or
+`GOOGLE_CLOUD_PROJECT`.
+
+`--session-id` gives multiple turns a stable durable Session identity; `--no-mcp` and
+`--no-skills` disable those planes.
+
+Minimal coding task:
+
+```bash
+orchestral "Read the failing source, fix it with apply_patch, run the relevant test, and report the result."
+```
+
+The model sees one structured file-mutation tool, `apply_patch`, for Add/Update/Delete. It cannot
+choose workspace roots or approval authority. `file_read`, `apply_patch`, Shell verification, and
+MCP calls all remain behind Host policy and effect journaling.
 
 The default Host policy uses an explicit process allowlist, does not inherit the ambient
 environment into tools, and keeps network access disabled. A model-visible tool call cannot

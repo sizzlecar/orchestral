@@ -57,15 +57,53 @@ export OPENAI_API_KEY="..."
 cargo run -p orchestral-cli -- "总结这个仓库的公共 API"
 ```
 
-进入交互式 Agent Session：
+进入全屏交互式 Agent Session：
 
 ```bash
 cargo run -p orchestral-cli --
 ```
 
-CLI 默认发现 `configs/orchestral.cli.yaml`。可以用 `--config`、`--backend`、
-`--model-profile` 或 `--model` 显式选择；`--session-id` 为多轮对话提供稳定、持久的
-Session 身份；`--no-mcp` 和 `--no-skills` 可分别关闭两套扩展面。
+根命令本身就是 Agent 入口，不存在 `agent` 子命令。入口选择是确定性的：
+
+| 调用方式 | 模式 |
+| --- | --- |
+| stdin/stdout 都是终端时执行 `orchestral` | 多轮 TUI |
+| `orchestral "修复这个 bug"` | Headless 单轮 |
+| `printf '修复这个 bug' \| orchestral` | Headless 单轮 |
+
+Headless stdout 只输出最终 Delivery，进度和错误进入 stderr，适合管道消费。TUI 中 Enter
+发送消息或 Steer，Shift/Alt+Enter 换行，`a`/`d` 处理审批，Ctrl-C 取消当前 Run，
+PageUp/PageDown 或鼠标滚轮滚动，Esc 退出；支持 paste、resize、中文与 emoji。
+
+CLI 依次发现 `.orchestral/config.yaml`、`.orchestral/config.yml`、
+`configs/orchestral.cli.yaml`、`orchestral.yaml`；都不存在时会生成
+`.orchestral/config.yaml`。可以用 `--config`、`--backend`、`--model-profile` 或
+`--model` 显式选择，例如：
+
+```bash
+orchestral --backend deepseek --model deepseek-chat "检查这个 crate"
+orchestral --backend google --model gemini-3.1-pro-preview "检查这个 crate"
+```
+
+OpenAI-compatible 厂商读取配置中对应的密钥环境变量。Google 可通过 `GOOGLE_API_KEY`
+调用 Gemini API，也支持 Vertex AI 的标准 Application Default Credentials 链：
+`GOOGLE_APPLICATION_CREDENTIALS`、`gcloud auth application-default login` 生成的文件
+（Unix 默认 `~/.config/gcloud/application_default_credentials.json`），或 Google Cloud
+挂载的服务账号。`--credential-file PATH` 是 service-account JSON key 的便捷覆盖；Vertex
+project 必须能从凭据或 `GOOGLE_CLOUD_PROJECT` 解析。
+
+`--session-id` 为多轮对话提供稳定、持久的 Session 身份；`--no-mcp` 和 `--no-skills`
+可分别关闭两套扩展面。
+
+最小 coding 任务：
+
+```bash
+orchestral "读取失败源码，用 apply_patch 修复，运行相关测试，然后报告结果。"
+```
+
+模型只看到一个结构化文件修改 Tool：`apply_patch`，支持 Add/Update/Delete，不能自行选择
+workspace root 或审批权限。`file_read`、`apply_patch`、Shell 验证和 MCP 调用都继续经过
+Host policy 与 Effect Journal。
 
 默认 Host 策略使用显式进程白名单，不把宿主环境变量自动传给 Tool，并关闭网络访问；
 模型可见参数无法扩大这些权限。
