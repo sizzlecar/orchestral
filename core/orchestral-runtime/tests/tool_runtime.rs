@@ -2,7 +2,10 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+#[cfg(target_os = "macos")]
+use std::time::Instant;
 
 use async_trait::async_trait;
 use orchestral_core::agent_protocol::wire::RunId;
@@ -24,18 +27,24 @@ use orchestral_core::tool_protocol::{
 };
 use orchestral_runtime::{
     tools::{
-        guarded_artifact_read_descriptor, guarded_file_read_descriptor,
-        guarded_pty_close_descriptor, guarded_pty_create_descriptor, guarded_pty_list_descriptor,
-        guarded_pty_read_descriptor, guarded_pty_write_descriptor, guarded_shell_descriptor,
-        GuardedArtifactReadExecutor, GuardedFileReadExecutor, GuardedPtyCloseExecutor,
-        GuardedPtyCreateExecutor, GuardedPtyListExecutor, GuardedPtyReadExecutor,
-        GuardedPtyWriteExecutor, GuardedShellExecutor, GUARDED_PTY_SANDBOX_PROFILE,
+        guarded_artifact_read_descriptor, guarded_file_read_descriptor, guarded_shell_descriptor,
+        GuardedArtifactReadExecutor, GuardedFileReadExecutor, GuardedShellExecutor,
         GUARDED_SHELL_SANDBOX_PROFILE,
     },
     GuardedToolExecution, GuardedToolExecutor, GuardedToolResult, GuardedToolRuntime,
     HookDispatchMode, HookError, HookExecutionPolicy, HookFailurePolicy, HookRegistry,
-    InMemoryBlobStore, PtyProcessManager, RuntimeHook, RuntimeHookContext,
-    RuntimeHookEventEnvelope, ToolArtifactStore,
+    InMemoryBlobStore, RuntimeHook, RuntimeHookContext, RuntimeHookEventEnvelope,
+    ToolArtifactStore,
+};
+#[cfg(target_os = "macos")]
+use orchestral_runtime::{
+    tools::{
+        guarded_pty_close_descriptor, guarded_pty_create_descriptor, guarded_pty_list_descriptor,
+        guarded_pty_read_descriptor, guarded_pty_write_descriptor, GuardedPtyCloseExecutor,
+        GuardedPtyCreateExecutor, GuardedPtyListExecutor, GuardedPtyReadExecutor,
+        GuardedPtyWriteExecutor, GUARDED_PTY_SANDBOX_PROFILE,
+    },
+    PtyProcessManager,
 };
 use serde_json::json;
 use tokio::sync::Notify;
