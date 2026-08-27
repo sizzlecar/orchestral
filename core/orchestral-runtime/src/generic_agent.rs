@@ -55,8 +55,8 @@ use crate::generic_agent_checkpoint::{
     AppendGenericCheckpointOutcome, CreateGenericRunOutcome, GenericAgentCheckpointStore,
     GenericAgentRunRegistration, GenericCheckpointDraft, GenericCheckpointError,
     GenericCheckpointEvent, GenericCheckpointEventId, GenericCheckpointPhase, GenericLoopBoundary,
-    GenericModelObservation, GenericObservedToolCall, InMemoryGenericAgentCheckpointStore,
-    StoredGenericAgentRun,
+    GenericModelContextTrace, GenericModelObservation, GenericObservedToolCall,
+    InMemoryGenericAgentCheckpointStore, StoredGenericAgentRun,
 };
 use crate::skill::{
     ActivatedSkillSet, SkillActivationOutcome, SkillActivationRequest, SkillRuntime,
@@ -65,7 +65,7 @@ use crate::tool_runtime::{AgentToolRuntime, GuardedToolResult, ToolRuntimeError}
 use crate::workflow_strategy::{WorkflowExecutionRequest, WorkflowExecutionStrategy};
 use crate::{
     AgentSessionContextEngine, JsonSizeTokenMeter, ModelTokenMeter, SessionContextError,
-    SessionContextRequest,
+    SessionContextProjection, SessionContextRequest,
 };
 
 const WORKFLOW_TOOL_NAME: &str = "orchestral_workflow";
@@ -3468,14 +3468,14 @@ fn record_command_with_approval(
     Ok(disposition)
 }
 
-async fn project_model_messages(
+async fn project_model_context(
     inner: &GenericInner,
     request: &AgentStartRequest,
     model_definitions: &[ModelToolDefinition],
     run_skills: Option<&SkillRuntime>,
     initial_input: Option<ModelMessage>,
     through_session_seq: Option<u64>,
-) -> Result<Vec<ModelMessage>, SessionContextError> {
+) -> Result<SessionContextProjection, SessionContextError> {
     if let Some(message) = initial_input {
         inner
             .session_journal
@@ -3532,7 +3532,26 @@ async fn project_model_messages(
                 .unwrap_or_default(),
         })
         .await
-        .map(|projection| projection.messages)
+}
+
+async fn project_model_messages(
+    inner: &GenericInner,
+    request: &AgentStartRequest,
+    model_definitions: &[ModelToolDefinition],
+    run_skills: Option<&SkillRuntime>,
+    initial_input: Option<ModelMessage>,
+    through_session_seq: Option<u64>,
+) -> Result<Vec<ModelMessage>, SessionContextError> {
+    project_model_context(
+        inner,
+        request,
+        model_definitions,
+        run_skills,
+        initial_input,
+        through_session_seq,
+    )
+    .await
+    .map(|projection| projection.messages)
 }
 
 async fn project_committed_model_messages(
@@ -3629,7 +3648,7 @@ async fn execute_model_run(execution: ModelRunExecution) {
             emit_failure(&inner, &request, &user_message, failure);
             return;
         }
-        model_messages = match project_model_messages(
+        let model_context = match project_model_context(
             &inner,
             &request,
             &model_tools,
@@ -3639,14 +3658,18 @@ async fn execute_model_run(execution: ModelRunExecution) {
         )
         .await
         {
-            Ok(messages) => messages,
+            Ok(context) => context,
             Err(error) => {
                 emit_failure(&inner, &request, &user_message, session_failure(error));
                 return;
             }
         };
+        let context_trace = model_context_trace(&model_context, inner.config.history_limit);
+        model_messages = model_context.messages;
         let model_request = model_request_for_round(&request, round, &model_messages, &model_tools);
-        if let Err(failure) = commit_model_attempt(&inner, &run_id, round, &model_request) {
+        if let Err(failure) =
+            commit_model_attempt(&inner, &run_id, round, &model_request, &context_trace)
+        {
             emit_failure(&inner, &request, &user_message, failure);
             return;
         }
@@ -7027,6 +7050,7 @@ fn commit_model_attempt(
     run_id: &RunId,
     round: u64,
     request: &ModelRequest,
+    context: &GenericModelContextTrace,
 ) -> Result<(), AgentFailure> {
     append_checkpoint(
         inner,
@@ -7036,8 +7060,24 @@ fn commit_model_attempt(
             round,
             request_id: request.request_id.clone(),
             request_digest: model_request_digest(request)?,
+            context: context.clone(),
         },
     )
+}
+
+fn model_context_trace(
+    projection: &SessionContextProjection,
+    history_limit: usize,
+) -> GenericModelContextTrace {
+    GenericModelContextTrace {
+        through_session_seq: projection.through_session_seq,
+        included_ranges: projection.included_ranges.clone(),
+        deferred_ranges: projection.deferred_ranges.clone(),
+        config_digest: projection.config_digest.clone(),
+        history_limit,
+        used_input_tokens: projection.used_input_tokens,
+        input_budget_tokens: projection.input_budget_tokens,
+    }
 }
 
 fn model_request_for_round(

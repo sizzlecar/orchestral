@@ -923,6 +923,18 @@ impl ModelBackend for WalInspectingModel {
             projection.phase,
             GenericCheckpointPhase::ModelAttemptOpen { round: 1, .. }
         ));
+        let context = stored
+            .records
+            .iter()
+            .find_map(|record| match &record.payload {
+                GenericCheckpointEvent::ModelAttemptStarted { context, .. } => Some(context),
+                _ => None,
+            })
+            .expect("model attempt stores its Session Context provenance");
+        assert_eq!(context.config_digest, stored.registration.config_digest);
+        assert_eq!(context.through_session_seq, 1);
+        assert_eq!(context.included_ranges.len(), 1);
+        assert!(context.used_input_tokens <= context.input_budget_tokens);
         self.observed_open_attempt.fetch_add(1, Ordering::SeqCst);
         let request_id = request.request_id;
         Ok(Box::pin(stream::iter([

@@ -12,6 +12,7 @@ use orchestral_core::agent_protocol::wire::{
     AgentAdmission, AgentCommandEnvelope, AgentEvent, AgentEventDraft, AgentEventId,
     AgentExecutionRef, AgentStartRequest, CommandId, Digest, ProviderCommandOutcome, RunId,
 };
+use orchestral_core::agent_session::SessionSourceRange;
 use orchestral_core::model_protocol::{
     ModelFinishReason, ModelRequestId, ModelToolCallId, ModelUsage,
 };
@@ -89,6 +90,59 @@ pub struct GenericModelObservation {
     pub tool_calls: Vec<GenericObservedToolCall>,
 }
 
+/// Durable provenance for the exact Session Context projected before one
+/// model attempt. The request digest proves bytes; this trace explains which
+/// Journal ranges and Host limits produced those bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenericModelContextTrace {
+    pub through_session_seq: u64,
+    pub included_ranges: Vec<SessionSourceRange>,
+    pub deferred_ranges: Vec<SessionSourceRange>,
+    pub config_digest: Digest,
+    pub history_limit: usize,
+    pub used_input_tokens: u64,
+    pub input_budget_tokens: u64,
+}
+
+impl GenericModelContextTrace {
+    fn validate(&self) -> Result<(), GenericCheckpointError> {
+        if !self.config_digest.is_sha256()
+            || self.history_limit == 0
+            || self.input_budget_tokens == 0
+            || self.used_input_tokens > self.input_budget_tokens
+        {
+            return Err(GenericCheckpointError::InvalidData(
+                "model Context trace requires a config digest and valid Host limits".to_owned(),
+            ));
+        }
+        let ranges = self
+            .included_ranges
+            .iter()
+            .chain(self.deferred_ranges.iter())
+            .collect::<Vec<_>>();
+        for range in &ranges {
+            range.validate().map_err(invalid_data)?;
+            if range.last_session_seq > self.through_session_seq {
+                return Err(GenericCheckpointError::InvalidData(
+                    "model Context range exceeds its Session Journal cursor".to_owned(),
+                ));
+            }
+        }
+        for (index, left) in ranges.iter().enumerate() {
+            if ranges.iter().skip(index + 1).any(|right| {
+                left.first_session_seq <= right.last_session_seq
+                    && right.first_session_seq <= left.last_session_seq
+            }) {
+                return Err(GenericCheckpointError::InvalidData(
+                    "model Context trace ranges must not overlap".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl GenericModelObservation {
     fn validate(&self) -> Result<(), GenericCheckpointError> {
         let mut call_ids = BTreeSet::new();
@@ -156,6 +210,7 @@ pub enum GenericCheckpointEvent {
         round: u64,
         request_id: ModelRequestId,
         request_digest: Digest,
+        context: GenericModelContextTrace,
     },
     ModelAttemptObserved {
         round: u64,
@@ -206,12 +261,14 @@ impl GenericCheckpointEvent {
                 round,
                 request_id,
                 request_digest,
+                context,
             } => {
                 if *round == 0 || request_id.is_empty() || !request_digest.is_sha256() {
                     return Err(GenericCheckpointError::InvalidData(
                         "model attempt requires a round, request identity, and digest".to_owned(),
                     ));
                 }
+                context.validate()?;
             }
             Self::ModelAttemptObserved {
                 round,
@@ -552,6 +609,7 @@ pub fn replay_generic_agent_checkpoint(
                 round,
                 request_id,
                 request_digest,
+                context: _,
             } => {
                 let GenericCheckpointPhase::Stable(boundary) = &phase else {
                     return Err(GenericCheckpointError::InvalidData(
@@ -928,6 +986,32 @@ mod tests {
         }
     }
 
+    fn context_trace() -> GenericModelContextTrace {
+        GenericModelContextTrace {
+            through_session_seq: 1,
+            included_ranges: vec![SessionSourceRange {
+                first_session_seq: 1,
+                last_session_seq: 1,
+            }],
+            deferred_ranges: Vec::new(),
+            config_digest: Digest::sha256("config-v1"),
+            history_limit: 128,
+            used_input_tokens: 10,
+            input_budget_tokens: 100,
+        }
+    }
+
+    #[test]
+    fn model_context_trace_rejects_overlapping_or_over_budget_provenance() {
+        let mut trace = context_trace();
+        trace.deferred_ranges = trace.included_ranges.clone();
+        assert!(trace.validate().is_err());
+
+        let mut trace = context_trace();
+        trace.used_input_tokens = trace.input_budget_tokens + 1;
+        assert!(trace.validate().is_err());
+    }
+
     #[test]
     fn stable_open_and_observed_model_boundaries_are_distinguishable_after_replay() {
         let store = InMemoryGenericAgentCheckpointStore::default();
@@ -949,6 +1033,7 @@ mod tests {
                         round: 1,
                         request_id: ModelRequestId::new("model-run-1-1"),
                         request_digest: Digest::sha256("request-1"),
+                        context: context_trace(),
                     },
                 },
             )

@@ -15,6 +15,7 @@ use orchestral_core::agent_protocol::{
 };
 use orchestral_core::agent_session::{
     AgentSessionEvent, AgentSessionEventDraft, AgentSessionEventId, AgentSessionJournalStore,
+    SessionSourceRange,
 };
 use orchestral_core::model_protocol::{ModelMessage, ModelRequestId, ModelRole, ModelUsage};
 use orchestral_core::tool_effect::{
@@ -29,6 +30,7 @@ use orchestral_runtime::{
     AgentController, AppendGenericCheckpointOutcome, CreateGenericRunOutcome,
     GenericAgentCheckpointStore, GenericAgentRunRegistration, GenericCheckpointDraft,
     GenericCheckpointEvent, GenericCheckpointEventId, GenericCheckpointPhase,
+    GenericModelContextTrace,
 };
 
 #[test]
@@ -85,6 +87,18 @@ fn generic_private_wal_rehydrates_from_a_new_store_instance() {
             round: 1,
             request_id: ModelRequestId::new("model-attempt-1"),
             request_digest: Digest::sha256("model-request-1"),
+            context: GenericModelContextTrace {
+                through_session_seq: 1,
+                included_ranges: vec![SessionSourceRange {
+                    first_session_seq: 1,
+                    last_session_seq: 1,
+                }],
+                deferred_ranges: Vec::new(),
+                config_digest: Digest::sha256("generic-config-v1"),
+                history_limit: 128,
+                used_input_tokens: 10,
+                input_budget_tokens: 100,
+            },
         },
     };
 
