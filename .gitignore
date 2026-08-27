@@ -24,6 +24,7 @@ target/
 .env
 .env.local
 .venv/
+/credential.json
 
 /docs/*
 !/docs/agent-foundation/
