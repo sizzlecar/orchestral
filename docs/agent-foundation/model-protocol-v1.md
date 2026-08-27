@@ -65,11 +65,15 @@ ORCHESTRAL_LIVE_MODEL_SMOKE=1 \
 ORCHESTRAL_OPENAI_LIVE_ENDPOINT=https://your-endpoint/v1 \
 ORCHESTRAL_OPENAI_LIVE_MODEL=your-model \
 OPENAI_API_KEY=... \
-cargo test -p orchestral-model-openai --test live_smoke -- --nocapture
+cargo test -p orchestral-model-openai --test live_smoke -- --ignored --nocapture
 
 ORCHESTRAL_LIVE_MODEL_SMOKE=1 \
 ORCHESTRAL_GEMINI_LIVE_ENDPOINT=https://your-gemini-endpoint/v1beta \
 ORCHESTRAL_GEMINI_LIVE_MODEL=your-model \
 GOOGLE_API_KEY=... \
-cargo test -p orchestral-model-gemini --test live_smoke -- --nocapture
+cargo test -p orchestral-model-gemini --test live_smoke -- --ignored --nocapture
 ```
+
+仓库的 `Live Model Smoke` 手动 workflow 运行同一组 ignored tests；触发前必须配置
+`OPENAI_API_KEY` 与 `GOOGLE_API_KEY` repository secrets，并在 dispatch 输入中显式指定
+两个 endpoint 与 model。缺少任一配置时 workflow 必须失败，不能将 skip 记作通过。

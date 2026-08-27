@@ -8,9 +8,10 @@ fn required(name: &str) -> String {
 }
 
 #[tokio::test]
+#[ignore = "requires an explicit live endpoint, model, and API key"]
 async fn gemini_native_adapter_live_smoke() {
     if std::env::var("ORCHESTRAL_LIVE_MODEL_SMOKE").as_deref() != Ok("1") {
-        return;
+        panic!("ORCHESTRAL_LIVE_MODEL_SMOKE=1 is required for the opt-in live smoke");
     }
     let api_key = std::env::var("GOOGLE_API_KEY")
         .or_else(|_| std::env::var("GEMINI_API_KEY"))

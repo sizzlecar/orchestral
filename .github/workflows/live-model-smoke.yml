@@ -1,0 +1,71 @@
+name: Live Model Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      openai_endpoint:
+        description: OpenAI-compatible base endpoint
+        required: true
+        type: string
+      openai_model:
+        description: OpenAI-compatible model identifier
+        required: true
+        type: string
+      gemini_endpoint:
+        description: Gemini Native base endpoint
+        required: true
+        type: string
+      gemini_model:
+        description: Gemini Native model identifier
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-model-smoke-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  openai-compatible:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ORCHESTRAL_LIVE_MODEL_SMOKE: "1"
+      ORCHESTRAL_OPENAI_LIVE_ENDPOINT: ${{ inputs.openai_endpoint }}
+      ORCHESTRAL_OPENAI_LIVE_MODEL: ${{ inputs.openai_model }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.91.0
+
+      - name: Run OpenAI-compatible live smoke
+        run: cargo test -p orchestral-model-openai --test live_smoke -- --ignored --nocapture
+
+  gemini-native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ORCHESTRAL_LIVE_MODEL_SMOKE: "1"
+      ORCHESTRAL_GEMINI_LIVE_ENDPOINT: ${{ inputs.gemini_endpoint }}
+      ORCHESTRAL_GEMINI_LIVE_MODEL: ${{ inputs.gemini_model }}
+      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.91.0
+
+      - name: Run Gemini Native live smoke
+        run: cargo test -p orchestral-model-gemini --test live_smoke -- --ignored --nocapture
