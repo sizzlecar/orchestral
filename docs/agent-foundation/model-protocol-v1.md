@@ -54,3 +54,22 @@ impl ModelBackend for MyBackend {
 可运行 fake 见 [`examples/agent_session.rs`](../../examples/agent_session.rs)；Adapter 必须通过
 `testing/orchestral-model-protocol-testkit`。当前 production family 是 OpenAI-compatible 与
 Gemini Native。
+
+## Opt-in live smoke
+
+默认测试不访问网络。显式提供 endpoint、model 和 key 后可验证两个 production Adapter 的
+真实协议/wiring；任务质量单独观察，不作为形式化正确性证明。
+
+```bash
+ORCHESTRAL_LIVE_MODEL_SMOKE=1 \
+ORCHESTRAL_OPENAI_LIVE_ENDPOINT=https://your-endpoint/v1 \
+ORCHESTRAL_OPENAI_LIVE_MODEL=your-model \
+OPENAI_API_KEY=... \
+cargo test -p orchestral-model-openai --test live_smoke -- --nocapture
+
+ORCHESTRAL_LIVE_MODEL_SMOKE=1 \
+ORCHESTRAL_GEMINI_LIVE_ENDPOINT=https://your-gemini-endpoint/v1beta \
+ORCHESTRAL_GEMINI_LIVE_MODEL=your-model \
+GOOGLE_API_KEY=... \
+cargo test -p orchestral-model-gemini --test live_smoke -- --nocapture
+```

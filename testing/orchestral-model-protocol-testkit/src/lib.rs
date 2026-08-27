@@ -5,10 +5,12 @@
 //! cancellation assertions for every model family.
 
 mod fake;
+mod live;
 mod stress;
 mod suite;
 
 pub use fake::ScriptedModelFixture;
+pub use live::{run_live_text_smoke, LiveModelSmokeReport};
 pub use stress::{
     ModelStreamStressCase, ModelStreamStressFault, ModelStreamStressReport, ModelStreamStressSuite,
     DEFAULT_MODEL_STREAM_STRESS_CASES,
