@@ -12,6 +12,7 @@ use orchestral_core::agent_session::{
 };
 use orchestral_core::model_protocol::{ModelMessage, ModelRole, ModelToolDefinition};
 use orchestral_core::skill_protocol::SkillId;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -436,7 +437,8 @@ fn ranges_overlap(left: &SessionSourceRange, right: &SessionSourceRange) -> bool
         && right.first_session_seq <= left.last_session_seq
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionCompactionPolicy {
     pub minimum_source_records: usize,
     pub keep_recent_records: usize,
@@ -451,14 +453,44 @@ impl Default for SessionCompactionPolicy {
     }
 }
 
+impl SessionCompactionPolicy {
+    pub fn validate(&self) -> Result<(), SessionContextError> {
+        if self.minimum_source_records == 0
+            || self.keep_recent_records == 0
+            || self
+                .minimum_source_records
+                .checked_add(self.keep_recent_records)
+                .is_none()
+        {
+            return Err(SessionContextError::InvalidRequest(
+                "Session compaction limits must be positive and bounded".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn digest(&self) -> Result<Digest, SessionContextError> {
+        self.validate()?;
+        serde_jcs::to_vec(self)
+            .map(Digest::sha256)
+            .map_err(|error| {
+                SessionContextError::InvalidRequest(format!(
+                    "could not digest Session compaction policy: {error}"
+                ))
+            })
+    }
+}
+
 pub fn select_compaction_source(
     records: &[AgentSessionRecord],
     current_run_id: &RunId,
     policy: &SessionCompactionPolicy,
 ) -> Option<SessionSourceRange> {
-    if policy.minimum_source_records == 0
-        || records.len() < policy.minimum_source_records + policy.keep_recent_records
-    {
+    policy.validate().ok()?;
+    let minimum_records = policy
+        .minimum_source_records
+        .checked_add(policy.keep_recent_records)?;
+    if records.len() < minimum_records {
         return None;
     }
     if let Some(previous_compaction) = records.iter().rev().find(|record| {
@@ -470,7 +502,7 @@ pub fn select_compaction_source(
         let records_since_compaction = records
             .len()
             .saturating_sub(previous_compaction.session_seq as usize);
-        if records_since_compaction < policy.minimum_source_records + policy.keep_recent_records {
+        if records_since_compaction < minimum_records {
             return None;
         }
     }
@@ -522,12 +554,13 @@ impl AgentSessionCompactor {
         journal: Arc<dyn AgentSessionJournalStore>,
         summarizer: Arc<dyn AgentSessionSummarizer>,
         policy: SessionCompactionPolicy,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, SessionContextError> {
+        policy.validate()?;
+        Ok(Self {
             journal,
             summarizer,
             policy,
-        }
+        })
     }
 
     pub async fn compact_if_needed(
@@ -541,6 +574,7 @@ impl AgentSessionCompactor {
             return Ok(None);
         };
         let source_digest = session_range_digest(&records, &source)?;
+        let policy_digest = self.policy.digest()?;
         let groups = replay_groups(&records, current_run_id, &BTreeMap::new())?;
         let mut messages = Vec::new();
         for group in groups
@@ -575,6 +609,7 @@ impl AgentSessionCompactor {
                 payload: AgentSessionEvent::CompactionCommitted {
                     source,
                     source_digest,
+                    policy_digest,
                     summary: summary.message,
                     strategy: summary.strategy,
                     model: summary.model,
@@ -789,19 +824,21 @@ mod tests {
             minimum_source_records: 3,
             keep_recent_records: 2,
         };
+        let policy_digest = policy.digest().unwrap();
         let compactor =
-            AgentSessionCompactor::new(store.clone(), Arc::new(FixedSummarizer), policy);
+            AgentSessionCompactor::new(store.clone(), Arc::new(FixedSummarizer), policy).unwrap();
         let compacted = compactor
             .compact_if_needed(&AgentSessionId::new("session-1"), &RunId::new("current"))
             .await
             .unwrap()
             .expect("old prefix is compacted");
-        let (source, source_digest) = match &compacted.payload {
+        let (source, source_digest, persisted_policy_digest) = match &compacted.payload {
             AgentSessionEvent::CompactionCommitted {
                 source,
                 source_digest,
+                policy_digest,
                 ..
-            } => (source, source_digest),
+            } => (source, source_digest, policy_digest),
             _ => panic!("expected compaction record"),
         };
         assert_eq!(source.first_session_seq, 1);
@@ -814,6 +851,7 @@ mod tests {
             session_range_digest(&records, source).unwrap(),
             *source_digest
         );
+        assert_eq!(*persisted_policy_digest, policy_digest);
         assert!(compactor
             .compact_if_needed(&AgentSessionId::new("session-1"), &RunId::new("current"),)
             .await
@@ -845,6 +883,105 @@ mod tests {
         assert!(rendered[0].contains("summary of 5 messages"));
         assert!(!rendered.join(" ").contains("old-1"));
         assert!(rendered.last().unwrap().contains("current-input"));
+    }
+
+    #[test]
+    fn ten_thousand_journal_policy_combinations_select_one_deterministic_traceable_source() {
+        const HISTORIES: usize = 100;
+        const POLICIES_PER_HISTORY: usize = 100;
+
+        let mut seed = 0xC04D_AC71_0A11_CE55u64;
+        let mut selected = 0usize;
+        let mut deferred = 0usize;
+
+        for history_index in 0..HISTORIES {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let record_count = 16 + (seed % 33) as usize;
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let current_sequence = 1 + (seed % record_count as u64);
+            let session_id = AgentSessionId::new(format!("compaction-session-{history_index}"));
+            let old_run_id = RunId::new(format!("compaction-old-{history_index}"));
+            let current_run_id = RunId::new(format!("compaction-current-{history_index}"));
+            let records = (1..=record_count as u64)
+                .map(|session_seq| {
+                    AgentSessionRecord::seal(
+                        AgentSessionEventDraft {
+                            event_id: AgentSessionEventId::new(format!(
+                                "compaction-event-{history_index}-{session_seq}"
+                            )),
+                            session_id: session_id.clone(),
+                            run_id: if session_seq == current_sequence {
+                                current_run_id.clone()
+                            } else {
+                                old_run_id.clone()
+                            },
+                            payload: AgentSessionEvent::RunInputCommitted {
+                                message: ModelMessage::text(
+                                    ModelRole::User,
+                                    format!("history-{history_index}-{session_seq}"),
+                                ),
+                            },
+                        },
+                        session_seq,
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            validate_session_trace(&session_id, &records).unwrap();
+
+            for _ in 0..POLICIES_PER_HISTORY {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                let minimum_source_records = 1 + (seed % 12) as usize;
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                let keep_recent_records = 1 + (seed % 12) as usize;
+                let policy = SessionCompactionPolicy {
+                    minimum_source_records,
+                    keep_recent_records,
+                };
+                let policy_digest = policy.digest().unwrap();
+                assert_eq!(policy.digest().unwrap(), policy_digest);
+                assert_ne!(
+                    SessionCompactionPolicy {
+                        minimum_source_records,
+                        keep_recent_records: keep_recent_records + 1,
+                    }
+                    .digest()
+                    .unwrap(),
+                    policy_digest
+                );
+
+                let first = select_compaction_source(&records, &current_run_id, &policy);
+                let second = select_compaction_source(&records, &current_run_id, &policy);
+                assert_eq!(first, second);
+
+                let source_len = record_count.saturating_sub(keep_recent_records);
+                let expected = (record_count >= minimum_source_records + keep_recent_records
+                    && current_sequence as usize > source_len)
+                    .then_some(SessionSourceRange {
+                        first_session_seq: 1,
+                        last_session_seq: source_len as u64,
+                    });
+                assert_eq!(first, expected);
+
+                if let Some(source) = first {
+                    source.validate().unwrap();
+                    let source_records = &records[..source.last_session_seq as usize];
+                    assert!(source_records.len() >= minimum_source_records);
+                    assert!(source_records
+                        .iter()
+                        .all(|record| record.run_id != current_run_id));
+                    assert!(source.last_session_seq as usize <= record_count - keep_recent_records);
+                    assert!(session_range_digest(&records, &source).unwrap().is_sha256());
+                    selected += 1;
+                } else {
+                    deferred += 1;
+                }
+            }
+        }
+
+        assert_eq!(selected + deferred, HISTORIES * POLICIES_PER_HISTORY);
+        assert!(selected > 0);
+        assert!(deferred > 0);
     }
 
     #[tokio::test]

@@ -99,6 +99,7 @@ pub enum AgentSessionEvent {
     CompactionCommitted {
         source: SessionSourceRange,
         source_digest: Digest,
+        policy_digest: Digest,
         summary: ModelMessage,
         strategy: String,
         #[serde(default)]
@@ -162,6 +163,7 @@ impl AgentSessionEvent {
             Self::CompactionCommitted {
                 source,
                 source_digest,
+                policy_digest,
                 summary,
                 strategy,
                 model,
@@ -169,12 +171,14 @@ impl AgentSessionEvent {
             } => {
                 source.validate()?;
                 if !source_digest.is_sha256()
+                    || !policy_digest.is_sha256()
                     || strategy.trim().is_empty()
                     || version.trim().is_empty()
                     || model.as_ref().is_some_and(|model| model.trim().is_empty())
                 {
                     return Err(AgentSessionError::InvalidEvent(
-                        "compaction requires source digest, strategy, and version".to_owned(),
+                        "compaction requires source and policy digests, strategy, and version"
+                            .to_owned(),
                     ));
                 }
                 validate_message(summary)?;
