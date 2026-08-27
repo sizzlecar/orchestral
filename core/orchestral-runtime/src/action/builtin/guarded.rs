@@ -339,7 +339,7 @@ impl GuardedToolExecutor for GuardedShellExecutor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        isolate_process_group(&mut command);
+        isolate_process_group(&mut command, sandboxed.backend_starts_new_session);
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => return failed("shell_spawn_failed", error.to_string(), false),
@@ -600,12 +600,14 @@ fn failed(code: impl Into<String>, message: impl Into<String>, retryable: bool) 
 }
 
 #[cfg(unix)]
-fn isolate_process_group(command: &mut Command) {
-    command.process_group(0);
+fn isolate_process_group(command: &mut Command, backend_starts_new_session: bool) {
+    if !backend_starts_new_session {
+        command.process_group(0);
+    }
 }
 
 #[cfg(not(unix))]
-fn isolate_process_group(_command: &mut Command) {}
+fn isolate_process_group(_command: &mut Command, _backend_starts_new_session: bool) {}
 
 async fn terminate_child_tree(
     child: &mut Child,

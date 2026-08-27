@@ -16,6 +16,10 @@ pub struct SandboxedCommand {
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
     pub backend: &'static str,
+    /// The sandbox launcher establishes a fresh session/process group itself.
+    /// Callers must not make that launcher a process-group leader before it
+    /// executes, because doing so makes a subsequent `setsid` fail.
+    pub backend_starts_new_session: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +94,7 @@ impl ShellSandboxBackend for MacosSeatbeltBackend {
             args: sandboxed_args,
             env,
             backend: self.backend_name(),
+            backend_starts_new_session: false,
         })
     }
 }
@@ -124,6 +129,7 @@ impl ShellSandboxBackend for LinuxBwrapBackend {
             args,
             env,
             backend: self.backend_name(),
+            backend_starts_new_session: true,
         })
     }
 }

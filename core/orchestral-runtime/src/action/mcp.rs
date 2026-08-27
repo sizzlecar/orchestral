@@ -411,6 +411,7 @@ impl McpTransportFactory for StdioMcpTransportFactory {
             &command.args,
             &environment,
             &self.sandbox.cwd,
+            command.backend_starts_new_session,
         )
         .await
         .map(|transport| Box::new(transport) as Box<dyn McpTransportConnection>)
@@ -1630,6 +1631,7 @@ impl StdioMcpTransport {
         args: &[String],
         env: &HashMap<String, String>,
         cwd: &std::path::Path,
+        backend_starts_new_session: bool,
     ) -> Result<Self, String> {
         let mut cmd = Command::new(command);
         cmd.args(args);
@@ -1637,7 +1639,7 @@ impl StdioMcpTransport {
         cmd.env_clear();
         cmd.envs(env);
         cmd.current_dir(cwd);
-        isolate_mcp_process_group(&mut cmd);
+        isolate_mcp_process_group(&mut cmd, backend_starts_new_session);
         cmd.kill_on_drop(true)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -1911,12 +1913,14 @@ fn attach_stateless_request_metadata(mut params: Value) -> Result<Value, McpRequ
 }
 
 #[cfg(unix)]
-fn isolate_mcp_process_group(command: &mut Command) {
-    command.process_group(0);
+fn isolate_mcp_process_group(command: &mut Command, backend_starts_new_session: bool) {
+    if !backend_starts_new_session {
+        command.process_group(0);
+    }
 }
 
 #[cfg(not(unix))]
-fn isolate_mcp_process_group(_command: &mut Command) {}
+fn isolate_mcp_process_group(_command: &mut Command, _backend_starts_new_session: bool) {}
 
 async fn terminate_mcp_process_tree(child: &mut Child, process_group_id: Option<u32>) {
     #[cfg(unix)]
