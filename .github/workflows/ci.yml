@@ -27,6 +27,11 @@ jobs:
           toolchain: 1.91.0
           components: rustfmt,clippy
 
+      - name: Install Linux sandbox backend
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
