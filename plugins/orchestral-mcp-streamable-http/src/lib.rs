@@ -190,21 +190,11 @@ struct StreamableHttpMcpTransport {
     max_frame_bytes: usize,
 }
 
-#[async_trait]
-impl McpTransportConnection for StreamableHttpMcpTransport {
-    fn kind(&self) -> McpTransportKind {
-        McpTransportKind::StreamableHttp
-    }
-
-    fn cancellation(&self) -> McpTransportCancellation {
-        McpTransportCancellation::DropExchange
-    }
-
-    async fn request(
+impl StreamableHttpMcpTransport {
+    fn build_request(
         &self,
         request: McpTransportRequest,
-        cancellation: CancellationToken,
-    ) -> Result<Value, McpTransportError> {
+    ) -> Result<reqwest::Request, McpTransportError> {
         let body = serde_json::to_vec(&json!({
             "jsonrpc": "2.0",
             "id": request.id,
@@ -266,6 +256,33 @@ impl McpTransportConnection for StreamableHttpMcpTransport {
             )?;
         }
 
+        self.client
+            .post(self.endpoint.clone())
+            .headers(headers)
+            .body(body)
+            .build()
+            .map_err(|error| McpTransportError::Transport(error.to_string()))
+    }
+}
+
+#[async_trait]
+impl McpTransportConnection for StreamableHttpMcpTransport {
+    fn kind(&self) -> McpTransportKind {
+        McpTransportKind::StreamableHttp
+    }
+
+    fn cancellation(&self) -> McpTransportCancellation {
+        McpTransportCancellation::DropExchange
+    }
+
+    async fn request(
+        &self,
+        request: McpTransportRequest,
+        cancellation: CancellationToken,
+    ) -> Result<Value, McpTransportError> {
+        let request_id = request.id;
+        let request = self.build_request(request)?;
+
         let response = tokio::select! {
             biased;
             _ = cancellation.cancelled() => {
@@ -273,13 +290,11 @@ impl McpTransportConnection for StreamableHttpMcpTransport {
                     "MCP HTTP request was cancelled".to_owned(),
                 ));
             }
-            response = self.client
-                .post(self.endpoint.clone())
-                .headers(headers)
-                .body(body)
-                .send() => response.map_err(|error| McpTransportError::Transport(error.to_string()))?,
+            response = self.client.execute(request) => {
+                response.map_err(|error| McpTransportError::Transport(error.to_string()))?
+            },
         };
-        decode_http_response(response, request.id, self.max_frame_bytes, cancellation).await
+        decode_http_response(response, request_id, self.max_frame_bytes, cancellation).await
     }
 
     async fn notification(
@@ -724,6 +739,71 @@ mod tests {
         assert_eq!(
             encode_header_value("=?base64?literal?="),
             "=?base64?PT9iYXNlNjQ/bGl0ZXJhbD89?="
+        );
+    }
+
+    #[test]
+    fn two_thousand_five_hundred_model_ssrf_mutations_cannot_change_the_host_endpoint() {
+        const MUTATIONS: usize = 2_500;
+        let endpoint = "https://mcp.example.test/fixed";
+        let factory = StreamableHttpMcpTransportFactory::new(
+            StreamableHttpMcpTransportConfig::unauthenticated(endpoint),
+        )
+        .unwrap();
+        let transport = StreamableHttpMcpTransport {
+            client: factory.client.clone(),
+            endpoint: factory.endpoint.clone(),
+            configured_headers: factory.configured_headers.clone(),
+            max_frame_bytes: factory.max_frame_bytes,
+        };
+        let suffixes = [
+            "Host",
+            "Forwarded",
+            "X-Forwarded-Host",
+            "Content-Type",
+            "Mcp-Protocol-Version",
+        ];
+        for index in 0..MUTATIONS {
+            let attacker_target = format!("http://169.254.169.254/latest/{index}");
+            let suffix = suffixes[index % suffixes.len()];
+            let request = transport
+                .build_request(McpTransportRequest {
+                    id: index as u64 + 1,
+                    method: "tools/call".to_owned(),
+                    params: json!({
+                        "name": "inspect",
+                        "arguments": {
+                            "url": attacker_target,
+                            "endpoint": attacker_target,
+                            "redirect": attacker_target,
+                            "proxy": attacker_target
+                        },
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": MCP_STATELESS_PROTOCOL_2026_07_28
+                        }
+                    }),
+                    parameter_headers: BTreeMap::from([(
+                        suffix.to_owned(),
+                        attacker_target.clone(),
+                    )]),
+                })
+                .unwrap();
+            assert_eq!(request.url().as_str(), endpoint);
+            assert_eq!(request.method(), reqwest::Method::POST);
+            assert!(request.headers().get("host").is_none());
+            assert_eq!(
+                request
+                    .headers()
+                    .get(format!("mcp-param-{suffix}"))
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                attacker_target
+            );
+        }
+        assert_eq!(
+            factory.authority.network_targets,
+            BTreeSet::from([endpoint.to_owned()])
         );
     }
 

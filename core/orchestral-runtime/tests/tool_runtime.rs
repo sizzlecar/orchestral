@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -110,6 +111,46 @@ fn runtime(bounds: ToolPolicyBounds) -> GuardedToolRuntime<InMemoryApprovalCapab
     let verifier =
         HostApprovalVerifier::new(SIGNING_KEY, InMemoryApprovalCapabilityStore::default()).unwrap();
     GuardedToolRuntime::new(HostToolPolicy { bounds }, verifier).unwrap()
+}
+
+#[cfg(unix)]
+fn strict_shell_security_bounds(root: &Path) -> (ToolPolicyBounds, String) {
+    let root = std::fs::canonicalize(root).unwrap();
+    let root = root.to_string_lossy().into_owned();
+    let executable = std::fs::canonicalize("/bin/echo")
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    (
+        ToolPolicyBounds {
+            allowed_effects: effects(&[
+                EffectScope::Process,
+                EffectScope::FilesystemRead,
+                EffectScope::FilesystemWrite,
+                EffectScope::EnvironmentRead,
+                EffectScope::ExternalSideEffect,
+            ]),
+            approval: ApprovalPolicy::Required,
+            sandbox: SandboxPolicy {
+                required: true,
+                allowed_profiles: strings(&[GUARDED_SHELL_SANDBOX_PROFILE]),
+            },
+            process: ProcessPolicy {
+                allowed_programs: BTreeSet::from([executable.clone()]),
+                allow_shell_expression: false,
+            },
+            filesystem: FilesystemPolicy {
+                readable_roots: BTreeSet::from([root.clone()]),
+                writable_roots: BTreeSet::from([root]),
+            },
+            network: NetworkPolicy::default(),
+            environment: EnvironmentPolicy::default(),
+            allowed_credentials: BTreeSet::new(),
+            max_timeout_ms: Some(2_000),
+            max_output_bytes: Some(4 * 1024),
+        },
+        executable,
+    )
 }
 
 fn runtime_with_effect_journal(
@@ -1853,6 +1894,235 @@ async fn run_cancellation_reaches_executor_and_closes_the_call() {
     ));
     assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
     assert_eq!(active.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn two_thousand_five_hundred_model_sandbox_downgrades_reach_no_executor() {
+    const MUTATIONS: usize = 2_500;
+    let root = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+    let (bounds, executable) = strict_shell_security_bounds(&root);
+    let runtime = runtime(bounds.clone());
+    runtime
+        .register(
+            guarded_shell_descriptor(ToolRestriction {
+                bounds: bounds.clone(),
+            }),
+            Arc::new(GuardedShellExecutor),
+        )
+        .unwrap();
+    let fields = [
+        "approval",
+        "sandbox",
+        "sandbox_mode",
+        "network",
+        "environment",
+        "credential",
+        "allowed_programs",
+    ];
+    for index in 0..MUTATIONS {
+        let mut arguments = json!({ "command": executable });
+        arguments.as_object_mut().unwrap().insert(
+            fields[index % fields.len()].to_owned(),
+            json!({ "required": false, "allow": "*", "index": index }),
+        );
+        let result = runtime
+            .invoke(
+                ToolInvocation {
+                    run_id: RunId::new("sandbox-downgrade-run"),
+                    call_id: ToolCallId::new(format!("sandbox-downgrade-{index}")),
+                    tool_id: ToolId::new("orchestral/shell_exec/v1"),
+                    arguments,
+                },
+                RunToolGrant {
+                    bounds: bounds.clone(),
+                },
+                None,
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            GuardedToolResult::Outcome {
+                outcome: ToolOutcome::Rejected { ref code, .. },
+                cached: false,
+            } if code == "input_schema_violation"
+        ));
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn two_thousand_five_hundred_alternate_spawn_mutations_start_zero_processes() {
+    const MUTATIONS: usize = 2_500;
+    let root = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+    let (bounds, _) = strict_shell_security_bounds(&root);
+    let runtime = runtime(bounds.clone());
+    runtime
+        .register(
+            guarded_shell_descriptor(ToolRestriction {
+                bounds: bounds.clone(),
+            }),
+            Arc::new(GuardedShellExecutor),
+        )
+        .unwrap();
+    for index in 0..MUTATIONS {
+        let invocation = ToolInvocation {
+            run_id: RunId::new("alternate-spawn-run"),
+            call_id: ToolCallId::new(format!("alternate-spawn-{index}")),
+            tool_id: ToolId::new("orchestral/shell_exec/v1"),
+            arguments: json!({
+                "command": format!("/orchestral-unapproved/bin-{index}"),
+                "args": ["must-not-run"]
+            }),
+        };
+        let GuardedToolResult::ApprovalRequired { binding, .. } = runtime
+            .invoke(
+                invocation.clone(),
+                RunToolGrant {
+                    bounds: bounds.clone(),
+                },
+                None,
+                CancellationToken::new(),
+            )
+            .await
+        else {
+            panic!("alternate spawn mutation must still require exact approval")
+        };
+        let capability = HostApprovalIssuer::new(SIGNING_KEY)
+            .unwrap()
+            .issue(binding, i64::MAX)
+            .unwrap();
+        let result = runtime
+            .invoke(
+                invocation,
+                RunToolGrant {
+                    bounds: bounds.clone(),
+                },
+                Some(capability),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            GuardedToolResult::Outcome {
+                outcome: ToolOutcome::Rejected { ref code, .. },
+                cached: false,
+            } if code == "shell_program_denied"
+        ));
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn two_thousand_five_hundred_symlink_escapes_read_zero_outside_bytes() {
+    const MUTATIONS: usize = 2_500;
+    let parent = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!("orchestral-symlink-gate-{}", uuid::Uuid::new_v4()));
+    let workspace = parent.join("workspace");
+    let outside = parent.join("outside");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let parent = std::fs::canonicalize(parent).unwrap();
+    let workspace = std::fs::canonicalize(workspace).unwrap();
+    let outside = std::fs::canonicalize(outside).unwrap();
+    let secret = outside.join("secret.txt");
+    std::fs::write(&secret, "ORCHESTRAL_SYMLINK_SENTINEL").unwrap();
+    let workspace_string = workspace.to_string_lossy().into_owned();
+    let bounds = ToolPolicyBounds {
+        allowed_effects: effects(&[EffectScope::FilesystemRead]),
+        approval: ApprovalPolicy::NotRequired,
+        sandbox: SandboxPolicy {
+            required: false,
+            allowed_profiles: strings(&["workspace_read"]),
+        },
+        process: ProcessPolicy::default(),
+        filesystem: FilesystemPolicy {
+            readable_roots: BTreeSet::from([workspace_string]),
+            writable_roots: BTreeSet::new(),
+        },
+        network: NetworkPolicy::default(),
+        environment: EnvironmentPolicy::default(),
+        allowed_credentials: BTreeSet::new(),
+        max_timeout_ms: Some(1_000),
+        max_output_bytes: Some(4 * 1024),
+    };
+    let runtime = runtime(bounds.clone());
+    runtime
+        .register(
+            guarded_file_read_descriptor(ToolRestriction {
+                bounds: bounds.clone(),
+            }),
+            Arc::new(GuardedFileReadExecutor),
+        )
+        .unwrap();
+    for index in 0..MUTATIONS {
+        let link = workspace.join(format!("escape-{index}.txt"));
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        let result = runtime
+            .invoke(
+                ToolInvocation {
+                    run_id: RunId::new("symlink-escape-run"),
+                    call_id: ToolCallId::new(format!("symlink-escape-{index}")),
+                    tool_id: ToolId::new("orchestral/file_read/v1"),
+                    arguments: json!({ "path": link }),
+                },
+                RunToolGrant {
+                    bounds: bounds.clone(),
+                },
+                None,
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            GuardedToolResult::Outcome {
+                outcome: ToolOutcome::Rejected { ref code, .. },
+                cached: false,
+            } if code == "file_path_escape"
+        ));
+    }
+    std::fs::remove_dir_all(parent).unwrap();
+}
+
+#[tokio::test]
+async fn one_thousand_each_retired_subprocess_and_http_secret_attempts_have_no_execution_route() {
+    const ATTEMPTS: usize = 1_000;
+    let bounds = policy(ApprovalPolicy::NotRequired);
+    let runtime = runtime(bounds.clone());
+    for tool_id in ["orchestral/subprocess/v1", "orchestral/http/v1"] {
+        for index in 0..ATTEMPTS {
+            let sentinel = format!("ORCHESTRAL_RETIRED_SENTINEL_{tool_id}_{index}");
+            let result = runtime
+                .invoke(
+                    ToolInvocation {
+                        run_id: RunId::new("retired-effect-route-run"),
+                        call_id: ToolCallId::new(format!("{tool_id}-{index}")),
+                        tool_id: ToolId::new(tool_id),
+                        arguments: json!({
+                            "command": "/bin/sh",
+                            "url": "http://169.254.169.254/latest/meta-data",
+                            "environment": {"SECRET": sentinel},
+                            "body": sentinel
+                        }),
+                    },
+                    RunToolGrant {
+                        bounds: bounds.clone(),
+                    },
+                    None,
+                    CancellationToken::new(),
+                )
+                .await;
+            assert!(matches!(
+                result,
+                GuardedToolResult::Outcome {
+                    outcome: ToolOutcome::Rejected { ref code, .. },
+                    cached: false,
+                } if code == "tool_not_found"
+            ));
+        }
+    }
 }
 
 #[tokio::test]
