@@ -27,9 +27,7 @@ use orchestral_core::config::{
 use orchestral_core::io::BlobStore;
 use orchestral_core::mcp_protocol::{McpServerId, McpTransportFactory};
 use orchestral_core::model_protocol::ModelBackend;
-use orchestral_core::skill_protocol::{
-    SkillSourceKind, SkillTrustLevel, SKILL_CATALOG_RESOURCE_KIND_V1,
-};
+use orchestral_core::skill_protocol::{SkillSourceKind, SKILL_CATALOG_RESOURCE_KIND_V1};
 use orchestral_core::tool_effect::{InMemoryToolEffectJournalStore, ToolEffectJournalStore};
 use orchestral_core::tool_protocol::{
     ApprovalPolicy, EffectScope, EnvironmentPolicy, FilesystemPolicy, HostApprovalVerifier,
@@ -49,13 +47,12 @@ use orchestral_runtime::tools::{
     GuardedApplyPatchExecutor, GuardedArtifactReadExecutor, GuardedFileReadExecutor,
 };
 use orchestral_runtime::{
-    AgentClient, AgentControlEvent, AgentController, AgentToolRuntime,
-    DeterministicExtractiveSessionSummarizer, GenericAgentCheckpointStore, GenericAgentConfig,
-    GuardedMcpServerConfig, GuardedToolRuntime, InMemoryBlobStore,
-    InMemoryGenericAgentCheckpointStore, InMemoryHostApprovalBroker, InternalGenericAgentProvider,
-    McpToolsAdapterRegistry, ModelTokenMeter, SessionCompactionPolicy, SkillActivationPolicy,
-    SkillHostProfile, SkillRoot, SkillRuntime, StdioMcpSandboxPolicy, StdioMcpTransportFactory,
-    ToolArtifactStore,
+    AgentClient, AgentControlEvent, AgentController, DeterministicExtractiveSessionSummarizer,
+    GenericAgentCheckpointStore, GenericAgentConfig, GuardedMcpServerConfig, GuardedToolRuntime,
+    InMemoryBlobStore, InMemoryGenericAgentCheckpointStore, InMemoryHostApprovalBroker,
+    InternalGenericAgentProvider, McpToolsAdapterRegistry, ModelTokenMeter,
+    SessionCompactionPolicy, SkillRoot, SkillRuntime, StdioMcpSandboxPolicy,
+    StdioMcpTransportFactory, ToolArtifactStore,
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
@@ -198,7 +195,7 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
     let skills = if options.no_skills {
         None
     } else {
-        build_cli_skill_runtime(&config, tool_runtime.as_ref(), mcp_registry.server_names())?
+        build_cli_skill_runtime(&config)?
     };
     let provider = match skills.clone() {
         Some(skills) => {
@@ -526,11 +523,7 @@ fn build_cli_blob_store(config: &OrchestralConfig) -> anyhow::Result<Arc<dyn Blo
     }
 }
 
-fn build_cli_skill_runtime(
-    config: &OrchestralConfig,
-    tools: &dyn AgentToolRuntime,
-    available_mcp_servers: BTreeSet<String>,
-) -> anyhow::Result<Option<Arc<SkillRuntime>>> {
+fn build_cli_skill_runtime(config: &OrchestralConfig) -> anyhow::Result<Option<Arc<SkillRuntime>>> {
     if !config.skills.enabled {
         return Ok(None);
     }
@@ -546,17 +539,11 @@ fn build_cli_skill_runtime(
                 workspace.join(path)
             },
             source_kind: SkillSourceKind::UserConfigured,
-            trust: SkillTrustLevel::UserTrusted,
             precedence: 10_000_u32.saturating_sub(index as u32),
             required: true,
         });
     }
     if config.skills.auto_discover {
-        let trust = if config.skills.trust_workspace {
-            SkillTrustLevel::WorkspaceTrusted
-        } else {
-            SkillTrustLevel::WorkspaceUntrusted
-        };
         for (index, relative) in [".claude/skills", ".codex/skills", "skills"]
             .into_iter()
             .enumerate()
@@ -564,7 +551,6 @@ fn build_cli_skill_runtime(
             roots.push(SkillRoot {
                 path: workspace.join(relative),
                 source_kind: SkillSourceKind::Workspace,
-                trust,
                 precedence: 1_000_u32.saturating_sub(index as u32),
                 required: false,
             });
@@ -573,33 +559,8 @@ fn build_cli_skill_runtime(
     if roots.is_empty() {
         return Ok(None);
     }
-    let mut host = SkillHostProfile::current();
-    host.available_tools = tools
-        .model_tool_schemas()
-        .context("inspect Host Tool catalog for Skill dependencies")?
-        .into_iter()
-        .map(|schema| schema.name)
-        .collect();
-    host.available_mcp_servers = available_mcp_servers;
-    for program in configured_shell_programs(config)? {
-        host.available_programs.insert(program.clone());
-        if let Some(name) = PathBuf::from(&program)
-            .file_name()
-            .and_then(|name| name.to_str())
-        {
-            host.available_programs.insert(name.to_owned());
-        }
-    }
-    let runtime = SkillRuntime::discover(
-        ResourceId::new("cli-skills"),
-        &roots,
-        host,
-        SkillActivationPolicy {
-            allow_untrusted_workspace: false,
-            allow_incompatible: config.skills.allow_incompatible,
-        },
-    )
-    .context("discover strict Skill catalog")?;
+    let runtime = SkillRuntime::discover(ResourceId::new("cli-skills"), &roots)
+        .context("discover Skill catalog")?;
     if runtime.catalog().skills.is_empty() {
         return Ok(None);
     }

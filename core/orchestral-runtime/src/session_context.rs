@@ -90,7 +90,7 @@ pub struct SessionContextRequest {
     pub system_message: Option<ModelMessage>,
     pub tools: Vec<ModelToolDefinition>,
     /// Maximum number of non-current Run history groups eligible for this
-    /// request. Current Run state and activated Skills remain pinned.
+    /// request. Current Run state and loaded Skills remain pinned.
     pub history_limit: usize,
     pub max_context_tokens: u64,
     pub reserved_output_tokens: u64,
@@ -227,7 +227,7 @@ fn replay_groups(
     allowed_skill_digests: &BTreeMap<SkillId, Digest>,
 ) -> Result<BTreeMap<u64, MessageGroup>, SessionContextError> {
     let mut groups = BTreeMap::new();
-    let mut activated_skills = BTreeMap::new();
+    let mut loaded_skills = BTreeMap::new();
     for record in records {
         match &record.payload {
             AgentSessionEvent::RunInputCommitted { message } => {
@@ -289,13 +289,13 @@ fn replay_groups(
                     },
                 );
             }
-            AgentSessionEvent::SkillActivated { activation } => {
-                let descriptor = &activation.package.descriptor;
+            AgentSessionEvent::SkillLoaded { load } => {
+                let descriptor = &load.package.descriptor;
                 if allowed_skill_digests.get(&descriptor.skill_id) != Some(&descriptor.digest) {
                     continue;
                 }
                 if let Some(previous) =
-                    activated_skills.insert(descriptor.skill_id.clone(), descriptor.digest.clone())
+                    loaded_skills.insert(descriptor.skill_id.clone(), descriptor.digest.clone())
                 {
                     if previous != descriptor.digest {
                         return Err(SessionContextError::Journal(AgentSessionError::Corrupt(
@@ -305,7 +305,7 @@ fn replay_groups(
                             ),
                         )));
                     }
-                    // Exact re-activation is semantically idempotent and must
+                    // Loading the same immutable instructions is idempotent and must
                     // not duplicate full instructions in model context.
                     continue;
                 }
@@ -314,8 +314,8 @@ fn replay_groups(
                     MessageGroup {
                         key: record.session_seq,
                         source: single_range(record.session_seq),
-                        messages: vec![skill_activation_message(activation)],
-                        // Activated instructions are Session state. They are
+                        messages: vec![skill_load_message(load)],
+                        // Loaded instructions are Session state. They are
                         // never evicted or shadowed by ordinary compaction.
                         pinned: true,
                     },
@@ -338,10 +338,10 @@ fn replay_groups(
                 }
                 if records.iter().any(|candidate| {
                     source.contains(candidate.session_seq)
-                        && matches!(candidate.payload, AgentSessionEvent::SkillActivated { .. })
+                        && matches!(candidate.payload, AgentSessionEvent::SkillLoaded { .. })
                 }) {
                     return Err(SessionContextError::Journal(AgentSessionError::Corrupt(
-                        "compaction cannot shadow durable Skill activation state".to_owned(),
+                        "compaction cannot shadow durable loaded Skill state".to_owned(),
                     )));
                 }
                 if groups
@@ -373,10 +373,10 @@ fn replay_groups(
     Ok(groups)
 }
 
-pub(crate) fn skill_activation_message(
-    activation: &orchestral_core::skill_protocol::SkillActivation,
+pub(crate) fn skill_load_message(
+    load: &orchestral_core::skill_protocol::SkillLoad,
 ) -> ModelMessage {
-    let descriptor = &activation.package.descriptor;
+    let descriptor = &load.package.descriptor;
     let version = descriptor.version.as_deref().unwrap_or("unversioned");
     ModelMessage::text(
         ModelRole::System,
@@ -388,7 +388,7 @@ pub(crate) fn skill_activation_message(
             descriptor.source.locator,
             version,
             descriptor.digest,
-            activation.package.instructions
+            load.package.instructions
         ),
     )
 }
@@ -572,7 +572,7 @@ pub fn select_compaction_source(
             .any(|source| source.contains(record.session_seq));
         let is_barrier = record.run_id == *current_run_id
             || match &record.payload {
-                AgentSessionEvent::SkillActivated { .. }
+                AgentSessionEvent::SkillLoaded { .. }
                 | AgentSessionEvent::EffectUncertaintyCommitted { .. } => true,
                 AgentSessionEvent::ToolExchangeCommitted {
                     retained_artifacts, ..

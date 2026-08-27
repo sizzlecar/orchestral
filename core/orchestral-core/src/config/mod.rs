@@ -303,14 +303,8 @@ pub struct SkillsConfig {
     pub enabled: bool,
     #[serde(default = "default_true")]
     pub auto_discover: bool,
-    #[serde(default = "default_max_active_skills")]
-    pub max_active_skills: usize,
     #[serde(default)]
     pub directories: Vec<String>,
-    #[serde(default)]
-    pub trust_workspace: bool,
-    #[serde(default)]
-    pub allow_incompatible: bool,
 }
 
 impl Default for SkillsConfig {
@@ -318,16 +312,9 @@ impl Default for SkillsConfig {
         Self {
             enabled: true,
             auto_discover: true,
-            max_active_skills: default_max_active_skills(),
             directories: Vec::new(),
-            trust_workspace: false,
-            allow_incompatible: false,
         }
     }
-}
-
-fn default_max_active_skills() -> usize {
-    3
 }
 
 #[derive(Debug, Clone, Deserialize)]

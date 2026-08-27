@@ -564,7 +564,7 @@ fn local_cli_reads_patches_and_runs_a_guarded_verification() {
 }
 
 #[test]
-fn local_cli_auto_discovers_reads_and_uses_a_workspace_skill() {
+fn local_cli_skill_read_injects_instructions_and_journals_load() {
     const DESCRIPTOR_MARKER: &str = "E2E skill descriptor marker";
     const INSTRUCTION_MARKER: &str = "SKILL_E2E_INSTRUCTION_雪豹_7319";
     const RESULT_MARKER: &str = "SKILL_E2E_RESULT_云鲸_4827";
@@ -596,12 +596,7 @@ fn local_cli_auto_discovers_reads_and_uses_a_workspace_skill() {
             let context = model_request_text(&request.body);
             assert!(context.contains("A Skill is a set of local instructions"));
             assert!(context.contains(&skill_path));
-            assert!(!context.contains("call orchestral_skill_activate"));
             assert!(model_request_has_tool(&request.body, "skill_read"));
-            assert!(!model_request_has_tool(
-                &request.body,
-                "orchestral_skill_activate"
-            ));
             openai_tool_response(
                 "read-e2e-skill",
                 "skill_read",
@@ -651,7 +646,7 @@ fn local_cli_auto_discovers_reads_and_uses_a_workspace_skill() {
     assert!(second_context.contains("\"status\":\"loaded\""));
 
     let records = session_records(&workspace);
-    assert_eq!(payload_count(&records, "skill_activated"), 1);
+    assert_eq!(payload_count(&records, "skill_loaded"), 1);
     let exchanges = tool_exchanges(&records);
     assert_eq!(exchanges.len(), 2);
     assert_eq!(tool_name(exchanges[0]), Some("skill_read"));
@@ -899,26 +894,26 @@ fn live_coding_agent_reads_patches_and_verifies_the_change() {
 
 #[test]
 #[ignore = "spends real Google Vertex quota; requires ADC or a service-account credential"]
-fn live_agent_discovers_reads_and_uses_a_workspace_skill() {
+fn live_agent_follows_a_dynamically_discovered_workspace_skill() {
     let _guard = live_test_guard();
-    const MARKER: &str = "LIVE_SKILL_PROVENANCE_海豚_6142";
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_nanos();
+    let marker = format!("LIVE_SKILL_RESULT_海豚_{nonce}");
+    let evidence_file = format!("skill-evidence-{nonce}.txt");
 
-    let workspace = TestWorkspace::new("live-skill-provenance");
-    let skill_directory = workspace.path("skills/origin-inspector");
+    let workspace = TestWorkspace::new("live-dynamic-skill");
+    let skill_directory = workspace.path("skills/workspace-audit");
     fs::create_dir_all(&skill_directory).expect("create live Skill directory");
     fs::write(
         skill_directory.join("SKILL.md"),
-        concat!(
-            "---\n",
-            "name: origin-inspector\n",
-            "description: Inspect this workspace Skill's provenance and verify its local evidence\n",
-            "version: 1.0.0\n",
-            "---\n",
-            "Read skill-evidence.txt with file_read. Report the Skill source path and the exact evidence content.\n",
+        format!(
+            "---\nname: workspace-audit\ndescription: Follow the workspace's local audit procedure\nversion: 1.0.0\n---\nRead {evidence_file} with file_read, then return its exact content.\n",
         ),
     )
     .expect("write live Skill");
-    fs::write(workspace.path("skill-evidence.txt"), format!("{MARKER}\n"))
+    fs::write(workspace.path(&evidence_file), format!("{marker}\n"))
         .expect("write live Skill evidence");
 
     let mut command = root_command(&workspace);
@@ -930,7 +925,7 @@ fn live_agent_discovers_reads_and_uses_a_workspace_skill() {
         .arg("--temperature")
         .arg("0")
         .arg("--session-id")
-        .arg("live-skill-provenance-session")
+        .arg("live-dynamic-skill-session")
         .arg("--no-mcp");
     if let Some(path) = explicit_live_credential() {
         command.arg("--credential-file").arg(path);
@@ -940,16 +935,12 @@ fn live_agent_discovers_reads_and_uses_a_workspace_skill() {
             "live E2E requires Google credentials"
         );
     }
-    command.arg("origin-inspector 这个 Skill 从哪里来的？使用它完成验证。");
+    command.arg("使用 workspace-audit 完成任务。");
 
     let output = run_to_completion(command, PROCESS_TIMEOUT);
     assert!(output.status.success(), "{}", output.stderr_text());
     let final_output = output.stdout_text();
-    assert!(final_output.contains(MARKER), "{final_output}");
-    assert!(
-        final_output.contains("skills/origin-inspector/SKILL.md"),
-        "{final_output}"
-    );
+    assert!(final_output.contains(&marker), "{final_output}");
     output.assert_no_ansi();
 
     let records = session_records(&workspace);

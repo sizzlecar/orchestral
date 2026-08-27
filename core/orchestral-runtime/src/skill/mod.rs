@@ -3,6 +3,5 @@
 mod runtime;
 
 pub use runtime::{
-    ActivatedSkillSet, SkillActivationOutcome, SkillActivationPolicy, SkillActivationRequest,
-    SkillConflict, SkillHostProfile, SkillRoot, SkillRuntime, SkillRuntimeError,
+    LoadedSkillSet, SkillConflict, SkillLoadOutcome, SkillRoot, SkillRuntime, SkillRuntimeError,
 };

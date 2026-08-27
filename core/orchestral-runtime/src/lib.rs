@@ -46,8 +46,7 @@ pub use session_context::{
     SessionContextRequest, SessionSummarizerDescriptor,
 };
 pub use skill::{
-    ActivatedSkillSet, SkillActivationOutcome, SkillActivationPolicy, SkillActivationRequest,
-    SkillConflict, SkillHostProfile, SkillRoot, SkillRuntime, SkillRuntimeError,
+    LoadedSkillSet, SkillConflict, SkillLoadOutcome, SkillRoot, SkillRuntime, SkillRuntimeError,
 };
 pub use tool_runtime::{
     AgentToolRuntime, GuardedToolExecution, GuardedToolExecutor, GuardedToolResult,

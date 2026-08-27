@@ -2,8 +2,8 @@
 
 状态：stable Context Plane contract。
 
-Skill 是带来源和信任信息的指令包，不是 Tool。Skill Runtime 只控制哪些文本可以进入模型
-Context；它不执行远程调用，也不能改变 ToolGrant、Sandbox 或 Host policy。
+Skill 是带来源信息的本地指令包，不是 Tool。Skill Runtime 负责发现、列出和加载指令；
+它不执行动作，也不能改变 ToolGrant、Sandbox 或 Host policy。
 
 ```text
 explicit Host roots
@@ -11,28 +11,25 @@ explicit Host roots
   → deterministic catalog snapshot + revision
   → Run ResourceBinding(skill-catalog/v1)
   → model sees descriptors only
-  → orchestral_skill_activate request
-  → trust / compatibility / dependency / digest checks
-  → SkillActivated SessionEvent
-  → full instructions enter this Run context
+  → skill_read(name)
+  → SkillLoaded SessionEvent
+  → immutable instructions enter model context
 ```
 
 ## 核心合同
 
-- `SkillPackage`：ID、描述、正文、source、trust、version、digest、compatibility、dependencies。
+- `SkillPackage`：ID、描述、正文、source、version、digest，以及可选的 compatibility/dependencies 元数据。
 - `SkillCatalogDescriptor`：Host 从显式 roots 构建的不可变快照。
 - `skill-catalog/v1` ResourceBinding：Run 可见 catalog 的精确 ID/revision。
-- `SkillActivationPolicy`：允许的 source、trust 与 compatibility 边界。
-- `ActivatedSkillSet`：从 Session Journal replay 的当前 Run 激活状态。
+- `LoadedSkillSet`：从 Session Journal replay 的已加载指令集合。
 
 ## 不变量
 
-1. 未绑定 catalog 的 Run 看不到 descriptor，未激活 Skill 的全文进入 Context 次数为 0。
+1. 未绑定 catalog 的 Run 看不到 descriptor；调用 `skill_read` 前，Skill 正文不可见。
 2. 同名冲突与解析失败必须可见且确定，不能按扫描顺序静默覆盖。
-3. workspace Skill 默认不受信任；digest 变化、依赖或 compatibility 不满足时拒绝激活。
-4. 激活事件记录 source、trust、version/digest 与 reason，可从 Journal 重建。
-5. Skill 激活前后 ToolGrant 和 Host policy 完全相同。
-6. 后续 Run 不因同 Session 的旧激活而自动继承全文。
+3. `skill_read` 是上下文读取，不因 compatibility/dependencies 元数据拒绝读取。
+4. 加载事件保存不可变 package，可从 Journal 精确重放，不依赖后来变化的文件。
+5. Skill 加载前后 ToolGrant 和 Host policy 完全相同；正文不能授予能力或权限。
 
 ## 最小 Skill 与 Host 配置
 
@@ -48,10 +45,8 @@ Inspect the changed Rust code, run focused tests, and report concrete risks.
 ```yaml
 skills:
   enabled: true
-  roots:
-    - path: ./skills
-      source: workspace
-      trusted: false
+  auto_discover: true
+  directories: []
 ```
 
 Runtime 构造与量化示例见 `core/orchestral-runtime/tests/skill_runtime.rs`。

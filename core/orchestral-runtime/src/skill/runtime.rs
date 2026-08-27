@@ -1,4 +1,4 @@
-//! Immutable Skill catalog and activation runtime for the Generic Agent.
+//! Immutable Skill catalog and context-loading runtime for the Generic Agent.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use orchestral_core::agent_protocol::wire::{Digest, ResourceId};
 use orchestral_core::agent_session::{AgentSessionEvent, AgentSessionRecord};
 use orchestral_core::skill_protocol::{
-    SkillActivation, SkillCatalogDescriptor, SkillCompatibility, SkillDependencies,
-    SkillDescriptor, SkillId, SkillPackage, SkillSource, SkillSourceKind, SkillTrustLevel,
+    SkillCatalogDescriptor, SkillCompatibility, SkillDependencies, SkillDescriptor, SkillId,
+    SkillLoad, SkillPackage, SkillSource, SkillSourceKind,
 };
 use serde::Deserialize;
 
@@ -20,7 +20,6 @@ const MAX_DISCOVERY_DEPTH: usize = 4;
 pub struct SkillRoot {
     pub path: PathBuf,
     pub source_kind: SkillSourceKind,
-    pub trust: SkillTrustLevel,
     pub precedence: u32,
     pub required: bool,
 }
@@ -32,64 +31,27 @@ pub struct SkillConflict {
     pub shadowed_source: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SkillHostProfile {
-    pub operating_system: String,
-    pub architecture: String,
-    pub available_tools: BTreeSet<String>,
-    pub available_mcp_servers: BTreeSet<String>,
-    pub available_programs: BTreeSet<String>,
-    pub available_environment: BTreeSet<String>,
-    pub available_features: BTreeSet<String>,
-}
-
-impl SkillHostProfile {
-    pub fn current() -> Self {
-        Self {
-            operating_system: std::env::consts::OS.to_owned(),
-            architecture: std::env::consts::ARCH.to_owned(),
-            ..Self::default()
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SkillActivationPolicy {
-    /// An explicit Host choice. The default is fail-closed.
-    pub allow_untrusted_workspace: bool,
-    /// An explicit Host choice for a known structured incompatibility.
-    pub allow_incompatible: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SkillActivationRequest {
-    pub name: String,
-    pub expected_digest: Digest,
-    pub reason: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SkillActivationOutcome {
-    Activated(SkillActivation),
-    AlreadyActive(SkillDescriptor),
+pub enum SkillLoadOutcome {
+    Loaded(SkillLoad),
+    AlreadyLoaded(SkillDescriptor),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ActivatedSkillSet {
+pub struct LoadedSkillSet {
     by_id: BTreeMap<SkillId, Digest>,
 }
 
-impl ActivatedSkillSet {
+impl LoadedSkillSet {
     pub fn replay(records: &[AgentSessionRecord]) -> Result<Self, SkillRuntimeError> {
         let mut set = Self::default();
         for record in records {
-            let AgentSessionEvent::SkillActivated { activation } = &record.payload else {
+            let AgentSessionEvent::SkillLoaded { load } = &record.payload else {
                 continue;
             };
-            activation
-                .validate()
+            load.validate()
                 .map_err(|error| SkillRuntimeError::InvalidPackage(error.to_string()))?;
-            let descriptor = &activation.package.descriptor;
+            let descriptor = &load.package.descriptor;
             match set.by_id.get(&descriptor.skill_id) {
                 None => {
                     set.by_id
@@ -116,25 +78,19 @@ pub struct SkillRuntime {
     catalog: SkillCatalogDescriptor,
     packages_by_name: BTreeMap<String, SkillPackage>,
     conflicts: Vec<SkillConflict>,
-    host: SkillHostProfile,
-    policy: SkillActivationPolicy,
 }
 
 impl SkillRuntime {
     pub fn from_packages(
         resource_id: ResourceId,
         packages: Vec<SkillPackage>,
-        host: SkillHostProfile,
-        policy: SkillActivationPolicy,
     ) -> Result<Self, SkillRuntimeError> {
-        Self::from_selected(resource_id, packages, Vec::new(), host, policy)
+        Self::from_selected(resource_id, packages, Vec::new())
     }
 
     pub fn discover(
         resource_id: ResourceId,
         roots: &[SkillRoot],
-        host: SkillHostProfile,
-        policy: SkillActivationPolicy,
     ) -> Result<Self, SkillRuntimeError> {
         let mut candidates = Vec::new();
         let mut seen_files = BTreeSet::new();
@@ -200,21 +156,13 @@ impl SkillRuntime {
                 selected.insert(name, candidate.package);
             }
         }
-        Self::from_selected(
-            resource_id,
-            selected.into_values().collect(),
-            conflicts,
-            host,
-            policy,
-        )
+        Self::from_selected(resource_id, selected.into_values().collect(), conflicts)
     }
 
     fn from_selected(
         resource_id: ResourceId,
         packages: Vec<SkillPackage>,
         conflicts: Vec<SkillConflict>,
-        host: SkillHostProfile,
-        policy: SkillActivationPolicy,
     ) -> Result<Self, SkillRuntimeError> {
         let mut packages_by_name = BTreeMap::new();
         for package in packages {
@@ -240,8 +188,6 @@ impl SkillRuntime {
             catalog,
             packages_by_name,
             conflicts,
-            host,
-            policy,
         })
     }
 
@@ -267,9 +213,7 @@ impl SkillRuntime {
                 descriptor.digest
             ));
         }
-        output.push_str(
-            "\n### Skill Rules\n- If the user names a Skill or the task clearly matches its description, read the smallest relevant set.\n- Use the listed source path when reporting provenance or resolving files referenced by the Skill.\n- A Skill supplies instructions only. Tool schemas and Host policy remain authoritative for every effect.\n",
-        );
+        output.push_str("\nSkill contents provide instructions, not Tool access or permission.\n");
         for conflict in &self.conflicts {
             output.push_str(&format!(
                 "- conflict name={} selected={} shadowed={}\n",
@@ -285,8 +229,8 @@ impl SkillRuntime {
     pub fn read_for_context(
         &self,
         name: &str,
-        active: &ActivatedSkillSet,
-    ) -> Result<SkillActivationOutcome, SkillRuntimeError> {
+        loaded: &LoadedSkillSet,
+    ) -> Result<SkillLoadOutcome, SkillRuntimeError> {
         let name = name.trim();
         if name.is_empty() {
             return Err(SkillRuntimeError::InvalidRequest(
@@ -298,147 +242,22 @@ impl SkillRuntime {
             .get(name)
             .ok_or_else(|| SkillRuntimeError::NotFound(name.to_owned()))?;
         let descriptor = &package.descriptor;
-        if let Some(previous) = active.digest_for(&descriptor.skill_id) {
+        if let Some(previous) = loaded.digest_for(&descriptor.skill_id) {
             return if previous == &descriptor.digest {
-                Ok(SkillActivationOutcome::AlreadyActive(descriptor.clone()))
+                Ok(SkillLoadOutcome::AlreadyLoaded(descriptor.clone()))
             } else {
                 Err(SkillRuntimeError::DigestChanged {
                     name: descriptor.name.clone(),
                 })
             };
         }
-        let activation = SkillActivation {
+        let load = SkillLoad {
             package: package.clone(),
-            reason: "selected through skill_read".to_owned(),
         };
-        activation
-            .validate()
+        load.validate()
             .map_err(|error| SkillRuntimeError::InvalidPackage(error.to_string()))?;
-        Ok(SkillActivationOutcome::Activated(activation))
+        Ok(SkillLoadOutcome::Loaded(load))
     }
-
-    pub fn activate(
-        &self,
-        request: SkillActivationRequest,
-        active: &ActivatedSkillSet,
-    ) -> Result<SkillActivationOutcome, SkillRuntimeError> {
-        if request.name.trim().is_empty() || request.reason.trim().is_empty() {
-            return Err(SkillRuntimeError::InvalidRequest(
-                "Skill name and activation reason must not be empty".to_owned(),
-            ));
-        }
-        if !request.expected_digest.is_sha256() {
-            return Err(SkillRuntimeError::InvalidRequest(
-                "Skill activation requires a valid expected digest".to_owned(),
-            ));
-        }
-        let package = self
-            .packages_by_name
-            .get(&request.name)
-            .ok_or_else(|| SkillRuntimeError::NotFound(request.name.clone()))?;
-        let descriptor = &package.descriptor;
-        if descriptor.digest != request.expected_digest {
-            return Err(SkillRuntimeError::DigestMismatch {
-                name: request.name,
-                expected: request.expected_digest,
-                current: descriptor.digest.clone(),
-            });
-        }
-        if let Some(previous) = active.digest_for(&descriptor.skill_id) {
-            return if previous == &descriptor.digest {
-                Ok(SkillActivationOutcome::AlreadyActive(descriptor.clone()))
-            } else {
-                Err(SkillRuntimeError::DigestChanged {
-                    name: descriptor.name.clone(),
-                })
-            };
-        }
-        if !descriptor.trust.permits_activation() && !self.policy.allow_untrusted_workspace {
-            return Err(SkillRuntimeError::Untrusted(descriptor.name.clone()));
-        }
-        if (!matches_constraint(
-            &descriptor.compatibility.operating_systems,
-            &self.host.operating_system,
-        ) || !matches_constraint(
-            &descriptor.compatibility.architectures,
-            &self.host.architecture,
-        )) && !self.policy.allow_incompatible
-        {
-            return Err(SkillRuntimeError::Incompatible(descriptor.name.clone()));
-        }
-        let missing_programs = descriptor
-            .compatibility
-            .required_programs
-            .difference(&self.host.available_programs)
-            .cloned()
-            .collect::<Vec<_>>();
-        let unsatisfied_program_groups = descriptor
-            .compatibility
-            .any_programs
-            .iter()
-            .filter(|group| group.is_disjoint(&self.host.available_programs))
-            .cloned()
-            .collect::<Vec<_>>();
-        let missing_environment = descriptor
-            .compatibility
-            .required_environment
-            .difference(&self.host.available_environment)
-            .cloned()
-            .collect::<Vec<_>>();
-        let missing_features = descriptor
-            .compatibility
-            .required_features
-            .difference(&self.host.available_features)
-            .cloned()
-            .collect::<Vec<_>>();
-        if !missing_programs.is_empty()
-            || !unsatisfied_program_groups.is_empty()
-            || !missing_environment.is_empty()
-            || !missing_features.is_empty()
-        {
-            return Err(SkillRuntimeError::MissingHostRequirements {
-                name: descriptor.name.clone(),
-                programs: missing_programs,
-                any_programs: unsatisfied_program_groups,
-                environment: missing_environment,
-                features: missing_features,
-            });
-        }
-        let missing_tools = descriptor
-            .dependencies
-            .tools
-            .difference(&self.host.available_tools)
-            .cloned()
-            .collect::<Vec<_>>();
-        let missing_mcp = descriptor
-            .dependencies
-            .mcp_servers
-            .difference(&self.host.available_mcp_servers)
-            .cloned()
-            .collect::<Vec<_>>();
-        if !missing_tools.is_empty() || !missing_mcp.is_empty() {
-            return Err(SkillRuntimeError::MissingDependencies {
-                name: descriptor.name.clone(),
-                tools: missing_tools,
-                mcp_servers: missing_mcp,
-            });
-        }
-        let activation = SkillActivation {
-            package: package.clone(),
-            reason: request.reason,
-        };
-        activation
-            .validate()
-            .map_err(|error| SkillRuntimeError::InvalidPackage(error.to_string()))?;
-        Ok(SkillActivationOutcome::Activated(activation))
-    }
-}
-
-fn matches_constraint(allowed: &BTreeSet<String>, observed: &str) -> bool {
-    allowed.is_empty()
-        || allowed
-            .iter()
-            .any(|value| value.eq_ignore_ascii_case(observed))
 }
 
 struct DiscoveredPackage {
@@ -504,7 +323,6 @@ fn parse_skill_file(path: &Path, root: &SkillRoot) -> Result<SkillPackage, Skill
             kind: root.source_kind,
             locator: path.to_string_lossy().to_string(),
         },
-        root.trust,
         parsed.compatibility,
         parsed.dependencies,
         body.trim(),
@@ -565,42 +383,12 @@ pub enum SkillRuntimeError {
     InvalidPackage(String),
     #[error("Skill conflict: {0}")]
     Conflict(String),
-    #[error("invalid Skill activation request: {0}")]
+    #[error("invalid Skill read request: {0}")]
     InvalidRequest(String),
     #[error("Skill not found: {0}")]
     NotFound(String),
-    #[error("Skill '{name}' digest mismatch (expected {expected}, current {current})")]
-    DigestMismatch {
-        name: String,
-        expected: Digest,
-        current: Digest,
-    },
-    #[error(
-        "Skill '{name}' changed digest and requires a new Host-confirmed replacement protocol"
-    )]
+    #[error("Skill '{name}' changed digest within one immutable catalog binding")]
     DigestChanged { name: String },
-    #[error("Skill is not trusted for activation: {0}")]
-    Untrusted(String),
-    #[error("Skill is incompatible with this Host: {0}")]
-    Incompatible(String),
-    #[error(
-        "Skill '{name}' dependencies are unavailable (tools={tools:?}, mcp_servers={mcp_servers:?})"
-    )]
-    MissingDependencies {
-        name: String,
-        tools: Vec<String>,
-        mcp_servers: Vec<String>,
-    },
-    #[error(
-        "Skill '{name}' Host requirements are unavailable (programs={programs:?}, any_programs={any_programs:?}, environment={environment:?}, features={features:?})"
-    )]
-    MissingHostRequirements {
-        name: String,
-        programs: Vec<String>,
-        any_programs: Vec<BTreeSet<String>>,
-        environment: Vec<String>,
-        features: Vec<String>,
-    },
 }
 
 #[cfg(test)]
@@ -646,33 +434,19 @@ mod tests {
             SkillRoot {
                 path: low.clone(),
                 source_kind: SkillSourceKind::Workspace,
-                trust: SkillTrustLevel::WorkspaceTrusted,
                 precedence: 10,
                 required: true,
             },
             SkillRoot {
                 path: high.clone(),
                 source_kind: SkillSourceKind::UserConfigured,
-                trust: SkillTrustLevel::UserTrusted,
                 precedence: 20,
                 required: true,
             },
         ];
-        let baseline = SkillRuntime::discover(
-            ResourceId::new("skills"),
-            &roots,
-            SkillHostProfile::current(),
-            SkillActivationPolicy::default(),
-        )
-        .unwrap();
+        let baseline = SkillRuntime::discover(ResourceId::new("skills"), &roots).unwrap();
         for _ in 0..1_000 {
-            let observed = SkillRuntime::discover(
-                ResourceId::new("skills"),
-                &roots,
-                SkillHostProfile::current(),
-                SkillActivationPolicy::default(),
-            )
-            .unwrap();
+            let observed = SkillRuntime::discover(ResourceId::new("skills"), &roots).unwrap();
             assert_eq!(baseline.catalog(), observed.catalog());
             assert_eq!(baseline.conflicts(), observed.conflicts());
         }
@@ -700,61 +474,21 @@ mod tests {
             &[SkillRoot {
                 path: root.clone(),
                 source_kind: SkillSourceKind::Workspace,
-                trust: SkillTrustLevel::WorkspaceTrusted,
                 precedence: 1,
                 required: true,
             }],
-            SkillHostProfile::current(),
-            SkillActivationPolicy::default(),
         );
         assert!(matches!(result, Err(SkillRuntimeError::Parse(_))));
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn untrusted_workspace_skill_cannot_activate_by_default() {
-        let package = SkillPackage::seal(
-            SkillId::new("demo"),
-            "demo",
-            "demo description",
-            None,
-            SkillSource {
-                kind: SkillSourceKind::Workspace,
-                locator: "/workspace/demo/SKILL.md".to_owned(),
-            },
-            SkillTrustLevel::WorkspaceUntrusted,
-            SkillCompatibility::default(),
-            SkillDependencies::default(),
-            "do the thing",
-        )
-        .unwrap();
-        let digest = package.descriptor.digest.clone();
-        let runtime = SkillRuntime::from_packages(
-            ResourceId::new("skills"),
-            vec![package],
-            SkillHostProfile::current(),
-            SkillActivationPolicy::default(),
-        )
-        .unwrap();
-        let result = runtime.activate(
-            SkillActivationRequest {
-                name: "demo".to_owned(),
-                expected_digest: digest,
-                reason: "task matches".to_owned(),
-            },
-            &ActivatedSkillSet::default(),
-        );
-        assert!(matches!(result, Err(SkillRuntimeError::Untrusted(_))));
-    }
-
-    #[test]
-    fn one_thousand_activations_are_complete_descriptor_only_and_never_expand_authority() {
+    fn one_thousand_loads_are_complete_descriptor_only_and_never_expand_authority() {
         for index in 0..1_000 {
             let name = format!("skill-{index}");
             let tool = format!("tool-{index}");
             let mcp_server = format!("mcp-{index}");
             let instructions = format!("FULL-INSTRUCTIONS-SENTINEL-{index}");
-            let reason = format!("activation-reason-{index}");
             let locator = format!("configured:/skills/{name}/SKILL.md");
             let package = SkillPackage::seal(
                 SkillId::new(&name),
@@ -765,25 +499,24 @@ mod tests {
                     kind: SkillSourceKind::UserConfigured,
                     locator: locator.clone(),
                 },
-                SkillTrustLevel::UserTrusted,
-                SkillCompatibility::default(),
+                SkillCompatibility {
+                    operating_systems: BTreeSet::from([format!("other-os-{index}")]),
+                    required_programs: BTreeSet::from([format!("missing-program-{index}")]),
+                    required_environment: BTreeSet::from([format!("MISSING_ENV_{index}")]),
+                    ..SkillCompatibility::default()
+                },
                 SkillDependencies {
-                    tools: BTreeSet::from([tool.clone()]),
-                    mcp_servers: BTreeSet::from([mcp_server.clone()]),
+                    tools: BTreeSet::from([tool]),
+                    mcp_servers: BTreeSet::from([mcp_server]),
                 },
                 &instructions,
             )
             .unwrap();
             let expected_digest = package.descriptor.digest.clone();
             let expected_skill_id = package.descriptor.skill_id.clone();
-            let mut host_profile = SkillHostProfile::current();
-            host_profile.available_tools.insert(tool);
-            host_profile.available_mcp_servers.insert(mcp_server);
             let runtime = SkillRuntime::from_packages(
                 ResourceId::new(format!("catalog-{index}")),
                 vec![package],
-                host_profile,
-                SkillActivationPolicy::default(),
             )
             .unwrap();
 
@@ -808,41 +541,29 @@ mod tests {
             let run_grant_before = run_grant.clone();
 
             let outcome = runtime
-                .activate(
-                    SkillActivationRequest {
-                        name: name.clone(),
-                        expected_digest: expected_digest.clone(),
-                        reason: reason.clone(),
-                    },
-                    &ActivatedSkillSet::default(),
-                )
+                .read_for_context(&name, &LoadedSkillSet::default())
                 .unwrap();
             assert_eq!(host_policy, host_policy_before);
             assert_eq!(run_grant, run_grant_before);
 
-            let SkillActivationOutcome::Activated(activation) = outcome else {
-                panic!("fresh Skill unexpectedly reported AlreadyActive");
+            let SkillLoadOutcome::Loaded(load) = outcome else {
+                panic!("fresh Skill unexpectedly reported AlreadyLoaded");
             };
-            assert_eq!(activation.package.descriptor.skill_id, expected_skill_id);
-            assert_eq!(activation.package.descriptor.source.locator, locator);
+            assert_eq!(load.package.descriptor.skill_id, expected_skill_id);
+            assert_eq!(load.package.descriptor.source.locator, locator);
             assert_eq!(
-                activation.package.descriptor.trust,
-                SkillTrustLevel::UserTrusted
-            );
-            assert_eq!(
-                activation.package.descriptor.version.as_deref(),
+                load.package.descriptor.version.as_deref(),
                 Some(format!("1.0.{index}").as_str())
             );
-            assert_eq!(activation.package.descriptor.digest, expected_digest);
-            assert_eq!(activation.reason, reason);
+            assert_eq!(load.package.descriptor.digest, expected_digest);
 
             let record = AgentSessionRecord::seal(
                 AgentSessionEventDraft {
-                    event_id: AgentSessionEventId::new(format!("skill-activated-{index}")),
+                    event_id: AgentSessionEventId::new(format!("skill-loaded-{index}")),
                     session_id: AgentSessionId::new(format!("session-{index}")),
                     run_id: RunId::new(format!("run-{index}")),
-                    payload: AgentSessionEvent::SkillActivated {
-                        activation: Box::new(activation),
+                    payload: AgentSessionEvent::SkillLoaded {
+                        load: Box::new(load),
                     },
                 },
                 1,
@@ -851,104 +572,37 @@ mod tests {
             record.validate().unwrap();
             assert!(matches!(
                 record.payload,
-                AgentSessionEvent::SkillActivated { .. }
+                AgentSessionEvent::SkillLoaded { .. }
             ));
         }
     }
 
     #[test]
-    fn one_thousand_variants_of_each_forbidden_activation_class_are_rejected() {
+    fn one_thousand_digest_changes_are_rejected_within_a_loaded_set() {
         for index in 0..1_000 {
             let name = format!("skill-{index}");
-            let untrusted = test_package(
-                &name,
-                SkillTrustLevel::WorkspaceUntrusted,
-                SkillCompatibility::default(),
-                "untrusted instructions",
-            );
-            let untrusted_digest = untrusted.descriptor.digest.clone();
-            let untrusted_runtime = SkillRuntime::from_packages(
-                ResourceId::new(format!("untrusted-catalog-{index}")),
-                vec![untrusted],
-                SkillHostProfile::current(),
-                SkillActivationPolicy::default(),
-            )
-            .unwrap();
-            assert!(matches!(
-                untrusted_runtime.activate(
-                    SkillActivationRequest {
-                        name: name.clone(),
-                        expected_digest: untrusted_digest,
-                        reason: "must remain denied".to_owned(),
-                    },
-                    &ActivatedSkillSet::default(),
-                ),
-                Err(SkillRuntimeError::Untrusted(_))
-            ));
-
-            let incompatible = test_package(
-                &name,
-                SkillTrustLevel::UserTrusted,
-                SkillCompatibility {
-                    operating_systems: BTreeSet::from([format!("unsupported-os-{index}")]),
-                    ..SkillCompatibility::default()
-                },
-                "incompatible instructions",
-            );
-            let incompatible_digest = incompatible.descriptor.digest.clone();
-            let incompatible_runtime = SkillRuntime::from_packages(
-                ResourceId::new(format!("incompatible-catalog-{index}")),
-                vec![incompatible],
-                SkillHostProfile::current(),
-                SkillActivationPolicy::default(),
-            )
-            .unwrap();
-            assert!(matches!(
-                incompatible_runtime.activate(
-                    SkillActivationRequest {
-                        name: name.clone(),
-                        expected_digest: incompatible_digest,
-                        reason: "must remain denied".to_owned(),
-                    },
-                    &ActivatedSkillSet::default(),
-                ),
-                Err(SkillRuntimeError::Incompatible(_))
-            ));
-
             let previous = test_package(
                 &name,
-                SkillTrustLevel::UserTrusted,
                 SkillCompatibility::default(),
                 "previous instructions",
             );
             let replacement = test_package(
                 &name,
-                SkillTrustLevel::UserTrusted,
                 SkillCompatibility::default(),
                 "replacement instructions",
             );
-            let mut active = ActivatedSkillSet::default();
-            active.by_id.insert(
+            let mut loaded = LoadedSkillSet::default();
+            loaded.by_id.insert(
                 previous.descriptor.skill_id.clone(),
                 previous.descriptor.digest,
             );
-            let replacement_digest = replacement.descriptor.digest.clone();
             let replacement_runtime = SkillRuntime::from_packages(
                 ResourceId::new(format!("replacement-catalog-{index}")),
                 vec![replacement],
-                SkillHostProfile::current(),
-                SkillActivationPolicy::default(),
             )
             .unwrap();
             assert!(matches!(
-                replacement_runtime.activate(
-                    SkillActivationRequest {
-                        name,
-                        expected_digest: replacement_digest,
-                        reason: "replacement was not confirmed".to_owned(),
-                    },
-                    &active,
-                ),
+                replacement_runtime.read_for_context(&name, &loaded),
                 Err(SkillRuntimeError::DigestChanged { .. })
             ));
         }
@@ -956,7 +610,6 @@ mod tests {
 
     fn test_package(
         name: &str,
-        trust: SkillTrustLevel,
         compatibility: SkillCompatibility,
         instructions: &str,
     ) -> SkillPackage {
@@ -966,14 +619,9 @@ mod tests {
             format!("{name} description"),
             Some("1.0.0".to_owned()),
             SkillSource {
-                kind: if trust == SkillTrustLevel::WorkspaceUntrusted {
-                    SkillSourceKind::Workspace
-                } else {
-                    SkillSourceKind::UserConfigured
-                },
+                kind: SkillSourceKind::Workspace,
                 locator: format!("configured:/skills/{name}/SKILL.md"),
             },
-            trust,
             compatibility,
             SkillDependencies::default(),
             instructions,

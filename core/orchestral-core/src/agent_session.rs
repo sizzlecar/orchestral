@@ -15,7 +15,7 @@ use crate::agent_protocol::wire::{AgentSessionId, ArtifactRefWithDigest, Digest,
 use crate::model_protocol::{
     ModelContent, ModelMessage, ModelRequestId, ModelRole, ModelToolCallId, ModelUsage,
 };
-use crate::skill_protocol::SkillActivation;
+use crate::skill_protocol::SkillLoad;
 use crate::tool_protocol::ToolCallId;
 
 macro_rules! string_id {
@@ -105,9 +105,9 @@ pub enum AgentSessionEvent {
         usage: Option<ModelUsage>,
     },
     /// A Skill is context data, not a Tool exchange. Persisting the immutable
-    /// package makes activation replay independent from a mutable filesystem.
-    SkillActivated {
-        activation: Box<SkillActivation>,
+    /// package makes replay independent from a mutable filesystem.
+    SkillLoaded {
+        load: Box<SkillLoad>,
     },
     CompactionCommitted {
         source: SessionSourceRange,
@@ -190,7 +190,7 @@ impl AgentSessionEvent {
                     ));
                 }
             }
-            Self::SkillActivated { activation } => activation
+            Self::SkillLoaded { load } => load
                 .validate()
                 .map_err(|error| AgentSessionError::InvalidEvent(error.to_string()))?,
             Self::CompactionCommitted {

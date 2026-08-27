@@ -61,22 +61,6 @@ pub struct SkillSource {
     pub locator: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum SkillTrustLevel {
-    BuiltIn,
-    UserTrusted,
-    WorkspaceTrusted,
-    WorkspaceUntrusted,
-}
-
-impl SkillTrustLevel {
-    pub fn permits_activation(self) -> bool {
-        !matches!(self, Self::WorkspaceUntrusted)
-    }
-}
-
 /// Compatibility is deliberately structured and closed in v1. Free-text
 /// compatibility cannot be verified and must be rejected by loaders.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,7 +102,6 @@ pub struct SkillDescriptor {
     pub version: Option<String>,
     pub digest: Digest,
     pub source: SkillSource,
-    pub trust: SkillTrustLevel,
     #[serde(default)]
     pub compatibility: SkillCompatibility,
     #[serde(default)]
@@ -140,7 +123,6 @@ struct SkillDigestView<'a> {
     description: &'a str,
     version: &'a Option<String>,
     source: &'a SkillSource,
-    trust: SkillTrustLevel,
     compatibility: &'a SkillCompatibility,
     dependencies: &'a SkillDependencies,
     instructions: &'a str,
@@ -154,7 +136,6 @@ impl SkillPackage {
         description: impl Into<String>,
         version: Option<String>,
         source: SkillSource,
-        trust: SkillTrustLevel,
         compatibility: SkillCompatibility,
         dependencies: SkillDependencies,
         instructions: impl Into<String>,
@@ -168,7 +149,6 @@ impl SkillPackage {
                 version,
                 digest: Digest::sha256([]),
                 source,
-                trust,
                 compatibility,
                 dependencies,
             },
@@ -187,7 +167,6 @@ impl SkillPackage {
             description: &self.descriptor.description,
             version: &self.descriptor.version,
             source: &self.descriptor.source,
-            trust: self.descriptor.trust,
             compatibility: &self.descriptor.compatibility,
             dependencies: &self.descriptor.dependencies,
             instructions: &self.instructions,
@@ -306,24 +285,17 @@ impl SkillCatalogDescriptor {
     }
 }
 
-/// Durable fact appended only after a package passes trust, compatibility,
-/// dependency, and digest checks.
+/// Durable fact recording the immutable Skill instructions loaded into model
+/// context. It carries no effect authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SkillActivation {
+pub struct SkillLoad {
     pub package: SkillPackage,
-    pub reason: String,
 }
 
-impl SkillActivation {
+impl SkillLoad {
     pub fn validate(&self) -> Result<(), SkillProtocolError> {
-        self.package.validate()?;
-        if self.reason.trim().is_empty() {
-            return Err(SkillProtocolError::Invalid(
-                "Skill activation reason must not be empty".to_owned(),
-            ));
-        }
-        Ok(())
+        self.package.validate()
     }
 }
 
@@ -356,7 +328,6 @@ mod tests {
                 kind: SkillSourceKind::UserConfigured,
                 locator: "/skills/xlsx/SKILL.md".to_owned(),
             },
-            SkillTrustLevel::UserTrusted,
             SkillCompatibility::default(),
             SkillDependencies::default(),
             instructions,
@@ -384,7 +355,6 @@ mod tests {
                 kind: SkillSourceKind::BuiltIn,
                 locator: "builtin:pdf".to_owned(),
             },
-            SkillTrustLevel::BuiltIn,
             SkillCompatibility::default(),
             SkillDependencies::default(),
             "pdf instructions",

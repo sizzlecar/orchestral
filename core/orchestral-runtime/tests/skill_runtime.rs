@@ -22,11 +22,11 @@ use orchestral_core::model_protocol::{
 };
 use orchestral_core::skill_protocol::{
     SkillCompatibility, SkillDependencies, SkillId, SkillPackage, SkillSource, SkillSourceKind,
-    SkillTrustLevel, SKILL_CATALOG_RESOURCE_KIND_V1,
+    SKILL_CATALOG_RESOURCE_KIND_V1,
 };
 use orchestral_runtime::{
     AgentController, GenericAgentConfig, InternalGenericAgentProvider, JsonSizeTokenMeter,
-    SkillActivationPolicy, SkillHostProfile, SkillRuntime,
+    SkillRuntime,
 };
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -34,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 const SKILL_FUNCTION: &str = "skill_read";
 const SECRET_INSTRUCTIONS: &str = "SECRET WORKFLOW: calculate twice, then verify the artifact.";
 
-struct SkillActivationModel {
+struct SkillLoadModel {
     rounds: AtomicUsize,
     digest: String,
 }
@@ -50,9 +50,9 @@ struct SkillVisibilityModel {
 }
 
 #[async_trait]
-impl ModelBackend for SkillActivationModel {
+impl ModelBackend for SkillLoadModel {
     fn descriptor(&self) -> ModelDescriptor {
-        function_capable_descriptor("skill-activation-model")
+        function_capable_descriptor("skill-load-model")
     }
 
     async fn start(
@@ -83,7 +83,7 @@ impl ModelBackend for SkillActivationModel {
                     event_id: ModelEventId::new("skill-call-start"),
                     sequence: 1,
                     payload: ModelEvent::ToolCallStart {
-                        call_id: ModelToolCallId::new("activate-xlsx"),
+                        call_id: ModelToolCallId::new("read-xlsx"),
                         name: SKILL_FUNCTION.to_owned(),
                         extensions: Default::default(),
                     },
@@ -93,7 +93,7 @@ impl ModelBackend for SkillActivationModel {
                     event_id: ModelEventId::new("skill-call-arguments"),
                     sequence: 2,
                     payload: ModelEvent::ToolCallArgumentsDelta {
-                        call_id: ModelToolCallId::new("activate-xlsx"),
+                        call_id: ModelToolCallId::new("read-xlsx"),
                         delta: arguments,
                     },
                 }),
@@ -102,7 +102,7 @@ impl ModelBackend for SkillActivationModel {
                     event_id: ModelEventId::new("skill-call-end"),
                     sequence: 3,
                     payload: ModelEvent::ToolCallEnd {
-                        call_id: ModelToolCallId::new("activate-xlsx"),
+                        call_id: ModelToolCallId::new("read-xlsx"),
                     },
                 }),
                 Ok(ModelStreamEvent {
@@ -190,15 +190,15 @@ impl ModelBackend for SkillVisibilityModel {
         let system = system_text(&request.messages);
         let descriptor_visible = system.contains("Spreadsheet workflow");
         let digest_visible = system.contains(&self.digest);
-        let activation_visible = request.tools.iter().any(|tool| tool.name == SKILL_FUNCTION);
+        let load_visible = request.tools.iter().any(|tool| tool.name == SKILL_FUNCTION);
         let instructions_visible = system.contains(SECRET_INSTRUCTIONS);
         if descriptor_visible != expect_bound
             || digest_visible != expect_bound
-            || activation_visible != expect_bound
+            || load_visible != expect_bound
             || instructions_visible
         {
             self.violations.lock().unwrap().push(format!(
-                "input={input} descriptor={descriptor_visible} digest={digest_visible} activation={activation_visible} instructions={instructions_visible}"
+                "input={input} descriptor={descriptor_visible} digest={digest_visible} load={load_visible} instructions={instructions_visible}"
             ));
         }
         self.starts.fetch_add(1, Ordering::SeqCst);
@@ -207,7 +207,7 @@ impl ModelBackend for SkillVisibilityModel {
 }
 
 #[tokio::test]
-async fn bound_skill_activates_into_context_and_replays_after_provider_restart() {
+async fn bound_skill_loads_into_context_and_replays_after_provider_restart() {
     let skills = Arc::new(skill_runtime());
     let digest = skills.catalog().skills[0].digest.clone();
     let journal = Arc::new(InMemoryAgentSessionJournalStore::default());
@@ -215,7 +215,7 @@ async fn bound_skill_activates_into_context_and_replays_after_provider_restart()
 
     let first_provider = Arc::new(
         InternalGenericAgentProvider::new_with_skills_and_session_journal(
-            Arc::new(SkillActivationModel {
+            Arc::new(SkillLoadModel {
                 rounds: AtomicUsize::new(0),
                 digest: digest.to_string(),
             }),
@@ -243,26 +243,18 @@ async fn bound_skill_activates_into_context_and_replays_after_provider_restart()
     assert_eq!(view.state.status(), AgentRunStatus::Delivered);
 
     let records = journal.load_session(&session_id).await.unwrap();
-    let activations = records
+    let loads = records
         .iter()
         .filter_map(|record| match &record.payload {
-            AgentSessionEvent::SkillActivated { activation } => Some(activation),
+            AgentSessionEvent::SkillLoaded { load } => Some(load),
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(activations.len(), 1);
-    let activation = activations[0];
-    assert_eq!(activation.package.descriptor.source.locator, "builtin:xlsx");
-    assert_eq!(
-        activation.package.descriptor.trust,
-        SkillTrustLevel::BuiltIn
-    );
-    assert_eq!(
-        activation.package.descriptor.version.as_deref(),
-        Some("1.0.0")
-    );
-    assert_eq!(activation.package.descriptor.digest, digest);
-    assert_eq!(activation.reason, "selected through skill_read");
+    assert_eq!(loads.len(), 1);
+    let load = loads[0];
+    assert_eq!(load.package.descriptor.source.locator, "builtin:xlsx");
+    assert_eq!(load.package.descriptor.version.as_deref(), Some("1.0.0"));
+    assert_eq!(load.package.descriptor.digest, digest);
 
     drop(first_controller);
     let unbound_provider = Arc::new(
@@ -346,7 +338,7 @@ async fn configured_but_unbound_skill_catalog_is_invisible_to_the_model() {
 }
 
 #[tokio::test]
-async fn one_thousand_run_bindings_never_leak_unactivated_skill_instructions() {
+async fn one_thousand_run_bindings_never_leak_unloaded_skill_instructions() {
     const CASES: usize = 1_000;
 
     let skills = Arc::new(skill_runtime());
@@ -435,19 +427,12 @@ fn skill_runtime() -> SkillRuntime {
             kind: SkillSourceKind::BuiltIn,
             locator: "builtin:xlsx".to_owned(),
         },
-        SkillTrustLevel::BuiltIn,
         SkillCompatibility::default(),
         SkillDependencies::default(),
         SECRET_INSTRUCTIONS,
     )
     .unwrap();
-    SkillRuntime::from_packages(
-        ResourceId::new("default-skills"),
-        vec![package],
-        SkillHostProfile::current(),
-        SkillActivationPolicy::default(),
-    )
-    .unwrap()
+    SkillRuntime::from_packages(ResourceId::new("default-skills"), vec![package]).unwrap()
 }
 
 fn bound_run(

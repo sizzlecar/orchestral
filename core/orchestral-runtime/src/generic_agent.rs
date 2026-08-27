@@ -41,7 +41,7 @@ use orchestral_core::model_protocol::{
     ModelMessage, ModelRequest, ModelRequestId, ModelRole, ModelToolCallId, ModelToolDefinition,
     ModelUsage,
 };
-use orchestral_core::skill_protocol::SkillActivation;
+use orchestral_core::skill_protocol::SkillLoad;
 use orchestral_core::tool_protocol::{
     ApprovalBinding, ApprovalCapability, RunToolGrant, ToolCallId, ToolInvocation, ToolOutcome,
     ToolOutput,
@@ -59,7 +59,7 @@ use crate::generic_agent_checkpoint::{
     GenericModelContextTrace, GenericModelObservation, GenericObservedToolCall,
     InMemoryGenericAgentCheckpointStore, StoredGenericAgentRun,
 };
-use crate::skill::{ActivatedSkillSet, SkillActivationOutcome, SkillRuntime};
+use crate::skill::{LoadedSkillSet, SkillLoadOutcome, SkillRuntime};
 use crate::tool_runtime::{AgentToolRuntime, GuardedToolResult, ToolRuntimeError};
 use crate::workflow_strategy::{WorkflowExecutionRequest, WorkflowExecutionStrategy};
 use crate::{
@@ -568,7 +568,7 @@ impl InternalGenericAgentProvider {
     }
 
     /// Enables the independent Skill Context Plane. The catalog must still be
-    /// bound into each Run before descriptors or activation are visible.
+    /// bound into each Run before descriptors or loading are visible.
     pub fn new_with_skills_and_session_journal(
         backend: Arc<dyn ModelBackend>,
         config: GenericAgentConfig,
@@ -1912,7 +1912,7 @@ fn stage_skill_recovery(
     }) {
         return Err(AgentProtocolError::new(
             AgentProtocolErrorCode::InvalidDigest,
-            "recovered Skill activation crossed an interaction boundary",
+            "recovered Skill load crossed an interaction boundary",
         ));
     }
     stage_loop_recovery(
@@ -2959,7 +2959,7 @@ fn stage_loop_recovery(
                 arguments,
             )
             .await?;
-            if prepared.activation_committed {
+            if prepared.load_committed {
                 let context_message =
                     prepared
                         .observation
@@ -2968,7 +2968,7 @@ fn stage_loop_recovery(
                         .ok_or_else(|| {
                             AgentProtocolError::new(
                                 AgentProtocolErrorCode::InvalidDigest,
-                                "recovered Skill activation has no immutable context message",
+                                "recovered Skill load has no immutable context message",
                             )
                         })?;
                 if model_messages
@@ -2979,7 +2979,7 @@ fn stage_loop_recovery(
                 {
                     return Err(AgentProtocolError::new(
                         AgentProtocolErrorCode::InvalidDigest,
-                        "recovered Skill activation is not uniquely projected into context",
+                        "recovered Skill load is not uniquely projected into context",
                     ));
                 }
             }
@@ -3034,7 +3034,7 @@ fn stage_loop_recovery(
                 ));
             }
             session_exchange_committed = prepared.exchange_record.is_some();
-            if prepared.activation_committed {
+            if prepared.load_committed {
                 *recovered_observation = Some(prepared.observation);
             }
         }
@@ -5367,7 +5367,7 @@ async fn resume_observed_skill(
                 &user_message,
                 agent_failure(
                     "skill_catalog_unavailable",
-                    "recovered Skill activation has no bound Skill catalog",
+                    "recovered Skill load has no bound Skill catalog",
                     false,
                 ),
             );
@@ -6044,7 +6044,7 @@ async fn recovered_tool_exchange_committed(
 
 struct RecoveredSkillPreparation {
     observation: SkillCallObservation,
-    activation_committed: bool,
+    load_committed: bool,
     exchange_record: Option<AgentSessionRecord>,
     prior_session_seq: Option<u64>,
 }
@@ -6065,38 +6065,37 @@ async fn prepare_recovered_skill(
         .load_session(&request.run.spec.session_id)
         .await
         .map_err(|error| session_context_recovery_error(SessionContextError::Journal(error)))?;
-    let expected_activation_id =
-        skill_activation_event_id(&request.run.spec.run_id, round, &call.call_id);
-    let activation_record = records
+    let expected_load_id = skill_load_event_id(&request.run.spec.run_id, round, &call.call_id);
+    let load_record = records
         .iter()
-        .find(|record| record.event_id == expected_activation_id)
+        .find(|record| record.event_id == expected_load_id)
         .cloned();
-    if activation_record.as_ref().is_some_and(|record| {
+    if load_record.as_ref().is_some_and(|record| {
         record.run_id != request.run.spec.run_id
             || record.session_id != request.run.spec.session_id
-            || !matches!(record.payload, AgentSessionEvent::SkillActivated { .. })
+            || !matches!(record.payload, AgentSessionEvent::SkillLoaded { .. })
     }) {
         return Err(AgentProtocolError::new(
             AgentProtocolErrorCode::InvalidDigest,
-            "recovered Skill activation event crossed its Run or has the wrong shape",
+            "recovered Skill load event crossed its Run or has the wrong shape",
         ));
     }
     let exchange_record =
         recovered_tool_exchange_record_from(&records, request, round, request_id)?;
-    if activation_record
+    if load_record
         .as_ref()
         .zip(exchange_record.as_ref())
-        .is_some_and(|(activation, exchange)| activation.session_seq >= exchange.session_seq)
+        .is_some_and(|(load, exchange)| load.session_seq >= exchange.session_seq)
     {
         return Err(AgentProtocolError::new(
             AgentProtocolErrorCode::InvalidDigest,
-            "recovered Skill activation was not committed before its Tool exchange",
+            "recovered Skill load was not committed before its Tool exchange",
         ));
     }
     let final_outcome_seq = exchange_record
         .as_ref()
         .map(|record| record.session_seq)
-        .or_else(|| activation_record.as_ref().map(|record| record.session_seq));
+        .or_else(|| load_record.as_ref().map(|record| record.session_seq));
     if final_outcome_seq.is_some_and(|sequence| {
         records
             .last()
@@ -6107,7 +6106,7 @@ async fn prepare_recovered_skill(
             "recovered Skill outcome is not the final Session record",
         ));
     }
-    let first_outcome_seq = activation_record
+    let first_outcome_seq = load_record
         .as_ref()
         .map(|record| record.session_seq)
         .into_iter()
@@ -6118,31 +6117,31 @@ async fn prepare_recovered_skill(
         .filter(|record| first_outcome_seq.is_none_or(|first| record.session_seq < first))
         .cloned()
         .collect::<Vec<_>>();
-    let active = ActivatedSkillSet::replay(&prior_records).map_err(|error| {
+    let loaded = LoadedSkillSet::replay(&prior_records).map_err(|error| {
         AgentProtocolError::new(
             AgentProtocolErrorCode::InvalidDigest,
             format!("recovered Skill state is invalid: {error}"),
         )
     })?;
-    let evaluation = evaluate_skill_read(skills, arguments.clone(), &active);
-    match (&activation_record, &evaluation.activation) {
+    let evaluation = evaluate_skill_read(skills, arguments.clone(), &loaded);
+    match (&load_record, &evaluation.load) {
         (
             Some(AgentSessionRecord {
-                payload: AgentSessionEvent::SkillActivated { activation },
+                payload: AgentSessionEvent::SkillLoaded { load },
                 ..
             }),
             Some(expected),
-        ) if activation.as_ref() == expected => {}
+        ) if load.as_ref() == expected => {}
         (Some(_), _) => {
             return Err(AgentProtocolError::new(
                 AgentProtocolErrorCode::InvalidDigest,
-                "recovered Skill activation differs from the observed model call",
+                "recovered Skill load differs from the observed model call",
             ))
         }
         (None, Some(_)) if exchange_record.is_some() => {
             return Err(AgentProtocolError::new(
                 AgentProtocolErrorCode::InvalidDigest,
-                "recovered Skill Tool exchange is missing its activation event",
+                "recovered Skill Tool exchange is missing its load event",
             ))
         }
         _ => {}
@@ -6165,13 +6164,13 @@ async fn prepare_recovered_skill(
         if record.payload != expected {
             return Err(AgentProtocolError::new(
                 AgentProtocolErrorCode::InvalidDigest,
-                "recovered Skill Tool exchange differs from its activation outcome",
+                "recovered Skill Tool exchange differs from its load outcome",
             ));
         }
     }
     Ok(RecoveredSkillPreparation {
         observation: evaluation.observation,
-        activation_committed: activation_record.is_some(),
+        load_committed: load_record.is_some(),
         exchange_record,
         prior_session_seq: first_outcome_seq.map(|sequence| sequence.saturating_sub(1)),
     })
@@ -6998,9 +6997,9 @@ struct SkillCallObservation {
     context_message: Option<ModelMessage>,
 }
 
-struct SkillActivationEvaluation {
+struct SkillReadEvaluation {
     observation: SkillCallObservation,
-    activation: Option<SkillActivation>,
+    load: Option<SkillLoad>,
 }
 
 #[derive(Deserialize)]
@@ -7022,18 +7021,18 @@ async fn execute_skill_read(
         .load_session(&request.run.spec.session_id)
         .await
         .map_err(session_journal_failure)?;
-    let active = ActivatedSkillSet::replay(&records)
+    let loaded = LoadedSkillSet::replay(&records)
         .map_err(|error| agent_failure("skill_session_state", error.to_string(), false))?;
-    let evaluation = evaluate_skill_read(skills, arguments, &active);
-    if let Some(activation) = evaluation.activation {
+    let evaluation = evaluate_skill_read(skills, arguments, &loaded);
+    if let Some(load) = evaluation.load {
         append_session_event(
             inner,
             AgentSessionEventDraft {
-                event_id: skill_activation_event_id(&request.run.spec.run_id, round, call_id),
+                event_id: skill_load_event_id(&request.run.spec.run_id, round, call_id),
                 session_id: request.run.spec.session_id.clone(),
                 run_id: request.run.spec.run_id.clone(),
-                payload: AgentSessionEvent::SkillActivated {
-                    activation: Box::new(activation),
+                payload: AgentSessionEvent::SkillLoaded {
+                    load: Box::new(load),
                 },
             },
         )
@@ -7042,7 +7041,7 @@ async fn execute_skill_read(
     Ok(evaluation.observation)
 }
 
-fn skill_activation_event_id(
+fn skill_load_event_id(
     run_id: &RunId,
     round: u64,
     call_id: &ModelToolCallId,
@@ -7058,12 +7057,12 @@ fn skill_activation_event_id(
 fn evaluate_skill_read(
     skills: &SkillRuntime,
     arguments: serde_json::Value,
-    active: &ActivatedSkillSet,
-) -> SkillActivationEvaluation {
+    loaded: &LoadedSkillSet,
+) -> SkillReadEvaluation {
     let parsed = match serde_json::from_value::<SkillReadArguments>(arguments) {
         Ok(parsed) => parsed,
         Err(error) => {
-            return SkillActivationEvaluation {
+            return SkillReadEvaluation {
                 observation: SkillCallObservation {
                     result: serde_json::json!({
                         "code": "skill_read_arguments_invalid",
@@ -7072,14 +7071,14 @@ fn evaluate_skill_read(
                     is_error: true,
                     context_message: None,
                 },
-                activation: None,
+                load: None,
             }
         }
     };
-    match skills.read_for_context(&parsed.name, active) {
-        Ok(SkillActivationOutcome::Activated(activation)) => {
-            let descriptor = &activation.package.descriptor;
-            SkillActivationEvaluation {
+    match skills.read_for_context(&parsed.name, loaded) {
+        Ok(SkillLoadOutcome::Loaded(load)) => {
+            let descriptor = &load.package.descriptor;
+            SkillReadEvaluation {
                 observation: SkillCallObservation {
                     result: serde_json::json!({
                         "status": "loaded",
@@ -7088,17 +7087,14 @@ fn evaluate_skill_read(
                         "version": descriptor.version,
                         "digest": descriptor.digest,
                         "source": descriptor.source,
-                        "trust": descriptor.trust,
                     }),
                     is_error: false,
-                    context_message: Some(crate::session_context::skill_activation_message(
-                        &activation,
-                    )),
+                    context_message: Some(crate::session_context::skill_load_message(&load)),
                 },
-                activation: Some(activation),
+                load: Some(load),
             }
         }
-        Ok(SkillActivationOutcome::AlreadyActive(descriptor)) => SkillActivationEvaluation {
+        Ok(SkillLoadOutcome::AlreadyLoaded(descriptor)) => SkillReadEvaluation {
             observation: SkillCallObservation {
                 result: serde_json::json!({
                     "status": "already_loaded",
@@ -7109,9 +7105,9 @@ fn evaluate_skill_read(
                 is_error: false,
                 context_message: None,
             },
-            activation: None,
+            load: None,
         },
-        Err(error) => SkillActivationEvaluation {
+        Err(error) => SkillReadEvaluation {
             observation: SkillCallObservation {
                 result: serde_json::json!({
                     "code": "skill_read_failed",
@@ -7120,7 +7116,7 @@ fn evaluate_skill_read(
                 is_error: true,
                 context_message: None,
             },
-            activation: None,
+            load: None,
         },
     }
 }

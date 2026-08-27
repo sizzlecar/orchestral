@@ -76,9 +76,6 @@ fn validate_config(config: &OrchestralConfig) -> Result<(), ConfigError> {
     }
     validate_providers(config)?;
     validate_mcp(config)?;
-    if config.skills.enabled && config.skills.max_active_skills == 0 {
-        return invalid("skills.max_active_skills must be positive");
-    }
     Ok(())
 }
 

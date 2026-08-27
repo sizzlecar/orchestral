@@ -278,10 +278,7 @@ mcp:
 skills:
   enabled: true
   auto_discover: true
-  max_active_skills: 3
   directories: []
-  trust_workspace: false
-  allow_incompatible: false
 
 journal:
   backend: filesystem
