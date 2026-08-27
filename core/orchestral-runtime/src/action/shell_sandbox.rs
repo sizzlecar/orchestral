@@ -413,7 +413,7 @@ fn push_bwrap_bind(args: &mut Vec<String>, operation: &str, path: &Path) {
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn run_sandboxed(command: SandboxedCommand, cwd: &Path) -> std::process::Output {
         let mut process = std::process::Command::new(command.program);
         process
@@ -424,7 +424,7 @@ mod tests {
         process.output().unwrap()
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn isolated_test_roots(label: &str) -> (PathBuf, PathBuf, PathBuf) {
         let parent = std::env::temp_dir().join(format!(
             "orchestral-sandbox-{label}-{}",
@@ -594,5 +594,39 @@ mod tests {
         assert!(!args
             .windows(3)
             .any(|window| { window[0] == "--ro-bind" && window[1] == "/" && window[2] == "/" }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_executes_one_allowlisted_program() {
+        let (parent, workspace, _) = isolated_test_roots("linux-exec");
+        let output_path = workspace.join("sandbox-output.txt");
+        let program = std::fs::canonicalize("/bin/bash").unwrap();
+        let command = sandbox_command(
+            program.to_string_lossy().into_owned(),
+            vec![
+                "--noprofile".to_owned(),
+                "--norc".to_owned(),
+                "-c".to_owned(),
+                format!("printf sandbox-ok > '{}'", output_path.display()),
+            ],
+            &workspace,
+            &ShellSandboxPolicy {
+                readable_roots: vec![workspace.clone()],
+                writable_roots: vec![workspace.clone()],
+                allowed_programs: vec![program],
+                linux_bwrap_path: None,
+            },
+        )
+        .unwrap();
+        let output = run_sandboxed(command, &workspace);
+        assert!(
+            output.status.success(),
+            "bubblewrap execution failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(output_path).unwrap(), "sandbox-ok");
+        std::fs::remove_dir_all(parent).unwrap();
     }
 }
