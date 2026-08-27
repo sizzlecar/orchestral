@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use orchestral_core::agent_protocol::wire::RunId;
@@ -553,6 +553,303 @@ async fn guarded_shell_executes_only_after_exact_approval_inside_the_host_sandbo
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
+async fn one_thousand_guarded_shell_wait_cancellations_reap_processes_with_subsecond_p99() {
+    const CANCELLATION_CASES: usize = 1_000;
+
+    let parent = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!("orchestral-shell-cancel-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&parent).unwrap();
+    let workspace = std::fs::canonicalize(parent).unwrap();
+    let marker = workspace.join("started.log");
+    let pid_file = workspace.join("pid");
+    let workspace_string = workspace.to_string_lossy().into_owned();
+    let executable = std::fs::canonicalize("/bin/bash")
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let bounds = ToolPolicyBounds {
+        allowed_effects: effects(&[
+            EffectScope::Process,
+            EffectScope::FilesystemRead,
+            EffectScope::FilesystemWrite,
+            EffectScope::EnvironmentRead,
+            EffectScope::ExternalSideEffect,
+        ]),
+        approval: ApprovalPolicy::Required,
+        sandbox: SandboxPolicy {
+            required: true,
+            allowed_profiles: strings(&[GUARDED_SHELL_SANDBOX_PROFILE]),
+        },
+        process: ProcessPolicy {
+            allowed_programs: BTreeSet::from([executable.clone()]),
+            allow_shell_expression: false,
+        },
+        filesystem: FilesystemPolicy {
+            readable_roots: strings(&[workspace_string.as_str()]),
+            writable_roots: strings(&[workspace_string.as_str()]),
+        },
+        network: NetworkPolicy::default(),
+        environment: EnvironmentPolicy::default(),
+        allowed_credentials: BTreeSet::new(),
+        max_timeout_ms: Some(60_000),
+        max_output_bytes: Some(4 * 1024),
+    };
+    let runtime = Arc::new(runtime(bounds.clone()));
+    runtime
+        .register(
+            guarded_shell_descriptor(ToolRestriction {
+                bounds: bounds.clone(),
+            }),
+            Arc::new(GuardedShellExecutor),
+        )
+        .unwrap();
+    let script = format!(
+        "printf '%s' \"$$\" > '{}'; printf x >> '{}'; while :; do :; done",
+        pid_file.display(),
+        marker.display()
+    );
+    let mut latencies = Vec::with_capacity(CANCELLATION_CASES);
+    for index in 0..CANCELLATION_CASES {
+        let invocation = ToolInvocation {
+            run_id: RunId::new("shell-cancel-run"),
+            call_id: ToolCallId::new(format!("shell-cancel-{index}")),
+            tool_id: ToolId::new("orchestral/shell_exec/v1"),
+            arguments: json!({
+                "command": executable,
+                "args": ["--noprofile", "--norc", "-c", script]
+            }),
+        };
+        let GuardedToolResult::ApprovalRequired { binding, .. } = runtime
+            .invoke(
+                invocation.clone(),
+                RunToolGrant {
+                    bounds: bounds.clone(),
+                },
+                None,
+                CancellationToken::new(),
+            )
+            .await
+        else {
+            panic!("Shell cancellation gate requires exact Host approval")
+        };
+        let capability = HostApprovalIssuer::new(SIGNING_KEY)
+            .unwrap()
+            .issue(binding, i64::MAX)
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        let task = {
+            let runtime = runtime.clone();
+            let bounds = bounds.clone();
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move {
+                runtime
+                    .invoke(
+                        invocation,
+                        RunToolGrant { bounds },
+                        Some(capability),
+                        cancellation,
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if std::fs::metadata(&marker)
+                    .map(|metadata| metadata.len() >= (index + 1) as u64)
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("sandboxed Shell reaches its wait boundary");
+
+        let cancelled_at = Instant::now();
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("Shell cancellation finishes within one second")
+            .unwrap();
+        latencies.push(cancelled_at.elapsed());
+        assert!(matches!(
+            result,
+            GuardedToolResult::Outcome {
+                outcome: ToolOutcome::UnknownEffect { .. },
+                cached: false,
+            }
+        ));
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        // SAFETY: signal 0 performs a read-only process existence check.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    }
+    latencies.sort_unstable();
+    let p99 = latencies[(CANCELLATION_CASES * 99 / 100).saturating_sub(1)];
+    assert!(
+        p99 <= Duration::from_secs(1),
+        "Shell cancel p99 was {p99:?}"
+    );
+
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn one_thousand_guarded_shell_read_cancellations_reap_pipe_holders_with_subsecond_p99() {
+    const CANCELLATION_CASES: usize = 1_000;
+
+    let parent = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!("orchestral-shell-read-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&parent).unwrap();
+    let workspace = std::fs::canonicalize(parent).unwrap();
+    let marker = workspace.join("pipe-holder-started.log");
+    let pid_file = workspace.join("pipe-holder-pid");
+    let workspace_string = workspace.to_string_lossy().into_owned();
+    let executable = std::fs::canonicalize("/bin/bash")
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let bounds = ToolPolicyBounds {
+        allowed_effects: effects(&[
+            EffectScope::Process,
+            EffectScope::FilesystemRead,
+            EffectScope::FilesystemWrite,
+            EffectScope::EnvironmentRead,
+            EffectScope::ExternalSideEffect,
+        ]),
+        approval: ApprovalPolicy::Required,
+        sandbox: SandboxPolicy {
+            required: true,
+            allowed_profiles: strings(&[GUARDED_SHELL_SANDBOX_PROFILE]),
+        },
+        process: ProcessPolicy {
+            allowed_programs: BTreeSet::from([executable.clone()]),
+            allow_shell_expression: false,
+        },
+        filesystem: FilesystemPolicy {
+            readable_roots: strings(&[workspace_string.as_str()]),
+            writable_roots: strings(&[workspace_string.as_str()]),
+        },
+        network: NetworkPolicy::default(),
+        environment: EnvironmentPolicy::default(),
+        allowed_credentials: BTreeSet::new(),
+        max_timeout_ms: Some(60_000),
+        max_output_bytes: Some(4 * 1024),
+    };
+    let runtime = Arc::new(runtime(bounds.clone()));
+    runtime
+        .register(
+            guarded_shell_descriptor(ToolRestriction {
+                bounds: bounds.clone(),
+            }),
+            Arc::new(GuardedShellExecutor),
+        )
+        .unwrap();
+    let script = format!(
+        "(trap '' HUP; while :; do :; done) & child=$!; printf '%s' \"$child\" > '{}'; printf x >> '{}'; exit 0",
+        pid_file.display(),
+        marker.display()
+    );
+    let mut latencies = Vec::with_capacity(CANCELLATION_CASES);
+    for index in 0..CANCELLATION_CASES {
+        let invocation = ToolInvocation {
+            run_id: RunId::new("shell-read-cancel-run"),
+            call_id: ToolCallId::new(format!("shell-read-cancel-{index}")),
+            tool_id: ToolId::new("orchestral/shell_exec/v1"),
+            arguments: json!({
+                "command": executable,
+                "args": ["--noprofile", "--norc", "-c", script]
+            }),
+        };
+        let GuardedToolResult::ApprovalRequired { binding, .. } = runtime
+            .invoke(
+                invocation.clone(),
+                RunToolGrant {
+                    bounds: bounds.clone(),
+                },
+                None,
+                CancellationToken::new(),
+            )
+            .await
+        else {
+            panic!("Shell read cancellation gate requires exact Host approval")
+        };
+        let capability = HostApprovalIssuer::new(SIGNING_KEY)
+            .unwrap()
+            .issue(binding, i64::MAX)
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        let task = {
+            let runtime = runtime.clone();
+            let bounds = bounds.clone();
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move {
+                runtime
+                    .invoke(
+                        invocation,
+                        RunToolGrant { bounds },
+                        Some(capability),
+                        cancellation,
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if std::fs::metadata(&marker)
+                    .map(|metadata| metadata.len() >= (index + 1) as u64)
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background pipe holder reaches the Shell read boundary");
+
+        let cancelled_at = Instant::now();
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("Shell pipe read cancellation finishes within one second")
+            .unwrap();
+        latencies.push(cancelled_at.elapsed());
+        assert!(
+            matches!(
+                &result,
+                GuardedToolResult::Outcome {
+                    outcome: ToolOutcome::UnknownEffect { .. },
+                    cached: false,
+                }
+            ),
+            "unexpected Shell read cancellation result: {result:?}"
+        );
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        // SAFETY: signal 0 performs a read-only process existence check.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    }
+    latencies.sort_unstable();
+    let p99 = latencies[(CANCELLATION_CASES * 99 / 100).saturating_sub(1)];
+    assert!(
+        p99 <= Duration::from_secs(1),
+        "Shell read cancel p99 was {p99:?}"
+    );
+
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
 async fn guarded_pty_tools_are_run_scoped_and_cancel_closes_the_process() {
     let workspace = std::fs::canonicalize(std::env::current_dir().unwrap())
         .unwrap()
@@ -768,6 +1065,153 @@ async fn guarded_pty_tools_are_run_scoped_and_cancel_closes_the_process() {
     })
     .await
     .expect("Run cancellation closes owned PTY processes");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn one_thousand_guarded_pty_reads_outside_host_roots_leak_zero_secrets() {
+    const ATTEMPTS: usize = 1_000;
+
+    let parent = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!("orchestral-pty-secret-{}", uuid::Uuid::new_v4()));
+    let workspace = parent.join("workspace");
+    let outside = parent.join("outside");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let parent = std::fs::canonicalize(parent).unwrap();
+    let workspace = std::fs::canonicalize(workspace).unwrap();
+    let outside = std::fs::canonicalize(outside).unwrap();
+    let mut paths = Vec::with_capacity(ATTEMPTS);
+    for index in 0..ATTEMPTS {
+        let path = outside.join(format!("secret-{index}.txt"));
+        std::fs::write(&path, format!("ORCHESTRAL_PTY_SENTINEL_SECRET_{index}")).unwrap();
+        paths.push(path.to_string_lossy().into_owned());
+    }
+
+    let executable = std::fs::canonicalize("/bin/cat")
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let workspace_string = workspace.to_string_lossy().into_owned();
+    let bounds = ToolPolicyBounds {
+        allowed_effects: effects(&[
+            EffectScope::Process,
+            EffectScope::FilesystemRead,
+            EffectScope::FilesystemWrite,
+            EffectScope::EnvironmentRead,
+            EffectScope::ExternalSideEffect,
+        ]),
+        approval: ApprovalPolicy::NotRequired,
+        sandbox: SandboxPolicy {
+            required: true,
+            allowed_profiles: strings(&[GUARDED_PTY_SANDBOX_PROFILE]),
+        },
+        process: ProcessPolicy {
+            allowed_programs: BTreeSet::from([executable.clone()]),
+            allow_shell_expression: false,
+        },
+        filesystem: FilesystemPolicy {
+            readable_roots: strings(&[&workspace_string]),
+            writable_roots: strings(&[&workspace_string]),
+        },
+        network: NetworkPolicy::default(),
+        environment: EnvironmentPolicy::default(),
+        allowed_credentials: BTreeSet::new(),
+        max_timeout_ms: Some(3_000),
+        max_output_bytes: Some(512 * 1024),
+    };
+    let runtime = runtime(bounds.clone());
+    let manager = Arc::new(PtyProcessManager::new(512 * 1024, Duration::from_secs(30)).unwrap());
+    runtime
+        .register(
+            guarded_pty_create_descriptor(ToolRestriction {
+                bounds: bounds.clone(),
+            }),
+            Arc::new(GuardedPtyCreateExecutor::new(manager.clone())),
+        )
+        .unwrap();
+    runtime
+        .register(
+            guarded_pty_read_descriptor(ToolRestriction {
+                bounds: bounds.clone(),
+            }),
+            Arc::new(GuardedPtyReadExecutor::new(manager.clone())),
+        )
+        .unwrap();
+
+    let create = ToolInvocation {
+        run_id: RunId::new("pty-secret-run"),
+        call_id: ToolCallId::new("pty-secret-create"),
+        tool_id: ToolId::new("orchestral/pty_create/v1"),
+        arguments: json!({ "command": executable, "args": paths }),
+    };
+    let GuardedToolResult::ApprovalRequired { binding, .. } = runtime
+        .invoke(
+            create.clone(),
+            RunToolGrant {
+                bounds: bounds.clone(),
+            },
+            None,
+            CancellationToken::new(),
+        )
+        .await
+    else {
+        panic!("PTY secret gate must pass through exact Host approval")
+    };
+    let capability = HostApprovalIssuer::new(SIGNING_KEY)
+        .unwrap()
+        .issue(binding, i64::MAX)
+        .unwrap();
+    assert!(matches!(
+        runtime
+            .invoke(
+                create,
+                RunToolGrant {
+                    bounds: bounds.clone(),
+                },
+                Some(capability),
+                CancellationToken::new(),
+            )
+            .await,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Completed { .. },
+            ..
+        }
+    ));
+
+    let read = runtime
+        .invoke(
+            ToolInvocation {
+                run_id: RunId::new("pty-secret-run"),
+                call_id: ToolCallId::new("pty-secret-read"),
+                tool_id: ToolId::new("orchestral/pty_read/v1"),
+                arguments: json!({
+                    "process_id": "pty:pty-secret-create",
+                    "timeout_ms": 2_000,
+                    "settle_ms": 50
+                }),
+            },
+            RunToolGrant { bounds },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(
+        read,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Completed { output: ToolOutput::Inline(ref output) },
+            ..
+        } if output["output"]
+            .as_str()
+            .is_some_and(|value| !value.contains("ORCHESTRAL_PTY_SENTINEL_SECRET_"))
+    ));
+
+    let _ = manager.close(
+        &RunId::new("pty-secret-run"),
+        &orchestral_runtime::PtyProcessId::new("pty:pty-secret-create").unwrap(),
+    );
+    std::fs::remove_dir_all(parent).unwrap();
 }
 
 #[tokio::test]

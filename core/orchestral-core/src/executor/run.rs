@@ -320,6 +320,9 @@ impl Executor {
         let mut current_execution_id = execution_id.to_string();
 
         loop {
+            if ctx.cancellation_token.is_cancelled() {
+                return StepOutcome::error("workflow execution cancelled before Step dispatch");
+            }
             let attempt = retries_used.saturating_add(1);
             let result = self
                 .execute_step_data(step, &current_execution_id, attempt, ctx)
@@ -372,7 +375,15 @@ impl Executor {
             .await;
 
             if !delay.is_zero() {
-                sleep(delay).await;
+                tokio::select! {
+                    biased;
+                    _ = ctx.cancellation_token.cancelled() => {
+                        return StepOutcome::error(
+                            "workflow execution cancelled during retry backoff",
+                        );
+                    }
+                    _ = sleep(delay) => {}
+                }
             }
             retries_used = next_attempt;
             current_execution_id = uuid::Uuid::new_v4().to_string();
@@ -475,5 +486,103 @@ impl Executor {
                 ctx,
             )
             .await
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Instant;
+    use tokio::sync::RwLock;
+    use tokio_util::sync::CancellationToken;
+
+    use crate::executor::StepExecutionPort;
+    use crate::types::WorkflowId;
+    use crate::workflow_state::WorkingSet;
+
+    const CANCELLATION_CASES: usize = 1_000;
+
+    struct AlwaysRetryPort {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl StepExecutionPort for AlwaysRetryPort {
+        async fn execute_step(
+            &self,
+            _request: StepExecutionRequest,
+            _ctx: &ExecutorContext,
+        ) -> StepOutcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            StepOutcome::retryable("retry later", Some(Duration::from_secs(60)), 1)
+        }
+    }
+
+    #[tokio::test]
+    async fn one_thousand_retry_backoff_cancellations_dispatch_no_new_attempt_and_finish_under_one_second(
+    ) {
+        let port = Arc::new(AlwaysRetryPort {
+            calls: AtomicUsize::new(0),
+        });
+        let cancellation = CancellationToken::new();
+        let context = Arc::new(
+            ExecutorContext::new(
+                WorkflowId::new("retry-cancel-workflow"),
+                Arc::new(RwLock::new(WorkingSet::new())),
+                port.clone(),
+            )
+            .with_cancellation_token(cancellation.clone()),
+        );
+        let executor = Arc::new(Executor::new().with_retry_policy(
+            3,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        ));
+        let step = Step::action("retry-cancel-step", "retry");
+        let mut tasks = Vec::with_capacity(CANCELLATION_CASES);
+        for index in 0..CANCELLATION_CASES {
+            let executor = executor.clone();
+            let context = context.clone();
+            let step = step.clone();
+            tasks.push(tokio::spawn(async move {
+                let outcome = executor
+                    .execute_step_with_retry(&step, &format!("execution-{index}"), &context)
+                    .await;
+                (outcome, Instant::now())
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while port.calls.load(Ordering::SeqCst) != CANCELLATION_CASES {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all retry waits are reached before cancellation");
+
+        let cancelled_at = Instant::now();
+        cancellation.cancel();
+        let completed = tokio::time::timeout(
+            Duration::from_secs(1),
+            futures_util::future::join_all(tasks),
+        )
+        .await
+        .expect("all retry waits observe cancellation within one second");
+        let mut latencies = Vec::with_capacity(CANCELLATION_CASES);
+        for result in completed {
+            let (outcome, finished_at) = result.unwrap();
+            assert!(matches!(
+                outcome,
+                StepOutcome::Error { ref message }
+                    if message == "workflow execution cancelled during retry backoff"
+            ));
+            latencies.push(finished_at.duration_since(cancelled_at));
+        }
+        latencies.sort_unstable();
+        let p99 = latencies[(CANCELLATION_CASES * 99 / 100).saturating_sub(1)];
+        assert!(p99 <= Duration::from_secs(1), "cancel p99 was {p99:?}");
+        assert_eq!(port.calls.load(Ordering::SeqCst), CANCELLATION_CASES);
     }
 }

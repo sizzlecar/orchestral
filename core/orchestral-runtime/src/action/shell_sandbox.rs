@@ -160,12 +160,22 @@ pub fn sandbox_command(
     cwd: &Path,
     policy: &ShellSandboxPolicy,
 ) -> Result<SandboxedCommand, String> {
+    let backend = default_backend_for_platform();
+    sandbox_command_with_backend(program, args, cwd, policy, backend.as_ref())
+}
+
+fn sandbox_command_with_backend(
+    program: String,
+    args: Vec<String>,
+    cwd: &Path,
+    policy: &ShellSandboxPolicy,
+    backend: &dyn ShellSandboxBackend,
+) -> Result<SandboxedCommand, String> {
     let (program, cwd, policy) = normalize_sandbox_inputs(&program, cwd, policy)?;
     let env = HashMap::from([(
         "ORCHESTRAL_SANDBOX_NETWORK_DISABLED".to_owned(),
         "1".to_owned(),
     )]);
-    let backend = default_backend_for_platform();
     let spec = SandboxCommandSpec {
         program,
         args,
@@ -521,6 +531,37 @@ mod tests {
             .contains("ORCHESTRAL_SENTINEL_ALTERNATE_SPAWN"));
 
         std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn one_thousand_unavailable_backend_attempts_fail_closed_without_a_bare_command() {
+        let cwd = std::fs::canonicalize(".").unwrap();
+        let program = if cfg!(windows) {
+            std::env::current_exe().unwrap()
+        } else {
+            std::fs::canonicalize("/bin/echo").unwrap()
+        };
+        let policy = ShellSandboxPolicy {
+            readable_roots: vec![cwd.clone()],
+            writable_roots: vec![cwd.clone()],
+            allowed_programs: vec![program.clone()],
+            linux_bwrap_path: None,
+        };
+        let unavailable = UnsupportedBackend {
+            backend_name: "test_unavailable",
+            reason: "injected backend outage",
+        };
+        for index in 0..1_000 {
+            let error = sandbox_command_with_backend(
+                program.to_string_lossy().into_owned(),
+                vec![format!("must-not-run-{index}")],
+                &cwd,
+                &policy,
+                &unavailable,
+            )
+            .expect_err("required sandbox outage must never return a bare command");
+            assert!(error.contains("Sandbox backend 'test_unavailable' is unavailable"));
+        }
     }
 
     #[cfg(target_os = "linux")]

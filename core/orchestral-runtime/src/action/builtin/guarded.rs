@@ -385,6 +385,7 @@ impl GuardedToolExecutor for GuardedShellExecutor {
         let stdout = tokio::select! {
             biased;
             _ = execution.cancellation.cancelled() => {
+                let _ = terminate_child_tree(&mut child, process_group_id).await;
                 stdout_task.abort();
                 stderr_task.abort();
                 return ToolOutcome::Cancelled;
@@ -394,10 +395,12 @@ impl GuardedToolExecutor for GuardedShellExecutor {
         let (stdout, stdout_stream_truncated) = match stdout {
             Ok(Ok(output)) => output,
             Ok(Err(error)) => {
+                let _ = terminate_child_tree(&mut child, process_group_id).await;
                 stderr_task.abort();
                 return failed("shell_stdout_read_failed", error.to_string(), true);
             }
             Err(error) => {
+                let _ = terminate_child_tree(&mut child, process_group_id).await;
                 stderr_task.abort();
                 return failed("shell_stdout_join_failed", error.to_string(), true);
             }
@@ -405,6 +408,7 @@ impl GuardedToolExecutor for GuardedShellExecutor {
         let stderr = tokio::select! {
             biased;
             _ = execution.cancellation.cancelled() => {
+                let _ = terminate_child_tree(&mut child, process_group_id).await;
                 stderr_task.abort();
                 return ToolOutcome::Cancelled;
             }
@@ -412,9 +416,16 @@ impl GuardedToolExecutor for GuardedShellExecutor {
         };
         let (stderr, stderr_stream_truncated) = match stderr {
             Ok(Ok(output)) => output,
-            Ok(Err(error)) => return failed("shell_stderr_read_failed", error.to_string(), true),
-            Err(error) => return failed("shell_stderr_join_failed", error.to_string(), true),
+            Ok(Err(error)) => {
+                let _ = terminate_child_tree(&mut child, process_group_id).await;
+                return failed("shell_stderr_read_failed", error.to_string(), true);
+            }
+            Err(error) => {
+                let _ = terminate_child_tree(&mut child, process_group_id).await;
+                return failed("shell_stderr_join_failed", error.to_string(), true);
+            }
         };
+        terminate_process_group(process_group_id);
         let (stdout, stdout_truncated, _) = truncate_utf8_lossy(&stdout, max_output_bytes);
         let (stderr, stderr_truncated, _) = truncate_utf8_lossy(&stderr, max_output_bytes);
         let stdout = stdout.trim_end().to_owned();
@@ -600,13 +611,20 @@ async fn terminate_child_tree(
     child: &mut Child,
     process_group_id: Option<u32>,
 ) -> io::Result<ExitStatus> {
-    #[cfg(unix)]
+    terminate_process_group(process_group_id);
+    let _ = child.start_kill();
+    child.wait().await
+}
+
+#[cfg(unix)]
+fn terminate_process_group(process_group_id: Option<u32>) {
     if let Some(process_group_id) = process_group_id.filter(|id| *id <= i32::MAX as u32) {
-        // SAFETY: the child was spawned as the leader of a new process group.
+        // SAFETY: the child was spawned as the leader of a fresh process group.
         unsafe {
             libc::kill(-(process_group_id as i32), libc::SIGKILL);
         }
     }
-    let _ = child.start_kill();
-    child.wait().await
 }
+
+#[cfg(not(unix))]
+fn terminate_process_group(_process_group_id: Option<u32>) {}

@@ -525,4 +525,72 @@ mod tests {
         manager.close(&run_id, &process_id).unwrap();
         assert!(manager.list(&run_id).unwrap().is_empty());
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_thousand_pty_read_cancellations_leave_no_read_handle_and_have_subsecond_p99() {
+        const CANCELLATION_CASES: usize = 1_000;
+
+        let manager = Arc::new(PtyProcessManager::new(4 * 1024, Duration::from_secs(60)).unwrap());
+        let run_id = RunId::new("pty-read-cancel-run");
+        let process_id = PtyProcessId::new("pty-read-cancel-process").unwrap();
+        manager
+            .create(PtySpawnSpec {
+                run_id: run_id.clone(),
+                process_id: process_id.clone(),
+                program: std::fs::canonicalize("/bin/cat")
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                args: Vec::new(),
+                cwd: std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap(),
+                environment: BTreeMap::new(),
+                rows: 24,
+                cols: 80,
+            })
+            .unwrap();
+
+        const BATCH_SIZE: usize = 50;
+        let mut latencies = Vec::with_capacity(CANCELLATION_CASES);
+        for _ in 0..(CANCELLATION_CASES / BATCH_SIZE) {
+            let cancellation = CancellationToken::new();
+            let barrier = Arc::new(std::sync::Barrier::new(BATCH_SIZE + 1));
+            let mut readers = Vec::with_capacity(BATCH_SIZE);
+            for _ in 0..BATCH_SIZE {
+                let manager = manager.clone();
+                let run_id = run_id.clone();
+                let process_id = process_id.clone();
+                let cancellation = cancellation.clone();
+                let barrier = barrier.clone();
+                readers.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    let result = manager.read(
+                        &run_id,
+                        &process_id,
+                        Duration::from_secs(60),
+                        Duration::from_secs(60),
+                        &cancellation,
+                    );
+                    (result, std::time::Instant::now())
+                }));
+            }
+            barrier.wait();
+            let cancelled_at = std::time::Instant::now();
+            cancellation.cancel();
+            for reader in readers {
+                let (result, finished_at) = reader.join().unwrap();
+                assert!(matches!(result, Err(PtyProcessError::Cancelled)));
+                latencies.push(finished_at.duration_since(cancelled_at));
+            }
+        }
+        latencies.sort_unstable();
+        let p99 = latencies[(CANCELLATION_CASES * 99 / 100).saturating_sub(1)];
+        assert!(
+            p99 <= Duration::from_secs(1),
+            "PTY read cancel p99 was {p99:?}"
+        );
+        assert_eq!(manager.list(&run_id).unwrap(), vec![process_id.clone()]);
+        manager.close(&run_id, &process_id).unwrap();
+        assert!(manager.list(&run_id).unwrap().is_empty());
+    }
 }
