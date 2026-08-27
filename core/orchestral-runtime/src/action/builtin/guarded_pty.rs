@@ -150,7 +150,14 @@ impl GuardedToolExecutor for GuardedPtyCreateExecutor {
                 .expect("non-empty roots were checked"),
         );
         let sandbox_policy = ShellSandboxPolicy {
+            readable_roots: readable_roots.iter().map(PathBuf::from).collect(),
             writable_roots: writable_roots.iter().map(PathBuf::from).collect(),
+            allowed_programs: bounds
+                .process
+                .allowed_programs
+                .iter()
+                .map(PathBuf::from)
+                .collect(),
             linux_bwrap_path: None,
         };
         let sandboxed = match sandbox_command(command, args, &cwd, &sandbox_policy) {
