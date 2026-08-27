@@ -1280,4 +1280,246 @@ mod tests {
             ToolProtocolErrorCode::CapabilityReplayed
         );
     }
+
+    fn next_random(seed: &mut u64) -> u64 {
+        *seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *seed
+    }
+
+    fn generated_strings(seed: &mut u64, universe: &[&str]) -> BTreeSet<String> {
+        universe
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| next_random(seed).rotate_left(*index as u32) & 1 == 1)
+            .map(|(_, value)| (*value).to_owned())
+            .collect()
+    }
+
+    fn generated_bounds(seed: &mut u64) -> ToolPolicyBounds {
+        const EFFECTS: [EffectScope; 8] = [
+            EffectScope::Process,
+            EffectScope::Network,
+            EffectScope::FilesystemRead,
+            EffectScope::FilesystemWrite,
+            EffectScope::ArtifactRead,
+            EffectScope::EnvironmentRead,
+            EffectScope::SecretRead,
+            EffectScope::ExternalSideEffect,
+        ];
+        let allowed_effects = EFFECTS
+            .into_iter()
+            .filter(|_| next_random(seed) & 1 == 1)
+            .collect();
+        let approval = match next_random(seed) % 3 {
+            0 => ApprovalPolicy::NotRequired,
+            1 => ApprovalPolicy::Required,
+            _ => ApprovalPolicy::Deny,
+        };
+        let random_cap = |seed: &mut u64| {
+            let value = next_random(seed);
+            (!value.is_multiple_of(4)).then_some(1 + value % 100_000)
+        };
+        ToolPolicyBounds {
+            allowed_effects,
+            approval,
+            sandbox: SandboxPolicy {
+                required: next_random(seed) & 1 == 1,
+                allowed_profiles: generated_strings(seed, &["strict", "networked", "isolated"]),
+            },
+            process: ProcessPolicy {
+                allowed_programs: generated_strings(seed, &["git", "rg", "cargo", "sh"]),
+                allow_shell_expression: next_random(seed) & 1 == 1,
+            },
+            filesystem: FilesystemPolicy {
+                readable_roots: generated_strings(
+                    seed,
+                    &["/workspace", "/workspace/docs", "/data"],
+                ),
+                writable_roots: generated_strings(seed, &["/workspace", "/workspace/out", "/data"]),
+            },
+            network: NetworkPolicy {
+                allowed_targets: generated_strings(
+                    seed,
+                    &["api.example", "docs.example", "127.0.0.1"],
+                ),
+            },
+            environment: EnvironmentPolicy {
+                allowed_variables: generated_strings(seed, &["PATH", "LANG", "TOKEN"]),
+                inherit_host_environment: next_random(seed) & 1 == 1,
+            },
+            allowed_credentials: generated_strings(
+                seed,
+                &["credential/read", "credential/write", "credential/admin"],
+            ),
+            max_timeout_ms: random_cap(seed),
+            max_output_bytes: random_cap(seed),
+        }
+    }
+
+    #[test]
+    fn ten_thousand_generated_policy_compositions_never_exceed_any_authority_ceiling() {
+        const CASES: usize = 10_000;
+
+        let mut seed = 0x5EC0_71A1_5AFE_CE11_u64;
+        let mut ceiling_violations = 0usize;
+        let mut model_authority_influences = 0usize;
+        for case in 0..CASES {
+            let host = HostToolPolicy {
+                bounds: generated_bounds(&mut seed),
+            };
+            let run = RunToolGrant {
+                bounds: generated_bounds(&mut seed),
+            };
+            let restriction = ToolRestriction {
+                bounds: generated_bounds(&mut seed),
+            };
+            let effective = EffectiveToolPolicy::resolve(&host, &run, &restriction).unwrap();
+            ceiling_violations += usize::from(
+                !effective.bounds().is_no_more_permissive_than(&host.bounds)
+                    || !effective.bounds().is_no_more_permissive_than(&run.bounds)
+                    || !effective
+                        .bounds()
+                        .is_no_more_permissive_than(&restriction.bounds),
+            );
+
+            let model_arguments = json!({
+                "case": case,
+                "approval": "not_required",
+                "sandbox": {"required": false, "profile": "host"},
+                "network": ["*"],
+                "environment": ["TOKEN"],
+                "credentials": ["credential/admin"]
+            });
+            let invocation = ToolInvocation {
+                run_id: RunId::new(format!("policy-run-{case}")),
+                call_id: ToolCallId::new(format!("policy-call-{case}")),
+                tool_id: ToolId::new("generated/tool"),
+                arguments: model_arguments,
+            };
+            invocation.validate().unwrap();
+            let repeated = EffectiveToolPolicy::resolve(&host, &run, &restriction).unwrap();
+            model_authority_influences += usize::from(repeated != effective);
+        }
+        assert_eq!(ceiling_violations, 0);
+        assert_eq!(model_authority_influences, 0);
+    }
+
+    #[test]
+    fn one_thousand_each_capability_mutation_expiry_and_replay_attempts_are_rejected() {
+        const CASES: usize = 1_000;
+
+        let common = bounds(&[EffectScope::Process], ApprovalPolicy::Required);
+        let effective = EffectiveToolPolicy::resolve(
+            &HostToolPolicy {
+                bounds: common.clone(),
+            },
+            &RunToolGrant {
+                bounds: common.clone(),
+            },
+            &ToolRestriction { bounds: common },
+        )
+        .unwrap();
+        let issuer = HostApprovalIssuer::new(SIGNING_KEY).unwrap();
+        let verifier =
+            HostApprovalVerifier::new(SIGNING_KEY, InMemoryApprovalCapabilityStore::default())
+                .unwrap();
+        let mut changed_args_rejected = 0usize;
+        let mut cross_run_rejected = 0usize;
+        let mut cross_tool_rejected = 0usize;
+        let mut expired_rejected = 0usize;
+        let mut replay_rejected = 0usize;
+
+        for case in 0..CASES {
+            let invocation = ToolInvocation {
+                run_id: RunId::new(format!("capability-run-{case}")),
+                call_id: ToolCallId::new(format!("capability-call-{case}")),
+                tool_id: ToolId::new("builtin/shell"),
+                arguments: json!({"command": format!("echo {case}")}),
+            };
+            let binding = ApprovalBinding::for_invocation(
+                &invocation,
+                effects(&[EffectScope::Process]),
+                &effective,
+            )
+            .unwrap();
+
+            let mut changed_args = invocation.clone();
+            changed_args.arguments = json!({"command": format!("mutated {case}")});
+            let changed_args_binding = ApprovalBinding::for_invocation(
+                &changed_args,
+                effects(&[EffectScope::Process]),
+                &effective,
+            )
+            .unwrap();
+            let capability = issuer.issue(binding.clone(), 10_000).unwrap();
+            changed_args_rejected += usize::from(
+                verifier
+                    .verify_and_consume(&capability, &changed_args_binding, 1)
+                    .unwrap_err()
+                    .code
+                    == ToolProtocolErrorCode::CapabilityBindingMismatch,
+            );
+
+            let mut cross_run = invocation.clone();
+            cross_run.run_id = RunId::new(format!("foreign-run-{case}"));
+            let cross_run_binding = ApprovalBinding::for_invocation(
+                &cross_run,
+                effects(&[EffectScope::Process]),
+                &effective,
+            )
+            .unwrap();
+            let capability = issuer.issue(binding.clone(), 10_000).unwrap();
+            cross_run_rejected += usize::from(
+                verifier
+                    .verify_and_consume(&capability, &cross_run_binding, 1)
+                    .unwrap_err()
+                    .code
+                    == ToolProtocolErrorCode::CapabilityBindingMismatch,
+            );
+
+            let mut cross_tool = invocation.clone();
+            cross_tool.tool_id = ToolId::new("builtin/other-shell");
+            let cross_tool_binding = ApprovalBinding::for_invocation(
+                &cross_tool,
+                effects(&[EffectScope::Process]),
+                &effective,
+            )
+            .unwrap();
+            let capability = issuer.issue(binding.clone(), 10_000).unwrap();
+            cross_tool_rejected += usize::from(
+                verifier
+                    .verify_and_consume(&capability, &cross_tool_binding, 1)
+                    .unwrap_err()
+                    .code
+                    == ToolProtocolErrorCode::CapabilityBindingMismatch,
+            );
+
+            let expired = issuer.issue(binding.clone(), 100).unwrap();
+            expired_rejected += usize::from(
+                verifier
+                    .verify_and_consume(&expired, &binding, 100)
+                    .unwrap_err()
+                    .code
+                    == ToolProtocolErrorCode::CapabilityExpired,
+            );
+
+            let replayed = issuer.issue(binding.clone(), 10_000).unwrap();
+            verifier.verify_and_consume(&replayed, &binding, 1).unwrap();
+            replay_rejected += usize::from(
+                verifier
+                    .verify_and_consume(&replayed, &binding, 1)
+                    .unwrap_err()
+                    .code
+                    == ToolProtocolErrorCode::CapabilityReplayed,
+            );
+        }
+
+        assert_eq!(changed_args_rejected, CASES);
+        assert_eq!(cross_run_rejected, CASES);
+        assert_eq!(cross_tool_rejected, CASES);
+        assert_eq!(expired_rejected, CASES);
+        assert_eq!(replay_rejected, CASES);
+    }
 }
