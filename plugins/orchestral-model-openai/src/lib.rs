@@ -471,7 +471,11 @@ impl OpenAiStreamState {
         let call_id = state.call_id.clone();
         if let Some((call_id, name)) = start {
             self.emitted_content = true;
-            self.emit(ModelEvent::ToolCallStart { call_id, name })?;
+            self.emit(ModelEvent::ToolCallStart {
+                call_id,
+                name,
+                extensions: BTreeMap::new(),
+            })?;
         }
         if let Some(delta) = arguments {
             let call_id = call_id.ok_or_else(|| {
@@ -625,6 +629,7 @@ fn encode_messages(messages: &[ModelMessage]) -> Result<Vec<Value>, ModelError> 
                             call_id,
                             name,
                             arguments,
+                            ..
                         } => calls.push(json!({
                             "id": call_id.as_str(),
                             "type": "function",
@@ -764,6 +769,7 @@ fn parse_response(
             ModelEvent::ToolCallStart {
                 call_id: call_id.clone(),
                 name: name.to_owned(),
+                extensions: BTreeMap::new(),
             },
             ModelEvent::ToolCallArgumentsDelta {
                 call_id: call_id.clone(),
@@ -1111,6 +1117,7 @@ mod tests {
                     call_id: ModelToolCallId::new("call-1"),
                     name: "echo".to_owned(),
                     arguments: json!({"value": "hello"}),
+                    extensions: BTreeMap::new(),
                 }],
             },
             ModelMessage {

@@ -25,6 +25,7 @@ use serde_json::{json, Map, Value};
 use tokio_util::sync::CancellationToken;
 
 const GOOGLE_CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
+const GEMINI_THOUGHT_SIGNATURE_EXTENSION: &str = "google.gemini/thought_signature";
 
 #[async_trait]
 pub trait GeminiAccessTokenProvider: Send + Sync {
@@ -529,8 +530,8 @@ impl GeminiStreamState {
                         delta: text.to_owned(),
                     })?;
                 }
-                if let Some(call) = part.get("functionCall") {
-                    self.emit_function_call(call)?;
+                if part.get("functionCall").is_some() {
+                    self.emit_function_call(part)?;
                 }
             }
             if let Some(reason) = candidate
@@ -554,7 +555,10 @@ impl GeminiStreamState {
         Ok(())
     }
 
-    fn emit_function_call(&mut self, call: &Value) -> Result<(), ModelError> {
+    fn emit_function_call(&mut self, part: &Value) -> Result<(), ModelError> {
+        let call = part
+            .get("functionCall")
+            .ok_or_else(|| ModelError::protocol("Gemini Tool-call part omitted functionCall"))?;
         let name = call
             .get("name")
             .and_then(Value::as_str)
@@ -577,10 +581,22 @@ impl GeminiStreamState {
             serde_json::to_string(call.get("args").unwrap_or(&Value::Object(Map::new())))
                 .map_err(|error| ModelError::protocol(error.to_string()))?;
         let call_id = ModelToolCallId::new(id);
+        let extensions = part
+            .get("thoughtSignature")
+            .and_then(Value::as_str)
+            .filter(|signature| !signature.is_empty())
+            .map(|signature| {
+                BTreeMap::from([(
+                    GEMINI_THOUGHT_SIGNATURE_EXTENSION.to_owned(),
+                    Value::String(signature.to_owned()),
+                )])
+            })
+            .unwrap_or_default();
         self.emitted_content = true;
         self.emit(ModelEvent::ToolCallStart {
             call_id: call_id.clone(),
             name: name.to_owned(),
+            extensions,
         })?;
         self.emit(ModelEvent::ToolCallArgumentsDelta {
             call_id: call_id.clone(),
@@ -708,15 +724,37 @@ fn encode_messages(messages: &[ModelMessage]) -> Result<(Vec<String>, Vec<Value>
                             call_id,
                             name,
                             arguments,
+                            extensions,
                         } => {
                             function_names.insert(call_id.as_str().to_owned(), name.clone());
-                            parts.push(json!({
+                            let mut part = json!({
                                 "functionCall": {
                                     "id": call_id.as_str(),
                                     "name": name,
                                     "args": arguments,
                                 }
-                            }));
+                            });
+                            if let Some(signature) = extensions
+                                .get(GEMINI_THOUGHT_SIGNATURE_EXTENSION)
+                                .map(|value| {
+                                    value.as_str().filter(|value| !value.is_empty()).ok_or_else(
+                                        || {
+                                            ModelError::invalid_request(
+                                                "Gemini thought-signature extension must be a non-empty string",
+                                            )
+                                        },
+                                    )
+                                })
+                                .transpose()?
+                            {
+                                part.as_object_mut()
+                                    .expect("Gemini function-call part is an object")
+                                    .insert(
+                                        "thoughtSignature".to_owned(),
+                                        Value::String(signature.to_owned()),
+                                    );
+                            }
+                            parts.push(part);
                         }
                         ModelContent::ToolResult { .. } => {
                             return Err(ModelError::invalid_request(
@@ -850,10 +888,22 @@ fn parse_response(
                 serde_json::to_string(call.get("args").unwrap_or(&Value::Object(Map::new())))
                     .map_err(|error| ModelError::protocol(error.to_string()))?;
             let call_id = ModelToolCallId::new(id);
+            let extensions = part
+                .get("thoughtSignature")
+                .and_then(Value::as_str)
+                .filter(|signature| !signature.is_empty())
+                .map(|signature| {
+                    BTreeMap::from([(
+                        GEMINI_THOUGHT_SIGNATURE_EXTENSION.to_owned(),
+                        Value::String(signature.to_owned()),
+                    )])
+                })
+                .unwrap_or_default();
             payloads.extend([
                 ModelEvent::ToolCallStart {
                     call_id: call_id.clone(),
                     name: name.to_owned(),
+                    extensions,
                 },
                 ModelEvent::ToolCallArgumentsDelta {
                     call_id: call_id.clone(),
@@ -1290,6 +1340,68 @@ mod tests {
     }
 
     #[test]
+    fn preserves_thought_signature_across_tool_continuation() {
+        let request = request();
+        let events = parse_response(
+            &request,
+            &json!({
+                "candidates": [{
+                    "content": {"parts": [{
+                        "functionCall": {
+                            "id": "call-1",
+                            "name": "echo",
+                            "args": {"value": "hello"}
+                        },
+                        "thoughtSignature": "opaque-signature"
+                    }]},
+                    "finishReason": "STOP"
+                }]
+            }),
+        )
+        .unwrap();
+        let (call_id, name, extensions) = events
+            .iter()
+            .find_map(|event| match &event.payload {
+                ModelEvent::ToolCallStart {
+                    call_id,
+                    name,
+                    extensions,
+                } => Some((call_id.clone(), name.clone(), extensions.clone())),
+                _ => None,
+            })
+            .expect("function call start");
+        assert_eq!(
+            extensions.get(GEMINI_THOUGHT_SIGNATURE_EXTENSION),
+            Some(&Value::String("opaque-signature".to_owned()))
+        );
+
+        let messages = vec![
+            ModelMessage {
+                role: ModelRole::Assistant,
+                content: vec![ModelContent::ToolCall {
+                    call_id: call_id.clone(),
+                    name,
+                    arguments: json!({"value": "hello"}),
+                    extensions,
+                }],
+            },
+            ModelMessage {
+                role: ModelRole::Tool,
+                content: vec![ModelContent::ToolResult {
+                    call_id,
+                    result: json!({"result": "hello"}),
+                    is_error: false,
+                }],
+            },
+        ];
+        let (_, encoded) = encode_messages(&messages).unwrap();
+        assert_eq!(
+            encoded[0]["parts"][0]["thoughtSignature"],
+            "opaque-signature"
+        );
+    }
+
+    #[test]
     fn maps_function_response_to_the_original_function_name() {
         let messages = vec![
             ModelMessage {
@@ -1298,6 +1410,7 @@ mod tests {
                     call_id: ModelToolCallId::new("call-1"),
                     name: "echo".to_owned(),
                     arguments: json!({"value": "hello"}),
+                    extensions: BTreeMap::new(),
                 }],
             },
             ModelMessage {
@@ -1319,7 +1432,8 @@ mod tests {
         let raw = concat!(
             "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello \"}]}}]}\n\n",
             "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{",
-            "\"id\":\"call-1\",\"name\":\"echo\",\"args\":{\"value\":\"world\"}}}]},",
+            "\"id\":\"call-1\",\"name\":\"echo\",\"args\":{\"value\":\"world\"}},",
+            "\"thoughtSignature\":\"opaque-stream-signature\"}]},",
             "\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":8,",
             "\"candidatesTokenCount\":3}}\n\n"
         );
@@ -1345,8 +1459,11 @@ mod tests {
         }
         assert!(events.iter().any(|event| matches!(
             &event.payload,
-            ModelEvent::ToolCallStart { call_id, name }
-                if call_id.as_str() == "call-1" && name == "echo"
+            ModelEvent::ToolCallStart { call_id, name, extensions }
+                if call_id.as_str() == "call-1"
+                    && name == "echo"
+                    && extensions.get(GEMINI_THOUGHT_SIGNATURE_EXTENSION)
+                        == Some(&Value::String("opaque-stream-signature".to_owned()))
         )));
         assert!(matches!(
             events.last().map(|event| &event.payload),

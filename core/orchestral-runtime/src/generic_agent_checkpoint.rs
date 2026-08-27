@@ -72,6 +72,8 @@ pub struct GenericObservedToolCall {
     pub name: String,
     #[serde(default)]
     pub arguments: String,
+    #[serde(default)]
+    pub extensions: BTreeMap<String, serde_json::Value>,
     pub ended: bool,
 }
 
@@ -1074,6 +1076,7 @@ mod tests {
                                 call_id: ModelToolCallId::new("call-1"),
                                 name: "echo".to_owned(),
                                 arguments: r#"{"value":"hello"}"#.to_owned(),
+                                extensions: Default::default(),
                                 ended: true,
                             }],
                         },

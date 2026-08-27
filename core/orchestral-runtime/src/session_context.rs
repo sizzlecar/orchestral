@@ -858,6 +858,7 @@ fn render_compaction_message(message: &ModelMessage) -> Result<String, SessionCo
                 call_id,
                 name,
                 arguments,
+                ..
             } => {
                 rendered.push_str("tool_call id=");
                 rendered.push_str(call_id.as_str());
@@ -1194,6 +1195,7 @@ mod tests {
                             call_id: ModelToolCallId::new("call-1"),
                             name: "echo".to_owned(),
                             arguments: json!({}),
+                            extensions: Default::default(),
                         }],
                     },
                     tool: ModelMessage {
@@ -1463,6 +1465,7 @@ mod tests {
                     call_id: old_call_id.clone(),
                     name: "inspect".to_owned(),
                     arguments: json!({ "case": case }),
+                    extensions: Default::default(),
                 }],
             };
             let old_tool = ModelMessage {
@@ -1551,6 +1554,7 @@ mod tests {
                             call_id: call_id.clone(),
                             name: "lookup".to_owned(),
                             arguments: json!({ "current": case }),
+                            extensions: Default::default(),
                         }],
                     },
                     ModelMessage {
@@ -1806,6 +1810,7 @@ mod tests {
                     call_id: artifact_call.clone(),
                     name: "artifact_source".to_owned(),
                     arguments: json!({}),
+                    extensions: Default::default(),
                 }],
             },
             tool: ModelMessage {
@@ -1934,6 +1939,7 @@ mod tests {
                                 call_id: call_id.clone(),
                                 name: "inspect".to_owned(),
                                 arguments: json!({ "value": "x".repeat(width) }),
+                                extensions: Default::default(),
                             }],
                         },
                         tool: ModelMessage {
@@ -1982,6 +1988,7 @@ mod tests {
                             call_id: artifact_call_id.clone(),
                             name: "artifact_source".to_owned(),
                             arguments: json!({}),
+                            extensions: Default::default(),
                         }],
                     },
                     tool: ModelMessage {
@@ -2047,6 +2054,7 @@ mod tests {
                                 call_id: call_id.clone(),
                                 name: tool_name.to_owned(),
                                 arguments: json!({"marker": kind}),
+                                extensions: Default::default(),
                             }],
                         },
                         tool: ModelMessage {

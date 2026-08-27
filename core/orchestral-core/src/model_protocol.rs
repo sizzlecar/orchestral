@@ -240,6 +240,10 @@ pub enum ModelContent {
         call_id: ModelToolCallId,
         name: String,
         arguments: Value,
+        /// Provider-owned continuation state that survives Tool execution and
+        /// recovery but is never passed to the Tool itself.
+        #[serde(default)]
+        extensions: BTreeMap<String, Value>,
     },
     ToolResult {
         call_id: ModelToolCallId,
@@ -257,12 +261,18 @@ impl ModelContent {
             Self::Data { media_type, .. } if media_type.trim().is_empty() => Err(
                 ModelError::invalid_request("model data requires a media type"),
             ),
-            Self::ToolCall { call_id, name, .. }
-                if call_id.is_empty() || name.trim().is_empty() =>
-            {
-                Err(ModelError::invalid_request(
-                    "model tool call requires call_id and name",
-                ))
+            Self::ToolCall {
+                call_id,
+                name,
+                extensions,
+                ..
+            } => {
+                if call_id.is_empty() || name.trim().is_empty() {
+                    return Err(ModelError::invalid_request(
+                        "model tool call requires call_id and name",
+                    ));
+                }
+                validate_extensions(extensions)
             }
             Self::ToolResult { call_id, .. } if call_id.is_empty() => Err(
                 ModelError::invalid_request("model tool result requires call_id"),
@@ -333,6 +343,9 @@ pub enum ModelEvent {
     ToolCallStart {
         call_id: ModelToolCallId,
         name: String,
+        /// Provider-owned state associated with the exact Tool-call part.
+        #[serde(default)]
+        extensions: BTreeMap<String, Value>,
     },
     ToolCallArgumentsDelta {
         call_id: ModelToolCallId,
@@ -355,12 +368,17 @@ impl ModelEvent {
             Self::TextDelta { delta } if delta.is_empty() => {
                 Err(ModelError::protocol("text delta must not be empty"))
             }
-            Self::ToolCallStart { call_id, name }
-                if call_id.is_empty() || name.trim().is_empty() =>
-            {
-                Err(ModelError::protocol(
-                    "tool-call start requires call_id and name",
-                ))
+            Self::ToolCallStart {
+                call_id,
+                name,
+                extensions,
+            } => {
+                if call_id.is_empty() || name.trim().is_empty() {
+                    return Err(ModelError::protocol(
+                        "tool-call start requires call_id and name",
+                    ));
+                }
+                validate_extensions(extensions)
             }
             Self::ToolCallArgumentsDelta { call_id, delta }
                 if call_id.is_empty() || delta.is_empty() =>

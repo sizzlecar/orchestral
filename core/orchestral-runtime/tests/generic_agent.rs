@@ -1235,6 +1235,7 @@ impl ModelBackend for InputRequestModel {
                     payload: ModelEvent::ToolCallStart {
                         call_id: ModelToolCallId::new("input-call"),
                         name: "orchestral_request_input".to_owned(),
+                        extensions: Default::default(),
                     },
                 }),
                 Ok(ModelStreamEvent {
@@ -1336,6 +1337,7 @@ impl ModelBackend for ToolLoopModel {
                     payload: ModelEvent::ToolCallStart {
                         call_id: ModelToolCallId::new("echo-call"),
                         name: "echo".to_owned(),
+                        extensions: Default::default(),
                     },
                 }),
                 Ok(ModelStreamEvent {
@@ -1439,6 +1441,7 @@ impl ModelBackend for BudgetGuardToolLoopModel {
                     payload: ModelEvent::ToolCallStart {
                         call_id: ModelToolCallId::new("budget-tool-call"),
                         name: "echo".to_owned(),
+                        extensions: Default::default(),
                     },
                 }),
                 Ok(ModelStreamEvent {
@@ -1523,6 +1526,7 @@ impl ModelBackend for RunBudgetModel {
                 payload: ModelEvent::ToolCallStart {
                     call_id: ModelToolCallId::new("must-not-run"),
                     name: "must_not_run".to_owned(),
+                    extensions: Default::default(),
                 },
             }),
             Ok(ModelStreamEvent {
@@ -1598,6 +1602,7 @@ impl ModelBackend for ArtifactLoopModel {
                     payload: ModelEvent::ToolCallStart {
                         call_id: ModelToolCallId::new("artifact-echo-call"),
                         name: "echo".to_owned(),
+                        extensions: Default::default(),
                     },
                 }),
                 Ok(ModelStreamEvent {
@@ -1711,6 +1716,7 @@ impl ModelBackend for SkillRecoveryModel {
                     payload: ModelEvent::ToolCallStart {
                         call_id: ModelToolCallId::new("activate-recovery-skill"),
                         name: "orchestral_skill_activate".to_owned(),
+                        extensions: Default::default(),
                     },
                 }),
                 Ok(ModelStreamEvent {
@@ -1822,6 +1828,7 @@ impl ModelBackend for ApprovalLoopModel {
                     payload: ModelEvent::ToolCallStart {
                         call_id: ModelToolCallId::new("approval-echo-call"),
                         name: "echo".to_owned(),
+                        extensions: Default::default(),
                     },
                 }),
                 Ok(ModelStreamEvent {
@@ -2188,6 +2195,7 @@ impl ModelBackend for WorkflowLoopModel {
                     payload: ModelEvent::ToolCallStart {
                         call_id: ModelToolCallId::new("workflow-call"),
                         name: "orchestral_workflow".to_owned(),
+                        extensions: Default::default(),
                     },
                 }),
                 Ok(ModelStreamEvent {
@@ -5171,6 +5179,7 @@ async fn run_skill_recovery(state: SkillRecoveryState) -> Vec<ModelMessage> {
                                 call_id: ModelToolCallId::new("activate-recovery-skill"),
                                 name: "orchestral_skill_activate".to_owned(),
                                 arguments,
+                                extensions: Default::default(),
                             }],
                         },
                         tool: ModelMessage {

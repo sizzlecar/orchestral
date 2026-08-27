@@ -87,6 +87,7 @@ impl ModelBackend for SkillActivationModel {
                     payload: ModelEvent::ToolCallStart {
                         call_id: ModelToolCallId::new("activate-xlsx"),
                         name: SKILL_FUNCTION.to_owned(),
+                        extensions: Default::default(),
                     },
                 }),
                 Ok(ModelStreamEvent {

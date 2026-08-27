@@ -260,7 +260,7 @@ async fn tool_stream_case(fixture: &dyn ModelFixtureFactory) -> Result<(), Strin
     let mut calls = BTreeMap::<String, (String, String, bool)>::new();
     for event in &events {
         match &event.payload {
-            ModelEvent::ToolCallStart { call_id, name } => {
+            ModelEvent::ToolCallStart { call_id, name, .. } => {
                 if calls
                     .insert(
                         call_id.as_str().to_owned(),

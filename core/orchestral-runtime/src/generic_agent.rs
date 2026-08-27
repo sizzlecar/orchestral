@@ -1572,6 +1572,7 @@ fn stage_observed_recovery(
         call_id: call.call_id.clone(),
         name: call.name.clone(),
         arguments: call.arguments.clone(),
+        extensions: call.extensions.clone(),
         ended: call.ended,
     };
     let arguments = parse_tool_arguments(&pending_call).map_err(observed_recovery_error)?;
@@ -1797,6 +1798,7 @@ fn stage_started_workflow_recovery(
         call_id: call.call_id.clone(),
         name: call.name.clone(),
         arguments: call.arguments.clone(),
+        extensions: call.extensions.clone(),
         ended: call.ended,
     })
     .map_err(observed_recovery_error)?;
@@ -4154,7 +4156,11 @@ async fn execute_model_run(execution: ModelRunExecution) {
                         },
                     );
                 }
-                ModelEvent::ToolCallStart { call_id, name } => {
+                ModelEvent::ToolCallStart {
+                    call_id,
+                    name,
+                    extensions,
+                } => {
                     if tool_calls.iter().any(|call| call.call_id == call_id) {
                         emit_failure(
                             &inner,
@@ -4168,6 +4174,7 @@ async fn execute_model_run(execution: ModelRunExecution) {
                         call_id,
                         name,
                         arguments: String::new(),
+                        extensions,
                         ended: false,
                     });
                 }
@@ -4219,6 +4226,7 @@ async fn execute_model_run(execution: ModelRunExecution) {
                                     call_id: call.call_id.clone(),
                                     name: call.name.clone(),
                                     arguments: call.arguments.clone(),
+                                    extensions: call.extensions.clone(),
                                     ended: call.ended,
                                 })
                                 .collect(),
@@ -4417,6 +4425,7 @@ async fn execute_model_run(execution: ModelRunExecution) {
                             call_id: call.call_id.clone(),
                             name: call.name.clone(),
                             arguments: arguments.clone(),
+                            extensions: call.extensions.clone(),
                         });
                         parsed_calls.push((call, arguments));
                     }
@@ -6503,6 +6512,7 @@ fn observed_tool_exchange_messages(
         call_id: call.call_id.clone(),
         name: call.name.clone(),
         arguments: arguments.clone(),
+        extensions: call.extensions.clone(),
     });
     (
         ModelMessage {
@@ -7052,6 +7062,7 @@ struct PendingModelToolCall {
     call_id: ModelToolCallId,
     name: String,
     arguments: String,
+    extensions: BTreeMap<String, serde_json::Value>,
     ended: bool,
 }
 

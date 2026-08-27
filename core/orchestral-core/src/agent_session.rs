@@ -605,6 +605,7 @@ mod tests {
                     call_id: ModelToolCallId::new("call-1"),
                     name: "echo".to_owned(),
                     arguments: json!({}),
+                    extensions: Default::default(),
                 }],
             },
             tool: ModelMessage {
@@ -635,6 +636,7 @@ mod tests {
                     call_id: ModelToolCallId::new("call-1"),
                     name: "read".to_owned(),
                     arguments: serde_json::json!({}),
+                    extensions: Default::default(),
                 }],
             },
             tool: ModelMessage {

@@ -96,6 +96,7 @@ impl ModelBackend for ScriptedModelBackend {
                     ModelEvent::ToolCallStart {
                         call_id: ModelToolCallId::new("call-1"),
                         name: "echo".to_owned(),
+                        extensions: BTreeMap::new(),
                     },
                     ModelEvent::ToolCallArgumentsDelta {
                         call_id: ModelToolCallId::new("call-1"),
