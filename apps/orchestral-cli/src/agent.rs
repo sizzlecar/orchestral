@@ -13,11 +13,11 @@ use orchestral_core::agent_protocol::{
     reference::AgentRunStatus,
     spi::{AgentJournalStore, InMemoryAgentJournalStore},
     wire::{
-        AgentCommand, AgentCommandEnvelope, AgentSessionId, AgentTelemetry, ApprovalDecision,
-        BindingRequirement, CommandAckState, CommandId, Content, ContentBody, Digest,
-        PendingRequest, PendingRequestPayload, ProviderBindingRef, RequestResolution,
-        ResourceBinding, ResourceBindingId, ResourceBindingMode, ResourceId, ResourceKind,
-        ResourceRef, ResourceRevision, RunId,
+        AgentCommand, AgentCommandEnvelope, AgentRunState, AgentSessionId, AgentTelemetry,
+        AgentTerminalState, ApprovalDecision, BindingRequirement, CommandAckState, CommandId,
+        Content, ContentBody, Digest, PendingRequest, PendingRequestPayload, ProviderBindingRef,
+        RequestResolution, ResourceBinding, ResourceBindingId, ResourceBindingMode, ResourceId,
+        ResourceKind, ResourceRef, ResourceRevision, RunId,
     },
 };
 use orchestral_core::agent_session::{AgentSessionJournalStore, InMemoryAgentSessionJournalStore};
@@ -262,7 +262,7 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
     let result = async {
         let mut lines = BufReader::new(tokio::io::stdin()).lines();
         if let Some(input) = options.input {
-            run_turn(&client, &approval_broker, 1, input, &mut lines).await?;
+            run_turn(&client, &approval_broker, 1, input, &mut lines, false).await?;
             return Ok(());
         }
 
@@ -272,8 +272,8 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
         );
         let mut turn = 0_u64;
         loop {
-            print!("> ");
-            io::stdout().flush().context("flush prompt")?;
+            eprint!("> ");
+            io::stderr().flush().context("flush prompt")?;
             let next = tokio::select! {
                 line = lines.next_line() => line.context("read Agent input")?,
                 signal = tokio::signal::ctrl_c() => {
@@ -299,6 +299,7 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
                 turn,
                 input.to_owned(),
                 &mut lines,
+                true,
             )
             .await?;
         }
@@ -924,6 +925,7 @@ async fn run_turn(
     turn: u64,
     input: String,
     lines: &mut tokio::io::Lines<BufReader<tokio::io::Stdin>>,
+    accept_unsolicited_stdin: bool,
 ) -> anyhow::Result<()> {
     let run_id = RunId::new(unique_id("cli-run", turn));
     let handle = client
@@ -992,7 +994,7 @@ async fn run_turn(
                     tracing::debug!(%error, "Agent Run reached terminal while cancellation was sent");
                 }
             }
-            line = lines.next_line(), if stdin_open => {
+            line = lines.next_line(), if stdin_open && accept_unsolicited_stdin => {
                 let line = line.context("read running Agent input")?;
                 let Some(line) = line else {
                     stdin_open = false;
@@ -1028,8 +1030,10 @@ async fn run_turn(
         }
     };
 
-    match view.state.status() {
-        AgentRunStatus::Delivered => {
+    match &view.state {
+        AgentRunState::Terminal {
+            terminal: AgentTerminalState::Delivered { .. },
+        } => {
             let delivery = view
                 .delivery
                 .context("Delivered Run omitted its Delivery")?;
@@ -1039,7 +1043,27 @@ async fn run_turn(
                 print_content(&delivery.final_response.body)?;
             }
         }
-        status => eprintln!("Agent Run ended with status {status:?}"),
+        AgentRunState::Terminal {
+            terminal: AgentTerminalState::Failed { failure },
+        } => {
+            bail!(
+                "Agent Run failed [{}]{}: {}",
+                failure.code,
+                if failure.retryable {
+                    " (retryable)"
+                } else {
+                    ""
+                },
+                failure.message
+            )
+        }
+        AgentRunState::Terminal {
+            terminal: AgentTerminalState::Incomplete { reason },
+        } => bail!("Agent Run incomplete: {reason:?}"),
+        AgentRunState::Terminal {
+            terminal: AgentTerminalState::Cancelled { reason },
+        } => bail!("Agent Run cancelled: {reason}"),
+        state => bail!("Agent Run stopped in unexpected state: {state:?}"),
     }
     Ok(())
 }
@@ -1057,8 +1081,8 @@ async fn resolve_cli_request(
             for item in prompt {
                 eprintln!("{}", display_content(item));
             }
-            print!("> ");
-            io::stdout().flush().context("flush input prompt")?;
+            eprint!("> ");
+            io::stderr().flush().context("flush input prompt")?;
             let answer = tokio::select! {
                 line = lines.next_line() => line.context("read requested Agent input")?,
                 signal = tokio::signal::ctrl_c() => {
@@ -1091,8 +1115,8 @@ async fn resolve_cli_request(
         } => {
             eprintln!("\nApproval required: {reason}");
             eprintln!("Effects: {}", requested_scope.join(", "));
-            print!("Allow this exact operation? [y/N] ");
-            io::stdout().flush().context("flush approval prompt")?;
+            eprint!("Allow this exact operation? [y/N] ");
+            io::stderr().flush().context("flush approval prompt")?;
             let answer = tokio::select! {
                 line = lines.next_line() => line.context("read approval decision")?,
                 signal = tokio::signal::ctrl_c() => {
