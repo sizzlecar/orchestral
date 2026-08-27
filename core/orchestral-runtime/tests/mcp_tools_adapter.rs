@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,14 +17,164 @@ use orchestral_core::tool_protocol::{
     ProcessPolicy, RunToolGrant, SandboxPolicy, ToolCallId, ToolId, ToolInvocation, ToolOutcome,
     ToolOutput, ToolPolicyBounds, ToolRestriction,
 };
+use orchestral_mcp_streamable_http::{
+    ResolvedCredentialHeader, StreamableHttpMcpTransportConfig, StreamableHttpMcpTransportFactory,
+};
 use orchestral_runtime::{
     GuardedMcpServerConfig, GuardedToolResult, GuardedToolRuntime, InMemoryBlobStore,
     McpServerHealth, McpToolsAdapterRegistry, StdioMcpTransportFactory, ToolArtifactStore,
 };
 use serde_json::json;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
 const SIGNING_KEY: &[u8] = b"0123456789abcdef0123456789abcdef";
+
+#[derive(Debug)]
+struct CapturedHttpRequest {
+    headers: BTreeMap<String, String>,
+    body: serde_json::Value,
+}
+
+async fn read_http_request(socket: &mut TcpStream) -> CapturedHttpRequest {
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 2048];
+    let header_end = loop {
+        let count = socket.read(&mut buffer).await.unwrap();
+        assert!(count > 0);
+        request.extend_from_slice(&buffer[..count]);
+        if let Some(index) = request.windows(4).position(|value| value == b"\r\n\r\n") {
+            break index + 4;
+        }
+    };
+    let header_text = String::from_utf8_lossy(&request[..header_end]);
+    let headers = header_text
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
+        .collect::<BTreeMap<_, _>>();
+    let content_length = headers
+        .get("content-length")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
+    while request.len() < header_end + content_length {
+        let count = socket.read(&mut buffer).await.unwrap();
+        assert!(count > 0);
+        request.extend_from_slice(&buffer[..count]);
+    }
+    CapturedHttpRequest {
+        headers,
+        body: serde_json::from_slice(&request[header_end..header_end + content_length]).unwrap(),
+    }
+}
+
+fn json_http_response(message: serde_json::Value) -> Vec<u8> {
+    let body = serde_json::to_vec(&message).unwrap();
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(&body);
+    response
+}
+
+fn sse_http_response(message: serde_json::Value) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n: catalog\r\ndata: {}\r\n\r\n",
+        message
+    )
+    .into_bytes()
+}
+
+async fn spawn_scripted_http_server(
+    responses: Vec<Vec<u8>>,
+) -> (String, tokio::task::JoinHandle<Vec<CapturedHttpRequest>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        let mut captured = Vec::new();
+        for response in responses {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            captured.push(read_http_request(&mut socket).await);
+            socket.write_all(&response).await.unwrap();
+        }
+        captured
+    });
+    (format!("http://{address}/mcp"), handle)
+}
+
+async fn spawn_cancellable_http_server() -> (
+    String,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::task::JoinHandle<bool>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (call_started, call_observed) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(async move {
+        let responses = [
+            json_http_response(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "supportedVersions": ["2026-07-28"],
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "http-cancel", "version": "1"}
+                }
+            })),
+            json_http_response(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "resultType": "complete",
+                    "ttlMs": 1000,
+                    "cacheScope": "private",
+                    "tools": [{
+                        "name": "wait",
+                        "inputSchema": {
+                            "type": "object",
+                            "additionalProperties": false
+                        }
+                    }]
+                }
+            })),
+        ];
+        for response in responses {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_http_request(&mut socket).await;
+            socket.write_all(&response).await.unwrap();
+        }
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_http_request(&mut socket).await;
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n: waiting\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        call_started.send(()).unwrap();
+        let mut byte = [0_u8; 1];
+        match tokio::time::timeout(Duration::from_secs(1), socket.read(&mut byte)).await {
+            Ok(Ok(0)) => true,
+            Ok(Err(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                true
+            }
+            _ => false,
+        }
+    });
+    (format!("http://{address}/mcp"), call_observed, handle)
+}
 
 fn unique_path(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("orchestral-{label}-{}", uuid::Uuid::new_v4()))
@@ -109,12 +259,52 @@ fn config(program: PathBuf, script: String, tool_timeout: Duration) -> GuardedMc
     }
 }
 
+fn http_config(
+    factory: StreamableHttpMcpTransportFactory,
+    tool_timeout: Duration,
+) -> GuardedMcpServerConfig {
+    GuardedMcpServerConfig {
+        server_id: McpServerId::new("http-mock"),
+        required: true,
+        transport: Arc::new(factory),
+        startup_timeout: Duration::from_secs(2),
+        tool_timeout,
+        enabled_tools: Default::default(),
+        disabled_tools: Default::default(),
+    }
+}
+
+fn http_bounds(config: &GuardedMcpServerConfig, timeout_ms: u64) -> ToolPolicyBounds {
+    ToolPolicyBounds {
+        allowed_effects: config.effect_scopes(),
+        approval: ApprovalPolicy::Required,
+        sandbox: SandboxPolicy::default(),
+        process: ProcessPolicy::default(),
+        filesystem: FilesystemPolicy::default(),
+        network: NetworkPolicy {
+            allowed_targets: config.allowed_network_targets(),
+        },
+        environment: EnvironmentPolicy::default(),
+        allowed_credentials: config.credential_references(),
+        max_timeout_ms: Some(timeout_ms),
+        max_output_bytes: Some(16 * 1024),
+    }
+}
+
 fn invocation(call_id: &str, tool: &str) -> ToolInvocation {
+    invocation_with_arguments(call_id, tool, json!({}))
+}
+
+fn invocation_with_arguments(
+    call_id: &str,
+    tool: &str,
+    arguments: serde_json::Value,
+) -> ToolInvocation {
     ToolInvocation {
         run_id: RunId::new("mcp-run"),
         call_id: ToolCallId::new(call_id),
         tool_id: ToolId::new(format!("mcp/mock/{tool}/v1")),
-        arguments: json!({}),
+        arguments,
     }
 }
 
@@ -145,6 +335,261 @@ async fn invoke_with_approval(
 }
 
 #[tokio::test]
+async fn streamable_http_discovery_headers_and_call_share_the_guarded_runtime() {
+    let responses = vec![
+        json_http_response(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "supportedVersions": ["2026-07-28"],
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "http-mock", "version": "1"}
+            }
+        })),
+        sse_http_response(json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "resultType": "complete",
+                "ttlMs": 1000,
+                "cacheScope": "private",
+                "tools": [
+                    {
+                        "name": "route",
+                        "description": "route a request",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "region": {
+                                    "type": "string",
+                                    "x-mcp-header": "Region"
+                                },
+                                "routing": {
+                                    "type": "object",
+                                    "properties": {
+                                        "priority": {
+                                            "type": "integer",
+                                            "x-mcp-header": "Priority"
+                                        }
+                                    }
+                                }
+                            },
+                            "required": ["region", "routing"],
+                            "additionalProperties": false
+                        }
+                    },
+                    {
+                        "name": "invalid",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "values": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "string",
+                                        "x-mcp-header": "Invalid"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                ]
+            }
+        })),
+        json_http_response(json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": {
+                "resultType": "complete",
+                "content": [{"type": "text", "text": "http-result"}],
+                "isError": false
+            }
+        })),
+    ];
+    let (endpoint, captured) = spawn_scripted_http_server(responses).await;
+    let mut transport_config = StreamableHttpMcpTransportConfig::unauthenticated(endpoint);
+    transport_config.credential_headers.insert(
+        "Authorization".to_owned(),
+        ResolvedCredentialHeader {
+            reference: "env:MCP_HTTP_TOKEN".to_owned(),
+            value: "Bearer test-token".to_owned(),
+        },
+    );
+    let server = http_config(
+        StreamableHttpMcpTransportFactory::new(transport_config).unwrap(),
+        Duration::from_secs(2),
+    );
+    let policy = http_bounds(&server, 5_000);
+    let journal = Arc::new(InMemoryToolEffectJournalStore::default());
+    let runtime = runtime(policy.clone(), journal);
+    let registry = McpToolsAdapterRegistry::register(
+        runtime.as_ref(),
+        vec![server],
+        ToolRestriction {
+            bounds: policy.clone(),
+        },
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(registry.tool_count(), 1);
+    assert_eq!(
+        runtime
+            .model_tool_schemas()
+            .unwrap()
+            .into_iter()
+            .map(|schema| schema.name)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["mcp__http-mock__route".to_owned()])
+    );
+    let result = invoke_with_approval(
+        runtime.as_ref(),
+        ToolInvocation {
+            run_id: RunId::new("mcp-http-run"),
+            call_id: ToolCallId::new("http-call"),
+            tool_id: ToolId::new("mcp/http-mock/route/v1"),
+            arguments: json!({"region": "世界", "routing": {"priority": 7}}),
+        },
+        RunToolGrant {
+            bounds: policy.clone(),
+        },
+        CancellationToken::new(),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Completed { output: ToolOutput::Inline(ref output) },
+            cached: false,
+        } if output["server"] == json!("http-mock")
+            && output["tool"] == json!("route")
+            && output["result"]["content"][0]["text"] == json!("http-result")
+    ));
+
+    let captured = captured.await.unwrap();
+    assert_eq!(captured.len(), 3);
+    for request in &captured {
+        assert_eq!(
+            request
+                .headers
+                .get("mcp-protocol-version")
+                .map(String::as_str),
+            Some("2026-07-28")
+        );
+        assert_eq!(
+            request.headers.get("authorization").map(String::as_str),
+            Some("Bearer test-token")
+        );
+        assert_eq!(
+            request.body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+            json!("2026-07-28")
+        );
+    }
+    let call = &captured[2];
+    assert_eq!(
+        call.headers.get("mcp-method").map(String::as_str),
+        Some("tools/call")
+    );
+    assert_eq!(
+        call.headers.get("mcp-name").map(String::as_str),
+        Some("route")
+    );
+    assert_eq!(
+        call.headers.get("mcp-param-priority").map(String::as_str),
+        Some("7")
+    );
+    assert!(call
+        .headers
+        .get("mcp-param-region")
+        .is_some_and(|value| value.starts_with("=?base64?")));
+    assert_eq!(policy.network.allowed_targets.len(), 1);
+    assert_eq!(
+        policy.allowed_credentials,
+        BTreeSet::from(["env:MCP_HTTP_TOKEN".to_owned()])
+    );
+    registry.shutdown().await;
+}
+
+#[tokio::test]
+async fn streamable_http_cancellation_closes_the_request_and_records_unknown_effect() {
+    let (endpoint, call_observed, server_task) = spawn_cancellable_http_server().await;
+    let server = http_config(
+        StreamableHttpMcpTransportFactory::new(StreamableHttpMcpTransportConfig::unauthenticated(
+            endpoint,
+        ))
+        .unwrap(),
+        Duration::from_secs(30),
+    );
+    let policy = http_bounds(&server, 30_000);
+    let journal = Arc::new(InMemoryToolEffectJournalStore::default());
+    let runtime = runtime(policy.clone(), journal.clone());
+    let registry = McpToolsAdapterRegistry::register(
+        runtime.as_ref(),
+        vec![server],
+        ToolRestriction {
+            bounds: policy.clone(),
+        },
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let manager = registry.manager(&McpServerId::new("http-mock")).unwrap();
+    let cancellation = CancellationToken::new();
+    let task_runtime = runtime.clone();
+    let task_policy = policy.clone();
+    let task_cancellation = cancellation.clone();
+    let task = tokio::spawn(async move {
+        invoke_with_approval(
+            task_runtime.as_ref(),
+            ToolInvocation {
+                run_id: RunId::new("mcp-http-cancel-run"),
+                call_id: ToolCallId::new("http-cancel-call"),
+                tool_id: ToolId::new("mcp/http-mock/wait/v1"),
+                arguments: json!({}),
+            },
+            RunToolGrant {
+                bounds: task_policy,
+            },
+            task_cancellation,
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), call_observed)
+        .await
+        .expect("HTTP MCP call should be dispatched")
+        .unwrap();
+    cancellation.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("HTTP MCP cancellation should settle within one second")
+        .unwrap();
+    assert!(matches!(
+        result,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::UnknownEffect { .. },
+            cached: false,
+        }
+    ));
+    let key = ToolEffectKey::new(
+        RunId::new("mcp-http-cancel-run"),
+        ToolCallId::new("http-cancel-call"),
+    );
+    let records = journal.load_effect(&key).await.unwrap();
+    let projection = replay_tool_effect(&key, &records).unwrap().unwrap();
+    assert!(matches!(
+        projection.phase,
+        ToolEffectPhase::UnknownEffect { .. }
+    ));
+    assert!(tokio::time::timeout(Duration::from_secs(1), server_task)
+        .await
+        .expect("cancelled HTTP response stream should close within one second")
+        .unwrap());
+    assert_ne!(manager.health(), McpServerHealth::Ready);
+    registry.shutdown().await;
+}
+
+#[tokio::test]
 async fn one_server_process_publishes_filtered_tools_and_all_calls_use_guarded_runtime() {
     let marker = unique_path("mcp-process-marker");
     let script = format!(
@@ -156,10 +601,10 @@ while IFS= read -r line; do
       printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"supportedVersions":["2026-07-28"],"capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"mock","version":"1"}}}}}}'
       ;;
     *'"method":"tools/list"'*'"io.modelcontextprotocol/protocolVersion":"2026-07-28"'*'"cursor":"page-2"'*)
-      printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"resultType":"complete","tools":[{{"name":"beta","description":"beta","inputSchema":{{"type":"object","additionalProperties":false}}}}]}}}}'
+      printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"resultType":"complete","ttlMs":1000,"cacheScope":"private","tools":[{{"name":"beta","description":"beta","inputSchema":{{"type":"object","additionalProperties":false}}}}]}}}}'
       ;;
     *'"method":"tools/list"'*'"io.modelcontextprotocol/protocolVersion":"2026-07-28"'*)
-      printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"resultType":"complete","tools":[{{"name":"alpha","description":"alpha","inputSchema":{{"type":"object","additionalProperties":false}}}},{{"name":"hidden","inputSchema":{{"type":"object"}}}}],"nextCursor":"page-2"}}}}'
+      printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"resultType":"complete","ttlMs":1000,"cacheScope":"private","tools":[{{"name":"alpha","description":"alpha","inputSchema":{{"type":"object","additionalProperties":false}}}},{{"name":"hidden","inputSchema":{{"type":"object"}}}}],"nextCursor":"page-2"}}}}'
       ;;
     *'"method":"tools/call"'*'"name":"alpha"'*)
       printf C >> "{marker}"
@@ -269,7 +714,7 @@ while IFS= read -r line; do
       printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"supportedVersions":["2026-07-28"],"capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"mock","version":"1"}}}}}}'
       ;;
     *'"method":"tools/list"'*)
-      printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"resultType":"complete","tools":[{{"name":"large","description":"large","inputSchema":{{"type":"object","additionalProperties":false}}}}]}}}}'
+      printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"resultType":"complete","ttlMs":1000,"cacheScope":"private","tools":[{{"name":"large","description":"large","inputSchema":{{"type":"object","additionalProperties":false}}}}]}}}}'
       ;;
     *'"method":"tools/call"'*)
       printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"resultType":"complete","content":[{{"type":"text","text":"{large}"}}],"isError":false}}}}'

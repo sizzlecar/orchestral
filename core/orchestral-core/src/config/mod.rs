@@ -203,7 +203,7 @@ impl Default for McpConfig {
     }
 }
 
-/// Explicit stdio MCP server declaration. MCP tools enter through Tool Protocol.
+/// Explicit Host MCP server declaration. MCP tools enter through Tool Protocol.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpServerSpec {
@@ -212,11 +212,7 @@ pub struct McpServerSpec {
     pub enabled: bool,
     #[serde(default)]
     pub required: bool,
-    pub command: String,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub env: HashMap<String, String>,
+    pub transport: McpTransportSpec,
     #[serde(default)]
     pub startup_timeout_ms: Option<u64>,
     #[serde(default)]
@@ -225,6 +221,32 @@ pub struct McpServerSpec {
     pub enabled_tools: Vec<String>,
     #[serde(default)]
     pub disabled_tools: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum McpTransportSpec {
+    Stdio {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: HashMap<String, String>,
+    },
+    StreamableHttp {
+        endpoint: String,
+        #[serde(default)]
+        credential_headers: HashMap<String, McpCredentialHeaderSpec>,
+        #[serde(default)]
+        max_frame_bytes: Option<usize>,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpCredentialHeaderSpec {
+    /// Environment variable resolved only by the application composition root.
+    pub env: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

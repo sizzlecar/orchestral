@@ -34,3 +34,4 @@ libc = "0.2"
 [dev-dependencies]
 tokio-test = { workspace = true }
 orchestral-agent-protocol-testkit = { path = "../../testing/orchestral-agent-protocol-testkit" }
+orchestral-mcp-streamable-http = { path = "../../plugins/orchestral-mcp-streamable-http" }

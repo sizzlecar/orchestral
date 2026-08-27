@@ -4,7 +4,7 @@ use std::path::Path;
 
 use thiserror::Error;
 
-use super::{OrchestralConfig, ProvidersConfig};
+use super::{McpTransportSpec, OrchestralConfig, ProvidersConfig};
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -135,11 +135,31 @@ fn validate_providers(config: &OrchestralConfig) -> Result<(), ConfigError> {
 fn validate_mcp(config: &OrchestralConfig) -> Result<(), ConfigError> {
     let mut names = HashSet::new();
     for server in &config.mcp.servers {
-        if server.name.trim().is_empty() || server.command.trim().is_empty() {
-            return invalid("MCP server name and stdio command must not be empty");
+        if server.name.trim().is_empty() {
+            return invalid("MCP server name must not be empty");
         }
         if !names.insert(server.name.as_str()) {
             return invalid(format!("duplicate MCP server '{}'", server.name));
+        }
+        match &server.transport {
+            McpTransportSpec::Stdio { command, .. } if command.trim().is_empty() => {
+                return invalid("MCP stdio command must not be empty")
+            }
+            McpTransportSpec::StreamableHttp {
+                endpoint,
+                credential_headers,
+                max_frame_bytes,
+            } => {
+                if endpoint.trim().is_empty()
+                    || *max_frame_bytes == Some(0)
+                    || credential_headers.iter().any(|(header, credential)| {
+                        header.trim().is_empty() || credential.env.trim().is_empty()
+                    })
+                {
+                    return invalid("MCP Streamable HTTP declaration is invalid");
+                }
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -173,5 +193,43 @@ mod tests {
             validate_config(&config),
             Err(ConfigError::Invalid(message)) if message.contains("allowed_programs")
         ));
+    }
+
+    #[test]
+    fn tagged_stdio_and_streamable_http_mcp_transports_are_valid() {
+        let config = serde_yaml::from_str::<OrchestralConfig>(
+            r#"
+mcp:
+  servers:
+    - name: local
+      transport:
+        type: stdio
+        command: /bin/echo
+        args: [--stdio]
+    - name: remote
+      transport:
+        type: streamable_http
+        endpoint: https://example.com/mcp
+        credential_headers:
+          Authorization:
+            env: MCP_TOKEN
+"#,
+        )
+        .unwrap();
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn flat_legacy_mcp_command_surface_is_rejected() {
+        let error = serde_yaml::from_str::<OrchestralConfig>(
+            r#"
+mcp:
+  servers:
+    - name: legacy
+      command: /bin/echo
+"#,
+        )
+        .expect_err("MCP transport must use the tagged transport contract");
+        assert!(error.to_string().contains("transport"));
     }
 }

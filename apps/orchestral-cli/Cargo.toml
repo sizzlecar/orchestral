@@ -17,6 +17,7 @@ orchestral-agent-journal-fs = { path = "../../plugins/orchestral-agent-journal-f
 orchestral-blob-fs = { path = "../../plugins/orchestral-blob-fs" }
 orchestral-model-gemini = { workspace = true }
 orchestral-model-openai = { workspace = true }
+orchestral-mcp-streamable-http = { path = "../../plugins/orchestral-mcp-streamable-http" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

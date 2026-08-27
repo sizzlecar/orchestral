@@ -1,6 +1,6 @@
 //! Minimal command-line composition root for the provider-neutral Generic Agent.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,9 +21,11 @@ use orchestral_core::agent_protocol::{
     },
 };
 use orchestral_core::agent_session::{AgentSessionJournalStore, InMemoryAgentSessionJournalStore};
-use orchestral_core::config::{load_config, BackendSpec, ModelProfile, OrchestralConfig};
+use orchestral_core::config::{
+    load_config, BackendSpec, McpTransportSpec, ModelProfile, OrchestralConfig,
+};
 use orchestral_core::io::BlobStore;
-use orchestral_core::mcp_protocol::McpServerId;
+use orchestral_core::mcp_protocol::{McpServerId, McpTransportFactory};
 use orchestral_core::model_protocol::ModelBackend;
 use orchestral_core::skill_protocol::{
     SkillSourceKind, SkillTrustLevel, SKILL_CATALOG_RESOURCE_KIND_V1,
@@ -33,6 +35,10 @@ use orchestral_core::tool_protocol::{
     ApprovalPolicy, EffectScope, EnvironmentPolicy, FilesystemPolicy, HostApprovalVerifier,
     HostToolPolicy, InMemoryApprovalCapabilityStore, NetworkPolicy, ProcessPolicy, RunToolGrant,
     SandboxPolicy, ToolPolicyBounds, ToolRestriction,
+};
+use orchestral_mcp_streamable_http::{
+    ResolvedCredentialHeader, StreamableHttpMcpTransportConfig, StreamableHttpMcpTransportFactory,
+    DEFAULT_MAX_MCP_HTTP_FRAME_BYTES,
 };
 use orchestral_model_gemini::{GeminiModelBackend, GeminiModelConfig};
 use orchestral_model_openai::{OpenAiCompatibleBackend, OpenAiCompatibleConfig};
@@ -285,7 +291,10 @@ fn build_cli_tool_runtime(
     let workspace = workspace.to_string_lossy().to_string();
     let shell_programs = configured_shell_programs(config)?;
     let shell_enabled = !shell_programs.is_empty();
-    let mcp_enabled = !mcp_configs.is_empty();
+    let mcp_effects = mcp_configs
+        .iter()
+        .flat_map(GuardedMcpServerConfig::effect_scopes)
+        .collect::<BTreeSet<_>>();
     let mut allowed_programs = shell_programs.clone();
     allowed_programs.extend(
         mcp_configs
@@ -302,24 +311,20 @@ fn build_cli_tool_runtime(
             EffectScope::ExternalSideEffect,
         ]);
     }
-    if mcp_enabled {
-        allowed_effects.extend([
-            EffectScope::Process,
-            EffectScope::FilesystemWrite,
-            EffectScope::ExternalSideEffect,
-        ]);
-    }
-    if mcp_configs
-        .iter()
-        .any(|server| !server.environment_names().is_empty())
-    {
-        allowed_effects.insert(EffectScope::SecretRead);
-    }
+    allowed_effects.extend(mcp_effects.iter().copied());
     let allowed_environment = mcp_configs
         .iter()
         .flat_map(GuardedMcpServerConfig::environment_names)
         .collect();
-    let writable_roots = if shell_enabled || mcp_enabled {
+    let allowed_network_targets = mcp_configs
+        .iter()
+        .flat_map(GuardedMcpServerConfig::allowed_network_targets)
+        .collect();
+    let allowed_credentials = mcp_configs
+        .iter()
+        .flat_map(GuardedMcpServerConfig::credential_references)
+        .collect();
+    let writable_roots = if shell_enabled || mcp_effects.contains(&EffectScope::FilesystemWrite) {
         BTreeSet::from([workspace.clone()])
     } else {
         BTreeSet::new()
@@ -343,12 +348,14 @@ fn build_cli_tool_runtime(
             readable_roots: BTreeSet::from([workspace.clone()]),
             writable_roots,
         },
-        network: NetworkPolicy::default(),
+        network: NetworkPolicy {
+            allowed_targets: allowed_network_targets,
+        },
         environment: EnvironmentPolicy {
             allowed_variables: allowed_environment,
             inherit_host_environment: false,
         },
-        allowed_credentials: BTreeSet::new(),
+        allowed_credentials,
         max_timeout_ms: Some(config.tools.max_timeout_ms),
         max_output_bytes: Some(config.tools.max_output_bytes),
     };
@@ -579,8 +586,8 @@ fn configured_shell_programs(config: &OrchestralConfig) -> anyhow::Result<BTreeS
     Ok(resolved)
 }
 
-/// MCP and Skill remain distinct resources. This adapter accepts only explicit
-/// stdio MCP servers and publishes their discovered methods as guarded Tools.
+/// MCP and Skill remain distinct resources. Only explicit Host MCP transports
+/// are composed here; discovered methods publish as guarded Tools.
 fn configured_mcp_servers(
     config: &OrchestralConfig,
 ) -> anyhow::Result<Vec<GuardedMcpServerConfig>> {
@@ -589,28 +596,65 @@ fn configured_mcp_servers(
     }
     let mut servers = Vec::new();
     for spec in config.mcp.servers.iter().filter(|server| server.enabled) {
-        let program = match resolve_host_program(&spec.command) {
-            Ok(program) => program,
+        let transport = (|| -> anyhow::Result<Arc<dyn McpTransportFactory>> {
+            match &spec.transport {
+                McpTransportSpec::Stdio { command, args, env } => {
+                    let program = resolve_host_program(command)?;
+                    Ok(Arc::new(StdioMcpTransportFactory::new(
+                        PathBuf::from(program),
+                        args.clone(),
+                        env.iter()
+                            .map(|(key, value)| (key.clone(), value.clone()))
+                            .collect(),
+                    )?))
+                }
+                McpTransportSpec::StreamableHttp {
+                    endpoint,
+                    credential_headers,
+                    max_frame_bytes,
+                } => {
+                    let mut resolved = BTreeMap::new();
+                    for (header, credential) in credential_headers {
+                        let env_name = credential.env.trim();
+                        let value = std::env::var(env_name).with_context(|| {
+                            format!(
+                                "resolve credential environment variable '{env_name}' for header '{header}'"
+                            )
+                        })?;
+                        resolved.insert(
+                            header.clone(),
+                            ResolvedCredentialHeader {
+                                reference: format!("env:{env_name}"),
+                                value,
+                            },
+                        );
+                    }
+                    Ok(Arc::new(StreamableHttpMcpTransportFactory::new(
+                        StreamableHttpMcpTransportConfig {
+                            endpoint: endpoint.clone(),
+                            credential_headers: resolved,
+                            max_frame_bytes: max_frame_bytes
+                                .unwrap_or(DEFAULT_MAX_MCP_HTTP_FRAME_BYTES),
+                        },
+                    )?))
+                }
+            }
+        })();
+        let transport = match transport {
+            Ok(transport) => transport,
             Err(error) if !spec.required => {
-                tracing::warn!(server = spec.name, %error, "optional MCP command was unavailable");
+                tracing::warn!(server = spec.name, %error, "optional MCP transport was unavailable");
                 continue;
             }
             Err(error) => {
                 return Err(error)
-                    .with_context(|| format!("resolve required MCP server '{}'", spec.name))
+                    .with_context(|| format!("compose required MCP server '{}'", spec.name))
             }
         };
         let server = GuardedMcpServerConfig {
             server_id: McpServerId::new(spec.name.trim()),
             required: spec.required,
-            transport: Arc::new(StdioMcpTransportFactory::new(
-                PathBuf::from(program),
-                spec.args.clone(),
-                spec.env
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect(),
-            )?),
+            transport,
             startup_timeout: Duration::from_millis(spec.startup_timeout_ms.unwrap_or(15_000)),
             tool_timeout: Duration::from_millis(spec.tool_timeout_ms.unwrap_or(20_000)),
             enabled_tools: spec.enabled_tools.iter().cloned().collect(),

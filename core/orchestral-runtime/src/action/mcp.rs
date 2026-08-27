@@ -28,6 +28,201 @@ use crate::tool_runtime::{
 };
 
 const DEFAULT_MCP_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SAFE_MCP_HEADER_INTEGER: u64 = 9_007_199_254_740_991;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpHeaderValueKind {
+    String,
+    Integer,
+    Boolean,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct McpHeaderBinding {
+    property_path: Vec<String>,
+    header_suffix: String,
+    value_kind: McpHeaderValueKind,
+}
+
+fn compile_mcp_header_bindings(schema: &Value) -> Result<Vec<McpHeaderBinding>, String> {
+    if !schema.is_object() {
+        return Err("MCP Tool inputSchema must be an object".to_owned());
+    }
+    let mut bindings = Vec::new();
+    let mut header_names = BTreeSet::new();
+    scan_mcp_header_annotations(schema, &[], true, &mut header_names, &mut bindings)?;
+    bindings.sort_by(|left, right| {
+        left.header_suffix
+            .to_ascii_lowercase()
+            .cmp(&right.header_suffix.to_ascii_lowercase())
+            .then_with(|| left.property_path.cmp(&right.property_path))
+    });
+    Ok(bindings)
+}
+
+fn scan_mcp_header_annotations(
+    value: &Value,
+    property_path: &[String],
+    statically_reachable: bool,
+    header_names: &mut BTreeSet<String>,
+    bindings: &mut Vec<McpHeaderBinding>,
+) -> Result<(), String> {
+    match value {
+        Value::Object(object) => {
+            if let Some(annotation) = object.get("x-mcp-header") {
+                if !statically_reachable || property_path.is_empty() {
+                    return Err(
+                        "x-mcp-header is not on a property statically reachable from the schema root"
+                            .to_owned(),
+                    );
+                }
+                let header_suffix = annotation.as_str().ok_or_else(|| {
+                    "x-mcp-header must be a non-empty HTTP field-name token".to_owned()
+                })?;
+                if !is_mcp_http_token(header_suffix) {
+                    return Err(format!(
+                        "x-mcp-header '{header_suffix}' is not an HTTP field-name token"
+                    ));
+                }
+                if !header_names.insert(header_suffix.to_ascii_lowercase()) {
+                    return Err(format!(
+                        "x-mcp-header '{header_suffix}' is not case-insensitively unique"
+                    ));
+                }
+                let value_kind = match object.get("type").and_then(Value::as_str) {
+                    Some("string") => McpHeaderValueKind::String,
+                    Some("integer") => McpHeaderValueKind::Integer,
+                    Some("boolean") => McpHeaderValueKind::Boolean,
+                    _ => {
+                        return Err(format!(
+                        "x-mcp-header '{header_suffix}' must annotate string, integer, or boolean"
+                    ))
+                    }
+                };
+                bindings.push(McpHeaderBinding {
+                    property_path: property_path.to_vec(),
+                    header_suffix: header_suffix.to_owned(),
+                    value_kind,
+                });
+            }
+
+            for (keyword, child) in object {
+                if keyword == "properties" && statically_reachable {
+                    let properties = child.as_object().ok_or_else(|| {
+                        "JSON Schema properties containing x-mcp-header must be an object"
+                            .to_owned()
+                    })?;
+                    for (name, property_schema) in properties {
+                        let mut child_path = property_path.to_vec();
+                        child_path.push(name.clone());
+                        scan_mcp_header_annotations(
+                            property_schema,
+                            &child_path,
+                            true,
+                            header_names,
+                            bindings,
+                        )?;
+                    }
+                } else if keyword != "x-mcp-header" {
+                    scan_mcp_header_annotations(
+                        child,
+                        property_path,
+                        false,
+                        header_names,
+                        bindings,
+                    )?;
+                }
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                scan_mcp_header_annotations(child, property_path, false, header_names, bindings)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn is_mcp_http_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+fn build_mcp_parameter_headers(
+    bindings: &[McpHeaderBinding],
+    arguments: &Value,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut headers = BTreeMap::new();
+    for binding in bindings {
+        let mut value = arguments;
+        let mut missing = false;
+        for segment in &binding.property_path {
+            let Some(next) = value.as_object().and_then(|object| object.get(segment)) else {
+                missing = true;
+                break;
+            };
+            value = next;
+        }
+        if missing || value.is_null() {
+            continue;
+        }
+        let value = match binding.value_kind {
+            McpHeaderValueKind::String => value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| invalid_mcp_header_value(binding))?,
+            McpHeaderValueKind::Boolean => value
+                .as_bool()
+                .map(|value| value.to_string())
+                .ok_or_else(|| invalid_mcp_header_value(binding))?,
+            McpHeaderValueKind::Integer => canonical_safe_mcp_integer(value)
+                .ok_or_else(|| invalid_mcp_header_value(binding))?,
+        };
+        headers.insert(binding.header_suffix.clone(), value);
+    }
+    Ok(headers)
+}
+
+fn canonical_safe_mcp_integer(value: &Value) -> Option<String> {
+    if let Some(value) = value.as_i64() {
+        if value.unsigned_abs() <= MAX_SAFE_MCP_HEADER_INTEGER {
+            return Some(value.to_string());
+        }
+    } else if let Some(value) = value.as_u64() {
+        if value <= MAX_SAFE_MCP_HEADER_INTEGER {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn invalid_mcp_header_value(binding: &McpHeaderBinding) -> String {
+    format!(
+        "MCP Tool argument at '{}' does not match x-mcp-header '{}' primitive type or safe integer range",
+        binding.property_path.join("."),
+        binding.header_suffix
+    )
+}
 
 /// Built-in stdio transport factory. External transports implement the core
 /// [`McpTransportFactory`] SPI from a plugin and are injected by the Host.
@@ -238,6 +433,7 @@ impl McpServerHealth {
 pub struct McpServerConnectionManager {
     config: GuardedMcpServerConfig,
     snapshot: McpServerSnapshot,
+    parameter_headers: BTreeMap<String, Vec<McpHeaderBinding>>,
     session: tokio::sync::Mutex<Option<McpTransportSession>>,
     connection_generation: AtomicU64,
     health: AtomicU64,
@@ -249,10 +445,12 @@ impl McpServerConnectionManager {
         cancellation: CancellationToken,
     ) -> Result<Arc<Self>, McpToolsAdapterError> {
         config.validate()?;
-        let (session, snapshot) = discover_guarded_mcp_session(&config, &cancellation).await?;
+        let (session, snapshot, parameter_headers) =
+            discover_guarded_mcp_session(&config, &cancellation).await?;
         Ok(Arc::new(Self {
             config,
             snapshot,
+            parameter_headers,
             session: tokio::sync::Mutex::new(Some(session)),
             connection_generation: AtomicU64::new(1),
             health: AtomicU64::new(McpServerHealth::Ready.encode()),
@@ -292,6 +490,14 @@ impl McpServerConnectionManager {
                 "MCP Tool '{tool_name}' is outside the pinned Host snapshot/filter"
             )));
         }
+        let parameter_headers = build_mcp_parameter_headers(
+            self.parameter_headers
+                .get(tool_name)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            &arguments,
+        )
+        .map_err(GuardedMcpCallError::Rejected)?;
         let mut guard = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(GuardedMcpCallError::Cancelled),
@@ -300,11 +506,13 @@ impl McpServerConnectionManager {
         if guard.is_none() {
             self.health
                 .store(McpServerHealth::Connecting.encode(), Ordering::Release);
-            let (mut session, current_snapshot) =
+            let (mut session, current_snapshot, current_parameter_headers) =
                 discover_guarded_mcp_session(&self.config, &cancellation)
                     .await
                     .map_err(|error| GuardedMcpCallError::Failed(error.to_string()))?;
-            if current_snapshot.revision != self.snapshot.revision {
+            if current_snapshot.revision != self.snapshot.revision
+                || current_parameter_headers != self.parameter_headers
+            {
                 let _ = session.shutdown().await;
                 self.health
                     .store(McpServerHealth::Degraded.encode(), Ordering::Release);
@@ -333,7 +541,7 @@ impl McpServerConnectionManager {
                     session.request(
                         "tools/call",
                         json!({"name": tool_name, "arguments": arguments}),
-                        BTreeMap::new(),
+                        parameter_headers,
                         exchange_cancellation.clone(),
                     ),
                 ) => match result {
@@ -490,7 +698,14 @@ async fn spawn_guarded_mcp_session(
 async fn discover_guarded_mcp_session(
     config: &GuardedMcpServerConfig,
     cancellation: &CancellationToken,
-) -> Result<(McpTransportSession, McpServerSnapshot), McpToolsAdapterError> {
+) -> Result<
+    (
+        McpTransportSession,
+        McpServerSnapshot,
+        BTreeMap<String, Vec<McpHeaderBinding>>,
+    ),
+    McpToolsAdapterError,
+> {
     let mut session = connect_guarded_mcp_session(config, cancellation).await?;
     let listed = tokio::select! {
         biased;
@@ -521,7 +736,7 @@ async fn discover_guarded_mcp_session(
         .map_err(mcp_request_adapter_error)?
         .clone();
     match parse_guarded_tool_snapshot(config, &negotiated, &listed) {
-        Ok(snapshot) => Ok((session, snapshot)),
+        Ok((snapshot, parameter_headers)) => Ok((session, snapshot, parameter_headers)),
         Err(error) => {
             let _ = session.shutdown().await;
             Err(error)
@@ -570,6 +785,9 @@ async fn list_all_mcp_tools(
             }
             None => return Err("stateless MCP tools/list omitted resultType".to_owned()),
         }
+        if stateless {
+            validate_stateless_cache_hint(&result)?;
+        }
         let page = result
             .get("tools")
             .and_then(Value::as_array)
@@ -592,11 +810,26 @@ async fn list_all_mcp_tools(
     ))
 }
 
+fn validate_stateless_cache_hint(result: &Value) -> Result<(), String> {
+    if result.get("ttlMs").and_then(Value::as_u64).is_none()
+        || !matches!(
+            result.get("cacheScope").and_then(Value::as_str),
+            Some("public" | "private")
+        )
+    {
+        return Err(
+            "stateless MCP tools/list requires non-negative ttlMs and public/private cacheScope"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
 fn parse_guarded_tool_snapshot(
     config: &GuardedMcpServerConfig,
     negotiated: &NegotiatedMcpProtocol,
     result: &Value,
-) -> Result<McpServerSnapshot, McpToolsAdapterError> {
+) -> Result<(McpServerSnapshot, BTreeMap<String, Vec<McpHeaderBinding>>), McpToolsAdapterError> {
     let tools = result
         .get("tools")
         .and_then(Value::as_array)
@@ -605,6 +838,7 @@ fn parse_guarded_tool_snapshot(
         })?;
     let mut names = BTreeSet::new();
     let mut snapshots = Vec::new();
+    let mut parameter_headers = BTreeMap::new();
     for raw in tools {
         let name = raw
             .get("name")
@@ -625,20 +859,38 @@ fn parse_guarded_tool_snapshot(
                 config.server_id
             )));
         }
+        let input_schema = raw
+            .get("inputSchema")
+            .cloned()
+            .unwrap_or_else(|| json!({"type": "object"}));
+        if config.transport_kind() == McpTransportKind::StreamableHttp {
+            match compile_mcp_header_bindings(&input_schema) {
+                Ok(bindings) => {
+                    parameter_headers.insert(name.to_owned(), bindings);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        server = %config.server_id,
+                        tool = name,
+                        %error,
+                        "excluding MCP Tool with invalid x-mcp-header annotation"
+                    );
+                    continue;
+                }
+            }
+        }
         snapshots.push(
             McpToolSnapshot::seal(
                 config.server_id.clone(),
                 name,
                 raw.get("description").and_then(Value::as_str).unwrap_or(""),
-                raw.get("inputSchema")
-                    .cloned()
-                    .unwrap_or_else(|| json!({"type": "object"})),
+                input_schema,
                 raw.get("outputSchema").cloned(),
             )
             .map_err(|error| McpToolsAdapterError::Protocol(error.to_string()))?,
         );
     }
-    McpServerSnapshot::seal(
+    let snapshot = McpServerSnapshot::seal(
         config.server_id.clone(),
         config.transport_kind(),
         config.transport.authority().binding_digest.clone(),
@@ -646,7 +898,8 @@ fn parse_guarded_tool_snapshot(
         negotiated.era,
         snapshots,
     )
-    .map_err(|error| McpToolsAdapterError::Protocol(error.to_string()))
+    .map_err(|error| McpToolsAdapterError::Protocol(error.to_string()))?;
+    Ok((snapshot, parameter_headers))
 }
 
 fn mcp_request_adapter_error(error: McpRequestError) -> McpToolsAdapterError {
@@ -1527,4 +1780,93 @@ async fn terminate_mcp_process_tree(child: &mut Child, process_group_id: Option<
     let _ = process_group_id;
     let _ = child.kill().await;
     let _ = timeout(Duration::from_secs(1), child.wait()).await;
+}
+
+#[cfg(test)]
+mod mcp_header_tests {
+    use super::*;
+
+    #[test]
+    fn nested_static_property_headers_compile_and_extract_canonically() {
+        let bindings = compile_mcp_header_bindings(&json!({
+            "type": "object",
+            "properties": {
+                "region": {"type": "string", "x-mcp-header": "Region"},
+                "routing": {
+                    "type": "object",
+                    "properties": {
+                        "priority": {"type": "integer", "x-mcp-header": "Priority"},
+                        "dryRun": {"type": "boolean", "x-mcp-header": "Dry-Run"}
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let headers = build_mcp_parameter_headers(
+            &bindings,
+            &json!({
+                "region": "us-west1",
+                "routing": {"priority": -7, "dryRun": true}
+            }),
+        )
+        .unwrap();
+        assert_eq!(headers.get("Region").map(String::as_str), Some("us-west1"));
+        assert_eq!(headers.get("Priority").map(String::as_str), Some("-7"));
+        assert_eq!(headers.get("Dry-Run").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn non_static_duplicate_and_non_primitive_annotations_are_rejected() {
+        let invalid = [
+            json!({
+                "type": "object",
+                "properties": {"values": {"type": "array", "items": {
+                    "type": "string", "x-mcp-header": "Item"
+                }}}
+            }),
+            json!({
+                "type": "object",
+                "allOf": [{"properties": {"value": {
+                    "type": "string", "x-mcp-header": "Value"
+                }}}]
+            }),
+            json!({
+                "type": "object",
+                "properties": {
+                    "left": {"type": "string", "x-mcp-header": "Route"},
+                    "right": {"type": "string", "x-mcp-header": "route"}
+                }
+            }),
+            json!({
+                "type": "object",
+                "properties": {"ratio": {"type": "number", "x-mcp-header": "Ratio"}}
+            }),
+            json!({
+                "type": "object",
+                "properties": {"value": {"type": "string", "x-mcp-header": "bad header"}}
+            }),
+        ];
+        for schema in invalid {
+            assert!(compile_mcp_header_bindings(&schema).is_err());
+        }
+    }
+
+    #[test]
+    fn header_integer_extraction_enforces_the_javascript_safe_range() {
+        let bindings = compile_mcp_header_bindings(&json!({
+            "type": "object",
+            "properties": {"value": {"type": "integer", "x-mcp-header": "Value"}}
+        }))
+        .unwrap();
+        assert!(build_mcp_parameter_headers(
+            &bindings,
+            &json!({"value": MAX_SAFE_MCP_HEADER_INTEGER})
+        )
+        .is_ok());
+        assert!(build_mcp_parameter_headers(
+            &bindings,
+            &json!({"value": MAX_SAFE_MCP_HEADER_INTEGER + 1})
+        )
+        .is_err());
+    }
 }
