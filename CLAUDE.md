@@ -16,7 +16,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 Run one Agent turn:
 
 ```bash
-cargo run -p orchestral-cli -- agent "your request"
+cargo run -p orchestral-cli -- "your request"
 ```
 
 Omit the request to start an interactive Session. A provider key such as

@@ -1,5 +1,6 @@
 [package]
 name = "orchestral-cli"
+autobins = false
 description = "Provider-neutral conversational Agent command line interface"
 version.workspace = true
 edition.workspace = true
@@ -9,6 +10,10 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 readme = "../../README.md"
+
+[[bin]]
+name = "orchestral"
+path = "src/main.rs"
 
 [dependencies]
 orchestral-core = { workspace = true }

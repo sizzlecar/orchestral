@@ -1,7 +1,7 @@
 use std::env;
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::Parser;
 
 use crate::envfile::load_env_file;
 use crate::runtime::ModelOverrides;
@@ -13,18 +13,6 @@ use crate::runtime::ModelOverrides;
     version
 )]
 pub struct Cli {
-    #[command(subcommand)]
-    command: Option<Command>,
-}
-
-#[derive(Debug, Subcommand)]
-enum Command {
-    /// Start an Agent conversation, optionally with one initial turn
-    Agent(AgentArgs),
-}
-
-#[derive(Debug, Args, Clone, Default)]
-struct AgentArgs {
     #[arg(long)]
     config: Option<PathBuf>,
     #[arg(long)]
@@ -53,7 +41,7 @@ struct AgentArgs {
     input: Vec<String>,
 }
 
-impl AgentArgs {
+impl Cli {
     fn model_overrides(&self) -> ModelOverrides {
         ModelOverrides {
             backend: self.backend.clone(),
@@ -62,27 +50,21 @@ impl AgentArgs {
             temperature: self.temperature,
         }
     }
-}
 
-impl Cli {
     pub async fn run(self) -> anyhow::Result<()> {
-        let args = match self.command {
-            Some(Command::Agent(args)) => args,
-            None => AgentArgs::default(),
-        };
-        if let Some(env_file) = &args.env_file {
+        if let Some(env_file) = &self.env_file {
             load_env_file(env_file)?;
         }
-        ensure_log_filter(args.verbose);
-        let model_overrides = args.model_overrides();
+        ensure_log_filter(self.verbose);
+        let model_overrides = self.model_overrides();
         crate::agent::run(crate::agent::AgentRunOptions {
-            config: args.config,
+            config: self.config,
             model_overrides,
-            session_id: args.session_id,
-            system_prompt: args.system_prompt,
-            input: (!args.input.is_empty()).then(|| args.input.join(" ")),
-            no_mcp: args.no_mcp,
-            no_skills: args.no_skills,
+            session_id: self.session_id,
+            system_prompt: self.system_prompt,
+            input: (!self.input.is_empty()).then(|| self.input.join(" ")),
+            no_mcp: self.no_mcp,
+            no_skills: self.no_skills,
         })
         .await
     }
@@ -96,20 +78,15 @@ fn ensure_log_filter(verbose: bool) {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
-    use super::{Cli, Command};
+    use super::Cli;
 
     #[test]
-    fn agent_is_the_only_explicit_conversation_entrypoint() {
-        let parsed = Cli::try_parse_from(["orchestral", "agent", "inspect this repository"])
-            .expect("the Agent entrypoint must parse");
-        let Some(Command::Agent(args)) = parsed.command else {
-            panic!("explicit Agent command must select the Agent surface");
-        };
-        assert_eq!(args.input, ["inspect this repository"]);
-
-        assert!(Cli::try_parse_from(["orchestral", "run", "legacy input"]).is_err());
-        assert!(Cli::try_parse_from(["orchestral", "scenario"]).is_err());
+    fn root_command_is_the_agent_entrypoint() {
+        let parsed = Cli::try_parse_from(["orchestral", "inspect this repository"])
+            .expect("a positional prompt must start the Agent directly");
+        assert_eq!(parsed.input, ["inspect this repository"]);
+        assert_eq!(Cli::command().get_subcommands().count(), 0);
     }
 }
