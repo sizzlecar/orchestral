@@ -22,8 +22,8 @@ use orchestral_core::agent_protocol::{
         AgentProviderId, AgentProviderStreamItem, AgentRejection, AgentRejectionCode,
         AgentStartRequest, AgentTelemetry, AgentTelemetryEnvelope, ApprovalDecision,
         ArtifactRefWithDigest, BindingRequirement, CancelSupport, CommandId, Content, ContentBody,
-        ControlCapabilities, DeliveryId, Digest, EffectMediation, IncompleteReason, OutputId,
-        PartialDelivery, PartialDeliveryId, PendingRequest, PendingRequestKind,
+        ControlCapabilities, DeliveryId, Digest, EffectMediation, IncompleteReason, MoneyAmount,
+        OutputId, PartialDelivery, PartialDeliveryId, PendingRequest, PendingRequestKind,
         PendingRequestPayload, Provenance, ProviderCommandDisposition, ProviderCommandOutcome,
         RequestId, RequestResolution, ResourceBindingMode, ResourceBindingSkip,
         ResourceBindingSkipCode, ResourceCapability, ResourceKind, RunId, RunLimitKind,
@@ -77,6 +77,90 @@ const RUN_STOP_RUNNING: u8 = 0;
 const RUN_STOP_HOST_CANCEL: u8 = 1;
 const RUN_STOP_DEADLINE: u8 = 2;
 const RUN_STOP_COMPLETING: u8 = 3;
+const TOKENS_PER_MILLION: u128 = 1_000_000;
+
+/// Host-owned, provider-neutral token pricing used to enforce a Run cost
+/// ceiling before a model request is dispatched. Providers with cached,
+/// tiered, or otherwise non-linear pricing must leave this unset until an
+/// equivalent conservative policy is available.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelCostPolicy {
+    pub currency: String,
+    pub input_microunits_per_million_tokens: u64,
+    pub output_microunits_per_million_tokens: u64,
+}
+
+impl ModelCostPolicy {
+    pub fn new(
+        currency: impl Into<String>,
+        input_microunits_per_million_tokens: u64,
+        output_microunits_per_million_tokens: u64,
+    ) -> Result<Self, AgentProtocolError> {
+        let policy = Self {
+            currency: currency.into(),
+            input_microunits_per_million_tokens,
+            output_microunits_per_million_tokens,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    fn validate(&self) -> Result<(), AgentProtocolError> {
+        if self.currency.len() != 3
+            || !self.currency.bytes().all(|byte| byte.is_ascii_uppercase())
+            || (self.input_microunits_per_million_tokens == 0
+                && self.output_microunits_per_million_tokens == 0)
+        {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidSpec,
+                "model cost policy requires an uppercase currency and at least one positive rate",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn quote(&self, input_tokens: u64, output_tokens: u64) -> MoneyAmount {
+        let input = u128::from(input_tokens)
+            .saturating_mul(u128::from(self.input_microunits_per_million_tokens));
+        let output = u128::from(output_tokens)
+            .saturating_mul(u128::from(self.output_microunits_per_million_tokens));
+        let microunits = input
+            .saturating_add(output)
+            .div_ceil(TOKENS_PER_MILLION)
+            .min(u128::from(u64::MAX)) as u64;
+        MoneyAmount {
+            currency: self.currency.clone(),
+            microunits,
+        }
+    }
+
+    fn max_output_tokens_within(
+        &self,
+        input_tokens: u64,
+        output_tokens: u64,
+        ceiling: &MoneyAmount,
+    ) -> Option<u64> {
+        if ceiling.currency != self.currency
+            || self.quote(input_tokens, 0).microunits > ceiling.microunits
+        {
+            return None;
+        }
+        if self.output_microunits_per_million_tokens == 0 {
+            return Some(output_tokens);
+        }
+        let mut low = 0_u64;
+        let mut high = output_tokens;
+        while low < high {
+            let candidate = low.saturating_add(high).saturating_add(1) / 2;
+            if self.quote(input_tokens, candidate).microunits <= ceiling.microunits {
+                low = candidate;
+            } else {
+                high = candidate.saturating_sub(1);
+            }
+        }
+        Some(low)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct GenericAgentConfig {
@@ -89,6 +173,7 @@ pub struct GenericAgentConfig {
     pub history_limit: usize,
     pub max_context_tokens: u64,
     pub reserved_output_tokens: u64,
+    pub model_cost_policy: Option<ModelCostPolicy>,
 }
 
 impl GenericAgentConfig {
@@ -103,6 +188,7 @@ impl GenericAgentConfig {
             history_limit: 128,
             max_context_tokens: 128 * 1024,
             reserved_output_tokens: 4 * 1024,
+            model_cost_policy: None,
         }
     }
 }
@@ -565,6 +651,9 @@ impl InternalGenericAgentProvider {
                 "Generic Agent buffers and loop limits must be non-zero",
             ));
         }
+        if let Some(policy) = &config.model_cost_policy {
+            policy.validate()?;
+        }
         let has_tools = tools.is_some();
         let has_input_requests = model_descriptor.capabilities.tool_calls;
         let has_approval = tools
@@ -575,9 +664,13 @@ impl InternalGenericAgentProvider {
             RunLimitKind::Deadline,
             RunLimitKind::ModelSteps,
             RunLimitKind::InputTokens,
+            RunLimitKind::OutputTokens,
         ]);
         if has_tools {
             supported_limits.insert(RunLimitKind::ToolCalls);
+        }
+        if config.model_cost_policy.is_some() {
+            supported_limits.insert(RunLimitKind::Cost);
         }
         let descriptor = AgentDescriptorEnvelope::seal(AgentDescriptor {
             provider_id: config.provider_id.clone(),
@@ -707,6 +800,20 @@ impl AgentProvider for InternalGenericAgentProvider {
             .descriptor
             .check_run_compatibility(&request.run)
             .map_err(AgentStartError::Rejected)?;
+        if let (Some(limit), Some(policy)) = (
+            request.run.spec.limits.max_cost.as_ref(),
+            self.inner.config.model_cost_policy.as_ref(),
+        ) {
+            if limit.currency != policy.currency {
+                return Err(Self::rejection(
+                    AgentRejectionCode::UnsupportedCapability,
+                    format!(
+                        "cost limit currency {} does not match configured model pricing currency {}",
+                        limit.currency, policy.currency
+                    ),
+                ));
+            }
+        }
         let run_skills = resolve_run_skill_binding(
             self.inner.skills.as_ref(),
             &request,
@@ -809,6 +916,7 @@ impl AgentProvider for InternalGenericAgentProvider {
             &model_definitions,
             run_skills.as_deref(),
             Some(user_message.clone()),
+            None,
             None,
         )
         .await;
@@ -2341,6 +2449,18 @@ fn recovered_approval_response(
     })
 }
 
+fn recovered_model_output_tokens(
+    budgets: &BTreeMap<u64, Option<u64>>,
+    round: u64,
+) -> Result<Option<u64>, AgentProtocolError> {
+    budgets.get(&round).copied().ok_or_else(|| {
+        AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidDigest,
+            "recovered model attempt has no durable output-budget reservation",
+        )
+    })
+}
+
 fn stage_loop_recovery(
     inner: Arc<GenericInner>,
     stored: StoredGenericAgentRun,
@@ -2348,12 +2468,30 @@ fn stage_loop_recovery(
     recovery_events: Vec<AgentEventDraft>,
     mut continuation: GenericRecoveryContinuation,
 ) -> Result<AgentRecovery, AgentProtocolError> {
+    let model_output_budgets = stored
+        .records
+        .iter()
+        .filter_map(|record| match &record.payload {
+            GenericCheckpointEvent::ModelAttemptStarted {
+                round,
+                max_output_tokens,
+                ..
+            } => Some((*round, *max_output_tokens)),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
     let checkpoint_seq = stored.last_checkpoint_seq();
     let registration = stored.registration;
     let request = registration.request.clone();
     let execution = registration.execution.clone();
     let admission = registration.admission.clone();
     let run_id = execution.run_id.clone();
+    let recovered_attempt_input_budget = request
+        .run
+        .spec
+        .limits
+        .max_input_tokens
+        .map(|limit| limit.saturating_sub(boundary.usage.input_tokens.unwrap_or(0)));
     let user_message = agent_input_message(&request)?;
     let run_skills = resolve_recovery_skill_binding(&inner, &registration)?;
     let model_definitions = model_definitions_for_run(&inner, run_skills.is_some());
@@ -2572,6 +2710,7 @@ fn stage_loop_recovery(
             run_skills.as_deref(),
             initial_input,
             None,
+            recovered_attempt_input_budget,
         )
         .await
         .map_err(session_context_recovery_error)?;
@@ -2625,6 +2764,7 @@ fn stage_loop_recovery(
                         run_skills.as_deref(),
                         None,
                         Some(exchange_seq.saturating_sub(1)),
+                        recovered_attempt_input_budget,
                     )
                     .await
                     .map_err(session_context_recovery_error)?,
@@ -2635,8 +2775,13 @@ fn stage_loop_recovery(
             let request_messages = prior_model_messages
                 .as_deref()
                 .unwrap_or(model_messages.as_slice());
-            let rebuilt =
-                model_request_for_round(&request, *round, request_messages, &model_definitions);
+            let rebuilt = model_request_for_round(
+                &request,
+                *round,
+                request_messages,
+                &model_definitions,
+                recovered_model_output_tokens(&model_output_budgets, *round)?,
+            );
             if rebuilt.request_id != *request_id
                 || model_request_digest(&rebuilt).map_err(checkpoint_stream_error)?
                     != *request_digest
@@ -2722,6 +2867,7 @@ fn stage_loop_recovery(
                         run_skills.as_deref(),
                         None,
                         Some(exchange_seq.saturating_sub(1)),
+                        recovered_attempt_input_budget,
                     )
                     .await
                     .map_err(session_context_recovery_error)?,
@@ -2732,8 +2878,13 @@ fn stage_loop_recovery(
             let request_messages = prior_model_messages
                 .as_deref()
                 .unwrap_or(model_messages.as_slice());
-            let rebuilt =
-                model_request_for_round(&request, *round, request_messages, &model_definitions);
+            let rebuilt = model_request_for_round(
+                &request,
+                *round,
+                request_messages,
+                &model_definitions,
+                recovered_model_output_tokens(&model_output_budgets, *round)?,
+            );
             if rebuilt.request_id != *request_id
                 || model_request_digest(&rebuilt).map_err(checkpoint_stream_error)?
                     != *request_digest
@@ -2845,6 +2996,7 @@ fn stage_loop_recovery(
                         run_skills.as_deref(),
                         None,
                         Some(prior_seq),
+                        recovered_attempt_input_budget,
                     )
                     .await
                     .map_err(session_context_recovery_error)?,
@@ -2855,8 +3007,13 @@ fn stage_loop_recovery(
             let request_messages = prior_model_messages
                 .as_deref()
                 .unwrap_or(model_messages.as_slice());
-            let rebuilt =
-                model_request_for_round(&request, *round, request_messages, &model_definitions);
+            let rebuilt = model_request_for_round(
+                &request,
+                *round,
+                request_messages,
+                &model_definitions,
+                recovered_model_output_tokens(&model_output_budgets, *round)?,
+            );
             if rebuilt.request_id != *request_id
                 || model_request_digest(&rebuilt).map_err(checkpoint_stream_error)?
                     != *request_digest
@@ -2902,8 +3059,13 @@ fn stage_loop_recovery(
                     "Workflow outcome exists without its private start fence",
                 ));
             }
-            let rebuilt =
-                model_request_for_round(&request, *round, &model_messages, &model_definitions);
+            let rebuilt = model_request_for_round(
+                &request,
+                *round,
+                &model_messages,
+                &model_definitions,
+                recovered_model_output_tokens(&model_output_budgets, *round)?,
+            );
             if rebuilt.request_id != *request_id
                 || model_request_digest(&rebuilt).map_err(checkpoint_stream_error)?
                     != *request_digest
@@ -2959,6 +3121,7 @@ fn stage_loop_recovery(
                         run_skills.as_deref(),
                         None,
                         Some(exchange_seq.saturating_sub(1)),
+                        recovered_attempt_input_budget,
                     )
                     .await
                     .map_err(session_context_recovery_error)?,
@@ -2969,8 +3132,13 @@ fn stage_loop_recovery(
             let request_messages = prior_model_messages
                 .as_deref()
                 .unwrap_or(model_messages.as_slice());
-            let rebuilt =
-                model_request_for_round(&request, *round, request_messages, &model_definitions);
+            let rebuilt = model_request_for_round(
+                &request,
+                *round,
+                request_messages,
+                &model_definitions,
+                recovered_model_output_tokens(&model_output_budgets, *round)?,
+            );
             if rebuilt.request_id != *request_id
                 || model_request_digest(&rebuilt).map_err(checkpoint_stream_error)?
                     != *request_digest
@@ -3014,6 +3182,7 @@ fn stage_loop_recovery(
                         run_skills.as_deref(),
                         None,
                         Some(record.session_seq.saturating_sub(1)),
+                        recovered_attempt_input_budget,
                     )
                     .await
                     .map_err(session_context_recovery_error)?,
@@ -3024,8 +3193,13 @@ fn stage_loop_recovery(
             let request_messages = prior_model_messages
                 .as_deref()
                 .unwrap_or(model_messages.as_slice());
-            let rebuilt =
-                model_request_for_round(&request, *round, request_messages, &model_definitions);
+            let rebuilt = model_request_for_round(
+                &request,
+                *round,
+                request_messages,
+                &model_definitions,
+                recovered_model_output_tokens(&model_output_budgets, *round)?,
+            );
             if rebuilt.request_id != *request_id
                 || model_request_digest(&rebuilt).map_err(checkpoint_stream_error)?
                     != *request_digest
@@ -3527,6 +3701,12 @@ fn record_command_with_approval(
     Ok(disposition)
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct ModelContextBudget {
+    remaining_input_tokens: Option<u64>,
+    reserved_output_tokens: Option<u64>,
+}
+
 async fn project_model_context(
     inner: &GenericInner,
     request: &AgentStartRequest,
@@ -3534,6 +3714,7 @@ async fn project_model_context(
     run_skills: Option<&SkillRuntime>,
     initial_input: Option<ModelMessage>,
     through_session_seq: Option<u64>,
+    budget: ModelContextBudget,
 ) -> Result<SessionContextProjection, SessionContextError> {
     if let Some(message) = initial_input {
         inner
@@ -3565,14 +3746,16 @@ async fn project_model_context(
         .max_context_tokens
         .unwrap_or(inner.config.max_context_tokens)
         .min(inner.config.max_context_tokens);
-    let max_context_tokens = request
-        .run
-        .spec
-        .limits
-        .max_input_tokens
+    let reserved_output_tokens = budget
+        .reserved_output_tokens
+        .unwrap_or(inner.config.reserved_output_tokens)
+        .min(inner.config.reserved_output_tokens);
+    let max_context_tokens = budget
+        .remaining_input_tokens
+        .or(request.run.spec.limits.max_input_tokens)
         .map(|limit| {
             limit
-                .saturating_add(inner.config.reserved_output_tokens)
+                .saturating_add(reserved_output_tokens)
                 .min(backend_context_limit)
         })
         .unwrap_or(backend_context_limit);
@@ -3586,7 +3769,7 @@ async fn project_model_context(
             tools: model_definitions.to_vec(),
             history_limit: inner.config.history_limit,
             max_context_tokens,
-            reserved_output_tokens: inner.config.reserved_output_tokens,
+            reserved_output_tokens,
             config_digest: inner.config_digest.clone(),
             allowed_skill_digests: run_skills
                 .map(|skills| {
@@ -3609,6 +3792,7 @@ async fn project_model_messages(
     run_skills: Option<&SkillRuntime>,
     initial_input: Option<ModelMessage>,
     through_session_seq: Option<u64>,
+    remaining_input_tokens: Option<u64>,
 ) -> Result<Vec<ModelMessage>, SessionContextError> {
     project_model_context(
         inner,
@@ -3617,6 +3801,10 @@ async fn project_model_messages(
         run_skills,
         initial_input,
         through_session_seq,
+        ModelContextBudget {
+            remaining_input_tokens,
+            reserved_output_tokens: None,
+        },
     )
     .await
     .map(|projection| projection.messages)
@@ -3628,9 +3816,17 @@ async fn project_committed_model_messages(
     model_definitions: &[ModelToolDefinition],
     run_skills: Option<&SkillRuntime>,
 ) -> Result<Vec<ModelMessage>, AgentFailure> {
-    project_model_messages(inner, request, model_definitions, run_skills, None, None)
-        .await
-        .map_err(session_failure)
+    project_model_messages(
+        inner,
+        request,
+        model_definitions,
+        run_skills,
+        None,
+        None,
+        None,
+    )
+    .await
+    .map_err(session_failure)
 }
 
 struct ModelRunExecution {
@@ -3716,6 +3912,36 @@ async fn execute_model_run(execution: ModelRunExecution) {
             emit_failure(&inner, &request, &user_message, failure);
             return;
         }
+        let remaining_input = match remaining_input_tokens(&request, &total_usage) {
+            Ok(remaining) => remaining,
+            Err(limit) => {
+                emit_limit_reached(
+                    &inner,
+                    &request,
+                    last_response,
+                    has_usage.then_some(total_usage),
+                    tool_call_count,
+                    started_event_id,
+                    limit,
+                );
+                return;
+            }
+        };
+        let output_reserve = match output_reserve_tokens(&inner.config, &request, &total_usage) {
+            Ok(reserve) => reserve,
+            Err(limit) => {
+                emit_limit_reached(
+                    &inner,
+                    &request,
+                    last_response,
+                    has_usage.then_some(total_usage),
+                    tool_call_count,
+                    started_event_id,
+                    limit,
+                );
+                return;
+            }
+        };
         let model_context = match project_model_context(
             &inner,
             &request,
@@ -3723,18 +3949,63 @@ async fn execute_model_run(execution: ModelRunExecution) {
             run_skills.as_deref(),
             None,
             None,
+            ModelContextBudget {
+                remaining_input_tokens: remaining_input,
+                reserved_output_tokens: Some(inner.config.reserved_output_tokens),
+            },
         )
         .await
         {
             Ok(context) => context,
+            Err(SessionContextError::ContextOverflow { budget, .. })
+                if remaining_input == Some(budget) =>
+            {
+                emit_limit_reached(
+                    &inner,
+                    &request,
+                    last_response,
+                    has_usage.then_some(total_usage),
+                    tool_call_count,
+                    started_event_id,
+                    RunLimitKind::InputTokens,
+                );
+                return;
+            }
             Err(error) => {
                 emit_failure(&inner, &request, &user_message, session_failure(error));
                 return;
             }
         };
+        let dispatch_budget = match model_dispatch_budget(
+            &inner.config,
+            &request,
+            &total_usage,
+            model_context.used_input_tokens,
+            output_reserve,
+        ) {
+            Ok(budget) => budget,
+            Err(limit) => {
+                emit_limit_reached(
+                    &inner,
+                    &request,
+                    last_response,
+                    has_usage.then_some(total_usage),
+                    tool_call_count,
+                    started_event_id,
+                    limit,
+                );
+                return;
+            }
+        };
         let context_trace = model_context_trace(&model_context, inner.config.history_limit);
         model_messages = model_context.messages;
-        let model_request = model_request_for_round(&request, round, &model_messages, &model_tools);
+        let model_request = model_request_for_round(
+            &request,
+            round,
+            &model_messages,
+            &model_tools,
+            dispatch_budget.max_output_tokens,
+        );
         if let Err(failure) =
             commit_model_attempt(&inner, &run_id, round, &model_request, &context_trace)
         {
@@ -3956,6 +4227,16 @@ async fn execute_model_run(execution: ModelRunExecution) {
                         emit_failure(&inner, &request, &user_message, failure);
                         return;
                     }
+                    if let Err(failure) = validate_observed_usage(
+                        &inner.config,
+                        &request,
+                        &total_usage,
+                        committed_usage.as_ref(),
+                        dispatch_budget,
+                    ) {
+                        emit_failure(&inner, &request, &user_message, failure);
+                        return;
+                    }
                     if let Some(observed) = committed_usage.clone() {
                         merge_usage(&mut total_usage, observed);
                         has_usage = true;
@@ -4001,6 +4282,24 @@ async fn execute_model_run(execution: ModelRunExecution) {
                                     return;
                                 }
                                 DeliveryCommit::SteerPending => {
+                                    if let Some(limit) = continuation_limit(
+                                        &inner.config,
+                                        &request,
+                                        &total_usage,
+                                        round,
+                                        model_round_limit,
+                                    ) {
+                                        emit_limit_reached(
+                                            &inner,
+                                            &request,
+                                            response,
+                                            has_usage.then_some(total_usage),
+                                            tool_call_count,
+                                            started_event_id,
+                                            limit,
+                                        );
+                                        return;
+                                    }
                                     last_response = response.clone();
                                     model_messages
                                         .push(ModelMessage::text(ModelRole::Assistant, response));
@@ -4071,6 +4370,24 @@ async fn execute_model_run(execution: ModelRunExecution) {
                         }
                     }
 
+                    if let Some(limit) = continuation_limit(
+                        &inner.config,
+                        &request,
+                        &total_usage,
+                        round,
+                        model_round_limit,
+                    ) {
+                        emit_limit_reached(
+                            &inner,
+                            &request,
+                            response,
+                            has_usage.then_some(total_usage),
+                            tool_call_count,
+                            started_event_id,
+                            limit,
+                        );
+                        return;
+                    }
                     if tool_calls.iter().any(|call| !call.ended) {
                         emit_failure(
                             &inner,
@@ -4200,22 +4517,22 @@ async fn execute_model_run(execution: ModelRunExecution) {
                             );
                             return;
                         };
-                        if tool_call_count >= tool_call_limit {
-                            emit_incomplete(
-                                &inner,
-                                &request,
-                                IncompleteRun {
-                                    response: last_response,
-                                    usage: has_usage.then_some(total_usage),
-                                    tool_calls: tool_call_count,
+                        tool_call_count = match reserve_tool_call(tool_call_count, tool_call_limit)
+                        {
+                            Ok(next) => next,
+                            Err(limit) => {
+                                emit_limit_reached(
+                                    &inner,
+                                    &request,
+                                    last_response,
+                                    has_usage.then_some(total_usage),
+                                    tool_call_count,
                                     started_event_id,
-                                    limit: RunLimitKind::ToolCalls,
-                                    unresolved_issue: "Tool call limit reached",
-                                },
-                            );
-                            return;
-                        }
-                        tool_call_count += 1;
+                                    limit,
+                                );
+                                return;
+                            }
+                        };
                         if call.name == WORKFLOW_TOOL_NAME {
                             let remaining_tool_calls =
                                 tool_call_limit.saturating_sub(tool_call_count);
@@ -4716,22 +5033,21 @@ async fn resume_observed_workflow(
     let has_usage =
         seed.total_usage.input_tokens.is_some() || seed.total_usage.output_tokens.is_some();
     let started_event_id = AgentEventId::new(format!("generic-{}-started", run_id.as_str()));
-    if seed.tool_call_count >= tool_call_limit {
-        emit_incomplete(
-            &inner,
-            &request,
-            IncompleteRun {
-                response: seed.last_response,
-                usage: has_usage.then_some(seed.total_usage),
-                tool_calls: seed.tool_call_count,
+    seed.tool_call_count = match reserve_tool_call(seed.tool_call_count, tool_call_limit) {
+        Ok(next) => next,
+        Err(limit) => {
+            emit_limit_reached(
+                &inner,
+                &request,
+                seed.last_response,
+                has_usage.then_some(seed.total_usage),
+                seed.tool_call_count,
                 started_event_id,
-                limit: RunLimitKind::ToolCalls,
-                unresolved_issue: "Tool call limit reached",
-            },
-        );
-        return;
-    }
-    seed.tool_call_count = seed.tool_call_count.saturating_add(1);
+                limit,
+            );
+            return;
+        }
+    };
     let remaining_tool_calls = tool_call_limit.saturating_sub(seed.tool_call_count);
     if remaining_tool_calls == 0 {
         emit_incomplete(
@@ -7167,6 +7483,275 @@ fn add_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ModelDispatchBudget {
+    projected_input_tokens: u64,
+    max_output_tokens: Option<u64>,
+}
+
+fn reserve_tool_call(current: u64, limit: u64) -> Result<u64, RunLimitKind> {
+    (current < limit)
+        .then(|| current.saturating_add(1))
+        .ok_or(RunLimitKind::ToolCalls)
+}
+
+fn remaining_input_tokens(
+    request: &AgentStartRequest,
+    usage: &ModelUsage,
+) -> Result<Option<u64>, RunLimitKind> {
+    let Some(limit) = request.run.spec.limits.max_input_tokens else {
+        return Ok(None);
+    };
+    let remaining = limit.saturating_sub(usage.input_tokens.unwrap_or(0));
+    (remaining > 0)
+        .then_some(Some(remaining))
+        .ok_or(RunLimitKind::InputTokens)
+}
+
+fn output_reserve_tokens(
+    config: &GenericAgentConfig,
+    request: &AgentStartRequest,
+    usage: &ModelUsage,
+) -> Result<u64, RunLimitKind> {
+    let remaining = request
+        .run
+        .spec
+        .limits
+        .max_output_tokens
+        .map(|limit| limit.saturating_sub(usage.output_tokens.unwrap_or(0)));
+    if remaining == Some(0) {
+        return Err(RunLimitKind::OutputTokens);
+    }
+    Ok(remaining
+        .unwrap_or(config.reserved_output_tokens)
+        .min(config.reserved_output_tokens))
+}
+
+fn model_dispatch_budget(
+    config: &GenericAgentConfig,
+    request: &AgentStartRequest,
+    usage: &ModelUsage,
+    projected_input_tokens: u64,
+    output_reserve_tokens: u64,
+) -> Result<ModelDispatchBudget, RunLimitKind> {
+    if request
+        .run
+        .spec
+        .limits
+        .max_input_tokens
+        .is_some_and(|limit| {
+            usage
+                .input_tokens
+                .unwrap_or(0)
+                .saturating_add(projected_input_tokens)
+                > limit
+        })
+    {
+        return Err(RunLimitKind::InputTokens);
+    }
+
+    let mut output_cap = output_reserve_tokens;
+    let mut bounded_output = request.run.spec.limits.max_output_tokens.is_some();
+    if let Some(ceiling) = &request.run.spec.limits.max_cost {
+        let policy = config
+            .model_cost_policy
+            .as_ref()
+            .expect("cost limits are admitted only with a bound cost policy");
+        let total_input = usage
+            .input_tokens
+            .unwrap_or(0)
+            .saturating_add(projected_input_tokens);
+        let total_output = usage.output_tokens.unwrap_or(0);
+        let Some(allowed_output) = policy.max_output_tokens_within(
+            total_input,
+            total_output.saturating_add(output_cap),
+            ceiling,
+        ) else {
+            return Err(RunLimitKind::Cost);
+        };
+        output_cap = allowed_output.saturating_sub(total_output).min(output_cap);
+        if output_cap == 0 {
+            return Err(RunLimitKind::Cost);
+        }
+        bounded_output = true;
+    }
+
+    Ok(ModelDispatchBudget {
+        projected_input_tokens,
+        max_output_tokens: bounded_output.then_some(output_cap),
+    })
+}
+
+fn validate_observed_usage(
+    config: &GenericAgentConfig,
+    request: &AgentStartRequest,
+    previous: &ModelUsage,
+    observed: Option<&ModelUsage>,
+    dispatch: ModelDispatchBudget,
+) -> Result<(), AgentFailure> {
+    let needs_input = request.run.spec.limits.max_input_tokens.is_some()
+        || request.run.spec.limits.max_cost.as_ref().is_some_and(|_| {
+            config
+                .model_cost_policy
+                .as_ref()
+                .is_some_and(|policy| policy.input_microunits_per_million_tokens > 0)
+        });
+    let needs_output = request.run.spec.limits.max_output_tokens.is_some()
+        || request.run.spec.limits.max_cost.as_ref().is_some_and(|_| {
+            config
+                .model_cost_policy
+                .as_ref()
+                .is_some_and(|policy| policy.output_microunits_per_million_tokens > 0)
+        });
+    let Some(observed) = observed else {
+        if needs_input || needs_output {
+            return Err(agent_failure(
+                "model_usage_missing",
+                "model usage is required to enforce the requested Run token or cost limit",
+                false,
+            ));
+        }
+        return Ok(());
+    };
+    if needs_input && observed.input_tokens.is_none() {
+        return Err(agent_failure(
+            "model_input_usage_missing",
+            "model input usage is required to enforce the requested Run limit",
+            false,
+        ));
+    }
+    if needs_output && observed.output_tokens.is_none() {
+        return Err(agent_failure(
+            "model_output_usage_missing",
+            "model output usage is required to enforce the requested Run limit",
+            false,
+        ));
+    }
+    if observed
+        .input_tokens
+        .is_some_and(|tokens| tokens > dispatch.projected_input_tokens)
+    {
+        return Err(agent_failure(
+            "model_input_usage_exceeded_reservation",
+            "model reported more input tokens than the bound token meter reserved",
+            false,
+        ));
+    }
+    if let Some(output_cap) = dispatch.max_output_tokens {
+        if observed
+            .output_tokens
+            .is_some_and(|tokens| tokens > output_cap)
+        {
+            return Err(agent_failure(
+                "model_output_usage_exceeded_reservation",
+                "model reported more output tokens than the request budget allowed",
+                false,
+            ));
+        }
+    }
+
+    let next_input = previous
+        .input_tokens
+        .unwrap_or(0)
+        .saturating_add(observed.input_tokens.unwrap_or(0));
+    let next_output = previous
+        .output_tokens
+        .unwrap_or(0)
+        .saturating_add(observed.output_tokens.unwrap_or(0));
+    if request
+        .run
+        .spec
+        .limits
+        .max_input_tokens
+        .is_some_and(|limit| next_input > limit)
+    {
+        return Err(agent_failure(
+            "model_input_limit_violated",
+            "model input usage exceeded the immutable Run limit",
+            false,
+        ));
+    }
+    if request
+        .run
+        .spec
+        .limits
+        .max_output_tokens
+        .is_some_and(|limit| next_output > limit)
+    {
+        return Err(agent_failure(
+            "model_output_limit_violated",
+            "model output usage exceeded the immutable Run limit",
+            false,
+        ));
+    }
+    if let Some(ceiling) = &request.run.spec.limits.max_cost {
+        let actual = config
+            .model_cost_policy
+            .as_ref()
+            .expect("cost limits are admitted only with a bound cost policy")
+            .quote(next_input, next_output);
+        if actual.currency != ceiling.currency || actual.microunits > ceiling.microunits {
+            return Err(agent_failure(
+                "model_cost_limit_violated",
+                "model usage exceeded the immutable Run cost limit",
+                false,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn exhausted_usage_limit(
+    config: &GenericAgentConfig,
+    request: &AgentStartRequest,
+    usage: &ModelUsage,
+) -> Option<RunLimitKind> {
+    if request
+        .run
+        .spec
+        .limits
+        .max_input_tokens
+        .is_some_and(|limit| usage.input_tokens.unwrap_or(0) >= limit)
+    {
+        return Some(RunLimitKind::InputTokens);
+    }
+    if request
+        .run
+        .spec
+        .limits
+        .max_output_tokens
+        .is_some_and(|limit| usage.output_tokens.unwrap_or(0) >= limit)
+    {
+        return Some(RunLimitKind::OutputTokens);
+    }
+    if let (Some(ceiling), Some(policy)) = (
+        request.run.spec.limits.max_cost.as_ref(),
+        config.model_cost_policy.as_ref(),
+    ) {
+        let actual = policy.quote(
+            usage.input_tokens.unwrap_or(0),
+            usage.output_tokens.unwrap_or(0),
+        );
+        if actual.microunits >= ceiling.microunits {
+            return Some(RunLimitKind::Cost);
+        }
+    }
+    None
+}
+
+fn continuation_limit(
+    config: &GenericAgentConfig,
+    request: &AgentStartRequest,
+    usage: &ModelUsage,
+    completed_round: u64,
+    model_round_limit: u64,
+) -> Option<RunLimitKind> {
+    if completed_round >= model_round_limit {
+        return Some(RunLimitKind::ModelSteps);
+    }
+    exhausted_usage_limit(config, request, usage)
+}
+
 fn agent_input_message(request: &AgentStartRequest) -> Result<ModelMessage, AgentProtocolError> {
     agent_content_message(&request.run.spec.input)
 }
@@ -7235,6 +7820,7 @@ fn commit_model_attempt(
             round,
             request_id: request.request_id.clone(),
             request_digest: model_request_digest(request)?,
+            max_output_tokens: request.max_output_tokens,
             context: context.clone(),
         },
     )
@@ -7260,6 +7846,7 @@ fn model_request_for_round(
     round: u64,
     messages: &[ModelMessage],
     tools: &[ModelToolDefinition],
+    max_output_tokens: Option<u64>,
 ) -> ModelRequest {
     ModelRequest {
         request_id: ModelRequestId::new(format!(
@@ -7269,7 +7856,7 @@ fn model_request_for_round(
         messages: messages.to_vec(),
         tools: tools.to_vec(),
         output_schema: None,
-        max_output_tokens: request.run.spec.limits.max_output_tokens,
+        max_output_tokens,
         extensions: Default::default(),
     }
 }
@@ -7536,7 +8123,7 @@ fn try_emit_delivery(
                 outputs: Vec::new(),
                 artifacts: Vec::new(),
                 unresolved_issues: Vec::new(),
-                usage: agent_usage(usage, tool_calls),
+                usage: agent_usage(inner, usage, tool_calls),
                 provenance: provenance(inner, supporting_event_ids),
             },
         },
@@ -7597,6 +8184,38 @@ struct IncompleteRun {
     unresolved_issue: &'static str,
 }
 
+fn emit_limit_reached(
+    inner: &GenericInner,
+    request: &AgentStartRequest,
+    response: String,
+    usage: Option<ModelUsage>,
+    tool_calls: u64,
+    started_event_id: AgentEventId,
+    limit: RunLimitKind,
+) {
+    let unresolved_issue = match limit {
+        RunLimitKind::Deadline => "Run deadline reached",
+        RunLimitKind::ModelSteps => "model step limit reached",
+        RunLimitKind::ToolCalls => "Tool call limit reached",
+        RunLimitKind::InputTokens => "model input token limit reached",
+        RunLimitKind::OutputTokens => "model output token limit reached",
+        RunLimitKind::Cost => "model cost limit reached",
+        _ => "Run limit reached",
+    };
+    emit_incomplete(
+        inner,
+        request,
+        IncompleteRun {
+            response,
+            usage,
+            tool_calls,
+            started_event_id,
+            limit,
+            unresolved_issue,
+        },
+    );
+}
+
 fn emit_incomplete(inner: &GenericInner, request: &AgentStartRequest, incomplete: IncompleteRun) {
     let IncompleteRun {
         response,
@@ -7615,7 +8234,7 @@ fn emit_incomplete(inner: &GenericInner, request: &AgentStartRequest, incomplete
         outputs: Vec::new(),
         artifacts: Vec::new(),
         unresolved_issues: vec![unresolved_issue.to_owned()],
-        usage: agent_usage(usage, tool_calls),
+        usage: agent_usage(inner, usage, tool_calls),
         provenance: provenance(inner, vec![started_event_id]),
     });
     if publish_durable(
@@ -7666,6 +8285,11 @@ fn current_unix_ms() -> i64 {
     i64::try_from(millis).unwrap_or(i64::MAX)
 }
 
+fn deadline_delay_ms(deadline_unix_ms: i64, now_unix_ms: i64) -> Option<u64> {
+    let remaining_ms = deadline_unix_ms.saturating_sub(now_unix_ms);
+    (remaining_ms > 0).then_some(remaining_ms as u64)
+}
+
 fn arm_run_deadline(
     deadline_unix_ms: Option<i64>,
     cancellation: CancellationToken,
@@ -7674,8 +8298,7 @@ fn arm_run_deadline(
     let Some(deadline_unix_ms) = deadline_unix_ms else {
         return;
     };
-    let remaining_ms = deadline_unix_ms.saturating_sub(current_unix_ms());
-    if remaining_ms <= 0 {
+    let Some(remaining_ms) = deadline_delay_ms(deadline_unix_ms, current_unix_ms()) else {
         if stop_cause
             .compare_exchange(
                 RUN_STOP_RUNNING,
@@ -7688,11 +8311,11 @@ fn arm_run_deadline(
             cancellation.cancel();
         }
         return;
-    }
+    };
     tokio::spawn(async move {
         tokio::select! {
             _ = cancellation.cancelled() => {}
-            _ = tokio::time::sleep(Duration::from_millis(remaining_ms as u64)) => {
+            _ = tokio::time::sleep(Duration::from_millis(remaining_ms)) => {
                 if stop_cause
                     .compare_exchange(
                         RUN_STOP_RUNNING,
@@ -7842,16 +8465,26 @@ fn provenance(inner: &GenericInner, supporting_event_ids: Vec<AgentEventId>) -> 
     }
 }
 
-fn agent_usage(usage: Option<ModelUsage>, tool_calls: u64) -> Option<UsageReport> {
+fn agent_usage(
+    inner: &GenericInner,
+    usage: Option<ModelUsage>,
+    tool_calls: u64,
+) -> Option<UsageReport> {
     if usage.is_none() && tool_calls == 0 {
         return None;
     }
     let usage = usage.unwrap_or_default();
+    let cost = inner.config.model_cost_policy.as_ref().map(|policy| {
+        policy.quote(
+            usage.input_tokens.unwrap_or(0),
+            usage.output_tokens.unwrap_or(0),
+        )
+    });
     Some(UsageReport {
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         tool_calls: (tool_calls > 0).then_some(tool_calls),
-        cost: None,
+        cost,
     })
 }
 
@@ -8122,6 +8755,11 @@ fn generic_config_digest(
         "history_limit": config.history_limit,
         "max_context_tokens": config.max_context_tokens,
         "reserved_output_tokens": config.reserved_output_tokens,
+        "model_cost_policy": config.model_cost_policy.as_ref().map(|policy| serde_json::json!({
+            "currency": policy.currency,
+            "input_microunits_per_million_tokens": policy.input_microunits_per_million_tokens,
+            "output_microunits_per_million_tokens": policy.output_microunits_per_million_tokens,
+        })),
         "tool_contract": tool_contract,
         "skill_catalog": skills,
         "approval_enabled": approval_enabled,
@@ -8355,5 +8993,181 @@ fn model_failure(error: ModelError) -> AgentFailure {
         message: error.message,
         retryable: error.retryable,
         details: error.details,
+    }
+}
+
+#[cfg(test)]
+mod run_limit_tests {
+    use super::*;
+    use orchestral_core::agent_protocol::wire::{
+        AgentRunEnvelope, AgentSessionId, ProviderBindingRef, RunLimits,
+    };
+
+    fn request() -> AgentStartRequest {
+        let descriptor = AgentDescriptorEnvelope::seal(AgentDescriptor {
+            provider_id: AgentProviderId::new("test/provider"),
+            agent_id: AgentId::new("test/agent"),
+            supported_protocol_versions: vec![AGENT_PROTOCOL_V1],
+            accepted_content_types: BTreeSet::from(["text/plain".to_owned()]),
+            capabilities: AgentCapabilities {
+                session_reuse: true,
+                structured_output: false,
+                controls: ControlCapabilities {
+                    steer: true,
+                    cancel: CancelSupport::Confirmed,
+                    recover: true,
+                },
+                pending_request_kinds: BTreeSet::new(),
+                supported_limits: BTreeSet::from([
+                    RunLimitKind::Deadline,
+                    RunLimitKind::ModelSteps,
+                    RunLimitKind::ToolCalls,
+                    RunLimitKind::InputTokens,
+                    RunLimitKind::OutputTokens,
+                    RunLimitKind::Cost,
+                ]),
+                resources: Vec::new(),
+                effect_mediation: EffectMediation::None,
+            },
+            extensions: Default::default(),
+        })
+        .expect("test descriptor is valid");
+        let run = AgentRunEnvelope::new(
+            AGENT_PROTOCOL_V1,
+            AgentSessionId::new("limit-session"),
+            RunId::new("limit-run"),
+            vec![Content::text("bounded request")],
+        )
+        .expect("test Run is valid");
+        AgentStartRequest::new(run, ProviderBindingRef::new("limit-binding"), &descriptor)
+            .expect("test start is valid")
+    }
+
+    #[test]
+    fn one_thousand_boundaries_per_run_limit_never_reserve_past_the_ceiling() {
+        let mut request = request();
+        let mut config = GenericAgentConfig::new("test/provider", "test/agent");
+        config.reserved_output_tokens = 10_000;
+        config.model_cost_policy = Some(
+            ModelCostPolicy::new("USD", 1_000_000, 1_000_000)
+                .expect("linear test pricing is valid"),
+        );
+
+        for boundary in 1_u64..=1_000 {
+            request.run.spec.limits = RunLimits {
+                max_model_steps: Some(boundary),
+                ..RunLimits::default()
+            };
+            assert_eq!(
+                continuation_limit(
+                    &config,
+                    &request,
+                    &ModelUsage::default(),
+                    boundary.saturating_sub(1),
+                    boundary,
+                ),
+                None
+            );
+            assert_eq!(
+                continuation_limit(
+                    &config,
+                    &request,
+                    &ModelUsage::default(),
+                    boundary,
+                    boundary,
+                ),
+                Some(RunLimitKind::ModelSteps)
+            );
+
+            assert_eq!(reserve_tool_call(boundary - 1, boundary), Ok(boundary));
+            assert_eq!(
+                reserve_tool_call(boundary, boundary),
+                Err(RunLimitKind::ToolCalls)
+            );
+
+            let now = 1_000_000_i64;
+            assert_eq!(
+                deadline_delay_ms(now + boundary as i64, now),
+                Some(boundary)
+            );
+            assert_eq!(deadline_delay_ms(now, now), None);
+
+            let token_limit = boundary.saturating_mul(2);
+            request.run.spec.limits = RunLimits {
+                max_input_tokens: Some(token_limit),
+                ..RunLimits::default()
+            };
+            let previous = ModelUsage {
+                input_tokens: Some(boundary),
+                output_tokens: None,
+            };
+            assert_eq!(
+                remaining_input_tokens(&request, &previous),
+                Ok(Some(boundary))
+            );
+            assert!(model_dispatch_budget(&config, &request, &previous, boundary, 1).is_ok());
+            assert_eq!(
+                model_dispatch_budget(&config, &request, &previous, boundary.saturating_add(1), 1,),
+                Err(RunLimitKind::InputTokens)
+            );
+
+            request.run.spec.limits = RunLimits {
+                max_output_tokens: Some(token_limit),
+                ..RunLimits::default()
+            };
+            let previous = ModelUsage {
+                input_tokens: None,
+                output_tokens: Some(boundary),
+            };
+            assert_eq!(
+                output_reserve_tokens(&config, &request, &previous),
+                Ok(boundary)
+            );
+            let dispatch = model_dispatch_budget(&config, &request, &previous, 1, boundary)
+                .expect("remaining output budget is reservable");
+            assert_eq!(dispatch.max_output_tokens, Some(boundary));
+            let exhausted = ModelUsage {
+                input_tokens: None,
+                output_tokens: Some(token_limit),
+            };
+            assert_eq!(
+                output_reserve_tokens(&config, &request, &exhausted),
+                Err(RunLimitKind::OutputTokens)
+            );
+
+            request.run.spec.limits = RunLimits {
+                max_cost: Some(MoneyAmount {
+                    currency: "USD".to_owned(),
+                    microunits: boundary.saturating_mul(2).saturating_add(4),
+                }),
+                ..RunLimits::default()
+            };
+            let previous = ModelUsage {
+                input_tokens: Some(boundary),
+                output_tokens: Some(boundary),
+            };
+            let dispatch = model_dispatch_budget(&config, &request, &previous, 1, 16)
+                .expect("cost ceiling admits the exact reservation");
+            assert_eq!(dispatch.max_output_tokens, Some(3));
+            assert!(validate_observed_usage(
+                &config,
+                &request,
+                &previous,
+                Some(&ModelUsage {
+                    input_tokens: Some(1),
+                    output_tokens: Some(3),
+                }),
+                dispatch,
+            )
+            .is_ok());
+            request.run.spec.limits.max_cost = Some(MoneyAmount {
+                currency: "USD".to_owned(),
+                microunits: boundary.saturating_mul(2),
+            });
+            assert_eq!(
+                model_dispatch_budget(&config, &request, &previous, 1, 16),
+                Err(RunLimitKind::Cost)
+            );
+        }
     }
 }

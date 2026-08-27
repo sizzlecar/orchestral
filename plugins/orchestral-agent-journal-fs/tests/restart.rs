@@ -87,6 +87,7 @@ fn generic_private_wal_rehydrates_from_a_new_store_instance() {
             round: 1,
             request_id: ModelRequestId::new("model-attempt-1"),
             request_digest: Digest::sha256("model-request-1"),
+            max_output_tokens: None,
             context: GenericModelContextTrace {
                 through_session_seq: 1,
                 included_ranges: vec![SessionSourceRange {

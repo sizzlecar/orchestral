@@ -210,6 +210,8 @@ pub enum GenericCheckpointEvent {
         round: u64,
         request_id: ModelRequestId,
         request_digest: Digest,
+        #[serde(default)]
+        max_output_tokens: Option<u64>,
         context: GenericModelContextTrace,
     },
     ModelAttemptObserved {
@@ -261,9 +263,14 @@ impl GenericCheckpointEvent {
                 round,
                 request_id,
                 request_digest,
+                max_output_tokens,
                 context,
             } => {
-                if *round == 0 || request_id.is_empty() || !request_digest.is_sha256() {
+                if *round == 0
+                    || request_id.is_empty()
+                    || !request_digest.is_sha256()
+                    || *max_output_tokens == Some(0)
+                {
                     return Err(GenericCheckpointError::InvalidData(
                         "model attempt requires a round, request identity, and digest".to_owned(),
                     ));
@@ -609,6 +616,7 @@ pub fn replay_generic_agent_checkpoint(
                 round,
                 request_id,
                 request_digest,
+                max_output_tokens: _,
                 context: _,
             } => {
                 let GenericCheckpointPhase::Stable(boundary) = &phase else {
@@ -1033,6 +1041,7 @@ mod tests {
                         round: 1,
                         request_id: ModelRequestId::new("model-run-1-1"),
                         request_digest: Digest::sha256("request-1"),
+                        max_output_tokens: None,
                         context: context_trace(),
                     },
                 },

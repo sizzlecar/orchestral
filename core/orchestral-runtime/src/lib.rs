@@ -19,7 +19,7 @@ pub mod workflow_strategy;
 pub use agent_control::{AgentControlError, AgentControlEvent, AgentController};
 pub use agent_sdk::{AgentClient, AgentRunHandle, AgentSdkError, AgentTurn};
 pub use approval_bridge::{AgentApprovalBridge, ApprovalBridgeError, InMemoryHostApprovalBroker};
-pub use generic_agent::{GenericAgentConfig, InternalGenericAgentProvider};
+pub use generic_agent::{GenericAgentConfig, InternalGenericAgentProvider, ModelCostPolicy};
 pub use generic_agent_checkpoint::{
     replay_generic_agent_checkpoint, AppendGenericCheckpointOutcome, CommandCheckpoint,
     CreateGenericRunOutcome, GenericAgentCheckpointProjection, GenericAgentCheckpointStore,

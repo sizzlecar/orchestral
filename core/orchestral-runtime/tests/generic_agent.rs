@@ -13,9 +13,10 @@ use orchestral_core::{
             AgentProtocolErrorCode, AgentProviderStreamItem, AgentRunEnvelope, AgentSessionId,
             AgentStartRequest, AgentTelemetry, ApprovalDecision, BindingRequirement,
             CommandAckState, CommandId, Content, ContentBody, Digest, IncompleteReason,
-            PendingRequestKind, PendingRequestPayload, ProviderBindingRef, ProviderCommandOutcome,
-            RequestResolution, ResourceBinding, ResourceBindingId, ResourceBindingMode, ResourceId,
-            ResourceKind, ResourceRef, ResourceRevision, RunId, RunLimitKind,
+            MoneyAmount, PendingRequestKind, PendingRequestPayload, ProviderBindingRef,
+            ProviderCommandOutcome, RequestResolution, ResourceBinding, ResourceBindingId,
+            ResourceBindingMode, ResourceId, ResourceKind, ResourceRef, ResourceRevision, RunId,
+            RunLimitKind,
         },
         AGENT_PROTOCOL_V1,
     },
@@ -28,7 +29,7 @@ use orchestral_core::{
         ModelBackend, ModelCapabilities, ModelContent, ModelDescriptor, ModelError, ModelEvent,
         ModelEventId, ModelFinishReason, ModelMessage, ModelRequest, ModelRequestId, ModelRole,
         ModelStream, ModelStreamEvent, ModelTokenAccounting, ModelTokenMeter,
-        ModelTokenMeterDescriptor, ModelToolCallId, ModelToolDefinition,
+        ModelTokenMeterDescriptor, ModelToolCallId, ModelToolDefinition, ModelUsage,
     },
     normalizer::PlanNormalizer,
     skill_protocol::{
@@ -50,7 +51,7 @@ use orchestral_runtime::{
     GenericCheckpointDraft, GenericCheckpointError, GenericCheckpointEvent, GenericCheckpointPhase,
     GuardedToolExecution, GuardedToolExecutor, GuardedToolResult, GuardedToolRuntime,
     InMemoryBlobStore, InMemoryGenericAgentCheckpointStore, InMemoryHostApprovalBroker,
-    InternalGenericAgentProvider, JsonSizeTokenMeter, SessionCompactionInput,
+    InternalGenericAgentProvider, JsonSizeTokenMeter, ModelCostPolicy, SessionCompactionInput,
     SessionCompactionPolicy, SessionContextError, SessionSummarizerDescriptor,
     SkillActivationOutcome, SkillActivationPolicy, SkillActivationRequest, SkillHostProfile,
     SkillRuntime, StoredGenericAgentRun, ToolArtifactStore, WorkflowExecutionStrategy,
@@ -86,6 +87,8 @@ struct RecoveryIdentityModel {
 
 struct FixedOverheadTokenMeter(u64);
 
+struct ConstantTokenMeter(u64);
+
 impl ModelTokenMeter for FixedOverheadTokenMeter {
     fn meter_descriptor(&self) -> ModelTokenMeterDescriptor {
         ModelTokenMeterDescriptor {
@@ -104,6 +107,25 @@ impl ModelTokenMeter for FixedOverheadTokenMeter {
         let bytes = serde_jcs::to_vec(&(messages, tools))
             .map_err(|error| ModelError::invalid_request(error.to_string()))?;
         Ok((bytes.len() as u64).saturating_add(self.0))
+    }
+}
+
+impl ModelTokenMeter for ConstantTokenMeter {
+    fn meter_descriptor(&self) -> ModelTokenMeterDescriptor {
+        ModelTokenMeterDescriptor {
+            strategy: "test/constant-token-meter".to_owned(),
+            version: "1".to_owned(),
+            accounting: ModelTokenAccounting::Exact,
+            config_digest: Digest::sha256(self.0.to_be_bytes()),
+        }
+    }
+
+    fn count_request_input(
+        &self,
+        _messages: &[ModelMessage],
+        _tools: &[ModelToolDefinition],
+    ) -> Result<u64, ModelError> {
+        Ok(self.0)
     }
 }
 
@@ -778,6 +800,11 @@ struct BudgetGuardToolLoopModel {
     rounds: AtomicUsize,
     oversized_dispatches: AtomicUsize,
     input_budget: u64,
+}
+
+struct RunBudgetModel {
+    starts: AtomicUsize,
+    wrong_output_caps: AtomicUsize,
 }
 
 struct ArtifactLoopModel {
@@ -1456,6 +1483,82 @@ impl ModelBackend for BudgetGuardToolLoopModel {
                 sequence: 2,
                 payload: ModelEvent::Finish {
                     reason: ModelFinishReason::Stop,
+                },
+            }),
+        ])))
+    }
+}
+
+#[async_trait]
+impl ModelBackend for RunBudgetModel {
+    fn descriptor(&self) -> ModelDescriptor {
+        ModelDescriptor {
+            backend_id: "run-budget-model".to_owned(),
+            capabilities: ModelCapabilities {
+                streaming: true,
+                tool_calls: true,
+                max_context_tokens: Some(100),
+                ..ModelCapabilities::default()
+            },
+            extensions: Default::default(),
+        }
+    }
+
+    async fn start(
+        &self,
+        request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelStream, ModelError> {
+        request.validate()?;
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        if request.max_output_tokens != Some(1) {
+            self.wrong_output_caps.fetch_add(1, Ordering::SeqCst);
+        }
+        let request_id = request.request_id;
+        Ok(Box::pin(stream::iter([
+            Ok(ModelStreamEvent {
+                request_id: request_id.clone(),
+                event_id: ModelEventId::new("budget-tail-tool-start"),
+                sequence: 1,
+                payload: ModelEvent::ToolCallStart {
+                    call_id: ModelToolCallId::new("must-not-run"),
+                    name: "must_not_run".to_owned(),
+                },
+            }),
+            Ok(ModelStreamEvent {
+                request_id: request_id.clone(),
+                event_id: ModelEventId::new("budget-tail-tool-arguments"),
+                sequence: 2,
+                payload: ModelEvent::ToolCallArgumentsDelta {
+                    call_id: ModelToolCallId::new("must-not-run"),
+                    delta: r#"{"value":"forbidden tail effect"}"#.to_owned(),
+                },
+            }),
+            Ok(ModelStreamEvent {
+                request_id: request_id.clone(),
+                event_id: ModelEventId::new("budget-tail-tool-end"),
+                sequence: 3,
+                payload: ModelEvent::ToolCallEnd {
+                    call_id: ModelToolCallId::new("must-not-run"),
+                },
+            }),
+            Ok(ModelStreamEvent {
+                request_id: request_id.clone(),
+                event_id: ModelEventId::new("budget-tail-usage"),
+                sequence: 4,
+                payload: ModelEvent::Usage {
+                    usage: ModelUsage {
+                        input_tokens: Some(10),
+                        output_tokens: Some(1),
+                    },
+                },
+            }),
+            Ok(ModelStreamEvent {
+                request_id,
+                event_id: ModelEventId::new("budget-tail-finish"),
+                sequence: 5,
+                payload: ModelEvent::Finish {
+                    reason: ModelFinishReason::ToolCalls,
                 },
             }),
         ])))
@@ -6572,6 +6675,97 @@ async fn deadline_cancels_a_blocked_model_and_stays_incomplete() {
     assert_eq!(starts.load(Ordering::SeqCst), 1);
     assert_eq!(view.state.status(), AgentRunStatus::Incomplete);
     assert!(test_unix_ms().saturating_sub(deadline_unix_ms) < 1_000);
+}
+
+#[tokio::test]
+async fn run_token_and_cost_budgets_cap_dispatch_and_block_tail_work() {
+    let model = Arc::new(RunBudgetModel {
+        starts: AtomicUsize::new(0),
+        wrong_output_caps: AtomicUsize::new(0),
+    });
+    let mut config = GenericAgentConfig::new("internal-provider", "generic-agent");
+    config.max_context_tokens = 100;
+    config.reserved_output_tokens = 10;
+    config.model_cost_policy = Some(
+        ModelCostPolicy::new("USD", 1_000_000, 1_000_000).expect("test pricing policy is valid"),
+    );
+    let provider = Arc::new(
+        InternalGenericAgentProvider::new_with_session_journal(
+            model.clone(),
+            config,
+            Arc::new(InMemoryAgentSessionJournalStore::default()),
+            Arc::new(ConstantTokenMeter(10)),
+        )
+        .expect("budgeted Generic Agent is valid"),
+    );
+    assert!(provider
+        .describe()
+        .descriptor
+        .capabilities
+        .supported_limits
+        .contains(&RunLimitKind::Cost));
+    let controller = Arc::new(
+        AgentController::new(provider, ProviderBindingRef::new("budget-binding"))
+            .expect("controller binds the budgeted Agent"),
+    );
+    let run_id = RunId::new("aggregate-budget-run");
+    let mut run = AgentRunEnvelope::new(
+        AGENT_PROTOCOL_V1,
+        AgentSessionId::new("aggregate-budget-session"),
+        run_id.clone(),
+        vec![Content::text("consume the exact model budget")],
+    )
+    .expect("valid budgeted Run");
+    run.spec.limits.max_model_steps = Some(2);
+    run.spec.limits.max_input_tokens = Some(10);
+    run.spec.limits.max_output_tokens = Some(1);
+    run.spec.limits.max_cost = Some(MoneyAmount {
+        currency: "USD".to_owned(),
+        microunits: 11,
+    });
+    let run = AgentRunEnvelope::seal(run.spec).expect("budgeted Run reseals");
+
+    let execution = controller.start(run).await.expect("budgeted Run starts");
+    let view = controller
+        .wait_for_terminal(&execution.run_id)
+        .await
+        .expect("budgeted Run reaches an authoritative terminal");
+    let records = controller
+        .events(&run_id, 0)
+        .await
+        .expect("budgeted Run remains replayable");
+
+    assert_eq!(view.state.status(), AgentRunStatus::Incomplete);
+    assert_eq!(model.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(model.wrong_output_caps.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| {
+                matches!(
+                    &record.event.payload,
+                    AgentEvent::DeliveryCommitted { .. }
+                        | AgentEvent::RunIncomplete { .. }
+                        | AgentEvent::RunFailed { .. }
+                        | AgentEvent::RunCancelled { .. }
+                )
+            })
+            .count(),
+        1
+    );
+    assert!(records.iter().any(|record| matches!(
+        &record.event.payload,
+        AgentEvent::RunIncomplete {
+            reason: IncompleteReason::LimitReached {
+                limit: RunLimitKind::InputTokens
+            },
+            ..
+        }
+    )));
+    assert!(records.iter().all(|record| !matches!(
+        &record.event.payload,
+        AgentEvent::RequestOpened { .. } | AgentEvent::DeliveryCommitted { .. }
+    )));
 }
 
 #[tokio::test]
