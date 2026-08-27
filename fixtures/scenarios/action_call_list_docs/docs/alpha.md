@@ -1,3 +1,0 @@
-# Alpha
-
-first file

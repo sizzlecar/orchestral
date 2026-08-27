@@ -37,6 +37,9 @@ jobs:
             exit 1
           fi
 
+      - name: Agent surface hard-cut gate
+        run: bash scripts/check_agent_surface.sh
+
       - name: Format check
         run: cargo fmt --all -- --check
 

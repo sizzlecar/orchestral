@@ -72,7 +72,6 @@ fn discover_config_path() -> Option<PathBuf> {
         PathBuf::from(".orchestral/config.yaml"),
         PathBuf::from(".orchestral/config.yml"),
         PathBuf::from("configs/orchestral.cli.yaml"),
-        PathBuf::from("configs/orchestral.yaml"),
         PathBuf::from("orchestral.yaml"),
     ]
     .into_iter()

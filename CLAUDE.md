@@ -86,7 +86,7 @@ Applications wire plugins at their composition root.
 
 The main development config is `configs/orchestral.cli.yaml`. Without `--config`, the CLI searches
 `.orchestral/config.yaml`, `.orchestral/config.yml`, the development config, and
-`configs/orchestral.yaml`, then creates a safe default if none exists.
+`orchestral.yaml`, then creates a safe default if none exists.
 
 The default Tool policy uses an executable allowlist, minimal environment, disabled network, and
 workspace-bounded filesystem access. Permission expansion must come from explicit Host policy or
