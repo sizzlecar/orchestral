@@ -187,6 +187,12 @@ pub(crate) enum UiMsg {
     RequestResolved {
         request_id: String,
     },
+    Stopping,
+    Notice {
+        id: String,
+        message: String,
+        is_error: bool,
+    },
     Delivered {
         final_text: Option<String>,
     },
@@ -236,6 +242,7 @@ impl UiState {
         self.stream_chunks.values().cloned().collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn committed_assistant_text(&self) -> Option<&str> {
         self.transcript
             .iter()
@@ -444,6 +451,34 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             if state.pending.as_ref().map(PendingOverlay::request_id) == Some(request_id.as_str()) {
                 state.pending = None;
                 state.phase = UiPhase::Running;
+            }
+        }
+        UiMsg::Stopping => {
+            state.pending = None;
+            state.phase = UiPhase::Cancelling;
+        }
+        UiMsg::Notice {
+            id,
+            message,
+            is_error,
+        } => {
+            if let Some(entry) = state
+                .transcript
+                .iter_mut()
+                .find(|entry| entry.id.as_deref() == Some(id.as_str()))
+            {
+                entry.text = message;
+                entry.role = if is_error {
+                    TranscriptRole::Error
+                } else {
+                    TranscriptRole::System
+                };
+            } else if is_error {
+                state.transcript.push(TranscriptEntry::error(id, message));
+            } else {
+                let mut entry = TranscriptEntry::system(message);
+                entry.id = Some(id);
+                state.transcript.push(entry);
             }
         }
         UiMsg::Delivered { final_text } => {

@@ -34,8 +34,10 @@ tracing = { workspace = true }
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1"
 futures-util = "0.3"
-ratatui = { version = "0.30.2", default-features = false }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
+crossterm = { version = "0.29", features = ["event-stream", "bracketed-paste"] }
 unicode-width = "0.2"
 
 [dev-dependencies]
 insta = "1.48.0"
+portable-pty = "0.9"

@@ -1,7 +1,7 @@
 //! Minimal command-line composition root for the provider-neutral Generic Agent.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -57,7 +57,7 @@ use orchestral_runtime::{
     SkillHostProfile, SkillRoot, SkillRuntime, StdioMcpSandboxPolicy, StdioMcpTransportFactory,
     ToolArtifactStore,
 };
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
 
 use crate::google_auth::{
@@ -75,6 +75,13 @@ pub struct AgentRunOptions {
     pub input: Option<String>,
     pub no_mcp: bool,
     pub no_skills: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EntryMode {
+    HeadlessPrompt(String),
+    HeadlessPipe,
+    Tui,
 }
 
 struct CliJournalStores {
@@ -258,52 +265,33 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
     }
     let client = AgentClient::new(controller, session_id.clone()).with_resources(resources);
 
-    eprintln!("Generic Agent: backend={} model={model}", backend.name);
+    let entry_mode = select_entry_mode(
+        options.input,
+        io::stdin().is_terminal(),
+        io::stdout().is_terminal(),
+    )?;
     let result = async {
-        let mut lines = BufReader::new(tokio::io::stdin()).lines();
-        if let Some(input) = options.input {
-            run_turn(&client, &approval_broker, 1, input, &mut lines, false).await?;
-            return Ok(());
-        }
-
-        eprintln!(
-            "Interactive session {}. Type /exit to quit.",
-            session_id.as_str()
-        );
-        let mut turn = 0_u64;
-        loop {
-            eprint!("> ");
-            io::stderr().flush().context("flush prompt")?;
-            let next = tokio::select! {
-                line = lines.next_line() => line.context("read Agent input")?,
-                signal = tokio::signal::ctrl_c() => {
-                    signal.context("listen for Ctrl-C")?;
-                    eprintln!();
-                    break;
+        match entry_mode {
+            EntryMode::HeadlessPrompt(input) => {
+                eprintln!("Generic Agent: backend={} model={model}", backend.name);
+                let mut lines = BufReader::new(tokio::io::stdin()).lines();
+                run_turn(&client, &approval_broker, 1, input, &mut lines, false).await
+            }
+            EntryMode::HeadlessPipe => {
+                eprintln!("Generic Agent: backend={} model={model}", backend.name);
+                let mut input = String::new();
+                tokio::io::stdin()
+                    .read_to_string(&mut input)
+                    .await
+                    .context("read piped Agent input")?;
+                if input.trim().is_empty() {
+                    bail!("stdin pipe did not contain an Agent prompt")
                 }
-            };
-            let Some(input) = next else {
-                break;
-            };
-            let input = input.trim();
-            if input == "/exit" || input == "/quit" {
-                break;
+                let mut lines = BufReader::new(tokio::io::stdin()).lines();
+                run_turn(&client, &approval_broker, 1, input, &mut lines, false).await
             }
-            if input.is_empty() {
-                continue;
-            }
-            turn += 1;
-            run_turn(
-                &client,
-                &approval_broker,
-                turn,
-                input.to_owned(),
-                &mut lines,
-                true,
-            )
-            .await?;
+            EntryMode::Tui => crate::tui::run_tui(client, approval_broker, model).await,
         }
-        Ok(())
     }
     .await;
     mcp_registry.shutdown().await;
@@ -943,7 +931,6 @@ async fn run_turn(
         .context("start Agent Run")?;
     let mut events = handle.subscribe().await.context("subscribe to Agent Run")?;
     let mut handled_requests = BTreeSet::new();
-    let mut streamed_output = false;
     let mut stdin_open = true;
     let view = loop {
         let view = handle.inspect().await.context("inspect Agent Run")?;
@@ -973,13 +960,7 @@ async fn run_turn(
         tokio::select! {
             event = events.recv() => match event {
                 Ok(AgentControlEvent::Telemetry(telemetry)) => match telemetry.payload {
-                    AgentTelemetry::OutputDelta { delta, .. } => {
-                        if let ContentBody::Inline(serde_json::Value::String(text)) = delta.body {
-                            print!("{text}");
-                            io::stdout().flush().context("flush Agent output delta")?;
-                            streamed_output = true;
-                        }
-                    }
+                    AgentTelemetry::OutputDelta { .. } => {}
                     AgentTelemetry::ProgressReported { message, fraction } => {
                         if let Some(fraction) = fraction {
                             eprintln!("\n[{:.0}%] {message}", fraction * 100.0);
@@ -1046,11 +1027,7 @@ async fn run_turn(
             let delivery = view
                 .delivery
                 .context("Delivered Run omitted its Delivery")?;
-            if streamed_output {
-                println!();
-            } else {
-                print_content(&delivery.final_response.body)?;
-            }
+            print_content(&delivery.final_response.body)?;
         }
         AgentRunState::Terminal {
             terminal: AgentTerminalState::Failed { failure },
@@ -1224,4 +1201,55 @@ fn unique_id(prefix: &str, sequence: u64) -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("{prefix}-{}-{epoch_nanos}-{sequence}", std::process::id())
+}
+
+fn select_entry_mode(
+    input: Option<String>,
+    stdin_is_terminal: bool,
+    stdout_is_terminal: bool,
+) -> anyhow::Result<EntryMode> {
+    if let Some(input) = input {
+        return Ok(EntryMode::HeadlessPrompt(input));
+    }
+    if !stdin_is_terminal {
+        return Ok(EntryMode::HeadlessPipe);
+    }
+    if stdout_is_terminal {
+        return Ok(EntryMode::Tui);
+    }
+    bail!(
+        "interactive mode requires a TTY on stdout; pass a prompt or pipe stdin for Headless mode"
+    )
+}
+
+#[cfg(test)]
+mod entry_mode_tests {
+    use super::{select_entry_mode, EntryMode};
+
+    #[test]
+    fn explicit_prompt_is_always_headless() {
+        assert_eq!(
+            select_entry_mode(Some("fix it".to_owned()), true, true).unwrap(),
+            EntryMode::HeadlessPrompt("fix it".to_owned())
+        );
+        assert_eq!(
+            select_entry_mode(Some("fix it".to_owned()), false, false).unwrap(),
+            EntryMode::HeadlessPrompt("fix it".to_owned())
+        );
+    }
+
+    #[test]
+    fn pipe_is_headless_and_interactive_ttys_use_tui() {
+        assert_eq!(
+            select_entry_mode(None, false, true).unwrap(),
+            EntryMode::HeadlessPipe
+        );
+        assert_eq!(select_entry_mode(None, true, true).unwrap(), EntryMode::Tui);
+    }
+
+    #[test]
+    fn interactive_stdin_without_terminal_output_is_rejected() {
+        let error = select_entry_mode(None, true, false).unwrap_err();
+        assert!(error.to_string().contains("requires a TTY on stdout"));
+    }
 }

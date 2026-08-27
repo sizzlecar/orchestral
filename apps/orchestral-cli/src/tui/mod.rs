@@ -3,13 +3,15 @@
 //! The UI owns presentation state only. Agent lifecycle and durable truth stay
 //! behind `AgentClient`; the C4 adapter translates between the two boundaries.
 
+mod app;
 mod render;
 mod state;
+mod terminal;
 
-#[allow(unused_imports)] // Used by the C4 terminal loop; C3 validates it with TestBackend.
+pub(crate) use app::run_tui;
 pub(crate) use render::render;
-#[allow(unused_imports)] // Used by the C4 Agent event adapter and input loop.
+#[cfg(test)]
+pub(crate) use state::TranscriptEntry;
 pub(crate) use state::{
-    update, ApprovalChoice, PendingOverlay, ToolActivityStatus, TranscriptEntry, TranscriptRole,
-    UiEffect, UiMsg, UiPhase, UiState,
+    update, ApprovalChoice, ToolActivityStatus, UiEffect, UiMsg, UiPhase, UiState,
 };

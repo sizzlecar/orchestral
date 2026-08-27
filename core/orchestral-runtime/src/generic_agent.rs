@@ -73,6 +73,7 @@ use crate::{
 const WORKFLOW_TOOL_NAME: &str = "orchestral_workflow";
 const SKILL_ACTIVATE_TOOL_NAME: &str = "orchestral_skill_activate";
 const REQUEST_INPUT_TOOL_NAME: &str = "orchestral_request_input";
+const TOOL_ACTIVITY_TELEMETRY_NAMESPACE: &str = "orchestral/tool_activity/v1";
 const RUN_STOP_RUNNING: u8 = 0;
 const RUN_STOP_HOST_CANCEL: u8 = 1;
 const RUN_STOP_DEADLINE: u8 = 2;
@@ -4572,6 +4573,14 @@ async fn execute_model_run(execution: ModelRunExecution) {
                                 emit_failure(&inner, &request, &user_message, failure);
                                 return;
                             }
+                            publish_tool_activity(
+                                &inner,
+                                &run_id,
+                                round,
+                                &call.call_id,
+                                &call.name,
+                                "running",
+                            );
                             let observation = match execute_workflow_call(
                                 inner.clone(),
                                 tools,
@@ -4620,6 +4629,18 @@ async fn execute_model_run(execution: ModelRunExecution) {
                             };
                             tool_call_count =
                                 tool_call_count.saturating_add(observation.tool_calls);
+                            publish_tool_activity(
+                                &inner,
+                                &run_id,
+                                round,
+                                &call.call_id,
+                                &call.name,
+                                if observation.is_error {
+                                    "failed"
+                                } else {
+                                    "succeeded"
+                                },
+                            );
                             let Some(workflow_event_id) = publish_workflow_output(
                                 &inner,
                                 &run_id,
@@ -4672,6 +4693,14 @@ async fn execute_model_run(execution: ModelRunExecution) {
                             tool_id,
                             arguments,
                         };
+                        publish_tool_activity(
+                            &inner,
+                            &run_id,
+                            round,
+                            &call.call_id,
+                            &call.name,
+                            "running",
+                        );
                         let result = tools
                             .runtime
                             .invoke(
@@ -4729,6 +4758,14 @@ async fn execute_model_run(execution: ModelRunExecution) {
                         };
                         match result {
                             GuardedToolResult::ApprovalRequired { binding, .. } => {
+                                publish_tool_activity(
+                                    &inner,
+                                    &run_id,
+                                    round,
+                                    &call.call_id,
+                                    &call.name,
+                                    "failed",
+                                );
                                 emit_failure(
                                     &inner,
                                     &request,
@@ -4747,6 +4784,14 @@ async fn execute_model_run(execution: ModelRunExecution) {
                                 outcome: ToolOutcome::UnknownEffect { message },
                                 ..
                             } if cancellation.is_cancelled() => {
+                                publish_tool_activity(
+                                    &inner,
+                                    &run_id,
+                                    round,
+                                    &call.call_id,
+                                    &call.name,
+                                    "cancelled",
+                                );
                                 // The effect journal deliberately retains UnknownEffect, while
                                 // the Agent Run still observes the user's cancellation as its
                                 // terminal control outcome. A late Tool result is never accepted.
@@ -4770,6 +4815,14 @@ async fn execute_model_run(execution: ModelRunExecution) {
                                 outcome: ToolOutcome::UnknownEffect { message },
                                 ..
                             } => {
+                                publish_tool_activity(
+                                    &inner,
+                                    &run_id,
+                                    round,
+                                    &call.call_id,
+                                    &call.name,
+                                    "failed",
+                                );
                                 if let Err(failure) = append_effect_uncertainty(
                                     &inner,
                                     &request,
@@ -4795,6 +4848,14 @@ async fn execute_model_run(execution: ModelRunExecution) {
                                 outcome: ToolOutcome::Cancelled,
                                 ..
                             } if cancellation.is_cancelled() => {
+                                publish_tool_activity(
+                                    &inner,
+                                    &run_id,
+                                    round,
+                                    &call.call_id,
+                                    &call.name,
+                                    "cancelled",
+                                );
                                 emit_cancel(&inner, &request, &user_message);
                                 return;
                             }
@@ -4806,6 +4867,14 @@ async fn execute_model_run(execution: ModelRunExecution) {
                                     );
                                 }
                                 let (result, is_error) = model_tool_result(outcome);
+                                publish_tool_activity(
+                                    &inner,
+                                    &run_id,
+                                    round,
+                                    &call.call_id,
+                                    &call.name,
+                                    if is_error { "failed" } else { "succeeded" },
+                                );
                                 tool_results.push(ModelContent::ToolResult {
                                     call_id: call.call_id,
                                     result,
@@ -8089,6 +8158,45 @@ fn publish_telemetry(inner: &GenericInner, run_id: &RunId, telemetry: AgentTelem
                 .send(Ok(AgentProviderStreamItem::Telemetry(telemetry)));
         }
     }
+}
+
+fn publish_tool_activity(
+    inner: &GenericInner,
+    run_id: &RunId,
+    round: u64,
+    call_id: &ModelToolCallId,
+    tool_name: &str,
+    status: &str,
+) {
+    let activity_id = format!(
+        "generic-{}-tool-{round}-{}",
+        run_id.as_str(),
+        call_id.as_str()
+    );
+    let summary = match status {
+        "running" => tool_name.to_owned(),
+        "succeeded" => format!("{tool_name} completed"),
+        "cancelled" => format!("{tool_name} cancelled"),
+        _ => format!("{tool_name} failed"),
+    };
+    publish_telemetry(
+        inner,
+        run_id,
+        AgentTelemetryEnvelope {
+            telemetry_id: TelemetryId::new(format!("{activity_id}-{status}")),
+            run_id: run_id.clone(),
+            provider_seq: None,
+            payload: AgentTelemetry::Extension {
+                namespace: TOOL_ACTIVITY_TELEMETRY_NAMESPACE.to_owned(),
+                value: serde_json::json!({
+                    "activity_id": activity_id,
+                    "tool_name": tool_name,
+                    "summary": summary,
+                    "status": status,
+                }),
+            },
+        },
+    );
 }
 
 enum DeliveryCommit {
