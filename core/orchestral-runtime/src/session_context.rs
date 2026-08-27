@@ -81,6 +81,9 @@ pub struct SessionContextRequest {
     pub through_session_seq: Option<u64>,
     pub system_message: Option<ModelMessage>,
     pub tools: Vec<ModelToolDefinition>,
+    /// Maximum number of non-current Run history groups eligible for this
+    /// request. Current Run state and activated Skills remain pinned.
+    pub history_limit: usize,
     pub max_context_tokens: u64,
     pub reserved_output_tokens: u64,
     pub config_digest: Digest,
@@ -155,7 +158,12 @@ impl AgentSessionContextEngine {
             });
         }
 
-        for group in groups.values().rev().filter(|group| !group.pinned) {
+        for group in groups
+            .values()
+            .rev()
+            .filter(|group| !group.pinned)
+            .take(request.history_limit)
+        {
             let mut candidate = selected.clone();
             candidate.insert(group.key);
             let messages = assemble_messages(&request.system_message, &groups, &candidate);
@@ -384,6 +392,7 @@ fn assemble_messages(
 fn validate_context_request(request: &SessionContextRequest) -> Result<(), SessionContextError> {
     if request.session_id.is_empty()
         || request.current_run_id.is_empty()
+        || request.history_limit == 0
         || request.max_context_tokens == 0
         || request.reserved_output_tokens >= request.max_context_tokens
         || !request.config_digest.is_sha256()
@@ -664,6 +673,7 @@ mod tests {
                 through_session_seq: None,
                 system_message: Some(ModelMessage::text(ModelRole::System, "system")),
                 tools: Vec::new(),
+                history_limit: 100,
                 max_context_tokens: 600,
                 reserved_output_tokens: 100,
                 config_digest: Digest::sha256("config"),
@@ -720,6 +730,7 @@ mod tests {
                 through_session_seq: None,
                 system_message: None,
                 tools: Vec::new(),
+                history_limit: 100,
                 max_context_tokens: 180,
                 reserved_output_tokens: 20,
                 config_digest: Digest::sha256("config"),
@@ -748,6 +759,7 @@ mod tests {
                 through_session_seq: Some(1),
                 system_message: None,
                 tools: Vec::new(),
+                history_limit: 100,
                 max_context_tokens: 180,
                 reserved_output_tokens: 20,
                 config_digest: Digest::sha256("config"),
@@ -817,6 +829,7 @@ mod tests {
                 through_session_seq: None,
                 system_message: None,
                 tools: Vec::new(),
+                history_limit: 100,
                 max_context_tokens: 10_000,
                 reserved_output_tokens: 100,
                 config_digest: Digest::sha256("config"),
@@ -942,8 +955,8 @@ mod tests {
                 .collect::<Vec<_>>();
             let mut recent = pinned.clone();
             let mut recent_prefixes = Vec::new();
-            for key in old_keys {
-                recent.insert(key);
+            for key in &old_keys {
+                recent.insert(*key);
                 recent_prefixes.push((
                     recent.clone(),
                     meter
@@ -960,6 +973,8 @@ mod tests {
                 let max_context_tokens = 320 + seed % 4_681;
                 seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
                 let reserved_output_tokens = 1 + seed % (max_context_tokens - 1);
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                let history_limit = 1 + (seed % 12) as usize;
                 let input_budget = max_context_tokens - reserved_output_tokens;
                 let config_digest =
                     Digest::sha256(format!("budget-config-{history_index}-{config_index}"));
@@ -970,6 +985,7 @@ mod tests {
                         through_session_seq: None,
                         system_message: Some(system.clone()),
                         tools: tools.clone(),
+                        history_limit,
                         max_context_tokens,
                         reserved_output_tokens,
                         config_digest: config_digest.clone(),
@@ -1005,10 +1021,19 @@ mod tests {
                     })
                     .collect::<BTreeSet<_>>();
                 assert!(pinned.is_subset(&selected));
-                if let Some((required, _)) = recent_prefixes
+                let eligible_history = old_keys
                     .iter()
-                    .rev()
-                    .find(|(_, tokens)| *tokens <= input_budget)
+                    .take(history_limit)
+                    .copied()
+                    .collect::<BTreeSet<_>>();
+                assert!(selected
+                    .difference(&pinned)
+                    .all(|key| eligible_history.contains(key)));
+                if let Some((required, _)) =
+                    recent_prefixes.iter().rev().find(|(required, tokens)| {
+                        required.len().saturating_sub(pinned.len()) <= history_limit
+                            && *tokens <= input_budget
+                    })
                 {
                     assert!(required.is_subset(&selected));
                 }

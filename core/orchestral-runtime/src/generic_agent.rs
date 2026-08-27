@@ -84,6 +84,7 @@ pub struct GenericAgentConfig {
     pub stream_buffer: usize,
     pub max_model_rounds: u64,
     pub max_tool_calls: u64,
+    pub history_limit: usize,
     pub max_context_tokens: u64,
     pub reserved_output_tokens: u64,
 }
@@ -97,6 +98,7 @@ impl GenericAgentConfig {
             stream_buffer: 128,
             max_model_rounds: 8,
             max_tool_calls: 32,
+            history_limit: 128,
             max_context_tokens: 128 * 1024,
             reserved_output_tokens: 4 * 1024,
         }
@@ -507,6 +509,7 @@ impl InternalGenericAgentProvider {
         if config.stream_buffer == 0
             || config.max_model_rounds == 0
             || config.max_tool_calls == 0
+            || config.history_limit == 0
             || config.max_context_tokens == 0
             || config.reserved_output_tokens >= config.max_context_tokens
         {
@@ -3513,6 +3516,7 @@ async fn project_model_messages(
             through_session_seq,
             system_message: system_message_for_run(&inner.config, run_skills),
             tools: model_definitions.to_vec(),
+            history_limit: inner.config.history_limit,
             max_context_tokens,
             reserved_output_tokens: inner.config.reserved_output_tokens,
             config_digest: inner.config_digest.clone(),
@@ -7898,6 +7902,7 @@ fn generic_config_digest(
         "model_descriptor": model_descriptor,
         "max_model_rounds": config.max_model_rounds,
         "max_tool_calls": config.max_tool_calls,
+        "history_limit": config.history_limit,
         "max_context_tokens": config.max_context_tokens,
         "reserved_output_tokens": config.reserved_output_tokens,
         "tool_contract": tool_contract,

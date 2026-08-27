@@ -37,6 +37,7 @@ fn validate_config(config: &OrchestralConfig) -> Result<(), ConfigError> {
     if config.agent.stream_buffer == 0
         || config.agent.max_model_rounds == 0
         || config.agent.max_tool_calls == 0
+        || config.agent.history_limit == 0
         || config.agent.max_context_tokens == 0
         || config.agent.reserved_output_tokens == 0
     {

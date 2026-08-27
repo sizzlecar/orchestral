@@ -103,6 +103,8 @@ pub struct AgentConfig {
     pub max_model_rounds: u64,
     #[serde(default = "default_max_tool_calls")]
     pub max_tool_calls: u64,
+    #[serde(default = "default_history_limit")]
+    pub history_limit: usize,
     #[serde(default = "default_max_context_tokens")]
     pub max_context_tokens: u64,
     #[serde(default = "default_reserved_output_tokens")]
@@ -120,6 +122,7 @@ impl Default for AgentConfig {
             stream_buffer: default_stream_buffer(),
             max_model_rounds: default_max_model_rounds(),
             max_tool_calls: default_max_tool_calls(),
+            history_limit: default_history_limit(),
             max_context_tokens: default_max_context_tokens(),
             reserved_output_tokens: default_reserved_output_tokens(),
         }
@@ -136,6 +139,10 @@ fn default_max_model_rounds() -> u64 {
 
 fn default_max_tool_calls() -> u64 {
     32
+}
+
+fn default_history_limit() -> usize {
+    128
 }
 
 fn default_max_context_tokens() -> u64 {
