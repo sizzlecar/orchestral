@@ -64,8 +64,9 @@ use crate::skill::{
 use crate::tool_runtime::{AgentToolRuntime, GuardedToolResult, ToolRuntimeError};
 use crate::workflow_strategy::{WorkflowExecutionRequest, WorkflowExecutionStrategy};
 use crate::{
-    AgentSessionContextEngine, JsonSizeTokenMeter, ModelTokenMeter, SessionContextError,
-    SessionContextProjection, SessionContextRequest,
+    AgentSessionCompactor, AgentSessionContextEngine, AgentSessionSummarizer, JsonSizeTokenMeter,
+    ModelTokenMeter, SessionCompactionPolicy, SessionContextError, SessionContextProjection,
+    SessionContextRequest,
 };
 
 const WORKFLOW_TOOL_NAME: &str = "orchestral_workflow";
@@ -118,6 +119,7 @@ struct GenericInner {
     skills: Option<Arc<SkillRuntime>>,
     session_journal: Arc<dyn AgentSessionJournalStore>,
     context_engine: AgentSessionContextEngine,
+    session_compactor: Option<Arc<AgentSessionCompactor>>,
     checkpoint_store: Arc<dyn GenericAgentCheckpointStore>,
     config_digest: Digest,
     state: Mutex<GenericState>,
@@ -317,6 +319,42 @@ impl InternalGenericAgentProvider {
             )
         })?;
         inner.checkpoint_store = checkpoint_store;
+        Ok(self)
+    }
+
+    /// Binds one explicit Session compaction strategy before this Provider is
+    /// shared. The policy becomes part of the immutable Generic Agent config
+    /// digest; summaries remain durable Journal facts with their own strategy
+    /// and version provenance.
+    pub fn with_session_compaction(
+        mut self,
+        summarizer: Arc<dyn AgentSessionSummarizer>,
+        policy: SessionCompactionPolicy,
+    ) -> Result<Self, AgentProtocolError> {
+        policy.validate().map_err(|error| {
+            AgentProtocolError::new(AgentProtocolErrorCode::InvalidSpec, error.to_string())
+        })?;
+        let inner = Arc::get_mut(&mut self.inner).ok_or_else(|| {
+            AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidTransition,
+                "Session compaction must be bound before the Generic Agent Provider is shared",
+            )
+        })?;
+        if inner.session_compactor.is_some() {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidTransition,
+                "Session compaction is already bound",
+            ));
+        }
+        let config_digest = bind_session_compaction_config_digest(&inner.config_digest, &policy)?;
+        let compactor =
+            AgentSessionCompactor::new(inner.session_journal.clone(), summarizer, policy).map_err(
+                |error| {
+                    AgentProtocolError::new(AgentProtocolErrorCode::InvalidSpec, error.to_string())
+                },
+            )?;
+        inner.config_digest = config_digest;
+        inner.session_compactor = Some(Arc::new(compactor));
         Ok(self)
     }
 
@@ -594,6 +632,7 @@ impl InternalGenericAgentProvider {
                 skills,
                 session_journal,
                 context_engine,
+                session_compactor: None,
                 checkpoint_store: Arc::new(InMemoryGenericAgentCheckpointStore::default()),
                 config_digest,
                 state: Mutex::new(GenericState::default()),
@@ -3489,6 +3528,15 @@ async fn project_model_context(
                 payload: AgentSessionEvent::RunInputCommitted { message },
             })
             .await?;
+    }
+    // A cursor is a request to reproduce an earlier durable model boundary.
+    // Replaying it must never append a new compaction fact to the Session.
+    if through_session_seq.is_none() {
+        if let Some(compactor) = &inner.session_compactor {
+            compactor
+                .compact_if_needed(&request.run.spec.session_id, &request.run.spec.run_id)
+                .await?;
+        }
     }
     let backend_context_limit = inner
         .backend
@@ -7955,6 +8003,24 @@ fn generic_config_digest(
         AgentProtocolError::new(
             AgentProtocolErrorCode::InvalidSpec,
             format!("could not digest Generic Agent configuration: {error}"),
+        )
+    })?;
+    Ok(Digest::sha256(bytes))
+}
+
+fn bind_session_compaction_config_digest(
+    base_config_digest: &Digest,
+    policy: &SessionCompactionPolicy,
+) -> Result<Digest, AgentProtocolError> {
+    let value = serde_json::json!({
+        "contract": "generic-agent-session-compaction/v1",
+        "base_config_digest": base_config_digest,
+        "policy": policy,
+    });
+    let bytes = serde_jcs::to_vec(&value).map_err(|error| {
+        AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidSpec,
+            format!("could not bind Session compaction configuration: {error}"),
         )
     })?;
     Ok(Digest::sha256(bytes))

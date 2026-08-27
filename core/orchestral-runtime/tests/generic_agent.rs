@@ -49,7 +49,8 @@ use orchestral_runtime::{
     GenericCheckpointDraft, GenericCheckpointError, GenericCheckpointEvent, GenericCheckpointPhase,
     GuardedToolExecution, GuardedToolExecutor, GuardedToolResult, GuardedToolRuntime,
     InMemoryBlobStore, InMemoryGenericAgentCheckpointStore, InMemoryHostApprovalBroker,
-    InternalGenericAgentProvider, JsonSizeTokenMeter, SkillActivationOutcome,
+    InternalGenericAgentProvider, JsonSizeTokenMeter, SessionCompactionInput,
+    SessionCompactionPolicy, SessionContextError, SessionSummary, SkillActivationOutcome,
     SkillActivationPolicy, SkillActivationRequest, SkillHostProfile, SkillRuntime,
     StoredGenericAgentRun, ToolArtifactStore, WorkflowExecutionStrategy,
 };
@@ -794,6 +795,14 @@ struct LargeResultTool {
 struct RestartSessionModel {
     response: &'static str,
     expect_prior_turn: bool,
+}
+
+struct CompactionAwareModel {
+    requests: AtomicUsize,
+}
+
+struct RecordingSessionSummarizer {
+    calls: Arc<AtomicUsize>,
 }
 
 struct WorkflowLoopModel {
@@ -2160,6 +2169,84 @@ impl ModelBackend for RestartSessionModel {
             Ok(ModelStreamEvent {
                 request_id,
                 event_id: ModelEventId::new("restart-finish"),
+                sequence: 2,
+                payload: ModelEvent::Finish {
+                    reason: ModelFinishReason::Stop,
+                },
+            }),
+        ])))
+    }
+}
+
+#[async_trait]
+impl orchestral_runtime::AgentSessionSummarizer for RecordingSessionSummarizer {
+    async fn summarize(
+        &self,
+        input: SessionCompactionInput,
+    ) -> Result<SessionSummary, SessionContextError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(input.source.first_session_seq, 1);
+        assert_eq!(input.source.last_session_seq, 2);
+        assert_eq!(input.messages.len(), 2);
+        Ok(SessionSummary {
+            message: ModelMessage::text(ModelRole::System, "durable compaction summary marker"),
+            strategy: "recording-integration-summary".to_owned(),
+            model: None,
+            version: "1".to_owned(),
+        })
+    }
+}
+
+#[async_trait]
+impl ModelBackend for CompactionAwareModel {
+    fn descriptor(&self) -> ModelDescriptor {
+        ModelDescriptor {
+            backend_id: "compaction-aware-model".to_owned(),
+            capabilities: ModelCapabilities {
+                streaming: true,
+                max_context_tokens: Some(16_384),
+                ..ModelCapabilities::default()
+            },
+            extensions: Default::default(),
+        }
+    }
+
+    async fn start(
+        &self,
+        request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelStream, ModelError> {
+        request.validate()?;
+        let request_index = self.requests.fetch_add(1, Ordering::SeqCst);
+        let serialized = serde_json::to_string(&request.messages).unwrap();
+        let response = match request_index {
+            0 => {
+                assert!(serialized.contains("raw first question"));
+                assert!(!serialized.contains("durable compaction summary marker"));
+                "raw first answer"
+            }
+            1 => {
+                assert!(serialized.contains("durable compaction summary marker"));
+                assert!(serialized.contains("second question"));
+                assert!(!serialized.contains("raw first question"));
+                assert!(!serialized.contains("raw first answer"));
+                "second answer"
+            }
+            _ => panic!("unexpected model request after two terminal Runs"),
+        };
+        let request_id = request.request_id;
+        Ok(Box::pin(stream::iter([
+            Ok(ModelStreamEvent {
+                request_id: request_id.clone(),
+                event_id: ModelEventId::new(format!("compaction-answer-{request_index}")),
+                sequence: 1,
+                payload: ModelEvent::TextDelta {
+                    delta: response.to_owned(),
+                },
+            }),
+            Ok(ModelStreamEvent {
+                request_id,
+                event_id: ModelEventId::new(format!("compaction-finish-{request_index}")),
                 sequence: 2,
                 payload: ModelEvent::Finish {
                     reason: ModelFinishReason::Stop,
@@ -7551,4 +7638,80 @@ async fn a_new_generic_provider_rebuilds_session_context_from_the_session_journa
         .unwrap();
 
     assert_eq!(second.state.status(), AgentRunStatus::Delivered);
+}
+
+#[tokio::test]
+async fn bound_session_compaction_runs_before_a_real_model_round_and_is_durable() {
+    let session_journal = Arc::new(InMemoryAgentSessionJournalStore::default());
+    let summarizer_calls = Arc::new(AtomicUsize::new(0));
+    let model = Arc::new(CompactionAwareModel {
+        requests: AtomicUsize::new(0),
+    });
+    let policy = SessionCompactionPolicy {
+        minimum_source_records: 2,
+        keep_recent_records: 1,
+    };
+    let expected_policy_digest = policy.digest().unwrap();
+    let provider = Arc::new(
+        InternalGenericAgentProvider::new_with_session_journal(
+            model.clone(),
+            GenericAgentConfig::new("internal-provider", "generic-agent"),
+            session_journal.clone(),
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+        .unwrap()
+        .with_session_compaction(
+            Arc::new(RecordingSessionSummarizer {
+                calls: summarizer_calls.clone(),
+            }),
+            policy,
+        )
+        .expect("Session compaction binds before the Provider is shared"),
+    );
+    let controller = Arc::new(
+        AgentController::new(provider, ProviderBindingRef::new("compaction-binding"))
+            .expect("controller binds"),
+    );
+    let session_id = AgentSessionId::new("compaction-session");
+
+    for (run_id, input) in [
+        ("compaction-run-1", "raw first question"),
+        ("compaction-run-2", "second question"),
+    ] {
+        let run = AgentRunEnvelope::new(
+            AGENT_PROTOCOL_V1,
+            session_id.clone(),
+            RunId::new(run_id),
+            vec![Content::text(input)],
+        )
+        .unwrap();
+        let execution = controller.start(run).await.unwrap();
+        let terminal = controller
+            .wait_for_terminal(&execution.run_id)
+            .await
+            .unwrap();
+        assert_eq!(terminal.state.status(), AgentRunStatus::Delivered);
+    }
+
+    let records = session_journal.load_session(&session_id).await.unwrap();
+    let compaction = records
+        .iter()
+        .find_map(|record| match &record.payload {
+            AgentSessionEvent::CompactionCommitted {
+                source,
+                policy_digest,
+                strategy,
+                version,
+                ..
+            } => Some((source, policy_digest, strategy, version)),
+            _ => None,
+        })
+        .expect("model-round compaction is a durable Session fact");
+    assert_eq!(compaction.0.first_session_seq, 1);
+    assert_eq!(compaction.0.last_session_seq, 2);
+    assert_eq!(*compaction.1, expected_policy_digest);
+    assert_eq!(compaction.2, "recording-integration-summary");
+    assert_eq!(compaction.3, "1");
+    assert_eq!(summarizer_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(model.requests.load(Ordering::SeqCst), 2);
 }
