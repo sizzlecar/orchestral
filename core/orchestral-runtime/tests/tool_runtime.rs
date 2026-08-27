@@ -10,8 +10,9 @@ use orchestral_core::io::{
 };
 use orchestral_core::tool_effect::{
     replay_tool_effect, InMemoryToolEffectJournalStore, PreparedToolEffect,
-    ToolAuthorizationEvidence, ToolEffectAttemptId, ToolEffectEvent, ToolEffectEventDraft,
-    ToolEffectEventId, ToolEffectJournalStore, ToolEffectKey, ToolEffectPhase,
+    ToolAuthorizationEvidence, ToolEffectAppend, ToolEffectAttemptId, ToolEffectError,
+    ToolEffectEvent, ToolEffectEventDraft, ToolEffectEventId, ToolEffectJournalRecord,
+    ToolEffectJournalStore, ToolEffectKey, ToolEffectPhase,
 };
 use orchestral_core::tool_protocol::{
     ApprovalPolicy, EffectScope, EffectiveToolPolicy, EnvironmentPolicy, FilesystemPolicy,
@@ -140,6 +141,104 @@ fn runtime_with_artifacts(
 struct EchoExecutor {
     calls: AtomicUsize,
     delay: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectCrashBoundary {
+    Prepared,
+    Invoked,
+    Observed,
+    Committed,
+}
+
+impl EffectCrashBoundary {
+    const ALL: [Self; 4] = [
+        Self::Prepared,
+        Self::Invoked,
+        Self::Observed,
+        Self::Committed,
+    ];
+
+    fn matches(self, event: &ToolEffectEvent) -> bool {
+        matches!(
+            (self, event),
+            (Self::Prepared, ToolEffectEvent::Prepared { .. })
+                | (Self::Invoked, ToolEffectEvent::Invoked { .. })
+                | (Self::Observed, ToolEffectEvent::Observed { .. })
+                | (Self::Committed, ToolEffectEvent::Committed { .. })
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectCrashSide {
+    BeforeAppend,
+    AfterAppendBeforeAck,
+}
+
+impl EffectCrashSide {
+    const ALL: [Self; 2] = [Self::BeforeAppend, Self::AfterAppendBeforeAck];
+}
+
+struct CrashCutEffectJournal {
+    inner: Arc<InMemoryToolEffectJournalStore>,
+    boundary: EffectCrashBoundary,
+    side: EffectCrashSide,
+    fired: std::sync::atomic::AtomicBool,
+}
+
+impl CrashCutEffectJournal {
+    fn new(
+        inner: Arc<InMemoryToolEffectJournalStore>,
+        boundary: EffectCrashBoundary,
+        side: EffectCrashSide,
+    ) -> Self {
+        Self {
+            inner,
+            boundary,
+            side,
+            fired: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn fired(&self) -> bool {
+        self.fired.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl ToolEffectJournalStore for CrashCutEffectJournal {
+    async fn load_effect(
+        &self,
+        key: &ToolEffectKey,
+    ) -> Result<Vec<ToolEffectJournalRecord>, ToolEffectError> {
+        self.inner.load_effect(key).await
+    }
+
+    async fn append(
+        &self,
+        expected_previous: u64,
+        draft: ToolEffectEventDraft,
+    ) -> Result<ToolEffectAppend, ToolEffectError> {
+        let inject =
+            self.boundary.matches(&draft.payload) && !self.fired.swap(true, Ordering::SeqCst);
+        if !inject {
+            return self.inner.append(expected_previous, draft).await;
+        }
+        match self.side {
+            EffectCrashSide::BeforeAppend => Err(ToolEffectError::StoreUnavailable(format!(
+                "injected crash before {:?}",
+                self.boundary
+            ))),
+            EffectCrashSide::AfterAppendBeforeAck => {
+                self.inner.append(expected_previous, draft).await?;
+                Err(ToolEffectError::StoreUnavailable(format!(
+                    "injected lost ACK after {:?}",
+                    self.boundary
+                )))
+            }
+        }
+    }
 }
 
 struct SelectiveArtifactHook {
@@ -1122,6 +1221,118 @@ async fn observed_effect_is_committed_after_restart_without_reexecution() {
         projection.phase,
         ToolEffectPhase::Committed { .. }
     ));
+}
+
+#[tokio::test]
+async fn four_thousand_crash_cuts_never_duplicate_or_blindly_replay_a_tool_effect() {
+    const CASES_PER_CUT: usize = 500;
+
+    let mut cuts = 0usize;
+    let mut duplicate_executions = 0usize;
+    let mut unknown_reexecutions = 0usize;
+    for boundary in EffectCrashBoundary::ALL {
+        for side in EffectCrashSide::ALL {
+            for _ in 0..CASES_PER_CUT {
+                let bounds = policy(ApprovalPolicy::NotRequired);
+                let durable = Arc::new(InMemoryToolEffectJournalStore::default());
+                let crash_journal =
+                    Arc::new(CrashCutEffectJournal::new(durable.clone(), boundary, side));
+                let first = runtime_with_effect_journal(bounds.clone(), crash_journal.clone());
+                let first_executor = Arc::new(EchoExecutor {
+                    calls: AtomicUsize::new(0),
+                    delay: Duration::ZERO,
+                });
+                first
+                    .register(
+                        descriptor(bounds.clone(), ToolConcurrency::ParallelSafe),
+                        first_executor.clone(),
+                    )
+                    .unwrap();
+                let _first_result = first
+                    .invoke(
+                        invocation("hello"),
+                        RunToolGrant {
+                            bounds: bounds.clone(),
+                        },
+                        None,
+                        CancellationToken::new(),
+                    )
+                    .await;
+                assert!(crash_journal.fired(), "cut did not fire at {boundary:?}");
+                let first_calls = first_executor.calls.load(Ordering::SeqCst);
+                drop(first);
+
+                let replacement = runtime_with_effect_journal(bounds.clone(), durable.clone());
+                let replacement_executor = Arc::new(EchoExecutor {
+                    calls: AtomicUsize::new(0),
+                    delay: Duration::ZERO,
+                });
+                replacement
+                    .register(
+                        descriptor(bounds.clone(), ToolConcurrency::ParallelSafe),
+                        replacement_executor.clone(),
+                    )
+                    .unwrap();
+                let recovered = replacement
+                    .invoke(
+                        invocation("hello"),
+                        RunToolGrant { bounds },
+                        None,
+                        CancellationToken::new(),
+                    )
+                    .await;
+                let replacement_calls = replacement_executor.calls.load(Ordering::SeqCst);
+                duplicate_executions += usize::from(first_calls + replacement_calls > 1);
+
+                let key = ToolEffectKey::new(RunId::new("run-1"), ToolCallId::new("call-1"));
+                let projection =
+                    replay_tool_effect(&key, &durable.load_effect(&key).await.unwrap())
+                        .unwrap()
+                        .unwrap();
+                let must_be_unknown = matches!(
+                    (boundary, side),
+                    (
+                        EffectCrashBoundary::Invoked,
+                        EffectCrashSide::AfterAppendBeforeAck
+                    ) | (EffectCrashBoundary::Observed, EffectCrashSide::BeforeAppend)
+                );
+                if must_be_unknown {
+                    unknown_reexecutions += replacement_calls;
+                    assert!(matches!(
+                        recovered,
+                        GuardedToolResult::Outcome {
+                            outcome: ToolOutcome::UnknownEffect { .. },
+                            cached: true,
+                        }
+                    ));
+                    assert!(matches!(
+                        projection.phase,
+                        ToolEffectPhase::UnknownEffect { .. }
+                    ));
+                } else {
+                    assert!(matches!(
+                        recovered,
+                        GuardedToolResult::Outcome {
+                            outcome: ToolOutcome::Completed { .. },
+                            ..
+                        }
+                    ));
+                    assert!(matches!(
+                        projection.phase,
+                        ToolEffectPhase::Committed { .. }
+                    ));
+                }
+                cuts += 1;
+            }
+        }
+    }
+
+    assert_eq!(
+        cuts,
+        EffectCrashBoundary::ALL.len() * EffectCrashSide::ALL.len() * CASES_PER_CUT
+    );
+    assert_eq!(duplicate_executions, 0);
+    assert_eq!(unknown_reexecutions, 0);
 }
 
 struct CancelExecutor {
