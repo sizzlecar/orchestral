@@ -1030,6 +1030,30 @@ mod tests {
             .unwrap();
     }
 
+    fn push_session_record(
+        records: &mut Vec<AgentSessionRecord>,
+        session_id: &AgentSessionId,
+        run_id: &RunId,
+        event_suffix: impl std::fmt::Display,
+        payload: AgentSessionEvent,
+    ) {
+        let session_seq = records.len() as u64 + 1;
+        records.push(
+            AgentSessionRecord::seal(
+                AgentSessionEventDraft {
+                    event_id: AgentSessionEventId::new(format!(
+                        "replay-{event_suffix}-{session_seq}"
+                    )),
+                    session_id: session_id.clone(),
+                    run_id: run_id.clone(),
+                    payload,
+                },
+                session_seq,
+            )
+            .unwrap(),
+        );
+    }
+
     #[tokio::test]
     async fn newest_history_cannot_be_evicted_by_older_messages() {
         let store = Arc::new(InMemoryAgentSessionJournalStore::default());
@@ -1323,6 +1347,206 @@ mod tests {
             };
             assert!(negative_f1 < 0.98);
         }
+    }
+
+    #[test]
+    fn ten_thousand_persisted_session_traces_replay_to_online_message_projection() {
+        const TRACES: usize = 10_000;
+
+        let policy_digest = SessionCompactionPolicy {
+            minimum_source_records: 3,
+            keep_recent_records: 2,
+        }
+        .digest()
+        .unwrap();
+        let summary_config_digest = Digest::sha256("session-replay-summary/v1");
+        let mut compacted_traces = 0usize;
+        let mut current_tool_traces = 0usize;
+
+        for case in 0..TRACES {
+            let session_id = AgentSessionId::new(format!("replay-session-{case}"));
+            let old_run_id = RunId::new(format!("replay-old-{case}"));
+            let current_run_id = RunId::new(format!("replay-current-{case}"));
+            let old_input = ModelMessage::text(ModelRole::User, format!("old-input-{case}"));
+            let old_call_id = ModelToolCallId::new(format!("old-call-{case}"));
+            let old_assistant = ModelMessage {
+                role: ModelRole::Assistant,
+                content: vec![ModelContent::ToolCall {
+                    call_id: old_call_id.clone(),
+                    name: "inspect".to_owned(),
+                    arguments: json!({ "case": case }),
+                }],
+            };
+            let old_tool = ModelMessage {
+                role: ModelRole::Tool,
+                content: vec![ModelContent::ToolResult {
+                    call_id: old_call_id,
+                    result: json!({ "observed": case * 2 }),
+                    is_error: false,
+                }],
+            };
+            let old_output = ModelMessage::text(ModelRole::Assistant, format!("old-output-{case}"));
+            let old_tail = ModelMessage::text(ModelRole::User, format!("old-tail-{case}"));
+            let current_input =
+                ModelMessage::text(ModelRole::User, format!("current-input-{case}"));
+            let mut records = Vec::with_capacity(7);
+            push_session_record(
+                &mut records,
+                &session_id,
+                &old_run_id,
+                case,
+                AgentSessionEvent::RunInputCommitted {
+                    message: old_input.clone(),
+                },
+            );
+            push_session_record(
+                &mut records,
+                &session_id,
+                &old_run_id,
+                case,
+                AgentSessionEvent::ToolExchangeCommitted {
+                    request_id: ModelRequestId::new(format!("old-request-{case}")),
+                    assistant: old_assistant.clone(),
+                    tool: old_tool.clone(),
+                    usage: None,
+                },
+            );
+            push_session_record(
+                &mut records,
+                &session_id,
+                &old_run_id,
+                case,
+                AgentSessionEvent::RunOutputCommitted {
+                    request_id: ModelRequestId::new(format!("old-output-request-{case}")),
+                    message: old_output.clone(),
+                    usage: None,
+                },
+            );
+            push_session_record(
+                &mut records,
+                &session_id,
+                &old_run_id,
+                case,
+                AgentSessionEvent::RunInputCommitted {
+                    message: old_tail.clone(),
+                },
+            );
+            push_session_record(
+                &mut records,
+                &session_id,
+                &current_run_id,
+                case,
+                AgentSessionEvent::RunInputCommitted {
+                    message: current_input.clone(),
+                },
+            );
+
+            let current_exchange = (case % 2 == 0).then(|| {
+                let call_id = ModelToolCallId::new(format!("current-call-{case}"));
+                (
+                    ModelMessage {
+                        role: ModelRole::Assistant,
+                        content: vec![ModelContent::ToolCall {
+                            call_id: call_id.clone(),
+                            name: "lookup".to_owned(),
+                            arguments: json!({ "current": case }),
+                        }],
+                    },
+                    ModelMessage {
+                        role: ModelRole::Tool,
+                        content: vec![ModelContent::ToolResult {
+                            call_id,
+                            result: json!({ "current_result": case + 1 }),
+                            is_error: false,
+                        }],
+                    },
+                )
+            });
+            if let Some((assistant, tool)) = &current_exchange {
+                push_session_record(
+                    &mut records,
+                    &session_id,
+                    &current_run_id,
+                    case,
+                    AgentSessionEvent::ToolExchangeCommitted {
+                        request_id: ModelRequestId::new(format!("current-request-{case}")),
+                        assistant: assistant.clone(),
+                        tool: tool.clone(),
+                        usage: None,
+                    },
+                );
+                current_tool_traces += 1;
+            }
+
+            let compacted = case % 3 != 0;
+            let summary =
+                ModelMessage::text(ModelRole::System, format!("durable-summary-for-{case}"));
+            if compacted {
+                let source = SessionSourceRange {
+                    first_session_seq: 1,
+                    last_session_seq: 3,
+                };
+                let source_digest = session_range_digest(&records, &source).unwrap();
+                push_session_record(
+                    &mut records,
+                    &session_id,
+                    &current_run_id,
+                    case,
+                    AgentSessionEvent::CompactionCommitted {
+                        source,
+                        source_digest,
+                        policy_digest: policy_digest.clone(),
+                        summary_config_digest: summary_config_digest.clone(),
+                        summary: summary.clone(),
+                        strategy: "session-replay-summary".to_owned(),
+                        model: None,
+                        version: "1".to_owned(),
+                    },
+                );
+                compacted_traces += 1;
+            }
+            validate_session_trace(&session_id, &records).unwrap();
+
+            let persisted_bytes = serde_json::to_vec(&records).unwrap();
+            let persisted: Vec<AgentSessionRecord> =
+                serde_json::from_slice(&persisted_bytes).unwrap();
+            validate_session_trace(&session_id, &persisted).unwrap();
+            let groups = replay_groups(&persisted, &current_run_id, &BTreeMap::new()).unwrap();
+            let selected = groups.keys().copied().collect::<BTreeSet<_>>();
+            let replayed = assemble_messages(&None, &groups, &selected);
+
+            let mut online = if compacted {
+                vec![summary, old_tail, current_input]
+            } else {
+                vec![
+                    old_input,
+                    old_assistant,
+                    old_tool,
+                    old_output,
+                    old_tail,
+                    current_input,
+                ]
+            };
+            if let Some((assistant, tool)) = current_exchange {
+                online.push(assistant);
+                online.push(tool);
+            }
+            assert_eq!(replayed, online);
+            let replayed_calls = replayed
+                .iter()
+                .flat_map(|message| message.content.iter())
+                .filter(|content| matches!(content, ModelContent::ToolCall { .. }))
+                .count();
+            let replayed_results = replayed
+                .iter()
+                .flat_map(|message| message.content.iter())
+                .filter(|content| matches!(content, ModelContent::ToolResult { .. }))
+                .count();
+            assert_eq!(replayed_calls, replayed_results);
+        }
+
+        assert_eq!(compacted_traces, 6_666);
+        assert_eq!(current_tool_traces, 5_000);
     }
 
     #[test]
