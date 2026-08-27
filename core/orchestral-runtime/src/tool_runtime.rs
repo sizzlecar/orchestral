@@ -1400,6 +1400,12 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
                 }
             }
         };
+        // The executor future has crossed the Host's dispatch boundary. A
+        // non-idempotent executor may observe the same cancellation as this
+        // outer select and return `Cancelled` first; that race cannot prove
+        // whether its external effect happened, so preserve the conservative
+        // `UnknownEffect` contract.
+        let outcome = normalize_post_dispatch_outcome(&registered.descriptor, outcome);
         normalize_completed_outcome(
             &registered.descriptor,
             &effective_policy,
@@ -1507,6 +1513,16 @@ fn cancellation_outcome(descriptor: &ToolDescriptor) -> ToolOutcome {
         )
     } else {
         ToolOutcome::Cancelled
+    }
+}
+
+fn normalize_post_dispatch_outcome(
+    descriptor: &ToolDescriptor,
+    outcome: ToolOutcome,
+) -> ToolOutcome {
+    match outcome {
+        ToolOutcome::Cancelled => cancellation_outcome(descriptor),
+        outcome => outcome,
     }
 }
 

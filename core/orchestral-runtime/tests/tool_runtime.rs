@@ -1896,6 +1896,53 @@ async fn run_cancellation_reaches_executor_and_closes_the_call() {
     assert_eq!(active.load(Ordering::SeqCst), 0);
 }
 
+#[tokio::test]
+async fn post_dispatch_non_idempotent_cancellation_is_unknown_effect() {
+    let bounds = policy(ApprovalPolicy::NotRequired);
+    let runtime = Arc::new(runtime(bounds.clone()));
+    let active = Arc::new(AtomicUsize::new(0));
+    let executor = Arc::new(CancelExecutor {
+        calls: AtomicUsize::new(0),
+        active: active.clone(),
+        started: Notify::new(),
+    });
+    let mut tool = descriptor(bounds.clone(), ToolConcurrency::PerRunSerial);
+    tool.idempotency = ToolIdempotency::NonIdempotent;
+    runtime.register(tool, executor.clone()).unwrap();
+
+    let root = CancellationToken::new();
+    let task = {
+        let runtime = runtime.clone();
+        let cancellation = root.clone();
+        tokio::spawn(async move {
+            runtime
+                .invoke(
+                    invocation("wait"),
+                    RunToolGrant { bounds },
+                    None,
+                    cancellation,
+                )
+                .await
+        })
+    };
+    executor.started.notified().await;
+    root.cancel();
+
+    let result = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("cancellation should close the invocation")
+        .unwrap();
+    assert!(matches!(
+        result,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::UnknownEffect { .. },
+            cached: false,
+        }
+    ));
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn two_thousand_five_hundred_model_sandbox_downgrades_reach_no_executor() {
