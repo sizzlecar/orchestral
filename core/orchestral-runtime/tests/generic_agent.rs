@@ -88,6 +88,8 @@ struct FixedOverheadTokenMeter(u64);
 
 struct ConstantTokenMeter(u64);
 
+struct ExchangeCountingTokenMeter;
+
 impl ModelTokenMeter for FixedOverheadTokenMeter {
     fn meter_descriptor(&self) -> ModelTokenMeterDescriptor {
         ModelTokenMeterDescriptor {
@@ -125,6 +127,33 @@ impl ModelTokenMeter for ConstantTokenMeter {
         _tools: &[ModelToolDefinition],
     ) -> Result<u64, ModelError> {
         Ok(self.0)
+    }
+}
+
+impl ModelTokenMeter for ExchangeCountingTokenMeter {
+    fn meter_descriptor(&self) -> ModelTokenMeterDescriptor {
+        ModelTokenMeterDescriptor {
+            strategy: "test/tool-exchange-count".to_owned(),
+            version: "1".to_owned(),
+            accounting: ModelTokenAccounting::Exact,
+            config_digest: Digest::sha256("test/tool-exchange-count/v1"),
+        }
+    }
+
+    fn count_request_input(
+        &self,
+        messages: &[ModelMessage],
+        _tools: &[ModelToolDefinition],
+    ) -> Result<u64, ModelError> {
+        Ok(500
+            + messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .map(|content| match content {
+                    ModelContent::ToolCall { .. } | ModelContent::ToolResult { .. } => 800,
+                    _ => 100,
+                })
+                .sum::<u64>())
     }
 }
 
@@ -812,6 +841,11 @@ struct BudgetGuardToolLoopModel {
     input_budget: u64,
 }
 
+struct PressureCompactionModel {
+    rounds: AtomicUsize,
+    tool_rounds: usize,
+}
+
 struct RunBudgetModel {
     starts: AtomicUsize,
     wrong_output_caps: AtomicUsize,
@@ -868,6 +902,10 @@ struct CompactionAwareModel {
 }
 
 struct RecordingSessionSummarizer {
+    calls: Arc<AtomicUsize>,
+}
+
+struct PressureSessionSummarizer {
     calls: Arc<AtomicUsize>,
 }
 
@@ -1685,6 +1723,90 @@ impl ModelBackend for BudgetGuardToolLoopModel {
             Ok(ModelStreamEvent {
                 request_id,
                 event_id: ModelEventId::new("budget-answer-finish"),
+                sequence: 2,
+                payload: ModelEvent::Finish {
+                    reason: ModelFinishReason::Stop,
+                },
+            }),
+        ])))
+    }
+}
+
+#[async_trait]
+impl ModelBackend for PressureCompactionModel {
+    fn descriptor(&self) -> ModelDescriptor {
+        ModelDescriptor {
+            backend_id: "pressure-compaction-model".to_owned(),
+            capabilities: ModelCapabilities {
+                streaming: true,
+                tool_calls: true,
+                max_context_tokens: Some(4_500),
+                ..ModelCapabilities::default()
+            },
+            extensions: Default::default(),
+        }
+    }
+
+    async fn start(
+        &self,
+        request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelStream, ModelError> {
+        request.validate()?;
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        let request_id = request.request_id;
+        if round < self.tool_rounds {
+            let call_id = ModelToolCallId::new(format!("pressure-call-{round}"));
+            return Ok(Box::pin(stream::iter([
+                Ok(ModelStreamEvent {
+                    request_id: request_id.clone(),
+                    event_id: ModelEventId::new(format!("pressure-start-{round}")),
+                    sequence: 1,
+                    payload: ModelEvent::ToolCallStart {
+                        call_id: call_id.clone(),
+                        name: "echo".to_owned(),
+                        extensions: Default::default(),
+                    },
+                }),
+                Ok(ModelStreamEvent {
+                    request_id: request_id.clone(),
+                    event_id: ModelEventId::new(format!("pressure-arguments-{round}")),
+                    sequence: 2,
+                    payload: ModelEvent::ToolCallArgumentsDelta {
+                        call_id: call_id.clone(),
+                        delta: json!({"value": format!("observation-{round}")}).to_string(),
+                    },
+                }),
+                Ok(ModelStreamEvent {
+                    request_id: request_id.clone(),
+                    event_id: ModelEventId::new(format!("pressure-end-{round}")),
+                    sequence: 3,
+                    payload: ModelEvent::ToolCallEnd { call_id },
+                }),
+                Ok(ModelStreamEvent {
+                    request_id,
+                    event_id: ModelEventId::new(format!("pressure-finish-{round}")),
+                    sequence: 4,
+                    payload: ModelEvent::Finish {
+                        reason: ModelFinishReason::ToolCalls,
+                    },
+                }),
+            ])));
+        }
+        let serialized = serde_json::to_string(&request.messages).unwrap();
+        assert!(serialized.contains("active pressure summary"));
+        Ok(Box::pin(stream::iter([
+            Ok(ModelStreamEvent {
+                request_id: request_id.clone(),
+                event_id: ModelEventId::new("pressure-answer"),
+                sequence: 1,
+                payload: ModelEvent::TextDelta {
+                    delta: "continued after active compaction".to_owned(),
+                },
+            }),
+            Ok(ModelStreamEvent {
+                request_id,
+                event_id: ModelEventId::new("pressure-answer-finish"),
                 sequence: 2,
                 payload: ModelEvent::Finish {
                     reason: ModelFinishReason::Stop,
@@ -2546,6 +2668,30 @@ impl orchestral_runtime::AgentSessionSummarizer for RecordingSessionSummarizer {
         Ok(ModelMessage::text(
             ModelRole::System,
             "durable compaction summary marker",
+        ))
+    }
+}
+
+#[async_trait]
+impl orchestral_runtime::AgentSessionSummarizer for PressureSessionSummarizer {
+    fn descriptor(&self) -> SessionSummarizerDescriptor {
+        SessionSummarizerDescriptor {
+            strategy: "pressure-integration-summary".to_owned(),
+            model: None,
+            version: "1".to_owned(),
+            config_digest: Digest::sha256("pressure-integration-summary/v1"),
+        }
+    }
+
+    async fn summarize(
+        &self,
+        input: SessionCompactionInput,
+    ) -> Result<ModelMessage, SessionContextError> {
+        assert!(!input.groups.is_empty());
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ModelMessage::text(
+            ModelRole::System,
+            "active pressure summary",
         ))
     }
 }
@@ -7938,6 +8084,98 @@ async fn every_model_round_reprojects_context_before_backend_dispatch() {
     assert_eq!(model.rounds.load(Ordering::SeqCst), 1);
     assert_eq!(model.oversized_dispatches.load(Ordering::SeqCst), 0);
     assert!(controller
+        .events(&run_id, 0)
+        .await
+        .unwrap()
+        .iter()
+        .any(|record| matches!(
+            &record.event.payload,
+            AgentEvent::RunFailed { failure } if failure.code == "context_overflow"
+        )));
+}
+
+#[tokio::test]
+async fn active_run_context_pressure_compacts_and_the_agent_continues_to_delivery() {
+    const TOOL_ROUNDS: usize = 5;
+    let bounds = ToolPolicyBounds {
+        approval: ApprovalPolicy::NotRequired,
+        max_timeout_ms: Some(1_000),
+        max_output_bytes: Some(1_024),
+        ..ToolPolicyBounds::default()
+    };
+    let tool = Arc::new(EchoTool {
+        calls: AtomicUsize::new(0),
+    });
+    let runtime = durable_direct_runtime(
+        &bounds,
+        Arc::new(InMemoryToolEffectJournalStore::default()),
+        tool.clone(),
+    );
+    let model = Arc::new(PressureCompactionModel {
+        rounds: AtomicUsize::new(0),
+        tool_rounds: TOOL_ROUNDS,
+    });
+    let summarizer_calls = Arc::new(AtomicUsize::new(0));
+    let session_journal = Arc::new(InMemoryAgentSessionJournalStore::default());
+    let session_id = AgentSessionId::new("active-pressure-session");
+    let mut config = GenericAgentConfig::new("internal-provider", "generic-agent");
+    config.max_context_tokens = 4_500;
+    config.reserved_output_tokens = 500;
+    let provider = Arc::new(
+        InternalGenericAgentProvider::new_with_tools_and_session_journal(
+            model.clone(),
+            config,
+            runtime,
+            RunToolGrant { bounds },
+            session_journal.clone(),
+            Arc::new(ExchangeCountingTokenMeter),
+        )
+        .unwrap()
+        .with_session_compaction(
+            Arc::new(PressureSessionSummarizer {
+                calls: summarizer_calls.clone(),
+            }),
+            SessionCompactionPolicy {
+                minimum_source_records: 2,
+                keep_recent_records: 2,
+            },
+        )
+        .unwrap(),
+    );
+    let controller = Arc::new(
+        AgentController::new(provider, ProviderBindingRef::new("active-pressure-binding")).unwrap(),
+    );
+    let run_id = RunId::new("active-pressure-run");
+    let execution = controller
+        .start(
+            AgentRunEnvelope::new(
+                AGENT_PROTOCOL_V1,
+                session_id.clone(),
+                run_id.clone(),
+                vec![Content::text("inspect enough evidence, then finish")],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let view = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        controller.wait_for_terminal(&execution.run_id),
+    )
+    .await
+    .expect("pressure-compacted Run reaches a terminal boundary")
+    .unwrap();
+
+    assert_eq!(view.state.status(), AgentRunStatus::Delivered);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), TOOL_ROUNDS);
+    assert_eq!(model.rounds.load(Ordering::SeqCst), TOOL_ROUNDS + 1);
+    assert!(summarizer_calls.load(Ordering::SeqCst) >= 1);
+    let records = session_journal.load_session(&session_id).await.unwrap();
+    assert!(records.iter().any(|record| matches!(
+        record.payload,
+        AgentSessionEvent::ActiveRunCompactionCommitted { .. }
+    )));
+    assert!(!controller
         .events(&run_id, 0)
         .await
         .unwrap()

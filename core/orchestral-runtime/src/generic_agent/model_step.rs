@@ -679,20 +679,6 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                         emit_failure(&inner, &request, &user_message, failure);
                         return;
                     }
-                    model_messages = match project_committed_model_messages(
-                        &inner,
-                        &request,
-                        &model_tools,
-                        run_skills.as_deref(),
-                    )
-                    .await
-                    {
-                        Ok(messages) => messages,
-                        Err(failure) => {
-                            emit_failure(&inner, &request, &user_message, failure);
-                            return;
-                        }
-                    };
                     if let Err(failure) = commit_loop_boundary(
                         &inner,
                         &run_id,

@@ -58,30 +58,95 @@ pub(super) async fn project_model_context(
                 .min(backend_context_limit)
         })
         .unwrap_or(backend_context_limit);
-    inner
-        .context_engine
-        .project(SessionContextRequest {
-            session_id: request.run.spec.session_id.clone(),
-            current_run_id: request.run.spec.run_id.clone(),
-            through_session_seq,
-            system_message: system_message_for_run(&inner.config, run_skills),
-            tools: model_definitions.to_vec(),
-            history_limit: inner.config.history_limit,
-            max_context_tokens,
-            reserved_output_tokens,
-            config_digest: inner.config_digest.clone(),
-            allowed_skill_digests: run_skills
-                .map(|skills| {
-                    skills
-                        .catalog()
-                        .skills
-                        .iter()
-                        .map(|descriptor| (descriptor.skill_id.clone(), descriptor.digest.clone()))
-                        .collect()
-                })
-                .unwrap_or_default(),
+    let system_message = system_message_for_run(&inner.config, run_skills);
+    let allowed_skill_digests: std::collections::BTreeMap<_, _> = run_skills
+        .map(|skills| {
+            skills
+                .catalog()
+                .skills
+                .iter()
+                .map(|descriptor| (descriptor.skill_id.clone(), descriptor.digest.clone()))
+                .collect()
         })
-        .await
+        .unwrap_or_default();
+    let make_request = || SessionContextRequest {
+        session_id: request.run.spec.session_id.clone(),
+        current_run_id: request.run.spec.run_id.clone(),
+        through_session_seq,
+        system_message: system_message.clone(),
+        tools: model_definitions.to_vec(),
+        history_limit: inner.config.history_limit,
+        max_context_tokens,
+        reserved_output_tokens,
+        config_digest: inner.config_digest.clone(),
+        allowed_skill_digests: allowed_skill_digests.clone(),
+    };
+
+    let mut previous_overflow = None;
+    loop {
+        match inner.context_engine.project(make_request()).await {
+            Ok(projection) => return Ok(projection),
+            Err(SessionContextError::ContextOverflow { used, budget })
+                if through_session_seq.is_none() && inner.session_compactor.is_some() =>
+            {
+                if previous_overflow.is_some_and(|previous| used >= previous) {
+                    return Err(SessionContextError::ContextOverflow { used, budget });
+                }
+                previous_overflow = Some(used);
+                publish_telemetry(
+                    inner,
+                    &request.run.spec.run_id,
+                    AgentTelemetryEnvelope {
+                        telemetry_id: TelemetryId::new(format!(
+                            "generic-{}-context-pressure-{used}",
+                            request.run.spec.run_id.as_str()
+                        )),
+                        run_id: request.run.spec.run_id.clone(),
+                        provider_seq: None,
+                        payload: AgentTelemetry::ProgressReported {
+                            message: format!(
+                                "Compacting context ({used} tokens exceed the {budget}-token input budget)"
+                            ),
+                            fraction: None,
+                        },
+                    },
+                );
+                let compacted = inner
+                    .session_compactor
+                    .as_ref()
+                    .expect("compactor presence was checked")
+                    .compact_active_run_for_pressure(
+                        &request.run.spec.session_id,
+                        &request.run.spec.run_id,
+                    )
+                    .await?;
+                if compacted.is_none() {
+                    return Err(SessionContextError::ContextOverflow { used, budget });
+                }
+                let compacted_seq = compacted
+                    .as_ref()
+                    .expect("compaction presence was checked")
+                    .session_seq;
+                publish_telemetry(
+                    inner,
+                    &request.run.spec.run_id,
+                    AgentTelemetryEnvelope {
+                        telemetry_id: TelemetryId::new(format!(
+                            "generic-{}-context-compacted-{compacted_seq}",
+                            request.run.spec.run_id.as_str()
+                        )),
+                        run_id: request.run.spec.run_id.clone(),
+                        provider_seq: None,
+                        payload: AgentTelemetry::ProgressReported {
+                            message: "Context compacted; continuing".to_owned(),
+                            fraction: None,
+                        },
+                    },
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 pub(super) async fn project_model_messages(

@@ -295,6 +295,19 @@ pub(super) async fn continue_observed_tool(
         emit_failure(&inner, &request, &user_message, failure);
         return;
     }
+    seed.next_model_round = round.saturating_add(1);
+    if let Err(failure) = commit_loop_boundary(
+        &inner,
+        &run_id,
+        seed.next_model_round,
+        &seed.total_usage,
+        seed.tool_call_count,
+        &seed.last_response,
+        &seed.supporting_event_ids,
+    ) {
+        emit_failure(&inner, &request, &user_message, failure);
+        return;
+    }
     let model_messages = match project_committed_model_messages(
         &inner,
         &request,
@@ -309,19 +322,6 @@ pub(super) async fn continue_observed_tool(
             return;
         }
     };
-    seed.next_model_round = round.saturating_add(1);
-    if let Err(failure) = commit_loop_boundary(
-        &inner,
-        &run_id,
-        seed.next_model_round,
-        &seed.total_usage,
-        seed.tool_call_count,
-        &seed.last_response,
-        &seed.supporting_event_ids,
-    ) {
-        emit_failure(&inner, &request, &user_message, failure);
-        return;
-    }
     execute_model_run(ModelRunExecution {
         inner,
         request,
@@ -575,7 +575,7 @@ pub(super) async fn resume_observed_input(
     inner: Arc<GenericInner>,
     request: AgentStartRequest,
     user_message: ModelMessage,
-    mut model_messages: Vec<ModelMessage>,
+    _model_messages: Vec<ModelMessage>,
     model_tools: Vec<ModelToolDefinition>,
     run_skills: Option<Arc<SkillRuntime>>,
     mut seed: GenericExecutionSeed,
@@ -669,20 +669,6 @@ pub(super) async fn resume_observed_input(
             emit_failure(&inner, &request, &user_message, failure);
             return;
         }
-        model_messages = match project_committed_model_messages(
-            &inner,
-            &request,
-            &model_tools,
-            run_skills.as_deref(),
-        )
-        .await
-        {
-            Ok(messages) => messages,
-            Err(failure) => {
-                emit_failure(&inner, &request, &user_message, failure);
-                return;
-            }
-        };
     }
     seed.next_model_round = round.saturating_add(1);
     if let Err(failure) = commit_loop_boundary(
@@ -697,6 +683,20 @@ pub(super) async fn resume_observed_input(
         emit_failure(&inner, &request, &user_message, failure);
         return;
     }
+    let model_messages = match project_committed_model_messages(
+        &inner,
+        &request,
+        &model_tools,
+        run_skills.as_deref(),
+    )
+    .await
+    {
+        Ok(messages) => messages,
+        Err(failure) => {
+            emit_failure(&inner, &request, &user_message, failure);
+            return;
+        }
+    };
     execute_model_run(ModelRunExecution {
         inner,
         request,

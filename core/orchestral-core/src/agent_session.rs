@@ -120,6 +120,21 @@ pub enum AgentSessionEvent {
         model: Option<String>,
         version: String,
     },
+    /// Durable pressure relief for a long-running Run. Unlike ordinary
+    /// historical compaction, this may shadow only complete Tool exchanges
+    /// from the same Run. User input, loaded Skills, safety facts, and
+    /// artifact-bearing exchanges remain verbatim.
+    ActiveRunCompactionCommitted {
+        source: SessionSourceRange,
+        source_digest: Digest,
+        policy_digest: Digest,
+        summary_config_digest: Digest,
+        summary: ModelMessage,
+        strategy: String,
+        #[serde(default)]
+        model: Option<String>,
+        version: String,
+    },
 }
 
 impl AgentSessionEvent {
@@ -194,6 +209,16 @@ impl AgentSessionEvent {
                 .validate()
                 .map_err(|error| AgentSessionError::InvalidEvent(error.to_string()))?,
             Self::CompactionCommitted {
+                source,
+                source_digest,
+                policy_digest,
+                summary_config_digest,
+                summary,
+                strategy,
+                model,
+                version,
+            }
+            | Self::ActiveRunCompactionCommitted {
                 source,
                 source_digest,
                 policy_digest,
@@ -432,7 +457,9 @@ pub fn validate_session_trace(
                 index + 1
             )));
         }
-        if let AgentSessionEvent::CompactionCommitted { source, .. } = &record.payload {
+        if let AgentSessionEvent::CompactionCommitted { source, .. }
+        | AgentSessionEvent::ActiveRunCompactionCommitted { source, .. } = &record.payload
+        {
             if source.last_session_seq >= record.session_seq {
                 return Err(AgentSessionError::Corrupt(
                     "compaction cannot shadow itself or future events".to_owned(),
