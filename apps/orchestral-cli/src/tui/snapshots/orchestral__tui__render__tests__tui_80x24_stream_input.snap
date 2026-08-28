@@ -1,6 +1,5 @@
 ---
 source: apps/orchestral-cli/src/tui/render.rs
-assertion_line: 673
 expression: "render_to_string(&state, 80, 24)"
 ---
   Orchestral  ·  gpt-5.6                                               ? input
@@ -12,9 +11,9 @@ expression: "render_to_string(&state, 80, 24)"
   time.
 
   ✓ Read 1 file
+      └ core/orchestral-runtime/src/generic_agent/model_step.rs
 
   • Agent 边界。🚀▌
-
 
 
 

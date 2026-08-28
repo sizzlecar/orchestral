@@ -2435,6 +2435,11 @@ pub enum AgentTelemetry {
         activity_id: ToolActivityId,
         tool_name: String,
         state: ToolActivityState,
+        /// Bounded, presentation-safe operation details selected by the Host
+        /// (for example a command preview or workspace-relative file paths).
+        /// Raw Tool arguments and results must never be copied here wholesale.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        details: Vec<String>,
     },
     Extension {
         #[cfg_attr(
@@ -2473,12 +2478,19 @@ impl AgentTelemetry {
             Self::ToolActivity {
                 activity_id,
                 tool_name,
+                details,
                 ..
             } => {
-                if activity_id.is_empty() || tool_name.trim().is_empty() {
+                if activity_id.is_empty()
+                    || tool_name.trim().is_empty()
+                    || details.len() > 8
+                    || details
+                        .iter()
+                        .any(|detail| detail.trim().is_empty() || detail.chars().count() > 512)
+                {
                     return Err(AgentProtocolError::new(
                         AgentProtocolErrorCode::InvalidSpec,
-                        "Tool activity telemetry requires an activity_id and tool_name",
+                        "Tool activity telemetry requires an activity_id, tool_name, and at most eight non-empty bounded details",
                     ));
                 }
                 Ok(())
@@ -3340,6 +3352,7 @@ mod tests {
             activity_id: ToolActivityId::new("activity-1"),
             tool_name: "file_read".to_owned(),
             state: ToolActivityState::Succeeded,
+            details: vec!["core/src/lib.rs".to_owned()],
         };
         telemetry
             .validate_integrity()
@@ -3347,6 +3360,7 @@ mod tests {
         let value = serde_json::to_value(&telemetry).expect("Tool activity serializes");
         assert_eq!(value["type"], "tool_activity");
         assert_eq!(value["state"], "succeeded");
+        assert_eq!(value["details"][0], "core/src/lib.rs");
         assert!(serde_json::from_value::<AgentTelemetry>(value)
             .expect("Tool activity deserializes")
             .validate_integrity()
@@ -3355,6 +3369,15 @@ mod tests {
             activity_id: ToolActivityId::new(""),
             tool_name: "file_read".to_owned(),
             state: ToolActivityState::Running,
+            details: Vec::new(),
+        }
+        .validate_integrity()
+        .is_err());
+        assert!(AgentTelemetry::ToolActivity {
+            activity_id: ToolActivityId::new("activity-2"),
+            tool_name: "exec_command".to_owned(),
+            state: ToolActivityState::Running,
+            details: vec!["x".repeat(513)],
         }
         .validate_integrity()
         .is_err());

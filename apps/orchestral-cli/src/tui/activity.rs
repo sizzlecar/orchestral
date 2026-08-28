@@ -56,17 +56,21 @@ struct ActivityCall {
     family: ActivityFamily,
     tool_name: String,
     state: ToolActivityState,
+    details: Vec<String>,
+    order: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct ActivityReducer {
     generation: u64,
+    next_order: u64,
     calls: BTreeMap<String, ActivityCall>,
 }
 
 impl ActivityReducer {
     pub(crate) fn begin_run(&mut self) {
         self.generation = self.generation.saturating_add(1);
+        self.next_order = 0;
         self.calls.clear();
     }
 
@@ -75,6 +79,7 @@ impl ActivityReducer {
         activity_id: String,
         tool_name: String,
         state: ToolActivityState,
+        details: Vec<String>,
     ) -> ActivityProjection {
         let family = ActivityFamily::for_tool(&tool_name);
         match self.calls.get_mut(&activity_id) {
@@ -82,15 +87,21 @@ impl ActivityReducer {
                 if call.state == ToolActivityState::Running {
                     call.state = state;
                 }
+                if !details.is_empty() {
+                    call.details = details;
+                }
             }
             Some(_) => {}
             None => {
+                self.next_order = self.next_order.saturating_add(1);
                 self.calls.insert(
                     activity_id,
                     ActivityCall {
                         family: family.clone(),
                         tool_name,
                         state,
+                        details,
+                        order: self.next_order,
                     },
                 );
             }
@@ -140,6 +151,10 @@ impl ActivityReducer {
         if cancelled > 0 {
             summary.push_str(&format!(" · {cancelled} cancelled"));
         }
+        for detail in projected_details(&calls) {
+            summary.push_str("\n  └ ");
+            summary.push_str(&detail);
+        }
         ActivityProjection {
             id: format!("{}:{}", self.generation, family.id()),
             summary,
@@ -162,7 +177,48 @@ fn primary_count(family: &ActivityFamily, calls: &[&ActivityCall]) -> usize {
             return commands;
         }
     }
+    if family == &ActivityFamily::Edit {
+        let files = calls
+            .iter()
+            .flat_map(|call| call.details.iter())
+            .collect::<std::collections::BTreeSet<_>>();
+        if !files.is_empty() {
+            return files.len();
+        }
+    }
     calls.len()
+}
+
+fn projected_details(calls: &[&ActivityCall]) -> Vec<String> {
+    const MAX_VISIBLE: usize = 4;
+    let mut ordered = calls.to_vec();
+    ordered.sort_by_key(|call| call.order);
+    let mut details = Vec::new();
+    for call in ordered {
+        for detail in &call.details {
+            let detail = if call.state == ToolActivityState::Failed {
+                format!("{detail} (failed)")
+            } else if call.state == ToolActivityState::Cancelled {
+                format!("{detail} (cancelled)")
+            } else {
+                detail.clone()
+            };
+            if !details.contains(&detail) {
+                details.push(detail);
+            }
+        }
+    }
+    if details.len() <= MAX_VISIBLE {
+        return details;
+    }
+    let omitted = details.len() - MAX_VISIBLE;
+    vec![
+        details[0].clone(),
+        details[1].clone(),
+        format!("… {omitted} more"),
+        details[details.len() - 2].clone(),
+        details[details.len() - 1].clone(),
+    ]
 }
 
 fn family_summary(family: &ActivityFamily, status: ActivityStatus, count: usize) -> String {
@@ -172,9 +228,7 @@ fn family_summary(family: &ActivityFamily, status: ActivityStatus, count: usize)
         ActivityFamily::Command => {
             counted(if running { "Running" } else { "Ran" }, count, "command")
         }
-        ActivityFamily::Edit => {
-            counted(if running { "Applying" } else { "Applied" }, count, "patch")
-        }
+        ActivityFamily::Edit => counted(if running { "Editing" } else { "Edited" }, count, "file"),
         ActivityFamily::Skill => {
             counted(if running { "Loading" } else { "Loaded" }, count, "skill")
         }
@@ -205,7 +259,7 @@ mod tests {
         tool: &str,
         state: ToolActivityState,
     ) -> ActivityProjection {
-        reducer.observe(id.into(), tool.to_owned(), state)
+        reducer.observe(id.into(), tool.to_owned(), state, Vec::new())
     }
 
     #[test]
@@ -231,6 +285,34 @@ mod tests {
                 status: ActivityStatus::Succeeded,
             })
         );
+    }
+
+    #[test]
+    fn activity_projection_keeps_a_bounded_first_and_latest_preview() {
+        let mut reducer = ActivityReducer::default();
+        reducer.begin_run();
+        let mut projection = None;
+        for index in 0..7 {
+            let id = format!("command-{index}");
+            reducer.observe(
+                id.clone(),
+                "exec_command".to_owned(),
+                ToolActivityState::Running,
+                vec![format!("command {index}")],
+            );
+            projection = Some(reducer.observe(
+                id,
+                "exec_command".to_owned(),
+                ToolActivityState::Succeeded,
+                Vec::new(),
+            ));
+        }
+        let projection = projection.expect("command projection");
+        assert!(projection.summary.starts_with("Ran 7 commands"));
+        assert!(projection.summary.contains("command 0"));
+        assert!(projection.summary.contains("… 3 more"));
+        assert!(projection.summary.contains("command 6"));
+        assert!(!projection.summary.contains("command 3"));
     }
 
     #[test]
@@ -289,7 +371,7 @@ mod tests {
             reducer.settle(ToolActivityState::Cancelled),
             vec![ActivityProjection {
                 id: "1:edit".to_owned(),
-                summary: "Applied 1 patch · 1 cancelled".to_owned(),
+                summary: "Edited 1 file · 1 cancelled".to_owned(),
                 status: ActivityStatus::Cancelled,
             }]
         );

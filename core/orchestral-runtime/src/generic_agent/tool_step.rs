@@ -49,6 +49,7 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
     let mut tool_results = Vec::with_capacity(parsed_calls.len());
     let mut retained_artifacts = BTreeMap::<String, ArtifactRefWithDigest>::new();
     for (call, arguments) in parsed_calls {
+        let activity_details = tool_activity_details(&call.name, &arguments);
         if cancellation.is_cancelled() {
             emit_cancel(&inner, &request, &user_message);
             return ToolBatchExecution::Terminal;
@@ -102,6 +103,15 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                 );
                 return ToolBatchExecution::Terminal;
             };
+            publish_tool_activity(
+                &inner,
+                &run_id,
+                round,
+                &call.call_id,
+                &call.name,
+                ToolActivityState::Running,
+                &activity_details,
+            );
             let observation =
                 match execute_skill_read(&inner, &request, skills, round, &call.call_id, arguments)
                     .await
@@ -112,6 +122,19 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                         return ToolBatchExecution::Terminal;
                     }
                 };
+            publish_tool_activity(
+                &inner,
+                &run_id,
+                round,
+                &call.call_id,
+                &call.name,
+                if observation.is_error {
+                    ToolActivityState::Failed
+                } else {
+                    ToolActivityState::Succeeded
+                },
+                &activity_details,
+            );
             tool_results.push(ModelContent::ToolResult {
                 call_id: call.call_id,
                 result: observation.result,
@@ -183,6 +206,7 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                 &call.call_id,
                 &call.name,
                 ToolActivityState::Running,
+                &activity_details,
             );
             let observation = match execute_workflow_call(
                 inner.clone(),
@@ -260,6 +284,7 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                 } else {
                     ToolActivityState::Succeeded
                 },
+                &activity_details,
             );
             let Some(workflow_event_id) = publish_workflow_output(
                 &inner,
@@ -316,6 +341,7 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
             &call.call_id,
             &call.name,
             ToolActivityState::Running,
+            &activity_details,
         );
         let result = tools
             .runtime
@@ -381,6 +407,7 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                     &call.call_id,
                     &call.name,
                     ToolActivityState::Failed,
+                    &activity_details,
                 );
                 emit_failure(
                     &inner,
@@ -408,6 +435,7 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                     &call.call_id,
                     &call.name,
                     ToolActivityState::Cancelled,
+                    &activity_details,
                 );
                 // The effect journal deliberately retains UnknownEffect, while
                 // the Agent Run still observes the user's cancellation as its
@@ -439,6 +467,7 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                     &call.call_id,
                     &call.name,
                     ToolActivityState::Failed,
+                    &activity_details,
                 );
                 if let Err(failure) = append_effect_uncertainty(
                     &inner,
@@ -472,6 +501,7 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                     &call.call_id,
                     &call.name,
                     ToolActivityState::Cancelled,
+                    &activity_details,
                 );
                 emit_cancel(&inner, &request, &user_message);
                 return ToolBatchExecution::Terminal;
@@ -492,6 +522,7 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                     } else {
                         ToolActivityState::Succeeded
                     },
+                    &activity_details,
                 );
                 tool_results.push(ModelContent::ToolResult {
                     call_id: call.call_id,
@@ -506,5 +537,118 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
         retained_artifacts: retained_artifacts.into_values().collect(),
         tool_call_count,
         supporting_event_ids,
+    }
+}
+
+/// Selects a small presentation-safe subset of Tool arguments for activity
+/// telemetry. This is deliberately allowlisted by Tool family: credentials,
+/// arbitrary MCP arguments, and full patches/results never enter the UI path.
+fn tool_activity_details(tool_name: &str, arguments: &serde_json::Value) -> Vec<String> {
+    match tool_name {
+        "exec_command" => string_argument(arguments, "cmd").into_iter().collect(),
+        "file_read" | "artifact_read" | "file_write" => {
+            string_argument(arguments, "path").into_iter().collect()
+        }
+        "apply_patch" => patch_file_details(arguments),
+        SKILL_READ_TOOL_NAME => string_argument(arguments, "name").into_iter().collect(),
+        WORKFLOW_TOOL_NAME => string_argument(arguments, "workflow_id")
+            .into_iter()
+            .collect(),
+        name if name.starts_with("mcp__") => bounded_activity_detail(name).into_iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn string_argument(arguments: &serde_json::Value, name: &str) -> Option<String> {
+    arguments
+        .get(name)
+        .and_then(serde_json::Value::as_str)
+        .and_then(bounded_activity_detail)
+}
+
+fn patch_file_details(arguments: &serde_json::Value) -> Vec<String> {
+    let Some(patch) = arguments.get("patch").and_then(serde_json::Value::as_str) else {
+        return Vec::new();
+    };
+    patch
+        .lines()
+        .filter_map(|line| {
+            [
+                ("*** Add File: ", "Add"),
+                ("*** Update File: ", "Update"),
+                ("*** Delete File: ", "Delete"),
+            ]
+            .into_iter()
+            .find_map(|(prefix, label)| {
+                line.strip_prefix(prefix)
+                    .and_then(bounded_activity_detail)
+                    .map(|path| format!("{label} {path}"))
+            })
+        })
+        .take(8)
+        .collect()
+}
+
+fn bounded_activity_detail(value: &str) -> Option<String> {
+    const MAX_CHARS: usize = 240;
+    let mut normalized = String::new();
+    let mut previous_space = false;
+    for character in value.trim().chars() {
+        let character = if character.is_control() || character.is_whitespace() {
+            ' '
+        } else {
+            character
+        };
+        if character == ' ' {
+            if previous_space {
+                continue;
+            }
+            previous_space = true;
+        } else {
+            previous_space = false;
+        }
+        normalized.push(character);
+    }
+    if normalized.is_empty() {
+        return None;
+    }
+    if normalized.chars().count() > MAX_CHARS {
+        normalized = normalized
+            .chars()
+            .take(MAX_CHARS - 1)
+            .chain(['…'])
+            .collect();
+    }
+    Some(normalized)
+}
+
+#[cfg(test)]
+mod activity_detail_tests {
+    use super::*;
+
+    #[test]
+    fn command_and_patch_previews_are_bounded_and_selective() {
+        assert_eq!(
+            tool_activity_details(
+                "exec_command",
+                &serde_json::json!({ "cmd": "git switch -c feat/visible-work" }),
+            ),
+            vec!["git switch -c feat/visible-work"]
+        );
+        assert_eq!(
+            tool_activity_details(
+                "apply_patch",
+                &serde_json::json!({
+                    "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old\n+new\n*** Add File: tests/new.rs\n+test\n*** End Patch"
+                }),
+            ),
+            vec!["Update src/lib.rs", "Add tests/new.rs"]
+        );
+        assert!(tool_activity_details(
+            "mcp__service__lookup",
+            &serde_json::json!({ "secret": "must-not-render" }),
+        )
+        .iter()
+        .all(|detail| !detail.contains("must-not-render")));
     }
 }

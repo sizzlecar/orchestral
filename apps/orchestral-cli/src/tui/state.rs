@@ -161,6 +161,7 @@ pub(crate) enum UiMsg {
         activity_id: String,
         tool_name: String,
         state: ToolActivityState,
+        details: Vec<String>,
     },
     ProgressReported {
         summary: String,
@@ -456,10 +457,12 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             activity_id,
             tool_name,
             state: activity_state,
+            details,
         } => {
-            let projection = state
-                .activity_reducer
-                .observe(activity_id, tool_name, activity_state);
+            let projection =
+                state
+                    .activity_reducer
+                    .observe(activity_id, tool_name, activity_state, details);
             state.upsert_tool(projection);
         }
         UiMsg::ProgressReported { summary } => state.working_detail = Some(summary),
@@ -1017,6 +1020,7 @@ mod tests {
                     activity_id: activity_id.clone(),
                     tool_name: "file_read".to_owned(),
                     state: ToolActivityState::Running,
+                    details: Vec::new(),
                 },
             );
             update(
@@ -1025,6 +1029,7 @@ mod tests {
                     activity_id,
                     tool_name: "file_read".to_owned(),
                     state: ToolActivityState::Succeeded,
+                    details: Vec::new(),
                 },
             );
         }

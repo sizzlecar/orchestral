@@ -1,17 +1,16 @@
 ---
 source: apps/orchestral-cli/src/tui/render.rs
-assertion_line: 720
 expression: "render_to_string(&state, 100, 24)"
 ---
   Orchestral  ·  gemini-2.5-flash                                                        ● running
   › 阅读核心代码，说明执行链路并给出证据。
 
   ✓ Read 1 file
+      └ core/orchestral-core/src/agent_protocol/types.rs
   • Running 1 command
+      └ rg -n "ToolActivity" core apps
 
   • 我正在核对模型循环与工具执行边界。▌
-
-
 
 
 

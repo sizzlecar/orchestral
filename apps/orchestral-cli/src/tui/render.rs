@@ -614,6 +614,7 @@ mod tests {
                 activity_id: "shell-test".to_owned(),
                 tool_name: "exec_command".to_owned(),
                 state: ToolActivityState::Running,
+                details: vec!["cargo test -p orchestral-runtime".to_owned()],
             },
         );
         update(
@@ -663,6 +664,7 @@ mod tests {
                 activity_id: "inspect-runtime".to_owned(),
                 tool_name: "file_read".to_owned(),
                 state: ToolActivityState::Succeeded,
+                details: vec!["core/orchestral-runtime/src/generic_agent/model_step.rs".to_owned()],
             },
         );
         update(
@@ -696,6 +698,7 @@ mod tests {
                 activity_id: "read-core".to_owned(),
                 tool_name: "file_read".to_owned(),
                 state: ToolActivityState::Succeeded,
+                details: vec!["core/orchestral-core/src/agent_protocol/types.rs".to_owned()],
             },
         );
         update(
@@ -704,6 +707,7 @@ mod tests {
                 activity_id: "search-flow".to_owned(),
                 tool_name: "exec_command".to_owned(),
                 state: ToolActivityState::Running,
+                details: vec!["rg -n \"ToolActivity\" core apps".to_owned()],
             },
         );
         update(
@@ -741,6 +745,7 @@ mod tests {
                 activity_id: "skill-read".to_owned(),
                 tool_name: "skill_read".to_owned(),
                 state: ToolActivityState::Succeeded,
+                details: vec!["code-fix".to_owned()],
             },
         );
         update(
@@ -749,6 +754,7 @@ mod tests {
                 activity_id: "mcp-inventory".to_owned(),
                 tool_name: "mcp__inventory__deployment_color".to_owned(),
                 state: ToolActivityState::Failed,
+                details: vec!["mcp__inventory__deployment_color".to_owned()],
             },
         );
         update(
@@ -757,6 +763,7 @@ mod tests {
                 activity_id: "exec-start".to_owned(),
                 tool_name: "exec_command".to_owned(),
                 state: ToolActivityState::Succeeded,
+                details: vec!["cargo test -p orchestral-cli".to_owned()],
             },
         );
         update(
@@ -765,6 +772,7 @@ mod tests {
                 activity_id: "exec-poll".to_owned(),
                 tool_name: "write_stdin".to_owned(),
                 state: ToolActivityState::Succeeded,
+                details: Vec::new(),
             },
         );
         update(

@@ -1339,6 +1339,13 @@
             "activity_id": {
               "$ref": "#/$defs/ToolActivityId"
             },
+            "details": {
+              "description": "Bounded, presentation-safe operation details selected by the Host\n(for example a command preview or workspace-relative file paths).\nRaw Tool arguments and results must never be copied here wholesale.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
             "state": {
               "$ref": "#/$defs/ToolActivityState"
             },
