@@ -178,7 +178,7 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
         {
             effect_scopes.insert(EffectScope::EnvironmentRead);
         }
-        if !strictly_read_only && !effective_policy.bounds().network.allowed_targets.is_empty() {
+        if classification.network && !effective_policy.bounds().network.allowed_targets.is_empty() {
             effect_scopes.insert(EffectScope::Network);
             effect_scopes.insert(EffectScope::ExternalSideEffect);
         }
@@ -200,8 +200,10 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
             for root in &writable_roots {
                 targets.insert(format!("write:{}", root.display()));
             }
-            for target in &effective_policy.bounds().network.allowed_targets {
-                targets.insert(format!("network:{target}"));
+            if classification.network {
+                for target in &effective_policy.bounds().network.allowed_targets {
+                    targets.insert(format!("network:{target}"));
+                }
             }
         }
         for name in &effective_policy.bounds().environment.allowed_variables {

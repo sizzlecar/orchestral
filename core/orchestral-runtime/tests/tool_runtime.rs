@@ -574,8 +574,8 @@ async fn workspace_policy_authorizes_the_planned_effects_not_the_tool_envelope()
     let operation = ToolOperationPlan {
         effect_scopes: effects(&[EffectScope::Process]),
         targets: strings(&["workspace"]),
-        risk: ToolOperationRisk::Routine,
-        summary: "List the workspace".to_owned(),
+        risk: ToolOperationRisk::Elevated,
+        summary: "Update the sandboxed workspace".to_owned(),
     };
     let executor = Arc::new(PlannedEchoExecutor {
         calls: AtomicUsize::new(0),

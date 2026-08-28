@@ -690,7 +690,7 @@ async fn guarded_unified_surface_executes_children_and_continues_one_tty_session
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
-async fn workspace_auto_run_uses_a_real_read_only_workspace_sandbox() {
+async fn workspace_auto_run_confines_reads_and_mutations_to_the_real_sandbox() {
     use std::os::unix::fs::PermissionsExt;
 
     let parent = std::env::temp_dir().join(format!(
@@ -773,14 +773,20 @@ async fn workspace_auto_run_uses_a_real_read_only_workspace_sandbox() {
                 "workspace-auto-run",
                 "mutation",
                 "orchestral/exec_command/v1",
-                json!({ "cmd": format!("touch {}", mutation.display()) }),
+                json!({ "cmd": format!("printf mutation > {}", mutation.display()) }),
             ),
             RunToolGrant { bounds },
             None,
             CancellationToken::new(),
         )
         .await;
-    assert!(matches!(result, GuardedToolResult::ApprovalRequired { .. }));
-    assert!(!mutation.exists());
+    assert!(matches!(
+        result,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Completed { .. },
+            cached: false,
+        }
+    ));
+    assert_eq!(std::fs::read_to_string(&mutation).unwrap(), "mutation");
     std::fs::remove_dir_all(parent).unwrap();
 }

@@ -152,15 +152,16 @@ impl ToolPermissionPolicy for DescriptorPermissionPolicy {
 
 /// Default interactive workspace policy used by the CLI.
 ///
-/// Routine work stays inside the mandatory sandbox and runs automatically.
-/// Destructive operations, open-world effects, secrets, and any Tool that
-/// statically requires approval still route to the reviewer.
+/// Routine and non-destructive workspace mutation stay inside the mandatory
+/// sandbox and run automatically. Destructive operations, open-world effects,
+/// secrets, and any Tool that statically requires approval still route to the
+/// reviewer.
 #[derive(Debug, Default)]
 pub struct WorkspacePermissionPolicy;
 
 impl ToolPermissionPolicy for WorkspacePermissionPolicy {
     fn contract_digest(&self) -> Digest {
-        Digest::sha256("orchestral.permission-policy/workspace/v1")
+        Digest::sha256("orchestral.permission-policy/workspace/v2")
     }
 
     fn decide(
@@ -177,7 +178,10 @@ impl ToolPermissionPolicy for WorkspacePermissionPolicy {
             };
         }
         if bounds.approval == ApprovalPolicy::Required
-            || operation.risk != ToolOperationRisk::Routine
+            || !matches!(
+                operation.risk,
+                ToolOperationRisk::Routine | ToolOperationRisk::Elevated
+            )
             || operation.effect_scopes.iter().any(|scope| {
                 matches!(
                     scope,
