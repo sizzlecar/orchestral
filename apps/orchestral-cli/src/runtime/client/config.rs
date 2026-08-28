@@ -209,7 +209,7 @@ agent:
   backend: {backend}
   model_profile: {profile}
   stream_buffer: 128
-  max_model_rounds: 8
+  max_model_rounds: 16
   max_tool_calls: 32
   history_limit: 128
   max_context_tokens: 131072

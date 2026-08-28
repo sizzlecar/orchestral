@@ -174,7 +174,7 @@ fn default_stream_buffer() -> usize {
 }
 
 fn default_max_model_rounds() -> u64 {
-    8
+    16
 }
 
 fn default_max_tool_calls() -> u64 {

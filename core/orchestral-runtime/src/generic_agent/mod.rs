@@ -187,11 +187,14 @@ impl GenericAgentConfig {
                 "Host policy are authoritative capability boundaries. Inspect available ",
                 "evidence before making claims, take relevant reversible actions when the ",
                 "request is clear, and ask only when a material choice or required fact cannot ",
-                "be derived."
+                "be derived. Prefer a dedicated Tool over a shell equivalent when one is ",
+                "available. For workspace text changes, inspect the target, use apply_patch, ",
+                "and run relevant verification. Treat every Tool failure as an observation to ",
+                "correct or safely work around; report completion only from successful evidence."
             )
             .to_owned(),
             stream_buffer: 128,
-            max_model_rounds: 8,
+            max_model_rounds: 16,
             max_tool_calls: 32,
             history_limit: 128,
             max_context_tokens: 128 * 1024,

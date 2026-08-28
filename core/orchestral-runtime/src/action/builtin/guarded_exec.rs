@@ -221,6 +221,7 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
         for name in ["TMPDIR", "TMP", "TEMP"] {
             environment.insert(name.to_owned(), runtime_temp.clone());
         }
+        environment.insert("TMPPREFIX".to_owned(), format!("{runtime_temp}/zsh"));
         let tty = execution
             .invocation
             .arguments

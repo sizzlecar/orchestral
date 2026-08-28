@@ -138,8 +138,9 @@ pub fn guarded_apply_patch_descriptor(restriction: ToolRestriction) -> ToolDescr
             name: "apply_patch".to_owned(),
             description: concat!(
                 "Apply a structured patch to UTF-8 text files in the Host-approved workspace. ",
-                "The patch must use *** Begin Patch / *** End Patch and one or more ",
-                "*** Add File, *** Update File with @@ hunks, or *** Delete File directives. ",
+                "The patch must use `*** Begin Patch` / `*** End Patch` and one or more ",
+                "exact directives: `*** Add File: path`, `*** Update File: path` with `@@` ",
+                "hunks, or `*** Delete File: path`; each path directive requires the colon. ",
                 "Paths must be normalized workspace-relative paths."
             )
             .to_owned(),
