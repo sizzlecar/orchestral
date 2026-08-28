@@ -26,6 +26,7 @@ const LOCAL_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 const APPROVAL_PROMPT: &str = "Allow this exact operation? [y/N]";
 
 static LIVE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static LOCAL_E2E_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 struct TestWorkspace {
     root: PathBuf,
@@ -200,6 +201,7 @@ fn terminal_model_failure_is_non_zero_and_preserves_the_reason() {
 
 #[test]
 fn tui_pty_resolves_input_and_approval_then_cancels_another_run() {
+    let _guard = local_e2e_guard();
     let workspace = TestWorkspace::new("tui-control");
     let (model_endpoint, model_server) = spawn_fixture_http_server(vec![
         Box::new(|request| {
@@ -240,7 +242,9 @@ fn tui_pty_resolves_input_and_approval_then_cancels_another_run() {
         "Follow the requested interaction exactly and keep final markers unchanged.",
     ));
     tui.wait_for_text("\u{1b}[?2004h", LOCAL_PROCESS_TIMEOUT);
+    let before_resize = tui.latest.len();
     tui.resize(100, 30);
+    tui.wait_for_text_after("Describe a task.", before_resize, LOCAL_PROCESS_TIMEOUT);
     tui.send_paste("start the input flow");
     tui.wait_for_text("INPUT_REQUEST_MARKER_7319", LOCAL_PROCESS_TIMEOUT);
     tui.send_paste("runtime-core");
@@ -277,6 +281,7 @@ fn tui_pty_resolves_input_and_approval_then_cancels_another_run() {
 
 #[test]
 fn tui_pty_restores_terminal_after_agent_failure() {
+    let _guard = local_e2e_guard();
     let workspace = TestWorkspace::new("tui-failure");
     let (model_endpoint, model_server) = spawn_fixture_http_server(vec![Box::new(|_| {
         openai_tool_response("unknown-call", "not_a_registered_tool", json!({}))
@@ -308,6 +313,7 @@ fn tui_pty_restores_terminal_after_agent_failure() {
 
 #[test]
 fn piped_prompt_is_headless_and_stdout_contains_only_final_delivery() {
+    let _guard = local_e2e_guard();
     const PIPE_PROMPT: &str = "PIPE_INPUT_MARKER_雪豹_7319";
     let workspace = TestWorkspace::new("headless-pipe");
     let (model_endpoint, model_server) = spawn_fixture_http_server(vec![Box::new(|request| {
@@ -342,6 +348,7 @@ fn piped_prompt_is_headless_and_stdout_contains_only_final_delivery() {
 
 #[test]
 fn local_cli_creates_and_verifies_a_file_with_exec_disabled() {
+    let _guard = local_e2e_guard();
     const CONTEXT_MARKER: &str = "需求上下文=雪豹-7319🧩";
     const GENERATED_CONTENT: &str = "generated from 雪豹-7319🧩\n";
 
@@ -434,6 +441,7 @@ fn local_cli_creates_and_verifies_a_file_with_exec_disabled() {
 
 #[test]
 fn local_cli_reads_patches_and_runs_a_guarded_verification() {
+    let _guard = local_e2e_guard();
     let workspace = TestWorkspace::new("patch-and-verify");
     fs::create_dir_all(workspace.path("src")).expect("create source directory");
     fs::write(
@@ -543,6 +551,7 @@ fn local_cli_reads_patches_and_runs_a_guarded_verification() {
 fn local_exec_runs_toolchains_and_a_child_script_without_program_enumeration() {
     use std::os::unix::fs::PermissionsExt;
 
+    let _guard = local_e2e_guard();
     let workspace = TestWorkspace::new("unified-exec-toolchains");
     let script = workspace.path("child-check.sh");
     fs::write(
@@ -628,6 +637,7 @@ fn local_exec_runs_toolchains_and_a_child_script_without_program_enumeration() {
 
 #[test]
 fn local_cli_skill_read_injects_instructions_and_journals_load() {
+    let _guard = local_e2e_guard();
     const DESCRIPTOR_MARKER: &str = "E2E skill descriptor marker";
     const INSTRUCTION_MARKER: &str = "SKILL_E2E_INSTRUCTION_雪豹_7319";
     const RESULT_MARKER: &str = "SKILL_E2E_RESULT_云鲸_4827";
@@ -730,6 +740,7 @@ fn local_cli_skill_read_injects_instructions_and_journals_load() {
 
 #[test]
 fn local_cli_discovers_calls_and_journals_an_mcp_tool() {
+    let _guard = local_e2e_guard();
     const MCP_RESULT_MARKER: &str = "MCP_RESULT_云鲸_4827🔌";
 
     let workspace = TestWorkspace::new("mcp-entrypoint");
@@ -1121,6 +1132,13 @@ fn live_test_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+fn local_e2e_guard() -> std::sync::MutexGuard<'static, ()> {
+    LOCAL_E2E_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn base_command(workspace: &TestWorkspace) -> Command {
     let mut command = root_command(workspace);
     command.arg("--no-mcp").arg("--no-skills");
@@ -1263,6 +1281,32 @@ impl PtyHarness {
 
     fn wait_for_text(&mut self, marker: &str, timeout: Duration) {
         self.wait_for_text_count(marker, 1, timeout);
+    }
+
+    fn wait_for_text_after(&mut self, marker: &str, offset: usize, timeout: Duration) {
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            if String::from_utf8_lossy(&self.latest[offset.min(self.latest.len())..])
+                .contains(marker)
+            {
+                return;
+            }
+            match self.updates.recv_timeout(Duration::from_millis(100)) {
+                Ok(bytes) => self.latest = bytes,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            if let Some(status) = self.child.try_wait().expect("poll TUI child") {
+                panic!(
+                    "TUI exited before fresh marker {marker:?} with {status:?}:\n{}",
+                    String::from_utf8_lossy(&self.latest)
+                );
+            }
+        }
+        panic!(
+            "TUI did not render fresh marker {marker:?} within {timeout:?}:\n{}",
+            String::from_utf8_lossy(&self.latest)
+        );
     }
 
     fn wait_for_text_count(&mut self, marker: &str, count: usize, timeout: Duration) {
@@ -1759,6 +1803,9 @@ fn spawn_fixture_http_server(
                 }
             };
             stream
+                .set_nonblocking(false)
+                .expect("use blocking fixture connection");
+            stream
                 .set_read_timeout(Some(Duration::from_secs(20)))
                 .expect("bound fixture read timeout");
             stream
@@ -1777,8 +1824,9 @@ fn spawn_fixture_http_server(
 fn read_http_fixture_request(stream: &mut TcpStream) -> CapturedHttpRequest {
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 4096];
+    let deadline = Instant::now() + Duration::from_secs(35);
     let header_end = loop {
-        let count = stream.read(&mut buffer).expect("read HTTP fixture request");
+        let count = read_http_fixture_chunk(stream, &mut buffer, deadline);
         assert!(count > 0, "HTTP fixture request ended before its headers");
         bytes.extend_from_slice(&buffer[..count]);
         assert!(
@@ -1802,9 +1850,7 @@ fn read_http_fixture_request(stream: &mut TcpStream) -> CapturedHttpRequest {
         .parse::<usize>()
         .expect("HTTP fixture Content-Length is valid");
     while bytes.len() < header_end + content_length {
-        let count = stream
-            .read(&mut buffer)
-            .expect("read HTTP fixture request body");
+        let count = read_http_fixture_chunk(stream, &mut buffer, deadline);
         assert!(count > 0, "HTTP fixture request body ended early");
         bytes.extend_from_slice(&buffer[..count]);
     }
@@ -1812,6 +1858,20 @@ fn read_http_fixture_request(stream: &mut TcpStream) -> CapturedHttpRequest {
         headers,
         body: serde_json::from_slice(&bytes[header_end..header_end + content_length])
             .expect("HTTP fixture request body is JSON"),
+    }
+}
+
+fn read_http_fixture_chunk(stream: &mut TcpStream, buffer: &mut [u8], deadline: Instant) -> usize {
+    loop {
+        match stream.read(buffer) {
+            Ok(count) => return count,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) && Instant::now() < deadline => {}
+            Err(error) => panic!("read HTTP fixture request: {error}"),
+        }
     }
 }
 
