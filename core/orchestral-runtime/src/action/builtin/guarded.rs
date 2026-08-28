@@ -4,7 +4,7 @@
 //! adapt or call the removed legacy `Action` stack.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::io;
+use std::io::{self, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
@@ -15,6 +15,7 @@ use orchestral_core::tool_protocol::{
     ToolIdempotency, ToolOutcome, ToolRestriction,
 };
 use serde_json::{json, Value};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
 
@@ -219,10 +220,16 @@ impl GuardedToolExecutor for GuardedFileReadExecutor {
             bounds
                 .max_output_bytes
                 .unwrap_or(512 * 1024)
-                .saturating_sub(4 * 1024)
-                .max(1),
+                .saturating_sub(4 * 1024),
         )
         .unwrap_or(usize::MAX);
+        if host_limit < 4 {
+            return failed(
+                "file_read_limit_too_small",
+                "effective output policy leaves fewer than four bytes for UTF-8 content",
+                false,
+            );
+        }
         let max_bytes = execution
             .invocation
             .arguments
@@ -231,44 +238,77 @@ impl GuardedToolExecutor for GuardedFileReadExecutor {
             .and_then(|value| usize::try_from(value).ok())
             .unwrap_or(host_limit)
             .min(host_limit)
-            .max(1);
-        let truncate = execution
+            .max(4);
+        let offset = execution
             .invocation
             .arguments
-            .get("truncate")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+            .get("offset")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let metadata = tokio::select! {
+            biased;
+            _ = execution.cancellation.cancelled() => return ToolOutcome::Cancelled,
+            result = tokio::fs::metadata(&path) => result,
+        };
+        let total_bytes = match metadata {
+            Ok(metadata) if metadata.is_file() => metadata.len(),
+            Ok(_) => return failed("file_read_not_file", "path is not a regular file", false),
+            Err(error) => return failed("file_read_failed", error.to_string(), false),
+        };
+        if offset > total_bytes {
+            return rejected(
+                "file_read_offset_out_of_range",
+                format!("offset {offset} exceeds file length {total_bytes}"),
+            );
+        }
         let read = tokio::select! {
             biased;
             _ = execution.cancellation.cancelled() => return ToolOutcome::Cancelled,
-            result = tokio::fs::read(&path) => result,
+            result = async {
+                let mut file = tokio::fs::File::open(&path).await?;
+                file.seek(SeekFrom::Start(offset)).await?;
+                let mut bytes = Vec::with_capacity(max_bytes);
+                file.take(max_bytes as u64).read_to_end(&mut bytes).await?;
+                Ok::<_, io::Error>(bytes)
+            } => result,
         };
-        let mut bytes = match read {
+        let bytes = match read {
             Ok(bytes) => bytes,
             Err(error) => return failed("file_read_failed", error.to_string(), false),
         };
-        let truncated = bytes.len() > max_bytes;
-        if truncated && !truncate {
-            return failed(
-                "file_read_too_large",
-                format!(
-                    "file contains {} bytes, exceeding the effective limit {max_bytes}",
-                    bytes.len()
-                ),
-                false,
+        if offset > 0
+            && bytes
+                .first()
+                .is_some_and(|byte| byte & 0b1100_0000 == 0b1000_0000)
+        {
+            return rejected(
+                "file_read_offset_not_utf8_boundary",
+                "offset points into the middle of a UTF-8 character; continue from a returned next_offset",
             );
         }
-        bytes.truncate(max_bytes);
-        let byte_count = bytes.len() as u64;
-        let content = match String::from_utf8(bytes) {
-            Ok(content) => content,
+        let valid_bytes = match std::str::from_utf8(&bytes) {
+            Ok(_) => bytes.len(),
+            Err(error)
+                if error.error_len().is_none()
+                    && offset.saturating_add(bytes.len() as u64) < total_bytes =>
+            {
+                error.valid_up_to()
+            }
             Err(error) => return failed("file_not_utf8", error.to_string(), false),
         };
+        let content = String::from_utf8(bytes[..valid_bytes].to_vec())
+            .expect("validated UTF-8 prefix must decode");
+        let byte_count = valid_bytes as u64;
+        let next_offset = offset.saturating_add(byte_count);
+        let truncated = next_offset < total_bytes;
         ToolOutcome::Completed {
             output: json!({
                 "content": content,
                 "path": path.to_string_lossy(),
+                "offset": offset,
+                "next_offset": next_offset,
                 "bytes": byte_count,
+                "total_bytes": total_bytes,
                 "truncated": truncated,
             })
             .into(),
@@ -278,29 +318,32 @@ impl GuardedToolExecutor for GuardedFileReadExecutor {
 
 pub fn guarded_file_read_descriptor(restriction: ToolRestriction) -> ToolDescriptor {
     ToolDescriptor {
-        tool_id: ToolId::new("orchestral/file_read/v1"),
+        tool_id: ToolId::new("orchestral/file_read/v2"),
         model_schema: ModelToolSchema {
             name: "file_read".to_owned(),
-            description: "Read a UTF-8 text file visible inside the Host-approved workspace"
+            description: "Read one bounded UTF-8 chunk from a file in the Host-approved workspace. If truncated is true, continue with the returned next_offset."
                 .to_owned(),
             input_schema: json!({
                 "type": "object",
                 "required": ["path"],
                 "properties": {
                     "path": { "type": "string" },
-                    "max_bytes": { "type": "integer", "minimum": 1 },
-                    "truncate": { "type": "boolean" }
+                    "offset": { "type": "integer", "minimum": 0 },
+                    "max_bytes": { "type": "integer", "minimum": 4 }
                 },
                 "additionalProperties": false
             }),
         },
         output_schema: json!({
             "type": "object",
-            "required": ["content", "path", "bytes", "truncated"],
+            "required": ["content", "path", "offset", "next_offset", "bytes", "total_bytes", "truncated"],
             "properties": {
                 "content": { "type": "string" },
                 "path": { "type": "string" },
+                "offset": { "type": "integer" },
+                "next_offset": { "type": "integer" },
                 "bytes": { "type": "integer" },
+                "total_bytes": { "type": "integer" },
                 "truncated": { "type": "boolean" }
             },
             "additionalProperties": false

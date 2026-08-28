@@ -39,8 +39,6 @@ struct SkillLoadModel {
     digest: String,
 }
 
-struct RecoveredSkillModel;
-
 struct UnboundCatalogModel;
 
 struct SkillVisibilityModel {
@@ -110,23 +108,6 @@ impl ModelBackend for SkillLoadModel {
 }
 
 #[async_trait]
-impl ModelBackend for RecoveredSkillModel {
-    fn descriptor(&self) -> ModelDescriptor {
-        function_capable_descriptor("recovered-skill-model")
-    }
-
-    async fn start(
-        &self,
-        request: ModelRequest,
-        _cancellation: CancellationToken,
-    ) -> Result<ModelStream, ModelError> {
-        request.validate()?;
-        assert!(system_text(&request.messages).contains(SECRET_INSTRUCTIONS));
-        answer_stream(request.request_id, "recovered skill context")
-    }
-}
-
-#[async_trait]
 impl ModelBackend for UnboundCatalogModel {
     fn descriptor(&self) -> ModelDescriptor {
         function_capable_descriptor("unbound-catalog-model")
@@ -185,7 +166,7 @@ impl ModelBackend for SkillVisibilityModel {
 }
 
 #[tokio::test]
-async fn bound_skill_loads_into_context_and_replays_after_provider_restart() {
+async fn bound_skill_loads_are_recovered_within_a_run_but_not_leaked_to_the_next_run() {
     let skills = Arc::new(skill_runtime());
     let digest = skills.catalog().skills[0].digest.clone();
     let journal = Arc::new(InMemoryAgentSessionJournalStore::default());
@@ -265,10 +246,13 @@ async fn bound_skill_loads_into_context_and_replays_after_provider_restart() {
 
     let restarted_provider = Arc::new(
         InternalGenericAgentProvider::new_with_skills_and_session_journal(
-            Arc::new(RecoveredSkillModel),
+            Arc::new(SkillLoadModel {
+                rounds: AtomicUsize::new(0),
+                digest: digest.to_string(),
+            }),
             GenericAgentConfig::new("internal-provider", "generic-agent"),
             skills.clone(),
-            journal,
+            journal.clone(),
             Arc::new(JsonSizeTokenMeter::default()),
         )
         .unwrap(),
@@ -276,13 +260,28 @@ async fn bound_skill_loads_into_context_and_replays_after_provider_restart() {
     let restarted_controller = Arc::new(
         AgentController::new(restarted_provider, ProviderBindingRef::new("skill-binding")).unwrap(),
     );
-    let second = bound_run(&skills, session_id, RunId::new("skill-run-2"), "continue");
+    let second = bound_run(
+        &skills,
+        session_id.clone(),
+        RunId::new("skill-run-2"),
+        "continue",
+    );
     let execution = restarted_controller.start(second).await.unwrap();
     let view = restarted_controller
         .wait_for_terminal(&execution.run_id)
         .await
         .unwrap();
     assert_eq!(view.state.status(), AgentRunStatus::Delivered);
+
+    let records = journal.load_session(&session_id).await.unwrap();
+    let load_runs = records
+        .iter()
+        .filter_map(|record| {
+            matches!(record.payload, AgentSessionEvent::SkillLoaded { .. })
+                .then_some(record.run_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(load_runs, vec!["skill-run-1", "skill-run-2"]);
 }
 
 #[tokio::test]

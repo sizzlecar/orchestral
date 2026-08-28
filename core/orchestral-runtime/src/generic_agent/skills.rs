@@ -31,8 +31,8 @@ pub(super) async fn execute_skill_read(
         .load_session(&request.run.spec.session_id)
         .await
         .map_err(session_journal_failure)?;
-    let loaded = LoadedSkillSet::replay(&records)
-        .map_err(|error| agent_failure("skill_session_state", error.to_string(), false))?;
+    let loaded = LoadedSkillSet::replay_for_run(&records, &request.run.spec.run_id)
+        .map_err(|error| agent_failure("skill_run_state", error.to_string(), false))?;
     let evaluation = evaluate_skill_read(skills, arguments, &loaded);
     if let Some(load) = evaluation.load {
         append_session_event(

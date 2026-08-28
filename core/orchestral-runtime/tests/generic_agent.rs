@@ -8136,8 +8136,10 @@ async fn active_run_context_pressure_compacts_and_the_agent_continues_to_deliver
                 calls: summarizer_calls.clone(),
             }),
             SessionCompactionPolicy {
-                minimum_source_records: 2,
-                keep_recent_records: 2,
+                // Production defaults deliberately exceed this Run's five
+                // exchanges. Pressure must still compact instead of failing.
+                minimum_source_records: 32,
+                keep_recent_records: 16,
             },
         )
         .unwrap(),

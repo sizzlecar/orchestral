@@ -511,12 +511,14 @@ pub(super) async fn prepare_recovered_skill(
         .filter(|record| first_outcome_seq.is_none_or(|first| record.session_seq < first))
         .cloned()
         .collect::<Vec<_>>();
-    let loaded = LoadedSkillSet::replay(&prior_records).map_err(|error| {
-        AgentProtocolError::new(
-            AgentProtocolErrorCode::InvalidDigest,
-            format!("recovered Skill state is invalid: {error}"),
-        )
-    })?;
+    let loaded = LoadedSkillSet::replay_for_run(&prior_records, &request.run.spec.run_id).map_err(
+        |error| {
+            AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidDigest,
+                format!("recovered Skill state is invalid: {error}"),
+            )
+        },
+    )?;
     let evaluation = evaluate_skill_read(skills, arguments.clone(), &loaded);
     match (&load_record, &evaluation.load) {
         (

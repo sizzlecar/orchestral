@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use orchestral_core::agent_protocol::wire::{Digest, ResourceId};
+use orchestral_core::agent_protocol::wire::{Digest, ResourceId, RunId};
 use orchestral_core::agent_session::{AgentSessionEvent, AgentSessionRecord};
 use orchestral_core::skill_protocol::{
     SkillCatalogDescriptor, SkillCompatibility, SkillDependencies, SkillDescriptor, SkillId,
@@ -43,9 +43,18 @@ pub struct LoadedSkillSet {
 }
 
 impl LoadedSkillSet {
-    pub fn replay(records: &[AgentSessionRecord]) -> Result<Self, SkillRuntimeError> {
+    /// Rebuilds the immutable Skill loads visible to one Run. Skill
+    /// instructions are task-local working context: a later Run in the same
+    /// Session starts from the catalog and must explicitly load what it needs.
+    pub fn replay_for_run(
+        records: &[AgentSessionRecord],
+        run_id: &RunId,
+    ) -> Result<Self, SkillRuntimeError> {
         let mut set = Self::default();
         for record in records {
+            if record.run_id != *run_id {
+                continue;
+            }
             let AgentSessionEvent::SkillLoaded { load } = &record.payload else {
                 continue;
             };

@@ -90,7 +90,7 @@ pub struct SessionContextRequest {
     pub system_message: Option<ModelMessage>,
     pub tools: Vec<ModelToolDefinition>,
     /// Maximum number of non-current Run history groups eligible for this
-    /// request. Current Run task/safety state and loaded Skills remain pinned;
+    /// request. Current Run task/safety state and its loaded Skills remain pinned;
     /// complete older Tool exchanges may be replaced by a durable active-Run
     /// summary under Context pressure.
     pub history_limit: usize,
@@ -307,6 +307,12 @@ fn replay_groups(
                 );
             }
             AgentSessionEvent::SkillLoaded { load } => {
+                // A Skill load is working context for the Run that requested
+                // it, not durable instructions for every future task in the
+                // Session.
+                if record.run_id != *current_run_id {
+                    continue;
+                }
                 let descriptor = &load.package.descriptor;
                 if allowed_skill_digests.get(&descriptor.skill_id) != Some(&descriptor.digest) {
                     continue;
@@ -317,7 +323,7 @@ fn replay_groups(
                     if previous != descriptor.digest {
                         return Err(SessionContextError::Journal(AgentSessionError::Corrupt(
                             format!(
-                                "Skill '{}' changed digest inside one Session without an explicit replacement protocol",
+                                "Skill '{}' changed digest inside one Run without an explicit replacement protocol",
                                 descriptor.skill_id
                             ),
                         )));
@@ -333,8 +339,8 @@ fn replay_groups(
                         producer_seq: record.session_seq,
                         source: single_range(record.session_seq),
                         messages: vec![skill_load_message(load)],
-                        // Loaded instructions are Session state. They are
-                        // never evicted or shadowed by ordinary compaction.
+                        // Current-Run instructions stay pinned for recovery
+                        // and cannot be evicted by ordinary history selection.
                         pinned: true,
                         active_compactable: false,
                     },
@@ -782,6 +788,27 @@ pub fn select_active_run_compaction_source(
         }
     }
 
+    let live_exchange_count = records
+        .iter()
+        .filter(|record| {
+            live.contains(&record.session_seq)
+                && matches!(
+                    record.payload,
+                    AgentSessionEvent::ToolExchangeCommitted { .. }
+                )
+        })
+        .count();
+    // The normal retention target is a quality preference, not a reason to
+    // fail a Run that is already over budget. When pressure arrives before
+    // that target is reached, preserve the newest exchange and compact the
+    // rest. A single oversized exchange is itself eligible for compaction.
+    let retain_count = if live_exchange_count > policy.keep_recent_records {
+        policy.keep_recent_records
+    } else if live_exchange_count > 1 {
+        1
+    } else {
+        0
+    };
     let retained_recent = records
         .iter()
         .rev()
@@ -792,7 +819,7 @@ pub fn select_active_run_compaction_source(
                     AgentSessionEvent::ToolExchangeCommitted { .. }
                 )
         })
-        .take(policy.keep_recent_records)
+        .take(retain_count)
         .map(|record| record.session_seq)
         .collect::<BTreeSet<_>>();
     let candidates = live

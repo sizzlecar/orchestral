@@ -2467,7 +2467,7 @@ async fn two_thousand_five_hundred_symlink_escapes_read_zero_outside_bytes() {
                 ToolInvocation {
                     run_id: RunId::new("symlink-escape-run"),
                     call_id: ToolCallId::new(format!("symlink-escape-{index}")),
-                    tool_id: ToolId::new("orchestral/file_read/v1"),
+                    tool_id: ToolId::new("orchestral/file_read/v2"),
                     arguments: json!({ "path": link }),
                 },
                 RunToolGrant {
@@ -2533,7 +2533,8 @@ async fn guarded_file_read_uses_effective_roots_without_model_authority_fields()
         std::env::temp_dir().join(format!("orchestral-guarded-read-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
     let file = root.join("hello.txt");
-    std::fs::write(&file, "hello from guarded file").unwrap();
+    let expected = "abcd你好ef";
+    std::fs::write(&file, expected).unwrap();
     let root = std::fs::canonicalize(&root).unwrap();
     let bounds = ToolPolicyBounds {
         allowed_effects: effects(&[EffectScope::FilesystemRead]),
@@ -2563,30 +2564,82 @@ async fn guarded_file_read_uses_effective_roots_without_model_authority_fields()
     assert!(descriptor.model_schema.input_schema["properties"]
         .get("sandbox_mode")
         .is_none());
+    assert!(descriptor.model_schema.input_schema["properties"]
+        .get("truncate")
+        .is_none());
+    assert!(descriptor.model_schema.input_schema["properties"]
+        .get("offset")
+        .is_some());
     runtime
         .register(descriptor, Arc::new(GuardedFileReadExecutor))
         .unwrap();
 
-    let result = runtime
+    let first = runtime
         .invoke(
             ToolInvocation {
                 run_id: RunId::new("guarded-file-run"),
-                call_id: ToolCallId::new("guarded-file-call"),
-                tool_id: ToolId::new("orchestral/file_read/v1"),
-                arguments: json!({ "path": file.to_string_lossy() }),
+                call_id: ToolCallId::new("guarded-file-call-1"),
+                tool_id: ToolId::new("orchestral/file_read/v2"),
+                arguments: json!({ "path": file.to_string_lossy(), "max_bytes": 5 }),
+            },
+            RunToolGrant {
+                bounds: bounds.clone(),
+            },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    let first = match first {
+        GuardedToolResult::Outcome {
+            outcome:
+                ToolOutcome::Completed {
+                    output: ToolOutput::Inline(output),
+                },
+            ..
+        } => output,
+        other => panic!("first bounded read failed: {other:?}"),
+    };
+    assert_eq!(first["content"], json!("abcd"));
+    assert_eq!(first["offset"], json!(0));
+    assert_eq!(first["next_offset"], json!(4));
+    assert_eq!(first["truncated"], json!(true));
+
+    let second = runtime
+        .invoke(
+            ToolInvocation {
+                run_id: RunId::new("guarded-file-run"),
+                call_id: ToolCallId::new("guarded-file-call-2"),
+                tool_id: ToolId::new("orchestral/file_read/v2"),
+                arguments: json!({
+                    "path": file.to_string_lossy(),
+                    "offset": first["next_offset"],
+                    "max_bytes": 64
+                }),
             },
             RunToolGrant { bounds },
             None,
             CancellationToken::new(),
         )
         .await;
-
-    assert!(matches!(
-        result,
+    let second = match second {
         GuardedToolResult::Outcome {
-            outcome: ToolOutcome::Completed { output: ToolOutput::Inline(ref output) },
+            outcome:
+                ToolOutcome::Completed {
+                    output: ToolOutput::Inline(output),
+                },
             ..
-        } if output["content"] == json!("hello from guarded file")
-    ));
+        } => output,
+        other => panic!("second bounded read failed: {other:?}"),
+    };
+    assert_eq!(
+        format!(
+            "{}{}",
+            first["content"].as_str().unwrap(),
+            second["content"].as_str().unwrap()
+        ),
+        expected
+    );
+    assert_eq!(second["truncated"], json!(false));
+    assert_eq!(second["next_offset"], second["total_bytes"]);
     std::fs::remove_dir_all(root).unwrap();
 }
