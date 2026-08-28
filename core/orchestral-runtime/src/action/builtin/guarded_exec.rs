@@ -533,7 +533,7 @@ fn ensure_controlled_directory(root: &Path, directory: &Path) -> Result<PathBuf,
             ));
         }
     }
-    let canonical = std::fs::canonicalize(&directory).map_err(|error| {
+    let canonical = std::fs::canonicalize(directory).map_err(|error| {
         format!(
             "canonicalize controlled runtime directory '{}' failed: {error}",
             directory.display()
