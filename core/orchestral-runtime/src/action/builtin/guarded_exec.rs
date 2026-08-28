@@ -8,7 +8,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use orchestral_core::tool_protocol::{
     ApprovalPolicy, EffectScope, ModelToolSchema, ToolConcurrency, ToolDescriptor, ToolId,
-    ToolIdempotency, ToolInvocation, ToolOutcome, ToolRestriction,
+    ToolIdempotency, ToolInvocation, ToolOperationPlan, ToolOperationRisk, ToolOutcome,
+    ToolRestriction,
 };
 use serde_json::{json, Map, Value};
 
@@ -111,22 +112,128 @@ impl GuardedWriteStdinExecutor {
 
 #[async_trait]
 impl GuardedToolExecutor for GuardedExecCommandExecutor {
+    fn planning_contract(&self) -> Value {
+        json!({
+            "contract": "orchestral.exec-command-operation-planner/v2",
+            "shell": self.shell,
+            "runtime_readable_roots": self.runtime_readable_roots,
+            "environment_names": self.environment.names(),
+        })
+    }
+
+    fn plan_operation(
+        &self,
+        invocation: &ToolInvocation,
+        descriptor: &ToolDescriptor,
+        effective_policy: &orchestral_core::tool_protocol::EffectiveToolPolicy,
+    ) -> Result<ToolOperationPlan, ToolOutcome> {
+        let Some(cmd) = invocation
+            .arguments
+            .get("cmd")
+            .and_then(Value::as_str)
+            .filter(|cmd| !cmd.trim().is_empty())
+        else {
+            return Err(rejected(
+                "exec_command_missing",
+                "cmd must be a non-empty string",
+            ));
+        };
+        let readable_roots = canonical_roots(&effective_policy.bounds().filesystem.readable_roots)
+            .map_err(|message| rejected("exec_read_root_invalid", message))?;
+        let writable_roots = canonical_roots(&effective_policy.bounds().filesystem.writable_roots)
+            .map_err(|message| rejected("exec_write_root_invalid", message))?;
+        if readable_roots.is_empty() || writable_roots.is_empty() {
+            return Err(rejected(
+                "exec_workspace_denied",
+                "exec_command requires readable and writable workspace roots",
+            ));
+        }
+        let cwd = resolve_workdir(
+            invocation.arguments.get("workdir"),
+            &readable_roots,
+            &writable_roots,
+        )
+        .map_err(|message| rejected("exec_workdir_invalid", message))?;
+        let classification = classify_command(cmd);
+        let interactive = invocation
+            .arguments
+            .get("tty")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let strictly_read_only = classification.read_only && !interactive;
+        let mut effect_scopes = BTreeSet::from([
+            EffectScope::Process,
+            EffectScope::FilesystemRead,
+            // Even a read-only command needs the Host-owned runtime temp
+            // directory. The executor grants no workspace write access for
+            // this class of operation.
+            EffectScope::FilesystemWrite,
+        ]);
+        if !effective_policy
+            .bounds()
+            .environment
+            .allowed_variables
+            .is_empty()
+        {
+            effect_scopes.insert(EffectScope::EnvironmentRead);
+        }
+        if !strictly_read_only && !effective_policy.bounds().network.allowed_targets.is_empty() {
+            effect_scopes.insert(EffectScope::Network);
+            effect_scopes.insert(EffectScope::ExternalSideEffect);
+        }
+        let mut targets = BTreeSet::from([
+            format!("process-shell:{}", self.shell.display()),
+            format!("workdir:{}", cwd.display()),
+        ]);
+        for root in readable_roots
+            .iter()
+            .chain(self.runtime_readable_roots.iter())
+        {
+            targets.insert(format!("read:{}", root.display()));
+        }
+        if strictly_read_only {
+            for root in &writable_roots {
+                targets.insert(format!("write:{}/.orchestral/tmp", root.display()));
+            }
+        } else {
+            for root in &writable_roots {
+                targets.insert(format!("write:{}", root.display()));
+            }
+            for target in &effective_policy.bounds().network.allowed_targets {
+                targets.insert(format!("network:{target}"));
+            }
+        }
+        for name in &effective_policy.bounds().environment.allowed_variables {
+            targets.insert(format!("environment:{name}"));
+        }
+        let operation = ToolOperationPlan {
+            effect_scopes,
+            targets,
+            risk: if classification.destructive {
+                ToolOperationRisk::Destructive
+            } else if strictly_read_only {
+                ToolOperationRisk::Routine
+            } else {
+                ToolOperationRisk::Elevated
+            },
+            summary: format!("Execute in workspace sandbox: {}", display_command(cmd)),
+        };
+        operation
+            .validate_envelope(&descriptor.effect_scopes)
+            .map_err(|error| rejected("exec_operation_invalid", error.message))?;
+        Ok(operation)
+    }
+
     fn approval_summary(&self, invocation: &ToolInvocation) -> String {
         let cmd = invocation
             .arguments
             .get("cmd")
             .and_then(Value::as_str)
             .unwrap_or("<invalid-command>");
-        format!(
-            "Execute in workspace sandbox: {}",
-            cmd.chars().take(240).collect::<String>()
-        )
+        format!("Execute in workspace sandbox: {}", display_command(cmd))
     }
 
     async fn execute(&self, execution: GuardedToolExecution) -> ToolOutcome {
-        if let Err(outcome) = require_exact_approval(&execution) {
-            return outcome;
-        }
         if execution.cancellation.is_cancelled() {
             return ToolOutcome::Cancelled;
         }
@@ -192,6 +299,34 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
             Ok(path) => path,
             Err(message) => return failed("exec_runtime_temp", message, false),
         };
+        let tty = execution
+            .invocation
+            .arguments
+            .get("tty")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let classification = classify_command(cmd);
+        let strictly_read_only = classification.read_only && !tty;
+        if strictly_read_only != (execution.operation.risk == ToolOperationRisk::Routine) {
+            return rejected(
+                "exec_operation_mismatch",
+                "planned command risk no longer matches the executable sandbox profile",
+            );
+        }
+        let sandbox_writes = if strictly_read_only {
+            vec![runtime_temp.clone()]
+        } else {
+            writable_roots
+        };
+        let network_targets = if execution
+            .operation
+            .effect_scopes
+            .contains(&EffectScope::Network)
+        {
+            bounds.network.allowed_targets.clone()
+        } else {
+            BTreeSet::new()
+        };
         let mut sandbox_reads = readable_roots;
         sandbox_reads.extend(self.runtime_readable_roots.iter().cloned());
         sandbox_reads.push(runtime_temp.clone());
@@ -203,31 +338,32 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
             &cwd,
             &ShellSandboxPolicy {
                 readable_roots: sandbox_reads,
-                writable_roots,
+                writable_roots: sandbox_writes,
                 allow_child_processes: true,
                 launcher_programs: vec![self.shell.clone()],
-                network_targets: bounds.network.allowed_targets.clone(),
+                network_targets,
                 linux_bwrap_path: None,
             },
         ) {
             Ok(command) => command,
             Err(message) => return failed("exec_sandbox_setup", message, false),
         };
-        let mut environment = self
-            .environment
-            .filtered(&bounds.environment.allowed_variables);
+        let mut environment = if execution
+            .operation
+            .effect_scopes
+            .contains(&EffectScope::EnvironmentRead)
+        {
+            self.environment
+                .filtered(&bounds.environment.allowed_variables)
+        } else {
+            BTreeMap::new()
+        };
         environment.extend(sandboxed.env);
         let runtime_temp = runtime_temp.to_string_lossy().into_owned();
         for name in ["TMPDIR", "TMP", "TEMP"] {
             environment.insert(name.to_owned(), runtime_temp.clone());
         }
         environment.insert("TMPPREFIX".to_owned(), format!("{runtime_temp}/zsh"));
-        let tty = execution
-            .invocation
-            .arguments
-            .get("tty")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
         let wait = bounded_wait(
             &execution.invocation.arguments,
             bounds.max_timeout_ms,
@@ -289,13 +425,80 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
 
 #[async_trait]
 impl GuardedToolExecutor for GuardedWriteStdinExecutor {
+    fn planning_contract(&self) -> Value {
+        json!({
+            "contract": "orchestral.write-stdin-operation-planner/v2"
+        })
+    }
+
+    fn plan_operation(
+        &self,
+        invocation: &ToolInvocation,
+        descriptor: &ToolDescriptor,
+        _effective_policy: &orchestral_core::tool_protocol::EffectiveToolPolicy,
+    ) -> Result<ToolOperationPlan, ToolOutcome> {
+        let Some(session_id) = invocation
+            .arguments
+            .get("session_id")
+            .and_then(Value::as_u64)
+        else {
+            return Err(rejected(
+                "exec_session_missing",
+                "session_id must be a positive integer",
+            ));
+        };
+        let has_input = invocation
+            .arguments
+            .get("chars")
+            .and_then(Value::as_str)
+            .is_some_and(|chars| !chars.is_empty());
+        // Input can trigger any authority already held by the live process.
+        // Until ProcessSupervisor stores that exact session capability, bind
+        // conservatively to the complete registered exec envelope. A pure
+        // poll cannot trigger new process behavior and stays Process-only.
+        let effect_scopes = if has_input {
+            descriptor.effect_scopes.clone()
+        } else {
+            BTreeSet::from([EffectScope::Process])
+        };
+        let input_preview = invocation
+            .arguments
+            .get("chars")
+            .and_then(Value::as_str)
+            .map(display_payload);
+        let operation = ToolOperationPlan {
+            effect_scopes,
+            targets: BTreeSet::from([format!("exec-session:{session_id}")]),
+            risk: if has_input {
+                ToolOperationRisk::Elevated
+            } else {
+                ToolOperationRisk::Routine
+            },
+            summary: if let Some(input) = input_preview {
+                format!("Send input to exec session {session_id}: {input}")
+            } else {
+                format!("Poll exec session {session_id}")
+            },
+        };
+        operation
+            .validate_envelope(&descriptor.effect_scopes)
+            .map_err(|error| rejected("exec_operation_invalid", error.message))?;
+        Ok(operation)
+    }
+
     fn approval_summary(&self, invocation: &ToolInvocation) -> String {
         let session_id = invocation
             .arguments
             .get("session_id")
             .and_then(Value::as_u64)
             .unwrap_or_default();
-        format!("Write to or poll exec session {session_id}")
+        match invocation.arguments.get("chars").and_then(Value::as_str) {
+            Some(chars) if !chars.is_empty() => format!(
+                "Send input to exec session {session_id}: {}",
+                display_payload(chars)
+            ),
+            _ => format!("Poll exec session {session_id}"),
+        }
     }
 
     async fn execute(&self, execution: GuardedToolExecution) -> ToolOutcome {
@@ -350,12 +553,20 @@ impl GuardedToolExecutor for GuardedWriteStdinExecutor {
     }
 }
 
+/// Safe SDK default: every shell command requires exact Host approval.
 pub fn guarded_exec_command_descriptor(mut restriction: ToolRestriction) -> ToolDescriptor {
-    restriction.bounds.approval = match restriction.bounds.approval {
-        ApprovalPolicy::Deny => ApprovalPolicy::Deny,
-        ApprovalPolicy::NotRequired | ApprovalPolicy::Required => ApprovalPolicy::Required,
-        _ => ApprovalPolicy::Deny,
-    };
+    restriction.bounds.approval = ApprovalPolicy::Required;
+    build_exec_command_descriptor(restriction)
+}
+
+/// Interactive CLI profile: the workspace permission policy may auto-run an
+/// invocation only after its operation planner selected a constrained routine
+/// sandbox. Applications must opt in explicitly.
+pub fn workspace_exec_command_descriptor(restriction: ToolRestriction) -> ToolDescriptor {
+    build_exec_command_descriptor(restriction)
+}
+
+fn build_exec_command_descriptor(mut restriction: ToolRestriction) -> ToolDescriptor {
     apply_exec_restriction(&mut restriction);
     ToolDescriptor {
         tool_id: ToolId::new("orchestral/exec_command/v1"),
@@ -383,7 +594,20 @@ pub fn guarded_exec_command_descriptor(mut restriction: ToolRestriction) -> Tool
     }
 }
 
+/// Safe SDK default: input to a live process requires exact Host approval.
+/// Polls use the same static descriptor and therefore inherit this default.
 pub fn guarded_write_stdin_descriptor(mut restriction: ToolRestriction) -> ToolDescriptor {
+    restriction.bounds.approval = ApprovalPolicy::Required;
+    build_write_stdin_descriptor(restriction)
+}
+
+/// Interactive CLI profile. Empty polls auto-run; non-empty input is planned
+/// as elevated and is reviewed by the workspace permission policy.
+pub fn workspace_write_stdin_descriptor(restriction: ToolRestriction) -> ToolDescriptor {
+    build_write_stdin_descriptor(restriction)
+}
+
+fn build_write_stdin_descriptor(mut restriction: ToolRestriction) -> ToolDescriptor {
     apply_exec_restriction(&mut restriction);
     ToolDescriptor {
         tool_id: ToolId::new("orchestral/write_stdin/v1"),
@@ -432,6 +656,197 @@ fn exec_effects() -> BTreeSet<EffectScope> {
     ])
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CommandClassification {
+    read_only: bool,
+    destructive: bool,
+    network: bool,
+}
+
+/// Conservative lexical classification only affects prompting and display;
+/// the mandatory OS sandbox remains the authority boundary. Unknown commands
+/// are treated as workspace-mutating, while destructive commands always need
+/// explicit review under the interactive workspace policy.
+fn classify_command(command: &str) -> CommandClassification {
+    let tokens = shell_words::split(command).unwrap_or_else(|_| {
+        command
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    });
+    let normalized = tokens
+        .iter()
+        .map(|token| {
+            Path::new(token)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(token)
+                .to_ascii_lowercase()
+        })
+        .collect::<Vec<_>>();
+    let destructive = normalized.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "rm" | "rmdir"
+                | "unlink"
+                | "shred"
+                | "truncate"
+                | "dd"
+                | "mkfs"
+                | "kill"
+                | "killall"
+                | "pkill"
+                | "shutdown"
+                | "reboot"
+                | "sudo"
+        )
+    }) || git_is_destructive(&normalized)
+        || normalized.iter().any(|token| token == "-delete");
+    let network = normalized.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "curl" | "wget" | "ssh" | "scp" | "sftp" | "nc" | "ncat" | "telnet" | "ftp" | "rsync"
+        )
+    }) || git_uses_network(&normalized);
+    let read_only = !destructive
+        && !network
+        && command_is_simple(command)
+        && known_read_only_command(&normalized);
+    CommandClassification {
+        read_only,
+        destructive,
+        network,
+    }
+}
+
+fn command_is_simple(command: &str) -> bool {
+    !["\n", "&&", "||", ";", "|", ">", "<", "`", "$("]
+        .iter()
+        .any(|operator| command.contains(operator))
+}
+
+fn known_read_only_command(tokens: &[String]) -> bool {
+    let Some(command) = tokens.first().map(String::as_str) else {
+        return false;
+    };
+    match command {
+        "cat" | "cut" | "echo" | "head" | "id" | "ls" | "nl" | "pwd" | "stat" | "tail" | "true"
+        | "false" | "uname" | "uniq" | "wc" | "which" | "whoami" => true,
+        "grep" => !tokens.iter().any(|token| token == "--include-zero"),
+        "rg" => !tokens.iter().any(|token| {
+            matches!(
+                token.as_str(),
+                "--pre" | "--hostname-bin" | "--search-zip" | "-z"
+            ) || token.starts_with("--pre=")
+                || token.starts_with("--hostname-bin=")
+        }),
+        "find" => !tokens.iter().any(|token| {
+            matches!(
+                token.as_str(),
+                "-delete"
+                    | "-exec"
+                    | "-execdir"
+                    | "-ok"
+                    | "-okdir"
+                    | "-fls"
+                    | "-fprint"
+                    | "-fprint0"
+                    | "-fprintf"
+            )
+        }),
+        "git" => git_is_read_only(tokens),
+        _ => false,
+    }
+}
+
+fn git_subcommand(tokens: &[String]) -> Option<&str> {
+    let git = tokens.iter().position(|token| token == "git")?;
+    let mut index = git + 1;
+    while let Some(token) = tokens.get(index) {
+        match token.as_str() {
+            "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" => index += 2,
+            value if value.starts_with('-') => index += 1,
+            value => return Some(value),
+        }
+    }
+    None
+}
+
+fn git_is_read_only(tokens: &[String]) -> bool {
+    matches!(
+        git_subcommand(tokens),
+        Some("status" | "log" | "diff" | "show" | "rev-parse" | "ls-files" | "grep")
+    ) || matches!(git_subcommand(tokens), Some("branch"))
+        && tokens
+            .iter()
+            .skip_while(|token| token.as_str() != "branch")
+            .skip(1)
+            .all(|token| {
+                matches!(
+                    token.as_str(),
+                    "--list"
+                        | "-l"
+                        | "--show-current"
+                        | "-a"
+                        | "--all"
+                        | "-r"
+                        | "--remotes"
+                        | "-v"
+                        | "-vv"
+                        | "--verbose"
+                ) || token.starts_with("--format=")
+            })
+}
+
+fn git_is_destructive(tokens: &[String]) -> bool {
+    match git_subcommand(tokens) {
+        Some("clean") => true,
+        Some("reset") => tokens.iter().any(|token| token == "--hard"),
+        Some("checkout" | "restore") => tokens.iter().any(|token| token == "--"),
+        Some("branch") => tokens
+            .iter()
+            .any(|token| matches!(token.as_str(), "-d" | "-D")),
+        _ => false,
+    }
+}
+
+fn git_uses_network(tokens: &[String]) -> bool {
+    matches!(
+        git_subcommand(tokens),
+        Some("clone" | "fetch" | "pull" | "push" | "ls-remote" | "submodule")
+    )
+}
+
+fn display_command(command: &str) -> String {
+    display_payload(command)
+}
+
+fn display_payload(payload: &str) -> String {
+    const HEAD_CHARS: usize = 120;
+    const TAIL_CHARS: usize = 80;
+
+    let normalized = payload
+        .chars()
+        .flat_map(|character| match character {
+            '\n' => "\\n".chars().collect::<Vec<_>>(),
+            '\r' => "\\r".chars().collect::<Vec<_>>(),
+            '\t' => "\\t".chars().collect::<Vec<_>>(),
+            value if value.is_control() => "�".chars().collect::<Vec<_>>(),
+            value => vec![value],
+        })
+        .collect::<Vec<_>>();
+    if normalized.len() <= HEAD_CHARS + TAIL_CHARS {
+        return normalized.into_iter().collect();
+    }
+    let omitted = normalized.len() - HEAD_CHARS - TAIL_CHARS;
+    let head = normalized.iter().take(HEAD_CHARS).collect::<String>();
+    let tail = normalized
+        .iter()
+        .skip(normalized.len() - TAIL_CHARS)
+        .collect::<String>();
+    format!("{head} … <{omitted} chars omitted> … {tail}")
+}
+
 fn exec_output_schema() -> Value {
     json!({
         "type": "object",
@@ -450,25 +865,6 @@ fn exec_output_schema() -> Value {
         },
         "additionalProperties": false
     })
-}
-
-fn require_exact_approval(execution: &GuardedToolExecution) -> Result<(), ToolOutcome> {
-    let Some(approval) = execution.approval.as_ref() else {
-        return Err(rejected(
-            "approval_proof_missing",
-            "exec_command requires a verified Host approval capability",
-        ));
-    };
-    if approval.binding().run_id != execution.invocation.run_id
-        || approval.binding().call_id != execution.invocation.call_id
-        || approval.binding().tool_id != execution.invocation.tool_id
-    {
-        return Err(rejected(
-            "approval_binding_mismatch",
-            "verified approval does not belong to this exec_command invocation",
-        ));
-    }
-    Ok(())
 }
 
 fn resolve_workdir(
@@ -648,7 +1044,88 @@ fn exec_error(error: ExecProcessError) -> ToolOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::prepare_runtime_temp;
+    use super::{
+        classify_command, display_payload, guarded_exec_command_descriptor,
+        guarded_write_stdin_descriptor, prepare_runtime_temp, workspace_exec_command_descriptor,
+        workspace_write_stdin_descriptor,
+    };
+    use orchestral_core::tool_protocol::{ApprovalPolicy, ToolPolicyBounds, ToolRestriction};
+
+    #[test]
+    fn operation_classifier_distinguishes_read_mutating_and_destructive_commands() {
+        let read = classify_command("ls -F");
+        assert!(read.read_only);
+        assert!(!read.destructive);
+        assert!(!read.network);
+
+        let build = classify_command("cargo test -p orchestral-runtime");
+        assert!(!build.read_only);
+        assert!(!build.destructive);
+        assert!(!build.network);
+
+        let destructive = classify_command("git reset --hard HEAD~1");
+        assert!(destructive.destructive);
+
+        let network = classify_command("curl https://example.com/status");
+        assert!(network.network);
+    }
+
+    #[test]
+    fn read_only_classifier_rejects_shell_composition_that_can_write() {
+        assert!(!classify_command("ls > inventory.txt").read_only);
+        assert!(!classify_command("find . -delete").read_only);
+        assert!(classify_command("find . -delete").destructive);
+        assert!(!classify_command("rg TODO | head").read_only);
+        assert!(!classify_command("sh -c 'rm -rf target'").read_only);
+        assert!(!classify_command("eval 'touch owned'").read_only);
+        assert!(!classify_command("sed 'e touch owned' input.txt").read_only);
+    }
+
+    #[test]
+    fn sdk_descriptors_are_safe_by_default_and_cli_opt_in_is_explicit() {
+        let bounds = ToolPolicyBounds {
+            approval: ApprovalPolicy::NotRequired,
+            ..ToolPolicyBounds::default()
+        };
+        let restriction = ToolRestriction { bounds };
+
+        assert_eq!(
+            guarded_exec_command_descriptor(restriction.clone())
+                .restriction
+                .bounds
+                .approval,
+            ApprovalPolicy::Required
+        );
+        assert_eq!(
+            guarded_write_stdin_descriptor(restriction.clone())
+                .restriction
+                .bounds
+                .approval,
+            ApprovalPolicy::Required
+        );
+        assert_eq!(
+            workspace_exec_command_descriptor(restriction.clone())
+                .restriction
+                .bounds
+                .approval,
+            ApprovalPolicy::NotRequired
+        );
+        assert_eq!(
+            workspace_write_stdin_descriptor(restriction)
+                .restriction
+                .bounds
+                .approval,
+            ApprovalPolicy::NotRequired
+        );
+    }
+
+    #[test]
+    fn approval_preview_keeps_the_dangerous_tail_and_marks_omissions() {
+        let payload = format!("{}rm -rf important", "safe ".repeat(80));
+        let preview = display_payload(&payload);
+        assert!(preview.contains("chars omitted"));
+        assert!(preview.ends_with("rm -rf important"));
+    }
 
     fn temporary_root(label: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(

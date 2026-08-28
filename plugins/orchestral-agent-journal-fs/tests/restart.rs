@@ -238,6 +238,8 @@ async fn invoked_tool_effect_rehydrates_without_losing_its_uncertain_boundary() 
     let prepared = PreparedToolEffect {
         args_digest: invocation.args_digest().unwrap(),
         invocation,
+        operation_digest: Digest::sha256("operation"),
+        permission_digest: Digest::sha256("permission"),
         policy_digest: Digest::sha256("policy"),
         descriptor_digest: Digest::sha256("descriptor"),
         idempotency: ToolIdempotency::NonIdempotent,

@@ -196,6 +196,8 @@ mod tests {
             call_id: ToolCallId::new("call-1"),
             tool_id: ToolId::new("tool-1"),
             args_digest: Digest::sha256("args"),
+            operation_digest: Digest::sha256("operation"),
+            permission_digest: Digest::sha256("permission"),
             requested_scopes: BTreeSet::from([EffectScope::Process]),
             policy_digest: Digest::sha256("policy"),
         };
@@ -218,12 +220,15 @@ mod tests {
             call_id: ToolCallId::new("call-1"),
             tool_id: ToolId::new("tool-1"),
             args_digest: Digest::sha256("args-1"),
+            operation_digest: Digest::sha256("operation-1"),
+            permission_digest: Digest::sha256("permission"),
             requested_scopes: BTreeSet::from([EffectScope::Process]),
             policy_digest: Digest::sha256("policy"),
         };
         let second = ApprovalBinding {
             call_id: ToolCallId::new("call-2"),
             args_digest: Digest::sha256("args-2"),
+            operation_digest: Digest::sha256("operation-2"),
             ..first.clone()
         };
         broker.stage(&first_request, first.clone()).await.unwrap();

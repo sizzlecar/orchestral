@@ -44,8 +44,8 @@ use orchestral_model_gemini::{
 };
 use orchestral_model_openai::{OpenAiCompatibleBackend, OpenAiCompatibleConfig};
 use orchestral_runtime::tools::{
-    guarded_apply_patch_descriptor, guarded_artifact_read_descriptor,
-    guarded_exec_command_descriptor, guarded_file_read_descriptor, guarded_write_stdin_descriptor,
+    guarded_apply_patch_descriptor, guarded_artifact_read_descriptor, guarded_file_read_descriptor,
+    workspace_exec_command_descriptor, workspace_write_stdin_descriptor,
     CommandEnvironmentSnapshot, GuardedApplyPatchExecutor, GuardedArtifactReadExecutor,
     GuardedExecCommandExecutor, GuardedFileReadExecutor, GuardedWriteStdinExecutor,
 };
@@ -55,7 +55,7 @@ use orchestral_runtime::{
     GuardedToolRuntime, InMemoryBlobStore, InMemoryGenericAgentCheckpointStore,
     InMemoryHostApprovalBroker, InternalGenericAgentProvider, McpToolsAdapterRegistry,
     ModelTokenMeter, SessionCompactionPolicy, SkillRoot, SkillRuntime, StdioMcpSandboxPolicy,
-    StdioMcpTransportFactory, ToolArtifactStore,
+    StdioMcpTransportFactory, ToolArtifactStore, WorkspacePermissionPolicy,
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
@@ -470,7 +470,8 @@ fn build_cli_tool_runtime(
             effect_journal,
             artifact_store.clone(),
         )
-        .context("create guarded Tool Runtime")?,
+        .context("create guarded Tool Runtime")?
+        .with_permission_policy(Arc::new(WorkspacePermissionPolicy)),
     );
     runtime
         .register(
@@ -508,7 +509,7 @@ fn build_cli_tool_runtime(
         );
         runtime
             .register(
-                guarded_exec_command_descriptor(ToolRestriction {
+                workspace_exec_command_descriptor(ToolRestriction {
                     bounds: exec_bounds.clone(),
                 }),
                 Arc::new(
@@ -525,7 +526,7 @@ fn build_cli_tool_runtime(
             .context("register guarded exec_command Tool")?;
         runtime
             .register(
-                guarded_write_stdin_descriptor(ToolRestriction {
+                workspace_write_stdin_descriptor(ToolRestriction {
                     bounds: exec_bounds,
                 }),
                 Arc::new(GuardedWriteStdinExecutor::new(manager)),
@@ -655,9 +656,16 @@ fn exec_runtime_readable_roots(shell: &Path) -> Vec<PathBuf> {
         for directory in std::env::split_paths(&path).filter(|path| path.is_absolute()) {
             candidates.insert(directory.clone());
             let text = directory.to_string_lossy();
-            for marker in ["/.cargo/", "/.rustup/", "/.nvm/", "/.pyenv/", "/.local/"] {
-                if let Some(index) = text.find(marker) {
-                    candidates.insert(PathBuf::from(&text[..index + marker.len() - 1]));
+            // Version-managed runtimes may load adjacent libraries, but never
+            // widen a PATH entry to the manager's entire user directory (for
+            // example ~/.cargo, which can contain credentials).
+            if ["/.nvm/versions/", "/.pyenv/versions/"]
+                .iter()
+                .any(|marker| text.contains(marker))
+                && directory.file_name().is_some_and(|name| name == "bin")
+            {
+                if let Some(installation) = directory.parent() {
+                    candidates.insert(installation.to_path_buf());
                 }
             }
             if text.starts_with("/opt/homebrew/") {

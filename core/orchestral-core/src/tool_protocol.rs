@@ -103,6 +103,89 @@ pub enum EffectScope {
     ExternalSideEffect,
 }
 
+/// Host-normalized risk carried by one concrete Tool operation.
+///
+/// This is deliberately smaller than a policy decision. A planner describes
+/// what an invocation will do; the Host permission policy decides whether that
+/// operation may run, needs review, or must be denied.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ToolOperationRisk {
+    #[default]
+    Routine,
+    /// Interactive or otherwise ambiguous operation that should be reviewed
+    /// by policies which auto-authorize only routine sandboxed work.
+    Elevated,
+    Destructive,
+}
+
+/// Invocation-specific effect plan produced before any Tool side effect.
+///
+/// [`ToolDescriptor::effect_scopes`] is only the immutable maximum envelope a
+/// Tool registration can ever request. This type records the narrower effects
+/// and targets of one concrete invocation. Approval and durable effect records
+/// bind to its digest so a capability for one planned operation cannot be
+/// reused after the operation is reclassified.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolOperationPlan {
+    #[serde(default)]
+    pub effect_scopes: BTreeSet<EffectScope>,
+    #[serde(default)]
+    pub targets: BTreeSet<String>,
+    #[serde(default)]
+    pub risk: ToolOperationRisk,
+    pub summary: String,
+}
+
+impl ToolOperationPlan {
+    pub fn validate_shape(&self) -> Result<(), ToolProtocolError> {
+        if self.summary.trim().is_empty()
+            || self.summary.chars().any(char::is_control)
+            || self
+                .targets
+                .iter()
+                .any(|target| target.trim().is_empty() || target.chars().any(char::is_control))
+        {
+            return Err(ToolProtocolError::new(
+                ToolProtocolErrorCode::InvalidInvocation,
+                "Tool operation plan requires a safe summary and normalized targets",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_envelope(
+        &self,
+        effect_envelope: &BTreeSet<EffectScope>,
+    ) -> Result<(), ToolProtocolError> {
+        self.validate_shape()?;
+        if !self.effect_scopes.is_subset(effect_envelope) {
+            return Err(ToolProtocolError::new(
+                ToolProtocolErrorCode::PolicyDenied,
+                "planned Tool effects exceed the registered effect envelope",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn digest(&self) -> Result<Digest, ToolProtocolError> {
+        self.validate_shape()?;
+        #[derive(Serialize)]
+        struct AuthorityView<'a> {
+            effect_scopes: &'a BTreeSet<EffectScope>,
+            targets: &'a BTreeSet<String>,
+            risk: ToolOperationRisk,
+        }
+        canonical_json_digest(&AuthorityView {
+            effect_scopes: &self.effect_scopes,
+            targets: &self.targets,
+            risk: self.risk,
+        })
+    }
+}
+
 /// Whether an invocation may proceed without a single-use Host capability.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -432,6 +515,8 @@ pub struct ToolDescriptor {
     /// Host-side output contract. It is not exposed to the model as authority
     /// and is validated before a Completed outcome is committed.
     pub output_schema: Value,
+    /// Maximum effect envelope for every invocation of this Tool. Runtime
+    /// planning must derive a narrower [`ToolOperationPlan`] per invocation.
     #[serde(default)]
     pub effect_scopes: BTreeSet<EffectScope>,
     pub restriction: ToolRestriction,
@@ -711,18 +796,31 @@ pub struct ApprovalBinding {
     pub call_id: ToolCallId,
     pub tool_id: ToolId,
     pub args_digest: Digest,
+    pub operation_digest: Digest,
+    /// Binds the Host permission-policy contract and its normalized decision
+    /// for this operation. A retry cannot turn a previously reviewed
+    /// operation into an automatically authorized one.
+    pub permission_digest: Digest,
     pub requested_scopes: BTreeSet<EffectScope>,
     pub policy_digest: Digest,
 }
 
 impl ApprovalBinding {
-    pub fn for_invocation(
+    pub fn for_operation(
         invocation: &ToolInvocation,
-        requested_scopes: BTreeSet<EffectScope>,
+        operation: &ToolOperationPlan,
         effective_policy: &EffectiveToolPolicy,
+        permission_digest: Digest,
     ) -> Result<Self, ToolProtocolError> {
         invocation.validate()?;
-        if !effective_policy.authorizes_scopes(&requested_scopes) {
+        operation.validate_shape()?;
+        if !permission_digest.is_sha256() {
+            return Err(ToolProtocolError::new(
+                ToolProtocolErrorCode::InvalidInvocation,
+                "permission decision requires a SHA-256 digest",
+            ));
+        }
+        if !effective_policy.authorizes_scopes(&operation.effect_scopes) {
             return Err(ToolProtocolError::new(
                 ToolProtocolErrorCode::PolicyDenied,
                 "requested effects are outside the effective policy",
@@ -733,7 +831,9 @@ impl ApprovalBinding {
             call_id: invocation.call_id.clone(),
             tool_id: invocation.tool_id.clone(),
             args_digest: invocation.args_digest()?,
-            requested_scopes,
+            operation_digest: operation.digest()?,
+            permission_digest,
+            requested_scopes: operation.effect_scopes.clone(),
             policy_digest: effective_policy.digest()?,
         })
     }
@@ -766,6 +866,8 @@ impl ApprovalCapability {
             || self.claims.expires_at_unix_ms <= 0
             || self.claims.nonce.is_empty()
             || !self.claims.binding.args_digest.is_sha256()
+            || !self.claims.binding.operation_digest.is_sha256()
+            || !self.claims.binding.permission_digest.is_sha256()
             || !self.claims.binding.policy_digest.is_sha256()
             || !self.authenticator.is_sha256()
         {
@@ -1122,6 +1224,15 @@ mod tests {
         values.iter().copied().collect()
     }
 
+    fn operation(values: &[EffectScope]) -> ToolOperationPlan {
+        ToolOperationPlan {
+            effect_scopes: effects(values),
+            targets: strings(&["workspace"]),
+            risk: ToolOperationRisk::Routine,
+            summary: "test operation".to_owned(),
+        }
+    }
+
     fn bounds(allowed_effects: &[EffectScope], approval: ApprovalPolicy) -> ToolPolicyBounds {
         ToolPolicyBounds {
             allowed_effects: effects(allowed_effects),
@@ -1278,10 +1389,11 @@ mod tests {
             tool_id: ToolId::new("builtin/shell"),
             arguments: json!({ "command": "pwd" }),
         };
-        let binding = ApprovalBinding::for_invocation(
+        let binding = ApprovalBinding::for_operation(
             &invocation,
-            effects(&[EffectScope::Process]),
+            &operation(&[EffectScope::Process]),
             &effective,
+            Digest::sha256("permission"),
         )
         .unwrap();
         let capability = HostApprovalIssuer::new(SIGNING_KEY)
@@ -1294,10 +1406,11 @@ mod tests {
 
         let mut changed_args = invocation.clone();
         changed_args.arguments = json!({ "command": "rm -rf ./target" });
-        let changed_args_binding = ApprovalBinding::for_invocation(
+        let changed_args_binding = ApprovalBinding::for_operation(
             &changed_args,
-            effects(&[EffectScope::Process]),
+            &operation(&[EffectScope::Process]),
             &effective,
+            Digest::sha256("permission"),
         )
         .unwrap();
         assert_eq!(
@@ -1308,12 +1421,30 @@ mod tests {
             ToolProtocolErrorCode::CapabilityBindingMismatch
         );
 
+        let mut changed_operation = operation(&[EffectScope::Process]);
+        changed_operation.risk = ToolOperationRisk::Destructive;
+        let changed_operation_binding = ApprovalBinding::for_operation(
+            &invocation,
+            &changed_operation,
+            &effective,
+            Digest::sha256("permission"),
+        )
+        .unwrap();
+        assert_eq!(
+            verifier
+                .verify_and_consume(&capability, &changed_operation_binding, 1)
+                .unwrap_err()
+                .code,
+            ToolProtocolErrorCode::CapabilityBindingMismatch
+        );
+
         let mut cross_run = invocation.clone();
         cross_run.run_id = RunId::new("run-2");
-        let cross_run_binding = ApprovalBinding::for_invocation(
+        let cross_run_binding = ApprovalBinding::for_operation(
             &cross_run,
-            effects(&[EffectScope::Process]),
+            &operation(&[EffectScope::Process]),
             &effective,
+            Digest::sha256("permission"),
         )
         .unwrap();
         assert_eq!(
@@ -1499,19 +1630,21 @@ mod tests {
                 tool_id: ToolId::new("builtin/shell"),
                 arguments: json!({"command": format!("echo {case}")}),
             };
-            let binding = ApprovalBinding::for_invocation(
+            let binding = ApprovalBinding::for_operation(
                 &invocation,
-                effects(&[EffectScope::Process]),
+                &operation(&[EffectScope::Process]),
                 &effective,
+                Digest::sha256("permission"),
             )
             .unwrap();
 
             let mut changed_args = invocation.clone();
             changed_args.arguments = json!({"command": format!("mutated {case}")});
-            let changed_args_binding = ApprovalBinding::for_invocation(
+            let changed_args_binding = ApprovalBinding::for_operation(
                 &changed_args,
-                effects(&[EffectScope::Process]),
+                &operation(&[EffectScope::Process]),
                 &effective,
+                Digest::sha256("permission"),
             )
             .unwrap();
             let capability = issuer.issue(binding.clone(), 10_000).unwrap();
@@ -1525,10 +1658,11 @@ mod tests {
 
             let mut cross_run = invocation.clone();
             cross_run.run_id = RunId::new(format!("foreign-run-{case}"));
-            let cross_run_binding = ApprovalBinding::for_invocation(
+            let cross_run_binding = ApprovalBinding::for_operation(
                 &cross_run,
-                effects(&[EffectScope::Process]),
+                &operation(&[EffectScope::Process]),
                 &effective,
+                Digest::sha256("permission"),
             )
             .unwrap();
             let capability = issuer.issue(binding.clone(), 10_000).unwrap();
@@ -1542,10 +1676,11 @@ mod tests {
 
             let mut cross_tool = invocation.clone();
             cross_tool.tool_id = ToolId::new("builtin/other-shell");
-            let cross_tool_binding = ApprovalBinding::for_invocation(
+            let cross_tool_binding = ApprovalBinding::for_operation(
                 &cross_tool,
-                effects(&[EffectScope::Process]),
+                &operation(&[EffectScope::Process]),
                 &effective,
+                Digest::sha256("permission"),
             )
             .unwrap();
             let capability = issuer.issue(binding.clone(), 10_000).unwrap();

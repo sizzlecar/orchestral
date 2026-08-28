@@ -22,10 +22,11 @@ use orchestral_core::tool_effect::{
     ToolEffectPhase, ToolEffectProjection,
 };
 use orchestral_core::tool_protocol::{
-    ApprovalBinding, ApprovalCapability, ApprovalCapabilityStore, EffectiveToolPolicy,
-    HostApprovalVerifier, HostToolPolicy, ModelToolSchema, RunToolGrant, ToolArtifact, ToolCallId,
-    ToolConcurrency, ToolDescriptor, ToolId, ToolIdempotency, ToolInvocation, ToolOutcome,
-    ToolOutput, ToolProtocolError, ToolProtocolErrorCode, VerifiedApprovalCapability,
+    ApprovalBinding, ApprovalCapability, ApprovalCapabilityStore, ApprovalPolicy, EffectScope,
+    EffectiveToolPolicy, HostApprovalVerifier, HostToolPolicy, ModelToolSchema, RunToolGrant,
+    ToolArtifact, ToolCallId, ToolConcurrency, ToolDescriptor, ToolId, ToolIdempotency,
+    ToolInvocation, ToolOperationPlan, ToolOperationRisk, ToolOutcome, ToolOutput,
+    ToolProtocolError, ToolProtocolErrorCode, VerifiedApprovalCapability,
 };
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
@@ -37,6 +38,9 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug, Clone)]
 pub struct GuardedToolExecution {
     pub invocation: ToolInvocation,
+    /// Host-inspected, invocation-specific operation. Executors must stay
+    /// within this plan as well as the effective authority ceiling.
+    pub operation: ToolOperationPlan,
     pub effective_policy: EffectiveToolPolicy,
     pub approval: Option<VerifiedApprovalCapability>,
     pub cancellation: CancellationToken,
@@ -45,6 +49,35 @@ pub struct GuardedToolExecution {
 /// Explicit opt-in SPI for implementations that enforce Host Tool policy.
 #[async_trait]
 pub trait GuardedToolExecutor: Send + Sync {
+    /// Stable identity of the pre-execution planner implemented by this Tool.
+    /// It becomes part of the runtime execution contract used by recovery.
+    fn planning_contract(&self) -> serde_json::Value {
+        serde_json::json!({
+            "contract": "orchestral.tool-operation-planner/static-envelope/v1"
+        })
+    }
+
+    /// Inspects one invocation without producing an externally observable
+    /// effect. The default is conservative: it requests the Tool's entire
+    /// registered effect envelope. Built-ins should narrow this plan whenever
+    /// their arguments provide stronger information.
+    fn plan_operation(
+        &self,
+        invocation: &ToolInvocation,
+        descriptor: &ToolDescriptor,
+        _effective_policy: &EffectiveToolPolicy,
+    ) -> Result<ToolOperationPlan, ToolOutcome> {
+        Ok(ToolOperationPlan {
+            effect_scopes: descriptor.effect_scopes.clone(),
+            targets: Default::default(),
+            risk: ToolOperationRisk::Routine,
+            summary: sanitize_approval_summary(
+                &self.approval_summary(invocation),
+                &invocation.tool_id,
+            ),
+        })
+    }
+
     /// Host-owned, human-facing description for an approval prompt. It is not
     /// authority: the signed [`ApprovalBinding`] remains the exact operation.
     /// Implementations should redact credential-bearing fields.
@@ -61,6 +94,170 @@ pub trait GuardedToolExecutor: Send + Sync {
     }
 
     async fn execute(&self, execution: GuardedToolExecution) -> ToolOutcome;
+}
+
+/// Host decision for one already-inspected Tool operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ToolPermissionDecision {
+    Allow,
+    RequireApproval,
+    Deny { code: String, message: String },
+}
+
+/// Policy SPI kept separate from Tool planning and capability issuance.
+/// Implementations decide; only the Host approval broker can issue an exact
+/// capability for a reviewed operation.
+pub trait ToolPermissionPolicy: Send + Sync {
+    fn contract_digest(&self) -> Digest;
+
+    fn decide(
+        &self,
+        descriptor: &ToolDescriptor,
+        operation: &ToolOperationPlan,
+        effective_policy: &EffectiveToolPolicy,
+    ) -> ToolPermissionDecision;
+}
+
+/// Compatibility policy used by SDK-created runtimes: the composed static
+/// approval bound remains authoritative.
+#[derive(Debug, Default)]
+pub struct DescriptorPermissionPolicy;
+
+impl ToolPermissionPolicy for DescriptorPermissionPolicy {
+    fn contract_digest(&self) -> Digest {
+        Digest::sha256("orchestral.permission-policy/descriptor/v1")
+    }
+
+    fn decide(
+        &self,
+        _descriptor: &ToolDescriptor,
+        _operation: &ToolOperationPlan,
+        effective_policy: &EffectiveToolPolicy,
+    ) -> ToolPermissionDecision {
+        match effective_policy.bounds().approval {
+            ApprovalPolicy::NotRequired => ToolPermissionDecision::Allow,
+            ApprovalPolicy::Required => ToolPermissionDecision::RequireApproval,
+            ApprovalPolicy::Deny => ToolPermissionDecision::Deny {
+                code: "approval_policy_denied".to_owned(),
+                message: "effective Host policy denies this Tool operation".to_owned(),
+            },
+            _ => ToolPermissionDecision::Deny {
+                code: "approval_policy_unknown".to_owned(),
+                message: "effective Host policy contains an unsupported approval mode".to_owned(),
+            },
+        }
+    }
+}
+
+/// Default interactive workspace policy used by the CLI.
+///
+/// Routine work stays inside the mandatory sandbox and runs automatically.
+/// Destructive operations, open-world effects, secrets, and any Tool that
+/// statically requires approval still route to the reviewer.
+#[derive(Debug, Default)]
+pub struct WorkspacePermissionPolicy;
+
+impl ToolPermissionPolicy for WorkspacePermissionPolicy {
+    fn contract_digest(&self) -> Digest {
+        Digest::sha256("orchestral.permission-policy/workspace/v1")
+    }
+
+    fn decide(
+        &self,
+        _descriptor: &ToolDescriptor,
+        operation: &ToolOperationPlan,
+        effective_policy: &EffectiveToolPolicy,
+    ) -> ToolPermissionDecision {
+        let bounds = effective_policy.bounds();
+        if bounds.approval == ApprovalPolicy::Deny {
+            return ToolPermissionDecision::Deny {
+                code: "approval_policy_denied".to_owned(),
+                message: "effective Host policy denies this Tool operation".to_owned(),
+            };
+        }
+        if bounds.approval == ApprovalPolicy::Required
+            || operation.risk != ToolOperationRisk::Routine
+            || operation.effect_scopes.iter().any(|scope| {
+                matches!(
+                    scope,
+                    EffectScope::Network
+                        | EffectScope::SecretRead
+                        | EffectScope::ExternalSideEffect
+                )
+            })
+            || (!bounds.sandbox.required
+                && operation.effect_scopes.iter().any(|scope| {
+                    matches!(scope, EffectScope::Process | EffectScope::FilesystemWrite)
+                }))
+        {
+            ToolPermissionDecision::RequireApproval
+        } else {
+            ToolPermissionDecision::Allow
+        }
+    }
+}
+
+/// The pluggable policy may only tighten the statically composed Host bound.
+/// `Required` and `Deny` are ceilings, never suggestions that an application
+/// policy can relax.
+fn constrain_permission_decision(
+    effective_policy: &EffectiveToolPolicy,
+    proposed: ToolPermissionDecision,
+) -> ToolPermissionDecision {
+    match effective_policy.bounds().approval {
+        ApprovalPolicy::Deny => ToolPermissionDecision::Deny {
+            code: "approval_policy_denied".to_owned(),
+            message: "effective Host policy denies this Tool operation".to_owned(),
+        },
+        ApprovalPolicy::Required => match proposed {
+            ToolPermissionDecision::Deny { code, message } => {
+                ToolPermissionDecision::Deny { code, message }
+            }
+            ToolPermissionDecision::Allow | ToolPermissionDecision::RequireApproval => {
+                ToolPermissionDecision::RequireApproval
+            }
+        },
+        ApprovalPolicy::NotRequired => proposed,
+        _ => ToolPermissionDecision::Deny {
+            code: "approval_policy_unknown".to_owned(),
+            message: "effective Host policy contains an unsupported approval mode".to_owned(),
+        },
+    }
+}
+
+/// Produces the durable identity of one normalized permission decision.
+///
+/// Journal builders and recovery adapters use the same function so a change
+/// from reviewed to automatic execution (or the reverse) is detected before
+/// an executor can run.
+pub fn tool_permission_decision_digest(
+    policy: &dyn ToolPermissionPolicy,
+    decision: &ToolPermissionDecision,
+) -> Result<Digest, ToolProtocolError> {
+    let decision = match decision {
+        ToolPermissionDecision::Allow => serde_json::json!({ "kind": "allow" }),
+        ToolPermissionDecision::RequireApproval => {
+            serde_json::json!({ "kind": "require_approval" })
+        }
+        ToolPermissionDecision::Deny { code, message } => serde_json::json!({
+            "kind": "deny",
+            "code": code,
+            "message": message,
+        }),
+    };
+    let binding = serde_json::json!({
+        "contract": "orchestral.tool-permission-decision/v1",
+        "policy_contract_digest": policy.contract_digest(),
+        "decision": decision,
+    });
+    let bytes = serde_jcs::to_vec(&binding).map_err(|error| {
+        ToolProtocolError::new(
+            ToolProtocolErrorCode::InvalidInvocation,
+            format!("canonicalize Tool permission decision failed: {error}"),
+        )
+    })?;
+    Ok(Digest::sha256(bytes))
 }
 
 /// Object-safe surface consumed by an Agent loop. Concrete approval stores and
@@ -447,6 +644,8 @@ struct RegisteredTool {
 struct InvocationIdentity {
     tool_id: ToolId,
     args_digest: Digest,
+    operation_digest: Digest,
+    permission_digest: Digest,
     policy_digest: Digest,
     descriptor_digest: Digest,
 }
@@ -472,6 +671,14 @@ enum DurableInvocationStart {
     },
 }
 
+struct PlannedInvocation {
+    operation: ToolOperationPlan,
+    effective_policy: EffectiveToolPolicy,
+    permission: ToolPermissionDecision,
+    permission_digest: Digest,
+    approval_binding: ApprovalBinding,
+}
+
 type InvocationKey = (RunId, ToolCallId);
 type PerRunGateKey = (ToolId, RunId);
 
@@ -482,6 +689,7 @@ type PerRunGateKey = (ToolId, RunId);
 /// ceiling or a registered descriptor.
 pub struct GuardedToolRuntime<S> {
     host_ceiling: HostToolPolicy,
+    permission_policy: Arc<dyn ToolPermissionPolicy>,
     approval_verifier: HostApprovalVerifier<S>,
     effect_journal: Arc<dyn ToolEffectJournalStore>,
     artifact_store: Option<ToolArtifactStore>,
@@ -536,6 +744,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
             .map_err(ToolRuntimeError::InvalidHostPolicy)?;
         Ok(Self {
             host_ceiling,
+            permission_policy: Arc::new(DescriptorPermissionPolicy),
             approval_verifier,
             effect_journal,
             artifact_store,
@@ -543,6 +752,13 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
             invocations: StdMutex::new(BTreeMap::new()),
             per_run_gates: StdMutex::new(BTreeMap::new()),
         })
+    }
+
+    /// Replaces the immutable invocation permission policy before the runtime
+    /// is shared or registered with an Agent composition root.
+    pub fn with_permission_policy(mut self, policy: Arc<dyn ToolPermissionPolicy>) -> Self {
+        self.permission_policy = policy;
+        self
     }
 
     /// Registers an immutable descriptor and policy-aware executor.
@@ -589,9 +805,14 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
             .registry
             .read()
             .map_err(|_| ToolRuntimeError::StateUnavailable)?;
-        let descriptors = registry
+        let registrations = registry
             .values()
-            .map(|registered| &registered.descriptor)
+            .map(|registered| {
+                serde_json::json!({
+                    "descriptor": &registered.descriptor,
+                    "planning_contract": registered.executor.planning_contract(),
+                })
+            })
             .collect::<Vec<_>>();
         let artifact_contract = self.artifact_store.as_ref().map(|store| {
             serde_json::json!({
@@ -603,7 +824,8 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
         let contract = serde_json::json!({
             "contract": "orchestral.guarded-tool-runtime/v1",
             "host_ceiling": &self.host_ceiling,
-            "registered_tools": descriptors,
+            "permission_policy": self.permission_policy.contract_digest(),
+            "registered_tools": registrations,
             "artifact_store": artifact_contract,
         });
         let bytes = serde_jcs::to_vec(&contract)
@@ -680,17 +902,44 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
             &registered.descriptor.restriction,
         )
         .map_err(|error| tool_outcome_recovery_error("invalid_effective_policy", error.message))?;
-        if !effective_policy.authorizes_scopes(&registered.descriptor.effect_scopes) {
+        let operation = registered
+            .executor
+            .plan_operation(&invocation, &registered.descriptor, &effective_policy)
+            .map_err(|outcome| {
+                tool_outcome_recovery_error(
+                    "operation_planning_failed",
+                    format!("Tool operation planning failed: {outcome:?}"),
+                )
+            })?;
+        operation
+            .validate_envelope(&registered.descriptor.effect_scopes)
+            .map_err(|error| {
+                tool_outcome_recovery_error("invalid_operation_plan", error.message)
+            })?;
+        if !effective_policy.authorizes_scopes(&operation.effect_scopes) {
             return Err(tool_outcome_recovery_error(
                 "policy_denied",
                 "tool effects are outside the effective Host policy",
             ));
         }
+        let permission = constrain_permission_decision(
+            &effective_policy,
+            self.permission_policy
+                .decide(&registered.descriptor, &operation, &effective_policy),
+        );
+        let permission_digest =
+            tool_permission_decision_digest(self.permission_policy.as_ref(), &permission).map_err(
+                |error| tool_outcome_recovery_error("invalid_permission_decision", error.message),
+            )?;
         let prepared = PreparedToolEffect {
             invocation: invocation.clone(),
             args_digest: invocation.args_digest().map_err(|error| {
                 tool_outcome_recovery_error("invalid_invocation", error.message)
             })?,
+            operation_digest: operation.digest().map_err(|error| {
+                tool_outcome_recovery_error("invalid_operation_plan", error.message)
+            })?,
+            permission_digest,
             policy_digest: effective_policy.digest().map_err(|error| {
                 tool_outcome_recovery_error("invalid_effective_policy", error.message)
             })?,
@@ -698,7 +947,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
                 tool_outcome_recovery_error("invalid_descriptor", error.message)
             })?,
             idempotency: registered.descriptor.idempotency,
-            effect_scopes: registered.descriptor.effect_scopes.clone(),
+            effect_scopes: operation.effect_scopes.clone(),
         };
         let key = prepared.key();
 
@@ -775,8 +1024,9 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
 
     /// Executes the fixed guarded pipeline:
     ///
-    /// invocation/input schema → effective policy → declared effects → approval
-    /// → concurrency gate/executor → output schema and output limit.
+    /// invocation/input schema → effective policy → operation planning →
+    /// permission decision/approval → concurrency gate/executor → output
+    /// schema and output limit.
     pub async fn invoke(
         &self,
         invocation: ToolInvocation,
@@ -813,25 +1063,67 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
             Ok(policy) => policy,
             Err(error) => return rejected("invalid_effective_policy", error.message),
         };
-        if !effective_policy.authorizes_scopes(&registered.descriptor.effect_scopes) {
+        let operation = match registered.executor.plan_operation(
+            &invocation,
+            &registered.descriptor,
+            &effective_policy,
+        ) {
+            Ok(operation) => operation,
+            Err(outcome) => {
+                return GuardedToolResult::Outcome {
+                    outcome,
+                    cached: false,
+                }
+            }
+        };
+        if let Err(error) = operation.validate_envelope(&registered.descriptor.effect_scopes) {
+            return rejected("invalid_operation_plan", error.message);
+        }
+        if !effective_policy.authorizes_scopes(&operation.effect_scopes) {
             return rejected(
                 "policy_denied",
                 "tool effects are outside the effective Host policy",
             );
         }
-        let approval_binding = match ApprovalBinding::for_invocation(
-            &invocation,
-            registered.descriptor.effect_scopes.clone(),
+        let permission = constrain_permission_decision(
             &effective_policy,
+            self.permission_policy
+                .decide(&registered.descriptor, &operation, &effective_policy),
+        );
+        if let ToolPermissionDecision::Deny { code, message } = &permission {
+            return rejected(code.clone(), message.clone());
+        }
+        let permission_digest =
+            match tool_permission_decision_digest(self.permission_policy.as_ref(), &permission) {
+                Ok(digest) => digest,
+                Err(error) => return rejected("invalid_permission_decision", error.message),
+            };
+        let approval_binding = match ApprovalBinding::for_operation(
+            &invocation,
+            &operation,
+            &effective_policy,
+            permission_digest.clone(),
         ) {
             Ok(binding) => binding,
             Err(error) => return rejected("policy_denied", error.message),
         };
-        let identity =
-            match invocation_identity(&invocation, &effective_policy, &registered.descriptor) {
-                Ok(identity) => identity,
-                Err(error) => return rejected("invalid_invocation", error.message),
-            };
+        let identity = match invocation_identity(
+            &invocation,
+            &operation,
+            &effective_policy,
+            &permission_digest,
+            &registered.descriptor,
+        ) {
+            Ok(identity) => identity,
+            Err(error) => return rejected("invalid_invocation", error.message),
+        };
+        let planned = PlannedInvocation {
+            operation,
+            effective_policy,
+            permission,
+            permission_digest,
+            approval_binding,
+        };
         let effect_key = ToolEffectKey::new(invocation.run_id.clone(), invocation.call_id.clone());
         let entry = match self.invocation_entry(&invocation, identity) {
             Ok(entry) => entry,
@@ -859,8 +1151,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
                         .prepare_durable_invocation(
                             &registered,
                             &invocation,
-                            &effective_policy,
-                            &approval_binding,
+                            &planned,
                             approval.as_ref(),
                             &run_cancellation,
                         )
@@ -886,6 +1177,11 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
         };
 
         let execution_cancellation = run_cancellation.child_token();
+        let PlannedInvocation {
+            operation,
+            effective_policy,
+            ..
+        } = planned;
         let outcome = match self
             .concurrency_gate(&registered, &invocation, &execution_cancellation)
             .await
@@ -895,6 +1191,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
                 self.execute(
                     registered,
                     invocation,
+                    operation,
                     effective_policy,
                     verified_approval,
                     execution_cancellation,
@@ -935,16 +1232,26 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
         &self,
         registered: &Arc<RegisteredTool>,
         invocation: &ToolInvocation,
-        effective_policy: &EffectiveToolPolicy,
-        approval_binding: &ApprovalBinding,
+        planned: &PlannedInvocation,
         approval: Option<&ApprovalCapability>,
         run_cancellation: &CancellationToken,
     ) -> Result<DurableInvocationStart, GuardedToolResult> {
+        let PlannedInvocation {
+            operation,
+            effective_policy,
+            permission,
+            permission_digest,
+            approval_binding,
+        } = planned;
         let prepared = PreparedToolEffect {
             invocation: invocation.clone(),
             args_digest: invocation
                 .args_digest()
                 .map_err(|error| rejected("invalid_invocation", error.message))?,
+            operation_digest: operation
+                .digest()
+                .map_err(|error| rejected("invalid_operation_plan", error.message))?,
+            permission_digest: permission_digest.clone(),
             policy_digest: effective_policy
                 .digest()
                 .map_err(|error| rejected("invalid_effective_policy", error.message))?,
@@ -953,7 +1260,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
                 .digest()
                 .map_err(|error| rejected("invalid_descriptor", error.message))?,
             idempotency: registered.descriptor.idempotency,
-            effect_scopes: registered.descriptor.effect_scopes.clone(),
+            effect_scopes: operation.effect_scopes.clone(),
         };
         let key = prepared.key();
 
@@ -1001,34 +1308,34 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
                             cached: false,
                         });
                     }
-                    let (verified_approval, authorization) = if effective_policy.requires_approval()
-                    {
-                        let Some(capability) = approval else {
-                            return Err(GuardedToolResult::ApprovalRequired {
-                                binding: approval_binding.clone(),
-                                summary: sanitize_approval_summary(
-                                    &registered.executor.approval_summary(invocation),
-                                    &invocation.tool_id,
-                                ),
-                            });
+                    let (verified_approval, authorization) =
+                        if matches!(permission, ToolPermissionDecision::RequireApproval) {
+                            let Some(capability) = approval else {
+                                return Err(GuardedToolResult::ApprovalRequired {
+                                    binding: approval_binding.clone(),
+                                    summary: sanitize_approval_summary(
+                                        &operation.summary,
+                                        &invocation.tool_id,
+                                    ),
+                                });
+                            };
+                            let verified = self
+                                .approval_verifier
+                                .verify_and_consume(
+                                    capability,
+                                    approval_binding,
+                                    chrono::Utc::now().timestamp_millis(),
+                                )
+                                .map_err(|error| {
+                                    rejected(approval_error_code(error.code), error.message)
+                                })?;
+                            let evidence = ToolAuthorizationEvidence::Approval {
+                                nonce: verified.nonce().clone(),
+                            };
+                            (Some(verified), evidence)
+                        } else {
+                            (None, ToolAuthorizationEvidence::Policy)
                         };
-                        let verified = self
-                            .approval_verifier
-                            .verify_and_consume(
-                                capability,
-                                approval_binding,
-                                chrono::Utc::now().timestamp_millis(),
-                            )
-                            .map_err(|error| {
-                                rejected(approval_error_code(error.code), error.message)
-                            })?;
-                        let evidence = ToolAuthorizationEvidence::Approval {
-                            nonce: verified.nonce().clone(),
-                        };
-                        (Some(verified), evidence)
-                    } else {
-                        (None, ToolAuthorizationEvidence::Policy)
-                    };
                     let appended = self
                         .effect_journal
                         .append(
@@ -1370,6 +1677,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
         &self,
         registered: Arc<RegisteredTool>,
         invocation: ToolInvocation,
+        operation: ToolOperationPlan,
         effective_policy: EffectiveToolPolicy,
         approval: Option<VerifiedApprovalCapability>,
         cancellation: CancellationToken,
@@ -1378,6 +1686,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
         let output_invocation = invocation.clone();
         let execution = registered.executor.execute(GuardedToolExecution {
             invocation,
+            operation,
             effective_policy: effective_policy.clone(),
             approval,
             cancellation: cancellation.clone(),
@@ -1475,12 +1784,16 @@ where
 
 fn invocation_identity(
     invocation: &ToolInvocation,
+    operation: &ToolOperationPlan,
     effective_policy: &EffectiveToolPolicy,
+    permission_digest: &Digest,
     descriptor: &ToolDescriptor,
 ) -> Result<InvocationIdentity, ToolProtocolError> {
     Ok(InvocationIdentity {
         tool_id: invocation.tool_id.clone(),
         args_digest: invocation.args_digest()?,
+        operation_digest: operation.digest()?,
+        permission_digest: permission_digest.clone(),
         policy_digest: effective_policy.digest()?,
         descriptor_digest: descriptor.digest()?,
     })

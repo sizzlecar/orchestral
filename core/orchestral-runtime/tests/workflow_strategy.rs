@@ -22,10 +22,11 @@ use orchestral_core::tool_protocol::{
 };
 use orchestral_core::types::{Plan, Step, WorkflowId};
 use orchestral_runtime::{
-    workflow_plan_digest, workflow_step_call_id, GuardedToolExecution, GuardedToolExecutor,
-    GuardedToolRuntime, HookDispatchMode, HookError, HookExecutionPolicy, HookFailurePolicy,
-    HookRegistry, RuntimeHook, RuntimeHookContext, RuntimeHookEventEnvelope,
-    WorkflowExecutionError, WorkflowExecutionRequest, WorkflowExecutionStrategy,
+    tool_permission_decision_digest, workflow_plan_digest, workflow_step_call_id,
+    DescriptorPermissionPolicy, GuardedToolExecution, GuardedToolExecutor, GuardedToolRuntime,
+    HookDispatchMode, HookError, HookExecutionPolicy, HookFailurePolicy, HookRegistry, RuntimeHook,
+    RuntimeHookContext, RuntimeHookEventEnvelope, ToolPermissionDecision, WorkflowExecutionError,
+    WorkflowExecutionRequest, WorkflowExecutionStrategy,
 };
 use serde_json::json;
 
@@ -647,12 +648,21 @@ async fn recovery_preflight_blocks_all_siblings_when_one_effect_is_unresolved() 
         &descriptor.restriction,
     )
     .expect("effective policy is valid");
+    let operation = executor
+        .plan_operation(&invocation, &descriptor, &effective_policy)
+        .expect("operation plan is valid");
     let prepared = PreparedToolEffect {
         args_digest: invocation.args_digest().expect("arguments digest"),
+        operation_digest: operation.digest().expect("operation digest"),
+        permission_digest: tool_permission_decision_digest(
+            &DescriptorPermissionPolicy,
+            &ToolPermissionDecision::Allow,
+        )
+        .expect("permission digest"),
         policy_digest: effective_policy.digest().expect("policy digest"),
         descriptor_digest: descriptor.digest().expect("descriptor digest"),
         idempotency: descriptor.idempotency,
-        effect_scopes: descriptor.effect_scopes.clone(),
+        effect_scopes: operation.effect_scopes,
         invocation,
     };
     let key_a = ToolEffectKey::new(run_id.clone(), call_a);

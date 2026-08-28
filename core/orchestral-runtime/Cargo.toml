@@ -25,6 +25,7 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }
+shell-words = { workspace = true }
 cap-std = "4.0.2"
 portable-pty = "0.9"
 strip-ansi-escapes = "0.2"

@@ -234,10 +234,10 @@ fn normalize_sandbox_inputs(
         || writable_roots.is_empty()
         || launcher_programs.is_empty()
         || !launcher_programs.contains(&program_identity)
-        || !writable_roots.iter().any(|root| cwd.starts_with(root))
+        || !readable_roots.iter().any(|root| cwd.starts_with(root))
     {
         return Err(
-            "sandbox requires canonical read/write roots, an allowed executable, and a writable cwd"
+            "sandbox requires canonical read/write roots, an allowed executable, and a readable cwd"
                 .to_owned(),
         );
     }
@@ -547,6 +547,27 @@ mod tests {
         let workspace = std::fs::canonicalize(workspace).unwrap();
         let outside = std::fs::canonicalize(outside).unwrap();
         (parent, workspace, outside)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sandbox_cwd_may_be_read_only_when_writes_use_a_separate_runtime_root() {
+        let (parent, workspace, runtime_root) = isolated_test_roots("read-only-cwd");
+        let executable = std::fs::canonicalize("/bin/echo").unwrap();
+        let normalized = normalize_sandbox_inputs(
+            &executable.to_string_lossy(),
+            &workspace,
+            &ShellSandboxPolicy {
+                readable_roots: vec![workspace.clone(), runtime_root.clone()],
+                writable_roots: vec![runtime_root],
+                allow_child_processes: false,
+                launcher_programs: vec![executable.clone()],
+                network_targets: BTreeSet::new(),
+                linux_bwrap_path: None,
+            },
+        );
+        assert!(normalized.is_ok(), "{normalized:?}");
+        std::fs::remove_dir_all(parent).unwrap();
     }
 
     #[cfg(target_os = "macos")]

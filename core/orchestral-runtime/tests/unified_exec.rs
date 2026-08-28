@@ -12,11 +12,13 @@ use orchestral_core::tool_protocol::{
     TransportLaunchPolicy,
 };
 use orchestral_runtime::tools::{
-    guarded_exec_command_descriptor, guarded_write_stdin_descriptor, CommandEnvironmentSnapshot,
-    GuardedExecCommandExecutor, GuardedWriteStdinExecutor, GUARDED_EXEC_SANDBOX_PROFILE,
+    guarded_exec_command_descriptor, guarded_write_stdin_descriptor,
+    workspace_exec_command_descriptor, CommandEnvironmentSnapshot, GuardedExecCommandExecutor,
+    GuardedWriteStdinExecutor, GUARDED_EXEC_SANDBOX_PROFILE,
 };
 use orchestral_runtime::{
     ExecSessionManager, ExecSpawnSpec, GuardedToolResult, GuardedToolRuntime,
+    WorkspacePermissionPolicy,
 };
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
@@ -414,24 +416,177 @@ async fn guarded_unified_surface_executes_children_and_continues_one_tty_session
             .await,
     );
     let session_id = started["session_id"].as_u64().unwrap();
-    let completed = inline_output(
+    let stdin = invocation(
+        "unified-run",
+        "stdin",
+        "orchestral/write_stdin/v1",
+        json!({ "session_id": session_id, "chars": "hello\n", "yield_time_ms": 1000 }),
+    );
+    let GuardedToolResult::ApprovalRequired { binding, summary } = runtime
+        .invoke(
+            stdin.clone(),
+            RunToolGrant {
+                bounds: bounds.clone(),
+            },
+            None,
+            CancellationToken::new(),
+        )
+        .await
+    else {
+        panic!("non-empty process input must require exact approval")
+    };
+    assert!(summary.contains("hello\\n"));
+    let approval = HostApprovalIssuer::new(SIGNING_KEY)
+        .unwrap()
+        .issue(binding, i64::MAX)
+        .unwrap();
+    let mut completed = inline_output(
         runtime
             .invoke(
-                invocation(
-                    "unified-run",
-                    "stdin",
-                    "orchestral/write_stdin/v1",
-                    json!({ "session_id": session_id, "chars": "hello\n", "yield_time_ms": 1000 }),
-                ),
-                RunToolGrant { bounds },
-                None,
+                stdin,
+                RunToolGrant {
+                    bounds: bounds.clone(),
+                },
+                Some(approval),
                 CancellationToken::new(),
             )
             .await,
     );
-    assert_eq!(completed["exit_code"], json!(0));
+    if completed["alive"] == json!(true) {
+        let poll = invocation(
+            "unified-run",
+            "poll",
+            "orchestral/write_stdin/v1",
+            json!({ "session_id": session_id, "yield_time_ms": 1000 }),
+        );
+        let GuardedToolResult::ApprovalRequired { binding, .. } = runtime
+            .invoke(
+                poll.clone(),
+                RunToolGrant {
+                    bounds: bounds.clone(),
+                },
+                None,
+                CancellationToken::new(),
+            )
+            .await
+        else {
+            panic!("safe SDK descriptor keeps polling behind exact approval")
+        };
+        let approval = HostApprovalIssuer::new(SIGNING_KEY)
+            .unwrap()
+            .issue(binding, i64::MAX)
+            .unwrap();
+        completed = inline_output(
+            runtime
+                .invoke(
+                    poll,
+                    RunToolGrant { bounds },
+                    Some(approval),
+                    CancellationToken::new(),
+                )
+                .await,
+        );
+    }
+    assert_eq!(completed["exit_code"], json!(0), "{completed:#?}");
     assert!(completed["output"].as_str().unwrap().contains("got:hello"));
     assert!(manager.list(&RunId::new("unified-run")).unwrap().is_empty());
 
+    std::fs::remove_dir_all(parent).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn workspace_auto_run_uses_a_real_read_only_workspace_sandbox() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let parent = std::env::temp_dir().join(format!(
+        "orchestral-workspace-auto-exec-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let workspace = parent.join("workspace");
+    let runtime_bin = parent.join("runtime-bin");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&runtime_bin).unwrap();
+    let workspace = std::fs::canonicalize(workspace).unwrap();
+    let runtime_bin = std::fs::canonicalize(runtime_bin).unwrap();
+    let escaped = workspace.join("escaped.txt");
+    let fake_ls = runtime_bin.join("ls");
+    std::fs::write(
+        &fake_ls,
+        format!("#!/bin/sh\nprintf escaped > '{}'\n", escaped.display()),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&fake_ls).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&fake_ls, permissions).unwrap();
+
+    let shell = std::fs::canonicalize("/bin/sh").unwrap();
+    let bounds = bounds(&workspace, &shell);
+    let runtime =
+        runtime(bounds.clone()).with_permission_policy(Arc::new(WorkspacePermissionPolicy));
+    let manager = Arc::new(ExecSessionManager::new(16 * 1024).unwrap());
+    runtime
+        .register(
+            workspace_exec_command_descriptor(ToolRestriction {
+                bounds: bounds.clone(),
+            }),
+            Arc::new(
+                GuardedExecCommandExecutor::new(
+                    manager,
+                    shell,
+                    [runtime_bin.clone(), PathBuf::from("/bin")],
+                    CommandEnvironmentSnapshot::from_values([(
+                        "PATH".to_owned(),
+                        runtime_bin.to_string_lossy().into_owned(),
+                    )]),
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+
+    let result = runtime
+        .invoke(
+            invocation(
+                "workspace-auto-run",
+                "read-only",
+                "orchestral/exec_command/v1",
+                json!({ "cmd": "ls", "yield_time_ms": 1000 }),
+            ),
+            RunToolGrant {
+                bounds: bounds.clone(),
+            },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Completed { .. },
+            cached: false,
+        }
+    ));
+    assert!(
+        !escaped.exists(),
+        "routine command escaped the read-only workspace sandbox"
+    );
+
+    let mutation = workspace.join("mutation.txt");
+    let result = runtime
+        .invoke(
+            invocation(
+                "workspace-auto-run",
+                "mutation",
+                "orchestral/exec_command/v1",
+                json!({ "cmd": format!("touch {}", mutation.display()) }),
+            ),
+            RunToolGrant { bounds },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(result, GuardedToolResult::ApprovalRequired { .. }));
+    assert!(!mutation.exists());
     std::fs::remove_dir_all(parent).unwrap();
 }

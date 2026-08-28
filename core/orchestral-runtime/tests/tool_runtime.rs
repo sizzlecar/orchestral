@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -8,7 +8,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use orchestral_core::agent_protocol::wire::RunId;
+use orchestral_core::agent_protocol::wire::{Digest, RunId};
 use orchestral_core::io::{
     BlobHead, BlobId, BlobIoError, BlobMeta, BlobRead, BlobStore, BlobWriteRequest,
 };
@@ -23,20 +23,21 @@ use orchestral_core::tool_protocol::{
     HostApprovalIssuer, HostApprovalVerifier, HostToolPolicy, InMemoryApprovalCapabilityStore,
     InteractiveCommandPolicy, ModelToolSchema, NetworkPolicy, ProcessPolicy, RunToolGrant,
     SandboxPolicy, ToolCallId, ToolConcurrency, ToolDescriptor, ToolId, ToolIdempotency,
-    ToolInvocation, ToolOutcome, ToolOutput, ToolPolicyBounds, ToolRestriction,
-    TransportLaunchPolicy,
+    ToolInvocation, ToolOperationPlan, ToolOperationRisk, ToolOutcome, ToolOutput,
+    ToolPolicyBounds, ToolRestriction, TransportLaunchPolicy,
 };
 use orchestral_runtime::{
+    tool_permission_decision_digest,
     tools::{
         guarded_artifact_read_descriptor, guarded_file_read_descriptor, guarded_shell_descriptor,
         guarded_shell_descriptor_with_program_aliases, GuardedArtifactReadExecutor,
         GuardedFileReadExecutor, GuardedProgramAliases, GuardedShellExecutor,
         GUARDED_SHELL_SANDBOX_PROFILE,
     },
-    GuardedToolExecution, GuardedToolExecutor, GuardedToolResult, GuardedToolRuntime,
-    HookDispatchMode, HookError, HookExecutionPolicy, HookFailurePolicy, HookRegistry,
-    InMemoryBlobStore, RuntimeHook, RuntimeHookContext, RuntimeHookEventEnvelope,
-    ToolArtifactStore,
+    DescriptorPermissionPolicy, GuardedToolExecution, GuardedToolExecutor, GuardedToolResult,
+    GuardedToolRuntime, HookDispatchMode, HookError, HookExecutionPolicy, HookFailurePolicy,
+    HookRegistry, InMemoryBlobStore, RuntimeHook, RuntimeHookContext, RuntimeHookEventEnvelope,
+    ToolArtifactStore, ToolPermissionDecision, ToolPermissionPolicy, WorkspacePermissionPolicy,
 };
 #[cfg(target_os = "macos")]
 use orchestral_runtime::{
@@ -199,6 +200,11 @@ fn runtime_with_artifacts(
 struct EchoExecutor {
     calls: AtomicUsize,
     delay: Duration,
+}
+
+struct PlannedEchoExecutor {
+    calls: AtomicUsize,
+    operation: ToolOperationPlan,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -415,6 +421,29 @@ impl GuardedToolExecutor for EchoExecutor {
     }
 }
 
+#[async_trait]
+impl GuardedToolExecutor for PlannedEchoExecutor {
+    fn planning_contract(&self) -> serde_json::Value {
+        json!({ "contract": "test.planned-echo/v1" })
+    }
+
+    fn plan_operation(
+        &self,
+        _invocation: &ToolInvocation,
+        _descriptor: &ToolDescriptor,
+        _effective_policy: &EffectiveToolPolicy,
+    ) -> Result<ToolOperationPlan, ToolOutcome> {
+        Ok(self.operation.clone())
+    }
+
+    async fn execute(&self, execution: GuardedToolExecution) -> ToolOutcome {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        ToolOutcome::Completed {
+            output: json!({ "result": execution.invocation.arguments["value"].clone() }).into(),
+        }
+    }
+}
+
 async fn seed_effect_trace(
     journal: &Arc<InMemoryToolEffectJournalStore>,
     bounds: &ToolPolicyBounds,
@@ -432,13 +461,26 @@ async fn seed_effect_trace(
         &descriptor.restriction,
     )
     .unwrap();
+    let planner = EchoExecutor {
+        calls: AtomicUsize::new(0),
+        delay: Duration::ZERO,
+    };
+    let operation = planner
+        .plan_operation(&invocation, &descriptor, &effective)
+        .unwrap();
     let prepared = PreparedToolEffect {
         args_digest: invocation.args_digest().unwrap(),
         invocation,
+        operation_digest: operation.digest().unwrap(),
+        permission_digest: tool_permission_decision_digest(
+            &DescriptorPermissionPolicy,
+            &ToolPermissionDecision::Allow,
+        )
+        .unwrap(),
         policy_digest: effective.digest().unwrap(),
         descriptor_digest: descriptor.digest().unwrap(),
         idempotency: descriptor.idempotency,
-        effect_scopes: descriptor.effect_scopes,
+        effect_scopes: operation.effect_scopes,
     };
     let key = prepared.key();
     journal
@@ -514,6 +556,269 @@ async fn approval_required_never_calls_executor() {
     };
     assert_eq!(binding.requested_scopes, effects(&[EffectScope::Process]));
     assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn workspace_policy_authorizes_the_planned_effects_not_the_tool_envelope() {
+    let mut bounds = policy(ApprovalPolicy::NotRequired);
+    bounds.sandbox.required = true;
+    bounds.allowed_effects = effects(&[
+        EffectScope::Process,
+        EffectScope::Network,
+        EffectScope::FilesystemWrite,
+        EffectScope::ExternalSideEffect,
+    ]);
+    let journal = Arc::new(InMemoryToolEffectJournalStore::default());
+    let runtime = runtime_with_effect_journal(bounds.clone(), journal.clone())
+        .with_permission_policy(Arc::new(WorkspacePermissionPolicy));
+    let operation = ToolOperationPlan {
+        effect_scopes: effects(&[EffectScope::Process]),
+        targets: strings(&["workspace"]),
+        risk: ToolOperationRisk::Routine,
+        summary: "List the workspace".to_owned(),
+    };
+    let executor = Arc::new(PlannedEchoExecutor {
+        calls: AtomicUsize::new(0),
+        operation: operation.clone(),
+    });
+    let mut tool = descriptor(bounds.clone(), ToolConcurrency::ParallelSafe);
+    tool.effect_scopes = bounds.allowed_effects.clone();
+    runtime.register(tool, executor.clone()).unwrap();
+
+    let result = runtime
+        .invoke(
+            invocation("hello"),
+            RunToolGrant {
+                bounds: bounds.clone(),
+            },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Completed { .. },
+            cached: false,
+        }
+    ));
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+
+    let key = ToolEffectKey::new(RunId::new("run-1"), ToolCallId::new("call-1"));
+    let records = journal.load_effect(&key).await.unwrap();
+    let projection = replay_tool_effect(&key, &records).unwrap().unwrap();
+    assert_eq!(projection.prepared.effect_scopes, operation.effect_scopes);
+    assert_eq!(
+        projection.prepared.operation_digest,
+        operation.digest().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn workspace_policy_routes_destructive_operations_to_exact_review() {
+    let mut bounds = policy(ApprovalPolicy::NotRequired);
+    bounds.sandbox.required = true;
+    let runtime =
+        runtime(bounds.clone()).with_permission_policy(Arc::new(WorkspacePermissionPolicy));
+    let operation = ToolOperationPlan {
+        effect_scopes: effects(&[EffectScope::Process]),
+        targets: strings(&["workspace"]),
+        risk: ToolOperationRisk::Destructive,
+        summary: "Reset workspace state".to_owned(),
+    };
+    let executor = Arc::new(PlannedEchoExecutor {
+        calls: AtomicUsize::new(0),
+        operation: operation.clone(),
+    });
+    runtime
+        .register(
+            descriptor(bounds.clone(), ToolConcurrency::ParallelSafe),
+            executor.clone(),
+        )
+        .unwrap();
+
+    let result = runtime
+        .invoke(
+            invocation("hello"),
+            RunToolGrant { bounds },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    let GuardedToolResult::ApprovalRequired { binding, summary } = result else {
+        panic!("destructive operation must require review")
+    };
+    assert_eq!(binding.requested_scopes, operation.effect_scopes);
+    assert_eq!(binding.operation_digest, operation.digest().unwrap());
+    assert_eq!(summary, operation.summary);
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+}
+
+struct AlwaysAllowPermissionPolicy;
+
+impl ToolPermissionPolicy for AlwaysAllowPermissionPolicy {
+    fn contract_digest(&self) -> Digest {
+        Digest::sha256("test.permission-policy/always-allow/v1")
+    }
+
+    fn decide(
+        &self,
+        _descriptor: &ToolDescriptor,
+        _operation: &ToolOperationPlan,
+        _effective_policy: &EffectiveToolPolicy,
+    ) -> ToolPermissionDecision {
+        ToolPermissionDecision::Allow
+    }
+}
+
+#[tokio::test]
+async fn permission_spi_cannot_relax_a_required_static_policy() {
+    let bounds = policy(ApprovalPolicy::Required);
+    let runtime =
+        runtime(bounds.clone()).with_permission_policy(Arc::new(AlwaysAllowPermissionPolicy));
+    let executor = Arc::new(EchoExecutor {
+        calls: AtomicUsize::new(0),
+        delay: Duration::ZERO,
+    });
+    runtime
+        .register(
+            descriptor(bounds.clone(), ToolConcurrency::ParallelSafe),
+            executor.clone(),
+        )
+        .unwrap();
+
+    let result = runtime
+        .invoke(
+            invocation("hello"),
+            RunToolGrant { bounds },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(result, GuardedToolResult::ApprovalRequired { .. }));
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn permission_spi_cannot_relax_a_denied_static_policy() {
+    let bounds = policy(ApprovalPolicy::Deny);
+    let runtime =
+        runtime(bounds.clone()).with_permission_policy(Arc::new(AlwaysAllowPermissionPolicy));
+    let executor = Arc::new(EchoExecutor {
+        calls: AtomicUsize::new(0),
+        delay: Duration::ZERO,
+    });
+    runtime
+        .register(
+            descriptor(bounds.clone(), ToolConcurrency::ParallelSafe),
+            executor.clone(),
+        )
+        .unwrap();
+
+    let result = runtime
+        .invoke(
+            invocation("hello"),
+            RunToolGrant { bounds },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Rejected { ref code, .. },
+            ..
+        } if code == "policy_denied"
+    ));
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+}
+
+struct FlippingPermissionPolicy {
+    require_approval: Arc<AtomicBool>,
+}
+
+impl ToolPermissionPolicy for FlippingPermissionPolicy {
+    fn contract_digest(&self) -> Digest {
+        Digest::sha256("test.permission-policy/flipping/v1")
+    }
+
+    fn decide(
+        &self,
+        _descriptor: &ToolDescriptor,
+        _operation: &ToolOperationPlan,
+        _effective_policy: &EffectiveToolPolicy,
+    ) -> ToolPermissionDecision {
+        if self.require_approval.load(Ordering::SeqCst) {
+            ToolPermissionDecision::RequireApproval
+        } else {
+            ToolPermissionDecision::Allow
+        }
+    }
+}
+
+#[tokio::test]
+async fn permission_decision_cannot_flip_from_review_to_allow_on_retry() {
+    let bounds = policy(ApprovalPolicy::NotRequired);
+    let journal = Arc::new(InMemoryToolEffectJournalStore::default());
+    let require_approval = Arc::new(AtomicBool::new(true));
+    let runtime = runtime_with_effect_journal(bounds.clone(), journal.clone())
+        .with_permission_policy(Arc::new(FlippingPermissionPolicy {
+            require_approval: require_approval.clone(),
+        }));
+    let first_executor = Arc::new(EchoExecutor {
+        calls: AtomicUsize::new(0),
+        delay: Duration::ZERO,
+    });
+    runtime
+        .register(
+            descriptor(bounds.clone(), ToolConcurrency::ParallelSafe),
+            first_executor.clone(),
+        )
+        .unwrap();
+
+    let first = runtime
+        .invoke(
+            invocation("hello"),
+            RunToolGrant {
+                bounds: bounds.clone(),
+            },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(first, GuardedToolResult::ApprovalRequired { .. }));
+    drop(runtime);
+
+    require_approval.store(false, Ordering::SeqCst);
+    let replacement = runtime_with_effect_journal(bounds.clone(), journal)
+        .with_permission_policy(Arc::new(FlippingPermissionPolicy { require_approval }));
+    let replacement_executor = Arc::new(EchoExecutor {
+        calls: AtomicUsize::new(0),
+        delay: Duration::ZERO,
+    });
+    replacement
+        .register(
+            descriptor(bounds.clone(), ToolConcurrency::ParallelSafe),
+            replacement_executor.clone(),
+        )
+        .unwrap();
+    let retry = replacement
+        .invoke(
+            invocation("hello"),
+            RunToolGrant { bounds },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(
+        retry,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Rejected { ref code, .. },
+            cached: false,
+        } if code == "call_identity_conflict"
+    ));
+    assert_eq!(first_executor.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(replacement_executor.calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

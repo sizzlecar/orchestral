@@ -53,9 +53,10 @@ pub use skill::{
     LoadedSkillSet, SkillConflict, SkillLoadOutcome, SkillRoot, SkillRuntime, SkillRuntimeError,
 };
 pub use tool_runtime::{
-    AgentToolRuntime, GuardedToolExecution, GuardedToolExecutor, GuardedToolResult,
-    GuardedToolRuntime, ToolArtifactError, ToolArtifactStore, ToolOutcomeRecoveryError,
-    ToolRuntimeError,
+    tool_permission_decision_digest, AgentToolRuntime, DescriptorPermissionPolicy,
+    GuardedToolExecution, GuardedToolExecutor, GuardedToolResult, GuardedToolRuntime,
+    ToolArtifactError, ToolArtifactStore, ToolOutcomeRecoveryError, ToolPermissionDecision,
+    ToolPermissionPolicy, ToolRuntimeError, WorkspacePermissionPolicy,
 };
 pub use tools::{
     GuardedMcpServerConfig, McpServerConnectionManager, McpServerHealth, McpToolsAdapterError,

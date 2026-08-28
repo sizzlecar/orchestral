@@ -74,6 +74,13 @@ impl ToolEffectKey {
 pub struct PreparedToolEffect {
     pub invocation: ToolInvocation,
     pub args_digest: Digest,
+    /// Digest of the invocation-specific effect plan authorized for this
+    /// attempt. It prevents recovery from silently widening or reclassifying
+    /// an operation after a runtime upgrade.
+    pub operation_digest: Digest,
+    /// Digest of the immutable permission policy contract and its normalized
+    /// decision for this operation.
+    pub permission_digest: Digest,
     pub policy_digest: Digest,
     pub descriptor_digest: Digest,
     pub idempotency: ToolIdempotency,
@@ -98,6 +105,8 @@ impl PreparedToolEffect {
             .args_digest()
             .map_err(|error| ToolEffectError::InvalidEvent(error.message))?
             != self.args_digest
+            || !self.operation_digest.is_sha256()
+            || !self.permission_digest.is_sha256()
             || !self.policy_digest.is_sha256()
             || !self.descriptor_digest.is_sha256()
         {
@@ -559,6 +568,8 @@ mod tests {
         PreparedToolEffect {
             args_digest: invocation.args_digest().unwrap(),
             invocation,
+            operation_digest: Digest::sha256("operation"),
+            permission_digest: Digest::sha256("permission"),
             policy_digest: Digest::sha256("policy"),
             descriptor_digest: Digest::sha256("descriptor"),
             idempotency: ToolIdempotency::NonIdempotent,

@@ -1898,6 +1898,7 @@ dependencies = [
  "serde_jcs",
  "serde_json",
  "serde_yaml",
+ "shell-words",
  "strip-ansi-escapes",
  "thiserror 1.0.69",
  "tokio",
