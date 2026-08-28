@@ -167,12 +167,52 @@ pub struct GenericAgentConfig {
     pub agent_id: AgentId,
     pub system_prompt: String,
     pub stream_buffer: usize,
-    pub max_model_rounds: u64,
-    pub max_tool_calls: u64,
+    pub continuation: ContinuationPolicy,
     pub history_limit: usize,
     pub max_context_tokens: u64,
     pub reserved_output_tokens: u64,
     pub model_cost_policy: Option<ModelCostPolicy>,
+}
+
+/// Host ceiling for one continuous Agent turn.
+///
+/// An absent ceiling means that normal progress is not stopped by an arbitrary
+/// number of model or Tool exchanges. Per-Run limits from Agent Protocol are
+/// intersected with these Host ceilings when either side explicitly supplies
+/// one. Deadline, token, cost, cancellation, and terminal-state checks remain
+/// independent continuation boundaries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContinuationPolicy {
+    pub max_model_steps: Option<u64>,
+    pub max_tool_calls: Option<u64>,
+}
+
+impl ContinuationPolicy {
+    pub fn effective_model_steps(self, requested: Option<u64>) -> Option<u64> {
+        intersect_limit(requested, self.max_model_steps)
+    }
+
+    pub fn effective_tool_calls(self, requested: Option<u64>) -> Option<u64> {
+        intersect_limit(requested, self.max_tool_calls)
+    }
+
+    fn validate(self) -> Result<(), AgentProtocolError> {
+        if self.max_model_steps == Some(0) || self.max_tool_calls == Some(0) {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidSpec,
+                "configured continuation ceilings must be positive when present",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn intersect_limit(requested: Option<u64>, host_ceiling: Option<u64>) -> Option<u64> {
+    match (requested, host_ceiling) {
+        (Some(requested), Some(host_ceiling)) => Some(requested.min(host_ceiling)),
+        (Some(limit), None) | (None, Some(limit)) => Some(limit),
+        (None, None) => None,
+    }
 }
 
 impl GenericAgentConfig {
@@ -194,8 +234,7 @@ impl GenericAgentConfig {
             )
             .to_owned(),
             stream_buffer: 128,
-            max_model_rounds: 16,
-            max_tool_calls: 32,
+            continuation: ContinuationPolicy::default(),
             history_limit: 128,
             max_context_tokens: 128 * 1024,
             reserved_output_tokens: 4 * 1024,

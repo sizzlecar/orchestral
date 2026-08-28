@@ -35,13 +35,13 @@ fn validate_config(config: &OrchestralConfig) -> Result<(), ConfigError> {
         return invalid("app.name must not be empty");
     }
     if config.agent.stream_buffer == 0
-        || config.agent.max_model_rounds == 0
-        || config.agent.max_tool_calls == 0
+        || config.agent.max_model_steps == Some(0)
+        || config.agent.max_tool_calls == Some(0)
         || config.agent.history_limit == 0
         || config.agent.max_context_tokens == 0
         || config.agent.reserved_output_tokens == 0
     {
-        return invalid("Agent limits must be positive");
+        return invalid("Agent limits must be positive when present");
     }
     if config.agent.reserved_output_tokens >= config.agent.max_context_tokens {
         return invalid("agent.reserved_output_tokens must be below max_context_tokens");
@@ -204,7 +204,44 @@ mod tests {
 
     #[test]
     fn default_config_is_valid() {
-        assert!(validate_config(&OrchestralConfig::default()).is_ok());
+        let config = OrchestralConfig::default();
+        assert_eq!(config.agent.max_model_steps, None);
+        assert_eq!(config.agent.max_tool_calls, None);
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn continuation_ceilings_are_optional_and_positive_when_configured() {
+        let config = serde_yaml::from_str::<OrchestralConfig>(
+            r#"
+agent:
+  max_model_steps: 48
+  max_tool_calls: 96
+"#,
+        )
+        .expect("explicit continuation ceilings deserialize");
+        assert_eq!(config.agent.max_model_steps, Some(48));
+        assert_eq!(config.agent.max_tool_calls, Some(96));
+        assert!(validate_config(&config).is_ok());
+
+        let mut invalid = OrchestralConfig::default();
+        invalid.agent.max_model_steps = Some(0);
+        assert!(matches!(
+            validate_config(&invalid),
+            Err(ConfigError::Invalid(message)) if message.contains("positive when present")
+        ));
+    }
+
+    #[test]
+    fn legacy_hidden_model_round_limit_is_rejected() {
+        let error = serde_yaml::from_str::<OrchestralConfig>(
+            r#"
+agent:
+  max_model_rounds: 16
+"#,
+        )
+        .expect_err("the removed hidden round-limit surface must not deserialize");
+        assert!(error.to_string().contains("max_model_rounds"));
     }
 
     #[test]

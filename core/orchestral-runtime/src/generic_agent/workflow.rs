@@ -101,7 +101,7 @@ pub(super) struct WorkflowCallRequest<'a> {
     pub(super) run_id: &'a RunId,
     pub(super) call_id: &'a ModelToolCallId,
     pub(super) arguments: serde_json::Value,
-    pub(super) remaining_tool_calls: u64,
+    pub(super) remaining_tool_calls: Option<u64>,
     pub(super) cancellation: CancellationToken,
     pub(super) recovery_replay: bool,
 }
@@ -149,8 +149,11 @@ pub(super) async fn execute_workflow_call(
         tools.run_grant.clone(),
     )
     .with_cancellation(call.cancellation.clone())
-    .with_progress_reporter(reporter)
-    .with_max_tool_calls(call.remaining_tool_calls);
+    .with_progress_reporter(reporter);
+    let request = match call.remaining_tool_calls {
+        Some(limit) => request.with_max_tool_calls(limit),
+        None => request,
+    };
     let request = if call.recovery_replay {
         request.with_recovery_replay()
     } else {

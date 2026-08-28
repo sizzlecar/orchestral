@@ -10,7 +10,7 @@ pub(super) struct ToolBatchRequest {
     pub(super) parsed_calls: Vec<(PendingModelToolCall, serde_json::Value)>,
     pub(super) cancellation: CancellationToken,
     pub(super) tool_call_count: u64,
-    pub(super) tool_call_limit: u64,
+    pub(super) tool_call_limit: Option<u64>,
     pub(super) last_response: String,
     pub(super) total_usage: ModelUsage,
     pub(super) has_usage: bool,
@@ -148,8 +148,9 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
             }
         };
         if call.name == WORKFLOW_TOOL_NAME {
-            let remaining_tool_calls = tool_call_limit.saturating_sub(tool_call_count);
-            if remaining_tool_calls == 0 {
+            let remaining_tool_calls =
+                tool_call_limit.map(|limit| limit.saturating_sub(tool_call_count));
+            if remaining_tool_calls == Some(0) {
                 emit_incomplete(
                     &inner,
                     &request,
@@ -222,7 +223,25 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                     return ToolBatchExecution::Terminal;
                 }
             };
-            tool_call_count = tool_call_count.saturating_add(observation.tool_calls);
+            tool_call_count = match reserve_tool_calls(
+                tool_call_count,
+                observation.tool_calls,
+                tool_call_limit,
+            ) {
+                Ok(next) => next,
+                Err(limit) => {
+                    emit_limit_reached(
+                        &inner,
+                        &request,
+                        last_response,
+                        has_usage.then_some(total_usage),
+                        tool_call_count,
+                        started_event_id,
+                        limit,
+                    );
+                    return ToolBatchExecution::Terminal;
+                }
+            };
             publish_tool_activity(
                 &inner,
                 &run_id,

@@ -99,10 +99,12 @@ pub struct AgentConfig {
     pub system_prompt: Option<String>,
     #[serde(default = "default_stream_buffer")]
     pub stream_buffer: usize,
-    #[serde(default = "default_max_model_rounds")]
-    pub max_model_rounds: u64,
-    #[serde(default = "default_max_tool_calls")]
-    pub max_tool_calls: u64,
+    /// Optional Host ceiling. Omit it to let a progressing turn continue until
+    /// it settles or reaches an explicit Run resource boundary.
+    #[serde(default)]
+    pub max_model_steps: Option<u64>,
+    #[serde(default)]
+    pub max_tool_calls: Option<u64>,
     #[serde(default = "default_history_limit")]
     pub history_limit: usize,
     #[serde(default = "default_max_context_tokens")]
@@ -122,8 +124,8 @@ impl Default for AgentConfig {
             temperature: None,
             system_prompt: None,
             stream_buffer: default_stream_buffer(),
-            max_model_rounds: default_max_model_rounds(),
-            max_tool_calls: default_max_tool_calls(),
+            max_model_steps: None,
+            max_tool_calls: None,
             history_limit: default_history_limit(),
             max_context_tokens: default_max_context_tokens(),
             reserved_output_tokens: default_reserved_output_tokens(),
@@ -171,14 +173,6 @@ fn default_compaction_summary_chars() -> usize {
 
 fn default_stream_buffer() -> usize {
     128
-}
-
-fn default_max_model_rounds() -> u64 {
-    16
-}
-
-fn default_max_tool_calls() -> u64 {
-    32
 }
 
 fn default_history_limit() -> usize {

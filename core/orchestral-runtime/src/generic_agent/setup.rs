@@ -239,8 +239,10 @@ pub(super) fn generic_config_digest(
         "system_prompt": config.system_prompt,
         "model_descriptor": model_descriptor,
         "token_meter": token_meter,
-        "max_model_rounds": config.max_model_rounds,
-        "max_tool_calls": config.max_tool_calls,
+        "continuation_policy": {
+            "max_model_steps": config.continuation.max_model_steps,
+            "max_tool_calls": config.continuation.max_tool_calls,
+        },
         "history_limit": config.history_limit,
         "max_context_tokens": config.max_context_tokens,
         "reserved_output_tokens": config.reserved_output_tokens,

@@ -795,6 +795,11 @@ struct ToolLoopModel {
     rounds: AtomicUsize,
 }
 
+struct LongToolLoopModel {
+    rounds: AtomicUsize,
+    tool_rounds: usize,
+}
+
 struct NonFatalToolModel {
     rounds: AtomicUsize,
     expected_status: &'static str,
@@ -1404,6 +1409,55 @@ impl ModelBackend for ToolLoopModel {
             Ok(ModelStreamEvent {
                 request_id,
                 event_id: ModelEventId::new("answer-finish"),
+                sequence: 2,
+                payload: ModelEvent::Finish {
+                    reason: ModelFinishReason::Stop,
+                },
+            }),
+        ])))
+    }
+}
+
+#[async_trait]
+impl ModelBackend for LongToolLoopModel {
+    fn descriptor(&self) -> ModelDescriptor {
+        ModelDescriptor {
+            backend_id: "long-tool-loop-model".to_owned(),
+            capabilities: ModelCapabilities {
+                streaming: true,
+                tool_calls: true,
+                ..ModelCapabilities::default()
+            },
+            extensions: Default::default(),
+        }
+    }
+
+    async fn start(
+        &self,
+        request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelStream, ModelError> {
+        request.validate()?;
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        let request_id = request.request_id;
+        if round < self.tool_rounds {
+            let prefix = format!("long-loop-{round}");
+            let call_id = format!("long-loop-call-{round}");
+            return Ok(scripted_tool_call(request_id, &prefix, &call_id, "echo"));
+        }
+
+        Ok(Box::pin(stream::iter([
+            Ok(ModelStreamEvent {
+                request_id: request_id.clone(),
+                event_id: ModelEventId::new("long-loop-delivery"),
+                sequence: 1,
+                payload: ModelEvent::TextDelta {
+                    delta: format!("completed {} Tool calls", self.tool_rounds),
+                },
+            }),
+            Ok(ModelStreamEvent {
+                request_id,
+                event_id: ModelEventId::new("long-loop-finish"),
                 sequence: 2,
                 payload: ModelEvent::Finish {
                     reason: ModelFinishReason::Stop,
@@ -7128,7 +7182,6 @@ async fn one_hundred_steers_are_committed_in_order_without_crossing_the_run() {
         first_started: Notify::new(),
     });
     let mut config = GenericAgentConfig::new("internal-provider", "generic-agent");
-    config.max_model_rounds = 128;
     config.stream_buffer = 128;
     let provider = Arc::new(
         InternalGenericAgentProvider::new(model.clone(), config)
@@ -7414,6 +7467,191 @@ async fn generic_agent_executes_model_tools_only_through_the_guarded_runtime() {
     ));
 }
 
+fn long_tool_loop_controller(
+    tool_rounds: usize,
+) -> (Arc<AgentController>, Arc<LongToolLoopModel>, Arc<EchoTool>) {
+    let bounds = ToolPolicyBounds {
+        approval: ApprovalPolicy::NotRequired,
+        max_timeout_ms: Some(1_000),
+        max_output_bytes: Some(1_024),
+        ..ToolPolicyBounds::default()
+    };
+    let verifier = HostApprovalVerifier::new(
+        b"0123456789abcdef0123456789abcdef",
+        InMemoryApprovalCapabilityStore::default(),
+    )
+    .expect("valid Host signing key");
+    let runtime = Arc::new(
+        GuardedToolRuntime::new(
+            HostToolPolicy {
+                bounds: bounds.clone(),
+            },
+            verifier,
+        )
+        .expect("valid Host policy"),
+    );
+    let tool = Arc::new(EchoTool {
+        calls: AtomicUsize::new(0),
+    });
+    runtime
+        .register(
+            ToolDescriptor {
+                tool_id: ToolId::new("test/long-loop-echo"),
+                model_schema: ModelToolSchema {
+                    name: "echo".to_owned(),
+                    description: "Echo one string".to_owned(),
+                    input_schema: json!({
+                        "type": "object",
+                        "required": ["value"],
+                        "properties": { "value": { "type": "string" } },
+                        "additionalProperties": false
+                    }),
+                },
+                output_schema: json!({
+                    "type": "object",
+                    "required": ["result"],
+                    "properties": { "result": { "type": "string" } },
+                    "additionalProperties": false
+                }),
+                effect_scopes: BTreeSet::new(),
+                restriction: ToolRestriction {
+                    bounds: bounds.clone(),
+                },
+                idempotency: ToolIdempotency::IdempotentWithKey,
+                concurrency: ToolConcurrency::ParallelSafe,
+            },
+            tool.clone(),
+        )
+        .expect("long-loop Tool registers");
+    let model = Arc::new(LongToolLoopModel {
+        rounds: AtomicUsize::new(0),
+        tool_rounds,
+    });
+    let provider = Arc::new(
+        InternalGenericAgentProvider::new_with_tools(
+            model.clone(),
+            GenericAgentConfig::new("internal-provider", "generic-agent"),
+            runtime,
+            RunToolGrant { bounds },
+        )
+        .expect("long-loop Generic Agent is valid"),
+    );
+    let controller = Arc::new(
+        AgentController::new(provider, ProviderBindingRef::new("long-loop-binding"))
+            .expect("controller binds the long-loop Agent"),
+    );
+    (controller, model, tool)
+}
+
+#[tokio::test]
+async fn default_continuation_policy_completes_beyond_legacy_step_and_tool_ceilings() {
+    const TOOL_ROUNDS: usize = 40;
+    let (controller, model, tool) = long_tool_loop_controller(TOOL_ROUNDS);
+    let run = AgentRunEnvelope::new(
+        AGENT_PROTOCOL_V1,
+        AgentSessionId::new("unbounded-continuation-session"),
+        RunId::new("unbounded-continuation-run"),
+        vec![Content::text("continue while useful, then report")],
+    )
+    .expect("valid long-loop Run");
+
+    let execution = controller.start(run).await.expect("long-loop Run starts");
+    let view = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        controller.wait_for_terminal(&execution.run_id),
+    )
+    .await
+    .expect("long-loop Run settles")
+    .expect("long-loop Run remains inspectable");
+
+    assert_eq!(view.state.status(), AgentRunStatus::Delivered);
+    assert_eq!(model.rounds.load(Ordering::SeqCst), TOOL_ROUNDS + 1);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), TOOL_ROUNDS);
+    assert_eq!(
+        view.delivery
+            .as_ref()
+            .and_then(|delivery| delivery.usage.as_ref())
+            .and_then(|usage| usage.tool_calls),
+        Some(TOOL_ROUNDS as u64)
+    );
+}
+
+#[tokio::test]
+async fn explicit_run_model_step_limit_still_stops_at_the_exact_boundary() {
+    let (controller, model, tool) = long_tool_loop_controller(20);
+    let mut run = AgentRunEnvelope::new(
+        AGENT_PROTOCOL_V1,
+        AgentSessionId::new("model-step-limit-session"),
+        RunId::new("model-step-limit-run"),
+        vec![Content::text("exercise an explicit model step budget")],
+    )
+    .expect("valid bounded Run");
+    run.spec.limits.max_model_steps = Some(3);
+    let run = AgentRunEnvelope::seal(run.spec).expect("bounded Run reseals");
+
+    let execution = controller.start(run).await.expect("bounded Run starts");
+    let view = controller
+        .wait_for_terminal(&execution.run_id)
+        .await
+        .expect("bounded Run reaches terminal");
+
+    assert_eq!(view.state.status(), AgentRunStatus::Incomplete);
+    assert_eq!(model.rounds.load(Ordering::SeqCst), 3);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 2);
+    assert!(controller
+        .events(&execution.run_id, 0)
+        .await
+        .expect("bounded Run journal is readable")
+        .iter()
+        .any(|record| matches!(
+            &record.event.payload,
+            AgentEvent::RunIncomplete {
+                reason: IncompleteReason::LimitReached {
+                    limit: RunLimitKind::ModelSteps
+                },
+                ..
+            }
+        )));
+}
+
+#[tokio::test]
+async fn explicit_run_tool_call_limit_still_stops_at_the_exact_boundary() {
+    let (controller, model, tool) = long_tool_loop_controller(20);
+    let mut run = AgentRunEnvelope::new(
+        AGENT_PROTOCOL_V1,
+        AgentSessionId::new("tool-call-limit-session"),
+        RunId::new("tool-call-limit-run"),
+        vec![Content::text("exercise an explicit Tool call budget")],
+    )
+    .expect("valid bounded Run");
+    run.spec.limits.max_tool_calls = Some(3);
+    let run = AgentRunEnvelope::seal(run.spec).expect("bounded Run reseals");
+
+    let execution = controller.start(run).await.expect("bounded Run starts");
+    let view = controller
+        .wait_for_terminal(&execution.run_id)
+        .await
+        .expect("bounded Run reaches terminal");
+
+    assert_eq!(view.state.status(), AgentRunStatus::Incomplete);
+    assert_eq!(model.rounds.load(Ordering::SeqCst), 4);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 3);
+    assert!(controller
+        .events(&execution.run_id, 0)
+        .await
+        .expect("bounded Run journal is readable")
+        .iter()
+        .any(|record| matches!(
+            &record.event.payload,
+            AgentEvent::RunIncomplete {
+                reason: IncompleteReason::LimitReached {
+                    limit: RunLimitKind::ToolCalls
+                },
+                ..
+            }
+        )));
+}
+
 #[tokio::test]
 async fn non_fatal_tool_errors_are_structured_and_the_model_can_use_a_fallback_tool() {
     let cases = [
@@ -7661,7 +7899,6 @@ async fn every_model_round_reprojects_context_before_backend_dispatch() {
     let mut config = GenericAgentConfig::new("internal-provider", "generic-agent");
     config.max_context_tokens = MAX_CONTEXT_TOKENS;
     config.reserved_output_tokens = RESERVED_OUTPUT_TOKENS;
-    config.max_model_rounds = 3;
     let provider = Arc::new(
         InternalGenericAgentProvider::new_with_tools_and_session_journal(
             model.clone(),

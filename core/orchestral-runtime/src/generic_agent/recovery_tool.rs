@@ -38,7 +38,27 @@ pub(super) async fn resume_observed_tool(
     if !observation.response.is_empty() {
         seed.last_response = observation.response.clone();
     }
-    seed.tool_call_count = seed.tool_call_count.saturating_add(1);
+    let tool_call_limit = inner
+        .config
+        .continuation
+        .effective_tool_calls(request.run.spec.limits.max_tool_calls);
+    seed.tool_call_count = match reserve_tool_call(seed.tool_call_count, tool_call_limit) {
+        Ok(next) => next,
+        Err(limit) => {
+            let has_usage =
+                seed.total_usage.input_tokens.is_some() || seed.total_usage.output_tokens.is_some();
+            emit_limit_reached(
+                &inner,
+                &request,
+                seed.last_response,
+                has_usage.then_some(seed.total_usage),
+                seed.tool_call_count,
+                AgentEventId::new(format!("generic-{}-started", run_id.as_str())),
+                limit,
+            );
+            return;
+        }
+    };
 
     if session_exchange_committed {
         seed.next_model_round = round.saturating_add(1);

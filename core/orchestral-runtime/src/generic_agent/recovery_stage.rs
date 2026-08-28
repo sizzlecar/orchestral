@@ -352,19 +352,13 @@ pub(super) fn stage_started_workflow_recovery(
             },
         );
     };
-    let tool_call_limit = stored
-        .registration
-        .request
-        .run
-        .spec
-        .limits
-        .max_tool_calls
-        .unwrap_or(inner.config.max_tool_calls)
-        .min(inner.config.max_tool_calls);
-    let outer_count = boundary.tool_call_count.saturating_add(1);
-    if outer_count >= tool_call_limit
-        || outer_count.saturating_add(outcome.tool_calls) > tool_call_limit
-    {
+    let tool_call_limit = inner
+        .config
+        .continuation
+        .effective_tool_calls(stored.registration.request.run.spec.limits.max_tool_calls);
+    let durable_count = reserve_tool_call(boundary.tool_call_count, tool_call_limit)
+        .and_then(|outer| reserve_tool_calls(outer, outcome.tool_calls, tool_call_limit));
+    if durable_count.is_err() {
         return Err(AgentProtocolError::new(
             AgentProtocolErrorCode::InvalidDigest,
             "durable Workflow output exceeds the Run Tool call limit",

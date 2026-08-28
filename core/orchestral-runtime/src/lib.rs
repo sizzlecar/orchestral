@@ -23,7 +23,9 @@ pub use approval_bridge::{AgentApprovalBridge, ApprovalBridgeError, InMemoryHost
 pub use exec_process::{
     ExecPollResult, ExecProcessError, ExecSessionId, ExecSessionManager, ExecSpawnSpec,
 };
-pub use generic_agent::{GenericAgentConfig, InternalGenericAgentProvider, ModelCostPolicy};
+pub use generic_agent::{
+    ContinuationPolicy, GenericAgentConfig, InternalGenericAgentProvider, ModelCostPolicy,
+};
 pub use generic_agent_checkpoint::{
     replay_generic_agent_checkpoint, AppendGenericCheckpointOutcome, CommandCheckpoint,
     CreateGenericRunOutcome, GenericAgentCheckpointProjection, GenericAgentCheckpointStore,

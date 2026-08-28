@@ -57,23 +57,31 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
         return;
     }
 
-    let model_round_limit = request
-        .run
-        .spec
-        .limits
-        .max_model_steps
-        .unwrap_or(inner.config.max_model_rounds)
-        .min(inner.config.max_model_rounds);
-    let tool_call_limit = request
-        .run
-        .spec
-        .limits
-        .max_tool_calls
-        .unwrap_or(inner.config.max_tool_calls)
-        .min(inner.config.max_tool_calls);
+    let model_step_limit = inner
+        .config
+        .continuation
+        .effective_model_steps(request.run.spec.limits.max_model_steps);
+    let tool_call_limit = inner
+        .config
+        .continuation
+        .effective_tool_calls(request.run.spec.limits.max_tool_calls);
     let mut has_usage = total_usage.input_tokens.is_some() || total_usage.output_tokens.is_some();
 
-    'model_rounds: for round in next_model_round..=model_round_limit {
+    'model_rounds: for round in
+        std::iter::successors(Some(next_model_round), |round| round.checked_add(1))
+    {
+        if model_step_limit.is_some_and(|limit| round > limit) {
+            emit_limit_reached(
+                &inner,
+                &request,
+                last_response,
+                has_usage.then_some(total_usage),
+                tool_call_count,
+                started_event_id,
+                RunLimitKind::ModelSteps,
+            );
+            return;
+        }
         steer_updates.borrow_and_update();
         if cancellation.is_cancelled() {
             emit_cancel(&inner, &request, &user_message);
@@ -464,7 +472,7 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                                         &request,
                                         &total_usage,
                                         round,
-                                        model_round_limit,
+                                        model_step_limit,
                                     ) {
                                         emit_limit_reached(
                                             &inner,
@@ -565,7 +573,7 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                         &request,
                         &total_usage,
                         round,
-                        model_round_limit,
+                        model_step_limit,
                     ) {
                         emit_limit_reached(
                             &inner,
@@ -716,16 +724,14 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
         }
     }
 
-    emit_incomplete(
+    emit_failure(
         &inner,
         &request,
-        IncompleteRun {
-            response: last_response,
-            usage: has_usage.then_some(total_usage),
-            tool_calls: tool_call_count,
-            started_event_id,
-            limit: RunLimitKind::ModelSteps,
-            unresolved_issue: "model step limit reached",
-        },
+        &user_message,
+        agent_failure(
+            "model_step_counter_exhausted",
+            "model step counter exhausted before the turn settled",
+            false,
+        ),
     );
 }

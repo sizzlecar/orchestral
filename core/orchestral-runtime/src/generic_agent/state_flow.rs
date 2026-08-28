@@ -58,10 +58,22 @@ pub(super) struct ModelDispatchBudget {
     pub(super) max_output_tokens: Option<u64>,
 }
 
-pub(super) fn reserve_tool_call(current: u64, limit: u64) -> Result<u64, RunLimitKind> {
-    (current < limit)
-        .then(|| current.saturating_add(1))
-        .ok_or(RunLimitKind::ToolCalls)
+pub(super) fn reserve_tool_calls(
+    current: u64,
+    additional: u64,
+    limit: Option<u64>,
+) -> Result<u64, RunLimitKind> {
+    let next = current
+        .checked_add(additional)
+        .ok_or(RunLimitKind::ToolCalls)?;
+    if limit.is_some_and(|limit| next > limit) {
+        return Err(RunLimitKind::ToolCalls);
+    }
+    Ok(next)
+}
+
+pub(super) fn reserve_tool_call(current: u64, limit: Option<u64>) -> Result<u64, RunLimitKind> {
+    reserve_tool_calls(current, 1, limit)
 }
 
 pub(super) fn remaining_input_tokens(
@@ -313,9 +325,9 @@ pub(super) fn continuation_limit(
     request: &AgentStartRequest,
     usage: &ModelUsage,
     completed_round: u64,
-    model_round_limit: u64,
+    model_step_limit: Option<u64>,
 ) -> Option<RunLimitKind> {
-    if completed_round >= model_round_limit {
+    if model_step_limit.is_some_and(|limit| completed_round >= limit) {
         return Some(RunLimitKind::ModelSteps);
     }
     exhausted_usage_limit(config, request, usage)

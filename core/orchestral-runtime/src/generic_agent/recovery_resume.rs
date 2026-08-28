@@ -27,10 +27,29 @@ pub(super) async fn resume_observed_workflow_output(
     if !observation.response.is_empty() {
         seed.last_response = observation.response.clone();
     }
-    seed.tool_call_count = seed
-        .tool_call_count
-        .saturating_add(1)
-        .saturating_add(outcome.tool_calls);
+    let tool_call_limit = inner
+        .config
+        .continuation
+        .effective_tool_calls(request.run.spec.limits.max_tool_calls);
+    seed.tool_call_count = match reserve_tool_call(seed.tool_call_count, tool_call_limit)
+        .and_then(|outer| reserve_tool_calls(outer, outcome.tool_calls, tool_call_limit))
+    {
+        Ok(next) => next,
+        Err(limit) => {
+            let has_usage =
+                seed.total_usage.input_tokens.is_some() || seed.total_usage.output_tokens.is_some();
+            emit_limit_reached(
+                &inner,
+                &request,
+                seed.last_response,
+                has_usage.then_some(seed.total_usage),
+                seed.tool_call_count,
+                AgentEventId::new(format!("generic-{}-started", run_id.as_str())),
+                limit,
+            );
+            return;
+        }
+    };
     if !seed.supporting_event_ids.contains(&workflow_event_id) {
         seed.supporting_event_ids.push(workflow_event_id);
     }
@@ -132,13 +151,10 @@ pub(super) async fn resume_observed_workflow(
     if !observation.response.is_empty() {
         seed.last_response = observation.response.clone();
     }
-    let tool_call_limit = request
-        .run
-        .spec
-        .limits
-        .max_tool_calls
-        .unwrap_or(inner.config.max_tool_calls)
-        .min(inner.config.max_tool_calls);
+    let tool_call_limit = inner
+        .config
+        .continuation
+        .effective_tool_calls(request.run.spec.limits.max_tool_calls);
     let has_usage =
         seed.total_usage.input_tokens.is_some() || seed.total_usage.output_tokens.is_some();
     let started_event_id = AgentEventId::new(format!("generic-{}-started", run_id.as_str()));
@@ -157,8 +173,9 @@ pub(super) async fn resume_observed_workflow(
             return;
         }
     };
-    let remaining_tool_calls = tool_call_limit.saturating_sub(seed.tool_call_count);
-    if remaining_tool_calls == 0 {
+    let remaining_tool_calls =
+        tool_call_limit.map(|limit| limit.saturating_sub(seed.tool_call_count));
+    if remaining_tool_calls == Some(0) {
         emit_incomplete(
             &inner,
             &request,
@@ -243,9 +260,25 @@ pub(super) async fn resume_observed_workflow(
             return;
         }
     };
-    seed.tool_call_count = seed
-        .tool_call_count
-        .saturating_add(workflow_observation.tool_calls);
+    seed.tool_call_count = match reserve_tool_calls(
+        seed.tool_call_count,
+        workflow_observation.tool_calls,
+        tool_call_limit,
+    ) {
+        Ok(next) => next,
+        Err(limit) => {
+            emit_limit_reached(
+                &inner,
+                &request,
+                seed.last_response,
+                has_usage.then_some(seed.total_usage),
+                seed.tool_call_count,
+                started_event_id,
+                limit,
+            );
+            return;
+        }
+    };
     let Some(workflow_event_id) = publish_workflow_output(
         &inner,
         &run_id,
@@ -540,7 +573,27 @@ pub(super) async fn resume_observed_approval(
     if !observation.response.is_empty() {
         seed.last_response = observation.response.clone();
     }
-    seed.tool_call_count = seed.tool_call_count.saturating_add(1);
+    let tool_call_limit = inner
+        .config
+        .continuation
+        .effective_tool_calls(request.run.spec.limits.max_tool_calls);
+    seed.tool_call_count = match reserve_tool_call(seed.tool_call_count, tool_call_limit) {
+        Ok(next) => next,
+        Err(limit) => {
+            let has_usage =
+                seed.total_usage.input_tokens.is_some() || seed.total_usage.output_tokens.is_some();
+            emit_limit_reached(
+                &inner,
+                &request,
+                seed.last_response,
+                has_usage.then_some(seed.total_usage),
+                seed.tool_call_count,
+                AgentEventId::new(format!("generic-{}-started", run_id.as_str())),
+                limit,
+            );
+            return;
+        }
+    };
 
     if session_exchange_committed {
         seed.next_model_round = round.saturating_add(1);

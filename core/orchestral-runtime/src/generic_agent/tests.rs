@@ -65,7 +65,7 @@ mod run_limit_tests {
                     &request,
                     &ModelUsage::default(),
                     boundary.saturating_sub(1),
-                    boundary,
+                    Some(boundary),
                 ),
                 None
             );
@@ -75,14 +75,17 @@ mod run_limit_tests {
                     &request,
                     &ModelUsage::default(),
                     boundary,
-                    boundary,
+                    Some(boundary),
                 ),
                 Some(RunLimitKind::ModelSteps)
             );
 
-            assert_eq!(reserve_tool_call(boundary - 1, boundary), Ok(boundary));
             assert_eq!(
-                reserve_tool_call(boundary, boundary),
+                reserve_tool_call(boundary - 1, Some(boundary)),
+                Ok(boundary)
+            );
+            assert_eq!(
+                reserve_tool_call(boundary, Some(boundary)),
                 Err(RunLimitKind::ToolCalls)
             );
 
@@ -170,5 +173,33 @@ mod run_limit_tests {
                 Err(RunLimitKind::Cost)
             );
         }
+    }
+
+    #[test]
+    fn absent_continuation_ceilings_do_not_create_hidden_step_or_tool_limits() {
+        let request = request();
+        let config = GenericAgentConfig::new("test/provider", "test/agent");
+
+        assert_eq!(config.continuation, ContinuationPolicy::default());
+        assert_eq!(
+            continuation_limit(&config, &request, &ModelUsage::default(), 10_000, None,),
+            None
+        );
+        assert_eq!(reserve_tool_call(10_000, None), Ok(10_001));
+    }
+
+    #[test]
+    fn host_and_run_continuation_limits_intersect_without_implicit_defaults() {
+        let policy = ContinuationPolicy {
+            max_model_steps: Some(40),
+            max_tool_calls: Some(80),
+        };
+
+        assert_eq!(policy.effective_model_steps(None), Some(40));
+        assert_eq!(policy.effective_model_steps(Some(60)), Some(40));
+        assert_eq!(policy.effective_model_steps(Some(20)), Some(20));
+        assert_eq!(policy.effective_tool_calls(None), Some(80));
+        assert_eq!(policy.effective_tool_calls(Some(100)), Some(80));
+        assert_eq!(policy.effective_tool_calls(Some(30)), Some(30));
     }
 }

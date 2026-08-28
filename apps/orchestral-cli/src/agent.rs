@@ -50,12 +50,12 @@ use orchestral_runtime::tools::{
     GuardedExecCommandExecutor, GuardedFileReadExecutor, GuardedWriteStdinExecutor,
 };
 use orchestral_runtime::{
-    AgentClient, AgentControlEvent, AgentController, DeterministicExtractiveSessionSummarizer,
-    ExecSessionManager, GenericAgentCheckpointStore, GenericAgentConfig, GuardedMcpServerConfig,
-    GuardedToolRuntime, InMemoryBlobStore, InMemoryGenericAgentCheckpointStore,
-    InMemoryHostApprovalBroker, InternalGenericAgentProvider, McpToolsAdapterRegistry,
-    ModelTokenMeter, SessionCompactionPolicy, SkillRoot, SkillRuntime, StdioMcpSandboxPolicy,
-    StdioMcpTransportFactory, ToolArtifactStore, WorkspacePermissionPolicy,
+    AgentClient, AgentControlEvent, AgentController, ContinuationPolicy,
+    DeterministicExtractiveSessionSummarizer, ExecSessionManager, GenericAgentCheckpointStore,
+    GenericAgentConfig, GuardedMcpServerConfig, GuardedToolRuntime, InMemoryBlobStore,
+    InMemoryGenericAgentCheckpointStore, InMemoryHostApprovalBroker, InternalGenericAgentProvider,
+    McpToolsAdapterRegistry, ModelTokenMeter, SessionCompactionPolicy, SkillRoot, SkillRuntime,
+    StdioMcpSandboxPolicy, StdioMcpTransportFactory, ToolArtifactStore, WorkspacePermissionPolicy,
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
@@ -123,8 +123,10 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
 
     let mut agent_config = GenericAgentConfig::new("orchestral/internal", "generic-agent");
     agent_config.stream_buffer = config.agent.stream_buffer;
-    agent_config.max_model_rounds = config.agent.max_model_rounds;
-    agent_config.max_tool_calls = config.agent.max_tool_calls;
+    agent_config.continuation = ContinuationPolicy {
+        max_model_steps: config.agent.max_model_steps,
+        max_tool_calls: config.agent.max_tool_calls,
+    };
     agent_config.history_limit = config.agent.history_limit;
     agent_config.max_context_tokens = config.agent.max_context_tokens;
     agent_config.reserved_output_tokens = config.agent.reserved_output_tokens;

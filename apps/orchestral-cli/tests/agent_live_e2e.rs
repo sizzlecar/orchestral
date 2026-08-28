@@ -227,7 +227,11 @@ fn tui_pty_resolves_input_and_approval_then_cancels_another_run() {
             openai_text_response("INPUT_RESOLVED_OK")
         }),
         Box::new(|_request| {
-            openai_tool_response("approval-pwd", "exec_command", json!({ "cmd": "pwd" }))
+            openai_tool_response(
+                "approval-write",
+                "exec_command",
+                json!({ "cmd": "touch tui-approved.marker" }),
+            )
         }),
         Box::new(|request| {
             assert!(model_request_text(&request.body).contains("\"exit_code\":0"));
@@ -282,6 +286,7 @@ fn tui_pty_resolves_input_and_approval_then_cancels_another_run() {
         "{}",
         output.text()
     );
+    assert!(workspace.path("tui-approved.marker").is_file());
     output.assert_terminal_restored();
     let requests = model_server.join().expect("join TUI model server");
     assert_eq!(requests.len(), 5);

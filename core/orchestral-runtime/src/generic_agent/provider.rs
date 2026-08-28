@@ -247,16 +247,15 @@ impl InternalGenericAgentProvider {
                 format!("reserved Generic Agent function name is already registered: {conflict}"),
             ));
         }
+        config.continuation.validate()?;
         if config.stream_buffer == 0
-            || config.max_model_rounds == 0
-            || config.max_tool_calls == 0
             || config.history_limit == 0
             || config.max_context_tokens == 0
             || config.reserved_output_tokens >= config.max_context_tokens
         {
             return Err(AgentProtocolError::new(
                 AgentProtocolErrorCode::InvalidSpec,
-                "Generic Agent buffers and loop limits must be non-zero",
+                "Generic Agent buffers and context limits must be non-zero",
             ));
         }
         if let Some(policy) = &config.model_cost_policy {
