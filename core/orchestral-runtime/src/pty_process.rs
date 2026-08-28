@@ -314,6 +314,19 @@ impl PtyProcessManager {
         result
     }
 
+    pub fn status(
+        &self,
+        run_id: &RunId,
+        process_id: &PtyProcessId,
+    ) -> Result<Option<i32>, PtyProcessError> {
+        let process = self.process(run_id, process_id)?;
+        let status = process
+            .lock()
+            .map_err(|_| PtyProcessError::Unavailable)?
+            .status();
+        status
+    }
+
     pub fn read(
         &self,
         run_id: &RunId,

@@ -3,6 +3,10 @@
 //! Pipe and PTY are execution details. Both are addressed by one integer
 //! session ID and remain strictly scoped to the owning Agent Run.
 
+mod lifecycle;
+
+pub use lifecycle::{ExecSessionEvent, ExecSessionSnapshot, ExecSessionStatus};
+
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::process::ExitStatus;
@@ -11,9 +15,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use orchestral_core::agent_protocol::wire::RunId;
+use orchestral_core::tool_protocol::ToolOperationPlan;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{Mutex as AsyncMutex, Notify};
+use tokio::sync::{broadcast, Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
 
 use crate::pty_process::{PtyProcessId, PtyProcessManager, PtySpawnSpec};
@@ -45,6 +50,8 @@ pub struct ExecSpawnSpec {
     pub environment: BTreeMap<String, String>,
     pub tty: bool,
     pub backend_starts_new_session: bool,
+    /// Exact Host-derived authority under which subsequent input executes.
+    pub operation: ToolOperationPlan,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -75,13 +82,21 @@ pub enum ExecProcessError {
 type SessionKey = (RunId, ExecSessionId);
 
 #[derive(Clone)]
-enum ManagedSession {
+enum ManagedProcess {
     Pipe(Arc<PipeSession>),
-    Pty {
-        process_id: PtyProcessId,
-        started: Instant,
-    },
+    Pty { process_id: PtyProcessId },
 }
+
+#[derive(Clone)]
+struct ManagedSession {
+    process: ManagedProcess,
+    lifecycle: Arc<SessionLifecycle>,
+    started: Instant,
+    tty: bool,
+    operation: ToolOperationPlan,
+}
+
+use lifecycle::SessionLifecycle;
 
 #[derive(Default)]
 struct OutputState {
@@ -152,7 +167,6 @@ struct PipeSession {
     stdin: AsyncMutex<Option<ChildStdin>>,
     stdout: Arc<SharedOutput>,
     stderr: Arc<SharedOutput>,
-    started: Instant,
     process_group_id: Option<u32>,
 }
 
@@ -196,7 +210,6 @@ impl PipeSession {
             stdin: AsyncMutex::new(stdin),
             stdout: stdout_buffer,
             stderr: stderr_buffer,
-            started: Instant::now(),
             process_group_id,
         }))
     }
@@ -221,6 +234,8 @@ impl PipeSession {
 
     async fn poll(
         &self,
+        lifecycle: &SessionLifecycle,
+        started_at: Instant,
         wait: Duration,
         cancellation: &CancellationToken,
     ) -> Result<ExecPollResult, ExecProcessError> {
@@ -232,12 +247,15 @@ impl PipeSession {
             if cancellation.is_cancelled() {
                 return Err(ExecProcessError::Cancelled);
             }
-            let status = self
-                .child
-                .lock()
-                .await
-                .try_wait()
-                .map_err(|error| ExecProcessError::Io(error.to_string()))?;
+            let status = lifecycle.status()?;
+            let exit_code = match &status {
+                ExecSessionStatus::Running => None,
+                ExecSessionStatus::Exited { exit_code } => Some(*exit_code),
+                ExecSessionStatus::Terminated => return Err(ExecProcessError::Cancelled),
+                ExecSessionStatus::Failed { message } => {
+                    return Err(ExecProcessError::Io(message.clone()))
+                }
+            };
             let stdout = self.stdout.snapshot()?;
             let stderr = self.stderr.snapshot()?;
             let generation = (stdout.0, stderr.0);
@@ -245,15 +263,13 @@ impl PipeSession {
                 observed = generation;
                 last_change = Instant::now();
             }
-            if let Some(status) = status {
-                if (stdout.1 && stderr.1) || last_change.elapsed() >= settle {
-                    break Some(exit_status_code(&status));
-                }
+            if exit_code.is_some() && ((stdout.1 && stderr.1) || last_change.elapsed() >= settle) {
+                break exit_code;
             }
             if started.elapsed() >= wait
                 || ((stdout.2 || stderr.2) && last_change.elapsed() >= settle)
             {
-                break status.as_ref().map(exit_status_code);
+                break exit_code;
             }
             let remaining = wait.saturating_sub(started.elapsed());
             let pause = remaining.min(Duration::from_millis(20));
@@ -261,6 +277,7 @@ impl PipeSession {
                 _ = cancellation.cancelled() => return Err(ExecProcessError::Cancelled),
                 _ = self.stdout.changed.notified() => {},
                 _ = self.stderr.changed.notified() => {},
+                _ = lifecycle.changed.notified() => {},
                 _ = tokio::time::sleep(pause) => {},
             }
         };
@@ -272,7 +289,7 @@ impl PipeSession {
             dropped_bytes: stdout_dropped.saturating_add(stderr_dropped),
             alive: exit_code.is_none(),
             exit_code,
-            wall_time_seconds: self.started.elapsed().as_secs_f64(),
+            wall_time_seconds: started_at.elapsed().as_secs_f64(),
         })
     }
 
@@ -302,14 +319,19 @@ where
     });
 }
 
-pub struct ExecSessionManager {
+const PROCESS_EVENT_BUFFER: usize = 256;
+const PROCESS_WATCH_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Run-scoped owner and observer for pipe and PTY execution resources.
+pub struct ProcessSupervisor {
     sessions: Mutex<BTreeMap<SessionKey, ManagedSession>>,
     next_session_id: AtomicU64,
     pty: Arc<PtyProcessManager>,
     max_output_bytes: usize,
+    events: broadcast::Sender<ExecSessionEvent>,
 }
 
-impl ExecSessionManager {
+impl ProcessSupervisor {
     pub fn new(max_output_bytes: usize) -> Result<Self, ExecProcessError> {
         if max_output_bytes == 0 {
             return Err(ExecProcessError::Invalid(
@@ -318,26 +340,37 @@ impl ExecSessionManager {
         }
         let pty = PtyProcessManager::new(max_output_bytes, Duration::from_secs(10 * 60))
             .map_err(|error| ExecProcessError::Io(error.to_string()))?;
+        let (events, _) = broadcast::channel(PROCESS_EVENT_BUFFER);
         Ok(Self {
             sessions: Mutex::new(BTreeMap::new()),
             next_session_id: AtomicU64::new(1),
             pty: Arc::new(pty),
             max_output_bytes,
+            events,
         })
     }
 
+    pub fn subscribe(&self) -> broadcast::Receiver<ExecSessionEvent> {
+        self.events.subscribe()
+    }
+
     pub async fn spawn(&self, spec: ExecSpawnSpec) -> Result<ExecSessionId, ExecProcessError> {
+        spec.operation
+            .validate_shape()
+            .map_err(|error| ExecProcessError::Invalid(error.message))?;
         let session_id = ExecSessionId::new(self.next_session_id.fetch_add(1, Ordering::Relaxed))?;
-        let session = if spec.tty {
+        let lifecycle = SessionLifecycle::running();
+        let started = Instant::now();
+        let process = if spec.tty {
             let process_id = PtyProcessId::new(format!("exec-{}", session_id.get()))
                 .map_err(|error| ExecProcessError::Invalid(error.to_string()))?;
             let pty_spec = PtySpawnSpec {
                 run_id: spec.run_id.clone(),
                 process_id: process_id.clone(),
-                program: spec.program,
-                args: spec.args,
-                cwd: spec.cwd,
-                environment: spec.environment,
+                program: spec.program.clone(),
+                args: spec.args.clone(),
+                cwd: spec.cwd.clone(),
+                environment: spec.environment.clone(),
                 rows: 24,
                 cols: 120,
             };
@@ -346,17 +379,24 @@ impl ExecSessionManager {
                 .await
                 .map_err(|error| ExecProcessError::Io(error.to_string()))?
                 .map_err(|error| ExecProcessError::Io(error.to_string()))?;
-            ManagedSession::Pty {
-                process_id,
-                started: Instant::now(),
-            }
+            ManagedProcess::Pty { process_id }
         } else {
-            ManagedSession::Pipe(PipeSession::spawn(&spec, self.max_output_bytes)?)
+            ManagedProcess::Pipe(PipeSession::spawn(&spec, self.max_output_bytes)?)
         };
+        let session = ManagedSession {
+            process,
+            lifecycle,
+            started,
+            tty: spec.tty,
+            operation: spec.operation,
+        };
+        let key = (spec.run_id, session_id);
         self.sessions
             .lock()
             .map_err(|_| ExecProcessError::Unavailable)?
-            .insert((spec.run_id, session_id), session);
+            .insert(key.clone(), session.clone());
+        publish_session_event(&self.events, &key, &session);
+        spawn_exit_watcher(key, session, self.pty.clone(), self.events.clone());
         Ok(session_id)
     }
 
@@ -374,17 +414,28 @@ impl ExecSessionManager {
             ));
         }
         let session = self.session(run_id, session_id)?;
-        let result = match session.clone() {
-            ManagedSession::Pipe(process) => {
+        if input.is_some_and(|input| !input.is_empty()) {
+            match session.lifecycle.status()? {
+                ExecSessionStatus::Running => {}
+                ExecSessionStatus::Exited { .. } => {
+                    return Err(ExecProcessError::Io(
+                        "exec process has already exited".to_owned(),
+                    ))
+                }
+                ExecSessionStatus::Terminated => return Err(ExecProcessError::Cancelled),
+                ExecSessionStatus::Failed { message } => return Err(ExecProcessError::Io(message)),
+            }
+        }
+        let result = match session.process.clone() {
+            ManagedProcess::Pipe(process) => {
                 if let Some(input) = input {
                     process.send(input).await?;
                 }
-                process.poll(wait, cancellation).await?
+                process
+                    .poll(&session.lifecycle, session.started, wait, cancellation)
+                    .await?
             }
-            ManagedSession::Pty {
-                process_id,
-                started,
-            } => {
+            ManagedProcess::Pty { process_id } => {
                 if let Some(input) = input.filter(|input| !input.is_empty()) {
                     let pty = self.pty.clone();
                     let run_id = run_id.clone();
@@ -420,11 +471,19 @@ impl ExecSessionManager {
                     dropped_bytes: read.dropped_bytes,
                     alive: read.alive,
                     exit_code: read.exit_code,
-                    wall_time_seconds: started.elapsed().as_secs_f64(),
+                    wall_time_seconds: session.started.elapsed().as_secs_f64(),
                 }
             }
         };
         if !result.alive {
+            if let Some(exit_code) = result.exit_code {
+                transition_session(
+                    &self.events,
+                    &(run_id.clone(), session_id),
+                    &session,
+                    ExecSessionStatus::Exited { exit_code },
+                )?;
+            }
             self.remove_finished(run_id, session_id, session).await;
         }
         Ok(result)
@@ -441,6 +500,12 @@ impl ExecSessionManager {
             .map_err(|_| ExecProcessError::Unavailable)?
             .remove(&(run_id.clone(), session_id))
             .ok_or(ExecProcessError::NotFound(session_id.get()))?;
+        transition_session(
+            &self.events,
+            &(run_id.clone(), session_id),
+            &session,
+            ExecSessionStatus::Terminated,
+        )?;
         self.terminate_session(run_id, session).await;
         Ok(())
     }
@@ -457,25 +522,46 @@ impl ExecSessionManager {
                 .cloned()
                 .collect::<Vec<_>>();
             keys.into_iter()
-                .filter_map(|key| sessions.remove(&key))
+                .filter_map(|key| sessions.remove(&key).map(|session| (key, session)))
                 .collect::<Vec<_>>()
         };
         let count = owned.len();
-        for session in owned {
+        for (key, session) in owned {
+            transition_session(&self.events, &key, &session, ExecSessionStatus::Terminated)?;
             self.terminate_session(run_id, session).await;
         }
         Ok(count)
     }
 
     pub fn list(&self, run_id: &RunId) -> Result<Vec<ExecSessionId>, ExecProcessError> {
-        Ok(self
+        let sessions = self
             .sessions
             .lock()
-            .map_err(|_| ExecProcessError::Unavailable)?
-            .keys()
-            .filter(|(owner, _)| owner == run_id)
-            .map(|(_, session_id)| *session_id)
-            .collect())
+            .map_err(|_| ExecProcessError::Unavailable)?;
+        let mut active = Vec::new();
+        for ((owner, session_id), session) in sessions.iter() {
+            if owner == run_id && session.lifecycle.status()? == ExecSessionStatus::Running {
+                active.push(*session_id);
+            }
+        }
+        Ok(active)
+    }
+
+    pub fn snapshot(
+        &self,
+        run_id: &RunId,
+        session_id: ExecSessionId,
+    ) -> Result<ExecSessionSnapshot, ExecProcessError> {
+        let session = self.session(run_id, session_id)?;
+        session_snapshot(&(run_id.clone(), session_id), &session)
+    }
+
+    pub fn operation_plan(
+        &self,
+        run_id: &RunId,
+        session_id: ExecSessionId,
+    ) -> Result<ToolOperationPlan, ExecProcessError> {
+        Ok(self.session(run_id, session_id)?.operation)
     }
 
     fn session(
@@ -500,7 +586,7 @@ impl ExecSessionManager {
         if let Ok(mut sessions) = self.sessions.lock() {
             sessions.remove(&(run_id.clone(), session_id));
         }
-        if let ManagedSession::Pty { process_id, .. } = session {
+        if let ManagedProcess::Pty { process_id } = session.process {
             let pty = self.pty.clone();
             let run_id = run_id.clone();
             let _ = tokio::task::spawn_blocking(move || pty.close(&run_id, &process_id)).await;
@@ -509,14 +595,133 @@ impl ExecSessionManager {
 
     async fn terminate_session(&self, run_id: &RunId, session: ManagedSession) {
         match session {
-            ManagedSession::Pipe(process) => process.terminate().await,
-            ManagedSession::Pty { process_id, .. } => {
+            ManagedSession {
+                process: ManagedProcess::Pipe(process),
+                ..
+            } => process.terminate().await,
+            ManagedSession {
+                process: ManagedProcess::Pty { process_id },
+                ..
+            } => {
                 let pty = self.pty.clone();
                 let run_id = run_id.clone();
                 let _ = tokio::task::spawn_blocking(move || pty.close(&run_id, &process_id)).await;
             }
         }
     }
+}
+
+fn session_snapshot(
+    (run_id, session_id): &SessionKey,
+    session: &ManagedSession,
+) -> Result<ExecSessionSnapshot, ExecProcessError> {
+    Ok(ExecSessionSnapshot {
+        run_id: run_id.clone(),
+        session_id: *session_id,
+        tty: session.tty,
+        status: session.lifecycle.status()?,
+        operation: session.operation.clone(),
+        wall_time_seconds: session.started.elapsed().as_secs_f64(),
+    })
+}
+
+fn publish_session_event(
+    events: &broadcast::Sender<ExecSessionEvent>,
+    key: &SessionKey,
+    session: &ManagedSession,
+) {
+    if let Ok(snapshot) = session_snapshot(key, session) {
+        let _ = events.send(ExecSessionEvent { snapshot });
+    }
+}
+
+fn transition_session(
+    events: &broadcast::Sender<ExecSessionEvent>,
+    key: &SessionKey,
+    session: &ManagedSession,
+    status: ExecSessionStatus,
+) -> Result<bool, ExecProcessError> {
+    let changed = session.lifecycle.transition(status)?;
+    if changed {
+        publish_session_event(events, key, session);
+    }
+    Ok(changed)
+}
+
+fn spawn_exit_watcher(
+    key: SessionKey,
+    session: ManagedSession,
+    pty: Arc<PtyProcessManager>,
+    events: broadcast::Sender<ExecSessionEvent>,
+) {
+    tokio::spawn(async move {
+        loop {
+            if session
+                .lifecycle
+                .status()
+                .is_ok_and(|status| status.is_terminal())
+            {
+                return;
+            }
+            let observed = match &session.process {
+                ManagedProcess::Pipe(process) => process
+                    .child
+                    .lock()
+                    .await
+                    .try_wait()
+                    .map(|status| status.map(|status| exit_status_code(&status)))
+                    .map_err(|error| error.to_string()),
+                ManagedProcess::Pty { process_id } => {
+                    let pty = pty.clone();
+                    let run_id = key.0.clone();
+                    let process_id = process_id.clone();
+                    match tokio::task::spawn_blocking(move || pty.status(&run_id, &process_id))
+                        .await
+                    {
+                        Ok(result) => result.map_err(|error| error.to_string()),
+                        Err(error) => Err(error.to_string()),
+                    }
+                }
+            };
+            match observed {
+                Ok(Some(exit_code)) => {
+                    if let ManagedProcess::Pipe(process) = &session.process {
+                        process.stdin.lock().await.take();
+                    }
+                    let _ = transition_session(
+                        &events,
+                        &key,
+                        &session,
+                        ExecSessionStatus::Exited { exit_code },
+                    );
+                    return;
+                }
+                Ok(None) => {}
+                Err(message) => {
+                    let _ = transition_session(
+                        &events,
+                        &key,
+                        &session,
+                        ExecSessionStatus::Failed { message },
+                    );
+                    match &session.process {
+                        ManagedProcess::Pipe(process) => process.terminate().await,
+                        ManagedProcess::Pty { process_id } => {
+                            let pty = pty.clone();
+                            let run_id = key.0.clone();
+                            let process_id = process_id.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                pty.close(&run_id, &process_id)
+                            })
+                            .await;
+                        }
+                    }
+                    return;
+                }
+            }
+            tokio::time::sleep(PROCESS_WATCH_INTERVAL).await;
+        }
+    });
 }
 
 fn exit_status_code(status: &ExitStatus) -> i32 {

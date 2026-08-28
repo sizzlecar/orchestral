@@ -14,7 +14,8 @@ use orchestral_core::tool_protocol::{
 use serde_json::{json, Map, Value};
 
 use crate::exec_process::{
-    ExecPollResult, ExecProcessError, ExecSessionId, ExecSessionManager, ExecSpawnSpec,
+    ExecPollResult, ExecProcessError, ExecSessionId, ExecSessionStatus, ExecSpawnSpec,
+    ProcessSupervisor,
 };
 use crate::tool_runtime::{GuardedToolExecution, GuardedToolExecutor};
 use crate::tools::shell_sandbox::{sandbox_command, ShellSandboxPolicy};
@@ -64,7 +65,7 @@ impl CommandEnvironmentSnapshot {
 
 #[derive(Clone)]
 pub struct GuardedExecCommandExecutor {
-    manager: Arc<ExecSessionManager>,
+    manager: Arc<ProcessSupervisor>,
     shell: PathBuf,
     runtime_readable_roots: Vec<PathBuf>,
     environment: CommandEnvironmentSnapshot,
@@ -72,12 +73,12 @@ pub struct GuardedExecCommandExecutor {
 
 #[derive(Clone)]
 pub struct GuardedWriteStdinExecutor {
-    manager: Arc<ExecSessionManager>,
+    manager: Arc<ProcessSupervisor>,
 }
 
 impl GuardedExecCommandExecutor {
     pub fn new(
-        manager: Arc<ExecSessionManager>,
+        manager: Arc<ProcessSupervisor>,
         shell: impl Into<PathBuf>,
         runtime_readable_roots: impl IntoIterator<Item = PathBuf>,
         environment: CommandEnvironmentSnapshot,
@@ -105,7 +106,7 @@ impl GuardedExecCommandExecutor {
 }
 
 impl GuardedWriteStdinExecutor {
-    pub fn new(manager: Arc<ExecSessionManager>) -> Self {
+    pub fn new(manager: Arc<ProcessSupervisor>) -> Self {
         Self { manager }
     }
 }
@@ -381,6 +382,7 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
                 environment,
                 tty,
                 backend_starts_new_session: sandboxed.backend_starts_new_session,
+                operation: execution.operation.clone(),
             })
             .await
         {
@@ -452,12 +454,23 @@ impl GuardedToolExecutor for GuardedWriteStdinExecutor {
             .get("chars")
             .and_then(Value::as_str)
             .is_some_and(|chars| !chars.is_empty());
-        // Input can trigger any authority already held by the live process.
-        // Until ProcessSupervisor stores that exact session capability, bind
-        // conservatively to the complete registered exec envelope. A pure
-        // poll cannot trigger new process behavior and stays Process-only.
+        let session_id = ExecSessionId::new(session_id)
+            .map_err(|error| rejected("exec_session_invalid", error.to_string()))?;
+        let snapshot = self
+            .manager
+            .snapshot(&invocation.run_id, session_id)
+            .map_err(|error| rejected("exec_session_unavailable", error.to_string()))?;
+        if has_input && snapshot.status != ExecSessionStatus::Running {
+            return Err(rejected(
+                "exec_session_exited",
+                "cannot send input to a terminal exec session",
+            ));
+        }
+        let origin = snapshot.operation;
+        // Input can trigger only the authority already held by this exact
+        // supervised process. A pure poll cannot trigger new process behavior.
         let effect_scopes = if has_input {
-            descriptor.effect_scopes.clone()
+            origin.effect_scopes
         } else {
             BTreeSet::from([EffectScope::Process])
         };
@@ -466,18 +479,24 @@ impl GuardedToolExecutor for GuardedWriteStdinExecutor {
             .get("chars")
             .and_then(Value::as_str)
             .map(display_payload);
+        let mut targets = if has_input {
+            origin.targets
+        } else {
+            BTreeSet::new()
+        };
+        targets.insert(format!("exec-session:{}", session_id.get()));
         let operation = ToolOperationPlan {
             effect_scopes,
-            targets: BTreeSet::from([format!("exec-session:{session_id}")]),
+            targets,
             risk: if has_input {
                 ToolOperationRisk::Elevated
             } else {
                 ToolOperationRisk::Routine
             },
             summary: if let Some(input) = input_preview {
-                format!("Send input to exec session {session_id}: {input}")
+                format!("Send input to exec session {}: {input}", session_id.get())
             } else {
-                format!("Poll exec session {session_id}")
+                format!("Poll exec session {}", session_id.get())
             },
         };
         operation

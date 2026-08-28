@@ -8,8 +8,8 @@ use orchestral_core::tool_protocol::{
     ApprovalPolicy, EffectScope, EnvironmentPolicy, FilesystemPolicy, HostApprovalIssuer,
     HostApprovalVerifier, HostToolPolicy, InMemoryApprovalCapabilityStore,
     InteractiveCommandPolicy, NetworkPolicy, ProcessPolicy, RunToolGrant, SandboxPolicy,
-    ToolCallId, ToolId, ToolInvocation, ToolOutcome, ToolOutput, ToolPolicyBounds, ToolRestriction,
-    TransportLaunchPolicy,
+    ToolCallId, ToolId, ToolInvocation, ToolOperationPlan, ToolOperationRisk, ToolOutcome,
+    ToolOutput, ToolPolicyBounds, ToolRestriction, TransportLaunchPolicy,
 };
 use orchestral_runtime::tools::{
     guarded_exec_command_descriptor, guarded_write_stdin_descriptor,
@@ -17,8 +17,8 @@ use orchestral_runtime::tools::{
     GuardedWriteStdinExecutor, GUARDED_EXEC_SANDBOX_PROFILE,
 };
 use orchestral_runtime::{
-    ExecSessionManager, ExecSpawnSpec, GuardedToolResult, GuardedToolRuntime,
-    WorkspacePermissionPolicy,
+    ExecProcessError, ExecSessionStatus, ExecSpawnSpec, GuardedToolResult, GuardedToolRuntime,
+    ProcessSupervisor, WorkspacePermissionPolicy,
 };
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
@@ -34,6 +34,15 @@ fn effects() -> BTreeSet<EffectScope> {
         EffectScope::EnvironmentRead,
         EffectScope::ExternalSideEffect,
     ])
+}
+
+fn test_operation(summary: &str) -> ToolOperationPlan {
+    ToolOperationPlan {
+        effect_scopes: BTreeSet::from([EffectScope::Process]),
+        targets: BTreeSet::from(["test-process".to_owned()]),
+        risk: ToolOperationRisk::Routine,
+        summary: summary.to_owned(),
+    }
 }
 
 fn bounds(workspace: &Path, shell: &Path) -> ToolPolicyBounds {
@@ -100,7 +109,7 @@ fn inline_output(result: GuardedToolResult) -> Value {
 #[cfg(unix)]
 #[tokio::test]
 async fn pipe_sessions_return_short_results_and_keep_long_processes_addressable() {
-    let manager = ExecSessionManager::new(16 * 1024).unwrap();
+    let manager = ProcessSupervisor::new(16 * 1024).unwrap();
     let run_id = RunId::new("pipe-run");
     let cwd = std::fs::canonicalize(".").unwrap();
     let shell = std::fs::canonicalize("/bin/sh").unwrap();
@@ -114,6 +123,7 @@ async fn pipe_sessions_return_short_results_and_keep_long_processes_addressable(
             environment: BTreeMap::new(),
             tty: false,
             backend_starts_new_session: false,
+            operation: test_operation("run a short test process"),
         })
         .await
         .unwrap();
@@ -144,6 +154,7 @@ async fn pipe_sessions_return_short_results_and_keep_long_processes_addressable(
             environment: BTreeMap::new(),
             tty: false,
             backend_starts_new_session: false,
+            operation: test_operation("run an interactive pipe test process"),
         })
         .await
         .unwrap();
@@ -187,8 +198,190 @@ async fn pipe_sessions_return_short_results_and_keep_long_processes_addressable(
 
 #[cfg(unix)]
 #[tokio::test]
+async fn process_supervisor_observes_and_reaps_pipe_exit_without_model_polling() {
+    let manager = ProcessSupervisor::new(16 * 1024).unwrap();
+    let mut events = manager.subscribe();
+    let run_id = RunId::new("supervised-pipe-run");
+    let parent = std::env::temp_dir().join(format!(
+        "orchestral-supervised-pipe-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&parent).unwrap();
+    let cwd = std::fs::canonicalize(&parent).unwrap();
+    let shell = std::fs::canonicalize("/bin/sh").unwrap();
+    let operation = test_operation("supervise a finite pipe process");
+    let session_id = manager
+        .spawn(ExecSpawnSpec {
+            run_id: run_id.clone(),
+            program: shell.to_string_lossy().into_owned(),
+            args: vec![
+                "-c".to_owned(),
+                "echo $$ > child.pid; sleep 0.05; printf supervised-output".to_owned(),
+            ],
+            cwd: cwd.clone(),
+            environment: BTreeMap::new(),
+            tty: false,
+            backend_starts_new_session: false,
+            operation: operation.clone(),
+        })
+        .await
+        .unwrap();
+
+    let started = tokio::time::timeout(Duration::from_secs(1), events.recv())
+        .await
+        .expect("started event is prompt")
+        .expect("started event is observable");
+    assert_eq!(started.snapshot.session_id, session_id);
+    assert_eq!(started.snapshot.status, ExecSessionStatus::Running);
+    assert_eq!(started.snapshot.operation, operation);
+
+    let exited = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let event = events.recv().await.expect("exit event channel stays open");
+            if event.snapshot.status.is_terminal() {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("exit is observed without write_stdin");
+    assert_eq!(
+        exited.snapshot.status,
+        ExecSessionStatus::Exited { exit_code: 0 }
+    );
+    assert!(manager.list(&run_id).unwrap().is_empty());
+    assert_eq!(
+        manager.snapshot(&run_id, session_id).unwrap().status,
+        ExecSessionStatus::Exited { exit_code: 0 }
+    );
+
+    let pid = std::fs::read_to_string(cwd.join("child.pid"))
+        .unwrap()
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+    // SAFETY: signal 0 is a read-only process existence check. The watcher
+    // must have reaped the child before publishing Exited.
+    assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+
+    let final_result = manager
+        .write_and_poll(
+            &run_id,
+            session_id,
+            None,
+            Duration::from_secs(1),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("terminal output remains retrievable once");
+    assert_eq!(final_result.stdout, "supervised-output");
+    assert_eq!(final_result.exit_code, Some(0));
+    assert!(matches!(
+        manager.snapshot(&run_id, session_id),
+        Err(ExecProcessError::NotFound(_))
+    ));
+    std::fs::remove_dir_all(parent).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn process_supervisor_publishes_one_terminal_transition_when_close_races_exit() {
+    let manager = ProcessSupervisor::new(16 * 1024).unwrap();
+    let mut events = manager.subscribe();
+    let run_id = RunId::new("supervisor-close-race-run");
+    let session_id = manager
+        .spawn(ExecSpawnSpec {
+            run_id: run_id.clone(),
+            program: std::fs::canonicalize("/bin/sh")
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            args: vec!["-c".to_owned(), "sleep 30".to_owned()],
+            cwd: std::fs::canonicalize(".").unwrap(),
+            environment: BTreeMap::new(),
+            tty: false,
+            backend_starts_new_session: false,
+            operation: test_operation("supervise a cancellable process"),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        events.recv().await.unwrap().snapshot.status,
+        ExecSessionStatus::Running
+    );
+
+    manager.close(&run_id, session_id).await.unwrap();
+    let terminal = tokio::time::timeout(Duration::from_secs(1), events.recv())
+        .await
+        .expect("close publishes terminal state")
+        .expect("event channel stays open");
+    assert_eq!(terminal.snapshot.status, ExecSessionStatus::Terminated);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    assert!(manager.list(&run_id).unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn process_supervisor_observes_pty_exit_without_a_write_stdin_poll() {
+    let manager = ProcessSupervisor::new(16 * 1024).unwrap();
+    let mut events = manager.subscribe();
+    let run_id = RunId::new("supervised-pty-run");
+    let session_id = manager
+        .spawn(ExecSpawnSpec {
+            run_id: run_id.clone(),
+            program: std::fs::canonicalize("/bin/sh")
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            args: vec!["-c".to_owned(), "printf supervised-pty; exit 7".to_owned()],
+            cwd: std::fs::canonicalize(".").unwrap(),
+            environment: BTreeMap::new(),
+            tty: true,
+            backend_starts_new_session: false,
+            operation: test_operation("supervise a finite PTY process"),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        events.recv().await.unwrap().snapshot.status,
+        ExecSessionStatus::Running
+    );
+
+    let exited = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let event = events.recv().await.expect("PTY event channel stays open");
+            if event.snapshot.status.is_terminal() {
+                break event.snapshot.status;
+            }
+        }
+    })
+    .await
+    .expect("PTY exit is observed without polling");
+    assert_eq!(exited, ExecSessionStatus::Exited { exit_code: 7 });
+    assert!(manager.list(&run_id).unwrap().is_empty());
+
+    let final_result = manager
+        .write_and_poll(
+            &run_id,
+            session_id,
+            None,
+            Duration::from_secs(1),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("terminal PTY output remains retrievable");
+    assert!(final_result.stdout.contains("supervised-pty"));
+    assert_eq!(final_result.exit_code, Some(7));
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn closing_a_run_reaps_pipe_and_pty_sessions() {
-    let manager = ExecSessionManager::new(16 * 1024).unwrap();
+    let manager = ProcessSupervisor::new(16 * 1024).unwrap();
     let run_id = RunId::new("cancel-run");
     let parent =
         std::env::temp_dir().join(format!("orchestral-exec-cancel-{}", uuid::Uuid::new_v4()));
@@ -209,6 +402,7 @@ async fn closing_a_run_reaps_pipe_and_pty_sessions() {
                 environment: BTreeMap::new(),
                 tty,
                 backend_starts_new_session: false,
+                operation: test_operation("run a cancellable test process"),
             })
             .await
             .unwrap();
@@ -254,7 +448,7 @@ async fn guarded_unified_surface_executes_children_and_continues_one_tty_session
     let shell = std::fs::canonicalize("/bin/sh").unwrap();
     let bounds = bounds(&workspace, &shell);
     let runtime = runtime(bounds.clone());
-    let manager = Arc::new(ExecSessionManager::new(16 * 1024).unwrap());
+    let manager = Arc::new(ProcessSupervisor::new(16 * 1024).unwrap());
     let restriction = || ToolRestriction {
         bounds: bounds.clone(),
     };
@@ -524,7 +718,7 @@ async fn workspace_auto_run_uses_a_real_read_only_workspace_sandbox() {
     let bounds = bounds(&workspace, &shell);
     let runtime =
         runtime(bounds.clone()).with_permission_policy(Arc::new(WorkspacePermissionPolicy));
-    let manager = Arc::new(ExecSessionManager::new(16 * 1024).unwrap());
+    let manager = Arc::new(ProcessSupervisor::new(16 * 1024).unwrap());
     runtime
         .register(
             workspace_exec_command_descriptor(ToolRestriction {

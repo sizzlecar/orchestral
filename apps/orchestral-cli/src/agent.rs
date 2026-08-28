@@ -51,11 +51,12 @@ use orchestral_runtime::tools::{
 };
 use orchestral_runtime::{
     AgentClient, AgentControlEvent, AgentController, ContinuationPolicy,
-    DeterministicExtractiveSessionSummarizer, ExecSessionManager, GenericAgentCheckpointStore,
-    GenericAgentConfig, GuardedMcpServerConfig, GuardedToolRuntime, InMemoryBlobStore,
+    DeterministicExtractiveSessionSummarizer, GenericAgentCheckpointStore, GenericAgentConfig,
+    GuardedMcpServerConfig, GuardedToolRuntime, InMemoryBlobStore,
     InMemoryGenericAgentCheckpointStore, InMemoryHostApprovalBroker, InternalGenericAgentProvider,
-    McpToolsAdapterRegistry, ModelTokenMeter, SessionCompactionPolicy, SkillRoot, SkillRuntime,
-    StdioMcpSandboxPolicy, StdioMcpTransportFactory, ToolArtifactStore, WorkspacePermissionPolicy,
+    McpToolsAdapterRegistry, ModelTokenMeter, ProcessSupervisor, SessionCompactionPolicy,
+    SkillRoot, SkillRuntime, StdioMcpSandboxPolicy, StdioMcpTransportFactory, ToolArtifactStore,
+    WorkspacePermissionPolicy,
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
@@ -504,7 +505,7 @@ fn build_cli_tool_runtime(
         .context("register guarded apply_patch Tool")?;
     if let Some(exec_host) = exec_host {
         let manager = Arc::new(
-            ExecSessionManager::new(
+            ProcessSupervisor::new(
                 usize::try_from(config.tools.max_output_bytes).unwrap_or(usize::MAX),
             )
             .context("create run-scoped exec session manager")?,

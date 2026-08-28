@@ -21,7 +21,8 @@ pub use agent_control::{AgentControlError, AgentControlEvent, AgentController};
 pub use agent_sdk::{AgentClient, AgentRunHandle, AgentSdkError, AgentTurn};
 pub use approval_bridge::{AgentApprovalBridge, ApprovalBridgeError, InMemoryHostApprovalBroker};
 pub use exec_process::{
-    ExecPollResult, ExecProcessError, ExecSessionId, ExecSessionManager, ExecSpawnSpec,
+    ExecPollResult, ExecProcessError, ExecSessionEvent, ExecSessionId, ExecSessionSnapshot,
+    ExecSessionStatus, ExecSpawnSpec, ProcessSupervisor,
 };
 pub use generic_agent::{
     ContinuationPolicy, GenericAgentConfig, InternalGenericAgentProvider, ModelCostPolicy,
