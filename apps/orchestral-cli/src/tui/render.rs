@@ -1,7 +1,7 @@
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Clear, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
@@ -15,6 +15,7 @@ const ASSISTANT: Style = Style::new().fg(Color::White);
 const ERROR: Style = Style::new().fg(Color::LightRed);
 const SUCCESS: Style = Style::new().fg(Color::Green);
 const CONTENT_PADDING: u16 = 2;
+const WORKING_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 pub(crate) fn render(frame: &mut Frame<'_>, state: &UiState) {
     let area = frame.area();
@@ -27,11 +28,17 @@ pub(crate) fn render(frame: &mut Frame<'_>, state: &UiState) {
     }
 
     let status_height = u16::from(shows_working_status(state.phase));
-    let composer_height = composer_height(state, area.width).min(area.height.saturating_sub(4));
+    let pending_height = pending_height(state, area.width);
+    let reserved = 2_u16
+        .saturating_add(status_height)
+        .saturating_add(pending_height);
+    let composer_height = composer_height(state, area.width)
+        .min(area.height.saturating_sub(reserved).saturating_sub(1));
     let rows = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(status_height),
+        Constraint::Length(pending_height),
         Constraint::Length(composer_height),
         Constraint::Length(1),
     ])
@@ -40,11 +47,11 @@ pub(crate) fn render(frame: &mut Frame<'_>, state: &UiState) {
     render_header(frame, rows[0], state);
     render_transcript(frame, rows[1], state);
     render_working_status(frame, rows[2], state);
-    render_composer(frame, rows[3], state);
-    render_footer(frame, rows[4], state);
     if let Some(pending) = &state.pending {
-        render_pending(frame, rows[1], pending);
+        render_pending(frame, rows[3], pending);
     }
+    render_composer(frame, rows[4], state);
+    render_footer(frame, rows[5], state);
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
@@ -310,16 +317,43 @@ fn render_working_status(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     if area.height == 0 {
         return;
     }
-    let (text, style) = match state.phase {
-        UiPhase::Running => ("• Working", ACCENT),
-        UiPhase::WaitingInput => ("? Waiting for your response", ACCENT),
-        UiPhase::WaitingApproval => ("! Approval required", Style::new().fg(Color::Yellow)),
-        UiPhase::Cancelling => ("◌ Stopping…", Style::new().fg(Color::Yellow)),
+    let (label, style) = match state.phase {
+        UiPhase::Running => ("Working", ACCENT),
+        UiPhase::Cancelling => ("Stopping", Style::new().fg(Color::Yellow)),
         _ => return,
     };
+    let frame_index = usize::try_from(state.animation_frame).unwrap_or(0) % WORKING_FRAMES.len();
+    let timer = if state.phase == UiPhase::Running {
+        format!(
+            " ({} · ctrl+c to interrupt)",
+            fmt_elapsed_compact(state.working_elapsed.as_secs())
+        )
+    } else {
+        format!(
+            " ({})",
+            fmt_elapsed_compact(state.working_elapsed.as_secs())
+        )
+    };
+    let mut spans = vec![
+        Span::styled(WORKING_FRAMES[frame_index], style),
+        Span::raw(" "),
+        Span::styled(label, style.add_modifier(Modifier::BOLD)),
+        Span::styled(timer, MUTED),
+    ];
+    let process_count = state.active_process_count();
+    if process_count > 0 {
+        spans.push(Span::styled(
+            format!(
+                " · {process_count} background terminal{} running",
+                if process_count == 1 { "" } else { "s" }
+            ),
+            MUTED,
+        ));
+    } else if let Some(detail) = state.working_detail.as_deref() {
+        spans.push(Span::styled(format!(" · {detail}"), MUTED));
+    }
     frame.render_widget(
-        Paragraph::new(text)
-            .style(style)
+        Paragraph::new(Line::from(spans))
             .block(Block::default().padding(Padding::horizontal(CONTENT_PADDING))),
         area,
     );
@@ -387,13 +421,14 @@ fn composer_placeholder(phase: UiPhase) -> &'static str {
 fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     let active = matches!(
         state.phase,
-        UiPhase::Running | UiPhase::WaitingInput | UiPhase::WaitingApproval
+        UiPhase::Running | UiPhase::WaitingInput | UiPhase::WaitingApproval | UiPhase::Cancelling
     );
     if area.width < 64 {
         let shortcuts = match state.phase {
-            UiPhase::WaitingApproval => "  a allow · d deny · esc quit",
+            UiPhase::WaitingApproval => "  a allow once · d deny · esc quit",
             UiPhase::WaitingInput => "  enter reply · ctrl+c stop · esc quit",
             UiPhase::Running => "  enter steer · ctrl+c stop · esc quit",
+            UiPhase::Cancelling => "  stopping current run… · esc quit",
             _ if active => "  ctrl+c stop · esc quit",
             _ => "  enter send · esc quit",
         };
@@ -402,10 +437,13 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     }
     let columns =
         Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)]).split(area);
-    let left = if active {
-        "  enter send  ·  ctrl+c interrupt"
-    } else {
-        "  enter send  ·  shift+enter newline"
+    let left = match state.phase {
+        UiPhase::WaitingApproval => "  a allow once  ·  d deny",
+        UiPhase::WaitingInput => "  enter reply  ·  ctrl+c interrupt",
+        UiPhase::Running => "  enter steer  ·  ctrl+c interrupt",
+        UiPhase::Cancelling => "  stopping current run…",
+        _ if active => "  ctrl+c interrupt",
+        _ => "  enter send  ·  shift+enter newline",
     };
     frame.render_widget(Paragraph::new(left).style(MUTED), columns[0]);
     frame.render_widget(
@@ -416,16 +454,10 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     );
 }
 
-fn render_pending(frame: &mut Frame<'_>, viewport: Rect, pending: &PendingOverlay) {
-    frame.render_widget(Clear, viewport);
-    let horizontal = if viewport.width >= 48 { 4 } else { 2 };
-    let top = u16::from(viewport.height >= 10);
-    let area = Rect {
-        x: viewport.x.saturating_add(horizontal),
-        y: viewport.y.saturating_add(top),
-        width: viewport.width.saturating_sub(horizontal.saturating_mul(2)),
-        height: viewport.height.saturating_sub(top),
-    };
+fn render_pending(frame: &mut Frame<'_>, area: Rect, pending: &PendingOverlay) {
+    if area.is_empty() {
+        return;
+    }
     let mut lines = Vec::new();
     match pending {
         PendingOverlay::Input { prompt, .. } => {
@@ -433,9 +465,7 @@ fn render_pending(frame: &mut Frame<'_>, viewport: Rect, pending: &PendingOverla
                 "? Input requested",
                 ACCENT.add_modifier(Modifier::BOLD),
             )));
-            lines.push(Line::default());
             lines.extend(prompt.lines().map(|line| Line::from(line.to_owned())));
-            lines.push(Line::default());
             lines.push(Line::from(Span::styled(
                 "Reply below, then press Enter",
                 MUTED,
@@ -446,12 +476,10 @@ fn render_pending(frame: &mut Frame<'_>, viewport: Rect, pending: &PendingOverla
                 "! Approval required",
                 Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             )));
-            lines.push(Line::default());
             lines.extend(summary.lines().map(|line| Line::from(line.to_owned())));
-            lines.push(Line::default());
             lines.push(Line::from(vec![
                 Span::styled("› a", ACCENT.add_modifier(Modifier::BOLD)),
-                Span::raw("  Allow this operation"),
+                Span::raw("  Allow once"),
             ]));
             lines.push(Line::from(vec![
                 Span::styled("  d", MUTED.add_modifier(Modifier::BOLD)),
@@ -459,7 +487,46 @@ fn render_pending(frame: &mut Frame<'_>, viewport: Rect, pending: &PendingOverla
             ]));
         }
     }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().padding(Padding::horizontal(CONTENT_PADDING))),
+        area,
+    );
+}
+
+fn pending_height(state: &UiState, width: u16) -> u16 {
+    let inner_width = width.saturating_sub(2 * CONTENT_PADDING).max(1) as usize;
+    match state.pending.as_ref() {
+        Some(PendingOverlay::Input { prompt, .. }) => 2_u16.saturating_add(
+            u16::try_from(wrapped_rows(prompt, inner_width).clamp(1, 3)).unwrap_or(3),
+        ),
+        Some(PendingOverlay::Approval { summary, .. }) => 3_u16.saturating_add(
+            u16::try_from(wrapped_rows(summary, inner_width).clamp(1, 3)).unwrap_or(3),
+        ),
+        None => 0,
+    }
+}
+
+fn wrapped_rows(text: &str, width: usize) -> usize {
+    text.lines()
+        .map(|line| UnicodeWidthStr::width(line).max(1).div_ceil(width))
+        .sum()
+}
+
+fn fmt_elapsed_compact(elapsed_seconds: u64) -> String {
+    if elapsed_seconds < 60 {
+        return format!("{elapsed_seconds}s");
+    }
+    if elapsed_seconds < 3_600 {
+        return format!("{}m {:02}s", elapsed_seconds / 60, elapsed_seconds % 60);
+    }
+    format!(
+        "{}h {:02}m {:02}s",
+        elapsed_seconds / 3_600,
+        (elapsed_seconds % 3_600) / 60,
+        elapsed_seconds % 60
+    )
 }
 
 fn composer_height(state: &UiState, width: u16) -> u16 {
@@ -522,6 +589,8 @@ fn phase_badge(phase: UiPhase) -> (&'static str, &'static str) {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use insta::assert_snapshot;
     use orchestral_core::agent_protocol::wire::ToolActivityState;
     use ratatui::backend::TestBackend;
@@ -616,6 +685,8 @@ mod tests {
         let mut state = UiState::new("session-running", "gemini-2.5-flash");
         state.phase = UiPhase::Running;
         state.run_id = Some("run-running".to_owned());
+        state.working_elapsed = Duration::from_secs(72);
+        state.animation_frame = 3;
         state.transcript.push(TranscriptEntry::user(
             "阅读核心代码，说明执行链路并给出证据。",
         ));
@@ -642,6 +713,14 @@ mod tests {
                 output_id: "output-running".to_owned(),
                 order: 0,
                 text: "我正在核对模型循环与工具执行边界。".to_owned(),
+            },
+        );
+        update(
+            &mut state,
+            UiMsg::ProcessActivity {
+                run_id: "run-running".to_owned(),
+                session_id: 7,
+                running: true,
             },
         );
 
@@ -761,6 +840,13 @@ mod tests {
         assert!(rendered.contains("│ 24 tests passed"), "{rendered}");
         assert!(!rendered.contains("**"), "{rendered}");
         assert!(!rendered.contains("```"), "{rendered}");
+    }
+
+    #[test]
+    fn elapsed_time_uses_compact_seconds_minutes_and_hours() {
+        assert_eq!(super::fmt_elapsed_compact(0), "0s");
+        assert_eq!(super::fmt_elapsed_compact(61), "1m 01s");
+        assert_eq!(super::fmt_elapsed_compact(3_661), "1h 01m 01s");
     }
 
     fn render_to_string(state: &UiState, width: u16, height: u16) -> String {

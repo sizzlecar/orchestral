@@ -281,7 +281,23 @@ fn tui_pty_resolves_input_and_approval_then_cancels_another_run() {
 
     let output = tui.finish(LOCAL_PROCESS_TIMEOUT);
     assert!(output.status.success(), "{}", output.text());
-    assert!(output.text().contains("Ran 1 command"), "{}", output.text());
+    assert!(
+        output.text().contains("Running 1 command"),
+        "{}",
+        output.text()
+    );
+    assert!(output.text().contains("Working"), "{}", output.text());
+    assert!(
+        output.text().contains("ctrl+c to interrupt"),
+        "{}",
+        output.text()
+    );
+    assert!(
+        output.text().contains("⠋") && output.text().contains("⠙"),
+        "{}",
+        output.text()
+    );
+    assert!(output.text().contains("Allow once"), "{}", output.text());
     assert!(workspace.path("tui-approved.marker").is_file());
     output.assert_terminal_restored();
     let requests = model_server.join().expect("join TUI model server");

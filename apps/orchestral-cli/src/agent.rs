@@ -100,6 +100,13 @@ struct CliExecHost {
     network_targets: BTreeSet<String>,
 }
 
+struct CliToolComposition {
+    runtime: Arc<GuardedToolRuntime<InMemoryApprovalCapabilityStore>>,
+    run_grant: RunToolGrant,
+    approval_broker: Arc<InMemoryHostApprovalBroker>,
+    process_supervisor: Arc<ProcessSupervisor>,
+}
+
 pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
     let config_path = prepare_runtime_config_path(
         options.config,
@@ -189,8 +196,12 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
         config.artifacts.summary_max_chars,
     )
     .context("configure Tool Artifact store")?;
-    let (tool_runtime, run_grant, approval_broker) =
-        build_cli_tool_runtime(&config, &mcp_configs, effect_journal, artifact_store)?;
+    let CliToolComposition {
+        runtime: tool_runtime,
+        run_grant,
+        approval_broker,
+        process_supervisor,
+    } = build_cli_tool_runtime(&config, &mcp_configs, effect_journal, artifact_store)?;
     let mut mcp_restriction = run_grant.bounds.clone();
     mcp_restriction.approval = ApprovalPolicy::Required;
     let mcp_registry = McpToolsAdapterRegistry::register(
@@ -310,7 +321,9 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
                 let mut lines = BufReader::new(tokio::io::stdin()).lines();
                 run_turn(&client, &approval_broker, 1, input, &mut lines, false).await
             }
-            EntryMode::Tui => crate::tui::run_tui(client, approval_broker, model).await,
+            EntryMode::Tui => {
+                crate::tui::run_tui(client, approval_broker, process_supervisor, model).await
+            }
         }
     }
     .await;
@@ -323,11 +336,7 @@ fn build_cli_tool_runtime(
     mcp_configs: &[GuardedMcpServerConfig],
     effect_journal: Arc<dyn ToolEffectJournalStore>,
     artifact_store: ToolArtifactStore,
-) -> anyhow::Result<(
-    Arc<GuardedToolRuntime<InMemoryApprovalCapabilityStore>>,
-    RunToolGrant,
-    Arc<InMemoryHostApprovalBroker>,
-)> {
+) -> anyhow::Result<CliToolComposition> {
     let workspace = std::fs::canonicalize(std::env::current_dir().context("resolve workspace")?)
         .context("canonicalize workspace")?;
     let workspace = workspace.to_string_lossy().to_string();
@@ -503,13 +512,13 @@ fn build_cli_tool_runtime(
             ),
         )
         .context("register guarded apply_patch Tool")?;
+    let process_supervisor = Arc::new(
+        ProcessSupervisor::new(
+            usize::try_from(config.tools.max_output_bytes).unwrap_or(usize::MAX),
+        )
+        .context("create run-scoped process supervisor")?,
+    );
     if let Some(exec_host) = exec_host {
-        let manager = Arc::new(
-            ProcessSupervisor::new(
-                usize::try_from(config.tools.max_output_bytes).unwrap_or(usize::MAX),
-            )
-            .context("create run-scoped exec session manager")?,
-        );
         runtime
             .register(
                 workspace_exec_command_descriptor(ToolRestriction {
@@ -517,7 +526,7 @@ fn build_cli_tool_runtime(
                 }),
                 Arc::new(
                     GuardedExecCommandExecutor::new(
-                        manager.clone(),
+                        process_supervisor.clone(),
                         exec_host.shell,
                         exec_host.runtime_readable_roots,
                         exec_host.environment,
@@ -532,13 +541,18 @@ fn build_cli_tool_runtime(
                 workspace_write_stdin_descriptor(ToolRestriction {
                     bounds: exec_bounds,
                 }),
-                Arc::new(GuardedWriteStdinExecutor::new(manager)),
+                Arc::new(GuardedWriteStdinExecutor::new(process_supervisor.clone())),
             )
             .context("register guarded write_stdin Tool")?;
     } else {
         tracing::warn!("Generic Agent command execution is disabled by Host config");
     }
-    Ok((runtime, RunToolGrant { bounds }, approval_broker))
+    Ok(CliToolComposition {
+        runtime,
+        run_grant: RunToolGrant { bounds },
+        approval_broker,
+        process_supervisor,
+    })
 }
 
 fn build_cli_blob_store(config: &OrchestralConfig) -> anyhow::Result<Arc<dyn BlobStore>> {

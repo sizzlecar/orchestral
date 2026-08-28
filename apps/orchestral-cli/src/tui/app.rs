@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use crossterm::event::{
@@ -14,7 +14,8 @@ use orchestral_core::agent_protocol::wire::{
     RequestId, RequestResolution, RunId,
 };
 use orchestral_runtime::{
-    AgentClient, AgentControlEvent, AgentRunHandle, InMemoryHostApprovalBroker,
+    AgentClient, AgentControlEvent, AgentRunHandle, ExecSessionEvent, ExecSessionStatus,
+    InMemoryHostApprovalBroker, ProcessSupervisor,
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -24,11 +25,13 @@ use super::terminal::TerminalSession;
 use super::{render, update, ApprovalChoice, UiEffect, UiMsg, UiPhase, UiState};
 
 const RECONCILE_INTERVAL: Duration = Duration::from_millis(200);
+const ANIMATION_INTERVAL: Duration = Duration::from_millis(80);
 static COMMAND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) async fn run_tui(
     client: AgentClient,
     approval_broker: Arc<InMemoryHostApprovalBroker>,
+    process_supervisor: Arc<ProcessSupervisor>,
     model: String,
 ) -> Result<()> {
     let mut terminal = TerminalSession::enter().context("enter TUI terminal mode")?;
@@ -38,6 +41,9 @@ pub(crate) async fn run_tui(
     let mut state = UiState::new(client.session_id().as_str(), model);
     let mut reconcile_tick = tokio::time::interval(RECONCILE_INTERVAL);
     reconcile_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut animation_tick = tokio::time::interval(ANIMATION_INTERVAL);
+    animation_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut process_events = process_supervisor.subscribe();
     let mut quit = false;
 
     while !quit {
@@ -73,11 +79,45 @@ pub(crate) async fn run_tui(
                     stop_active(&mut active);
                 }
             }
+            _ = animation_tick.tick(), if active.is_some() => {
+                update(&mut state, UiMsg::Tick { now: Instant::now() });
+            }
+            process_event = process_events.recv(), if active.is_some() => {
+                match process_event {
+                    Ok(event) => project_process_event(&mut state, event),
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if let Some(run_id) = state.run_id.as_deref() {
+                            let run_id = RunId::new(run_id);
+                            if let Ok(sessions) = process_supervisor.list(&run_id) {
+                                update(
+                                    &mut state,
+                                    UiMsg::ProcessInventory {
+                                        run_id: run_id.as_str().to_owned(),
+                                        session_ids: sessions.into_iter().map(|id| id.get()).collect(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {}
+                }
+            }
         }
     }
 
     stop_active(&mut active);
     terminal.restore().context("restore terminal after TUI")
+}
+
+fn project_process_event(state: &mut UiState, event: ExecSessionEvent) {
+    update(
+        state,
+        UiMsg::ProcessActivity {
+            run_id: event.snapshot.run_id.as_str().to_owned(),
+            session_id: event.snapshot.session_id.get(),
+            running: matches!(event.snapshot.status, ExecSessionStatus::Running),
+        },
+    );
 }
 
 struct ActiveRun {

@@ -1,16 +1,17 @@
 ---
 source: apps/orchestral-cli/src/tui/render.rs
+assertion_line: 627
 expression: "render_to_string(&state, 40, 12)"
 ---
   Orchestral                ! approval
+  › 修复支付重试 🧪，不要重复扣款
+
+  • Running 1 command
+
+
 
   ! Approval required
-
   Run workspace tests with cargo
-
-  › a  Allow this operation
+  › a  Allow once
     d  Deny
-
-
-
-  a allow · d deny · esc quit
+  a allow once · d deny · esc quit

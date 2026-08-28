@@ -1,28 +1,29 @@
 ---
 source: apps/orchestral-cli/src/tui/render.rs
+assertion_line: 673
 expression: "render_to_string(&state, 80, 24)"
 ---
   Orchestral  ·  gpt-5.6                                               ? input
+  › Review the workspace and explain the longest risk without losing 中文 or
+  emoji 🚀.
 
-    ? Input requested
+  • I inspected the runtime boundary. The important invariant is that durable
+  output replaces lossy streaming text instead of being appended a second
+  time.
 
-    Which package should receive the compatibility fix?
+  ✓ Read 1 file
 
-    Reply below, then press Enter
-
-
-
-
-
-
+  • Agent 边界。🚀▌
 
 
 
 
 
-
+  ? Input requested
+  Which package should receive the compatibility fix?
+  Reply below, then press Enter
 
   › orchestral-runtime
     保留协议兼容性
 
-  enter send  ·  ctrl+c interrupt                pgup/pgdn scroll  ·  esc quit
+  enter reply  ·  ctrl+c interrupt               pgup/pgdn scroll  ·  esc quit

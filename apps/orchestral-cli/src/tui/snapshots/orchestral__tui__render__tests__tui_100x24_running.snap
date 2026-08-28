@@ -1,5 +1,6 @@
 ---
 source: apps/orchestral-cli/src/tui/render.rs
+assertion_line: 720
 expression: "render_to_string(&state, 100, 24)"
 ---
   Orchestral  ·  gemini-2.5-flash                                                        ● running
@@ -21,8 +22,8 @@ expression: "render_to_string(&state, 100, 24)"
 
 
 
-  • Working
+  ⠸ Working (1m 12s · ctrl+c to interrupt) · 1 background terminal running
 
   › Add guidance while Orchestral works…
 
-  enter send  ·  ctrl+c interrupt                                    pgup/pgdn scroll  ·  esc quit
+  enter steer  ·  ctrl+c interrupt                                   pgup/pgdn scroll  ·  esc quit

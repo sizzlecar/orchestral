@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
 
 use orchestral_core::agent_protocol::wire::ToolActivityState;
 
@@ -140,6 +141,9 @@ pub(crate) enum UiMsg {
     Quit,
     ScrollUp(usize),
     ScrollDown(usize),
+    Tick {
+        now: Instant,
+    },
     RunStarted {
         run_id: String,
     },
@@ -160,6 +164,15 @@ pub(crate) enum UiMsg {
     },
     ProgressReported {
         summary: String,
+    },
+    ProcessActivity {
+        run_id: String,
+        session_id: u64,
+        running: bool,
+    },
+    ProcessInventory {
+        run_id: String,
+        session_ids: Vec<u64>,
     },
     WaitingInput {
         run_id: String,
@@ -203,10 +216,14 @@ pub(crate) struct UiState {
     pub pending: Option<PendingOverlay>,
     pub scroll_back: usize,
     pub working_detail: Option<String>,
+    pub working_elapsed: Duration,
+    pub animation_frame: u64,
     stream_output_id: Option<String>,
     stream_chunks: BTreeMap<u64, String>,
     seen_delta_ids: BTreeSet<String>,
     activity_reducer: ActivityReducer,
+    active_processes: BTreeSet<u64>,
+    last_tick: Option<Instant>,
 }
 
 impl UiState {
@@ -222,15 +239,23 @@ impl UiState {
             pending: None,
             scroll_back: 0,
             working_detail: None,
+            working_elapsed: Duration::ZERO,
+            animation_frame: 0,
             stream_output_id: None,
             stream_chunks: BTreeMap::new(),
             seen_delta_ids: BTreeSet::new(),
             activity_reducer: ActivityReducer::default(),
+            active_processes: BTreeSet::new(),
+            last_tick: None,
         }
     }
 
     pub(crate) fn streamed_text(&self) -> String {
         self.stream_chunks.values().cloned().collect()
+    }
+
+    pub(crate) fn active_process_count(&self) -> usize {
+        self.active_processes.len()
     }
 
     #[cfg(test)]
@@ -387,7 +412,26 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
         UiMsg::Quit => return vec![UiEffect::Quit],
         UiMsg::ScrollUp(rows) => state.scroll_back = state.scroll_back.saturating_add(rows),
         UiMsg::ScrollDown(rows) => state.scroll_back = state.scroll_back.saturating_sub(rows),
+        UiMsg::Tick { now } => {
+            if state.run_id.is_some() {
+                if matches!(state.phase, UiPhase::Running | UiPhase::Cancelling) {
+                    if let Some(last_tick) = state.last_tick {
+                        state.working_elapsed += now.saturating_duration_since(last_tick);
+                    }
+                }
+                state.last_tick = Some(now);
+                if matches!(state.phase, UiPhase::Running | UiPhase::Cancelling) {
+                    state.animation_frame = state.animation_frame.wrapping_add(1);
+                }
+            }
+        }
         UiMsg::RunStarted { run_id } => {
+            if state.run_id.as_deref() != Some(run_id.as_str()) {
+                state.working_elapsed = Duration::ZERO;
+                state.animation_frame = 0;
+                state.active_processes.clear();
+                state.last_tick = None;
+            }
             state.run_id = Some(run_id);
             state.phase = UiPhase::Running;
             state.pending = None;
@@ -419,6 +463,27 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             state.upsert_tool(projection);
         }
         UiMsg::ProgressReported { summary } => state.working_detail = Some(summary),
+        UiMsg::ProcessActivity {
+            run_id,
+            session_id,
+            running,
+        } => {
+            if state.run_id.as_deref() == Some(run_id.as_str()) {
+                if running {
+                    state.active_processes.insert(session_id);
+                } else {
+                    state.active_processes.remove(&session_id);
+                }
+            }
+        }
+        UiMsg::ProcessInventory {
+            run_id,
+            session_ids,
+        } => {
+            if state.run_id.as_deref() == Some(run_id.as_str()) {
+                state.active_processes = session_ids.into_iter().collect();
+            }
+        }
         UiMsg::WaitingInput {
             run_id,
             request_id,
@@ -482,6 +547,8 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             state.clear_stream();
             state.pending = None;
             state.working_detail = None;
+            state.active_processes.clear();
+            state.last_tick = None;
             state.run_id = None;
             state.phase = UiPhase::Completed;
         }
@@ -494,6 +561,8 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             state.clear_stream();
             state.pending = None;
             state.working_detail = None;
+            state.active_processes.clear();
+            state.last_tick = None;
             state.run_id = None;
             state.phase = UiPhase::Failed;
         }
@@ -505,6 +574,8 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             state.clear_stream();
             state.pending = None;
             state.working_detail = None;
+            state.active_processes.clear();
+            state.last_tick = None;
             state.run_id = None;
             state.phase = UiPhase::Cancelled;
         }
@@ -522,6 +593,10 @@ fn submit(state: &mut UiState) -> Vec<UiEffect> {
         state.clear_stream();
         state.pending = None;
         state.working_detail = None;
+        state.working_elapsed = Duration::ZERO;
+        state.animation_frame = 0;
+        state.active_processes.clear();
+        state.last_tick = None;
         state.run_id = None;
         state.phase = UiPhase::Running;
         state.scroll_back = 0;
@@ -851,6 +926,83 @@ mod tests {
         update(&mut state, UiMsg::MoveCursorEnd);
         update(&mut state, UiMsg::InsertText("\n第二行".to_owned()));
         assert_eq!(state.composer, "中B\n第二行");
+    }
+
+    #[test]
+    fn work_clock_pauses_for_user_requests_and_processes_are_run_scoped() {
+        let mut state = UiState::new("session", "model");
+        let start = Instant::now();
+        update(
+            &mut state,
+            UiMsg::RunStarted {
+                run_id: "run-a".to_owned(),
+            },
+        );
+        update(&mut state, UiMsg::Tick { now: start });
+        update(
+            &mut state,
+            UiMsg::Tick {
+                now: start + Duration::from_secs(2),
+            },
+        );
+        assert_eq!(state.working_elapsed, Duration::from_secs(2));
+        assert_eq!(state.animation_frame, 2);
+
+        update(
+            &mut state,
+            UiMsg::WaitingApproval {
+                run_id: "run-a".to_owned(),
+                request_id: "approval-a".to_owned(),
+                summary: "Run a command".to_owned(),
+            },
+        );
+        update(
+            &mut state,
+            UiMsg::Tick {
+                now: start + Duration::from_secs(12),
+            },
+        );
+        assert_eq!(state.working_elapsed, Duration::from_secs(2));
+        update(
+            &mut state,
+            UiMsg::RequestResolved {
+                request_id: "approval-a".to_owned(),
+            },
+        );
+        update(
+            &mut state,
+            UiMsg::Tick {
+                now: start + Duration::from_secs(13),
+            },
+        );
+        assert_eq!(state.working_elapsed, Duration::from_secs(3));
+
+        update(
+            &mut state,
+            UiMsg::ProcessActivity {
+                run_id: "stale-run".to_owned(),
+                session_id: 1,
+                running: true,
+            },
+        );
+        assert_eq!(state.active_process_count(), 0);
+        update(
+            &mut state,
+            UiMsg::ProcessActivity {
+                run_id: "run-a".to_owned(),
+                session_id: 7,
+                running: true,
+            },
+        );
+        assert_eq!(state.active_process_count(), 1);
+        update(
+            &mut state,
+            UiMsg::ProcessInventory {
+                run_id: "run-a".to_owned(),
+                session_ids: vec![8, 9],
+            },
+        );
+        assert_eq!(state.active_process_count(), 2);
     }
 
     #[test]
