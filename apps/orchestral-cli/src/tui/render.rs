@@ -85,19 +85,14 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         .padding(Padding::horizontal(1));
     let inner = block.inner(area);
     let lines = transcript_lines(state);
-    let wrapped = wrapped_line_count(&lines, inner.width.max(1) as usize);
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let wrapped = paragraph.line_count(inner.width.max(1));
     let max_scroll = wrapped.saturating_sub(inner.height as usize) as u16;
     let back = u16::try_from(state.scroll_back)
         .unwrap_or(u16::MAX)
         .min(max_scroll);
     let scroll = max_scroll.saturating_sub(back);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0)),
-        area,
-    );
+    frame.render_widget(paragraph.block(block).scroll((scroll, 0)), area);
 }
 
 fn transcript_lines(state: &UiState) -> Vec<Line<'static>> {
@@ -304,17 +299,6 @@ fn composer_cursor(state: &UiState, inner: Rect) -> (u16, u16) {
     )
 }
 
-fn wrapped_line_count(lines: &[Line<'_>], width: usize) -> usize {
-    lines
-        .iter()
-        .map(|line| {
-            UnicodeWidthStr::width(line.to_string().as_str())
-                .max(1)
-                .div_ceil(width.max(1))
-        })
-        .sum()
-}
-
 fn phase_style(phase: UiPhase) -> Style {
     match phase {
         UiPhase::Idle | UiPhase::Completed => Style::new().fg(Color::Green),
@@ -466,6 +450,46 @@ mod tests {
         assert_snapshot!(
             "tui_120x40_completed_recovery",
             render_to_string(&state, 120, 40)
+        );
+    }
+
+    #[test]
+    fn auto_scroll_keeps_newest_running_input_and_completed_answer_visible() {
+        let mut state = UiState::new("session-scroll", "model-scroll");
+        for index in 0..12 {
+            state.transcript.push(TranscriptEntry::assistant(
+                format!("history-{index}"),
+                "abcdefghijklmnopqrst abcdefghijklmnopqrst abcdefghijklmnopqrst abcdefghijklmnopqrst",
+            ));
+        }
+
+        update(
+            &mut state,
+            UiMsg::InsertText("最新用户消息必须立即可见".to_owned()),
+        );
+        update(&mut state, UiMsg::Submit);
+        update(
+            &mut state,
+            UiMsg::RunStarted {
+                run_id: "run-scroll".to_owned(),
+            },
+        );
+        let running = render_to_string(&state, 50, 16);
+        assert!(
+            running.contains("最新用户消息必须立即可见"),
+            "running viewport did not reach the newest input:\n{running}"
+        );
+
+        update(
+            &mut state,
+            UiMsg::Completed {
+                final_text: Some("最终回答第一行\n最终回答末行必须可见".to_owned()),
+            },
+        );
+        let completed = render_to_string(&state, 50, 16);
+        assert!(
+            completed.contains("最终回答末行必须可见"),
+            "completed viewport clipped the final answer:\n{completed}"
         );
     }
 
