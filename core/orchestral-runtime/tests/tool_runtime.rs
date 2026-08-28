@@ -2076,7 +2076,7 @@ async fn two_thousand_five_hundred_model_sandbox_downgrades_reach_no_executor() 
 
 #[cfg(unix)]
 #[tokio::test]
-async fn two_thousand_five_hundred_alternate_spawn_mutations_start_zero_processes() {
+async fn two_thousand_five_hundred_alternate_spawn_mutations_are_rejected_before_approval() {
     const MUTATIONS: usize = 2_500;
     let root = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
     let (bounds, _) = strict_shell_security_bounds(&root);
@@ -2099,30 +2099,13 @@ async fn two_thousand_five_hundred_alternate_spawn_mutations_start_zero_processe
                 "args": ["must-not-run"]
             }),
         };
-        let GuardedToolResult::ApprovalRequired { binding, .. } = runtime
-            .invoke(
-                invocation.clone(),
-                RunToolGrant {
-                    bounds: bounds.clone(),
-                },
-                None,
-                CancellationToken::new(),
-            )
-            .await
-        else {
-            panic!("alternate spawn mutation must still require exact approval")
-        };
-        let capability = HostApprovalIssuer::new(SIGNING_KEY)
-            .unwrap()
-            .issue(binding, i64::MAX)
-            .unwrap();
         let result = runtime
             .invoke(
                 invocation,
                 RunToolGrant {
                     bounds: bounds.clone(),
                 },
-                Some(capability),
+                None,
                 CancellationToken::new(),
             )
             .await;
@@ -2131,7 +2114,7 @@ async fn two_thousand_five_hundred_alternate_spawn_mutations_start_zero_processe
             GuardedToolResult::Outcome {
                 outcome: ToolOutcome::Rejected { ref code, .. },
                 cached: false,
-            } if code == "shell_program_denied"
+            } if code == "input_schema_violation"
         ));
     }
 }

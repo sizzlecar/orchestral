@@ -77,32 +77,12 @@ impl TestWorkspace {
         });
     }
 
-    fn disable_shell(&self) {
+    fn disable_exec(&self) {
         self.rewrite_config(|config| {
             config.replace(
-                "tools:\n  max_timeout_ms: 30000\n  max_output_bytes: 1048576\n  shell:\n    enabled: true",
-                "tools:\n  max_timeout_ms: 30000\n  max_output_bytes: 1048576\n  shell:\n    enabled: false",
+                "tools:\n  max_timeout_ms: 30000\n  max_output_bytes: 1048576\n  exec:\n    enabled: true",
+                "tools:\n  max_timeout_ms: 30000\n  max_output_bytes: 1048576\n  exec:\n    enabled: false",
             )
-        });
-    }
-
-    fn configure_shell_allowed_programs(&self, programs: &[&str]) {
-        self.rewrite_config(|mut config| {
-            let start_marker = "    allowed_programs:\n";
-            let start = config
-                .find(start_marker)
-                .expect("CLI config has a shell allowlist");
-            let end = config[start..]
-                .find("\n\nmcp:")
-                .map(|offset| start + offset)
-                .expect("CLI config shell allowlist ends before MCP config");
-            let mut replacement = start_marker.to_owned();
-            for program in programs {
-                replacement.push_str(&format!("      - {program}\n"));
-            }
-            replacement.pop();
-            config.replace_range(start..end, &replacement);
-            config
         });
     }
 
@@ -237,20 +217,11 @@ fn tui_pty_resolves_input_and_approval_then_cancels_another_run() {
             assert!(model_request_text(&request.body).contains("runtime-core"));
             openai_text_response("INPUT_RESOLVED_OK")
         }),
-        Box::new(|request| {
-            let pwd = model_allowed_program(&request.body, "pwd");
-            openai_tool_response(
-                "approval-pwd",
-                "shell",
-                json!({
-                    "command": pwd,
-                    "args": [],
-                    "fail_on_non_zero": true
-                }),
-            )
+        Box::new(|_request| {
+            openai_tool_response("approval-pwd", "exec_command", json!({ "cmd": "pwd" }))
         }),
         Box::new(|request| {
-            assert!(model_request_text(&request.body).contains("\"status\":0"));
+            assert!(model_request_text(&request.body).contains("\"exit_code\":0"));
             openai_text_response("APPROVAL_RESOLVED_OK")
         }),
         Box::new(|_| {
@@ -292,7 +263,7 @@ fn tui_pty_resolves_input_and_approval_then_cancels_another_run() {
     let output = tui.finish(LOCAL_PROCESS_TIMEOUT);
     assert!(output.status.success(), "{}", output.text());
     assert!(
-        output.text().contains("shell completed"),
+        output.text().contains("exec_command completed"),
         "{}",
         output.text()
     );
@@ -370,7 +341,7 @@ fn piped_prompt_is_headless_and_stdout_contains_only_final_delivery() {
 }
 
 #[test]
-fn local_cli_creates_and_verifies_a_file_with_shell_disabled() {
+fn local_cli_creates_and_verifies_a_file_with_exec_disabled() {
     const CONTEXT_MARKER: &str = "需求上下文=雪豹-7319🧩";
     const GENERATED_CONTENT: &str = "generated from 雪豹-7319🧩\n";
 
@@ -380,7 +351,7 @@ fn local_cli_creates_and_verifies_a_file_with_shell_disabled() {
         format!("{CONTEXT_MARKER}\nCreate generated.txt from this request.\n"),
     )
     .expect("write patch request fixture");
-    workspace.disable_shell();
+    workspace.disable_exec();
 
     let (model_endpoint, model_server) = spawn_fixture_http_server(vec![
         Box::new(|request| {
@@ -475,7 +446,18 @@ fn local_cli_reads_patches_and_runs_a_guarded_verification() {
         Box::new(|request| {
             assert!(model_request_has_tool(&request.body, "file_read"));
             assert!(model_request_has_tool(&request.body, "apply_patch"));
-            assert!(model_request_has_tool(&request.body, "shell"));
+            assert!(model_request_has_tool(&request.body, "exec_command"));
+            assert!(model_request_has_tool(&request.body, "write_stdin"));
+            assert!(!model_request_has_tool(&request.body, "shell"));
+            for old_name in [
+                "pty_create",
+                "pty_write",
+                "pty_read",
+                "pty_close",
+                "pty_list",
+            ] {
+                assert!(!model_request_has_tool(&request.body, old_name));
+            }
             openai_tool_response(
                 "read-buggy-source",
                 "file_read",
@@ -502,24 +484,17 @@ fn local_cli_reads_patches_and_runs_a_guarded_verification() {
         Box::new(|request| {
             let context = model_request_text(&request.body);
             assert!(context.contains("\"operation\":\"update\""), "{context}");
-            let rg = model_allowed_program(&request.body, "rg");
             openai_tool_response(
                 "verify-fixed-source",
-                "shell",
+                "exec_command",
                 json!({
-                    "command": rg,
-                    "args": [
-                        "--fixed-strings",
-                        "pub fn answer() -> u32 { 42 }",
-                        "src/lib.rs"
-                    ],
-                    "fail_on_non_zero": true
+                    "cmd": "rg --fixed-strings 'pub fn answer() -> u32 { 42 }' src/lib.rs"
                 }),
             )
         }),
         Box::new(|request| {
             let context = model_request_text(&request.body);
-            assert!(context.contains("\"status\":0"), "{context}");
+            assert!(context.contains("\"exit_code\":0"), "{context}");
             openai_text_response("PATCH_AND_VERIFY_OK")
         }),
     ]);
@@ -557,7 +532,95 @@ fn local_cli_reads_patches_and_runs_a_guarded_verification() {
     assert_eq!(exchanges.len(), 3);
     assert_eq!(tool_name(exchanges[0]), Some("file_read"));
     assert_eq!(tool_name(exchanges[1]), Some("apply_patch"));
-    assert_eq!(tool_name(exchanges[2]), Some("shell"));
+    assert_eq!(tool_name(exchanges[2]), Some("exec_command"));
+    assert!(exchanges
+        .iter()
+        .all(|exchange| tool_result_is_error(exchange) == Some(false)));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn local_exec_runs_toolchains_and_a_child_script_without_program_enumeration() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let workspace = TestWorkspace::new("unified-exec-toolchains");
+    let script = workspace.path("child-check.sh");
+    fs::write(
+        &script,
+        "#!/bin/sh\npython3 -c 'print(\"CHILD_SCRIPT_OK\")'\n",
+    )
+    .expect("write child script");
+    let mut permissions = fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script, permissions).unwrap();
+
+    let (model_endpoint, model_server) = spawn_fixture_http_server(vec![
+        Box::new(|request| {
+            let names = model_request_tool_names(&request.body);
+            assert!(names.contains(&"exec_command"));
+            assert!(names.contains(&"write_stdin"));
+            for removed in [
+                "shell",
+                "pty_create",
+                "pty_write",
+                "pty_read",
+                "pty_close",
+                "pty_list",
+            ] {
+                assert!(!names.contains(&removed));
+            }
+            openai_tool_response(
+                "toolchain-check",
+                "exec_command",
+                json!({
+                    "cmd": "cargo --version && python3 --version && ./child-check.sh",
+                    "yield_time_ms": 5000
+                }),
+            )
+        }),
+        Box::new(|request| {
+            let context = model_request_text(&request.body);
+            assert!(context.contains("cargo 1."), "{context}");
+            assert!(context.contains("Python 3."), "{context}");
+            assert!(context.contains("\"alive\":true"), "{context}");
+            openai_tool_response(
+                "toolchain-poll",
+                "write_stdin",
+                json!({ "session_id": 1, "yield_time_ms": 5000 }),
+            )
+        }),
+        Box::new(|request| {
+            let context = model_request_text(&request.body);
+            assert!(context.contains("CHILD_SCRIPT_OK"), "{context}");
+            assert!(context.contains("\"exit_code\":0"), "{context}");
+            openai_text_response("UNIFIED_EXEC_TOOLCHAINS_OK")
+        }),
+    ]);
+    workspace.configure_local_openai(&model_endpoint);
+
+    let output = run_with_approval(
+        local_agent_command(
+            &workspace,
+            "unified-exec-toolchains-session",
+            "Execute the requested local verification, use its observation, then report the marker.",
+            "Verify the installed Rust and Python toolchains and run child-check.sh.",
+            true,
+            true,
+        ),
+        true,
+        None,
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    assert!(output.status.success(), "{}", output.stderr_text());
+    assert_eq!(output.stdout_text().trim(), "UNIFIED_EXEC_TOOLCHAINS_OK");
+    output.assert_no_ansi();
+    assert_eq!(model_server.join().unwrap().len(), 3);
+
+    let records = session_records(&workspace);
+    let exchanges = tool_exchanges(&records);
+    assert_eq!(exchanges.len(), 2);
+    assert_eq!(tool_name(exchanges[0]), Some("exec_command"));
+    assert_eq!(tool_name(exchanges[1]), Some("write_stdin"));
     assert!(exchanges
         .iter()
         .all(|exchange| tool_result_is_error(exchange) == Some(false)));
@@ -848,8 +911,6 @@ fn live_coding_agent_reads_patches_and_verifies_the_change() {
         "pub fn answer() -> u32 { 41 }\n",
     )
     .expect("write live buggy source");
-    workspace.configure_shell_allowed_programs(&["rg"]);
-
     let output = run_with_approval(
         live_command(
             &workspace,
@@ -894,7 +955,7 @@ fn live_coding_agent_reads_patches_and_verifies_the_change() {
         .expect("live coding run omitted apply_patch");
     let verify = trace
         .iter()
-        .position(|(name, error)| *name == "shell" && *error == Some(false))
+        .position(|(name, error)| *name == "exec_command" && *error == Some(false))
         .expect("live coding run omitted guarded verification");
     assert!(
         read < patch && patch < verify,
@@ -1393,8 +1454,8 @@ fn run_live_shell_copy(workspace: &TestWorkspace, allow: bool, target: &Path) ->
             "approval-deny-session"
         },
         concat!(
-            "Use exactly one shell tool call to run the allowed cp program with the argument ",
-            "vector [source.txt, approved.txt]. Do not call other tools and do not retry a ",
+            "Use exactly one exec_command call with `cp source.txt approved.txt`. ",
+            "Do not call other tools and do not retry a ",
             "denied operation. After the observation, briefly report the actual outcome."
         ),
         "Copy source.txt to approved.txt now.",
@@ -1859,30 +1920,6 @@ fn assert_single_apply_patch_tool(request: &Value) {
         1,
         "apply_patch must survive composition exactly once"
     );
-}
-
-fn model_allowed_program(request: &Value, program: &str) -> String {
-    let shell = request["tools"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|tool| tool["function"]["name"].as_str() == Some("shell"))
-        .unwrap_or_else(|| panic!("model request omitted the guarded shell descriptor"));
-    let accepted = shell["function"]["parameters"]["properties"]["command"]["enum"]
-        .as_array()
-        .unwrap_or_else(|| panic!("shell descriptor omitted its command enum: {shell}"));
-    accepted
-        .iter()
-        .filter_map(Value::as_str)
-        .find(|candidate| {
-            *candidate == program
-                || Path::new(candidate)
-                    .file_stem()
-                    .and_then(|name| name.to_str())
-                    == Some(program)
-        })
-        .unwrap_or_else(|| panic!("shell descriptor omitted '{program}': {shell}"))
-        .to_owned()
 }
 
 fn model_request_text(request: &Value) -> String {

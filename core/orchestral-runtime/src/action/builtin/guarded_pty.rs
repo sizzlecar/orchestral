@@ -173,6 +173,7 @@ impl GuardedToolExecutor for GuardedPtyCreateExecutor {
         let sandbox_policy = ShellSandboxPolicy {
             readable_roots: readable_roots.clone(),
             writable_roots: writable_roots.clone(),
+            allow_child_processes: false,
             allowed_programs: bounds
                 .process
                 .allowed_programs

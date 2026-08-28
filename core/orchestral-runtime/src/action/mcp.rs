@@ -395,6 +395,7 @@ impl McpTransportFactory for StdioMcpTransportFactory {
             &ShellSandboxPolicy {
                 readable_roots: self.sandbox.readable_roots.iter().cloned().collect(),
                 writable_roots: self.sandbox.writable_roots.iter().cloned().collect(),
+                allow_child_processes: false,
                 allowed_programs: vec![self.program.clone()],
                 linux_bwrap_path: None,
             },

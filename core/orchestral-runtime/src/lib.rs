@@ -6,6 +6,7 @@ pub mod agent_control;
 pub mod agent_sdk;
 pub mod api;
 pub mod approval_bridge;
+pub mod exec_process;
 pub mod generic_agent;
 pub mod generic_agent_checkpoint;
 mod in_memory_blob;
@@ -19,6 +20,9 @@ pub mod workflow_strategy;
 pub use agent_control::{AgentControlError, AgentControlEvent, AgentController};
 pub use agent_sdk::{AgentClient, AgentRunHandle, AgentSdkError, AgentTurn};
 pub use approval_bridge::{AgentApprovalBridge, ApprovalBridgeError, InMemoryHostApprovalBroker};
+pub use exec_process::{
+    ExecPollResult, ExecProcessError, ExecSessionId, ExecSessionManager, ExecSpawnSpec,
+};
 pub use generic_agent::{GenericAgentConfig, InternalGenericAgentProvider, ModelCostPolicy};
 pub use generic_agent_checkpoint::{
     replay_generic_agent_checkpoint, AppendGenericCheckpointOutcome, CommandCheckpoint,

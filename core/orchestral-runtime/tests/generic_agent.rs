@@ -5174,6 +5174,7 @@ async fn run_skill_recovery(state: SkillRecoveryState) -> Vec<ModelMessage> {
                                     "version": descriptor.version,
                                     "digest": descriptor.digest,
                                     "source": descriptor.source,
+                                    "resource_base": null,
                                 }),
                                 is_error: false,
                             }],

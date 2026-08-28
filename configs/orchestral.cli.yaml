@@ -70,23 +70,8 @@ providers:
 tools:
   max_timeout_ms: 30000
   max_output_bytes: 1048576
-  shell:
+  exec:
     enabled: true
-    allowed_programs:
-      - git
-      - rg
-      - cargo
-      - rustc
-      - ls
-      - find
-      - sed
-      - head
-      - tail
-      - wc
-      - pwd
-      - mkdir
-      - cp
-      - mv
 
 mcp:
   enabled: true

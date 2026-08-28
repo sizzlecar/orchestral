@@ -55,6 +55,7 @@ pub struct PtyReadResult {
     pub output: String,
     pub dropped_bytes: u64,
     pub alive: bool,
+    pub exit_code: Option<i32>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -226,8 +227,11 @@ impl PtyProcess {
         Ok(())
     }
 
-    fn alive(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+    fn status(&mut self) -> Result<Option<i32>, PtyProcessError> {
+        self.child
+            .try_wait()
+            .map(|status| status.map(|status| status.exit_code() as i32))
+            .map_err(|error| PtyProcessError::Io(error.to_string()))
     }
 
     fn terminate(&mut self) {
@@ -357,15 +361,16 @@ impl PtyProcessManager {
         }
         let (raw, dropped_bytes) = buffer.drain();
         drop(buffer);
-        let alive = process
+        let exit_code = process
             .lock()
             .map_err(|_| PtyProcessError::Unavailable)?
-            .alive();
+            .status()?;
         let output = strip_ansi_escapes::strip(&raw);
         Ok(PtyReadResult {
             output: String::from_utf8_lossy(&output).replace('\r', ""),
             dropped_bytes,
-            alive,
+            alive: exit_code.is_none(),
+            exit_code,
         })
     }
 

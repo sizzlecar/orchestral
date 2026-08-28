@@ -62,9 +62,6 @@ fn validate_config(config: &OrchestralConfig) -> Result<(), ConfigError> {
     if config.tools.max_timeout_ms == 0 || config.tools.max_output_bytes == 0 {
         return invalid("Tool limits must be positive");
     }
-    if config.tools.shell.enabled && config.tools.shell.allowed_programs.is_empty() {
-        return invalid("tools.shell.allowed_programs must be explicit when shell is enabled");
-    }
     validate_storage_backend("journal", &config.journal.backend, &config.journal.root_dir)?;
     validate_storage_backend(
         "artifacts",
@@ -197,13 +194,10 @@ mod tests {
     }
 
     #[test]
-    fn enabled_shell_requires_an_explicit_allowlist() {
+    fn unified_exec_needs_no_per_program_allowlist() {
         let mut config = OrchestralConfig::default();
-        config.tools.shell.enabled = true;
-        assert!(matches!(
-            validate_config(&config),
-            Err(ConfigError::Invalid(message)) if message.contains("allowed_programs")
-        ));
+        config.tools.exec.enabled = true;
+        assert!(validate_config(&config).is_ok());
     }
 
     #[test]

@@ -43,17 +43,17 @@ use orchestral_model_gemini::{
 };
 use orchestral_model_openai::{OpenAiCompatibleBackend, OpenAiCompatibleConfig};
 use orchestral_runtime::tools::{
-    guarded_apply_patch_descriptor, guarded_artifact_read_descriptor, guarded_file_read_descriptor,
-    guarded_pty_create_descriptor_with_program_aliases,
-    guarded_shell_descriptor_with_program_aliases, GuardedApplyPatchExecutor,
-    GuardedArtifactReadExecutor, GuardedFileReadExecutor, GuardedProgramAliases,
+    guarded_apply_patch_descriptor, guarded_artifact_read_descriptor,
+    guarded_exec_command_descriptor, guarded_file_read_descriptor, guarded_write_stdin_descriptor,
+    GuardedApplyPatchExecutor, GuardedArtifactReadExecutor, GuardedExecCommandExecutor,
+    GuardedFileReadExecutor, GuardedWriteStdinExecutor,
 };
 use orchestral_runtime::{
     AgentClient, AgentControlEvent, AgentController, DeterministicExtractiveSessionSummarizer,
-    GenericAgentCheckpointStore, GenericAgentConfig, GuardedMcpServerConfig, GuardedToolRuntime,
-    InMemoryBlobStore, InMemoryGenericAgentCheckpointStore, InMemoryHostApprovalBroker,
-    InternalGenericAgentProvider, McpToolsAdapterRegistry, ModelTokenMeter,
-    SessionCompactionPolicy, SkillRoot, SkillRuntime, StdioMcpSandboxPolicy,
+    ExecSessionManager, GenericAgentCheckpointStore, GenericAgentConfig, GuardedMcpServerConfig,
+    GuardedToolRuntime, InMemoryBlobStore, InMemoryGenericAgentCheckpointStore,
+    InMemoryHostApprovalBroker, InternalGenericAgentProvider, McpToolsAdapterRegistry,
+    ModelTokenMeter, SessionCompactionPolicy, SkillRoot, SkillRuntime, StdioMcpSandboxPolicy,
     StdioMcpTransportFactory, ToolArtifactStore,
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -88,6 +88,12 @@ struct CliJournalStores {
     session: Arc<dyn AgentSessionJournalStore>,
     effect: Arc<dyn ToolEffectJournalStore>,
     checkpoint: Arc<dyn GenericAgentCheckpointStore>,
+}
+
+struct CliExecHost {
+    shell: PathBuf,
+    runtime_readable_roots: Vec<PathBuf>,
+    environment_names: BTreeSet<String>,
 }
 
 pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
@@ -319,14 +325,17 @@ fn build_cli_tool_runtime(
     let workspace = std::fs::canonicalize(std::env::current_dir().context("resolve workspace")?)
         .context("canonicalize workspace")?;
     let workspace = workspace.to_string_lossy().to_string();
-    let shell_program_aliases = configured_shell_programs(config)?;
-    let shell_programs = shell_program_aliases.canonical_programs();
-    let shell_enabled = !shell_programs.is_empty();
+    let exec_host = configured_exec_host(config)?;
+    let exec_programs = exec_host
+        .as_ref()
+        .map(|host| BTreeSet::from([host.shell.to_string_lossy().into_owned()]))
+        .unwrap_or_default();
+    let exec_enabled = exec_host.is_some();
     let mcp_effects = mcp_configs
         .iter()
         .flat_map(GuardedMcpServerConfig::effect_scopes)
         .collect::<BTreeSet<_>>();
-    let mut allowed_programs = shell_programs.clone();
+    let mut allowed_programs = exec_programs.clone();
     allowed_programs.extend(
         mcp_configs
             .iter()
@@ -337,7 +346,7 @@ fn build_cli_tool_runtime(
         EffectScope::FilesystemWrite,
         EffectScope::ArtifactRead,
     ]);
-    if shell_enabled {
+    if exec_enabled {
         allowed_effects.extend([
             EffectScope::Process,
             EffectScope::EnvironmentRead,
@@ -345,10 +354,13 @@ fn build_cli_tool_runtime(
         ]);
     }
     allowed_effects.extend(mcp_effects.iter().copied());
-    let allowed_environment = mcp_configs
+    let mut allowed_environment = mcp_configs
         .iter()
         .flat_map(GuardedMcpServerConfig::environment_names)
-        .collect();
+        .collect::<BTreeSet<_>>();
+    if let Some(host) = &exec_host {
+        allowed_environment.extend(host.environment_names.iter().cloned());
+    }
     let allowed_network_targets = mcp_configs
         .iter()
         .flat_map(GuardedMcpServerConfig::allowed_network_targets)
@@ -369,8 +381,7 @@ fn build_cli_tool_runtime(
             required: true,
             allowed_profiles: BTreeSet::from([
                 "workspace_read".to_owned(),
-                orchestral_runtime::tools::GUARDED_SHELL_SANDBOX_PROFILE.to_owned(),
-                orchestral_runtime::tools::GUARDED_PTY_SANDBOX_PROFILE.to_owned(),
+                orchestral_runtime::tools::GUARDED_EXEC_SANDBOX_PROFILE.to_owned(),
             ])
             .union(&mcp_sandbox_profiles)
             .cloned()
@@ -378,7 +389,7 @@ fn build_cli_tool_runtime(
         },
         process: ProcessPolicy {
             allowed_programs,
-            allow_shell_expression: false,
+            allow_shell_expression: exec_enabled,
         },
         filesystem: FilesystemPolicy {
             readable_roots: BTreeSet::from([workspace.clone()]),
@@ -396,24 +407,29 @@ fn build_cli_tool_runtime(
         max_output_bytes: Some(config.tools.max_output_bytes),
     };
     // Tool restrictions are capability-local. MCP transport programs,
-    // credentials, environment names, and network targets must never become
-    // ambient authority for the generic Shell/PTY tools.
-    let mut shell_bounds = bounds.clone();
-    shell_bounds.allowed_effects = BTreeSet::from([
+    // credentials, environment names, and network targets never become
+    // ambient authority for generic command execution.
+    let mut exec_bounds = bounds.clone();
+    exec_bounds.allowed_effects = BTreeSet::from([
         EffectScope::Process,
         EffectScope::FilesystemRead,
         EffectScope::FilesystemWrite,
         EffectScope::EnvironmentRead,
         EffectScope::ExternalSideEffect,
     ]);
-    shell_bounds.sandbox.allowed_profiles = BTreeSet::from([
-        orchestral_runtime::tools::GUARDED_SHELL_SANDBOX_PROFILE.to_owned(),
-        orchestral_runtime::tools::GUARDED_PTY_SANDBOX_PROFILE.to_owned(),
-    ]);
-    shell_bounds.process.allowed_programs = shell_programs;
-    shell_bounds.network = NetworkPolicy::default();
-    shell_bounds.environment = EnvironmentPolicy::default();
-    shell_bounds.allowed_credentials.clear();
+    exec_bounds.sandbox.allowed_profiles =
+        BTreeSet::from([orchestral_runtime::tools::GUARDED_EXEC_SANDBOX_PROFILE.to_owned()]);
+    exec_bounds.process.allowed_programs = exec_programs;
+    exec_bounds.process.allow_shell_expression = true;
+    exec_bounds.network = NetworkPolicy::default();
+    exec_bounds.environment = EnvironmentPolicy {
+        allowed_variables: exec_host
+            .as_ref()
+            .map(|host| host.environment_names.clone())
+            .unwrap_or_default(),
+        inherit_host_environment: false,
+    };
+    exec_bounds.allowed_credentials.clear();
     let signing_material = Digest::sha256(unique_id("cli-approval-key", 0));
     let approval_broker = Arc::new(
         InMemoryHostApprovalBroker::new(signing_material.as_str().as_bytes())
@@ -462,84 +478,39 @@ fn build_cli_tool_runtime(
             ),
         )
         .context("register guarded apply_patch Tool")?;
-    if shell_enabled {
-        runtime
-            .register(
-                guarded_shell_descriptor_with_program_aliases(
-                    ToolRestriction {
-                        bounds: shell_bounds.clone(),
-                    },
-                    &shell_program_aliases,
-                ),
-                Arc::new(orchestral_runtime::tools::GuardedShellExecutor::new(
-                    shell_program_aliases.clone(),
-                )),
+    if let Some(exec_host) = exec_host {
+        let manager = Arc::new(
+            ExecSessionManager::new(
+                usize::try_from(config.tools.max_output_bytes).unwrap_or(usize::MAX),
             )
-            .context("register guarded shell Tool")?;
-        let pty_manager = Arc::new(
-            orchestral_runtime::PtyProcessManager::new(1024 * 1024, Duration::from_secs(10 * 60))
-                .context("create run-scoped PTY process manager")?,
+            .context("create run-scoped exec session manager")?,
         );
         runtime
             .register(
-                guarded_pty_create_descriptor_with_program_aliases(
-                    ToolRestriction {
-                        bounds: shell_bounds.clone(),
-                    },
-                    &shell_program_aliases,
-                ),
+                guarded_exec_command_descriptor(ToolRestriction {
+                    bounds: exec_bounds.clone(),
+                }),
                 Arc::new(
-                    orchestral_runtime::tools::GuardedPtyCreateExecutor::new_with_program_aliases(
-                        pty_manager.clone(),
-                        shell_program_aliases,
-                    ),
+                    GuardedExecCommandExecutor::new(
+                        manager.clone(),
+                        exec_host.shell,
+                        exec_host.runtime_readable_roots,
+                    )
+                    .map_err(anyhow::Error::msg)
+                    .context("configure guarded exec_command Tool")?,
                 ),
             )
-            .context("register guarded pty_create Tool")?;
+            .context("register guarded exec_command Tool")?;
         runtime
             .register(
-                orchestral_runtime::tools::guarded_pty_write_descriptor(ToolRestriction {
-                    bounds: shell_bounds.clone(),
+                guarded_write_stdin_descriptor(ToolRestriction {
+                    bounds: exec_bounds,
                 }),
-                Arc::new(orchestral_runtime::tools::GuardedPtyWriteExecutor::new(
-                    pty_manager.clone(),
-                )),
+                Arc::new(GuardedWriteStdinExecutor::new(manager)),
             )
-            .context("register guarded pty_write Tool")?;
-        runtime
-            .register(
-                orchestral_runtime::tools::guarded_pty_read_descriptor(ToolRestriction {
-                    bounds: shell_bounds.clone(),
-                }),
-                Arc::new(orchestral_runtime::tools::GuardedPtyReadExecutor::new(
-                    pty_manager.clone(),
-                )),
-            )
-            .context("register guarded pty_read Tool")?;
-        runtime
-            .register(
-                orchestral_runtime::tools::guarded_pty_close_descriptor(ToolRestriction {
-                    bounds: shell_bounds.clone(),
-                }),
-                Arc::new(orchestral_runtime::tools::GuardedPtyCloseExecutor::new(
-                    pty_manager.clone(),
-                )),
-            )
-            .context("register guarded pty_close Tool")?;
-        runtime
-            .register(
-                orchestral_runtime::tools::guarded_pty_list_descriptor(ToolRestriction {
-                    bounds: shell_bounds,
-                }),
-                Arc::new(orchestral_runtime::tools::GuardedPtyListExecutor::new(
-                    pty_manager,
-                )),
-            )
-            .context("register guarded pty_list Tool")?;
+            .context("register guarded write_stdin Tool")?;
     } else {
-        tracing::warn!(
-            "Generic Agent shell Tool is disabled because no explicit allowed_commands resolved"
-        );
+        tracing::warn!("Generic Agent command execution is disabled by Host config");
     }
     Ok((runtime, RunToolGrant { bounds }, approval_broker))
 }
@@ -608,34 +579,96 @@ fn build_cli_skill_runtime(config: &OrchestralConfig) -> anyhow::Result<Option<A
     Ok(Some(Arc::new(runtime)))
 }
 
-fn configured_shell_programs(config: &OrchestralConfig) -> anyhow::Result<GuardedProgramAliases> {
-    if !config.tools.shell.enabled {
-        return Ok(GuardedProgramAliases::default());
+fn configured_exec_host(config: &OrchestralConfig) -> anyhow::Result<Option<CliExecHost>> {
+    if !config.tools.exec.enabled {
+        return Ok(None);
     }
-    let configured = config.tools.shell.allowed_programs.clone();
-    let mut resolved = Vec::new();
-    for program in configured {
-        match locate_host_program(&program) {
-            Ok(path) => {
-                let alias = if Path::new(&program).is_absolute() {
-                    Path::new(&program)
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .context("configured executable path has no UTF-8 file name")?
-                        .to_owned()
-                } else {
-                    program.clone()
-                };
-                resolved.push((alias, path.to_string_lossy().into_owned()));
+    let configured = config
+        .tools
+        .exec
+        .shell
+        .as_deref()
+        .filter(|shell| !shell.trim().is_empty());
+    let shell = if let Some(shell) = configured {
+        PathBuf::from(resolve_host_program(shell)?)
+    } else if let Some(shell) = std::env::var_os("SHELL").filter(|shell| !shell.is_empty()) {
+        PathBuf::from(resolve_host_program(&shell.to_string_lossy())?)
+    } else {
+        ["/bin/zsh", "/bin/bash", "/bin/sh"]
+            .into_iter()
+            .find_map(|candidate| resolve_host_program(candidate).ok())
+            .map(PathBuf::from)
+            .context("no command shell is available; set tools.exec.shell")?
+    };
+    Ok(Some(CliExecHost {
+        runtime_readable_roots: exec_runtime_readable_roots(&shell),
+        shell,
+        environment_names: [
+            "PATH",
+            "HOME",
+            "USER",
+            "LANG",
+            "LC_ALL",
+            "TERM",
+            "COLORTERM",
+            "NO_COLOR",
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+    }))
+}
+
+fn exec_runtime_readable_roots(shell: &Path) -> Vec<PathBuf> {
+    let mut candidates = BTreeSet::new();
+    if let Some(parent) = shell.parent() {
+        candidates.insert(parent.to_path_buf());
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&path).filter(|path| path.is_absolute()) {
+            candidates.insert(directory.clone());
+            let text = directory.to_string_lossy();
+            for marker in ["/.cargo/", "/.rustup/", "/.nvm/", "/.pyenv/", "/.local/"] {
+                if let Some(index) = text.find(marker) {
+                    candidates.insert(PathBuf::from(&text[..index + marker.len() - 1]));
+                }
             }
-            Err(error) => {
-                tracing::warn!(program, %error, "configured shell program is unavailable")
+            if text.starts_with("/opt/homebrew/") {
+                candidates.insert(PathBuf::from("/opt/homebrew"));
+            }
+            if text.starts_with("/nix/store/") {
+                candidates.insert(PathBuf::from("/nix/store"));
             }
         }
     }
-    GuardedProgramAliases::new(resolved)
-        .map_err(anyhow::Error::msg)
-        .context("build Host executable alias registry")
+    for candidate in [
+        "/bin",
+        "/usr/bin",
+        "/usr/sbin",
+        "/usr/local",
+        "/opt/homebrew",
+        "/nix/store",
+        "/etc",
+        "/Library/Frameworks",
+        "/Library/Developer/CommandLineTools",
+        "/Applications/Xcode.app",
+    ] {
+        candidates.insert(PathBuf::from(candidate));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        candidates.insert(home.join(".cargo/bin"));
+        candidates.insert(home.join(".cargo/registry"));
+        candidates.insert(home.join(".cargo/git"));
+        candidates.insert(home.join(".rustup"));
+    }
+    candidates
+        .into_iter()
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .filter(|path| path.is_dir())
+        .collect()
 }
 
 /// MCP and Skill remain distinct resources. Only explicit Host MCP transports

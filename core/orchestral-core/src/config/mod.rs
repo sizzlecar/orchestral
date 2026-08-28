@@ -197,7 +197,7 @@ fn default_reserved_output_tokens() -> u64 {
 #[serde(deny_unknown_fields)]
 pub struct ToolsConfig {
     #[serde(default)]
-    pub shell: ShellToolConfig,
+    pub exec: ExecToolConfig,
     #[serde(default = "default_tool_timeout_ms")]
     pub max_timeout_ms: u64,
     #[serde(default = "default_tool_output_bytes")]
@@ -207,7 +207,7 @@ pub struct ToolsConfig {
 impl Default for ToolsConfig {
     fn default() -> Self {
         Self {
-            shell: ShellToolConfig::default(),
+            exec: ExecToolConfig::default(),
             max_timeout_ms: default_tool_timeout_ms(),
             max_output_bytes: default_tool_output_bytes(),
         }
@@ -222,14 +222,16 @@ fn default_tool_output_bytes() -> u64 {
     1024 * 1024
 }
 
-/// Shell and PTY are disabled until the Host grants explicit executable names.
+/// Unified command execution. The Host resolves one command shell; child
+/// process safety is enforced by the effect sandbox rather than a model-facing
+/// executable allowlist.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ShellToolConfig {
+pub struct ExecToolConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
-    pub allowed_programs: Vec<String>,
+    pub shell: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

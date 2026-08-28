@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 pub struct ShellSandboxPolicy {
     pub readable_roots: Vec<PathBuf>,
     pub writable_roots: Vec<PathBuf>,
+    /// Allow the already-sandboxed launcher to execute child programs.
+    /// Filesystem and network effects remain constrained by this profile.
+    pub allow_child_processes: bool,
     pub allowed_programs: Vec<PathBuf>,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub linux_bwrap_path: Option<PathBuf>,
@@ -233,6 +236,7 @@ fn normalize_sandbox_inputs(
         ShellSandboxPolicy {
             readable_roots,
             writable_roots,
+            allow_child_processes: policy.allow_child_processes,
             allowed_programs,
             linux_bwrap_path: policy.linux_bwrap_path.clone(),
         },
@@ -272,11 +276,15 @@ fn build_macos_profile(spec: &SandboxCommandSpec, policy: &ShellSandboxPolicy) -
     profile.push_str("(version 1)\n");
     profile.push_str("(deny default)\n");
     profile.push_str("(allow process-fork)\n");
-    for program in &policy.allowed_programs {
-        profile.push_str(&format!(
-            "(allow process-exec (literal \"{}\"))\n",
-            escape_profile_string(&program.to_string_lossy())
-        ));
+    if policy.allow_child_processes {
+        profile.push_str("(allow process-exec)\n");
+    } else {
+        for program in &policy.allowed_programs {
+            profile.push_str(&format!(
+                "(allow process-exec (literal \"{}\"))\n",
+                escape_profile_string(&program.to_string_lossy())
+            ));
+        }
     }
     profile.push_str("(allow sysctl-read)\n");
 
@@ -469,6 +477,7 @@ mod tests {
         let policy = ShellSandboxPolicy {
             readable_roots: vec![cwd.clone()],
             writable_roots: vec![cwd.clone()],
+            allow_child_processes: false,
             allowed_programs: vec![program.clone()],
             linux_bwrap_path: None,
         };
@@ -498,6 +507,7 @@ mod tests {
             &ShellSandboxPolicy {
                 readable_roots: vec![workspace.clone()],
                 writable_roots: vec![workspace.clone()],
+                allow_child_processes: false,
                 allowed_programs: vec![executable],
                 linux_bwrap_path: None,
             },
@@ -543,6 +553,7 @@ mod tests {
             &ShellSandboxPolicy {
                 readable_roots: vec![workspace.clone()],
                 writable_roots: vec![workspace.clone()],
+                allow_child_processes: false,
                 allowed_programs: vec![program],
                 linux_bwrap_path: None,
             },
@@ -574,6 +585,7 @@ mod tests {
             &ShellSandboxPolicy {
                 readable_roots: vec![workspace.clone()],
                 writable_roots: vec![workspace.clone()],
+                allow_child_processes: false,
                 allowed_programs: vec![program],
                 linux_bwrap_path: None,
             },
@@ -598,6 +610,7 @@ mod tests {
         let policy = ShellSandboxPolicy {
             readable_roots: vec![cwd.clone()],
             writable_roots: vec![cwd.clone()],
+            allow_child_processes: false,
             allowed_programs: vec![program.clone()],
             linux_bwrap_path: None,
         };
@@ -632,6 +645,7 @@ mod tests {
         let policy = ShellSandboxPolicy {
             readable_roots: vec![cwd.clone()],
             writable_roots: vec![cwd],
+            allow_child_processes: false,
             allowed_programs: vec![program],
             linux_bwrap_path: None,
         };
@@ -662,6 +676,7 @@ mod tests {
             &ShellSandboxPolicy {
                 readable_roots: vec![workspace.clone()],
                 writable_roots: vec![workspace.clone()],
+                allow_child_processes: false,
                 allowed_programs: vec![program],
                 linux_bwrap_path: None,
             },

@@ -267,9 +267,8 @@ providers:
 tools:
   max_timeout_ms: 30000
   max_output_bytes: 1048576
-  shell:
+  exec:
     enabled: true
-    allowed_programs: [git, rg, cargo, rustc, ls, find, sed, head, tail, wc, pwd, mkdir, cp, mv]
 
 mcp:
   enabled: true
@@ -328,7 +327,7 @@ mod tests {
     fn generated_config_is_strict_agent_config() {
         let raw = embedded_default_config();
         let parsed: OrchestralConfig = serde_yaml::from_str(&raw).expect("strict config");
-        assert!(parsed.tools.shell.enabled);
+        assert!(parsed.tools.exec.enabled);
         assert!(!raw.contains("planner:"));
         assert!(!raw.contains("actions:"));
         assert!(!raw.contains("task:"));
