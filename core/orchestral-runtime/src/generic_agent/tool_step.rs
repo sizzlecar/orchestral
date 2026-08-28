@@ -176,7 +176,14 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                 emit_failure(&inner, &request, &user_message, failure);
                 return ToolBatchExecution::Terminal;
             }
-            publish_tool_activity(&inner, &run_id, round, &call.call_id, &call.name, "running");
+            publish_tool_activity(
+                &inner,
+                &run_id,
+                round,
+                &call.call_id,
+                &call.name,
+                ToolActivityState::Running,
+            );
             let observation = match execute_workflow_call(
                 inner.clone(),
                 tools,
@@ -249,9 +256,9 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                 &call.call_id,
                 &call.name,
                 if observation.is_error {
-                    "failed"
+                    ToolActivityState::Failed
                 } else {
-                    "succeeded"
+                    ToolActivityState::Succeeded
                 },
             );
             let Some(workflow_event_id) = publish_workflow_output(
@@ -302,7 +309,14 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
             tool_id,
             arguments,
         };
-        publish_tool_activity(&inner, &run_id, round, &call.call_id, &call.name, "running");
+        publish_tool_activity(
+            &inner,
+            &run_id,
+            round,
+            &call.call_id,
+            &call.name,
+            ToolActivityState::Running,
+        );
         let result = tools
             .runtime
             .invoke(
@@ -360,7 +374,14 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
         };
         match result {
             GuardedToolResult::ApprovalRequired { binding, .. } => {
-                publish_tool_activity(&inner, &run_id, round, &call.call_id, &call.name, "failed");
+                publish_tool_activity(
+                    &inner,
+                    &run_id,
+                    round,
+                    &call.call_id,
+                    &call.name,
+                    ToolActivityState::Failed,
+                );
                 emit_failure(
                     &inner,
                     &request,
@@ -386,7 +407,7 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                     round,
                     &call.call_id,
                     &call.name,
-                    "cancelled",
+                    ToolActivityState::Cancelled,
                 );
                 // The effect journal deliberately retains UnknownEffect, while
                 // the Agent Run still observes the user's cancellation as its
@@ -411,7 +432,14 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                 outcome: ToolOutcome::UnknownEffect { message },
                 ..
             } => {
-                publish_tool_activity(&inner, &run_id, round, &call.call_id, &call.name, "failed");
+                publish_tool_activity(
+                    &inner,
+                    &run_id,
+                    round,
+                    &call.call_id,
+                    &call.name,
+                    ToolActivityState::Failed,
+                );
                 if let Err(failure) = append_effect_uncertainty(
                     &inner,
                     &request,
@@ -443,7 +471,7 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                     round,
                     &call.call_id,
                     &call.name,
-                    "cancelled",
+                    ToolActivityState::Cancelled,
                 );
                 emit_cancel(&inner, &request, &user_message);
                 return ToolBatchExecution::Terminal;
@@ -459,7 +487,11 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                     round,
                     &call.call_id,
                     &call.name,
-                    if is_error { "failed" } else { "succeeded" },
+                    if is_error {
+                        ToolActivityState::Failed
+                    } else {
+                        ToolActivityState::Succeeded
+                    },
                 );
                 tool_results.push(ModelContent::ToolResult {
                     call_id: call.call_id,

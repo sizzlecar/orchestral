@@ -677,34 +677,24 @@ pub(super) fn publish_tool_activity(
     round: u64,
     call_id: &ModelToolCallId,
     tool_name: &str,
-    status: &str,
+    state: ToolActivityState,
 ) {
     let activity_id = format!(
         "generic-{}-tool-{round}-{}",
         run_id.as_str(),
         call_id.as_str()
     );
-    let summary = match status {
-        "running" => tool_name.to_owned(),
-        "succeeded" => format!("{tool_name} completed"),
-        "cancelled" => format!("{tool_name} cancelled"),
-        _ => format!("{tool_name} failed"),
-    };
     publish_telemetry(
         inner,
         run_id,
         AgentTelemetryEnvelope {
-            telemetry_id: TelemetryId::new(format!("{activity_id}-{status}")),
+            telemetry_id: TelemetryId::new(format!("{activity_id}-{state:?}")),
             run_id: run_id.clone(),
             provider_seq: None,
-            payload: AgentTelemetry::Extension {
-                namespace: TOOL_ACTIVITY_TELEMETRY_NAMESPACE.to_owned(),
-                value: serde_json::json!({
-                    "activity_id": activity_id,
-                    "tool_name": tool_name,
-                    "summary": summary,
-                    "status": status,
-                }),
+            payload: AgentTelemetry::ToolActivity {
+                activity_id: ToolActivityId::new(activity_id),
+                tool_name: tool_name.to_owned(),
+                state,
             },
         },
     );

@@ -5,9 +5,8 @@ use ratatui::widgets::{Block, Clear, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-use super::state::{
-    PendingOverlay, ToolActivityStatus, TranscriptEntry, TranscriptRole, UiPhase, UiState,
-};
+use super::activity::ActivityStatus;
+use super::state::{PendingOverlay, TranscriptEntry, TranscriptRole, UiPhase, UiState};
 
 const MUTED: Style = Style::new().fg(Color::DarkGray);
 const ACCENT: Style = Style::new().fg(Color::Cyan);
@@ -137,9 +136,10 @@ fn push_entry_lines(lines: &mut Vec<Line<'static>>, entry: &TranscriptEntry) {
         TranscriptRole::Error => push_plain(lines, "■ ", &entry.text, ERROR),
         TranscriptRole::Tool => {
             let (symbol, style) = match entry.tool_status {
-                Some(ToolActivityStatus::Running) => ("• ", ACCENT),
-                Some(ToolActivityStatus::Succeeded) => ("✓ ", SUCCESS),
-                Some(ToolActivityStatus::Failed) => ("× ", ERROR),
+                Some(ActivityStatus::Running) => ("• ", ACCENT),
+                Some(ActivityStatus::Succeeded) => ("✓ ", SUCCESS),
+                Some(ActivityStatus::Failed) => ("× ", ERROR),
+                Some(ActivityStatus::Cancelled) => ("■ ", Style::new().fg(Color::Yellow)),
                 None => ("· ", MUTED),
             };
             push_status_text(lines, symbol, &entry.text, style);
@@ -523,12 +523,13 @@ fn phase_badge(phase: UiPhase) -> (&'static str, &'static str) {
 #[cfg(test)]
 mod tests {
     use insta::assert_snapshot;
+    use orchestral_core::agent_protocol::wire::ToolActivityState;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use unicode_width::UnicodeWidthStr;
 
     use super::render;
-    use crate::tui::{update, ToolActivityStatus, TranscriptEntry, UiMsg, UiPhase, UiState};
+    use crate::tui::{update, TranscriptEntry, UiMsg, UiPhase, UiState};
 
     #[test]
     fn snapshot_40x12_cjk_emoji_tool_and_approval() {
@@ -542,8 +543,8 @@ mod tests {
             &mut state,
             UiMsg::ToolActivity {
                 activity_id: "shell-test".to_owned(),
-                summary: "cargo test -p payment".to_owned(),
-                status: ToolActivityStatus::Running,
+                tool_name: "exec_command".to_owned(),
+                state: ToolActivityState::Running,
             },
         );
         update(
@@ -591,8 +592,8 @@ mod tests {
             &mut state,
             UiMsg::ToolActivity {
                 activity_id: "inspect-runtime".to_owned(),
-                summary: "file_read core/orchestral-runtime/src/lib.rs".to_owned(),
-                status: ToolActivityStatus::Succeeded,
+                tool_name: "file_read".to_owned(),
+                state: ToolActivityState::Succeeded,
             },
         );
         update(
@@ -622,17 +623,16 @@ mod tests {
             &mut state,
             UiMsg::ToolActivity {
                 activity_id: "read-core".to_owned(),
-                summary: "file_read core/orchestral-runtime/src/generic_agent/coordinator.rs"
-                    .to_owned(),
-                status: ToolActivityStatus::Succeeded,
+                tool_name: "file_read".to_owned(),
+                state: ToolActivityState::Succeeded,
             },
         );
         update(
             &mut state,
             UiMsg::ToolActivity {
                 activity_id: "search-flow".to_owned(),
-                summary: "exec_command rg execute_model_run core/".to_owned(),
-                status: ToolActivityStatus::Running,
+                tool_name: "exec_command".to_owned(),
+                state: ToolActivityState::Running,
             },
         );
         update(
@@ -660,32 +660,32 @@ mod tests {
             &mut state,
             UiMsg::ToolActivity {
                 activity_id: "skill-read".to_owned(),
-                summary: "skill_read release-evidence → instructions loaded".to_owned(),
-                status: ToolActivityStatus::Succeeded,
+                tool_name: "skill_read".to_owned(),
+                state: ToolActivityState::Succeeded,
             },
         );
         update(
             &mut state,
             UiMsg::ToolActivity {
                 activity_id: "mcp-inventory".to_owned(),
-                summary: "mcp__inventory__deployment_color → request timed out".to_owned(),
-                status: ToolActivityStatus::Failed,
+                tool_name: "mcp__inventory__deployment_color".to_owned(),
+                state: ToolActivityState::Failed,
             },
         );
         update(
             &mut state,
             UiMsg::ToolActivity {
                 activity_id: "exec-start".to_owned(),
-                summary: "exec_command cargo test → session 7 started".to_owned(),
-                status: ToolActivityStatus::Succeeded,
+                tool_name: "exec_command".to_owned(),
+                state: ToolActivityState::Succeeded,
             },
         );
         update(
             &mut state,
             UiMsg::ToolActivity {
                 activity_id: "exec-poll".to_owned(),
-                summary: "write_stdin session 7 → exited 0; 18 tests passed".to_owned(),
-                status: ToolActivityStatus::Succeeded,
+                tool_name: "write_stdin".to_owned(),
+                state: ToolActivityState::Succeeded,
             },
         );
         update(

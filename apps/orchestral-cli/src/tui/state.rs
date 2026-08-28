@@ -1,5 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use orchestral_core::agent_protocol::wire::ToolActivityState;
+
+use super::activity::{ActivityProjection, ActivityReducer, ActivityStatus};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UiPhase {
     Idle,
@@ -30,19 +34,12 @@ pub(crate) enum TranscriptRole {
     Error,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ToolActivityStatus {
-    Running,
-    Succeeded,
-    Failed,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TranscriptEntry {
     pub id: Option<String>,
     pub role: TranscriptRole,
     pub text: String,
-    pub tool_status: Option<ToolActivityStatus>,
+    pub tool_status: Option<ActivityStatus>,
 }
 
 impl TranscriptEntry {
@@ -158,8 +155,11 @@ pub(crate) enum UiMsg {
     },
     ToolActivity {
         activity_id: String,
+        tool_name: String,
+        state: ToolActivityState,
+    },
+    ProgressReported {
         summary: String,
-        status: ToolActivityStatus,
     },
     WaitingInput {
         run_id: String,
@@ -202,9 +202,11 @@ pub(crate) struct UiState {
     pub composer_cursor: usize,
     pub pending: Option<PendingOverlay>,
     pub scroll_back: usize,
+    pub working_detail: Option<String>,
     stream_output_id: Option<String>,
     stream_chunks: BTreeMap<u64, String>,
     seen_delta_ids: BTreeSet<String>,
+    activity_reducer: ActivityReducer,
 }
 
 impl UiState {
@@ -219,9 +221,11 @@ impl UiState {
             composer_cursor: 0,
             pending: None,
             scroll_back: 0,
+            working_detail: None,
             stream_output_id: None,
             stream_chunks: BTreeMap::new(),
             seen_delta_ids: BTreeSet::new(),
+            activity_reducer: ActivityReducer::default(),
         }
     }
 
@@ -295,23 +299,29 @@ impl UiState {
         }
     }
 
-    fn upsert_tool(&mut self, activity_id: String, summary: String, status: ToolActivityStatus) {
-        let id = format!("tool:{activity_id}");
+    fn upsert_tool(&mut self, projection: ActivityProjection) {
+        let id = format!("tool:{}", projection.id);
         if let Some(entry) = self
             .transcript
             .iter_mut()
             .find(|entry| entry.id.as_deref() == Some(id.as_str()))
         {
-            entry.text = summary;
-            entry.tool_status = Some(status);
+            entry.text = projection.summary;
+            entry.tool_status = Some(projection.status);
             return;
         }
         self.transcript.push(TranscriptEntry {
             id: Some(id),
             role: TranscriptRole::Tool,
-            text: summary,
-            tool_status: Some(status),
+            text: projection.summary,
+            tool_status: Some(projection.status),
         });
+    }
+
+    fn settle_tools(&mut self, state: ToolActivityState) {
+        for projection in self.activity_reducer.settle(state) {
+            self.upsert_tool(projection);
+        }
     }
 
     fn commit_output(&mut self, output_id: String, text: String) {
@@ -400,9 +410,15 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
         UiMsg::OutputCommitted { output_id, text } => state.commit_output(output_id, text),
         UiMsg::ToolActivity {
             activity_id,
-            summary,
-            status,
-        } => state.upsert_tool(activity_id, summary, status),
+            tool_name,
+            state: activity_state,
+        } => {
+            let projection = state
+                .activity_reducer
+                .observe(activity_id, tool_name, activity_state);
+            state.upsert_tool(projection);
+        }
+        UiMsg::ProgressReported { summary } => state.working_detail = Some(summary),
         UiMsg::WaitingInput {
             run_id,
             request_id,
@@ -459,30 +475,36 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             }
         }
         UiMsg::Completed { final_text } => {
+            state.settle_tools(ToolActivityState::Succeeded);
             if let Some(final_text) = final_text {
                 state.reconcile_delivery(final_text);
             }
             state.clear_stream();
             state.pending = None;
+            state.working_detail = None;
             state.run_id = None;
             state.phase = UiPhase::Completed;
         }
         UiMsg::Failed { message } => {
+            state.settle_tools(ToolActivityState::Failed);
             state.transcript.push(TranscriptEntry::error(
                 "terminal-failure",
                 format!("Run failed: {message}"),
             ));
             state.clear_stream();
             state.pending = None;
+            state.working_detail = None;
             state.run_id = None;
             state.phase = UiPhase::Failed;
         }
         UiMsg::Cancelled { reason } => {
+            state.settle_tools(ToolActivityState::Cancelled);
             state
                 .transcript
                 .push(TranscriptEntry::system(format!("Run cancelled: {reason}")));
             state.clear_stream();
             state.pending = None;
+            state.working_detail = None;
             state.run_id = None;
             state.phase = UiPhase::Cancelled;
         }
@@ -496,8 +518,10 @@ fn submit(state: &mut UiState) -> Vec<UiEffect> {
             return Vec::new();
         };
         state.transcript.push(TranscriptEntry::user(input.clone()));
+        state.activity_reducer.begin_run();
         state.clear_stream();
         state.pending = None;
+        state.working_detail = None;
         state.run_id = None;
         state.phase = UiPhase::Running;
         state.scroll_back = 0;
@@ -830,21 +854,25 @@ mod tests {
     }
 
     #[test]
-    fn tool_activity_updates_one_transcript_entry() {
+    fn tool_activity_reduces_repeated_calls_into_one_transcript_entry() {
         let mut state = UiState::new("session", "model");
-        for (status, summary) in [
-            (ToolActivityStatus::Running, "apply_patch src/lib.rs"),
-            (
-                ToolActivityStatus::Succeeded,
-                "apply_patch changed src/lib.rs",
-            ),
-        ] {
+        state.activity_reducer.begin_run();
+        for index in 0..16 {
+            let activity_id = format!("read-{index}");
             update(
                 &mut state,
                 UiMsg::ToolActivity {
-                    activity_id: "patch-1".to_owned(),
-                    summary: summary.to_owned(),
-                    status,
+                    activity_id: activity_id.clone(),
+                    tool_name: "file_read".to_owned(),
+                    state: ToolActivityState::Running,
+                },
+            );
+            update(
+                &mut state,
+                UiMsg::ToolActivity {
+                    activity_id,
+                    tool_name: "file_read".to_owned(),
+                    state: ToolActivityState::Succeeded,
                 },
             );
         }
@@ -854,7 +882,7 @@ mod tests {
             .filter(|entry| entry.role == TranscriptRole::Tool)
             .collect::<Vec<_>>();
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].text, "apply_patch changed src/lib.rs");
-        assert_eq!(tools[0].tool_status, Some(ToolActivityStatus::Succeeded));
+        assert_eq!(tools[0].text, "Read 16 files");
+        assert_eq!(tools[0].tool_status, Some(ActivityStatus::Succeeded));
     }
 }

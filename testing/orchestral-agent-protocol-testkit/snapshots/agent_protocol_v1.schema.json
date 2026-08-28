@@ -1336,6 +1336,31 @@
         {
           "type": "object",
           "properties": {
+            "activity_id": {
+              "$ref": "#/$defs/ToolActivityId"
+            },
+            "state": {
+              "$ref": "#/$defs/ToolActivityState"
+            },
+            "tool_name": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "tool_activity"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "activity_id",
+            "tool_name",
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "namespace": {
               "type": "string",
               "pattern": "^[^/][^/]*/[\\s\\S]+$"
@@ -2489,6 +2514,19 @@
     "TelemetryId": {
       "description": "Stable telemetry item identifier.",
       "type": "string"
+    },
+    "ToolActivityId": {
+      "description": "Stable identifier for one Tool activity across state transitions.",
+      "type": "string"
+    },
+    "ToolActivityState": {
+      "type": "string",
+      "enum": [
+        "running",
+        "succeeded",
+        "failed",
+        "cancelled"
+      ]
     },
     "UsageReport": {
       "type": "object",

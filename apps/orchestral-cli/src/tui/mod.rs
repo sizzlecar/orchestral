@@ -3,6 +3,7 @@
 //! The UI owns presentation state only. Agent lifecycle and durable truth stay
 //! behind `AgentClient`; the C4 adapter translates between the two boundaries.
 
+mod activity;
 mod app;
 mod render;
 mod state;
@@ -12,6 +13,4 @@ pub(crate) use app::run_tui;
 pub(crate) use render::render;
 #[cfg(test)]
 pub(crate) use state::TranscriptEntry;
-pub(crate) use state::{
-    update, ApprovalChoice, ToolActivityStatus, UiEffect, UiMsg, UiPhase, UiState,
-};
+pub(crate) use state::{update, ApprovalChoice, UiEffect, UiMsg, UiPhase, UiState};

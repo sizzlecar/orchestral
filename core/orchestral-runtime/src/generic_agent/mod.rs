@@ -27,7 +27,7 @@ use orchestral_core::agent_protocol::{
         PendingRequestPayload, Provenance, ProviderCommandDisposition, ProviderCommandOutcome,
         RequestId, RequestResolution, ResourceBindingMode, ResourceBindingSkip,
         ResourceBindingSkipCode, ResourceCapability, ResourceKind, RunId, RunLimitKind,
-        TelemetryId, UsageReport,
+        TelemetryId, ToolActivityId, ToolActivityState, UsageReport,
     },
     AGENT_PROTOCOL_V1,
 };
@@ -71,7 +71,6 @@ use crate::{
 const WORKFLOW_TOOL_NAME: &str = "orchestral_workflow";
 const SKILL_READ_TOOL_NAME: &str = "skill_read";
 const REQUEST_INPUT_TOOL_NAME: &str = "orchestral_request_input";
-const TOOL_ACTIVITY_TELEMETRY_NAMESPACE: &str = "orchestral/tool_activity/v1";
 const RUN_STOP_RUNNING: u8 = 0;
 const RUN_STOP_HOST_CANCEL: u8 = 1;
 const RUN_STOP_DEADLINE: u8 = 2;

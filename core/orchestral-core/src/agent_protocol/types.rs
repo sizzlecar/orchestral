@@ -93,6 +93,8 @@ string_id!(/// Artifact identifier independent of physical storage.
     ArtifactRef);
 string_id!(/// Stable telemetry item identifier.
     TelemetryId);
+string_id!(/// Stable identifier for one Tool activity across state transitions.
+    ToolActivityId);
 
 /// Hex-encoded SHA-256 digest used for immutable protocol bindings.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -2405,6 +2407,16 @@ impl AgentTelemetryEnvelope {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "agent-protocol-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ToolActivityState {
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "agent-protocol-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -2418,6 +2430,11 @@ pub enum AgentTelemetry {
         message: String,
         #[serde(default)]
         fraction: Option<f64>,
+    },
+    ToolActivity {
+        activity_id: ToolActivityId,
+        tool_name: String,
+        state: ToolActivityState,
     },
     Extension {
         #[cfg_attr(
@@ -2449,6 +2466,19 @@ impl AgentTelemetry {
                     return Err(AgentProtocolError::new(
                         AgentProtocolErrorCode::InvalidSpec,
                         "progress telemetry requires a message and fraction within [0, 1]",
+                    ));
+                }
+                Ok(())
+            }
+            Self::ToolActivity {
+                activity_id,
+                tool_name,
+                ..
+            } => {
+                if activity_id.is_empty() || tool_name.trim().is_empty() {
+                    return Err(AgentProtocolError::new(
+                        AgentProtocolErrorCode::InvalidSpec,
+                        "Tool activity telemetry requires an activity_id and tool_name",
                     ));
                 }
                 Ok(())
@@ -3302,5 +3332,31 @@ mod tests {
         let mut telemetry_value = serde_json::to_value(telemetry).expect("telemetry serializes");
         telemetry_value["future_core_field"] = Value::Bool(true);
         assert!(serde_json::from_value::<AgentTelemetryEnvelope>(telemetry_value).is_err());
+    }
+
+    #[test]
+    fn tool_activity_telemetry_is_typed_and_validated() {
+        let telemetry = AgentTelemetry::ToolActivity {
+            activity_id: ToolActivityId::new("activity-1"),
+            tool_name: "file_read".to_owned(),
+            state: ToolActivityState::Succeeded,
+        };
+        telemetry
+            .validate_integrity()
+            .expect("typed Tool activity is valid");
+        let value = serde_json::to_value(&telemetry).expect("Tool activity serializes");
+        assert_eq!(value["type"], "tool_activity");
+        assert_eq!(value["state"], "succeeded");
+        assert!(serde_json::from_value::<AgentTelemetry>(value)
+            .expect("Tool activity deserializes")
+            .validate_integrity()
+            .is_ok());
+        assert!(AgentTelemetry::ToolActivity {
+            activity_id: ToolActivityId::new(""),
+            tool_name: "file_read".to_owned(),
+            state: ToolActivityState::Running,
+        }
+        .validate_integrity()
+        .is_err());
     }
 }

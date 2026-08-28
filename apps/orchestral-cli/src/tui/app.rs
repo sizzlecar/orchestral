@@ -21,11 +21,8 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use super::terminal::TerminalSession;
-use super::{
-    render, update, ApprovalChoice, ToolActivityStatus, UiEffect, UiMsg, UiPhase, UiState,
-};
+use super::{render, update, ApprovalChoice, UiEffect, UiMsg, UiPhase, UiState};
 
-const TOOL_ACTIVITY_NAMESPACE: &str = "orchestral/tool_activity/v1";
 const RECONCILE_INTERVAL: Duration = Duration::from_millis(200);
 static COMMAND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -664,46 +661,24 @@ fn project_telemetry(run: &mut ActiveRun, state: &mut UiState, telemetry: AgentT
             let summary = fraction
                 .map(|fraction| format!("{:.0}% {message}", fraction * 100.0))
                 .unwrap_or(message);
+            update(state, UiMsg::ProgressReported { summary });
+        }
+        AgentTelemetry::ToolActivity {
+            activity_id,
+            tool_name,
+            state: activity_state,
+        } => {
             update(
                 state,
                 UiMsg::ToolActivity {
-                    activity_id: telemetry_id,
-                    summary,
-                    status: ToolActivityStatus::Running,
+                    activity_id: activity_id.as_str().to_owned(),
+                    tool_name,
+                    state: activity_state,
                 },
             );
         }
-        AgentTelemetry::Extension { namespace, value } if namespace == TOOL_ACTIVITY_NAMESPACE => {
-            if let Some(message) = tool_activity_message(&value) {
-                update(state, message);
-            }
-        }
         _ => {}
     }
-}
-
-fn tool_activity_message(value: &serde_json::Value) -> Option<UiMsg> {
-    let activity_id = value.get("activity_id")?.as_str()?.to_owned();
-    let tool_name = value
-        .get("tool_name")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("tool");
-    let summary = value
-        .get("summary")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .unwrap_or_else(|| tool_name.to_owned());
-    let status = match value.get("status")?.as_str()? {
-        "running" => ToolActivityStatus::Running,
-        "succeeded" => ToolActivityStatus::Succeeded,
-        "failed" | "cancelled" | "rejected" => ToolActivityStatus::Failed,
-        _ => return None,
-    };
-    Some(UiMsg::ToolActivity {
-        activity_id,
-        summary,
-        status,
-    })
 }
 
 fn project_ack(state: &mut UiState, ack: CommandAck, operation: &str) {
@@ -773,13 +748,11 @@ fn stop_active(active: &mut Option<ActiveRun>) {
 
 #[cfg(test)]
 mod tests {
+    use super::key_message;
+    use crate::tui::{ApprovalChoice, UiMsg, UiPhase, UiState};
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
-    use serde_json::json;
-
-    use super::{key_message, tool_activity_message};
-    use crate::tui::{ApprovalChoice, ToolActivityStatus, UiMsg, UiPhase, UiState};
 
     #[test]
     fn approval_keys_cannot_become_composer_text() {
@@ -843,23 +816,5 @@ mod tests {
             super::terminal_event_message(event(MouseEventKind::Down(MouseButton::Left)), &state),
             None
         );
-    }
-
-    #[test]
-    fn tool_activity_extension_is_strictly_projected() {
-        assert_eq!(
-            tool_activity_message(&json!({
-                "activity_id": "call-7",
-                "tool_name": "apply_patch",
-                "summary": "apply_patch src/lib.rs",
-                "status": "succeeded"
-            })),
-            Some(UiMsg::ToolActivity {
-                activity_id: "call-7".to_owned(),
-                summary: "apply_patch src/lib.rs".to_owned(),
-                status: ToolActivityStatus::Succeeded,
-            })
-        );
-        assert!(tool_activity_message(&json!({"status": "running"})).is_none());
     }
 }
