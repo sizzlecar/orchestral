@@ -13,19 +13,6 @@ pub(crate) enum UiPhase {
 }
 
 impl UiPhase {
-    pub(crate) const fn label(self) -> &'static str {
-        match self {
-            Self::Idle => "idle",
-            Self::Running => "running",
-            Self::WaitingInput => "waiting input",
-            Self::WaitingApproval => "waiting approval",
-            Self::Cancelling => "cancelling",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-        }
-    }
-
     fn accepts_new_run(self) -> bool {
         matches!(
             self,
@@ -249,16 +236,6 @@ impl UiState {
             .rev()
             .find(|entry| entry.role == TranscriptRole::Assistant)
             .map(|entry| entry.text.as_str())
-    }
-
-    pub(crate) fn composer_title(&self) -> &'static str {
-        match self.phase {
-            UiPhase::Running => "Steer",
-            UiPhase::WaitingInput => "Response",
-            UiPhase::WaitingApproval => "Approval response",
-            UiPhase::Cancelling => "Cancelling",
-            _ => "Message",
-        }
     }
 
     fn composer_editable(&self) -> bool {

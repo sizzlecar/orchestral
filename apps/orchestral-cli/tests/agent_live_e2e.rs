@@ -251,18 +251,22 @@ fn tui_pty_resolves_input_and_approval_then_cancels_another_run() {
     tui.wait_for_text("\u{1b}[?2004h", LOCAL_PROCESS_TIMEOUT);
     let before_resize = tui.latest.len();
     tui.resize(100, 30);
-    tui.wait_for_text_after("Describe a task.", before_resize, LOCAL_PROCESS_TIMEOUT);
+    tui.wait_for_text_after(
+        "Ask Orchestral to do anything",
+        before_resize,
+        LOCAL_PROCESS_TIMEOUT,
+    );
     tui.send_paste("start the input flow");
     tui.wait_for_text("INPUT_REQUEST_MARKER_7319", LOCAL_PROCESS_TIMEOUT);
     tui.send_paste("runtime-core");
     tui.wait_for_text("INPUT_RESOLVED_OK", LOCAL_PROCESS_TIMEOUT);
-    tui.wait_for_text_count("completed ", 1, LOCAL_PROCESS_TIMEOUT);
+    tui.wait_for_text_count("✓ done", 1, LOCAL_PROCESS_TIMEOUT);
 
     tui.send_paste("start the approval flow");
     tui.wait_for_text("Effects:", LOCAL_PROCESS_TIMEOUT);
     tui.send(b"a");
     tui.wait_for_text("APPROVAL_RESOLVED_OK", LOCAL_PROCESS_TIMEOUT);
-    tui.wait_for_text_count("completed ", 2, LOCAL_PROCESS_TIMEOUT);
+    tui.wait_for_text_count("✓ done", 2, LOCAL_PROCESS_TIMEOUT);
 
     tui.send_paste("start the cancellation flow");
     tui.wait_for_text("CANCEL_REQUEST_MARKER_4827", LOCAL_PROCESS_TIMEOUT);

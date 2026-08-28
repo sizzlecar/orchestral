@@ -1,7 +1,7 @@
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
@@ -9,12 +9,13 @@ use super::state::{
     PendingOverlay, ToolActivityStatus, TranscriptEntry, TranscriptRole, UiPhase, UiState,
 };
 
-const BORDER: Style = Style::new().fg(Color::DarkGray);
 const MUTED: Style = Style::new().fg(Color::DarkGray);
 const ACCENT: Style = Style::new().fg(Color::Cyan);
 const USER: Style = Style::new().fg(Color::LightCyan);
 const ASSISTANT: Style = Style::new().fg(Color::White);
 const ERROR: Style = Style::new().fg(Color::LightRed);
+const SUCCESS: Style = Style::new().fg(Color::Green);
+const CONTENT_PADDING: u16 = 2;
 
 pub(crate) fn render(frame: &mut Frame<'_>, state: &UiState) {
     let area = frame.area();
@@ -26,10 +27,12 @@ pub(crate) fn render(frame: &mut Frame<'_>, state: &UiState) {
         return;
     }
 
-    let composer_height = composer_height(state, area.width).min(area.height.saturating_sub(5));
+    let status_height = u16::from(shows_working_status(state.phase));
+    let composer_height = composer_height(state, area.width).min(area.height.saturating_sub(4));
     let rows = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Min(3),
+        Constraint::Min(1),
+        Constraint::Length(status_height),
         Constraint::Length(composer_height),
         Constraint::Length(1),
     ])
@@ -37,23 +40,25 @@ pub(crate) fn render(frame: &mut Frame<'_>, state: &UiState) {
 
     render_header(frame, rows[0], state);
     render_transcript(frame, rows[1], state);
-    render_composer(frame, rows[2], state);
-    render_footer(frame, rows[3], state);
+    render_working_status(frame, rows[2], state);
+    render_composer(frame, rows[3], state);
+    render_footer(frame, rows[4], state);
     if let Some(pending) = &state.pending {
         render_pending(frame, rows[1], pending);
     }
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
-    if area.width < 60 {
+    let (phase_icon, phase_label) = phase_badge(state.phase);
+    if area.width < 54 {
         let columns = Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)])
             .split(area);
         frame.render_widget(
-            Paragraph::new(" Orchestral").style(ACCENT.add_modifier(Modifier::BOLD)),
+            Paragraph::new("  Orchestral").style(ACCENT.add_modifier(Modifier::BOLD)),
             columns[0],
         );
         frame.render_widget(
-            Paragraph::new(format!("{} ", state.phase.label()))
+            Paragraph::new(format!("{phase_icon} {phase_label}  "))
                 .style(phase_style(state.phase))
                 .alignment(Alignment::Right),
             columns[1],
@@ -64,13 +69,13 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         Layout::horizontal([Constraint::Percentage(72), Constraint::Percentage(28)]).split(area);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" Orchestral", ACCENT.add_modifier(Modifier::BOLD)),
-            Span::styled(format!("  {} / {}", state.session_id, state.model), MUTED),
+            Span::styled("  Orchestral", ACCENT.add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  ·  {}", state.model), MUTED),
         ])),
         columns[0],
     );
     frame.render_widget(
-        Paragraph::new(format!("{} ", state.phase.label()))
+        Paragraph::new(format!("{phase_icon} {phase_label}  "))
             .style(phase_style(state.phase))
             .alignment(Alignment::Right),
         columns[1],
@@ -78,11 +83,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
 }
 
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
-    let block = Block::default()
-        .title(" Conversation ")
-        .borders(Borders::ALL)
-        .border_style(BORDER)
-        .padding(Padding::horizontal(1));
+    let block = Block::default().padding(Padding::horizontal(CONTENT_PADDING));
     let inner = block.inner(area);
     let lines = transcript_lines(state);
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
@@ -99,175 +100,373 @@ fn transcript_lines(state: &UiState) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if state.transcript.is_empty() && state.streamed_text().is_empty() {
         lines.push(Line::from(Span::styled(
-            "Describe a task. Orchestral will inspect, act, and report.",
+            "Ask for an outcome. Orchestral can inspect, act, and verify.",
             MUTED,
         )));
     }
+    let mut previous_role = None;
     for entry in &state.transcript {
+        if previous_role.is_some_and(|previous| should_separate(previous, entry.role)) {
+            lines.push(Line::default());
+        }
         push_entry_lines(&mut lines, entry);
-        lines.push(Line::default());
+        previous_role = Some(entry.role);
     }
     let stream = state.streamed_text();
     if !stream.is_empty() {
-        push_multiline(&mut lines, "Agent › ", &format!("{stream}▌"), ASSISTANT);
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        push_markdown(&mut lines, "• ", &stream, ASSISTANT, true);
     }
     lines
 }
 
+fn should_separate(previous: TranscriptRole, current: TranscriptRole) -> bool {
+    !matches!(
+        (previous, current),
+        (TranscriptRole::Tool, TranscriptRole::Tool)
+    )
+}
+
 fn push_entry_lines(lines: &mut Vec<Line<'static>>, entry: &TranscriptEntry) {
     match entry.role {
-        TranscriptRole::User => push_multiline(lines, "You   › ", &entry.text, USER),
-        TranscriptRole::Assistant => push_multiline(lines, "Agent › ", &entry.text, ASSISTANT),
-        TranscriptRole::System => push_multiline(lines, "• ", &entry.text, MUTED),
-        TranscriptRole::Error => push_multiline(lines, "Error › ", &entry.text, ERROR),
+        TranscriptRole::User => push_plain(lines, "› ", &entry.text, USER),
+        TranscriptRole::Assistant => push_markdown(lines, "• ", &entry.text, ASSISTANT, false),
+        TranscriptRole::System => push_plain(lines, "○ ", &entry.text, MUTED),
+        TranscriptRole::Error => push_plain(lines, "■ ", &entry.text, ERROR),
         TranscriptRole::Tool => {
             let (symbol, style) = match entry.tool_status {
-                Some(ToolActivityStatus::Running) => ("…", ACCENT),
-                Some(ToolActivityStatus::Succeeded) => ("✓", Style::new().fg(Color::Green)),
-                Some(ToolActivityStatus::Failed) => ("×", ERROR),
-                None => ("·", MUTED),
+                Some(ToolActivityStatus::Running) => ("• ", ACCENT),
+                Some(ToolActivityStatus::Succeeded) => ("✓ ", SUCCESS),
+                Some(ToolActivityStatus::Failed) => ("× ", ERROR),
+                None => ("· ", MUTED),
             };
-            push_multiline(lines, &format!("Tool {symbol} "), &entry.text, style);
+            push_status_text(lines, symbol, &entry.text, style);
         }
     }
 }
 
-fn push_multiline(lines: &mut Vec<Line<'static>>, prefix: &str, text: &str, style: Style) {
-    let mut parts = text.lines();
-    if let Some(first) = parts.next() {
-        lines.push(Line::from(vec![
-            Span::styled(prefix.to_owned(), style.add_modifier(Modifier::BOLD)),
-            Span::styled(first.to_owned(), style),
-        ]));
-    } else {
-        lines.push(Line::from(Span::styled(prefix.to_owned(), style)));
-    }
+fn push_plain(lines: &mut Vec<Line<'static>>, prefix: &str, text: &str, style: Style) {
     let indent = " ".repeat(UnicodeWidthStr::width(prefix));
-    for part in parts {
+    for (index, part) in text.split('\n').enumerate() {
+        let current_prefix = if index == 0 { prefix } else { &indent };
         lines.push(Line::from(vec![
-            Span::raw(indent.clone()),
+            Span::styled(
+                current_prefix.to_owned(),
+                style.add_modifier(Modifier::BOLD),
+            ),
             Span::styled(part.to_owned(), style),
         ]));
     }
 }
 
-fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
-    let block = Block::default()
-        .title(format!(" {} ", state.composer_title()))
-        .borders(Borders::ALL)
-        .border_style(if state.phase == UiPhase::WaitingInput {
-            ACCENT
+fn push_status_text(lines: &mut Vec<Line<'static>>, prefix: &str, text: &str, style: Style) {
+    let indent = " ".repeat(UnicodeWidthStr::width(prefix));
+    for (index, part) in text.split('\n').enumerate() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                if index == 0 {
+                    prefix.to_owned()
+                } else {
+                    indent.clone()
+                },
+                style.add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(part.to_owned(), if index == 0 { ASSISTANT } else { MUTED }),
+        ]));
+    }
+}
+
+fn push_markdown(
+    lines: &mut Vec<Line<'static>>,
+    prefix: &str,
+    text: &str,
+    style: Style,
+    streaming: bool,
+) {
+    let indent = " ".repeat(UnicodeWidthStr::width(prefix));
+    let mut first_content = true;
+    let mut in_code_block = false;
+    let start_len = lines.len();
+
+    for source in text.split('\n') {
+        let trimmed = source.trim_start();
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            continue;
+        }
+        if source.is_empty() {
+            lines.push(Line::default());
+            continue;
+        }
+
+        let current_prefix = if first_content { prefix } else { &indent };
+        first_content = false;
+        let mut spans = vec![Span::styled(
+            current_prefix.to_owned(),
+            style.add_modifier(Modifier::BOLD),
+        )];
+
+        if in_code_block {
+            spans.push(Span::styled("│ ", MUTED));
+            spans.push(Span::styled(source.to_owned(), ACCENT));
         } else {
-            BORDER
-        })
-        .padding(Padding::horizontal(1));
+            let (marker, content, line_style) = markdown_line(source, style);
+            if !marker.is_empty() {
+                spans.push(Span::styled(marker, MUTED));
+            }
+            spans.extend(inline_markdown_spans(content, line_style));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    if lines.len() == start_len {
+        lines.push(Line::from(Span::styled(prefix.to_owned(), style)));
+    }
+    if streaming {
+        if let Some(last) = lines.iter_mut().rev().find(|line| !line.spans.is_empty()) {
+            last.spans.push(Span::styled("▌", ACCENT));
+        } else {
+            lines.push(Line::from(Span::styled("• ▌", ACCENT)));
+        }
+    }
+}
+
+fn markdown_line(source: &str, style: Style) -> (String, &str, Style) {
+    let trimmed = source.trim_start();
+    let leading = &source[..source.len().saturating_sub(trimmed.len())];
+    if let Some(content) = trimmed
+        .strip_prefix("### ")
+        .or_else(|| trimmed.strip_prefix("## "))
+        .or_else(|| trimmed.strip_prefix("# "))
+    {
+        return (
+            leading.to_owned(),
+            content,
+            style.add_modifier(Modifier::BOLD),
+        );
+    }
+    if let Some(content) = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| trimmed.strip_prefix("+ "))
+    {
+        return (format!("{leading}– "), content, style);
+    }
+    if let Some(content) = trimmed.strip_prefix("> ") {
+        return (format!("{leading}│ "), content, style);
+    }
+    (String::new(), source, style)
+}
+
+fn inline_markdown_spans(mut text: &str, style: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    while !text.is_empty() {
+        let bold = closed_delimiter(text, "**");
+        let code = closed_delimiter(text, "`");
+        let selected = match (bold, code) {
+            (Some(bold), Some(code)) if bold.0 <= code.0 => Some((bold, "**", true)),
+            (Some(_), Some(code)) => Some((code, "`", false)),
+            (Some(bold), None) => Some((bold, "**", true)),
+            (None, Some(code)) => Some((code, "`", false)),
+            (None, None) => None,
+        };
+        let Some(((start, end), delimiter, is_bold)) = selected else {
+            spans.push(Span::styled(text.to_owned(), style));
+            break;
+        };
+        if start > 0 {
+            spans.push(Span::styled(text[..start].to_owned(), style));
+        }
+        let content_start = start + delimiter.len();
+        let content_end = end;
+        let token_style = if is_bold {
+            style.add_modifier(Modifier::BOLD)
+        } else {
+            ACCENT
+        };
+        spans.push(Span::styled(
+            text[content_start..content_end].to_owned(),
+            token_style,
+        ));
+        text = &text[end + delimiter.len()..];
+    }
+    spans
+}
+
+fn closed_delimiter(text: &str, delimiter: &str) -> Option<(usize, usize)> {
+    let start = text.find(delimiter)?;
+    let content_start = start + delimiter.len();
+    let end = text[content_start..].find(delimiter)? + content_start;
+    (end > content_start).then_some((start, end))
+}
+
+fn shows_working_status(phase: UiPhase) -> bool {
+    matches!(phase, UiPhase::Running | UiPhase::Cancelling)
+}
+
+fn render_working_status(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
+    if area.height == 0 {
+        return;
+    }
+    let (text, style) = match state.phase {
+        UiPhase::Running => ("• Working", ACCENT),
+        UiPhase::WaitingInput => ("? Waiting for your response", ACCENT),
+        UiPhase::WaitingApproval => ("! Approval required", Style::new().fg(Color::Yellow)),
+        UiPhase::Cancelling => ("◌ Stopping…", Style::new().fg(Color::Yellow)),
+        _ => return,
+    };
+    frame.render_widget(
+        Paragraph::new(text)
+            .style(style)
+            .block(Block::default().padding(Padding::horizontal(CONTENT_PADDING))),
+        area,
+    );
+}
+
+fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
+    if area.height == 0 {
+        return;
+    }
+    let block = Block::default().padding(Padding::new(CONTENT_PADDING, CONTENT_PADDING, 1, 1));
     let inner = block.inner(area);
+    let prompt_width = 2_u16.min(inner.width);
+    let prompt_area = Rect {
+        width: prompt_width,
+        ..inner
+    };
+    let content_area = Rect {
+        x: inner.x.saturating_add(prompt_width),
+        width: inner.width.saturating_sub(prompt_width),
+        ..inner
+    };
+    frame.render_widget(
+        Paragraph::new("› ").style(
+            if !matches!(state.phase, UiPhase::WaitingApproval | UiPhase::Cancelling) {
+                ACCENT.add_modifier(Modifier::BOLD)
+            } else {
+                MUTED
+            },
+        ),
+        prompt_area,
+    );
     let content = if state.composer.is_empty() {
         Text::from(Line::from(Span::styled(
-            if state.phase == UiPhase::WaitingApproval {
-                "Choose allow or deny"
-            } else {
-                "Type a message…"
-            },
+            composer_placeholder(state.phase),
             MUTED.add_modifier(Modifier::ITALIC),
         )))
     } else {
         Text::styled(state.composer.clone(), ASSISTANT)
     };
     frame.render_widget(
-        Paragraph::new(content)
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        area,
+        Paragraph::new(content).wrap(Wrap { trim: false }),
+        content_area,
     );
 
     if !matches!(state.phase, UiPhase::WaitingApproval | UiPhase::Cancelling)
-        && inner.width > 0
-        && inner.height > 0
+        && content_area.width > 0
+        && content_area.height > 0
     {
-        let (x, y) = composer_cursor(state, inner);
+        let (x, y) = composer_cursor(state, content_area);
         frame.set_cursor_position((x, y));
     }
 }
 
-fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
-    let shortcuts = if area.width < 60 {
-        match state.phase {
-            UiPhase::Running | UiPhase::WaitingInput | UiPhase::WaitingApproval => {
-                "Ctrl+C cancel  Esc quit"
-            }
-            _ => "Enter send  Esc quit",
-        }
-    } else {
-        match state.phase {
-            UiPhase::Running | UiPhase::WaitingInput | UiPhase::WaitingApproval => {
-                "Enter send  Ctrl+C cancel  PgUp/PgDn scroll  Esc quit"
-            }
-            _ => "Enter send  Shift+Enter newline  PgUp/PgDn scroll  Esc quit",
-        }
-    };
-    frame.render_widget(Paragraph::new(format!(" {shortcuts}")).style(MUTED), area);
-}
-
-fn render_pending(frame: &mut Frame<'_>, viewport: Rect, pending: &PendingOverlay) {
-    let area = modal_area(viewport);
-    let (title, body, hint) = match pending {
-        PendingOverlay::Input { prompt, .. } => (
-            " Input requested ",
-            prompt.as_str(),
-            "Type the response below, then press Enter",
-        ),
-        PendingOverlay::Approval { summary, .. } => (
-            " Approval required ",
-            summary.as_str(),
-            if area.width < 50 {
-                "[a] allow   [d] deny"
-            } else {
-                "[a] allow this exact operation   [d] deny"
-            },
-        ),
-    };
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(body.to_owned()),
-            Line::default(),
-            Line::from(Span::styled(hint.to_owned(), ACCENT)),
-        ])
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(ACCENT)
-                .padding(Padding::horizontal(1)),
-        )
-        .wrap(Wrap { trim: false }),
-        area,
-    );
-}
-
-fn modal_area(viewport: Rect) -> Rect {
-    let height = viewport.height.clamp(1, 8);
-    let compact = viewport.height <= 8;
-    let width = if compact {
-        viewport.width
-    } else {
-        viewport.width.saturating_sub(4).clamp(20, 80)
-    };
-    Rect {
-        x: if compact {
-            viewport.x
-        } else {
-            viewport.x + viewport.width.saturating_sub(width) / 2
-        },
-        y: if compact { viewport.y } else { viewport.y + 1 },
-        width,
-        height,
+fn composer_placeholder(phase: UiPhase) -> &'static str {
+    match phase {
+        UiPhase::Running => "Add guidance while Orchestral works…",
+        UiPhase::WaitingInput => "Type your response…",
+        UiPhase::WaitingApproval => "Press a to allow or d to deny",
+        UiPhase::Cancelling => "Stopping the current run…",
+        UiPhase::Failed => "Ask Orchestral to retry another way…",
+        _ => "Ask Orchestral to do anything…",
     }
 }
 
+fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
+    let active = matches!(
+        state.phase,
+        UiPhase::Running | UiPhase::WaitingInput | UiPhase::WaitingApproval
+    );
+    if area.width < 64 {
+        let shortcuts = match state.phase {
+            UiPhase::WaitingApproval => "  a allow · d deny · esc quit",
+            UiPhase::WaitingInput => "  enter reply · ctrl+c stop · esc quit",
+            UiPhase::Running => "  enter steer · ctrl+c stop · esc quit",
+            _ if active => "  ctrl+c stop · esc quit",
+            _ => "  enter send · esc quit",
+        };
+        frame.render_widget(Paragraph::new(shortcuts).style(MUTED), area);
+        return;
+    }
+    let columns =
+        Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)]).split(area);
+    let left = if active {
+        "  enter send  ·  ctrl+c interrupt"
+    } else {
+        "  enter send  ·  shift+enter newline"
+    };
+    frame.render_widget(Paragraph::new(left).style(MUTED), columns[0]);
+    frame.render_widget(
+        Paragraph::new("pgup/pgdn scroll  ·  esc quit  ")
+            .style(MUTED)
+            .alignment(Alignment::Right),
+        columns[1],
+    );
+}
+
+fn render_pending(frame: &mut Frame<'_>, viewport: Rect, pending: &PendingOverlay) {
+    frame.render_widget(Clear, viewport);
+    let horizontal = if viewport.width >= 48 { 4 } else { 2 };
+    let top = u16::from(viewport.height >= 10);
+    let area = Rect {
+        x: viewport.x.saturating_add(horizontal),
+        y: viewport.y.saturating_add(top),
+        width: viewport.width.saturating_sub(horizontal.saturating_mul(2)),
+        height: viewport.height.saturating_sub(top),
+    };
+    let mut lines = Vec::new();
+    match pending {
+        PendingOverlay::Input { prompt, .. } => {
+            lines.push(Line::from(Span::styled(
+                "? Input requested",
+                ACCENT.add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::default());
+            lines.extend(prompt.lines().map(|line| Line::from(line.to_owned())));
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                "Reply below, then press Enter",
+                MUTED,
+            )));
+        }
+        PendingOverlay::Approval { summary, .. } => {
+            lines.push(Line::from(Span::styled(
+                "! Approval required",
+                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::default());
+            lines.extend(summary.lines().map(|line| Line::from(line.to_owned())));
+            lines.push(Line::default());
+            lines.push(Line::from(vec![
+                Span::styled("› a", ACCENT.add_modifier(Modifier::BOLD)),
+                Span::raw("  Allow this operation"),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("  d", MUTED.add_modifier(Modifier::BOLD)),
+                Span::raw("  Deny"),
+            ]));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
 fn composer_height(state: &UiState, width: u16) -> u16 {
-    let inner_width = width.saturating_sub(4).max(1) as usize;
+    if matches!(state.phase, UiPhase::WaitingApproval | UiPhase::Cancelling) {
+        return 0;
+    }
+    let inner_width = width.saturating_sub(2 * CONTENT_PADDING + 2).max(1) as usize;
     let rows = state
         .composer
         .split('\n')
@@ -305,6 +504,19 @@ fn phase_style(phase: UiPhase) -> Style {
         UiPhase::Running | UiPhase::WaitingInput | UiPhase::WaitingApproval => ACCENT,
         UiPhase::Cancelling | UiPhase::Cancelled => Style::new().fg(Color::Yellow),
         UiPhase::Failed => ERROR,
+    }
+}
+
+fn phase_badge(phase: UiPhase) -> (&'static str, &'static str) {
+    match phase {
+        UiPhase::Idle => ("○", "ready"),
+        UiPhase::Running => ("●", "running"),
+        UiPhase::WaitingInput => ("?", "input"),
+        UiPhase::WaitingApproval => ("!", "approval"),
+        UiPhase::Cancelling => ("◌", "stopping"),
+        UiPhase::Completed => ("✓", "done"),
+        UiPhase::Failed => ("×", "failed"),
+        UiPhase::Cancelled => ("■", "cancelled"),
     }
 }
 
@@ -396,6 +608,44 @@ mod tests {
             UiMsg::InsertText("orchestral-runtime\n保留协议兼容性".to_owned()),
         );
         assert_snapshot!("tui_80x24_stream_input", render_to_string(&state, 80, 24));
+    }
+
+    #[test]
+    fn snapshot_100x24_running_with_compact_tool_activity() {
+        let mut state = UiState::new("session-running", "gemini-2.5-flash");
+        state.phase = UiPhase::Running;
+        state.run_id = Some("run-running".to_owned());
+        state.transcript.push(TranscriptEntry::user(
+            "阅读核心代码，说明执行链路并给出证据。",
+        ));
+        update(
+            &mut state,
+            UiMsg::ToolActivity {
+                activity_id: "read-core".to_owned(),
+                summary: "file_read core/orchestral-runtime/src/generic_agent/coordinator.rs"
+                    .to_owned(),
+                status: ToolActivityStatus::Succeeded,
+            },
+        );
+        update(
+            &mut state,
+            UiMsg::ToolActivity {
+                activity_id: "search-flow".to_owned(),
+                summary: "exec_command rg execute_model_run core/".to_owned(),
+                status: ToolActivityStatus::Running,
+            },
+        );
+        update(
+            &mut state,
+            UiMsg::StreamDelta {
+                delta_id: "delta-running".to_owned(),
+                output_id: "output-running".to_owned(),
+                order: 0,
+                text: "我正在核对模型循环与工具执行边界。".to_owned(),
+            },
+        );
+
+        assert_snapshot!("tui_100x24_running", render_to_string(&state, 100, 24));
     }
 
     #[test]
@@ -491,6 +741,26 @@ mod tests {
             completed.contains("最终回答末行必须可见"),
             "completed viewport clipped the final answer:\n{completed}"
         );
+    }
+
+    #[test]
+    fn completed_assistant_markdown_is_presented_without_raw_control_markers() {
+        let mut state = UiState::new("session-markdown", "model-markdown");
+        state.phase = UiPhase::Completed;
+        state.transcript.push(TranscriptEntry::assistant(
+            "answer-markdown",
+            "## 结果\n\n**修复完成**，运行 `cargo test`。\n\n```text\n24 tests passed\n```",
+        ));
+
+        let rendered = render_to_string(&state, 70, 16);
+        assert!(rendered.contains("结果"), "{rendered}");
+        assert!(
+            rendered.contains("修复完成，运行 cargo test。"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("│ 24 tests passed"), "{rendered}");
+        assert!(!rendered.contains("**"), "{rendered}");
+        assert!(!rendered.contains("```"), "{rendered}");
     }
 
     fn render_to_string(state: &UiState, width: u16, height: u16) -> String {

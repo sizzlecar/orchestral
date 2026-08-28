@@ -2,15 +2,15 @@
 source: apps/orchestral-cli/src/tui/render.rs
 expression: "render_to_string(&state, 40, 12)"
 ---
- Orchestral            waiting approval
-┌ Approval required ───────────────────┐
-│ Run workspace tests with cargo       │
-│                                      │
-│ [a] allow   [d] deny                 │
-│                                      │
-│                                      │
-└──────────────────────────────────────┘
-┌ Approval response ───────────────────┐
-│ Choose allow or deny                 │
-└──────────────────────────────────────┘
- Ctrl+C cancel  Esc quit
+  Orchestral                ! approval
+
+  ! Approval required
+
+  Run workspace tests with cargo
+
+  › a  Allow this operation
+    d  Deny
+
+
+
+  a allow · d deny · esc quit

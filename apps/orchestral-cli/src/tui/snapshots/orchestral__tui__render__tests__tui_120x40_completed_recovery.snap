@@ -2,43 +2,43 @@
 source: apps/orchestral-cli/src/tui/render.rs
 expression: "render_to_string(&state, 120, 40)"
 ---
- Orchestral  会话-恢复 / gemini-3.1-pro                                                                       completed
-┌ Conversation ────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ You   › 按照发布检查 Skill 验证 checkout 服务；如果远程查询失败，就用本地测试恢复。                                  │
-│                                                                                                                      │
-│ Tool ✓ skill_read release-evidence → instructions loaded                                                             │
-│                                                                                                                      │
-│ Tool × mcp__inventory__deployment_color → request timed out                                                          │
-│                                                                                                                      │
-│ Tool ✓ exec_command cargo test → session 7 started                                                                   │
-│                                                                                                                      │
-│ Tool ✓ write_stdin session 7 → exited 0; 18 tests passed                                                             │
-│                                                                                                                      │
-│ Agent › 已恢复完成：MCP 查询超时，但本地发布检查的 18 项测试全部通过；没有发现需要修改的文件。                       │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Type a message…                                                                                                      │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
- Enter send  Shift+Enter newline  PgUp/PgDn scroll  Esc quit
+  Orchestral  ·  gemini-3.1-pro                                                                                 ✓ done
+  › 按照发布检查 Skill 验证 checkout 服务；如果远程查询失败，就用本地测试恢复。
+
+  ✓ skill_read release-evidence → instructions loaded
+  × mcp__inventory__deployment_color → request timed out
+  ✓ exec_command cargo test → session 7 started
+  ✓ write_stdin session 7 → exited 0; 18 tests passed
+
+  • 已恢复完成：MCP 查询超时，但本地发布检查的 18 项测试全部通过；没有发现需要修改的文件。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  › Ask Orchestral to do anything…
+
+  enter send  ·  shift+enter newline                                                     pgup/pgdn scroll  ·  esc quit
