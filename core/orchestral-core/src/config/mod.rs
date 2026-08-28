@@ -232,6 +232,10 @@ pub struct ExecToolConfig {
     pub enabled: bool,
     #[serde(default)]
     pub shell: Option<String>,
+    /// Exact `host:port` destinations available to commands. Empty denies
+    /// network access.
+    #[serde(default)]
+    pub network_targets: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

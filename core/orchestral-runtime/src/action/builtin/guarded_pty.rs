@@ -128,7 +128,7 @@ impl GuardedToolExecutor for GuardedPtyCreateExecutor {
         };
         let command = match self
             .program_aliases
-            .resolve(command, &bounds.process.allowed_programs)
+            .resolve(command, &bounds.process.interactive.command_shells)
         {
             Ok(command) => command,
             Err(message) => return rejected("pty_program_denied", message),
@@ -174,12 +174,14 @@ impl GuardedToolExecutor for GuardedPtyCreateExecutor {
             readable_roots: readable_roots.clone(),
             writable_roots: writable_roots.clone(),
             allow_child_processes: false,
-            allowed_programs: bounds
+            launcher_programs: bounds
                 .process
-                .allowed_programs
+                .interactive
+                .command_shells
                 .iter()
                 .map(PathBuf::from)
                 .collect(),
+            network_targets: BTreeSet::new(),
             linux_bwrap_path: None,
         };
         let sandboxed = match sandbox_command(command, args, &cwd, &sandbox_policy) {
@@ -404,9 +406,9 @@ pub fn guarded_pty_create_descriptor_with_program_aliases(
 ) -> ToolDescriptor {
     let restriction = guarded_pty_restriction(restriction, true);
     let programs =
-        program_aliases.advertised_programs(&restriction.bounds.process.allowed_programs);
+        program_aliases.advertised_programs(&restriction.bounds.process.interactive.command_shells);
     let accepted_commands =
-        program_aliases.accepted_commands(&restriction.bounds.process.allowed_programs);
+        program_aliases.accepted_commands(&restriction.bounds.process.interactive.command_shells);
     ToolDescriptor {
         tool_id: ToolId::new("orchestral/pty_create/v1"),
         model_schema: ModelToolSchema {
@@ -576,7 +578,8 @@ fn guarded_pty_restriction(
     restriction.bounds.sandbox.required = true;
     restriction.bounds.sandbox.allowed_profiles =
         BTreeSet::from([GUARDED_PTY_SANDBOX_PROFILE.to_owned()]);
-    restriction.bounds.process.allow_shell_expression = false;
+    restriction.bounds.process.interactive.enabled = true;
+    restriction.bounds.process.interactive.allow_child_processes = false;
     restriction.bounds.environment.inherit_host_environment = false;
     restriction
 }

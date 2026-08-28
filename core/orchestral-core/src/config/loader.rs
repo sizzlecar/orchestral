@@ -62,6 +62,15 @@ fn validate_config(config: &OrchestralConfig) -> Result<(), ConfigError> {
     if config.tools.max_timeout_ms == 0 || config.tools.max_output_bytes == 0 {
         return invalid("Tool limits must be positive");
     }
+    if config
+        .tools
+        .exec
+        .network_targets
+        .iter()
+        .any(|target| !valid_network_target(target))
+    {
+        return invalid("tools.exec.network_targets must contain exact host:port values");
+    }
     validate_storage_backend("journal", &config.journal.backend, &config.journal.root_dir)?;
     validate_storage_backend(
         "artifacts",
@@ -74,6 +83,18 @@ fn validate_config(config: &OrchestralConfig) -> Result<(), ConfigError> {
     validate_providers(config)?;
     validate_mcp(config)?;
     Ok(())
+}
+
+fn valid_network_target(target: &str) -> bool {
+    let Some((host, port)) = target.trim().rsplit_once(':') else {
+        return false;
+    };
+    let host = host.trim_matches(['[', ']']);
+    !host.is_empty()
+        && host
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || ".-_:".contains(character))
+        && port.parse::<u16>().is_ok_and(|port| port > 0)
 }
 
 fn validate_storage_backend(
@@ -198,6 +219,34 @@ mod tests {
         let mut config = OrchestralConfig::default();
         config.tools.exec.enabled = true;
         assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn exec_network_targets_are_exact_host_and_port_pairs() {
+        let mut config = OrchestralConfig::default();
+        config.tools.exec.network_targets = vec![
+            "localhost:43128".to_owned(),
+            "127.0.0.1:443".to_owned(),
+            "[::1]:8080".to_owned(),
+            "api.example.com:443".to_owned(),
+        ];
+        assert!(validate_config(&config).is_ok());
+
+        for invalid_target in [
+            "",
+            "api.example.com",
+            "api.example.com:*",
+            "api.example.com:0",
+            "api.example.com:65536",
+            "api.example.com:443\") (allow network-outbound)",
+        ] {
+            config.tools.exec.network_targets = vec![invalid_target.to_owned()];
+            assert!(matches!(
+                validate_config(&config),
+                Err(ConfigError::Invalid(message))
+                    if message.contains("exact host:port")
+            ));
+        }
     }
 
     #[test]

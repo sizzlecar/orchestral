@@ -15,7 +15,7 @@ use orchestral_core::tool_protocol::{
     ApprovalPolicy, EffectScope, EnvironmentPolicy, FilesystemPolicy, HostApprovalIssuer,
     HostApprovalVerifier, HostToolPolicy, InMemoryApprovalCapabilityStore, NetworkPolicy,
     ProcessPolicy, RunToolGrant, SandboxPolicy, ToolCallId, ToolId, ToolInvocation, ToolOutcome,
-    ToolOutput, ToolPolicyBounds, ToolRestriction,
+    ToolOutput, ToolPolicyBounds, ToolRestriction, TransportLaunchPolicy,
 };
 use orchestral_mcp_streamable_http::{
     ResolvedCredentialHeader, StreamableHttpMcpTransportConfig, StreamableHttpMcpTransportFactory,
@@ -202,8 +202,10 @@ fn bounds(program: &Path, root: &Path, timeout_ms: u64) -> ToolPolicyBounds {
             allowed_profiles: BTreeSet::from([MCP_STDIO_SANDBOX_PROFILE.to_owned()]),
         },
         process: ProcessPolicy {
-            allowed_programs: BTreeSet::from([program.to_string_lossy().to_string()]),
-            allow_shell_expression: false,
+            interactive: Default::default(),
+            transport: TransportLaunchPolicy {
+                allowed_programs: BTreeSet::from([program.to_string_lossy().to_string()]),
+            },
         },
         filesystem: FilesystemPolicy {
             readable_roots: BTreeSet::from([root.to_string_lossy().into_owned()]),

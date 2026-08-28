@@ -31,8 +31,9 @@ use orchestral_core::skill_protocol::{SkillSourceKind, SKILL_CATALOG_RESOURCE_KI
 use orchestral_core::tool_effect::{InMemoryToolEffectJournalStore, ToolEffectJournalStore};
 use orchestral_core::tool_protocol::{
     ApprovalPolicy, EffectScope, EnvironmentPolicy, FilesystemPolicy, HostApprovalVerifier,
-    HostToolPolicy, InMemoryApprovalCapabilityStore, NetworkPolicy, ProcessPolicy, RunToolGrant,
-    SandboxPolicy, ToolPolicyBounds, ToolRestriction,
+    HostToolPolicy, InMemoryApprovalCapabilityStore, InteractiveCommandPolicy, NetworkPolicy,
+    ProcessPolicy, RunToolGrant, SandboxPolicy, ToolPolicyBounds, ToolRestriction,
+    TransportLaunchPolicy,
 };
 use orchestral_mcp_streamable_http::{
     ResolvedCredentialHeader, StreamableHttpMcpTransportConfig, StreamableHttpMcpTransportFactory,
@@ -45,8 +46,8 @@ use orchestral_model_openai::{OpenAiCompatibleBackend, OpenAiCompatibleConfig};
 use orchestral_runtime::tools::{
     guarded_apply_patch_descriptor, guarded_artifact_read_descriptor,
     guarded_exec_command_descriptor, guarded_file_read_descriptor, guarded_write_stdin_descriptor,
-    GuardedApplyPatchExecutor, GuardedArtifactReadExecutor, GuardedExecCommandExecutor,
-    GuardedFileReadExecutor, GuardedWriteStdinExecutor,
+    CommandEnvironmentSnapshot, GuardedApplyPatchExecutor, GuardedArtifactReadExecutor,
+    GuardedExecCommandExecutor, GuardedFileReadExecutor, GuardedWriteStdinExecutor,
 };
 use orchestral_runtime::{
     AgentClient, AgentControlEvent, AgentController, DeterministicExtractiveSessionSummarizer,
@@ -94,6 +95,8 @@ struct CliExecHost {
     shell: PathBuf,
     runtime_readable_roots: Vec<PathBuf>,
     environment_names: BTreeSet<String>,
+    environment: CommandEnvironmentSnapshot,
+    network_targets: BTreeSet<String>,
 }
 
 pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
@@ -335,12 +338,10 @@ fn build_cli_tool_runtime(
         .iter()
         .flat_map(GuardedMcpServerConfig::effect_scopes)
         .collect::<BTreeSet<_>>();
-    let mut allowed_programs = exec_programs.clone();
-    allowed_programs.extend(
-        mcp_configs
-            .iter()
-            .flat_map(GuardedMcpServerConfig::allowed_programs),
-    );
+    let transport_programs = mcp_configs
+        .iter()
+        .flat_map(GuardedMcpServerConfig::allowed_programs)
+        .collect::<BTreeSet<_>>();
     let mut allowed_effects = BTreeSet::from([
         EffectScope::FilesystemRead,
         EffectScope::FilesystemWrite,
@@ -349,6 +350,7 @@ fn build_cli_tool_runtime(
     if exec_enabled {
         allowed_effects.extend([
             EffectScope::Process,
+            EffectScope::Network,
             EffectScope::EnvironmentRead,
             EffectScope::ExternalSideEffect,
         ]);
@@ -361,10 +363,13 @@ fn build_cli_tool_runtime(
     if let Some(host) = &exec_host {
         allowed_environment.extend(host.environment_names.iter().cloned());
     }
-    let allowed_network_targets = mcp_configs
+    let mut allowed_network_targets = mcp_configs
         .iter()
         .flat_map(GuardedMcpServerConfig::allowed_network_targets)
-        .collect();
+        .collect::<BTreeSet<_>>();
+    if let Some(host) = &exec_host {
+        allowed_network_targets.extend(host.network_targets.iter().cloned());
+    }
     let allowed_credentials = mcp_configs
         .iter()
         .flat_map(GuardedMcpServerConfig::credential_references)
@@ -388,8 +393,14 @@ fn build_cli_tool_runtime(
             .collect(),
         },
         process: ProcessPolicy {
-            allowed_programs,
-            allow_shell_expression: exec_enabled,
+            interactive: InteractiveCommandPolicy {
+                enabled: exec_enabled,
+                command_shells: exec_programs.clone(),
+                allow_child_processes: exec_enabled,
+            },
+            transport: TransportLaunchPolicy {
+                allowed_programs: transport_programs,
+            },
         },
         filesystem: FilesystemPolicy {
             readable_roots: BTreeSet::from([workspace.clone()]),
@@ -412,6 +423,7 @@ fn build_cli_tool_runtime(
     let mut exec_bounds = bounds.clone();
     exec_bounds.allowed_effects = BTreeSet::from([
         EffectScope::Process,
+        EffectScope::Network,
         EffectScope::FilesystemRead,
         EffectScope::FilesystemWrite,
         EffectScope::EnvironmentRead,
@@ -419,9 +431,18 @@ fn build_cli_tool_runtime(
     ]);
     exec_bounds.sandbox.allowed_profiles =
         BTreeSet::from([orchestral_runtime::tools::GUARDED_EXEC_SANDBOX_PROFILE.to_owned()]);
-    exec_bounds.process.allowed_programs = exec_programs;
-    exec_bounds.process.allow_shell_expression = true;
-    exec_bounds.network = NetworkPolicy::default();
+    exec_bounds.process.interactive = InteractiveCommandPolicy {
+        enabled: true,
+        command_shells: exec_programs,
+        allow_child_processes: true,
+    };
+    exec_bounds.process.transport = TransportLaunchPolicy::default();
+    exec_bounds.network = NetworkPolicy {
+        allowed_targets: exec_host
+            .as_ref()
+            .map(|host| host.network_targets.clone())
+            .unwrap_or_default(),
+    };
     exec_bounds.environment = EnvironmentPolicy {
         allowed_variables: exec_host
             .as_ref()
@@ -495,6 +516,7 @@ fn build_cli_tool_runtime(
                         manager.clone(),
                         exec_host.shell,
                         exec_host.runtime_readable_roots,
+                        exec_host.environment,
                     )
                     .map_err(anyhow::Error::msg)
                     .context("configure guarded exec_command Tool")?,
@@ -600,24 +622,27 @@ fn configured_exec_host(config: &OrchestralConfig) -> anyhow::Result<Option<CliE
             .map(PathBuf::from)
             .context("no command shell is available; set tools.exec.shell")?
     };
+    let environment_names = [
+        "PATH",
+        "HOME",
+        "USER",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "COLORTERM",
+        "NO_COLOR",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<BTreeSet<_>>();
     Ok(Some(CliExecHost {
         runtime_readable_roots: exec_runtime_readable_roots(&shell),
         shell,
-        environment_names: [
-            "PATH",
-            "HOME",
-            "USER",
-            "LANG",
-            "LC_ALL",
-            "TERM",
-            "COLORTERM",
-            "NO_COLOR",
-            "CARGO_HOME",
-            "RUSTUP_HOME",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect(),
+        environment: CommandEnvironmentSnapshot::capture(environment_names.iter().cloned()),
+        environment_names,
+        network_targets: config.tools.exec.network_targets.iter().cloned().collect(),
     }))
 }
 

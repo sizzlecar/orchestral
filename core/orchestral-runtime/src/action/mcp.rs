@@ -396,7 +396,8 @@ impl McpTransportFactory for StdioMcpTransportFactory {
                 readable_roots: self.sandbox.readable_roots.iter().cloned().collect(),
                 writable_roots: self.sandbox.writable_roots.iter().cloned().collect(),
                 allow_child_processes: false,
-                allowed_programs: vec![self.program.clone()],
+                launcher_programs: vec![self.program.clone()],
+                network_targets: BTreeSet::new(),
                 linux_bwrap_path: None,
             },
         )
@@ -1078,7 +1079,7 @@ impl McpToolsAdapterRegistry {
             if !config
                 .effect_scopes()
                 .is_subset(&restriction.bounds.allowed_effects)
-                || !programs.is_subset(&restriction.bounds.process.allowed_programs)
+                || !programs.is_subset(&restriction.bounds.process.transport.allowed_programs)
                 || !read_roots.is_subset(&restriction.bounds.filesystem.readable_roots)
                 || !write_roots.is_subset(&restriction.bounds.filesystem.writable_roots)
                 || !sandbox_profiles.is_subset(&restriction.bounds.sandbox.allowed_profiles)
@@ -1271,7 +1272,7 @@ impl GuardedToolExecutor for GuardedMcpToolExecutor {
         let network_targets = self.manager.config.allowed_network_targets();
         let environment = self.manager.config.environment_names();
         let credentials = self.manager.config.credential_references();
-        if !programs.is_subset(&bounds.process.allowed_programs)
+        if !programs.is_subset(&bounds.process.transport.allowed_programs)
             || !read_roots.is_subset(&bounds.filesystem.readable_roots)
             || !write_roots.is_subset(&bounds.filesystem.writable_roots)
             || !sandbox_profiles.is_subset(&bounds.sandbox.allowed_profiles)
@@ -2409,7 +2410,7 @@ mod mcp_lifecycle_gate_tests {
             max_output_bytes: Some(64 * 1024),
             ..ToolPolicyBounds::default()
         };
-        bounds.process.allowed_programs = authority.process_programs.clone();
+        bounds.process.transport.allowed_programs = authority.process_programs.clone();
         bounds.filesystem.readable_roots = authority.filesystem_read_roots.clone();
         bounds.filesystem.writable_roots = authority.filesystem_write_roots.clone();
         bounds.sandbox.allowed_profiles = authority.sandbox_profiles.clone();

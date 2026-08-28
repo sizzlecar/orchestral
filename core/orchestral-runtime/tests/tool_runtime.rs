@@ -21,9 +21,10 @@ use orchestral_core::tool_effect::{
 use orchestral_core::tool_protocol::{
     ApprovalPolicy, EffectScope, EffectiveToolPolicy, EnvironmentPolicy, FilesystemPolicy,
     HostApprovalIssuer, HostApprovalVerifier, HostToolPolicy, InMemoryApprovalCapabilityStore,
-    ModelToolSchema, NetworkPolicy, ProcessPolicy, RunToolGrant, SandboxPolicy, ToolCallId,
-    ToolConcurrency, ToolDescriptor, ToolId, ToolIdempotency, ToolInvocation, ToolOutcome,
-    ToolOutput, ToolPolicyBounds, ToolRestriction,
+    InteractiveCommandPolicy, ModelToolSchema, NetworkPolicy, ProcessPolicy, RunToolGrant,
+    SandboxPolicy, ToolCallId, ToolConcurrency, ToolDescriptor, ToolId, ToolIdempotency,
+    ToolInvocation, ToolOutcome, ToolOutput, ToolPolicyBounds, ToolRestriction,
+    TransportLaunchPolicy,
 };
 use orchestral_runtime::{
     tools::{
@@ -62,6 +63,17 @@ fn effects(values: &[EffectScope]) -> BTreeSet<EffectScope> {
     values.iter().copied().collect()
 }
 
+fn interactive_process(command_shells: BTreeSet<String>) -> ProcessPolicy {
+    ProcessPolicy {
+        interactive: InteractiveCommandPolicy {
+            enabled: true,
+            command_shells,
+            allow_child_processes: false,
+        },
+        transport: TransportLaunchPolicy::default(),
+    }
+}
+
 fn policy(approval: ApprovalPolicy) -> ToolPolicyBounds {
     ToolPolicyBounds {
         allowed_effects: effects(&[EffectScope::Process]),
@@ -70,10 +82,7 @@ fn policy(approval: ApprovalPolicy) -> ToolPolicyBounds {
             required: false,
             allowed_profiles: strings(&["strict"]),
         },
-        process: ProcessPolicy {
-            allowed_programs: strings(&["echo"]),
-            allow_shell_expression: false,
-        },
+        process: interactive_process(strings(&["echo"])),
         filesystem: FilesystemPolicy::default(),
         network: NetworkPolicy::default(),
         environment: EnvironmentPolicy::default(),
@@ -146,10 +155,7 @@ fn strict_shell_security_bounds(root: &Path) -> (ToolPolicyBounds, String) {
                 required: true,
                 allowed_profiles: strings(&[GUARDED_SHELL_SANDBOX_PROFILE]),
             },
-            process: ProcessPolicy {
-                allowed_programs: BTreeSet::from([executable.clone()]),
-                allow_shell_expression: false,
-            },
+            process: interactive_process(BTreeSet::from([executable.clone()])),
             filesystem: FilesystemPolicy {
                 readable_roots: BTreeSet::from([root.clone()]),
                 writable_roots: BTreeSet::from([root]),
@@ -592,10 +598,7 @@ async fn guarded_shell_executes_only_after_exact_approval_inside_the_host_sandbo
             required: true,
             allowed_profiles: strings(&[GUARDED_SHELL_SANDBOX_PROFILE]),
         },
-        process: ProcessPolicy {
-            allowed_programs: BTreeSet::from([executable.clone()]),
-            allow_shell_expression: false,
-        },
+        process: interactive_process(BTreeSet::from([executable.clone()])),
         filesystem: FilesystemPolicy {
             readable_roots: BTreeSet::from([workspace.clone()]),
             writable_roots: BTreeSet::from([workspace]),
@@ -694,10 +697,7 @@ async fn one_thousand_guarded_shell_wait_cancellations_reap_processes_with_subse
             required: true,
             allowed_profiles: strings(&[GUARDED_SHELL_SANDBOX_PROFILE]),
         },
-        process: ProcessPolicy {
-            allowed_programs: BTreeSet::from([executable.clone()]),
-            allow_shell_expression: false,
-        },
+        process: interactive_process(BTreeSet::from([executable.clone()])),
         filesystem: FilesystemPolicy {
             readable_roots: strings(&[workspace_string.as_str()]),
             writable_roots: strings(&[workspace_string.as_str()]),
@@ -841,10 +841,7 @@ async fn one_thousand_guarded_shell_read_cancellations_reap_pipe_holders_with_su
             required: true,
             allowed_profiles: strings(&[GUARDED_SHELL_SANDBOX_PROFILE]),
         },
-        process: ProcessPolicy {
-            allowed_programs: BTreeSet::from([executable.clone()]),
-            allow_shell_expression: false,
-        },
+        process: interactive_process(BTreeSet::from([executable.clone()])),
         filesystem: FilesystemPolicy {
             readable_roots: strings(&[workspace_string.as_str()]),
             writable_roots: strings(&[workspace_string.as_str()]),
@@ -985,10 +982,7 @@ async fn guarded_pty_tools_are_run_scoped_and_cancel_closes_the_process() {
             required: false,
             allowed_profiles: strings(&[GUARDED_PTY_SANDBOX_PROFILE]),
         },
-        process: ProcessPolicy {
-            allowed_programs: BTreeSet::from([executable.clone()]),
-            allow_shell_expression: false,
-        },
+        process: interactive_process(BTreeSet::from([executable.clone()])),
         filesystem: FilesystemPolicy {
             readable_roots: BTreeSet::from([workspace.clone()]),
             writable_roots: BTreeSet::from([workspace]),
@@ -1224,10 +1218,7 @@ async fn one_thousand_guarded_pty_reads_outside_host_roots_leak_zero_secrets() {
             required: true,
             allowed_profiles: strings(&[GUARDED_PTY_SANDBOX_PROFILE]),
         },
-        process: ProcessPolicy {
-            allowed_programs: BTreeSet::from([executable.clone()]),
-            allow_shell_expression: false,
-        },
+        process: interactive_process(BTreeSet::from([executable.clone()])),
         filesystem: FilesystemPolicy {
             readable_roots: strings(&[&workspace_string]),
             writable_roots: strings(&[&workspace_string]),

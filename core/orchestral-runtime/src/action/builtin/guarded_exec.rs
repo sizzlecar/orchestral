@@ -1,6 +1,6 @@
 //! Unified model-facing command execution Tools.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,15 +18,55 @@ use crate::exec_process::{
 use crate::tool_runtime::{GuardedToolExecution, GuardedToolExecutor};
 use crate::tools::shell_sandbox::{sandbox_command, ShellSandboxPolicy};
 
-use super::support::{build_allowlisted_env, canonical_roots, truncate_utf8_lossy};
+use super::support::{canonical_roots, truncate_utf8_lossy};
 
 pub const GUARDED_EXEC_SANDBOX_PROFILE: &str = "orchestral.exec_command.v1";
+
+/// Immutable Host environment captured when the Agent runtime is composed.
+/// Tool calls only receive the intersection with their effective policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommandEnvironmentSnapshot {
+    values: BTreeMap<String, String>,
+}
+
+impl CommandEnvironmentSnapshot {
+    pub fn capture(names: impl IntoIterator<Item = String>) -> Self {
+        Self::from_values(
+            names
+                .into_iter()
+                .filter_map(|name| std::env::var(&name).ok().map(|value| (name, value))),
+        )
+    }
+
+    pub fn from_values(values: impl IntoIterator<Item = (String, String)>) -> Self {
+        Self {
+            values: values
+                .into_iter()
+                .filter(|(name, _)| !name.trim().is_empty())
+                .map(|(name, value)| (name.to_ascii_uppercase(), value))
+                .collect(),
+        }
+    }
+
+    pub fn names(&self) -> BTreeSet<String> {
+        self.values.keys().cloned().collect()
+    }
+
+    fn filtered(&self, allowed: &BTreeSet<String>) -> BTreeMap<String, String> {
+        self.values
+            .iter()
+            .filter(|(name, _)| allowed.contains(*name))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect()
+    }
+}
 
 #[derive(Clone)]
 pub struct GuardedExecCommandExecutor {
     manager: Arc<ExecSessionManager>,
     shell: PathBuf,
     runtime_readable_roots: Vec<PathBuf>,
+    environment: CommandEnvironmentSnapshot,
 }
 
 #[derive(Clone)]
@@ -39,6 +79,7 @@ impl GuardedExecCommandExecutor {
         manager: Arc<ExecSessionManager>,
         shell: impl Into<PathBuf>,
         runtime_readable_roots: impl IntoIterator<Item = PathBuf>,
+        environment: CommandEnvironmentSnapshot,
     ) -> Result<Self, String> {
         let shell = std::fs::canonicalize(shell.into())
             .map_err(|error| format!("canonicalize command shell failed: {error}"))?;
@@ -57,6 +98,7 @@ impl GuardedExecCommandExecutor {
             manager,
             shell,
             runtime_readable_roots: roots.into_iter().collect(),
+            environment,
         })
     }
 }
@@ -100,14 +142,20 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
                 "effective policy does not authorize the exec_command sandbox profile",
             );
         }
-        if !bounds.process.allow_shell_expression {
+        if !bounds.process.interactive.enabled || !bounds.process.interactive.allow_child_processes
+        {
             return rejected(
-                "exec_shell_expression_denied",
-                "effective policy does not authorize shell command semantics",
+                "exec_interactive_policy_denied",
+                "effective policy does not authorize interactive commands and sandboxed descendants",
             );
         }
         let shell_identity = self.shell.to_string_lossy().into_owned();
-        if !bounds.process.allowed_programs.contains(&shell_identity) {
+        if !bounds
+            .process
+            .interactive
+            .command_shells
+            .contains(&shell_identity)
+        {
             return rejected(
                 "exec_shell_denied",
                 "Host command shell is outside the effective process policy",
@@ -152,22 +200,18 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
                 readable_roots: sandbox_reads,
                 writable_roots,
                 allow_child_processes: true,
-                allowed_programs: vec![self.shell.clone()],
+                launcher_programs: vec![self.shell.clone()],
+                network_targets: bounds.network.allowed_targets.clone(),
                 linux_bwrap_path: None,
             },
         ) {
             Ok(command) => command,
             Err(message) => return failed("exec_sandbox_setup", message, false),
         };
-        let allowed_environment = bounds
+        let mut environment = self
             .environment
-            .allowed_variables
-            .iter()
-            .map(|name| name.to_ascii_uppercase())
-            .collect::<HashSet<_>>();
-        let environment = build_allowlisted_env(&allowed_environment, &sandboxed.env)
-            .into_iter()
-            .collect::<BTreeMap<_, _>>();
+            .filtered(&bounds.environment.allowed_variables);
+        environment.extend(sandboxed.env);
         let tty = execution
             .invocation
             .arguments
@@ -362,13 +406,15 @@ fn apply_exec_restriction(restriction: &mut ToolRestriction) {
     restriction.bounds.sandbox.required = true;
     restriction.bounds.sandbox.allowed_profiles =
         BTreeSet::from([GUARDED_EXEC_SANDBOX_PROFILE.to_owned()]);
-    restriction.bounds.process.allow_shell_expression = true;
+    restriction.bounds.process.interactive.enabled = true;
+    restriction.bounds.process.interactive.allow_child_processes = true;
     restriction.bounds.environment.inherit_host_environment = false;
 }
 
 fn exec_effects() -> BTreeSet<EffectScope> {
     BTreeSet::from([
         EffectScope::Process,
+        EffectScope::Network,
         EffectScope::FilesystemRead,
         EffectScope::FilesystemWrite,
         EffectScope::EnvironmentRead,

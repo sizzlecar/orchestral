@@ -19,8 +19,8 @@ pub use self::guarded::{
 };
 pub use self::guarded_artifact::{guarded_artifact_read_descriptor, GuardedArtifactReadExecutor};
 pub use self::guarded_exec::{
-    guarded_exec_command_descriptor, guarded_write_stdin_descriptor, GuardedExecCommandExecutor,
-    GuardedWriteStdinExecutor, GUARDED_EXEC_SANDBOX_PROFILE,
+    guarded_exec_command_descriptor, guarded_write_stdin_descriptor, CommandEnvironmentSnapshot,
+    GuardedExecCommandExecutor, GuardedWriteStdinExecutor, GUARDED_EXEC_SANDBOX_PROFILE,
 };
 pub use self::guarded_patch::{guarded_apply_patch_descriptor, GuardedApplyPatchExecutor};
 pub use self::guarded_pty::{

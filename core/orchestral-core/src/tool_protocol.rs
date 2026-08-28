@@ -146,14 +146,36 @@ pub struct SandboxPolicy {
     pub allowed_profiles: BTreeSet<String>,
 }
 
-/// Host-normalized process boundary. Programs are stable executable identities
-/// (not raw shell fragments); shell expression mode is an independent grant.
+/// Host policy for the generic interactive command surface.
+///
+/// The model supplies command text, but cannot select the launcher or decide
+/// whether descendants may execute. Descendants inherit the same effect
+/// sandbox; they are not enumerated as transport identities.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InteractiveCommandPolicy {
+    pub enabled: bool,
+    #[serde(default)]
+    pub command_shells: BTreeSet<String>,
+    pub allow_child_processes: bool,
+}
+
+/// Exact executable identities allowed to establish Host-configured
+/// transports such as MCP stdio connections.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransportLaunchPolicy {
+    #[serde(default)]
+    pub allowed_programs: BTreeSet<String>,
+}
+
+/// Process authority keeps generic commands and infrastructure transports in
+/// separate lanes so credentials or executable identities cannot bleed across.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessPolicy {
-    #[serde(default)]
-    pub allowed_programs: BTreeSet<String>,
-    pub allow_shell_expression: bool,
+    pub interactive: InteractiveCommandPolicy,
+    pub transport: TransportLaunchPolicy,
 }
 
 /// Host-normalized filesystem boundary. Adapters must resolve symlinks and
@@ -222,7 +244,14 @@ impl ToolPolicyBounds {
             ));
         }
         validate_non_empty_set("sandbox profile", &self.sandbox.allowed_profiles)?;
-        validate_non_empty_set("allowed program", &self.process.allowed_programs)?;
+        validate_non_empty_set(
+            "interactive command shell",
+            &self.process.interactive.command_shells,
+        )?;
+        validate_non_empty_set(
+            "transport program",
+            &self.process.transport.allowed_programs,
+        )?;
         validate_non_empty_set("readable root", &self.filesystem.readable_roots)?;
         validate_non_empty_set("writable root", &self.filesystem.writable_roots)?;
         validate_non_empty_set("network target", &self.network.allowed_targets)?;
@@ -243,12 +272,21 @@ impl ToolPolicyBounds {
                 ),
             },
             process: ProcessPolicy {
-                allowed_programs: set_intersection(
-                    &self.process.allowed_programs,
-                    &other.process.allowed_programs,
-                ),
-                allow_shell_expression: self.process.allow_shell_expression
-                    && other.process.allow_shell_expression,
+                interactive: InteractiveCommandPolicy {
+                    enabled: self.process.interactive.enabled && other.process.interactive.enabled,
+                    command_shells: set_intersection(
+                        &self.process.interactive.command_shells,
+                        &other.process.interactive.command_shells,
+                    ),
+                    allow_child_processes: self.process.interactive.allow_child_processes
+                        && other.process.interactive.allow_child_processes,
+                },
+                transport: TransportLaunchPolicy {
+                    allowed_programs: set_intersection(
+                        &self.process.transport.allowed_programs,
+                        &other.process.transport.allowed_programs,
+                    ),
+                },
             },
             filesystem: FilesystemPolicy {
                 readable_roots: set_intersection(
@@ -291,11 +329,19 @@ impl ToolPolicyBounds {
                 .allowed_profiles
                 .is_subset(&ceiling.sandbox.allowed_profiles)
             && (!ceiling.sandbox.required || self.sandbox.required)
+            && (!self.process.interactive.enabled || ceiling.process.interactive.enabled)
             && self
                 .process
+                .interactive
+                .command_shells
+                .is_subset(&ceiling.process.interactive.command_shells)
+            && (!self.process.interactive.allow_child_processes
+                || ceiling.process.interactive.allow_child_processes)
+            && self
+                .process
+                .transport
                 .allowed_programs
-                .is_subset(&ceiling.process.allowed_programs)
-            && (!self.process.allow_shell_expression || ceiling.process.allow_shell_expression)
+                .is_subset(&ceiling.process.transport.allowed_programs)
             && self
                 .filesystem
                 .readable_roots
@@ -1085,8 +1131,14 @@ mod tests {
                 allowed_profiles: strings(&["strict", "networked"]),
             },
             process: ProcessPolicy {
-                allowed_programs: strings(&["git", "rg"]),
-                allow_shell_expression: true,
+                interactive: InteractiveCommandPolicy {
+                    enabled: true,
+                    command_shells: strings(&["sh", "zsh"]),
+                    allow_child_processes: true,
+                },
+                transport: TransportLaunchPolicy {
+                    allowed_programs: strings(&["git", "rg"]),
+                },
             },
             filesystem: FilesystemPolicy {
                 readable_roots: strings(&["/workspace", "/workspace/docs"]),
@@ -1108,7 +1160,7 @@ mod tests {
     #[test]
     fn model_surface_has_no_authority_fields() {
         let schema = ModelToolSchema {
-            name: "shell".to_owned(),
+            name: "exec_command".to_owned(),
             description: "Run a command".to_owned(),
             input_schema: json!({
                 "type": "object",
@@ -1122,8 +1174,8 @@ mod tests {
         let invocation = ToolInvocation {
             run_id: RunId::new("run-1"),
             call_id: ToolCallId::new("call-1"),
-            tool_id: ToolId::new("builtin/shell"),
-            arguments: json!({ "command": "pwd" }),
+            tool_id: ToolId::new("builtin/exec_command"),
+            arguments: json!({ "cmd": "pwd" }),
         };
         let invocation_json = serde_json::to_value(invocation).unwrap();
         let invocation_keys: BTreeSet<_> = invocation_json
@@ -1155,8 +1207,9 @@ mod tests {
             ApprovalPolicy::Required,
         );
         run_bounds.sandbox.allowed_profiles = strings(&["strict"]);
-        run_bounds.process.allowed_programs = strings(&["rg"]);
-        run_bounds.process.allow_shell_expression = false;
+        run_bounds.process.interactive.command_shells = strings(&["sh"]);
+        run_bounds.process.interactive.allow_child_processes = false;
+        run_bounds.process.transport.allowed_programs = strings(&["rg"]);
         run_bounds.filesystem.readable_roots = strings(&["/workspace/docs"]);
         run_bounds.filesystem.writable_roots.clear();
         run_bounds.network.allowed_targets = strings(&["api.example"]);
@@ -1171,7 +1224,8 @@ mod tests {
         );
         restriction_bounds.sandbox.required = true;
         restriction_bounds.sandbox.allowed_profiles = strings(&["strict"]);
-        restriction_bounds.process.allowed_programs = strings(&["git", "rg"]);
+        restriction_bounds.process.interactive.command_shells = strings(&["sh"]);
+        restriction_bounds.process.transport.allowed_programs = strings(&["git", "rg"]);
         restriction_bounds.filesystem.readable_roots = strings(&["/workspace/docs"]);
         restriction_bounds.network.allowed_targets = strings(&["api.example", "other.example"]);
         restriction_bounds.environment.allowed_variables = strings(&["PATH"]);
@@ -1187,8 +1241,9 @@ mod tests {
         assert_eq!(actual.approval, ApprovalPolicy::Required);
         assert!(actual.sandbox.required);
         assert_eq!(actual.sandbox.allowed_profiles, strings(&["strict"]));
-        assert_eq!(actual.process.allowed_programs, strings(&["rg"]));
-        assert!(!actual.process.allow_shell_expression);
+        assert_eq!(actual.process.interactive.command_shells, strings(&["sh"]));
+        assert!(!actual.process.interactive.allow_child_processes);
+        assert_eq!(actual.process.transport.allowed_programs, strings(&["rg"]));
         assert_eq!(
             actual.filesystem.readable_roots,
             strings(&["/workspace/docs"])
@@ -1329,8 +1384,14 @@ mod tests {
                 allowed_profiles: generated_strings(seed, &["strict", "networked", "isolated"]),
             },
             process: ProcessPolicy {
-                allowed_programs: generated_strings(seed, &["git", "rg", "cargo", "sh"]),
-                allow_shell_expression: next_random(seed) & 1 == 1,
+                interactive: InteractiveCommandPolicy {
+                    enabled: next_random(seed) & 1 == 1,
+                    command_shells: generated_strings(seed, &["sh", "bash", "zsh"]),
+                    allow_child_processes: next_random(seed) & 1 == 1,
+                },
+                transport: TransportLaunchPolicy {
+                    allowed_programs: generated_strings(seed, &["node", "python", "mcp"]),
+                },
             },
             filesystem: FilesystemPolicy {
                 readable_roots: generated_strings(

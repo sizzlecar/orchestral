@@ -8,7 +8,8 @@ pub struct ShellSandboxPolicy {
     /// Allow the already-sandboxed launcher to execute child programs.
     /// Filesystem and network effects remain constrained by this profile.
     pub allow_child_processes: bool,
-    pub allowed_programs: Vec<PathBuf>,
+    pub launcher_programs: Vec<PathBuf>,
+    pub network_targets: BTreeSet<String>,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub linux_bwrap_path: Option<PathBuf>,
 }
@@ -83,7 +84,7 @@ impl ShellSandboxBackend for MacosSeatbeltBackend {
             return Err("sandbox-exec not found at /usr/bin/sandbox-exec".to_string());
         }
 
-        let profile = build_macos_profile(&spec, policy);
+        let profile = build_macos_profile(&spec, policy)?;
         let mut sandboxed_args = vec!["-p".to_string(), profile, spec.program];
         sandboxed_args.extend(spec.args);
         let mut env = spec.env;
@@ -116,6 +117,12 @@ impl ShellSandboxBackend for LinuxBwrapBackend {
         spec: SandboxCommandSpec,
         policy: &ShellSandboxPolicy,
     ) -> Result<SandboxedCommand, String> {
+        if !policy.network_targets.is_empty() {
+            return Err(
+                "target-restricted network is unavailable in the bubblewrap adapter; refusing to widen network access"
+                    .to_owned(),
+            );
+        }
         let bwrap = resolve_linux_bwrap_executable(policy)?;
         let mut args = build_linux_bwrap_args(&spec, policy);
         args.push("--".to_string());
@@ -183,7 +190,11 @@ fn sandbox_command_with_backend(
     let (program, cwd, policy) = normalize_sandbox_inputs(&program, cwd, policy)?;
     let env = HashMap::from([(
         "ORCHESTRAL_SANDBOX_NETWORK_DISABLED".to_owned(),
-        "1".to_owned(),
+        if policy.network_targets.is_empty() {
+            "1".to_owned()
+        } else {
+            "0".to_owned()
+        },
     )]);
     let spec = SandboxCommandSpec {
         program,
@@ -212,16 +223,17 @@ fn normalize_sandbox_inputs(
     let cwd = canonical_directory(cwd, "sandbox cwd")?;
     let readable_roots = canonical_directories(&policy.readable_roots, "readable root")?;
     let writable_roots = canonical_directories(&policy.writable_roots, "writable root")?;
-    let allowed_programs = policy
-        .allowed_programs
+    let launcher_programs = policy
+        .launcher_programs
         .iter()
-        .map(|path| canonical_file(path, "allowed executable"))
+        .map(|path| canonical_file(path, "launcher executable"))
         .collect::<Result<Vec<_>, _>>()?;
+    let network_targets = normalize_network_targets(&policy.network_targets)?;
 
     if readable_roots.is_empty()
         || writable_roots.is_empty()
-        || allowed_programs.is_empty()
-        || !allowed_programs.contains(&program_identity)
+        || launcher_programs.is_empty()
+        || !launcher_programs.contains(&program_identity)
         || !writable_roots.iter().any(|root| cwd.starts_with(root))
     {
         return Err(
@@ -237,7 +249,8 @@ fn normalize_sandbox_inputs(
             readable_roots,
             writable_roots,
             allow_child_processes: policy.allow_child_processes,
-            allowed_programs,
+            launcher_programs,
+            network_targets,
             linux_bwrap_path: policy.linux_bwrap_path.clone(),
         },
     ))
@@ -270,8 +283,41 @@ fn canonical_file(path: &Path, label: &str) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
+fn normalize_network_targets(targets: &BTreeSet<String>) -> Result<BTreeSet<String>, String> {
+    targets
+        .iter()
+        .map(|target| {
+            let target = target.trim();
+            let (host, port) = target
+                .rsplit_once(':')
+                .ok_or_else(|| format!("network target must use host:port syntax: {target}"))?;
+            let host = host.trim_matches(['[', ']']);
+            if host.is_empty()
+                || !host.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || ".-_:".contains(character)
+                })
+            {
+                return Err(format!("network target has an invalid host: {target}"));
+            }
+            if port.parse::<u16>().ok().filter(|port| *port > 0).is_none() {
+                return Err(format!("network target has an invalid port: {target}"));
+            }
+            let host =
+                if host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1" {
+                    "localhost"
+                } else {
+                    host
+                };
+            Ok(format!("{host}:{port}"))
+        })
+        .collect()
+}
+
 #[cfg(target_os = "macos")]
-fn build_macos_profile(spec: &SandboxCommandSpec, policy: &ShellSandboxPolicy) -> String {
+fn build_macos_profile(
+    spec: &SandboxCommandSpec,
+    policy: &ShellSandboxPolicy,
+) -> Result<String, String> {
     let mut profile = String::new();
     profile.push_str("(version 1)\n");
     profile.push_str("(deny default)\n");
@@ -279,12 +325,26 @@ fn build_macos_profile(spec: &SandboxCommandSpec, policy: &ShellSandboxPolicy) -
     if policy.allow_child_processes {
         profile.push_str("(allow process-exec)\n");
     } else {
-        for program in &policy.allowed_programs {
+        for program in &policy.launcher_programs {
             profile.push_str(&format!(
                 "(allow process-exec (literal \"{}\"))\n",
                 escape_profile_string(&program.to_string_lossy())
             ));
         }
+    }
+    for target in &policy.network_targets {
+        let (host, _) = target
+            .rsplit_once(':')
+            .expect("normalized network target has a host and port");
+        if host != "localhost" {
+            return Err(format!(
+                "exact remote network target '{target}' requires a managed proxy on macOS; refusing broader network access"
+            ));
+        }
+        profile.push_str(&format!(
+            "(allow network-outbound (remote ip \"{}\"))\n",
+            escape_profile_string(target)
+        ));
     }
     profile.push_str("(allow sysctl-read)\n");
 
@@ -303,7 +363,7 @@ fn build_macos_profile(spec: &SandboxCommandSpec, policy: &ShellSandboxPolicy) -
         add_path_ancestors(path, &mut literal_reads);
         literal_reads.insert(path.to_path_buf());
     }
-    for program in &policy.allowed_programs {
+    for program in &policy.launcher_programs {
         add_path_ancestors(program, &mut literal_reads);
         literal_reads.insert(program.clone());
     }
@@ -337,7 +397,7 @@ fn build_macos_profile(spec: &SandboxCommandSpec, policy: &ShellSandboxPolicy) -
             escape_profile_string(&root.to_string_lossy())
         ));
     }
-    profile
+    Ok(profile)
 }
 
 #[cfg(target_os = "macos")]
@@ -403,12 +463,12 @@ fn build_linux_bwrap_args(spec: &SandboxCommandSpec, policy: &ShellSandboxPolicy
             push_bwrap_bind(&mut args, "--ro-bind", Path::new(runtime_path));
         }
     }
-    for program in &policy.allowed_programs {
+    for program in &policy.launcher_programs {
         push_bwrap_bind(&mut args, "--ro-bind", program);
     }
     let launch_program = Path::new(&spec.program);
     if !policy
-        .allowed_programs
+        .launcher_programs
         .iter()
         .any(|program| program == launch_program)
     {
@@ -478,10 +538,11 @@ mod tests {
             readable_roots: vec![cwd.clone()],
             writable_roots: vec![cwd.clone()],
             allow_child_processes: false,
-            allowed_programs: vec![program.clone()],
+            launcher_programs: vec![program.clone()],
+            network_targets: BTreeSet::new(),
             linux_bwrap_path: None,
         };
-        let profile = build_macos_profile(&spec, &policy);
+        let profile = build_macos_profile(&spec, &policy).unwrap();
         assert!(profile.contains("file-write*"));
         assert!(profile.contains("(deny default)"));
         assert!(profile.contains("(literal \"/dev/null\")"));
@@ -508,7 +569,8 @@ mod tests {
                 readable_roots: vec![workspace.clone()],
                 writable_roots: vec![workspace.clone()],
                 allow_child_processes: false,
-                allowed_programs: vec![executable],
+                launcher_programs: vec![executable],
+                network_targets: BTreeSet::new(),
                 linux_bwrap_path: None,
             },
         )
@@ -554,7 +616,8 @@ mod tests {
                 readable_roots: vec![workspace.clone()],
                 writable_roots: vec![workspace.clone()],
                 allow_child_processes: false,
-                allowed_programs: vec![program],
+                launcher_programs: vec![program],
+                network_targets: BTreeSet::new(),
                 linux_bwrap_path: None,
             },
         )
@@ -586,7 +649,8 @@ mod tests {
                 readable_roots: vec![workspace.clone()],
                 writable_roots: vec![workspace.clone()],
                 allow_child_processes: false,
-                allowed_programs: vec![program],
+                launcher_programs: vec![program],
+                network_targets: BTreeSet::new(),
                 linux_bwrap_path: None,
             },
         )
@@ -597,6 +661,171 @@ mod tests {
             .contains("ORCHESTRAL_SENTINEL_ALTERNATE_SPAWN"));
 
         std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn one_thousand_command_write_escapes_change_zero_outside_files() {
+        const ATTEMPTS: usize = 1_000;
+
+        let (parent, workspace, outside) = isolated_test_roots("write-escape");
+        let child_inside = workspace.join("child-inside.txt");
+        let child_outside = outside.join("child-outside.txt");
+        let mut command_text = format!(
+            "printf created > '{0}/inside.txt'; printf updated >> '{0}/inside.txt'; rm '{0}/inside.txt'\n/bin/sh -c \"printf child-ok > '{1}'\"\n/bin/sh -c \"printf child-escaped > '{2}'\" || true\n",
+            workspace.display(),
+            child_inside.display(),
+            child_outside.display(),
+        );
+        let mut outside_files = Vec::with_capacity(ATTEMPTS);
+        for index in 0..ATTEMPTS {
+            let outside_file = outside.join(format!("outside-{index}.txt"));
+            std::fs::write(&outside_file, format!("ORIGINAL-{index}")).unwrap();
+            outside_files.push(outside_file.clone());
+            let target = match index % 3 {
+                0 => outside_file,
+                1 => workspace
+                    .join("..")
+                    .join("outside")
+                    .join(format!("outside-{index}.txt")),
+                _ => {
+                    let link = workspace.join(format!("escape-{index}.txt"));
+                    std::os::unix::fs::symlink(&outside_file, &link).unwrap();
+                    link
+                }
+            };
+            command_text.push_str(&format!(
+                "if printf MUTATED > '{}'; then printf ESCAPED; fi\n",
+                target.display()
+            ));
+        }
+        let program = std::fs::canonicalize("/bin/sh").unwrap();
+        let command = sandbox_command(
+            program.to_string_lossy().into_owned(),
+            vec!["-c".to_owned(), command_text],
+            &workspace,
+            &ShellSandboxPolicy {
+                readable_roots: vec![
+                    workspace.clone(),
+                    std::fs::canonicalize("/bin").unwrap(),
+                    std::fs::canonicalize("/usr/bin").unwrap(),
+                ],
+                writable_roots: vec![workspace.clone()],
+                allow_child_processes: true,
+                launcher_programs: vec![program],
+                network_targets: BTreeSet::new(),
+                linux_bwrap_path: None,
+            },
+        )
+        .unwrap();
+        let output = run_sandboxed(command, &workspace);
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("ESCAPED"));
+        assert!(!workspace.join("inside.txt").exists());
+        assert_eq!(std::fs::read_to_string(child_inside).unwrap(), "child-ok");
+        assert!(!child_outside.exists());
+        for (index, path) in outside_files.iter().enumerate() {
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap(),
+                format!("ORIGINAL-{index}")
+            );
+        }
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn network_is_denied_by_default_and_exactly_one_host_target_can_be_opened() {
+        let (parent, workspace, _) = isolated_test_roots("network-target");
+        let allowed_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let denied_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let allowed_port = allowed_listener.local_addr().unwrap().port();
+        let denied_port = denied_listener.local_addr().unwrap().port();
+        let python = std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .map(|directory| directory.join("python3"))
+            .find(|candidate| candidate.is_file())
+            .map(|candidate| std::fs::canonicalize(candidate).unwrap())
+            .expect("python3 is installed for the sandbox network test");
+        let shell = std::fs::canonicalize("/bin/sh").unwrap();
+        let mut readable_roots = vec![workspace.clone()];
+        for candidate in [
+            "/bin",
+            "/usr",
+            "/opt/homebrew",
+            "/Library",
+            "/System/Library",
+        ] {
+            if let Ok(path) = std::fs::canonicalize(candidate) {
+                readable_roots.push(path);
+            }
+        }
+        let run = |port: u16, targets: BTreeSet<String>| {
+            let code = format!(
+                "import socket; socket.create_connection(('127.0.0.1', {port}), .5); print('CONNECTED')"
+            );
+            let command = sandbox_command(
+                shell.to_string_lossy().into_owned(),
+                vec![
+                    "-c".to_owned(),
+                    format!(
+                        "PYTHONDONTWRITEBYTECODE=1 '{}' -c \"{}\"",
+                        python.display(),
+                        code
+                    ),
+                ],
+                &workspace,
+                &ShellSandboxPolicy {
+                    readable_roots: readable_roots.clone(),
+                    writable_roots: vec![workspace.clone()],
+                    allow_child_processes: true,
+                    launcher_programs: vec![shell.clone()],
+                    network_targets: targets,
+                    linux_bwrap_path: None,
+                },
+            )
+            .unwrap();
+            run_sandboxed(command, &workspace)
+        };
+
+        let denied = run(allowed_port, BTreeSet::new());
+        assert!(!denied.status.success());
+        assert!(!String::from_utf8_lossy(&denied.stdout).contains("CONNECTED"));
+
+        let target = format!("127.0.0.1:{allowed_port}");
+        let allowed = run(allowed_port, BTreeSet::from([target.clone()]));
+        assert!(
+            allowed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&allowed.stderr)
+        );
+        assert!(String::from_utf8_lossy(&allowed.stdout).contains("CONNECTED"));
+
+        let wrong_target = run(denied_port, BTreeSet::from([target]));
+        assert!(!wrong_target.status.success());
+        assert!(!String::from_utf8_lossy(&wrong_target.stdout).contains("CONNECTED"));
+
+        drop(allowed_listener);
+        drop(denied_listener);
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn network_target_normalization_rejects_profile_injection_and_invalid_ports() {
+        for target in [
+            "",
+            "example.com",
+            "example.com:*",
+            "example.com:0",
+            "example.com:65536",
+            "example.com:443\") (allow network-outbound)",
+        ] {
+            assert!(normalize_network_targets(&BTreeSet::from([target.to_owned()])).is_err());
+        }
+        assert_eq!(
+            normalize_network_targets(&BTreeSet::from(["127.0.0.1:443".to_owned()])).unwrap(),
+            BTreeSet::from(["localhost:443".to_owned()])
+        );
     }
 
     #[test]
@@ -611,7 +840,8 @@ mod tests {
             readable_roots: vec![cwd.clone()],
             writable_roots: vec![cwd.clone()],
             allow_child_processes: false,
-            allowed_programs: vec![program.clone()],
+            launcher_programs: vec![program.clone()],
+            network_targets: BTreeSet::new(),
             linux_bwrap_path: None,
         };
         let unavailable = UnsupportedBackend {
@@ -646,7 +876,8 @@ mod tests {
             readable_roots: vec![cwd.clone()],
             writable_roots: vec![cwd],
             allow_child_processes: false,
-            allowed_programs: vec![program],
+            launcher_programs: vec![program],
+            network_targets: BTreeSet::new(),
             linux_bwrap_path: None,
         };
         let args = build_linux_bwrap_args(&spec, &policy);
@@ -677,7 +908,8 @@ mod tests {
                 readable_roots: vec![workspace.clone()],
                 writable_roots: vec![workspace.clone()],
                 allow_child_processes: false,
-                allowed_programs: vec![program],
+                launcher_programs: vec![program],
+                network_targets: BTreeSet::new(),
                 linux_bwrap_path: None,
             },
         )

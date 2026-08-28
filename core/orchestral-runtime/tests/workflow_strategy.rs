@@ -15,9 +15,10 @@ use orchestral_core::tool_effect::{
 };
 use orchestral_core::tool_protocol::{
     ApprovalPolicy, EffectScope, EffectiveToolPolicy, EnvironmentPolicy, FilesystemPolicy,
-    HostApprovalVerifier, HostToolPolicy, InMemoryApprovalCapabilityStore, ModelToolSchema,
-    NetworkPolicy, ProcessPolicy, RunToolGrant, SandboxPolicy, ToolConcurrency, ToolDescriptor,
-    ToolId, ToolIdempotency, ToolInvocation, ToolOutcome, ToolPolicyBounds, ToolRestriction,
+    HostApprovalVerifier, HostToolPolicy, InMemoryApprovalCapabilityStore,
+    InteractiveCommandPolicy, ModelToolSchema, NetworkPolicy, ProcessPolicy, RunToolGrant,
+    SandboxPolicy, ToolConcurrency, ToolDescriptor, ToolId, ToolIdempotency, ToolInvocation,
+    ToolOutcome, ToolPolicyBounds, ToolRestriction, TransportLaunchPolicy,
 };
 use orchestral_core::types::{Plan, Step, WorkflowId};
 use orchestral_runtime::{
@@ -60,8 +61,12 @@ fn bounds(approval: ApprovalPolicy) -> ToolPolicyBounds {
             allowed_profiles: strings(&["strict"]),
         },
         process: ProcessPolicy {
-            allowed_programs: strings(&["echo"]),
-            allow_shell_expression: false,
+            interactive: InteractiveCommandPolicy {
+                enabled: true,
+                command_shells: strings(&["echo"]),
+                allow_child_processes: false,
+            },
+            transport: TransportLaunchPolicy::default(),
         },
         filesystem: FilesystemPolicy::default(),
         network: NetworkPolicy::default(),

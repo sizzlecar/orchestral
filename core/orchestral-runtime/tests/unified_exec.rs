@@ -6,13 +6,14 @@ use std::time::Duration;
 use orchestral_core::agent_protocol::wire::RunId;
 use orchestral_core::tool_protocol::{
     ApprovalPolicy, EffectScope, EnvironmentPolicy, FilesystemPolicy, HostApprovalIssuer,
-    HostApprovalVerifier, HostToolPolicy, InMemoryApprovalCapabilityStore, NetworkPolicy,
-    ProcessPolicy, RunToolGrant, SandboxPolicy, ToolCallId, ToolId, ToolInvocation, ToolOutcome,
-    ToolOutput, ToolPolicyBounds, ToolRestriction,
+    HostApprovalVerifier, HostToolPolicy, InMemoryApprovalCapabilityStore,
+    InteractiveCommandPolicy, NetworkPolicy, ProcessPolicy, RunToolGrant, SandboxPolicy,
+    ToolCallId, ToolId, ToolInvocation, ToolOutcome, ToolOutput, ToolPolicyBounds, ToolRestriction,
+    TransportLaunchPolicy,
 };
 use orchestral_runtime::tools::{
-    guarded_exec_command_descriptor, guarded_write_stdin_descriptor, GuardedExecCommandExecutor,
-    GuardedWriteStdinExecutor, GUARDED_EXEC_SANDBOX_PROFILE,
+    guarded_exec_command_descriptor, guarded_write_stdin_descriptor, CommandEnvironmentSnapshot,
+    GuardedExecCommandExecutor, GuardedWriteStdinExecutor, GUARDED_EXEC_SANDBOX_PROFILE,
 };
 use orchestral_runtime::{
     ExecSessionManager, ExecSpawnSpec, GuardedToolResult, GuardedToolRuntime,
@@ -25,6 +26,7 @@ const SIGNING_KEY: &[u8] = b"0123456789abcdef0123456789abcdef";
 fn effects() -> BTreeSet<EffectScope> {
     BTreeSet::from([
         EffectScope::Process,
+        EffectScope::Network,
         EffectScope::FilesystemRead,
         EffectScope::FilesystemWrite,
         EffectScope::EnvironmentRead,
@@ -43,8 +45,12 @@ fn bounds(workspace: &Path, shell: &Path) -> ToolPolicyBounds {
             allowed_profiles: BTreeSet::from([GUARDED_EXEC_SANDBOX_PROFILE.to_owned()]),
         },
         process: ProcessPolicy {
-            allowed_programs: BTreeSet::from([shell]),
-            allow_shell_expression: true,
+            interactive: InteractiveCommandPolicy {
+                enabled: true,
+                command_shells: BTreeSet::from([shell]),
+                allow_child_processes: true,
+            },
+            transport: TransportLaunchPolicy::default(),
         },
         filesystem: FilesystemPolicy {
             readable_roots: BTreeSet::from([workspace.clone()]),
@@ -52,7 +58,7 @@ fn bounds(workspace: &Path, shell: &Path) -> ToolPolicyBounds {
         },
         network: NetworkPolicy::default(),
         environment: EnvironmentPolicy {
-            allowed_variables: BTreeSet::from(["PATH".to_owned()]),
+            allowed_variables: BTreeSet::from(["PATH".to_owned(), "VISIBLE".to_owned()]),
             inherit_host_environment: false,
         },
         allowed_credentials: BTreeSet::new(),
@@ -258,6 +264,11 @@ async fn guarded_unified_surface_executes_children_and_continues_one_tty_session
                     manager.clone(),
                     shell,
                     [PathBuf::from("/bin"), PathBuf::from("/usr/bin")],
+                    CommandEnvironmentSnapshot::from_values([
+                        ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+                        ("VISIBLE".to_owned(), "captured-at-composition".to_owned()),
+                        ("MCP_CREDENTIAL".to_owned(), "must-not-leak".to_owned()),
+                    ]),
                 )
                 .unwrap(),
             ),
@@ -319,6 +330,49 @@ async fn guarded_unified_surface_executes_children_and_continues_one_tty_session
     assert!(output["output"].as_str().unwrap().contains("short-ok"));
     assert!(output["output"].as_str().unwrap().contains("child-ok"));
     assert!(output.get("session_id").is_none());
+
+    let environment_probe = invocation(
+        "unified-run",
+        "environment",
+        "orchestral/exec_command/v1",
+        json!({
+            "cmd": "printf '%s|%s|%s' \"$VISIBLE\" \"${MCP_CREDENTIAL-unset}\" \"${HOME-unset}\"",
+            "yield_time_ms": 1000
+        }),
+    );
+    let GuardedToolResult::ApprovalRequired { binding, .. } = runtime
+        .invoke(
+            environment_probe.clone(),
+            RunToolGrant {
+                bounds: bounds.clone(),
+            },
+            None,
+            CancellationToken::new(),
+        )
+        .await
+    else {
+        panic!("environment probe must require exact approval")
+    };
+    let approval = HostApprovalIssuer::new(SIGNING_KEY)
+        .unwrap()
+        .issue(binding, i64::MAX)
+        .unwrap();
+    let output = inline_output(
+        runtime
+            .invoke(
+                environment_probe,
+                RunToolGrant {
+                    bounds: bounds.clone(),
+                },
+                Some(approval),
+                CancellationToken::new(),
+            )
+            .await,
+    );
+    assert_eq!(
+        output["stdout"],
+        json!("captured-at-composition|unset|unset")
+    );
 
     let interactive = invocation(
         "unified-run",
