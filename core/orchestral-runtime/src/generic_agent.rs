@@ -7078,6 +7078,7 @@ fn evaluate_skill_read(
     match skills.read_for_context(&parsed.name, loaded) {
         Ok(SkillLoadOutcome::Loaded(load)) => {
             let descriptor = &load.package.descriptor;
+            let resource_base = crate::session_context::skill_resource_base(&descriptor.source);
             SkillReadEvaluation {
                 observation: SkillCallObservation {
                     result: serde_json::json!({
@@ -7087,6 +7088,7 @@ fn evaluate_skill_read(
                         "version": descriptor.version,
                         "digest": descriptor.digest,
                         "source": descriptor.source,
+                        "resource_base": resource_base,
                     }),
                     is_error: false,
                     context_message: Some(crate::session_context::skill_load_message(&load)),

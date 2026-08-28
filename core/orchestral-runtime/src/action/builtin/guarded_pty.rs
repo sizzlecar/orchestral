@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use crate::pty_process::{PtyProcessError, PtyProcessId, PtyProcessManager, PtySpawnSpec};
 use crate::tool_runtime::{GuardedToolExecution, GuardedToolExecutor};
 
-use super::guarded::canonical_allowed_program;
+use super::guarded::GuardedProgramAliases;
 use super::support::{build_allowlisted_env, canonical_roots};
 use crate::tools::shell_sandbox::{sandbox_command, ShellSandboxPolicy};
 
@@ -24,6 +24,7 @@ pub const GUARDED_PTY_SANDBOX_PROFILE: &str = "orchestral.pty.process.v1";
 #[derive(Clone)]
 pub struct GuardedPtyCreateExecutor {
     manager: Arc<PtyProcessManager>,
+    program_aliases: GuardedProgramAliases,
 }
 
 #[derive(Clone)]
@@ -56,11 +57,29 @@ macro_rules! manager_constructor {
     };
 }
 
-manager_constructor!(GuardedPtyCreateExecutor);
 manager_constructor!(GuardedPtyWriteExecutor);
 manager_constructor!(GuardedPtyReadExecutor);
 manager_constructor!(GuardedPtyCloseExecutor);
 manager_constructor!(GuardedPtyListExecutor);
+
+impl GuardedPtyCreateExecutor {
+    pub fn new(manager: Arc<PtyProcessManager>) -> Self {
+        Self {
+            manager,
+            program_aliases: GuardedProgramAliases::default(),
+        }
+    }
+
+    pub fn new_with_program_aliases(
+        manager: Arc<PtyProcessManager>,
+        program_aliases: GuardedProgramAliases,
+    ) -> Self {
+        Self {
+            manager,
+            program_aliases,
+        }
+    }
+}
 
 #[async_trait]
 impl GuardedToolExecutor for GuardedPtyCreateExecutor {
@@ -107,7 +126,10 @@ impl GuardedToolExecutor for GuardedPtyCreateExecutor {
             Some(command) => command,
             None => return rejected("pty_command_missing", "PTY command must be a string"),
         };
-        let command = match canonical_allowed_program(command, &bounds.process.allowed_programs) {
+        let command = match self
+            .program_aliases
+            .resolve(command, &bounds.process.allowed_programs)
+        {
             Ok(command) => command,
             Err(message) => return rejected("pty_program_denied", message),
         };
@@ -369,27 +391,37 @@ impl GuardedToolExecutor for GuardedPtyListExecutor {
 }
 
 pub fn guarded_pty_create_descriptor(restriction: ToolRestriction) -> ToolDescriptor {
+    guarded_pty_create_descriptor_with_program_aliases(
+        restriction,
+        &GuardedProgramAliases::default(),
+    )
+}
+
+pub fn guarded_pty_create_descriptor_with_program_aliases(
+    restriction: ToolRestriction,
+    program_aliases: &GuardedProgramAliases,
+) -> ToolDescriptor {
     let restriction = guarded_pty_restriction(restriction, true);
-    let programs = restriction
-        .bounds
-        .process
-        .allowed_programs
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(", ");
+    let programs =
+        program_aliases.advertised_programs(&restriction.bounds.process.allowed_programs);
+    let accepted_commands =
+        program_aliases.accepted_commands(&restriction.bounds.process.allowed_programs);
     ToolDescriptor {
         tool_id: ToolId::new("orchestral/pty_create/v1"),
         model_schema: ModelToolSchema {
             name: "pty_create".to_owned(),
             description: format!(
-                "Create a run-scoped interactive process inside the Host sandbox. Allowed programs: {programs}"
+                "Create a run-scoped interactive process inside the Host sandbox. Use this only when the process requires ongoing input or incremental output. Allowed programs: {programs}"
             ),
             input_schema: json!({
                 "type": "object",
                 "required": ["command"],
                 "properties": {
-                    "command": { "type": "string" },
+                    "command": {
+                        "type": "string",
+                        "enum": accepted_commands,
+                        "description": "One advertised executable alias or absolute path; put every argument in args"
+                    },
                     "args": { "type": "array", "items": { "type": "string" } },
                     "rows": { "type": "integer", "minimum": 1, "maximum": 500 },
                     "cols": { "type": "integer", "minimum": 1, "maximum": 500 }

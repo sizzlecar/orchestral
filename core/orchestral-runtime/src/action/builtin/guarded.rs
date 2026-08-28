@@ -3,7 +3,7 @@
 //! These executors consume only Host-derived effective policy. They do not
 //! adapt or call the removed legacy `Action` stack.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
@@ -27,6 +27,132 @@ use super::support::{
 };
 
 pub const GUARDED_SHELL_SANDBOX_PROFILE: &str = "orchestral.shell.exec.v1";
+
+/// Host-owned executable aliases. Aliases are resolved once during composition
+/// and never consult `PATH` during a Tool call.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GuardedProgramAliases {
+    by_alias: BTreeMap<String, GuardedProgramBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GuardedProgramBinding {
+    launch_path: String,
+    canonical_identity: String,
+}
+
+impl GuardedProgramAliases {
+    pub fn new(aliases: impl IntoIterator<Item = (String, String)>) -> Result<Self, String> {
+        let mut by_alias = BTreeMap::new();
+        for (alias, executable) in aliases {
+            validate_program_alias(&alias)?;
+            let path = Path::new(&executable);
+            if !path.is_absolute() {
+                return Err(format!(
+                    "Host executable for alias '{alias}' must be an absolute path"
+                ));
+            }
+            let canonical = std::fs::canonicalize(path).map_err(|error| {
+                format!("canonicalize executable for alias '{alias}' failed: {error}")
+            })?;
+            if !canonical.is_file() {
+                return Err(format!(
+                    "Host executable for alias '{alias}' is not a file: {}",
+                    canonical.display()
+                ));
+            }
+            let canonical_identity = canonical.to_string_lossy().to_string();
+            if by_alias.contains_key(&alias) {
+                return Err(format!(
+                    "Host executable alias '{alias}' is configured more than once"
+                ));
+            }
+            by_alias.insert(
+                alias,
+                GuardedProgramBinding {
+                    launch_path: executable,
+                    canonical_identity,
+                },
+            );
+        }
+        Ok(Self { by_alias })
+    }
+
+    pub fn canonical_programs(&self) -> BTreeSet<String> {
+        self.by_alias
+            .values()
+            .map(|binding| binding.canonical_identity.clone())
+            .collect()
+    }
+
+    pub(super) fn resolve(
+        &self,
+        command: &str,
+        allowed_programs: &BTreeSet<String>,
+    ) -> Result<String, String> {
+        let path = Path::new(command);
+        if path.is_absolute() {
+            return canonical_absolute_program(command, allowed_programs);
+        }
+        validate_program_alias(command)?;
+        let binding = self.by_alias.get(command).ok_or_else(|| {
+            format!("executable alias is absent from the Host allowlist: {command}")
+        })?;
+        let current_identity = std::fs::canonicalize(&binding.launch_path)
+            .map_err(|error| format!("revalidate executable alias '{command}' failed: {error}"))?
+            .to_string_lossy()
+            .into_owned();
+        if current_identity != binding.canonical_identity {
+            return Err(format!(
+                "Host executable identity changed after composition: {command}"
+            ));
+        }
+        if !allowed_programs.contains(&binding.canonical_identity) {
+            return Err(format!(
+                "executable alias is absent from the effective Run allowlist: {command}"
+            ));
+        }
+        Ok(binding.launch_path.clone())
+    }
+
+    pub(super) fn accepted_commands(&self, allowed_programs: &BTreeSet<String>) -> Vec<String> {
+        let mut commands = allowed_programs.iter().cloned().collect::<BTreeSet<_>>();
+        commands.extend(
+            self.by_alias
+                .iter()
+                .filter(|(_, binding)| allowed_programs.contains(&binding.canonical_identity))
+                .map(|(alias, _)| alias.clone()),
+        );
+        commands.into_iter().collect()
+    }
+
+    pub(super) fn advertised_programs(&self, allowed_programs: &BTreeSet<String>) -> String {
+        let mut advertised = self
+            .by_alias
+            .iter()
+            .filter(|(_, binding)| allowed_programs.contains(&binding.canonical_identity))
+            .map(|(alias, binding)| format!("{alias} ({})", binding.canonical_identity))
+            .collect::<Vec<_>>();
+        let aliased = self
+            .by_alias
+            .values()
+            .map(|binding| binding.canonical_identity.clone())
+            .collect::<BTreeSet<_>>();
+        advertised.extend(allowed_programs.difference(&aliased).cloned());
+        advertised.join(", ")
+    }
+}
+
+fn validate_program_alias(alias: &str) -> Result<(), String> {
+    if alias.trim() != alias || alias.is_empty() || alias.contains('/') || alias.contains('\\') {
+        return Err("executable alias must be one bare program name".to_owned());
+    }
+    let mut components = Path::new(alias).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        return Err("executable alias must be one bare program name".to_owned());
+    }
+    Ok(())
+}
 
 #[derive(Default)]
 pub struct GuardedFileReadExecutor;
@@ -186,8 +312,16 @@ pub fn guarded_file_read_descriptor(restriction: ToolRestriction) -> ToolDescrip
     }
 }
 
-#[derive(Default)]
-pub struct GuardedShellExecutor;
+#[derive(Clone, Default)]
+pub struct GuardedShellExecutor {
+    program_aliases: GuardedProgramAliases,
+}
+
+impl GuardedShellExecutor {
+    pub fn new(program_aliases: GuardedProgramAliases) -> Self {
+        Self { program_aliases }
+    }
+}
 
 #[async_trait]
 impl GuardedToolExecutor for GuardedShellExecutor {
@@ -262,7 +396,10 @@ impl GuardedToolExecutor for GuardedShellExecutor {
         else {
             return rejected("shell_command_missing", "shell command must be a string");
         };
-        let command = match canonical_allowed_program(command, &bounds.process.allowed_programs) {
+        let command = match self
+            .program_aliases
+            .resolve(command, &bounds.process.allowed_programs)
+        {
             Ok(command) => command,
             Err(message) => return rejected("shell_program_denied", message),
         };
@@ -467,7 +604,14 @@ impl GuardedToolExecutor for GuardedShellExecutor {
     }
 }
 
-pub fn guarded_shell_descriptor(mut restriction: ToolRestriction) -> ToolDescriptor {
+pub fn guarded_shell_descriptor(restriction: ToolRestriction) -> ToolDescriptor {
+    guarded_shell_descriptor_with_program_aliases(restriction, &GuardedProgramAliases::default())
+}
+
+pub fn guarded_shell_descriptor_with_program_aliases(
+    mut restriction: ToolRestriction,
+    program_aliases: &GuardedProgramAliases,
+) -> ToolDescriptor {
     restriction.bounds.approval = match restriction.bounds.approval {
         ApprovalPolicy::Deny => ApprovalPolicy::Deny,
         ApprovalPolicy::NotRequired | ApprovalPolicy::Required => ApprovalPolicy::Required,
@@ -478,26 +622,26 @@ pub fn guarded_shell_descriptor(mut restriction: ToolRestriction) -> ToolDescrip
         BTreeSet::from([GUARDED_SHELL_SANDBOX_PROFILE.to_owned()]);
     restriction.bounds.process.allow_shell_expression = false;
     restriction.bounds.environment.inherit_host_environment = false;
-    let advertised_programs = restriction
-        .bounds
-        .process
-        .allowed_programs
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(", ");
+    let advertised_programs =
+        program_aliases.advertised_programs(&restriction.bounds.process.allowed_programs);
+    let accepted_commands =
+        program_aliases.accepted_commands(&restriction.bounds.process.allowed_programs);
     ToolDescriptor {
         tool_id: ToolId::new("orchestral/shell_exec/v1"),
         model_schema: ModelToolSchema {
             name: "shell".to_owned(),
             description: format!(
-                "Execute one Host-approved absolute program with an argument vector inside the workspace sandbox. Shell expressions are unsupported. Allowed programs: {advertised_programs}"
+                "Execute one Host-approved program with an argument vector inside the workspace sandbox. Use an advertised alias or absolute executable path; shell expressions are unsupported. Allowed programs: {advertised_programs}"
             ),
             input_schema: json!({
                 "type": "object",
                 "required": ["command"],
                 "properties": {
-                    "command": { "type": "string" },
+                    "command": {
+                        "type": "string",
+                        "enum": accepted_commands,
+                        "description": "One advertised executable alias or absolute path; put every argument in args"
+                    },
                     "args": { "type": "array", "items": { "type": "string" } },
                     "fail_on_non_zero": { "type": "boolean" }
                 },
@@ -534,13 +678,13 @@ pub fn guarded_shell_descriptor(mut restriction: ToolRestriction) -> ToolDescrip
     }
 }
 
-pub(super) fn canonical_allowed_program(
+fn canonical_absolute_program(
     command: &str,
     allowed_programs: &BTreeSet<String>,
 ) -> Result<String, String> {
     let path = Path::new(command);
     if !path.is_absolute() {
-        return Err("guarded process requires an absolute executable path".to_owned());
+        return Err("guarded absolute executable path is required".to_owned());
     }
     let canonical = std::fs::canonicalize(path)
         .map_err(|error| format!("canonicalize executable '{command}' failed: {error}"))?;
@@ -617,3 +761,64 @@ fn terminate_process_group(process_group_id: Option<u32>) {
 
 #[cfg(not(unix))]
 fn terminate_process_group(_process_group_id: Option<u32>) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn current_executable() -> String {
+        std::fs::canonicalize(std::env::current_exe().unwrap())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn program_alias_resolves_to_the_host_identity_without_path_lookup() {
+        let executable = current_executable();
+        let aliases =
+            GuardedProgramAliases::new([("fixture".to_owned(), executable.clone())]).unwrap();
+        let allowed = BTreeSet::from([executable.clone()]);
+
+        assert_eq!(aliases.resolve("fixture", &allowed), Ok(executable));
+    }
+
+    #[test]
+    fn program_alias_cannot_widen_the_effective_run_allowlist() {
+        let executable = current_executable();
+        let aliases = GuardedProgramAliases::new([("fixture".to_owned(), executable)]).unwrap();
+
+        assert!(aliases.resolve("fixture", &BTreeSet::new()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn program_alias_preserves_the_host_resolved_launch_path() {
+        let parent =
+            std::env::temp_dir().join(format!("orchestral-alias-launch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&parent).unwrap();
+        let link = parent.join("fixture");
+        let executable = current_executable();
+        std::os::unix::fs::symlink(&executable, &link).unwrap();
+        let launch_path = link.to_string_lossy().into_owned();
+        let aliases =
+            GuardedProgramAliases::new([("fixture".to_owned(), launch_path.clone())]).unwrap();
+        let allowed = BTreeSet::from([executable]);
+
+        assert_eq!(aliases.resolve("fixture", &allowed), Ok(launch_path));
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn program_alias_rejects_paths_and_duplicates() {
+        let executable = current_executable();
+        for alias in ["", " fixture", "./fixture", "../fixture", "a/b", "a\\b"] {
+            assert!(GuardedProgramAliases::new([(alias.to_owned(), executable.clone())]).is_err());
+        }
+        assert!(GuardedProgramAliases::new([
+            ("fixture".to_owned(), executable.clone()),
+            ("fixture".to_owned(), executable),
+        ])
+        .is_err());
+    }
+}

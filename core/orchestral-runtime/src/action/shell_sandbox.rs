@@ -201,7 +201,11 @@ fn normalize_sandbox_inputs(
     cwd: &Path,
     policy: &ShellSandboxPolicy,
 ) -> Result<(String, PathBuf, ShellSandboxPolicy), String> {
-    let program = canonical_file(Path::new(program), "sandbox executable")?;
+    let launch_program = PathBuf::from(program);
+    if !launch_program.is_absolute() {
+        return Err("sandbox executable must be a Host-resolved absolute path".to_owned());
+    }
+    let program_identity = canonical_file(&launch_program, "sandbox executable")?;
     let cwd = canonical_directory(cwd, "sandbox cwd")?;
     let readable_roots = canonical_directories(&policy.readable_roots, "readable root")?;
     let writable_roots = canonical_directories(&policy.writable_roots, "writable root")?;
@@ -214,7 +218,7 @@ fn normalize_sandbox_inputs(
     if readable_roots.is_empty()
         || writable_roots.is_empty()
         || allowed_programs.is_empty()
-        || !allowed_programs.contains(&program)
+        || !allowed_programs.contains(&program_identity)
         || !writable_roots.iter().any(|root| cwd.starts_with(root))
     {
         return Err(
@@ -224,7 +228,7 @@ fn normalize_sandbox_inputs(
     }
 
     Ok((
-        program.to_string_lossy().into_owned(),
+        launch_program.to_string_lossy().into_owned(),
         cwd,
         ShellSandboxPolicy {
             readable_roots,
@@ -295,6 +299,9 @@ fn build_macos_profile(spec: &SandboxCommandSpec, policy: &ShellSandboxPolicy) -
         add_path_ancestors(program, &mut literal_reads);
         literal_reads.insert(program.clone());
     }
+    let launch_program = Path::new(&spec.program);
+    add_path_ancestors(launch_program, &mut literal_reads);
+    literal_reads.insert(launch_program.to_path_buf());
     for root in &policy.readable_roots {
         add_path_ancestors(root, &mut literal_reads);
         literal_reads.insert(root.clone());
@@ -391,6 +398,14 @@ fn build_linux_bwrap_args(spec: &SandboxCommandSpec, policy: &ShellSandboxPolicy
     for program in &policy.allowed_programs {
         push_bwrap_bind(&mut args, "--ro-bind", program);
     }
+    let launch_program = Path::new(&spec.program);
+    if !policy
+        .allowed_programs
+        .iter()
+        .any(|program| program == launch_program)
+    {
+        push_bwrap_bind(&mut args, "--ro-bind", launch_program);
+    }
     for root in &policy.readable_roots {
         push_bwrap_bind(&mut args, "--ro-bind", root);
     }
@@ -467,6 +482,39 @@ mod tests {
         )));
         assert!(!profile.contains("(allow process*)"));
         assert!(!profile.contains("(allow file-read*)\n"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_resolved_executable_symlink_keeps_its_launch_identity() {
+        let (parent, workspace, _) = isolated_test_roots("executable-symlink");
+        let executable = std::fs::canonicalize("/bin/echo").unwrap();
+        let launch_path = workspace.join("echo-alias");
+        std::os::unix::fs::symlink(&executable, &launch_path).unwrap();
+        let command = sandbox_command(
+            launch_path.to_string_lossy().into_owned(),
+            vec!["SYMLINK_LAUNCH_OK".to_owned()],
+            &workspace,
+            &ShellSandboxPolicy {
+                readable_roots: vec![workspace.clone()],
+                writable_roots: vec![workspace.clone()],
+                allowed_programs: vec![executable],
+                linux_bwrap_path: None,
+            },
+        )
+        .unwrap();
+
+        let output = run_sandboxed(command, &workspace);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "SYMLINK_LAUNCH_OK"
+        );
+        std::fs::remove_dir_all(parent).unwrap();
     }
 
     #[cfg(target_os = "macos")]

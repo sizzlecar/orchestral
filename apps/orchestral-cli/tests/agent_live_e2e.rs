@@ -579,15 +579,23 @@ fn local_cli_skill_read_injects_instructions_and_journals_load() {
         ),
     )
     .expect("write Skill fixture");
-    fs::write(
-        workspace.path("verification.txt"),
-        format!("{RESULT_MARKER}\n"),
-    )
-    .expect("write Skill verification fixture");
+    let verification_path = skill_directory.join("verification.txt");
+    fs::write(&verification_path, format!("{RESULT_MARKER}\n"))
+        .expect("write Skill verification fixture");
     let skill_path = skill_directory
         .join("SKILL.md")
         .canonicalize()
         .expect("canonical Skill fixture path")
+        .to_string_lossy()
+        .to_string();
+    let skill_resource_base = skill_directory
+        .canonicalize()
+        .expect("canonical Skill resource base")
+        .to_string_lossy()
+        .to_string();
+    let verification_path = verification_path
+        .canonicalize()
+        .expect("canonical Skill verification fixture")
         .to_string_lossy()
         .to_string();
 
@@ -603,14 +611,16 @@ fn local_cli_skill_read_injects_instructions_and_journals_load() {
                 json!({ "name": "e2e-skill" }),
             )
         }),
-        Box::new(|request| {
+        Box::new(move |request| {
             let context = model_request_text(&request.body);
             assert!(context.contains(INSTRUCTION_MARKER));
             assert!(context.contains("\"status\":\"loaded\""));
+            assert!(context.contains(&skill_resource_base));
+            assert!(context.contains("Relative paths in this Skill's instructions"));
             openai_tool_response(
                 "read-verification",
                 "file_read",
-                json!({ "path": "verification.txt" }),
+                json!({ "path": verification_path }),
             )
         }),
         Box::new(|request| {
@@ -913,7 +923,7 @@ fn live_agent_follows_a_dynamically_discovered_workspace_skill() {
         ),
     )
     .expect("write live Skill");
-    fs::write(workspace.path(&evidence_file), format!("{marker}\n"))
+    fs::write(skill_directory.join(&evidence_file), format!("{marker}\n"))
         .expect("write live Skill evidence");
 
     let mut command = root_command(&workspace);
@@ -1852,25 +1862,26 @@ fn assert_single_apply_patch_tool(request: &Value) {
 }
 
 fn model_allowed_program(request: &Value, program: &str) -> String {
-    let description = request["tools"]
+    let shell = request["tools"]
         .as_array()
         .into_iter()
         .flatten()
         .find(|tool| tool["function"]["name"].as_str() == Some("shell"))
-        .and_then(|tool| tool["function"]["description"].as_str())
         .unwrap_or_else(|| panic!("model request omitted the guarded shell descriptor"));
-    let (_, programs) = description
-        .rsplit_once("Allowed programs: ")
-        .unwrap_or_else(|| panic!("shell descriptor omitted its allowlist: {description}"));
-    programs
-        .split(", ")
+    let accepted = shell["function"]["parameters"]["properties"]["command"]["enum"]
+        .as_array()
+        .unwrap_or_else(|| panic!("shell descriptor omitted its command enum: {shell}"));
+    accepted
+        .iter()
+        .filter_map(Value::as_str)
         .find(|candidate| {
-            Path::new(candidate)
-                .file_stem()
-                .and_then(|name| name.to_str())
-                == Some(program)
+            *candidate == program
+                || Path::new(candidate)
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    == Some(program)
         })
-        .unwrap_or_else(|| panic!("shell descriptor omitted '{program}': {description}"))
+        .unwrap_or_else(|| panic!("shell descriptor omitted '{program}': {shell}"))
         .to_owned()
 }
 

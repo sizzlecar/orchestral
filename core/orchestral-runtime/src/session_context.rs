@@ -378,19 +378,39 @@ pub(crate) fn skill_load_message(
 ) -> ModelMessage {
     let descriptor = &load.package.descriptor;
     let version = descriptor.version.as_deref().unwrap_or("unversioned");
+    let resource_base = skill_resource_base(&descriptor.source)
+        .map(|base| {
+            format!(
+                "\nresource_base: {base}\nRelative paths in this Skill's instructions are relative to resource_base."
+            )
+        })
+        .unwrap_or_default();
     ModelMessage::text(
         ModelRole::System,
         format!(
-            "Loaded Skill (immutable instruction context)\nname: {}\nskill_id: {}\nsource: {:?}:{}\nversion: {}\ndigest: {}\n\nInstructions:\n{}",
+            "Loaded Skill (immutable instruction context)\nname: {}\nskill_id: {}\nsource: {:?}:{}{}\nversion: {}\ndigest: {}\n\nInstructions:\n{}",
             descriptor.name,
             descriptor.skill_id,
             descriptor.source.kind,
             descriptor.source.locator,
+            resource_base,
             version,
             descriptor.digest,
             load.package.instructions
         ),
     )
+}
+
+pub(crate) fn skill_resource_base(
+    source: &orchestral_core::skill_protocol::SkillSource,
+) -> Option<String> {
+    let locator = std::path::Path::new(&source.locator);
+    if !locator.is_absolute() {
+        return None;
+    }
+    locator
+        .parent()
+        .map(|parent| parent.to_string_lossy().into_owned())
 }
 
 fn effect_uncertainty_message(

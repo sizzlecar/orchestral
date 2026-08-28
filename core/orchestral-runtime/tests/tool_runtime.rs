@@ -28,7 +28,8 @@ use orchestral_core::tool_protocol::{
 use orchestral_runtime::{
     tools::{
         guarded_artifact_read_descriptor, guarded_file_read_descriptor, guarded_shell_descriptor,
-        GuardedArtifactReadExecutor, GuardedFileReadExecutor, GuardedShellExecutor,
+        guarded_shell_descriptor_with_program_aliases, GuardedArtifactReadExecutor,
+        GuardedFileReadExecutor, GuardedProgramAliases, GuardedShellExecutor,
         GUARDED_SHELL_SANDBOX_PROFILE,
     },
     GuardedToolExecution, GuardedToolExecutor, GuardedToolResult, GuardedToolRuntime,
@@ -39,7 +40,8 @@ use orchestral_runtime::{
 #[cfg(target_os = "macos")]
 use orchestral_runtime::{
     tools::{
-        guarded_pty_close_descriptor, guarded_pty_create_descriptor, guarded_pty_list_descriptor,
+        guarded_pty_close_descriptor, guarded_pty_create_descriptor,
+        guarded_pty_create_descriptor_with_program_aliases, guarded_pty_list_descriptor,
         guarded_pty_read_descriptor, guarded_pty_write_descriptor, GuardedPtyCloseExecutor,
         GuardedPtyCreateExecutor, GuardedPtyListExecutor, GuardedPtyReadExecutor,
         GuardedPtyWriteExecutor, GUARDED_PTY_SANDBOX_PROFILE,
@@ -604,20 +606,24 @@ async fn guarded_shell_executes_only_after_exact_approval_inside_the_host_sandbo
         max_timeout_ms: Some(2_000),
         max_output_bytes: Some(4 * 1024),
     };
+    let aliases = GuardedProgramAliases::new([("echo".to_owned(), executable.clone())]).unwrap();
     let runtime = runtime(bounds.clone());
     runtime
         .register(
-            guarded_shell_descriptor(ToolRestriction {
-                bounds: bounds.clone(),
-            }),
-            Arc::new(GuardedShellExecutor),
+            guarded_shell_descriptor_with_program_aliases(
+                ToolRestriction {
+                    bounds: bounds.clone(),
+                },
+                &aliases,
+            ),
+            Arc::new(GuardedShellExecutor::new(aliases)),
         )
         .unwrap();
     let invocation = ToolInvocation {
         run_id: RunId::new("guarded-shell-run"),
         call_id: ToolCallId::new("guarded-shell-call"),
         tool_id: ToolId::new("orchestral/shell_exec/v1"),
-        arguments: json!({ "command": executable, "args": ["hello"] }),
+        arguments: json!({ "command": "echo", "args": ["hello"] }),
     };
     let first = runtime
         .invoke(
@@ -632,7 +638,7 @@ async fn guarded_shell_executes_only_after_exact_approval_inside_the_host_sandbo
     let GuardedToolResult::ApprovalRequired { binding, summary } = first else {
         panic!("guarded shell must request approval before execution")
     };
-    assert!(summary.contains("/bin/echo"));
+    assert!(summary.contains("echo"));
     assert!(summary.contains("hello"));
     let capability = HostApprovalIssuer::new(SIGNING_KEY)
         .unwrap()
@@ -708,7 +714,7 @@ async fn one_thousand_guarded_shell_wait_cancellations_reap_processes_with_subse
             guarded_shell_descriptor(ToolRestriction {
                 bounds: bounds.clone(),
             }),
-            Arc::new(GuardedShellExecutor),
+            Arc::new(GuardedShellExecutor::default()),
         )
         .unwrap();
     let script = format!(
@@ -855,7 +861,7 @@ async fn one_thousand_guarded_shell_read_cancellations_reap_pipe_holders_with_su
             guarded_shell_descriptor(ToolRestriction {
                 bounds: bounds.clone(),
             }),
-            Arc::new(GuardedShellExecutor),
+            Arc::new(GuardedShellExecutor::default()),
         )
         .unwrap();
     let script = format!(
@@ -993,6 +999,7 @@ async fn guarded_pty_tools_are_run_scoped_and_cancel_closes_the_process() {
         max_timeout_ms: Some(2_000),
         max_output_bytes: Some(16 * 1024),
     };
+    let aliases = GuardedProgramAliases::new([("cat".to_owned(), executable.clone())]).unwrap();
     let runtime = runtime(bounds.clone());
     let manager = Arc::new(PtyProcessManager::new(16 * 1024, Duration::from_secs(60)).unwrap());
     let restriction = || ToolRestriction {
@@ -1000,8 +1007,11 @@ async fn guarded_pty_tools_are_run_scoped_and_cancel_closes_the_process() {
     };
     runtime
         .register(
-            guarded_pty_create_descriptor(restriction()),
-            Arc::new(GuardedPtyCreateExecutor::new(manager.clone())),
+            guarded_pty_create_descriptor_with_program_aliases(restriction(), &aliases),
+            Arc::new(GuardedPtyCreateExecutor::new_with_program_aliases(
+                manager.clone(),
+                aliases,
+            )),
         )
         .unwrap();
     runtime
@@ -1033,7 +1043,7 @@ async fn guarded_pty_tools_are_run_scoped_and_cancel_closes_the_process() {
         run_id: RunId::new("pty-run"),
         call_id: ToolCallId::new("create-1"),
         tool_id: ToolId::new("orchestral/pty_create/v1"),
-        arguments: json!({ "command": executable }),
+        arguments: json!({ "command": "cat" }),
     };
     let GuardedToolResult::ApprovalRequired { binding, summary } = runtime
         .invoke(
@@ -1048,7 +1058,7 @@ async fn guarded_pty_tools_are_run_scoped_and_cancel_closes_the_process() {
     else {
         panic!("PTY create must require approval")
     };
-    assert!(summary.contains("/bin/cat"));
+    assert!(summary.contains("cat"));
     let create_capability = HostApprovalIssuer::new(SIGNING_KEY)
         .unwrap()
         .issue(binding, i64::MAX)
@@ -2021,7 +2031,7 @@ async fn two_thousand_five_hundred_model_sandbox_downgrades_reach_no_executor() 
             guarded_shell_descriptor(ToolRestriction {
                 bounds: bounds.clone(),
             }),
-            Arc::new(GuardedShellExecutor),
+            Arc::new(GuardedShellExecutor::default()),
         )
         .unwrap();
     let fields = [
@@ -2076,7 +2086,7 @@ async fn two_thousand_five_hundred_alternate_spawn_mutations_start_zero_processe
             guarded_shell_descriptor(ToolRestriction {
                 bounds: bounds.clone(),
             }),
-            Arc::new(GuardedShellExecutor),
+            Arc::new(GuardedShellExecutor::default()),
         )
         .unwrap();
     for index in 0..MUTATIONS {

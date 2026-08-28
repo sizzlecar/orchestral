@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -44,7 +44,9 @@ use orchestral_model_gemini::{
 use orchestral_model_openai::{OpenAiCompatibleBackend, OpenAiCompatibleConfig};
 use orchestral_runtime::tools::{
     guarded_apply_patch_descriptor, guarded_artifact_read_descriptor, guarded_file_read_descriptor,
-    GuardedApplyPatchExecutor, GuardedArtifactReadExecutor, GuardedFileReadExecutor,
+    guarded_pty_create_descriptor_with_program_aliases,
+    guarded_shell_descriptor_with_program_aliases, GuardedApplyPatchExecutor,
+    GuardedArtifactReadExecutor, GuardedFileReadExecutor, GuardedProgramAliases,
 };
 use orchestral_runtime::{
     AgentClient, AgentControlEvent, AgentController, DeterministicExtractiveSessionSummarizer,
@@ -317,7 +319,8 @@ fn build_cli_tool_runtime(
     let workspace = std::fs::canonicalize(std::env::current_dir().context("resolve workspace")?)
         .context("canonicalize workspace")?;
     let workspace = workspace.to_string_lossy().to_string();
-    let shell_programs = configured_shell_programs(config)?;
+    let shell_program_aliases = configured_shell_programs(config)?;
+    let shell_programs = shell_program_aliases.canonical_programs();
     let shell_enabled = !shell_programs.is_empty();
     let mcp_effects = mcp_configs
         .iter()
@@ -392,6 +395,25 @@ fn build_cli_tool_runtime(
         max_timeout_ms: Some(config.tools.max_timeout_ms),
         max_output_bytes: Some(config.tools.max_output_bytes),
     };
+    // Tool restrictions are capability-local. MCP transport programs,
+    // credentials, environment names, and network targets must never become
+    // ambient authority for the generic Shell/PTY tools.
+    let mut shell_bounds = bounds.clone();
+    shell_bounds.allowed_effects = BTreeSet::from([
+        EffectScope::Process,
+        EffectScope::FilesystemRead,
+        EffectScope::FilesystemWrite,
+        EffectScope::EnvironmentRead,
+        EffectScope::ExternalSideEffect,
+    ]);
+    shell_bounds.sandbox.allowed_profiles = BTreeSet::from([
+        orchestral_runtime::tools::GUARDED_SHELL_SANDBOX_PROFILE.to_owned(),
+        orchestral_runtime::tools::GUARDED_PTY_SANDBOX_PROFILE.to_owned(),
+    ]);
+    shell_bounds.process.allowed_programs = shell_programs;
+    shell_bounds.network = NetworkPolicy::default();
+    shell_bounds.environment = EnvironmentPolicy::default();
+    shell_bounds.allowed_credentials.clear();
     let signing_material = Digest::sha256(unique_id("cli-approval-key", 0));
     let approval_broker = Arc::new(
         InMemoryHostApprovalBroker::new(signing_material.as_str().as_bytes())
@@ -443,10 +465,15 @@ fn build_cli_tool_runtime(
     if shell_enabled {
         runtime
             .register(
-                orchestral_runtime::tools::guarded_shell_descriptor(ToolRestriction {
-                    bounds: bounds.clone(),
-                }),
-                Arc::new(orchestral_runtime::tools::GuardedShellExecutor),
+                guarded_shell_descriptor_with_program_aliases(
+                    ToolRestriction {
+                        bounds: shell_bounds.clone(),
+                    },
+                    &shell_program_aliases,
+                ),
+                Arc::new(orchestral_runtime::tools::GuardedShellExecutor::new(
+                    shell_program_aliases.clone(),
+                )),
             )
             .context("register guarded shell Tool")?;
         let pty_manager = Arc::new(
@@ -455,18 +482,24 @@ fn build_cli_tool_runtime(
         );
         runtime
             .register(
-                orchestral_runtime::tools::guarded_pty_create_descriptor(ToolRestriction {
-                    bounds: bounds.clone(),
-                }),
-                Arc::new(orchestral_runtime::tools::GuardedPtyCreateExecutor::new(
-                    pty_manager.clone(),
-                )),
+                guarded_pty_create_descriptor_with_program_aliases(
+                    ToolRestriction {
+                        bounds: shell_bounds.clone(),
+                    },
+                    &shell_program_aliases,
+                ),
+                Arc::new(
+                    orchestral_runtime::tools::GuardedPtyCreateExecutor::new_with_program_aliases(
+                        pty_manager.clone(),
+                        shell_program_aliases,
+                    ),
+                ),
             )
             .context("register guarded pty_create Tool")?;
         runtime
             .register(
                 orchestral_runtime::tools::guarded_pty_write_descriptor(ToolRestriction {
-                    bounds: bounds.clone(),
+                    bounds: shell_bounds.clone(),
                 }),
                 Arc::new(orchestral_runtime::tools::GuardedPtyWriteExecutor::new(
                     pty_manager.clone(),
@@ -476,7 +509,7 @@ fn build_cli_tool_runtime(
         runtime
             .register(
                 orchestral_runtime::tools::guarded_pty_read_descriptor(ToolRestriction {
-                    bounds: bounds.clone(),
+                    bounds: shell_bounds.clone(),
                 }),
                 Arc::new(orchestral_runtime::tools::GuardedPtyReadExecutor::new(
                     pty_manager.clone(),
@@ -486,7 +519,7 @@ fn build_cli_tool_runtime(
         runtime
             .register(
                 orchestral_runtime::tools::guarded_pty_close_descriptor(ToolRestriction {
-                    bounds: bounds.clone(),
+                    bounds: shell_bounds.clone(),
                 }),
                 Arc::new(orchestral_runtime::tools::GuardedPtyCloseExecutor::new(
                     pty_manager.clone(),
@@ -496,7 +529,7 @@ fn build_cli_tool_runtime(
         runtime
             .register(
                 orchestral_runtime::tools::guarded_pty_list_descriptor(ToolRestriction {
-                    bounds: bounds.clone(),
+                    bounds: shell_bounds,
                 }),
                 Arc::new(orchestral_runtime::tools::GuardedPtyListExecutor::new(
                     pty_manager,
@@ -575,23 +608,34 @@ fn build_cli_skill_runtime(config: &OrchestralConfig) -> anyhow::Result<Option<A
     Ok(Some(Arc::new(runtime)))
 }
 
-fn configured_shell_programs(config: &OrchestralConfig) -> anyhow::Result<BTreeSet<String>> {
+fn configured_shell_programs(config: &OrchestralConfig) -> anyhow::Result<GuardedProgramAliases> {
     if !config.tools.shell.enabled {
-        return Ok(BTreeSet::new());
+        return Ok(GuardedProgramAliases::default());
     }
     let configured = config.tools.shell.allowed_programs.clone();
-    let mut resolved = BTreeSet::new();
+    let mut resolved = Vec::new();
     for program in configured {
-        match resolve_host_program(&program) {
+        match locate_host_program(&program) {
             Ok(path) => {
-                resolved.insert(path);
+                let alias = if Path::new(&program).is_absolute() {
+                    Path::new(&program)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .context("configured executable path has no UTF-8 file name")?
+                        .to_owned()
+                } else {
+                    program.clone()
+                };
+                resolved.push((alias, path.to_string_lossy().into_owned()));
             }
             Err(error) => {
                 tracing::warn!(program, %error, "configured shell program is unavailable")
             }
         }
     }
-    Ok(resolved)
+    GuardedProgramAliases::new(resolved)
+        .map_err(anyhow::Error::msg)
+        .context("build Host executable alias registry")
 }
 
 /// MCP and Skill remain distinct resources. Only explicit Host MCP transports
@@ -685,11 +729,19 @@ fn configured_mcp_servers(
 }
 
 fn resolve_host_program(program: &str) -> anyhow::Result<String> {
+    let candidate = locate_host_program(program)?;
+    std::fs::canonicalize(&candidate)
+        .with_context(|| format!("canonicalize executable '{}'", candidate.display()))
+        .map(|path| path.to_string_lossy().to_string())
+}
+
+fn locate_host_program(program: &str) -> anyhow::Result<PathBuf> {
     let candidate = PathBuf::from(program);
     if candidate.is_absolute() {
-        return std::fs::canonicalize(&candidate)
-            .with_context(|| format!("canonicalize executable '{}'", candidate.display()))
-            .map(|path| path.to_string_lossy().to_string());
+        if host_executable_file(&candidate) {
+            return Ok(candidate);
+        }
+        bail!("executable is unavailable: {}", candidate.display())
     }
     if program.contains(std::path::MAIN_SEPARATOR) || program.trim().is_empty() {
         bail!("program must be an absolute path or a bare executable name")
@@ -697,23 +749,35 @@ fn resolve_host_program(program: &str) -> anyhow::Result<String> {
     let path = std::env::var_os("PATH").context("PATH is unavailable")?;
     for directory in std::env::split_paths(&path) {
         let candidate = directory.join(program);
-        if candidate.is_file() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if candidate
-                    .metadata()
-                    .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 == 0)
-                {
-                    continue;
-                }
-            }
-            return std::fs::canonicalize(&candidate)
-                .with_context(|| format!("canonicalize executable '{}'", candidate.display()))
-                .map(|path| path.to_string_lossy().to_string());
+        if host_executable_file(&candidate) {
+            return if candidate.is_absolute() {
+                Ok(candidate)
+            } else {
+                Ok(std::env::current_dir()
+                    .context("resolve current directory for relative PATH entry")?
+                    .join(candidate))
+            };
         }
     }
     bail!("executable was not found on Host PATH")
+}
+
+fn host_executable_file(candidate: &Path) -> bool {
+    let Ok(metadata) = candidate.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn resolve_model(
