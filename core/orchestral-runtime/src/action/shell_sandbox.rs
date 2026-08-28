@@ -352,14 +352,40 @@ fn build_macos_profile(
     let mut subtree_reads = BTreeSet::new();
     for path in [
         Path::new("/usr/lib"),
+        Path::new("/usr/share"),
         Path::new("/System/Library"),
+        Path::new("/System/Cryptexes"),
         Path::new("/System/Volumes/Preboot/Cryptexes/OS/usr/lib"),
         Path::new("/System/Volumes/Preboot/Cryptexes/OS/System/Library"),
+        // Xcode command-line drivers load Apple-owned developer frameworks
+        // from these system locations even when the selected SDK lives under
+        // `/Applications/Xcode.app`.
+        Path::new("/Library/Developer"),
+        Path::new("/Library/Apple/System/Library"),
+        Path::new("/etc"),
+        Path::new("/private/etc"),
     ] {
         add_path_ancestors(path, &mut literal_reads);
         subtree_reads.insert(path.to_path_buf());
     }
-    for path in [Path::new("/usr/bin/sandbox-exec"), Path::new("/dev/null")] {
+    for path in [
+        Path::new("/usr/bin/sandbox-exec"),
+        Path::new("/dev/null"),
+        // Apple toolchains resolve the active developer directory through this
+        // Host-owned selector before reading SDKs under the approved Xcode root.
+        // Seatbelt observes the physical `/private/var` path while the tool
+        // reports the public `/var` alias, so both exact identities are needed.
+        Path::new("/var/select/developer_dir"),
+        Path::new("/private/var/select/developer_dir"),
+        // macOS resolves the system `sh` implementation through the same
+        // selector mechanism when compiler drivers launch helper scripts.
+        Path::new("/var/select/sh"),
+        Path::new("/private/var/select/sh"),
+        // xcrun/clang consult this non-secret Host preference to confirm the
+        // installed Xcode SDK license before linking.
+        Path::new("/Library/Preferences/com.apple.dt.Xcode.plist"),
+        Path::new("/Library/Preferences/.GlobalPreferences.plist"),
+    ] {
         add_path_ancestors(path, &mut literal_reads);
         literal_reads.insert(path.to_path_buf());
     }
@@ -546,6 +572,11 @@ mod tests {
         assert!(profile.contains("file-write*"));
         assert!(profile.contains("(deny default)"));
         assert!(profile.contains("(literal \"/dev/null\")"));
+        assert!(profile.contains("(literal \"/var/select/developer_dir\")"));
+        assert!(profile.contains("(literal \"/private/var/select/developer_dir\")"));
+        assert!(profile.contains("(literal \"/var/select/sh\")"));
+        assert!(profile.contains("(literal \"/private/var/select/sh\")"));
+        assert!(profile.contains("(literal \"/Library/Preferences/com.apple.dt.Xcode.plist\")"));
         assert!(profile.contains(&format!(
             "(allow process-exec (literal \"{}\"))",
             program.to_string_lossy()
