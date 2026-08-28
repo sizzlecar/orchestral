@@ -109,6 +109,13 @@ impl TestWorkspace {
 
 impl Drop for TestWorkspace {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!(
+                "preserving failed Agent E2E workspace at {}",
+                self.root.display()
+            );
+            return;
+        }
         let _ = fs::remove_dir_all(&self.root);
     }
 }
@@ -445,8 +452,28 @@ fn local_cli_reads_patches_and_runs_a_guarded_verification() {
     let workspace = TestWorkspace::new("patch-and-verify");
     fs::create_dir_all(workspace.path("src")).expect("create source directory");
     fs::write(
+        workspace.path("Cargo.toml"),
+        concat!(
+            "[package]\n",
+            "name = \"agent-e1-deterministic-fixture\"\n",
+            "version = \"0.1.0\"\n",
+            "edition = \"2021\"\n",
+        ),
+    )
+    .expect("write deterministic Cargo manifest");
+    fs::write(
         workspace.path("src/lib.rs"),
-        "pub fn answer() -> u32 { 41 }\n",
+        concat!(
+            "pub fn answer() -> u32 { 41 }\n\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    use super::*;\n\n",
+            "    #[test]\n",
+            "    fn returns_the_documented_answer() {\n",
+            "        assert_eq!(answer(), 42);\n",
+            "    }\n",
+            "}\n",
+        ),
     )
     .expect("write buggy source fixture");
 
@@ -496,7 +523,8 @@ fn local_cli_reads_patches_and_runs_a_guarded_verification() {
                 "verify-fixed-source",
                 "exec_command",
                 json!({
-                    "cmd": "rg --fixed-strings 'pub fn answer() -> u32 { 42 }' src/lib.rs"
+                    "cmd": "cargo test --offline --quiet >/dev/null 2>&1",
+                    "yield_time_ms": 30_000
                 }),
             )
         }),
@@ -509,13 +537,9 @@ fn local_cli_reads_patches_and_runs_a_guarded_verification() {
     workspace.configure_local_openai(&model_endpoint);
 
     let output = run_with_approval(
-        local_agent_command(
+        local_default_agent_command(
             &workspace,
             "patch-and-verify-session",
-            concat!(
-                "Inspect the source, fix the requested behavior with the file mutation Tool, ",
-                "run a guarded verification, then report only the success marker."
-            ),
             "Fix answer() so it returns the documented answer 42, then verify the change.",
             true,
             true,
@@ -526,10 +550,9 @@ fn local_cli_reads_patches_and_runs_a_guarded_verification() {
     );
     assert!(output.status.success(), "{}", output.stderr_text());
     assert_eq!(output.stdout_text().trim(), "PATCH_AND_VERIFY_OK");
-    assert_eq!(
-        fs::read_to_string(workspace.path("src/lib.rs")).unwrap(),
-        "pub fn answer() -> u32 { 42 }\n"
-    );
+    assert!(fs::read_to_string(workspace.path("src/lib.rs"))
+        .unwrap()
+        .contains("pub fn answer() -> u32 { 42 }"));
     assert!(output.stderr_text().contains(APPROVAL_PROMPT));
     output.assert_no_ansi();
 
@@ -644,17 +667,19 @@ fn local_cli_skill_read_injects_instructions_and_journals_load() {
 
     let workspace = TestWorkspace::new("skill-entrypoint");
     let skill_directory = workspace.path("skills/e2e-skill");
-    fs::create_dir_all(&skill_directory).expect("create Skill fixture directory");
+    fs::create_dir_all(skill_directory.join("scripts")).expect("create Skill fixture resources");
     fs::write(
         skill_directory.join("SKILL.md"),
         format!(
-            "---\nname: e2e-skill\ndescription: {DESCRIPTOR_MARKER}\nversion: 1.0.0\n---\nPrivate instruction {INSTRUCTION_MARKER}: read verification.txt with file_read, then report its exact content.\n"
+            "---\nname: e2e-skill\ndescription: {DESCRIPTOR_MARKER}\nversion: 1.0.0\n---\nPrivate instruction {INSTRUCTION_MARKER}: run `sh scripts/collect.sh` with exec_command using this Skill's resource base as workdir, then report its exact stdout.\n"
         ),
     )
     .expect("write Skill fixture");
-    let verification_path = skill_directory.join("verification.txt");
-    fs::write(&verification_path, format!("{RESULT_MARKER}\n"))
-        .expect("write Skill verification fixture");
+    fs::write(
+        skill_directory.join("scripts/collect.sh"),
+        format!("#!/bin/sh\nprintf '%s\\n' '{RESULT_MARKER}'\n"),
+    )
+    .expect("write Skill verification script");
     let skill_path = skill_directory
         .join("SKILL.md")
         .canonicalize()
@@ -664,11 +689,6 @@ fn local_cli_skill_read_injects_instructions_and_journals_load() {
     let skill_resource_base = skill_directory
         .canonicalize()
         .expect("canonical Skill resource base")
-        .to_string_lossy()
-        .to_string();
-    let verification_path = verification_path
-        .canonicalize()
-        .expect("canonical Skill verification fixture")
         .to_string_lossy()
         .to_string();
 
@@ -691,9 +711,13 @@ fn local_cli_skill_read_injects_instructions_and_journals_load() {
             assert!(context.contains(&skill_resource_base));
             assert!(context.contains("Relative paths in this Skill's instructions"));
             openai_tool_response(
-                "read-verification",
-                "file_read",
-                json!({ "path": verification_path }),
+                "run-skill-resource",
+                "exec_command",
+                json!({
+                    "cmd": "sh scripts/collect.sh",
+                    "workdir": skill_resource_base,
+                    "yield_time_ms": 5_000
+                }),
             )
         }),
         Box::new(|request| {
@@ -703,7 +727,7 @@ fn local_cli_skill_read_injects_instructions_and_journals_load() {
     ]);
     workspace.configure_local_openai(&model_endpoint);
 
-    let output = run_to_completion(
+    let output = run_with_approval(
         local_default_agent_command(
             &workspace,
             "skill-entrypoint-session",
@@ -711,6 +735,8 @@ fn local_cli_skill_read_injects_instructions_and_journals_load() {
             true,
             false,
         ),
+        true,
+        None,
         LOCAL_PROCESS_TIMEOUT,
     );
     assert!(output.status.success(), "{}", output.stderr_text());
@@ -733,9 +759,15 @@ fn local_cli_skill_read_injects_instructions_and_journals_load() {
     let exchanges = tool_exchanges(&records);
     assert_eq!(exchanges.len(), 2);
     assert_eq!(tool_name(exchanges[0]), Some("skill_read"));
-    assert_eq!(tool_name(exchanges[1]), Some("file_read"));
+    assert_eq!(tool_name(exchanges[1]), Some("exec_command"));
     assert_eq!(tool_result_is_error(exchanges[0]), Some(false));
     assert_eq!(tool_result_is_error(exchanges[1]), Some(false));
+    assert!(
+        tool_result_value(exchanges[1])
+            .to_string()
+            .contains(RESULT_MARKER),
+        "Skill script output did not enter the Tool observation"
+    );
 }
 
 #[test]
@@ -801,10 +833,9 @@ fn local_cli_discovers_calls_and_journals_an_mcp_tool() {
     workspace.configure_local_openai(&model_endpoint);
 
     let output = run_with_approval(
-        local_agent_command(
+        local_default_agent_command(
             &workspace,
             "mcp-entrypoint-session",
-            "Call the requested MCP Tool exactly once, then return only the success marker.",
             "Use the fixture MCP lookup_marker tool with key 能力.",
             false,
             true,
@@ -913,134 +944,267 @@ fn live_agent_recovers_after_a_failed_file_read() {
 
 #[test]
 #[ignore = "spends real Google Vertex quota; requires ADC or a service-account credential"]
-fn live_coding_agent_reads_patches_and_verifies_the_change() {
+fn live_e1_coding_closes_the_inspect_patch_verify_loop_three_times() {
     let _guard = live_test_guard();
-    let workspace = TestWorkspace::new("live-coding-patch");
-    fs::create_dir_all(workspace.path("src")).expect("create live source directory");
-    fs::write(
-        workspace.path("src/lib.rs"),
-        "pub fn answer() -> u32 { 41 }\n",
-    )
-    .expect("write live buggy source");
-    let output = run_with_approval(
-        live_command(
+    for attempt in 1..=3 {
+        let workspace = TestWorkspace::new(&format!("live-e1-coding-{attempt}"));
+        fs::create_dir_all(workspace.path("src")).expect("create live source directory");
+        fs::write(
+            workspace.path("Cargo.toml"),
+            concat!(
+                "[package]\n",
+                "name = \"agent-e1-fixture\"\n",
+                "version = \"0.1.0\"\n",
+                "edition = \"2021\"\n",
+            ),
+        )
+        .expect("write live Cargo manifest");
+        fs::write(
+            workspace.path("src/lib.rs"),
+            concat!(
+                "pub fn total(values: &[u32]) -> u32 {\n",
+                "    values.iter().sum::<u32>().saturating_sub(1)\n",
+                "}\n\n",
+                "#[cfg(test)]\n",
+                "mod tests {\n",
+                "    use super::*;\n\n",
+                "    #[test]\n",
+                "    fn totals_every_value() {\n",
+                "        assert_eq!(total(&[10, 20, 12]), 42);\n",
+                "    }\n",
+                "}\n",
+            ),
+        )
+        .expect("write live failing source");
+
+        let mut command = live_default_command(
             &workspace,
-            "live-coding-patch-session",
-            concat!(
-                "For coding tasks, inspect the target before editing, make the smallest scoped ",
-                "change through the file mutation Tool, and ground the final report in a ",
-                "successful verification observation."
-            ),
-            concat!(
-                "Fix src/lib.rs so answer() returns 42. Inspect it first, use apply_patch, then ",
-                "use the available rg command as a guarded verification before finishing."
-            ),
-        ),
-        true,
-        None,
-        LIVE_CODING_PROCESS_TIMEOUT,
-    );
-    assert!(output.status.success(), "{}", output.stderr_text());
-    assert!(!output.stdout_text().trim().is_empty());
-    output.assert_no_ansi();
+            &format!("live-e1-coding-session-{attempt}"),
+            true,
+            true,
+        );
+        command.arg(
+            "Repair the failing Rust project in this workspace. Run its test suite and report the verified result.",
+        );
+        let output = run_with_approval(command, true, None, LIVE_CODING_PROCESS_TIMEOUT);
+        assert!(output.status.success(), "{}", output.stderr_text());
+        assert!(!output.stdout_text().trim().is_empty());
+        output.assert_no_ansi();
 
-    let source = fs::read_to_string(workspace.path("src/lib.rs")).expect("read fixed source");
-    assert!(source.contains("42"), "source was not fixed: {source}");
-    assert!(!source.contains("41"), "stale bug remains: {source}");
+        let verification = Command::new("cargo")
+            .arg("test")
+            .current_dir(&workspace.root)
+            .output()
+            .expect("independently verify the live coding fixture");
+        assert!(
+            verification.status.success(),
+            "live coding attempt {attempt} did not fix the project:\n{}",
+            String::from_utf8_lossy(&verification.stderr)
+        );
 
-    let records = session_records(&workspace);
-    let exchanges = tool_exchanges(&records);
-    let trace = exchanges
-        .iter()
-        .filter_map(|exchange| {
-            tool_name(exchange).map(|name| (name, tool_result_is_error(exchange)))
-        })
-        .collect::<Vec<_>>();
-    let read = trace
-        .iter()
-        .position(|(name, error)| *name == "file_read" && *error == Some(false))
-        .expect("live coding run omitted file_read");
-    let patch = trace
-        .iter()
-        .position(|(name, error)| *name == "apply_patch" && *error == Some(false))
-        .expect("live coding run omitted apply_patch");
-    let verify = trace
-        .iter()
-        .position(|(name, error)| *name == "exec_command" && *error == Some(false))
-        .expect("live coding run omitted guarded verification");
-    assert!(
-        read < patch && patch < verify,
-        "unexpected Tool trace: {trace:?}"
-    );
+        let records = session_records(&workspace);
+        let exchanges = tool_exchanges(&records);
+        let patch = exchanges
+            .iter()
+            .position(|exchange| {
+                tool_name(exchange) == Some("apply_patch")
+                    && tool_result_is_error(exchange) == Some(false)
+            })
+            .expect("live coding run omitted apply_patch");
+        assert!(
+            exchanges[..patch].iter().any(|exchange| {
+                matches!(tool_name(exchange), Some("file_read" | "exec_command"))
+                    && tool_result_is_error(exchange) == Some(false)
+            }),
+            "live coding run did not inspect before editing"
+        );
+        assert!(
+            exchanges[patch + 1..].iter().any(|exchange| {
+                matches!(tool_name(exchange), Some("exec_command" | "write_stdin"))
+                    && tool_result_is_error(exchange) == Some(false)
+                    && tool_result_value(exchange)["exit_code"] == json!(0)
+            }),
+            "live coding run did not verify successfully after editing"
+        );
+    }
 }
 
 #[test]
 #[ignore = "spends real Google Vertex quota; requires ADC or a service-account credential"]
-fn live_agent_follows_a_dynamically_discovered_workspace_skill() {
+fn live_e2_skill_discovers_relative_resources_three_times() {
     let _guard = live_test_guard();
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock after epoch")
-        .as_nanos();
-    let marker = format!("LIVE_SKILL_RESULT_海豚_{nonce}");
-    let evidence_file = format!("skill-evidence-{nonce}.txt");
+    for attempt in 1..=3 {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let marker = format!("LIVE_SKILL_EVIDENCE_海豚_{attempt}_{nonce}");
+        let workspace = TestWorkspace::new(&format!("live-e2-skill-{attempt}"));
+        let skill_directory = workspace.path("skills/release-evidence");
+        fs::create_dir_all(skill_directory.join("scripts")).expect("create live Skill resources");
+        fs::write(
+            skill_directory.join("SKILL.md"),
+            concat!(
+                "---\n",
+                "name: release-evidence\n",
+                "description: Collect release evidence by following this workspace's local procedure\n",
+                "version: 1.0.0\n",
+                "---\n",
+                "Run `sh scripts/collect.sh` with exec_command using this Skill's resource base as workdir. ",
+                "Report the exact stdout as the evidence.\n",
+            ),
+        )
+        .expect("write live Skill");
+        fs::write(
+            skill_directory.join("scripts/collect.sh"),
+            format!("#!/bin/sh\nprintf '%s\\n' '{marker}'\n"),
+        )
+        .expect("write live Skill script");
 
-    let workspace = TestWorkspace::new("live-dynamic-skill");
-    let skill_directory = workspace.path("skills/workspace-audit");
-    fs::create_dir_all(&skill_directory).expect("create live Skill directory");
-    fs::write(
-        skill_directory.join("SKILL.md"),
-        format!(
-            "---\nname: workspace-audit\ndescription: Follow the workspace's local audit procedure\nversion: 1.0.0\n---\nRead {evidence_file} with file_read, then return its exact content.\n",
-        ),
-    )
-    .expect("write live Skill");
-    fs::write(skill_directory.join(&evidence_file), format!("{marker}\n"))
-        .expect("write live Skill evidence");
+        let mut command = live_default_command(
+            &workspace,
+            &format!("live-e2-skill-session-{attempt}"),
+            true,
+            false,
+        );
+        command.arg(
+            "Follow the workspace procedure for collecting release evidence and report what it produces.",
+        );
+        let output = run_with_approval(command, true, None, PROCESS_TIMEOUT);
+        assert!(output.status.success(), "{}", output.stderr_text());
+        let final_output = output.stdout_text();
+        assert!(final_output.contains(&marker), "{final_output}");
+        output.assert_no_ansi();
 
-    let mut command = root_command(&workspace);
-    command
-        .arg("--backend")
-        .arg("google")
-        .arg("--model")
-        .arg(live_model())
-        .arg("--temperature")
-        .arg("0")
-        .arg("--session-id")
-        .arg("live-dynamic-skill-session")
-        .arg("--no-mcp");
-    if let Some(path) = explicit_live_credential() {
-        command.arg("--credential-file").arg(path);
-    } else {
+        let records = session_records(&workspace);
+        assert_eq!(payload_count(&records, "skill_loaded"), 1);
+        let exchanges = tool_exchanges(&records);
+        let skill_read = exchanges
+            .iter()
+            .position(|exchange| {
+                tool_name(exchange) == Some("skill_read")
+                    && tool_result_is_error(exchange) == Some(false)
+            })
+            .expect("live Skill run omitted skill_read");
+        let script = exchanges
+            .iter()
+            .position(|exchange| {
+                tool_name(exchange) == Some("exec_command")
+                    && tool_result_is_error(exchange) == Some(false)
+            })
+            .expect("live Skill run omitted relative script execution");
         assert!(
-            standard_adc_is_available(),
-            "live E2E requires Google credentials"
+            skill_read < script,
+            "Skill instructions were not loaded first"
+        );
+        assert!(
+            tool_result_value(exchanges[script])
+                .to_string()
+                .contains(&marker),
+            "Skill script output was not returned through the Tool observation"
         );
     }
-    command.arg("使用 workspace-audit 完成任务。");
+}
 
-    let output = run_to_completion(command, PROCESS_TIMEOUT);
-    assert!(output.status.success(), "{}", output.stderr_text());
-    let final_output = output.stdout_text();
-    assert!(final_output.contains(&marker), "{final_output}");
-    output.assert_no_ansi();
+#[test]
+#[ignore = "spends real Google Vertex quota; requires ADC or a service-account credential"]
+fn live_e3_mcp_discovers_and_uses_the_configured_service_three_times() {
+    let _guard = live_test_guard();
+    for attempt in 1..=3 {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let color = format!("blue-{attempt}-{nonce}");
+        let marker = format!("checkout={color}");
+        let mcp_marker = marker.clone();
+        let workspace = TestWorkspace::new(&format!("live-e3-mcp-{attempt}"));
+        let (mcp_base, mcp_server) = spawn_fixture_http_server(vec![
+            Box::new(|request| {
+                mcp_json_response(
+                    request,
+                    json!({
+                        "supportedVersions": ["2026-07-28"],
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "deployment-inventory", "version": "1"}
+                    }),
+                )
+            }),
+            Box::new(|request| {
+                mcp_sse_response(
+                    request,
+                    json!({
+                        "resultType": "complete",
+                        "ttlMs": 1000,
+                        "cacheScope": "private",
+                        "tools": [{
+                            "name": "deployment_color",
+                            "description": "Look up the current deployment color for a service",
+                            "inputSchema": {
+                                "type": "object",
+                                "required": ["service"],
+                                "properties": {"service": {"type": "string"}},
+                                "additionalProperties": false
+                            }
+                        }]
+                    }),
+                )
+            }),
+            Box::new(move |request| {
+                assert_eq!(
+                    request.body["params"]["arguments"]["service"],
+                    json!("checkout")
+                );
+                mcp_json_response(
+                    request,
+                    json!({
+                        "resultType": "complete",
+                        "content": [{"type": "text", "text": mcp_marker}],
+                        "isError": false
+                    }),
+                )
+            }),
+        ]);
+        workspace.configure_mcp_server(&format!("{mcp_base}/mcp"));
 
-    let records = session_records(&workspace);
-    let trace = tool_exchanges(&records)
-        .iter()
-        .filter_map(|exchange| {
-            tool_name(exchange).map(|name| (name, tool_result_is_error(exchange)))
-        })
-        .collect::<Vec<_>>();
-    let skill_read = trace
-        .iter()
-        .position(|(name, error)| *name == "skill_read" && *error == Some(false))
-        .expect("live run omitted skill_read");
-    let file_read = trace
-        .iter()
-        .position(|(name, error)| *name == "file_read" && *error == Some(false))
-        .expect("live run omitted file_read");
-    assert!(skill_read < file_read, "unexpected Tool trace: {trace:?}");
+        let mut command = live_default_command(
+            &workspace,
+            &format!("live-e3-mcp-session-{attempt}"),
+            false,
+            true,
+        );
+        command.arg(
+            "Consult the configured deployment inventory and report the current color for service checkout.",
+        );
+        let output = run_with_approval(command, true, None, PROCESS_TIMEOUT);
+        assert!(output.status.success(), "{}", output.stderr_text());
+        assert!(
+            output.stdout_text().contains(&color),
+            "{}",
+            output.stdout_text()
+        );
+        output.assert_no_ansi();
+
+        let requests = mcp_server.join().expect("join live MCP fixture");
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].body["method"], "server/discover");
+        assert_eq!(requests[1].body["method"], "tools/list");
+        assert_eq!(requests[2].body["method"], "tools/call");
+        let records = session_records(&workspace);
+        let exchanges = tool_exchanges(&records);
+        assert_eq!(exchanges.len(), 1);
+        assert_eq!(
+            tool_name(exchanges[0]),
+            Some("mcp__fixture__deployment_color")
+        );
+        assert_eq!(tool_result_is_error(exchanges[0]), Some(false));
+        assert!(
+            tool_result_value(exchanges[0])
+                .to_string()
+                .contains(&marker),
+            "MCP Tool observation did not preserve the service result"
+        );
+    }
 }
 
 #[test]
@@ -1452,7 +1616,21 @@ fn live_command(
     system_prompt: &str,
     prompt: &str,
 ) -> Command {
-    let mut command = base_command(workspace);
+    let mut command = live_default_command(workspace, session_id, true, true);
+    command
+        .arg("--system-prompt")
+        .arg(system_prompt)
+        .arg(prompt);
+    command
+}
+
+fn live_default_command(
+    workspace: &TestWorkspace,
+    session_id: &str,
+    disable_mcp: bool,
+    disable_skills: bool,
+) -> Command {
+    let mut command = root_command(workspace);
     command
         .arg("--backend")
         .arg("google")
@@ -1461,9 +1639,13 @@ fn live_command(
         .arg("--temperature")
         .arg("0")
         .arg("--session-id")
-        .arg(session_id)
-        .arg("--system-prompt")
-        .arg(system_prompt);
+        .arg(session_id);
+    if disable_mcp {
+        command.arg("--no-mcp");
+    }
+    if disable_skills {
+        command.arg("--no-skills");
+    }
     if let Some(path) = explicit_live_credential() {
         command.arg("--credential-file").arg(path);
     } else {
@@ -1473,7 +1655,6 @@ fn live_command(
              GOOGLE_APPLICATION_CREDENTIALS, repository credential.json, or standard ADC"
         );
     }
-    command.arg(prompt);
     command
 }
 
@@ -1724,6 +1905,18 @@ fn tool_result_is_error(exchange: &Value) -> Option<bool> {
         .iter()
         .find(|item| item["type"].as_str() == Some("tool_result"))?["is_error"]
         .as_bool()
+}
+
+fn tool_result_value(exchange: &Value) -> &Value {
+    exchange["tool"]["content"]
+        .as_array()
+        .and_then(|content| {
+            content
+                .iter()
+                .find(|item| item["type"].as_str() == Some("tool_result"))
+        })
+        .map(|item| &item["result"])
+        .expect("Tool exchange contains one Tool result")
 }
 
 fn checkpoint_event_count(workspace: &TestWorkspace, kind: &str) -> usize {

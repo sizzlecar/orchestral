@@ -34,12 +34,12 @@ AgentController ── Agent Protocol + 持久 Run Journal
       ▼
 Generic Agent ─── ModelBackend + 持久 Session Context
       │
-      ├── 直接 Tool ────────────────┐
-      └── Workflow → Plan/DAG/Step ─┤
+      ├── 直接 Tool ───────────────────────────┐
+      └── 可选注入的 Workflow → Plan/DAG ──────┤
                                     ▼
                          GuardedToolRuntime
                            ├── 内置 Tools
-                           └── MCP stdio Tools
+                           └── MCP Tools（stdio / Streamable HTTP）
 ```
 
 ## 快速开始
@@ -74,6 +74,7 @@ cargo run -p orchestral-cli --
 Headless stdout 只输出最终 Delivery，进度和错误进入 stderr，适合管道消费。TUI 中 Enter
 发送消息或 Steer，Shift/Alt+Enter 换行，`a`/`d` 处理审批，Ctrl-C 取消当前 Run，
 PageUp/PageDown 或鼠标滚轮滚动，Esc 退出；支持 paste、resize、中文与 emoji。
+`completed` 只表示当前 Turn 已收敛并提交输出，不表示用户的外部目标已经被独立证明完成。
 
 CLI 依次发现 `.orchestral/config.yaml`、`.orchestral/config.yml`、
 `configs/orchestral.cli.yaml`、`orchestral.yaml`；都不存在时会生成
@@ -98,15 +99,23 @@ project 必须能从凭据或 `GOOGLE_CLOUD_PROJECT` 解析。
 最小 coding 任务：
 
 ```bash
-orchestral "读取失败源码，用 apply_patch 修复，运行相关测试，然后报告结果。"
+orchestral "修复当前 workspace 中失败的项目，运行测试，并报告经过验证的结果。"
 ```
 
 模型只看到一个结构化文件修改 Tool：`apply_patch`，支持 Add/Update/Delete，不能自行选择
-workspace root 或审批权限。`file_read`、`apply_patch`、Shell 验证和 MCP 调用都继续经过
-Host policy 与 Effect Journal。
+workspace root 或审批权限。`file_read`、`apply_patch`、`exec_command` / `write_stdin` 和
+MCP 调用都继续经过 Host policy 与 Effect Journal。
 
-默认 Host 策略使用显式进程白名单，不把宿主环境变量自动传给 Tool，并关闭网络访问；
-模型可见参数无法扩大这些权限。
+`exec_command` 只启动 Host 解析并批准的 shell，但允许它在 OS sandbox 内运行普通子进程和
+本地工具链，不要求逐个配置程序白名单。真正的边界是 Host 批准的读写根目录、精确网络目标、
+捕获的环境变量、时间/输出上限、逐次审批与 Effect Journal。默认不继承完整宿主环境，并关闭
+网络；MCP stdio 的启动程序仍必须由 Host 明确配置。模型可见参数不能扩大任何权限。
+
+启用 `skills.auto_discover` 后，CLI 会从 workspace 的 `.claude/skills`、`.codex/skills`、
+`skills` 以及显式 `skills.directories` 发现 `SKILL.md` 包。初始 Context 只包含 Skill descriptor；
+选中后由 `skill_read` 载入完整指令，相对资源从该 Skill 目录解析。MCP 与 Skill 保持独立：
+`mcp.servers` 支持 Host 配置的 stdio 与 Streamable HTTP transport，发现的方法会成为经过统一
+Guarded Runtime 的命名空间 Tool，而不是提示词。
 
 ## SDK
 

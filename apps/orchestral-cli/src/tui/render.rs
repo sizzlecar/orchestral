@@ -415,54 +415,58 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_120x40_scroll_and_error() {
-        let mut state = UiState::new("session-history", "deepseek-chat");
-        for index in 0..28 {
-            if index == 17 {
-                update(
-                    &mut state,
-                    UiMsg::ToolActivity {
-                        activity_id: "historical-read".to_owned(),
-                        summary: "file_read crates/runtime/src/lib.rs".to_owned(),
-                        status: ToolActivityStatus::Succeeded,
-                    },
-                );
-            }
-            if index == 18 {
-                state.transcript.push(TranscriptEntry::error(
-                    "historical-error",
-                    "MCP lookup timed out; the Agent continued with local context",
-                ));
-            }
-            state.transcript.push(if index % 5 == 0 {
-                TranscriptEntry::user(format!("Turn {index}: inspect module_{index} 中文"))
-            } else {
-                TranscriptEntry::assistant(
-                    format!("output-{index}"),
-                    format!("Observation {index}: a deliberately long line exercises wrapping and historical scrolling across a wide terminal viewport."),
-                )
-            });
-        }
+    fn snapshot_120x40_completed_tool_recovery() {
+        let mut state = UiState::new("会话-恢复", "gemini-3.1-pro");
+        state.phase = UiPhase::Running;
+        state.run_id = Some("run-recovery".to_owned());
+        state.transcript.push(TranscriptEntry::user(
+            "按照发布检查 Skill 验证 checkout 服务；如果远程查询失败，就用本地测试恢复。",
+        ));
         update(
             &mut state,
             UiMsg::ToolActivity {
-                activity_id: "patch-failed".to_owned(),
-                summary: "apply_patch conflict: source changed since inspection".to_owned(),
+                activity_id: "skill-read".to_owned(),
+                summary: "skill_read release-evidence → instructions loaded".to_owned(),
+                status: ToolActivityStatus::Succeeded,
+            },
+        );
+        update(
+            &mut state,
+            UiMsg::ToolActivity {
+                activity_id: "mcp-inventory".to_owned(),
+                summary: "mcp__inventory__deployment_color → request timed out".to_owned(),
                 status: ToolActivityStatus::Failed,
             },
         );
         update(
             &mut state,
-            UiMsg::Failed {
-                message: "verification failed after a recoverable patch conflict".to_owned(),
+            UiMsg::ToolActivity {
+                activity_id: "exec-start".to_owned(),
+                summary: "exec_command cargo test → session 7 started".to_owned(),
+                status: ToolActivityStatus::Succeeded,
             },
         );
-        update(&mut state, UiMsg::ScrollUp(12));
         update(
             &mut state,
-            UiMsg::InsertText("retry with fresh context".to_owned()),
+            UiMsg::ToolActivity {
+                activity_id: "exec-poll".to_owned(),
+                summary: "write_stdin session 7 → exited 0; 18 tests passed".to_owned(),
+                status: ToolActivityStatus::Succeeded,
+            },
         );
-        assert_snapshot!("tui_120x40_error_scroll", render_to_string(&state, 120, 40));
+        update(
+            &mut state,
+            UiMsg::Completed {
+                final_text: Some(
+                    "已恢复完成：MCP 查询超时，但本地发布检查的 18 项测试全部通过；没有发现需要修改的文件。"
+                        .to_owned(),
+                ),
+            },
+        );
+        assert_snapshot!(
+            "tui_120x40_completed_recovery",
+            render_to_string(&state, 120, 40)
+        );
     }
 
     fn render_to_string(state: &UiState, width: u16, height: u16) -> String {

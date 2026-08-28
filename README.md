@@ -35,12 +35,12 @@ AgentController ── Agent Protocol + durable Run journal
       ▼
 Generic Agent ─── ModelBackend + durable Session context
       │
-      ├── direct Tool ───────────────┐
-      └── Workflow → Plan/DAG/Step ──┤
+      ├── direct Tool ─────────────────────────┐
+      └── optional injected Workflow → Plan/DAG┤
                                      ▼
                          GuardedToolRuntime
                            ├── built-in tools
-                           └── MCP stdio tools
+                           └── MCP tools (stdio / Streamable HTTP)
 ```
 
 ## Quick start
@@ -77,6 +77,8 @@ Headless stdout contains only the final Delivery, so it is safe to pipe into ano
 progress and errors use stderr. In the TUI, Enter sends or steers, Shift/Alt+Enter inserts a
 newline, `a`/`d` resolves an approval, Ctrl-C cancels the active Run, PageUp/PageDown or the mouse
 wheel scrolls, and Esc exits. Paste, resize, CJK, and emoji are supported.
+`completed` means that the current turn settled and committed its output; it is not an independent
+claim that the user's external goal was achieved.
 
 The CLI discovers `.orchestral/config.yaml`, `.orchestral/config.yml`,
 `configs/orchestral.cli.yaml`, then `orchestral.yaml`; if none exists it creates
@@ -102,16 +104,26 @@ override for a service-account JSON key; a Vertex project must resolve from the 
 Minimal coding task:
 
 ```bash
-orchestral "Read the failing source, fix it with apply_patch, run the relevant test, and report the result."
+orchestral "Repair the failing project in this workspace, run its tests, and report the verified result."
 ```
 
 The model sees one structured file-mutation tool, `apply_patch`, for Add/Update/Delete. It cannot
-choose workspace roots or approval authority. `file_read`, `apply_patch`, Shell verification, and
-MCP calls all remain behind Host policy and effect journaling.
+choose workspace roots or approval authority. `file_read`, `apply_patch`, `exec_command` /
+`write_stdin`, and MCP calls all remain behind Host policy and effect journaling.
 
-The default Host policy uses an explicit process allowlist, does not inherit the ambient
-environment into tools, and keeps network access disabled. A model-visible tool call cannot
-expand those permissions.
+`exec_command` launches one Host-resolved shell and may run ordinary child programs and local
+toolchains inside the OS sandbox; it does not require a per-program allowlist. The actual boundary
+is the Host-approved read/write roots, exact network targets, captured environment, time/output
+limits, exact approval, and effect journal. Ambient environment is not inherited wholesale and
+network access is disabled by default. MCP stdio launch identities remain explicitly configured by
+the Host. Model-visible arguments cannot expand any of these permissions.
+
+With `skills.auto_discover: true`, the CLI discovers `SKILL.md` packages under workspace
+`.claude/skills`, `.codex/skills`, and `skills`, plus any explicit `skills.directories`. Only Skill
+descriptors enter initial Context; `skill_read` loads the selected instructions, and relative
+resources resolve from that Skill's directory. MCP stays separate: `mcp.servers` accepts
+Host-configured stdio or Streamable HTTP transports, and discovered MCP methods become guarded,
+namespaced Tools rather than prompt text.
 
 ## SDK
 
