@@ -7,7 +7,7 @@ pub(crate) enum UiPhase {
     WaitingInput,
     WaitingApproval,
     Cancelling,
-    Delivered,
+    Completed,
     Failed,
     Cancelled,
 }
@@ -20,7 +20,7 @@ impl UiPhase {
             Self::WaitingInput => "waiting input",
             Self::WaitingApproval => "waiting approval",
             Self::Cancelling => "cancelling",
-            Self::Delivered => "delivered",
+            Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
         }
@@ -29,7 +29,7 @@ impl UiPhase {
     fn accepts_new_run(self) -> bool {
         matches!(
             self,
-            Self::Idle | Self::Delivered | Self::Failed | Self::Cancelled
+            Self::Idle | Self::Completed | Self::Failed | Self::Cancelled
         )
     }
 }
@@ -193,7 +193,7 @@ pub(crate) enum UiMsg {
         message: String,
         is_error: bool,
     },
-    Delivered {
+    Completed {
         final_text: Option<String>,
     },
     Failed {
@@ -481,14 +481,14 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
                 state.transcript.push(entry);
             }
         }
-        UiMsg::Delivered { final_text } => {
+        UiMsg::Completed { final_text } => {
             if let Some(final_text) = final_text {
                 state.reconcile_delivery(final_text);
             }
             state.clear_stream();
             state.pending = None;
             state.run_id = None;
-            state.phase = UiPhase::Delivered;
+            state.phase = UiPhase::Completed;
         }
         UiMsg::Failed { message } => {
             state.transcript.push(TranscriptEntry::error(
@@ -725,11 +725,11 @@ mod tests {
         );
         update(
             &mut state,
-            UiMsg::Delivered {
+            UiMsg::Completed {
                 final_text: Some("done".to_owned()),
             },
         );
-        assert_eq!(state.phase, UiPhase::Delivered);
+        assert_eq!(state.phase, UiPhase::Completed);
 
         type_and_submit(&mut state, "third run");
         update(
@@ -820,7 +820,7 @@ mod tests {
             );
             update(
                 &mut state,
-                UiMsg::Delivered {
+                UiMsg::Completed {
                     final_text: Some(final_text.clone()),
                 },
             );

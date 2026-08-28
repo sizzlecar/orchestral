@@ -317,7 +317,7 @@ fn wrapped_line_count(lines: &[Line<'_>], width: usize) -> usize {
 
 fn phase_style(phase: UiPhase) -> Style {
     match phase {
-        UiPhase::Idle | UiPhase::Delivered => Style::new().fg(Color::Green),
+        UiPhase::Idle | UiPhase::Completed => Style::new().fg(Color::Green),
         UiPhase::Running | UiPhase::WaitingInput | UiPhase::WaitingApproval => ACCENT,
         UiPhase::Cancelling | UiPhase::Cancelled => Style::new().fg(Color::Yellow),
         UiPhase::Failed => ERROR,

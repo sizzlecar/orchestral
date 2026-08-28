@@ -499,7 +499,7 @@ fn project_durable(state: &mut UiState, record: &AgentJournalRecord) -> bool {
         AgentEvent::DeliveryCommitted { delivery } => {
             update(
                 state,
-                UiMsg::Delivered {
+                UiMsg::Completed {
                     final_text: Some(display_content(&delivery.final_response)),
                 },
             );
@@ -606,7 +606,7 @@ fn project_terminal_view(
     match terminal {
         AgentTerminalState::Delivered { .. } => update(
             state,
-            UiMsg::Delivered {
+            UiMsg::Completed {
                 final_text: delivery.map(|delivery| display_content(&delivery.final_response)),
             },
         ),

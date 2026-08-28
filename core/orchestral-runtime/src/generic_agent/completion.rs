@@ -3,6 +3,7 @@ use super::*;
 pub(super) enum DeliveryCommit {
     Committed,
     SteerPending,
+    InteractionPending,
     TerminationPending,
     CheckpointFailed,
     AlreadyTerminal,
@@ -64,6 +65,9 @@ pub(super) fn try_emit_delivery(
     }
     if !run.queued_steers.is_empty() {
         return DeliveryCommit::SteerPending;
+    }
+    if !run.pending_inputs.is_empty() || !run.pending_approvals.is_empty() {
+        return DeliveryCommit::InteractionPending;
     }
     if run
         .stop_cause

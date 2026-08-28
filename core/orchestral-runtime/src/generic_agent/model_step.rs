@@ -501,6 +501,19 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                                     }
                                     continue 'model_rounds;
                                 }
+                                DeliveryCommit::InteractionPending => {
+                                    emit_failure(
+                                        &inner,
+                                        &request,
+                                        &user_message,
+                                        agent_failure(
+                                            "turn_not_settled",
+                                            "model stopped while a Host input or approval request remained pending",
+                                            true,
+                                        ),
+                                    );
+                                    return;
+                                }
                                 DeliveryCommit::TerminationPending => {
                                     emit_cancel(&inner, &request, &user_message);
                                     return;

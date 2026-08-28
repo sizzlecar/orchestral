@@ -69,65 +69,43 @@ impl ModelBackend for SkillLoadModel {
         let round = self.rounds.fetch_add(1, Ordering::SeqCst);
         let system = system_text(&request.messages);
         let request_id = request.request_id;
-        if round == 0 {
-            assert!(system.contains("Spreadsheet workflow"));
-            assert!(system.contains(&self.digest));
-            assert!(!system.contains(SECRET_INSTRUCTIONS));
-            let arguments = json!({
-                "name": "xlsx"
-            })
-            .to_string();
-            return Ok(Box::pin(stream::iter([
-                Ok(ModelStreamEvent {
-                    request_id: request_id.clone(),
-                    event_id: ModelEventId::new("skill-call-start"),
-                    sequence: 1,
-                    payload: ModelEvent::ToolCallStart {
-                        call_id: ModelToolCallId::new("read-xlsx"),
-                        name: SKILL_FUNCTION.to_owned(),
-                        extensions: Default::default(),
-                    },
-                }),
-                Ok(ModelStreamEvent {
-                    request_id: request_id.clone(),
-                    event_id: ModelEventId::new("skill-call-arguments"),
-                    sequence: 2,
-                    payload: ModelEvent::ToolCallArgumentsDelta {
-                        call_id: ModelToolCallId::new("read-xlsx"),
-                        delta: arguments,
-                    },
-                }),
-                Ok(ModelStreamEvent {
-                    request_id: request_id.clone(),
-                    event_id: ModelEventId::new("skill-call-end"),
-                    sequence: 3,
-                    payload: ModelEvent::ToolCallEnd {
-                        call_id: ModelToolCallId::new("read-xlsx"),
-                    },
-                }),
-                Ok(ModelStreamEvent {
-                    request_id,
-                    event_id: ModelEventId::new("skill-call-finish"),
-                    sequence: 4,
-                    payload: ModelEvent::Finish {
-                        reason: ModelFinishReason::ToolCalls,
-                    },
-                }),
-            ])));
+        match round {
+            0 => {
+                assert!(system.contains("Spreadsheet workflow"));
+                assert!(system.contains(&self.digest));
+                assert!(!system.contains(SECRET_INSTRUCTIONS));
+                skill_read_stream(request_id, "read-xlsx")
+            }
+            1 => {
+                assert!(system.contains(SECRET_INSTRUCTIONS));
+                assert!(request.messages.iter().any(|message| {
+                    message.role == ModelRole::Tool
+                        && message.content.iter().any(|content| {
+                            matches!(
+                                content,
+                                ModelContent::ToolResult { result, is_error: false, .. }
+                                    if result.get("status") == Some(&json!("loaded"))
+                            )
+                        })
+                }));
+                skill_read_stream(request_id, "read-xlsx-again")
+            }
+            2 => {
+                assert!(system.contains(SECRET_INSTRUCTIONS));
+                assert!(request.messages.iter().any(|message| {
+                    message.role == ModelRole::Tool
+                        && message.content.iter().any(|content| {
+                            matches!(
+                                content,
+                                ModelContent::ToolResult { result, is_error: false, .. }
+                                    if result.get("status") == Some(&json!("already_loaded"))
+                            )
+                        })
+                }));
+                answer_stream(request_id, "skill context applied")
+            }
+            _ => panic!("Skill load scenario dispatched an unexpected model round"),
         }
-
-        assert!(system.contains(SECRET_INSTRUCTIONS));
-        assert!(request.messages.iter().any(|message| {
-            message.role == ModelRole::Tool
-                && message.content.iter().any(|content| {
-                    matches!(
-                        content,
-                        ModelContent::ToolResult { result, is_error: false, .. }
-                            if result.get("status") == Some(&json!("loaded"))
-                    )
-                })
-        }));
-        answer_stream(request_id, "skill context applied")
     }
 }
 
@@ -520,6 +498,50 @@ fn answer_stream(
             sequence: 2,
             payload: ModelEvent::Finish {
                 reason: ModelFinishReason::Stop,
+            },
+        }),
+    ])))
+}
+
+fn skill_read_stream(
+    request_id: orchestral_core::model_protocol::ModelRequestId,
+    call_id: &str,
+) -> Result<ModelStream, ModelError> {
+    let arguments = json!({ "name": "xlsx" }).to_string();
+    Ok(Box::pin(stream::iter([
+        Ok(ModelStreamEvent {
+            request_id: request_id.clone(),
+            event_id: ModelEventId::new(format!("{call_id}-start")),
+            sequence: 1,
+            payload: ModelEvent::ToolCallStart {
+                call_id: ModelToolCallId::new(call_id),
+                name: SKILL_FUNCTION.to_owned(),
+                extensions: Default::default(),
+            },
+        }),
+        Ok(ModelStreamEvent {
+            request_id: request_id.clone(),
+            event_id: ModelEventId::new(format!("{call_id}-arguments")),
+            sequence: 2,
+            payload: ModelEvent::ToolCallArgumentsDelta {
+                call_id: ModelToolCallId::new(call_id),
+                delta: arguments,
+            },
+        }),
+        Ok(ModelStreamEvent {
+            request_id: request_id.clone(),
+            event_id: ModelEventId::new(format!("{call_id}-end")),
+            sequence: 3,
+            payload: ModelEvent::ToolCallEnd {
+                call_id: ModelToolCallId::new(call_id),
+            },
+        }),
+        Ok(ModelStreamEvent {
+            request_id,
+            event_id: ModelEventId::new(format!("{call_id}-finish")),
+            sequence: 4,
+            payload: ModelEvent::Finish {
+                reason: ModelFinishReason::ToolCalls,
             },
         }),
     ])))

@@ -795,6 +795,12 @@ struct ToolLoopModel {
     rounds: AtomicUsize,
 }
 
+struct NonFatalToolModel {
+    rounds: AtomicUsize,
+    expected_status: &'static str,
+    expected_code: &'static str,
+}
+
 struct BudgetGuardToolLoopModel {
     rounds: AtomicUsize,
     oversized_dispatches: AtomicUsize,
@@ -826,6 +832,12 @@ struct ApprovalLoopModel {
 
 struct EchoTool {
     calls: AtomicUsize,
+}
+
+struct ScriptedOutcomeTool {
+    calls: AtomicUsize,
+    delay_ms: u64,
+    outcome: ToolOutcome,
 }
 
 struct UnknownEffectTool;
@@ -1401,6 +1413,144 @@ impl ModelBackend for ToolLoopModel {
     }
 }
 
+fn scripted_tool_call(
+    request_id: ModelRequestId,
+    prefix: &str,
+    call_id: &str,
+    name: &str,
+) -> ModelStream {
+    Box::pin(stream::iter([
+        Ok(ModelStreamEvent {
+            request_id: request_id.clone(),
+            event_id: ModelEventId::new(format!("{prefix}-start")),
+            sequence: 1,
+            payload: ModelEvent::ToolCallStart {
+                call_id: ModelToolCallId::new(call_id),
+                name: name.to_owned(),
+                extensions: Default::default(),
+            },
+        }),
+        Ok(ModelStreamEvent {
+            request_id: request_id.clone(),
+            event_id: ModelEventId::new(format!("{prefix}-arguments")),
+            sequence: 2,
+            payload: ModelEvent::ToolCallArgumentsDelta {
+                call_id: ModelToolCallId::new(call_id),
+                delta: r#"{"value":"continue"}"#.to_owned(),
+            },
+        }),
+        Ok(ModelStreamEvent {
+            request_id: request_id.clone(),
+            event_id: ModelEventId::new(format!("{prefix}-end")),
+            sequence: 3,
+            payload: ModelEvent::ToolCallEnd {
+                call_id: ModelToolCallId::new(call_id),
+            },
+        }),
+        Ok(ModelStreamEvent {
+            request_id,
+            event_id: ModelEventId::new(format!("{prefix}-finish")),
+            sequence: 4,
+            payload: ModelEvent::Finish {
+                reason: ModelFinishReason::ToolCalls,
+            },
+        }),
+    ]))
+}
+
+#[async_trait]
+impl ModelBackend for NonFatalToolModel {
+    fn descriptor(&self) -> ModelDescriptor {
+        ModelDescriptor {
+            backend_id: "non-fatal-tool-model".to_owned(),
+            capabilities: ModelCapabilities {
+                streaming: true,
+                tool_calls: true,
+                ..ModelCapabilities::default()
+            },
+            extensions: Default::default(),
+        }
+    }
+
+    async fn start(
+        &self,
+        request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelStream, ModelError> {
+        request.validate()?;
+        assert!(request.tools.iter().any(|tool| tool.name == "unstable"));
+        assert!(request.tools.iter().any(|tool| tool.name == "echo"));
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        let request_id = request.request_id;
+        match round {
+            0 => Ok(scripted_tool_call(
+                request_id,
+                "unstable",
+                "unstable-call",
+                "unstable",
+            )),
+            1 => {
+                assert!(request.messages.iter().any(|message| {
+                    message.role == ModelRole::Tool
+                        && message.content.iter().any(|content| {
+                            matches!(
+                                content,
+                                ModelContent::ToolResult {
+                                    call_id,
+                                    result,
+                                    is_error: true,
+                                } if call_id.as_str() == "unstable-call"
+                                    && result["status"] == json!(self.expected_status)
+                                    && result["code"] == json!(self.expected_code)
+                            )
+                        })
+                }));
+                Ok(scripted_tool_call(
+                    request_id,
+                    "fallback",
+                    "echo-after-error",
+                    "echo",
+                ))
+            }
+            2 => {
+                assert!(request.messages.iter().any(|message| {
+                    message.role == ModelRole::Tool
+                        && message.content.iter().any(|content| {
+                            matches!(
+                                content,
+                                ModelContent::ToolResult {
+                                    call_id,
+                                    result,
+                                    is_error: false,
+                                } if call_id.as_str() == "echo-after-error"
+                                    && result == &json!({ "result": "continue" })
+                            )
+                        })
+                }));
+                Ok(Box::pin(stream::iter([
+                    Ok(ModelStreamEvent {
+                        request_id: request_id.clone(),
+                        event_id: ModelEventId::new("continued-answer"),
+                        sequence: 1,
+                        payload: ModelEvent::TextDelta {
+                            delta: "continued after a non-fatal Tool error".to_owned(),
+                        },
+                    }),
+                    Ok(ModelStreamEvent {
+                        request_id,
+                        event_id: ModelEventId::new("continued-answer-finish"),
+                        sequence: 2,
+                        payload: ModelEvent::Finish {
+                            reason: ModelFinishReason::Stop,
+                        },
+                    }),
+                ])))
+            }
+            _ => panic!("non-fatal Tool scenario dispatched an unexpected model round"),
+        }
+    }
+}
+
 #[async_trait]
 impl ModelBackend for BudgetGuardToolLoopModel {
     fn descriptor(&self) -> ModelDescriptor {
@@ -1904,6 +2054,17 @@ impl GuardedToolExecutor for EchoTool {
         ToolOutcome::Completed {
             output: json!({ "result": execution.invocation.arguments["value"].clone() }).into(),
         }
+    }
+}
+
+#[async_trait]
+impl GuardedToolExecutor for ScriptedOutcomeTool {
+    async fn execute(&self, _execution: GuardedToolExecution) -> ToolOutcome {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+        }
+        self.outcome.clone()
     }
 }
 
@@ -7116,6 +7277,8 @@ async fn model_input_request_resolves_by_request_id_and_resumes_the_same_run() {
     .expect("Run opens an input request")
     .expect("blocked Run remains inspectable");
     assert!(blocked.is_waiting());
+    assert_eq!(blocked.view.state.status(), AgentRunStatus::Waiting);
+    assert!(blocked.view.delivery.is_none());
     assert_eq!(blocked.view.pending_requests.len(), 1);
     let request = &blocked.view.pending_requests[0];
     assert_eq!(request.kind(), PendingRequestKind::Input);
@@ -7249,6 +7412,187 @@ async fn generic_agent_executes_model_tools_only_through_the_guarded_runtime() {
         ContentBody::Inline(serde_json::Value::String(ref text))
             if text == "tool said hello"
     ));
+}
+
+#[tokio::test]
+async fn non_fatal_tool_errors_are_structured_and_the_model_can_use_a_fallback_tool() {
+    let cases = [
+        (
+            "failed",
+            0,
+            1_000,
+            ToolOutcome::Failed {
+                code: "fixture_failed".to_owned(),
+                message: "the first Tool failed".to_owned(),
+                retryable: true,
+            },
+            "failed",
+            "fixture_failed",
+        ),
+        (
+            "rejected",
+            0,
+            1_000,
+            ToolOutcome::Rejected {
+                code: "fixture_rejected".to_owned(),
+                message: "the first Tool rejected the request".to_owned(),
+            },
+            "rejected",
+            "fixture_rejected",
+        ),
+        (
+            "timeout",
+            20,
+            1,
+            ToolOutcome::Completed {
+                output: json!({ "unreachable": true }).into(),
+            },
+            "failed",
+            "timeout",
+        ),
+    ];
+
+    for (suffix, delay_ms, timeout_ms, outcome, expected_status, expected_code) in cases {
+        run_non_fatal_tool_case(
+            suffix,
+            delay_ms,
+            timeout_ms,
+            outcome,
+            expected_status,
+            expected_code,
+        )
+        .await;
+    }
+}
+
+async fn run_non_fatal_tool_case(
+    suffix: &str,
+    delay_ms: u64,
+    timeout_ms: u64,
+    outcome: ToolOutcome,
+    expected_status: &'static str,
+    expected_code: &'static str,
+) {
+    let bounds = ToolPolicyBounds {
+        approval: ApprovalPolicy::NotRequired,
+        max_timeout_ms: Some(timeout_ms),
+        max_output_bytes: Some(1_024),
+        ..ToolPolicyBounds::default()
+    };
+    let verifier = HostApprovalVerifier::new(
+        b"0123456789abcdef0123456789abcdef",
+        InMemoryApprovalCapabilityStore::default(),
+    )
+    .expect("valid Host signing key");
+    let runtime = Arc::new(
+        GuardedToolRuntime::new(
+            HostToolPolicy {
+                bounds: bounds.clone(),
+            },
+            verifier,
+        )
+        .expect("valid Host policy"),
+    );
+    let unstable = Arc::new(ScriptedOutcomeTool {
+        calls: AtomicUsize::new(0),
+        delay_ms,
+        outcome,
+    });
+    let echo = Arc::new(EchoTool {
+        calls: AtomicUsize::new(0),
+    });
+    let descriptor = |tool_id: &str, name: &str, description: &str| ToolDescriptor {
+        tool_id: ToolId::new(tool_id),
+        model_schema: ModelToolSchema {
+            name: name.to_owned(),
+            description: description.to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["value"],
+                "properties": { "value": { "type": "string" } },
+                "additionalProperties": false
+            }),
+        },
+        output_schema: json!({
+            "type": "object",
+            "additionalProperties": true
+        }),
+        effect_scopes: BTreeSet::new(),
+        restriction: ToolRestriction {
+            bounds: bounds.clone(),
+        },
+        idempotency: ToolIdempotency::IdempotentWithKey,
+        concurrency: ToolConcurrency::ParallelSafe,
+    };
+    runtime
+        .register(
+            descriptor(
+                &format!("test/{suffix}-unstable"),
+                "unstable",
+                "Return one deterministic non-fatal test outcome",
+            ),
+            unstable.clone(),
+        )
+        .expect("unstable Tool registers");
+    runtime
+        .register(
+            descriptor(
+                &format!("test/{suffix}-fallback"),
+                "echo",
+                "Return the provided value",
+            ),
+            echo.clone(),
+        )
+        .expect("fallback Tool registers");
+
+    let model = Arc::new(NonFatalToolModel {
+        rounds: AtomicUsize::new(0),
+        expected_status,
+        expected_code,
+    });
+    let provider = Arc::new(
+        InternalGenericAgentProvider::new_with_tools(
+            model.clone(),
+            GenericAgentConfig::new("internal-provider", "generic-agent"),
+            runtime,
+            RunToolGrant { bounds },
+        )
+        .expect("Tool-capable Generic Agent is valid"),
+    );
+    let controller = Arc::new(
+        AgentController::new(
+            provider,
+            ProviderBindingRef::new(format!("non-fatal-{suffix}-binding")),
+        )
+        .expect("controller binds the Generic Agent"),
+    );
+    let execution = controller
+        .start(
+            AgentRunEnvelope::new(
+                AGENT_PROTOCOL_V1,
+                AgentSessionId::new(format!("non-fatal-{suffix}-session")),
+                RunId::new(format!("non-fatal-{suffix}-run")),
+                vec![Content::text("recover from the first Tool result")],
+            )
+            .expect("valid Tool Run"),
+        )
+        .await
+        .expect("Run starts");
+    let view = controller
+        .wait_for_terminal(&execution.run_id)
+        .await
+        .expect("model continues after the non-fatal Tool observation");
+
+    assert_eq!(view.state.status(), AgentRunStatus::Delivered);
+    assert_eq!(unstable.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(echo.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(model.rounds.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        view.delivery
+            .and_then(|delivery| delivery.usage)
+            .and_then(|usage| usage.tool_calls),
+        Some(2)
+    );
 }
 
 #[tokio::test]
@@ -7606,6 +7950,12 @@ async fn run_approval_case(allow: bool) {
     .await
     .expect("Tool opens an approval request");
     assert_eq!(pending.kind(), PendingRequestKind::Approval);
+    let waiting = controller
+        .inspect(&execution.run_id)
+        .await
+        .expect("pending approval Run remains inspectable");
+    assert_eq!(waiting.state.status(), AgentRunStatus::Waiting);
+    assert!(waiting.delivery.is_none());
 
     let resolution = if allow {
         let now_ms = std::time::SystemTime::now()
