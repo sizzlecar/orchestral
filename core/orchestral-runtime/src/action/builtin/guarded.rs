@@ -434,6 +434,7 @@ impl GuardedToolExecutor for GuardedShellExecutor {
             .clone();
         let sandbox_policy = ShellSandboxPolicy {
             readable_roots: readable_roots.clone(),
+            readable_files: Vec::new(),
             writable_roots: writable_roots.clone(),
             allow_child_processes: false,
             launcher_programs: bounds

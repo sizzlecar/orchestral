@@ -68,6 +68,7 @@ pub struct GuardedExecCommandExecutor {
     manager: Arc<ProcessSupervisor>,
     shell: PathBuf,
     runtime_readable_roots: Vec<PathBuf>,
+    runtime_readable_files: Vec<PathBuf>,
     environment: CommandEnvironmentSnapshot,
 }
 
@@ -81,6 +82,7 @@ impl GuardedExecCommandExecutor {
         manager: Arc<ProcessSupervisor>,
         shell: impl Into<PathBuf>,
         runtime_readable_roots: impl IntoIterator<Item = PathBuf>,
+        runtime_readable_files: impl IntoIterator<Item = PathBuf>,
         environment: CommandEnvironmentSnapshot,
     ) -> Result<Self, String> {
         let shell = std::fs::canonicalize(shell.into())
@@ -96,10 +98,16 @@ impl GuardedExecCommandExecutor {
         if let Some(parent) = shell.parent() {
             roots.insert(parent.to_path_buf());
         }
+        let files = runtime_readable_files
+            .into_iter()
+            .filter_map(|file| std::fs::canonicalize(file).ok())
+            .filter(|file| file.is_file())
+            .collect::<BTreeSet<_>>();
         Ok(Self {
             manager,
             shell,
             runtime_readable_roots: roots.into_iter().collect(),
+            runtime_readable_files: files.into_iter().collect(),
             environment,
         })
     }
@@ -115,9 +123,10 @@ impl GuardedWriteStdinExecutor {
 impl GuardedToolExecutor for GuardedExecCommandExecutor {
     fn planning_contract(&self) -> Value {
         json!({
-            "contract": "orchestral.exec-command-operation-planner/v2",
+            "contract": "orchestral.exec-command-operation-planner/v3",
             "shell": self.shell,
             "runtime_readable_roots": self.runtime_readable_roots,
+            "runtime_readable_files": self.runtime_readable_files,
             "environment_names": self.environment.names(),
         })
     }
@@ -191,6 +200,9 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
             .chain(self.runtime_readable_roots.iter())
         {
             targets.insert(format!("read:{}", root.display()));
+        }
+        for file in &self.runtime_readable_files {
+            targets.insert(format!("read:{}", file.display()));
         }
         if strictly_read_only {
             for root in &writable_roots {
@@ -341,6 +353,7 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
             &cwd,
             &ShellSandboxPolicy {
                 readable_roots: sandbox_reads,
+                readable_files: self.runtime_readable_files.clone(),
                 writable_roots: sandbox_writes,
                 allow_child_processes: true,
                 launcher_programs: vec![self.shell.clone()],

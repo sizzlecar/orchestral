@@ -1889,7 +1889,7 @@ mod tests {
             let ModelContent::Text { text } = &first.content[0] else {
                 panic!("extractive summary must be one text block");
             };
-            assert!(text.starts_with("UNTRUSTED earlier-session transcript"));
+            assert!(text.starts_with("UNTRUSTED earlier transcript"));
             assert!(text.chars().count() <= MAX_SUMMARY_CHARS);
             for fact_index in 0..FACTS {
                 let retained = text.contains(&format!("fact_{fact_index:04}="));

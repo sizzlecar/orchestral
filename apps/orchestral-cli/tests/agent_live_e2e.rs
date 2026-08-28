@@ -105,6 +105,43 @@ impl TestWorkspace {
         assert_ne!(after, before, "E2E config rewrite did not match its target");
         fs::write(path, after).expect("write E2E config");
     }
+
+    fn git(&self, args: &[&str]) -> std::process::Output {
+        Command::new("git")
+            .args(args)
+            .current_dir(&self.root)
+            .output()
+            .expect("run fixture git command")
+    }
+
+    fn initialize_git(&self, tracked_paths: &[&str]) {
+        for args in [
+            vec!["init", "-q", "--initial-branch=main"],
+            vec!["config", "user.name", "Orchestral E2E"],
+            vec!["config", "user.email", "orchestral-e2e@example.invalid"],
+        ] {
+            let output = self.git(&args);
+            assert!(
+                output.status.success(),
+                "git fixture setup failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let mut add = vec!["add"];
+        add.extend_from_slice(tracked_paths);
+        let added = self.git(&add);
+        assert!(
+            added.status.success(),
+            "git fixture add failed: {}",
+            String::from_utf8_lossy(&added.stderr)
+        );
+        let committed = self.git(&["commit", "-q", "-m", "initial fixture"]);
+        assert!(
+            committed.status.success(),
+            "git fixture commit failed: {}",
+            String::from_utf8_lossy(&committed.stderr)
+        );
+    }
 }
 
 impl Drop for TestWorkspace {
@@ -210,6 +247,11 @@ fn terminal_model_failure_is_non_zero_and_preserves_the_reason() {
 fn tui_pty_resolves_input_and_approval_then_cancels_another_run() {
     let _guard = local_e2e_guard();
     let workspace = TestWorkspace::new("tui-control");
+    fs::write(
+        workspace.path("tui-approved.marker"),
+        "delete after approval\n",
+    )
+    .expect("write destructive approval fixture");
     let (model_endpoint, model_server) = spawn_fixture_http_server(vec![
         Box::new(|request| {
             assert!(model_request_has_tool(
@@ -230,7 +272,7 @@ fn tui_pty_resolves_input_and_approval_then_cancels_another_run() {
             openai_tool_response(
                 "approval-write",
                 "exec_command",
-                json!({ "cmd": "touch tui-approved.marker" }),
+                json!({ "cmd": "rm tui-approved.marker" }),
             )
         }),
         Box::new(|request| {
@@ -298,7 +340,7 @@ fn tui_pty_resolves_input_and_approval_then_cancels_another_run() {
         output.text()
     );
     assert!(output.text().contains("Allow once"), "{}", output.text());
-    assert!(workspace.path("tui-approved.marker").is_file());
+    assert!(!workspace.path("tui-approved.marker").exists());
     output.assert_terminal_restored();
     let requests = model_server.join().expect("join TUI model server");
     assert_eq!(requests.len(), 5);
@@ -557,7 +599,7 @@ fn local_cli_reads_patches_and_runs_a_guarded_verification() {
     ]);
     workspace.configure_local_openai(&model_endpoint);
 
-    let output = run_with_approval(
+    let output = run_to_completion(
         local_default_agent_command(
             &workspace,
             "patch-and-verify-session",
@@ -565,8 +607,6 @@ fn local_cli_reads_patches_and_runs_a_guarded_verification() {
             true,
             true,
         ),
-        true,
-        None,
         LOCAL_PROCESS_TIMEOUT,
     );
     assert!(output.status.success(), "{}", output.stderr_text());
@@ -574,7 +614,7 @@ fn local_cli_reads_patches_and_runs_a_guarded_verification() {
     assert!(fs::read_to_string(workspace.path("src/lib.rs"))
         .unwrap()
         .contains("pub fn answer() -> u32 { 42 }"));
-    assert!(output.stderr_text().contains(APPROVAL_PROMPT));
+    assert!(!output.stderr_text().contains(APPROVAL_PROMPT));
     output.assert_no_ansi();
 
     let requests = model_server.join().expect("join local model server");
@@ -585,6 +625,145 @@ fn local_cli_reads_patches_and_runs_a_guarded_verification() {
     assert_eq!(tool_name(exchanges[0]), Some("file_read"));
     assert_eq!(tool_name(exchanges[1]), Some("apply_patch"));
     assert_eq!(tool_name(exchanges[2]), Some("exec_command"));
+    assert!(exchanges
+        .iter()
+        .all(|exchange| tool_result_is_error(exchange) == Some(false)));
+}
+
+#[test]
+fn local_cli_establishes_a_requested_branch_before_editing_and_verifying() {
+    let _guard = local_e2e_guard();
+    const BRANCH: &str = "agent/e2e-fix";
+    let workspace = TestWorkspace::new("branch-edit-verify");
+    fs::create_dir_all(workspace.path("src")).expect("create source directory");
+    fs::write(
+        workspace.path("Cargo.toml"),
+        concat!(
+            "[package]\n",
+            "name = \"agent-branch-e2e-fixture\"\n",
+            "version = \"0.1.0\"\n",
+            "edition = \"2021\"\n",
+        ),
+    )
+    .expect("write branch fixture manifest");
+    fs::write(
+        workspace.path("src/lib.rs"),
+        concat!(
+            "pub fn answer() -> u32 { 41 }\n\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    use super::*;\n\n",
+            "    #[test]\n",
+            "    fn answer_is_verified() {\n",
+            "        assert_eq!(answer(), 42);\n",
+            "    }\n",
+            "}\n",
+        ),
+    )
+    .expect("write branch fixture source");
+    workspace.initialize_git(&["Cargo.toml", "src/lib.rs"]);
+
+    let (model_endpoint, model_server) = spawn_fixture_http_server(vec![
+        Box::new(|request| {
+            assert!(model_request_has_tool(&request.body, "exec_command"));
+            openai_tool_response(
+                "create-task-branch",
+                "exec_command",
+                json!({"cmd": format!("git switch -c {BRANCH}")}),
+            )
+        }),
+        Box::new(|request| {
+            let context = model_request_text(&request.body);
+            assert!(context.contains("\"exit_code\":0"), "{context}");
+            openai_tool_response(
+                "read-branch-source",
+                "file_read",
+                json!({"path": "src/lib.rs"}),
+            )
+        }),
+        Box::new(|request| {
+            assert!(model_request_text(&request.body).contains("answer() -> u32 { 41 }"));
+            openai_tool_response(
+                "fix-branch-source",
+                "apply_patch",
+                json!({
+                    "patch": concat!(
+                        "*** Begin Patch\n",
+                        "*** Update File: src/lib.rs\n",
+                        "@@\n",
+                        "-pub fn answer() -> u32 { 41 }\n",
+                        "+pub fn answer() -> u32 { 42 }\n",
+                        "*** End Patch"
+                    )
+                }),
+            )
+        }),
+        Box::new(|request| {
+            let context = model_request_text(&request.body);
+            assert!(context.contains("\"operation\":\"update\""), "{context}");
+            openai_tool_response(
+                "verify-branch-change",
+                "exec_command",
+                json!({"cmd": "cargo test --offline --quiet", "yield_time_ms": 30_000}),
+            )
+        }),
+        Box::new(|request| {
+            let context = model_request_text(&request.body);
+            assert!(context.contains("\"exit_code\":0"), "{context}");
+            openai_text_response("BRANCH_EDIT_VERIFY_OK")
+        }),
+    ]);
+    workspace.configure_local_openai(&model_endpoint);
+
+    let output = run_to_completion(
+        local_default_agent_command(
+            &workspace,
+            "branch-edit-verify-session",
+            concat!(
+                "Before changing files, create branch agent/e2e-fix. On that branch, fix ",
+                "answer() so the test passes, run the test suite, and report the verified result."
+            ),
+            true,
+            true,
+        ),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    assert!(output.status.success(), "{}", output.stderr_text());
+    assert_eq!(output.stdout_text().trim(), "BRANCH_EDIT_VERIFY_OK");
+    assert!(!output.stderr_text().contains(APPROVAL_PROMPT));
+    output.assert_no_ansi();
+
+    let branch = workspace.git(&["branch", "--show-current"]);
+    assert!(branch.status.success());
+    assert_eq!(String::from_utf8_lossy(&branch.stdout).trim(), BRANCH);
+    let verification = Command::new("cargo")
+        .arg("test")
+        .arg("--offline")
+        .arg("--quiet")
+        .current_dir(&workspace.root)
+        .output()
+        .expect("independently verify branch fixture");
+    assert!(
+        verification.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verification.stderr)
+    );
+
+    assert_eq!(
+        model_server.join().expect("join branch model server").len(),
+        5
+    );
+    let records = session_records(&workspace);
+    let exchanges = tool_exchanges(&records);
+    assert_eq!(exchanges.len(), 4);
+    assert_eq!(tool_name(exchanges[0]), Some("exec_command"));
+    assert_eq!(
+        tool_arguments(exchanges[0])["cmd"],
+        format!("git switch -c {BRANCH}")
+    );
+    assert_eq!(tool_name(exchanges[1]), Some("file_read"));
+    assert_eq!(tool_name(exchanges[2]), Some("apply_patch"));
+    assert_eq!(tool_name(exchanges[3]), Some("exec_command"));
     assert!(exchanges
         .iter()
         .all(|exchange| tool_result_is_error(exchange) == Some(false)));
@@ -651,7 +830,7 @@ fn local_exec_runs_toolchains_and_a_child_script_without_program_enumeration() {
     ]);
     workspace.configure_local_openai(&model_endpoint);
 
-    let output = run_with_approval(
+    let output = run_to_completion(
         local_agent_command(
             &workspace,
             "unified-exec-toolchains-session",
@@ -660,8 +839,6 @@ fn local_exec_runs_toolchains_and_a_child_script_without_program_enumeration() {
             true,
             true,
         ),
-        true,
-        None,
         LOCAL_PROCESS_TIMEOUT,
     );
     assert!(output.status.success(), "{}", output.stderr_text());
@@ -748,7 +925,7 @@ fn local_cli_skill_read_injects_instructions_and_journals_load() {
     ]);
     workspace.configure_local_openai(&model_endpoint);
 
-    let output = run_with_approval(
+    let output = run_to_completion(
         local_default_agent_command(
             &workspace,
             "skill-entrypoint-session",
@@ -756,8 +933,6 @@ fn local_cli_skill_read_injects_instructions_and_journals_load() {
             true,
             false,
         ),
-        true,
-        None,
         LOCAL_PROCESS_TIMEOUT,
     );
     assert!(output.status.success(), "{}", output.stderr_text());
@@ -862,7 +1037,6 @@ fn local_cli_discovers_calls_and_journals_an_mcp_tool() {
             true,
         ),
         true,
-        None,
         LOCAL_PROCESS_TIMEOUT,
     );
     assert!(output.status.success(), "{}", output.stderr_text());
@@ -965,6 +1139,100 @@ fn live_agent_recovers_after_a_failed_file_read() {
 
 #[test]
 #[ignore = "spends real Google Vertex quota; requires ADC or a service-account credential"]
+fn live_agent_creates_the_requested_branch_before_editing_and_verifying() {
+    let _guard = live_test_guard();
+    const BRANCH: &str = "agent/live-branch-e2e";
+    let workspace = TestWorkspace::new("live-branch-edit-verify");
+    fs::create_dir_all(workspace.path("src")).expect("create live branch source directory");
+    fs::write(
+        workspace.path("Cargo.toml"),
+        concat!(
+            "[package]\n",
+            "name = \"agent-live-branch-fixture\"\n",
+            "version = \"0.1.0\"\n",
+            "edition = \"2021\"\n",
+        ),
+    )
+    .expect("write live branch manifest");
+    fs::write(
+        workspace.path("src/lib.rs"),
+        concat!(
+            "pub fn total(values: &[u32]) -> u32 {\n",
+            "    values.iter().sum::<u32>().saturating_sub(1)\n",
+            "}\n\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    use super::*;\n\n",
+            "    #[test]\n",
+            "    fn totals_every_value() {\n",
+            "        assert_eq!(total(&[10, 20, 12]), 42);\n",
+            "    }\n",
+            "}\n",
+        ),
+    )
+    .expect("write live branch failing source");
+    workspace.initialize_git(&["Cargo.toml", "src/lib.rs"]);
+
+    let mut command =
+        live_default_command(&workspace, "live-branch-edit-verify-session", true, true);
+    command.arg(concat!(
+        "Create a new branch named agent/live-branch-e2e before changing any file. ",
+        "On that branch, repair the failing Rust project, run its tests, and report the ",
+        "verified result."
+    ));
+    let output = run_to_completion(command, LIVE_CODING_PROCESS_TIMEOUT);
+    assert!(output.status.success(), "{}", output.stderr_text());
+    assert!(!output.stdout_text().trim().is_empty());
+    assert!(!output.stderr_text().contains(APPROVAL_PROMPT));
+    output.assert_no_ansi();
+
+    let branch = workspace.git(&["branch", "--show-current"]);
+    assert!(branch.status.success());
+    assert_eq!(String::from_utf8_lossy(&branch.stdout).trim(), BRANCH);
+    let verification = Command::new("cargo")
+        .arg("test")
+        .arg("--offline")
+        .arg("--quiet")
+        .current_dir(&workspace.root)
+        .output()
+        .expect("independently verify live branch fixture");
+    assert!(
+        verification.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verification.stderr)
+    );
+
+    let records = session_records(&workspace);
+    let exchanges = tool_exchanges(&records);
+    let patch = exchanges
+        .iter()
+        .position(|exchange| {
+            tool_name(exchange) == Some("apply_patch")
+                && tool_result_is_error(exchange) == Some(false)
+        })
+        .expect("live branch task omitted apply_patch");
+    assert!(
+        exchanges[..patch].iter().any(|exchange| {
+            tool_name(exchange) == Some("exec_command")
+                && tool_result_is_error(exchange) == Some(false)
+                && tool_arguments(exchange)["cmd"]
+                    .as_str()
+                    .is_some_and(|command| command.contains(BRANCH) && command.contains("git"))
+        }),
+        "live branch task did not establish the requested branch before editing"
+    );
+    assert!(
+        exchanges[patch + 1..].iter().any(|exchange| {
+            matches!(tool_name(exchange), Some("exec_command" | "write_stdin"))
+                && tool_result_is_error(exchange) == Some(false)
+                && tool_result_value(exchange)["exit_code"] == json!(0)
+        }),
+        "live branch task did not verify successfully after editing"
+    );
+}
+
+#[test]
+#[ignore = "spends real Google Vertex quota; requires ADC or a service-account credential"]
 fn live_e1_coding_closes_the_inspect_patch_verify_loop_three_times() {
     let _guard = live_test_guard();
     for attempt in 1..=3 {
@@ -1007,7 +1275,7 @@ fn live_e1_coding_closes_the_inspect_patch_verify_loop_three_times() {
         command.arg(
             "Repair the failing Rust project in this workspace. Run its test suite and report the verified result.",
         );
-        let output = run_with_approval(command, true, None, LIVE_CODING_PROCESS_TIMEOUT);
+        let output = run_to_completion(command, LIVE_CODING_PROCESS_TIMEOUT);
         assert!(output.status.success(), "{}", output.stderr_text());
         assert!(!output.stdout_text().trim().is_empty());
         output.assert_no_ansi();
@@ -1091,7 +1359,7 @@ fn live_e2_skill_discovers_relative_resources_three_times() {
         command.arg(
             "Follow the workspace procedure for collecting release evidence and report what it produces.",
         );
-        let output = run_with_approval(command, true, None, PROCESS_TIMEOUT);
+        let output = run_to_completion(command, PROCESS_TIMEOUT);
         assert!(output.status.success(), "{}", output.stderr_text());
         let final_output = output.stdout_text();
         assert!(final_output.contains(&marker), "{final_output}");
@@ -1197,7 +1465,7 @@ fn live_e3_mcp_discovers_and_uses_the_configured_service_three_times() {
         command.arg(
             "Consult the configured deployment inventory and report the current color for service checkout.",
         );
-        let output = run_with_approval(command, true, None, PROCESS_TIMEOUT);
+        let output = run_with_approval(command, true, PROCESS_TIMEOUT);
         assert!(output.status.success(), "{}", output.stderr_text());
         assert!(
             output.stdout_text().contains(&color),
@@ -1230,38 +1498,40 @@ fn live_e3_mcp_discovers_and_uses_the_configured_service_three_times() {
 
 #[test]
 #[ignore = "spends real Google Vertex quota; requires ADC or a service-account credential"]
-fn live_shell_effect_happens_only_after_exact_approval() {
+fn live_destructive_effect_happens_only_after_exact_approval() {
     let _guard = live_test_guard();
 
     let denied = TestWorkspace::new("approval-deny");
-    fs::write(denied.path("source.txt"), "审批边界-拒绝🧪\n").expect("write source");
     let denied_target = denied.path("approved.txt");
-    let denied_output = run_live_shell_copy(&denied, false, &denied_target);
+    let denied_bytes = "审批边界-拒绝🧪\n".as_bytes();
+    fs::write(&denied_target, denied_bytes).expect("write denied deletion target");
+    let denied_output = run_live_shell_delete(&denied, false);
     assert!(
         denied_output.status.success(),
         "{}",
         denied_output.stderr_text()
     );
-    assert!(!denied_target.exists(), "denied effect changed the world");
+    assert_eq!(
+        fs::read(&denied_target).expect("denied target remains"),
+        denied_bytes
+    );
     assert!(denied_output.stderr_text().contains(APPROVAL_PROMPT));
     assert!(!denied_output.stdout_text().contains(APPROVAL_PROMPT));
     denied_output.assert_no_ansi();
 
     let allowed = TestWorkspace::new("approval-allow");
-    let source_bytes = "审批边界-允许🧪\n".as_bytes();
-    fs::write(allowed.path("source.txt"), source_bytes).expect("write source");
     let allowed_target = allowed.path("approved.txt");
-    let allowed_output = run_live_shell_copy(&allowed, true, &allowed_target);
+    fs::write(&allowed_target, "审批边界-允许🧪\n").expect("write allowed deletion target");
+    let allowed_output = run_live_shell_delete(&allowed, true);
     assert!(
         allowed_output.status.success(),
         "{}",
         allowed_output.stderr_text()
     );
-    assert_eq!(
-        fs::read(&allowed_target).expect("approved target"),
-        source_bytes
+    assert!(
+        !allowed_target.exists(),
+        "approved destructive effect did not run"
     );
-    assert_eq!(fs::read(allowed.path("source.txt")).unwrap(), source_bytes);
     assert!(allowed_output.stderr_text().contains(APPROVAL_PROMPT));
     assert!(!allowed_output.stdout_text().contains(APPROVAL_PROMPT));
     allowed_output.assert_no_ansi();
@@ -1691,7 +1961,7 @@ fn run_live_agent(
     )
 }
 
-fn run_live_shell_copy(workspace: &TestWorkspace, allow: bool, target: &Path) -> ProcessOutput {
+fn run_live_shell_delete(workspace: &TestWorkspace, allow: bool) -> ProcessOutput {
     let command = live_command(
         workspace,
         if allow {
@@ -1700,13 +1970,13 @@ fn run_live_shell_copy(workspace: &TestWorkspace, allow: bool, target: &Path) ->
             "approval-deny-session"
         },
         concat!(
-            "Use exactly one exec_command call with `cp source.txt approved.txt`. ",
+            "Use exactly one exec_command call with `rm approved.txt`. ",
             "Do not call other tools and do not retry a ",
             "denied operation. After the observation, briefly report the actual outcome."
         ),
-        "Copy source.txt to approved.txt now.",
+        "Delete approved.txt now.",
     );
-    run_with_approval(command, allow, Some(target), PROCESS_TIMEOUT)
+    run_with_approval(command, allow, PROCESS_TIMEOUT)
 }
 
 fn live_model() -> String {
@@ -1782,12 +2052,7 @@ fn run_with_piped_input(mut command: Command, input: &[u8], timeout: Duration) -
     }
 }
 
-fn run_with_approval(
-    mut command: Command,
-    allow: bool,
-    target: Option<&Path>,
-    timeout: Duration,
-) -> ProcessOutput {
+fn run_with_approval(mut command: Command, allow: bool, timeout: Duration) -> ProcessOutput {
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1808,11 +2073,6 @@ fn run_with_approval(
             let text = String::from_utf8_lossy(&bytes);
             let observed_prompts = text.matches(APPROVAL_PROMPT).count();
             while approvals_sent < observed_prompts {
-                if approvals_sent == 0 {
-                    if let Some(target) = target {
-                        assert!(!target.exists(), "effect happened before exact approval");
-                    }
-                }
                 stdin
                     .write_all(if allow { b"y\n" } else { b"n\n" })
                     .expect("answer approval prompt");
@@ -1918,6 +2178,18 @@ fn tool_name(exchange: &Value) -> Option<&str> {
         .iter()
         .find(|item| item["type"].as_str() == Some("tool_call"))?["name"]
         .as_str()
+}
+
+fn tool_arguments(exchange: &Value) -> &Value {
+    exchange["assistant"]["content"]
+        .as_array()
+        .and_then(|content| {
+            content
+                .iter()
+                .find(|item| item["type"].as_str() == Some("tool_call"))
+        })
+        .map(|item| &item["arguments"])
+        .expect("Tool exchange contains one Tool call")
 }
 
 fn tool_result_is_error(exchange: &Value) -> Option<bool> {

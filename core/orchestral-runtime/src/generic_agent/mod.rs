@@ -226,7 +226,9 @@ impl GenericAgentConfig {
                 "Host policy are authoritative capability boundaries. Inspect available ",
                 "evidence before making claims, take relevant reversible actions when the ",
                 "request is clear, and ask only when a material choice or required fact cannot ",
-                "be derived. Prefer a dedicated Tool over a shell equivalent when one is ",
+                "be derived. Treat explicit ordering and preconditions in the request as ",
+                "acceptance constraints: establish and verify them before dependent work. ",
+                "Prefer a dedicated Tool over a shell equivalent when one is ",
                 "available. For workspace text changes, inspect the target, use apply_patch, ",
                 "and run relevant verification. Treat every Tool failure as an observation to ",
                 "correct or safely work around; report completion only from successful evidence."

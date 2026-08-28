@@ -95,6 +95,7 @@ struct CliJournalStores {
 struct CliExecHost {
     shell: PathBuf,
     runtime_readable_roots: Vec<PathBuf>,
+    runtime_readable_files: Vec<PathBuf>,
     environment_names: BTreeSet<String>,
     environment: CommandEnvironmentSnapshot,
     network_targets: BTreeSet<String>,
@@ -529,6 +530,7 @@ fn build_cli_tool_runtime(
                         process_supervisor.clone(),
                         exec_host.shell,
                         exec_host.runtime_readable_roots,
+                        exec_host.runtime_readable_files,
                         exec_host.environment,
                     )
                     .map_err(anyhow::Error::msg)
@@ -651,17 +653,47 @@ fn configured_exec_host(config: &OrchestralConfig) -> anyhow::Result<Option<CliE
         "NO_COLOR",
         "CARGO_HOME",
         "RUSTUP_HOME",
+        "XDG_CONFIG_HOME",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_NOSYSTEM",
     ]
     .into_iter()
     .map(str::to_owned)
     .collect::<BTreeSet<_>>();
     Ok(Some(CliExecHost {
         runtime_readable_roots: exec_runtime_readable_roots(&shell),
+        runtime_readable_files: exec_runtime_readable_files(),
         shell,
         environment: CommandEnvironmentSnapshot::capture(environment_names.iter().cloned()),
         environment_names,
         network_targets: config.tools.exec.network_targets.iter().cloned().collect(),
     }))
+}
+
+fn exec_runtime_readable_files() -> Vec<PathBuf> {
+    let mut candidates = BTreeSet::new();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if let Some(home) = &home {
+        candidates.insert(home.join(".gitconfig"));
+        let xdg_home = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .unwrap_or_else(|| home.join(".config"));
+        candidates.insert(xdg_home.join("git/config"));
+    }
+    for name in ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"] {
+        if let Some(path) = std::env::var_os(name).map(PathBuf::from) {
+            if path.is_absolute() {
+                candidates.insert(path);
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .filter(|path| path.is_file())
+        .collect()
 }
 
 fn exec_runtime_readable_roots(shell: &Path) -> Vec<PathBuf> {

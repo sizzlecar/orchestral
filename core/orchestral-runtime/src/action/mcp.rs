@@ -394,6 +394,7 @@ impl McpTransportFactory for StdioMcpTransportFactory {
             &self.sandbox.cwd,
             &ShellSandboxPolicy {
                 readable_roots: self.sandbox.readable_roots.iter().cloned().collect(),
+                readable_files: Vec::new(),
                 writable_roots: self.sandbox.writable_roots.iter().cloned().collect(),
                 allow_child_processes: false,
                 launcher_programs: vec![self.program.clone()],

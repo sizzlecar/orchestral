@@ -460,6 +460,7 @@ async fn guarded_unified_surface_executes_children_and_continues_one_tty_session
                     manager.clone(),
                     shell,
                     [PathBuf::from("/bin"), PathBuf::from("/usr/bin")],
+                    [],
                     CommandEnvironmentSnapshot::from_values([
                         ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
                         ("VISIBLE".to_owned(), "captured-at-composition".to_owned()),
@@ -729,6 +730,7 @@ async fn workspace_auto_run_confines_reads_and_mutations_to_the_real_sandbox() {
                     manager,
                     shell,
                     [runtime_bin.clone(), PathBuf::from("/bin")],
+                    [],
                     CommandEnvironmentSnapshot::from_values([(
                         "PATH".to_owned(),
                         runtime_bin.to_string_lossy().into_owned(),

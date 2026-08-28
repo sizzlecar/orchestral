@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Default)]
 pub struct ShellSandboxPolicy {
     pub readable_roots: Vec<PathBuf>,
+    /// Host-owned files required by a toolchain at runtime. These are exposed
+    /// as exact read-only paths, never as readable parent directories.
+    pub readable_files: Vec<PathBuf>,
     pub writable_roots: Vec<PathBuf>,
     /// Allow the already-sandboxed launcher to execute child programs.
     /// Filesystem and network effects remain constrained by this profile.
@@ -222,6 +225,7 @@ fn normalize_sandbox_inputs(
     let program_identity = canonical_file(&launch_program, "sandbox executable")?;
     let cwd = canonical_directory(cwd, "sandbox cwd")?;
     let readable_roots = canonical_directories(&policy.readable_roots, "readable root")?;
+    let readable_files = canonical_files(&policy.readable_files, "readable file")?;
     let writable_roots = canonical_directories(&policy.writable_roots, "writable root")?;
     let launcher_programs = policy
         .launcher_programs
@@ -247,6 +251,7 @@ fn normalize_sandbox_inputs(
         cwd,
         ShellSandboxPolicy {
             readable_roots,
+            readable_files,
             writable_roots,
             allow_child_processes: policy.allow_child_processes,
             launcher_programs,
@@ -260,6 +265,15 @@ fn canonical_directories(paths: &[PathBuf], label: &str) -> Result<Vec<PathBuf>,
     paths
         .iter()
         .map(|path| canonical_directory(path, label))
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map(BTreeSet::into_iter)
+        .map(Iterator::collect)
+}
+
+fn canonical_files(paths: &[PathBuf], label: &str) -> Result<Vec<PathBuf>, String> {
+    paths
+        .iter()
+        .map(|path| canonical_file(path, label))
         .collect::<Result<BTreeSet<_>, _>>()
         .map(BTreeSet::into_iter)
         .map(Iterator::collect)
@@ -401,6 +415,10 @@ fn build_macos_profile(
         literal_reads.insert(root.clone());
         subtree_reads.insert(root.clone());
     }
+    for file in &policy.readable_files {
+        add_path_ancestors(file, &mut literal_reads);
+        literal_reads.insert(file.clone());
+    }
     add_path_ancestors(&spec.cwd, &mut literal_reads);
     literal_reads.insert(spec.cwd.clone());
 
@@ -503,6 +521,9 @@ fn build_linux_bwrap_args(spec: &SandboxCommandSpec, policy: &ShellSandboxPolicy
     for root in &policy.readable_roots {
         push_bwrap_bind(&mut args, "--ro-bind", root);
     }
+    for file in &policy.readable_files {
+        push_bwrap_bind(&mut args, "--ro-bind", file);
+    }
     for root in &policy.writable_roots {
         push_bwrap_bind(&mut args, "--bind", root);
     }
@@ -559,6 +580,7 @@ mod tests {
             &workspace,
             &ShellSandboxPolicy {
                 readable_roots: vec![workspace.clone(), runtime_root.clone()],
+                readable_files: Vec::new(),
                 writable_roots: vec![runtime_root],
                 allow_child_processes: false,
                 launcher_programs: vec![executable.clone()],
@@ -567,6 +589,45 @@ mod tests {
             },
         );
         assert!(normalized.is_ok(), "{normalized:?}");
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sandbox_reads_an_exact_host_file_without_exposing_its_sibling() {
+        let (parent, workspace, outside) = isolated_test_roots("exact-readable-file");
+        let allowed = outside.join("allowed.txt");
+        let denied = outside.join("denied.txt");
+        std::fs::write(&allowed, "ORCHESTRAL_ALLOWED_FILE").unwrap();
+        std::fs::write(&denied, "ORCHESTRAL_DENIED_SIBLING").unwrap();
+        let program = std::fs::canonicalize("/bin/cat").unwrap();
+        let command = sandbox_command(
+            program.to_string_lossy().into_owned(),
+            vec![
+                allowed.to_string_lossy().into_owned(),
+                denied.to_string_lossy().into_owned(),
+            ],
+            &workspace,
+            &ShellSandboxPolicy {
+                readable_roots: vec![workspace.clone()],
+                readable_files: vec![allowed],
+                writable_roots: vec![workspace.clone()],
+                allow_child_processes: false,
+                launcher_programs: vec![program],
+                network_targets: BTreeSet::new(),
+                linux_bwrap_path: None,
+            },
+        )
+        .unwrap();
+
+        let output = run_sandboxed(command, &workspace);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("ORCHESTRAL_ALLOWED_FILE"), "{stdout}");
+        assert!(!stdout.contains("ORCHESTRAL_DENIED_SIBLING"), "{stdout}");
+        assert!(
+            !output.status.success(),
+            "the sibling read unexpectedly worked"
+        );
         std::fs::remove_dir_all(parent).unwrap();
     }
 
@@ -583,6 +644,7 @@ mod tests {
         };
         let policy = ShellSandboxPolicy {
             readable_roots: vec![cwd.clone()],
+            readable_files: Vec::new(),
             writable_roots: vec![cwd.clone()],
             allow_child_processes: false,
             launcher_programs: vec![program.clone()],
@@ -619,6 +681,7 @@ mod tests {
             &workspace,
             &ShellSandboxPolicy {
                 readable_roots: vec![workspace.clone()],
+                readable_files: Vec::new(),
                 writable_roots: vec![workspace.clone()],
                 allow_child_processes: false,
                 launcher_programs: vec![executable],
@@ -666,6 +729,7 @@ mod tests {
             &workspace,
             &ShellSandboxPolicy {
                 readable_roots: vec![workspace.clone()],
+                readable_files: Vec::new(),
                 writable_roots: vec![workspace.clone()],
                 allow_child_processes: false,
                 launcher_programs: vec![program],
@@ -699,6 +763,7 @@ mod tests {
             &workspace,
             &ShellSandboxPolicy {
                 readable_roots: vec![workspace.clone()],
+                readable_files: Vec::new(),
                 writable_roots: vec![workspace.clone()],
                 allow_child_processes: false,
                 launcher_programs: vec![program],
@@ -762,6 +827,7 @@ mod tests {
                     std::fs::canonicalize("/bin").unwrap(),
                     std::fs::canonicalize("/usr/bin").unwrap(),
                 ],
+                readable_files: Vec::new(),
                 writable_roots: vec![workspace.clone()],
                 allow_child_processes: true,
                 launcher_programs: vec![program],
@@ -829,6 +895,7 @@ mod tests {
                 &workspace,
                 &ShellSandboxPolicy {
                     readable_roots: readable_roots.clone(),
+                    readable_files: Vec::new(),
                     writable_roots: vec![workspace.clone()],
                     allow_child_processes: true,
                     launcher_programs: vec![shell.clone()],
@@ -890,6 +957,7 @@ mod tests {
         };
         let policy = ShellSandboxPolicy {
             readable_roots: vec![cwd.clone()],
+            readable_files: Vec::new(),
             writable_roots: vec![cwd.clone()],
             allow_child_processes: false,
             launcher_programs: vec![program.clone()],
@@ -926,6 +994,7 @@ mod tests {
         };
         let policy = ShellSandboxPolicy {
             readable_roots: vec![cwd.clone()],
+            readable_files: Vec::new(),
             writable_roots: vec![cwd],
             allow_child_processes: false,
             launcher_programs: vec![program],
@@ -958,6 +1027,7 @@ mod tests {
             &workspace,
             &ShellSandboxPolicy {
                 readable_roots: vec![workspace.clone()],
+                readable_files: Vec::new(),
                 writable_roots: vec![workspace.clone()],
                 allow_child_processes: false,
                 launcher_programs: vec![program],
