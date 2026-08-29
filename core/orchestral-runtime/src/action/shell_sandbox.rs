@@ -501,6 +501,11 @@ fn build_linux_bwrap_args(spec: &SandboxCommandSpec, policy: &ShellSandboxPolicy
         "/lib64",
         "/usr/lib",
         "/usr/lib64",
+        // GCC keeps compiler helpers (collect2, lto-wrapper, and on Debian/
+        // Ubuntu the linker plugin it selects) under /usr/libexec. Exposing
+        // only shared-library directories makes an otherwise available host
+        // toolchain fail after it enters the sandbox.
+        "/usr/libexec",
         "/etc/ld.so.cache",
     ] {
         if Path::new(runtime_path).exists() {
@@ -1005,6 +1010,13 @@ mod tests {
         assert!(args.iter().any(|v| v == "--unshare-net"));
         assert!(args.iter().any(|v| v == "--bind"));
         assert!(args.iter().any(|v| v == "--chdir"));
+        if Path::new("/usr/libexec").is_dir() {
+            assert!(args.windows(3).any(|window| {
+                window[0] == "--ro-bind"
+                    && window[1] == "/usr/libexec"
+                    && window[2] == "/usr/libexec"
+            }));
+        }
         assert!(!args
             .windows(3)
             .any(|window| { window[0] == "--ro-bind" && window[1] == "/" && window[2] == "/" }));
