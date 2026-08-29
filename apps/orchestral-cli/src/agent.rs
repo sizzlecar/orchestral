@@ -45,11 +45,11 @@ use orchestral_model_gemini::{
 use orchestral_model_openai::{OpenAiCompatibleBackend, OpenAiCompatibleConfig};
 use orchestral_runtime::tools::{
     guarded_apply_patch_descriptor, guarded_artifact_read_descriptor, guarded_file_read_descriptor,
-    guarded_file_search_descriptor, guarded_text_search_descriptor,
+    guarded_file_search_descriptor, guarded_file_write_descriptor, guarded_text_search_descriptor,
     workspace_exec_command_descriptor, workspace_write_stdin_descriptor,
     CommandEnvironmentSnapshot, GuardedApplyPatchExecutor, GuardedArtifactReadExecutor,
     GuardedExecCommandExecutor, GuardedFileReadExecutor, GuardedFileSearchExecutor,
-    GuardedTextSearchExecutor, GuardedWriteStdinExecutor,
+    GuardedFileWriteExecutor, GuardedTextSearchExecutor, GuardedWriteStdinExecutor,
 };
 use orchestral_runtime::{
     AgentClient, AgentControlEvent, AgentController, ContinuationPolicy,
@@ -534,6 +534,17 @@ fn build_cli_tool_runtime(
             ),
         )
         .context("register guarded text_search Tool")?;
+    runtime
+        .register(
+            guarded_file_write_descriptor(ToolRestriction {
+                bounds: bounds.clone(),
+            }),
+            Arc::new(
+                GuardedFileWriteExecutor::new(&workspace)
+                    .context("open file_write workspace capability")?,
+            ),
+        )
+        .context("register guarded file_write Tool")?;
     runtime
         .register(
             guarded_apply_patch_descriptor(ToolRestriction {

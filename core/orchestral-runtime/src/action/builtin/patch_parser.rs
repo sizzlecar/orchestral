@@ -264,7 +264,7 @@ pub(super) fn apply_update_hunks(
     Ok(updated)
 }
 
-fn parse_path(raw: &str) -> Result<PatchPath, PatchParseError> {
+pub(super) fn parse_path(raw: &str) -> Result<PatchPath, PatchParseError> {
     if raw.is_empty() || raw.trim() != raw || raw.contains('\\') {
         return Err(PatchParseError::new(
             "patch paths must be non-empty normalized workspace-relative paths",

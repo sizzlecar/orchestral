@@ -26,7 +26,10 @@ pub use self::guarded_exec::{
     CommandEnvironmentSnapshot, GuardedExecCommandExecutor, GuardedWriteStdinExecutor,
     GUARDED_EXEC_SANDBOX_PROFILE,
 };
-pub use self::guarded_patch::{guarded_apply_patch_descriptor, GuardedApplyPatchExecutor};
+pub use self::guarded_patch::{
+    guarded_apply_patch_descriptor, guarded_file_write_descriptor, GuardedApplyPatchExecutor,
+    GuardedFileWriteExecutor,
+};
 pub use self::guarded_pty::{
     guarded_pty_close_descriptor, guarded_pty_create_descriptor,
     guarded_pty_create_descriptor_with_program_aliases, guarded_pty_list_descriptor,
