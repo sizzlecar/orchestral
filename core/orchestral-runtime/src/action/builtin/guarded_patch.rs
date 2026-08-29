@@ -647,8 +647,7 @@ fn sync_parent(target: &CapabilityTarget) -> Result<(), MutationError> {
     {
         target
             .parent
-            .try_clone()
-            .map(Dir::into_std_file)
+            .open(".")
             .and_then(|directory| directory.sync_all())
             .map_err(|error| mutation_io("patch_sync_failed", &target.display, error))?;
     }
