@@ -8,6 +8,8 @@ mod guarded_exec;
 mod guarded_patch;
 #[path = "builtin/guarded_pty.rs"]
 mod guarded_pty;
+#[path = "builtin/guarded_search.rs"]
+mod guarded_search;
 #[path = "builtin/patch_parser.rs"]
 mod patch_parser;
 #[path = "builtin/support.rs"]
@@ -31,4 +33,8 @@ pub use self::guarded_pty::{
     guarded_pty_read_descriptor, guarded_pty_write_descriptor, GuardedPtyCloseExecutor,
     GuardedPtyCreateExecutor, GuardedPtyListExecutor, GuardedPtyReadExecutor,
     GuardedPtyWriteExecutor, GUARDED_PTY_SANDBOX_PROFILE,
+};
+pub use self::guarded_search::{
+    guarded_file_search_descriptor, guarded_text_search_descriptor, GuardedFileSearchExecutor,
+    GuardedTextSearchExecutor,
 };

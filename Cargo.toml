@@ -65,6 +65,11 @@ hex = "0.4"
 serde_jcs = "0.2"
 base64 = "0.22"
 shell-words = "1"
+globset = "0.4"
+grep-matcher = "0.1"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+ignore = "0.4"
 
 # Internal crates - Core
 orchestral = { path = "core/orchestral" }

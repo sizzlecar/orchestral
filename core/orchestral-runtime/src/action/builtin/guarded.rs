@@ -4,18 +4,19 @@
 //! adapt or call the removed legacy `Action` stack.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::io::{self, SeekFrom};
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use orchestral_core::agent_protocol::wire::Digest;
 use orchestral_core::tool_protocol::{
     ApprovalPolicy, EffectScope, ModelToolSchema, ToolConcurrency, ToolDescriptor, ToolId,
     ToolIdempotency, ToolOutcome, ToolRestriction,
 };
 use serde_json::{json, Value};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
 
@@ -24,7 +25,7 @@ use crate::tools::shell_sandbox::{sandbox_command, ShellSandboxPolicy};
 
 use super::support::{
     build_allowlisted_env, canonical_roots, read_stream_limited, stderr_preview,
-    truncate_utf8_lossy,
+    truncate_utf8_lossy, GuardedWorkspace, WorkspacePathError,
 };
 
 pub const GUARDED_SHELL_SANDBOX_PROFILE: &str = "orchestral.shell.exec.v1";
@@ -155,8 +156,24 @@ fn validate_program_alias(alias: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Default)]
-pub struct GuardedFileReadExecutor;
+const DEFAULT_FILE_READ_LINES: usize = 400;
+const MAX_FILE_READ_LINES: usize = 2_000;
+const MAX_FILE_READ_LINE_BYTES: usize = 64 * 1024;
+const MAX_FILE_READ_SCAN_BYTES: usize = 32 * 1024 * 1024;
+const FILE_READ_OUTPUT_RESERVE_BYTES: usize = 2 * 1024;
+
+#[derive(Debug, Clone)]
+pub struct GuardedFileReadExecutor {
+    workspace: GuardedWorkspace,
+}
+
+impl GuardedFileReadExecutor {
+    pub fn new(workspace: impl AsRef<Path>) -> io::Result<Self> {
+        Ok(Self {
+            workspace: GuardedWorkspace::new(workspace)?,
+        })
+    }
+}
 
 #[async_trait]
 impl GuardedToolExecutor for GuardedFileReadExecutor {
@@ -188,128 +205,121 @@ impl GuardedToolExecutor for GuardedFileReadExecutor {
                 "file_read path must be a non-empty string",
             );
         };
-        if Path::new(raw_path)
-            .components()
-            .any(|component| matches!(component, Component::ParentDir))
-        {
-            return rejected(
-                "file_path_escape",
-                "file_read path contains a parent traversal",
-            );
-        }
-        let unresolved = if Path::new(raw_path).is_absolute() {
-            PathBuf::from(raw_path)
-        } else {
-            match std::env::current_dir() {
-                Ok(cwd) => cwd.join(raw_path),
-                Err(error) => return failed("file_cwd_failed", error.to_string(), false),
-            }
+        let target = match self.workspace.resolve_existing(raw_path, &roots) {
+            Ok(target) => target,
+            Err(error) => return workspace_path_outcome(error),
         };
-        let path = match tokio::fs::canonicalize(&unresolved).await {
-            Ok(path) => path,
-            Err(error) => return failed("file_read_failed", error.to_string(), false),
-        };
-        if !roots.iter().any(|root| path.starts_with(root)) {
-            return rejected(
-                "file_path_escape",
-                "resolved file is outside Host-approved readable roots",
-            );
-        }
 
         let host_limit = usize::try_from(
             bounds
                 .max_output_bytes
                 .unwrap_or(512 * 1024)
-                .saturating_sub(4 * 1024),
+                .saturating_sub(FILE_READ_OUTPUT_RESERVE_BYTES as u64),
         )
         .unwrap_or(usize::MAX);
-        if host_limit < 4 {
+        if host_limit < 256 {
             return failed(
                 "file_read_limit_too_small",
-                "effective output policy leaves fewer than four bytes for UTF-8 content",
+                "effective output policy leaves fewer than 256 bytes for file content",
                 false,
             );
         }
-        let max_bytes = execution
-            .invocation
-            .arguments
-            .get("max_bytes")
-            .and_then(Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok())
-            .unwrap_or(host_limit)
-            .min(host_limit)
-            .max(4);
-        let offset = execution
+        let start_line = execution
             .invocation
             .arguments
             .get("offset")
             .and_then(Value::as_u64)
-            .unwrap_or(0);
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(1);
+        if start_line == 0 {
+            return rejected(
+                "file_read_offset_invalid",
+                "file_read offset is a 1-indexed line number and must be at least 1",
+            );
+        }
+        let line_limit = execution
+            .invocation
+            .arguments
+            .get("limit")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(DEFAULT_FILE_READ_LINES)
+            .min(MAX_FILE_READ_LINES);
         let metadata = tokio::select! {
             biased;
             _ = execution.cancellation.cancelled() => return ToolOutcome::Cancelled,
-            result = tokio::fs::metadata(&path) => result,
+            result = tokio::fs::metadata(target.canonical()) => result,
         };
-        let total_bytes = match metadata {
-            Ok(metadata) if metadata.is_file() => metadata.len(),
+        let metadata = match metadata {
+            Ok(metadata) if metadata.is_file() => metadata,
             Ok(_) => return failed("file_read_not_file", "path is not a regular file", false),
             Err(error) => return failed("file_read_failed", error.to_string(), false),
         };
-        if offset > total_bytes {
-            return rejected(
-                "file_read_offset_out_of_range",
-                format!("offset {offset} exceeds file length {total_bytes}"),
-            );
-        }
-        let read = tokio::select! {
+        let revision = file_revision(target.canonical(), &metadata);
+        let file = tokio::select! {
             biased;
             _ = execution.cancellation.cancelled() => return ToolOutcome::Cancelled,
-            result = async {
-                let mut file = tokio::fs::File::open(&path).await?;
-                file.seek(SeekFrom::Start(offset)).await?;
-                let mut bytes = Vec::with_capacity(max_bytes);
-                file.take(max_bytes as u64).read_to_end(&mut bytes).await?;
-                Ok::<_, io::Error>(bytes)
-            } => result,
+            result = tokio::fs::File::open(target.canonical()) => result,
         };
-        let bytes = match read {
-            Ok(bytes) => bytes,
+        let file = match file {
+            Ok(file) => file,
             Err(error) => return failed("file_read_failed", error.to_string(), false),
         };
-        if offset > 0
-            && bytes
-                .first()
-                .is_some_and(|byte| byte & 0b1100_0000 == 0b1000_0000)
+        let page = match read_file_page(
+            BufReader::new(file),
+            start_line,
+            line_limit,
+            host_limit,
+            &execution.cancellation,
+        )
+        .await
         {
-            return rejected(
-                "file_read_offset_not_utf8_boundary",
-                "offset points into the middle of a UTF-8 character; continue from a returned next_offset",
-            );
-        }
-        let valid_bytes = match std::str::from_utf8(&bytes) {
-            Ok(_) => bytes.len(),
-            Err(error)
-                if error.error_len().is_none()
-                    && offset.saturating_add(bytes.len() as u64) < total_bytes =>
-            {
-                error.valid_up_to()
+            Ok(page) => page,
+            Err(FilePageError::Cancelled) => return ToolOutcome::Cancelled,
+            Err(FilePageError::OffsetOutOfRange { available_lines }) => {
+                return rejected(
+                    "file_read_offset_out_of_range",
+                    format!(
+                        "offset {start_line} exceeds the file's {available_lines} available lines"
+                    ),
+                )
             }
-            Err(error) => return failed("file_not_utf8", error.to_string(), false),
+            Err(FilePageError::ScanLimit) => {
+                return failed(
+                    "file_read_scan_limit",
+                    format!(
+                        "reaching line {start_line} exceeded the {} byte scan budget; narrow the file or use text_search",
+                        MAX_FILE_READ_SCAN_BYTES
+                    ),
+                    false,
+                )
+            }
+            Err(FilePageError::NotUtf8 { line }) => {
+                return failed(
+                    "file_not_utf8",
+                    format!("file is not valid UTF-8 near line {line}"),
+                    false,
+                )
+            }
+            Err(FilePageError::Io(error)) => {
+                return failed("file_read_failed", error.to_string(), false)
+            }
         };
-        let content = String::from_utf8(bytes[..valid_bytes].to_vec())
-            .expect("validated UTF-8 prefix must decode");
-        let byte_count = valid_bytes as u64;
-        let next_offset = offset.saturating_add(byte_count);
-        let truncated = next_offset < total_bytes;
         ToolOutcome::Completed {
             output: json!({
-                "content": content,
-                "path": path.to_string_lossy(),
-                "offset": offset,
-                "next_offset": next_offset,
-                "bytes": byte_count,
-                "total_bytes": total_bytes,
-                "truncated": truncated,
+                "path": target.display(),
+                "revision": revision,
+                "content": page.content,
+                "content_digest": Digest::sha256(page.content.as_bytes()),
+                "start_line": start_line,
+                "end_line": page.end_line,
+                "next_offset": page.next_offset,
+                "eof": page.eof,
+                "truncated": !page.truncation_reasons.is_empty(),
+                "truncation_reasons": page.truncation_reasons,
+                "truncated_line_numbers": page.truncated_line_numbers,
+                "file_size_bytes": metadata.len(),
+                "scanned_bytes": page.scanned_bytes,
             })
             .into(),
         }
@@ -318,33 +328,61 @@ impl GuardedToolExecutor for GuardedFileReadExecutor {
 
 pub fn guarded_file_read_descriptor(restriction: ToolRestriction) -> ToolDescriptor {
     ToolDescriptor {
-        tool_id: ToolId::new("orchestral/file_read/v2"),
+        tool_id: ToolId::new("orchestral/file_read/v3"),
         model_schema: ModelToolSchema {
             name: "file_read".to_owned(),
-            description: "Read one bounded UTF-8 chunk from a file in the Host-approved workspace. If truncated is true, continue with the returned next_offset."
+            description: "Read UTF-8 source text by 1-indexed line range from a Host-approved workspace-relative path. Continue with next_offset when eof is false; truncation reasons are always explicit."
                 .to_owned(),
             input_schema: json!({
                 "type": "object",
                 "required": ["path"],
                 "properties": {
-                    "path": { "type": "string" },
-                    "offset": { "type": "integer", "minimum": 0 },
-                    "max_bytes": { "type": "integer", "minimum": 4 }
+                    "path": {
+                        "type": "string",
+                        "description": "Path relative to the composed workspace; absolute paths and parent traversal are rejected."
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "1-indexed first line. Defaults to 1."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_FILE_READ_LINES,
+                        "description": "Maximum lines to return. Defaults to 400."
+                    }
                 },
                 "additionalProperties": false
             }),
         },
         output_schema: json!({
             "type": "object",
-            "required": ["content", "path", "offset", "next_offset", "bytes", "total_bytes", "truncated"],
+            "required": [
+                "path", "revision", "content", "content_digest", "start_line", "end_line",
+                "next_offset", "eof", "truncated", "truncation_reasons",
+                "truncated_line_numbers", "file_size_bytes", "scanned_bytes"
+            ],
             "properties": {
-                "content": { "type": "string" },
                 "path": { "type": "string" },
-                "offset": { "type": "integer" },
+                "revision": { "type": "string" },
+                "content": { "type": "string" },
+                "content_digest": { "type": "string" },
+                "start_line": { "type": "integer" },
+                "end_line": { "type": "integer" },
                 "next_offset": { "type": "integer" },
-                "bytes": { "type": "integer" },
-                "total_bytes": { "type": "integer" },
-                "truncated": { "type": "boolean" }
+                "eof": { "type": "boolean" },
+                "truncated": { "type": "boolean" },
+                "truncation_reasons": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                },
+                "truncated_line_numbers": {
+                    "type": "array",
+                    "items": { "type": "integer" }
+                },
+                "file_size_bytes": { "type": "integer" },
+                "scanned_bytes": { "type": "integer" }
             },
             "additionalProperties": false
         }),
@@ -352,6 +390,253 @@ pub fn guarded_file_read_descriptor(restriction: ToolRestriction) -> ToolDescrip
         restriction,
         idempotency: ToolIdempotency::Pure,
         concurrency: ToolConcurrency::ParallelSafe,
+    }
+}
+
+#[derive(Debug)]
+struct FilePage {
+    content: String,
+    end_line: usize,
+    next_offset: usize,
+    eof: bool,
+    truncation_reasons: Vec<&'static str>,
+    truncated_line_numbers: Vec<usize>,
+    scanned_bytes: usize,
+}
+
+#[derive(Debug)]
+enum FilePageError {
+    Cancelled,
+    OffsetOutOfRange { available_lines: usize },
+    ScanLimit,
+    NotUtf8 { line: usize },
+    Io(io::Error),
+}
+
+async fn read_file_page(
+    mut reader: BufReader<tokio::fs::File>,
+    start_line: usize,
+    line_limit: usize,
+    content_budget: usize,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<FilePage, FilePageError> {
+    let mut content = String::new();
+    let mut line_number = 1_usize;
+    let mut end_line = start_line.saturating_sub(1);
+    let mut next_offset = start_line;
+    let mut scanned_bytes = 0_usize;
+    let mut selected_lines = 0_usize;
+    let mut reasons = BTreeSet::new();
+    let mut truncated_line_numbers = Vec::new();
+    let mut eof = false;
+    let mut stopped_after_partial_line = false;
+
+    while selected_lines < line_limit {
+        let line = match read_one_bounded_line(&mut reader, &mut scanned_bytes, cancellation).await
+        {
+            Err(FilePageError::NotUtf8 { .. }) => {
+                return Err(FilePageError::NotUtf8 { line: line_number })
+            }
+            other => other?,
+        };
+        let Some(line) = line else {
+            eof = true;
+            break;
+        };
+        if line_number < start_line {
+            line_number = line_number.saturating_add(1);
+            continue;
+        }
+
+        let mut rendered = String::from_utf8(line.prefix)
+            .map_err(|_| FilePageError::NotUtf8 { line: line_number })?;
+        if line.truncated {
+            if rendered.ends_with('\n') {
+                rendered.pop();
+            }
+            rendered.push_str("… [line truncated]\n");
+            reasons.insert("line_too_long");
+            truncated_line_numbers.push(line_number);
+        }
+        if content.len().saturating_add(rendered.len()) > content_budget {
+            reasons.insert("byte_limit");
+            if content.is_empty() {
+                rendered = truncate_line_to_budget(&rendered, content_budget);
+                content.push_str(&rendered);
+                end_line = line_number;
+                selected_lines = selected_lines.saturating_add(1);
+                line_number = line_number.saturating_add(1);
+                next_offset = line_number;
+                stopped_after_partial_line = true;
+            } else {
+                next_offset = line_number;
+            }
+            break;
+        }
+        content.push_str(&rendered);
+        end_line = line_number;
+        selected_lines = selected_lines.saturating_add(1);
+        line_number = line_number.saturating_add(1);
+        next_offset = line_number;
+    }
+
+    if (selected_lines == line_limit || stopped_after_partial_line) && !eof {
+        let at_eof = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(FilePageError::Cancelled),
+            result = reader.fill_buf() => result.map_err(FilePageError::Io)?.is_empty(),
+        };
+        eof = at_eof;
+        if !eof && selected_lines == line_limit && !stopped_after_partial_line {
+            reasons.insert("line_limit");
+        }
+    }
+    if content.is_empty() && eof && start_line > 1 {
+        return Err(FilePageError::OffsetOutOfRange {
+            available_lines: line_number.saturating_sub(1),
+        });
+    }
+    if eof {
+        next_offset = end_line.saturating_add(1).max(start_line);
+    }
+    Ok(FilePage {
+        content,
+        end_line,
+        next_offset,
+        eof,
+        truncation_reasons: reasons.into_iter().collect(),
+        truncated_line_numbers,
+        scanned_bytes,
+    })
+}
+
+fn truncate_line_to_budget(line: &str, budget: usize) -> String {
+    const MARKER: &str = "… [output truncated]\n";
+    if line.len() <= budget {
+        return line.to_owned();
+    }
+    if budget <= MARKER.len() {
+        return MARKER.chars().take(budget).collect();
+    }
+    let mut end = budget.saturating_sub(MARKER.len()).min(line.len());
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &line[..end], MARKER)
+}
+
+#[derive(Debug)]
+struct BoundedLine {
+    prefix: Vec<u8>,
+    truncated: bool,
+}
+
+async fn read_one_bounded_line(
+    reader: &mut BufReader<tokio::fs::File>,
+    scanned_bytes: &mut usize,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<Option<BoundedLine>, FilePageError> {
+    let mut prefix = Vec::new();
+    let mut truncated = false;
+    let mut validator = Utf8StreamValidator::default();
+    let mut saw_bytes = false;
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(FilePageError::Cancelled);
+        }
+        let (consumed, ended) = {
+            let available = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(FilePageError::Cancelled),
+                result = reader.fill_buf() => result.map_err(FilePageError::Io)?,
+            };
+            if available.is_empty() {
+                if !validator.finish() {
+                    return Err(FilePageError::NotUtf8 { line: 0 });
+                }
+                return if saw_bytes {
+                    Ok(Some(BoundedLine { prefix, truncated }))
+                } else {
+                    Ok(None)
+                };
+            }
+            let consumed = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(available.len(), |index| index + 1);
+            if scanned_bytes.saturating_add(consumed) > MAX_FILE_READ_SCAN_BYTES {
+                return Err(FilePageError::ScanLimit);
+            }
+            let segment = &available[..consumed];
+            if !validator.feed(segment) {
+                return Err(FilePageError::NotUtf8 { line: 0 });
+            }
+            let remaining = MAX_FILE_READ_LINE_BYTES.saturating_sub(prefix.len());
+            let kept = remaining.min(segment.len());
+            prefix.extend_from_slice(&segment[..kept]);
+            truncated |= kept < segment.len();
+            *scanned_bytes = scanned_bytes.saturating_add(consumed);
+            saw_bytes = true;
+            (consumed, segment.ends_with(b"\n"))
+        };
+        reader.consume(consumed);
+        if ended {
+            if !validator.finish() {
+                return Err(FilePageError::NotUtf8 { line: 0 });
+            }
+            while std::str::from_utf8(&prefix).is_err() {
+                prefix.pop();
+                truncated = true;
+            }
+            return Ok(Some(BoundedLine { prefix, truncated }));
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct Utf8StreamValidator {
+    pending: Vec<u8>,
+}
+
+impl Utf8StreamValidator {
+    fn feed(&mut self, bytes: &[u8]) -> bool {
+        let mut combined = Vec::with_capacity(self.pending.len().saturating_add(bytes.len()));
+        combined.append(&mut self.pending);
+        combined.extend_from_slice(bytes);
+        match std::str::from_utf8(&combined) {
+            Ok(_) => true,
+            Err(error) if error.error_len().is_none() => {
+                self.pending
+                    .extend_from_slice(&combined[error.valid_up_to()..]);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn finish(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
+fn file_revision(path: &Path, metadata: &std::fs::Metadata) -> Digest {
+    let modified_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    Digest::sha256(format!(
+        "orchestral.file-revision/v1\n{}\n{}\n{modified_ns}",
+        path.to_string_lossy(),
+        metadata.len(),
+    ))
+}
+
+fn workspace_path_outcome(error: WorkspacePathError) -> ToolOutcome {
+    match error {
+        WorkspacePathError::Rejected { code, message } => rejected(code, message),
+        WorkspacePathError::Failed { code, message } => failed(code, message, false),
     }
 }
 

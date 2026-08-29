@@ -2456,7 +2456,7 @@ async fn two_thousand_five_hundred_symlink_escapes_read_zero_outside_bytes() {
             guarded_file_read_descriptor(ToolRestriction {
                 bounds: bounds.clone(),
             }),
-            Arc::new(GuardedFileReadExecutor),
+            Arc::new(GuardedFileReadExecutor::new(&workspace).unwrap()),
         )
         .unwrap();
     for index in 0..MUTATIONS {
@@ -2467,8 +2467,8 @@ async fn two_thousand_five_hundred_symlink_escapes_read_zero_outside_bytes() {
                 ToolInvocation {
                     run_id: RunId::new("symlink-escape-run"),
                     call_id: ToolCallId::new(format!("symlink-escape-{index}")),
-                    tool_id: ToolId::new("orchestral/file_read/v2"),
-                    arguments: json!({ "path": link }),
+                    tool_id: ToolId::new("orchestral/file_read/v3"),
+                    arguments: json!({ "path": format!("escape-{index}.txt") }),
                 },
                 RunToolGrant {
                     bounds: bounds.clone(),
@@ -2482,7 +2482,7 @@ async fn two_thousand_five_hundred_symlink_escapes_read_zero_outside_bytes() {
             GuardedToolResult::Outcome {
                 outcome: ToolOutcome::Rejected { ref code, .. },
                 cached: false,
-            } if code == "file_path_escape"
+            } if code == "workspace_path_escape"
         ));
     }
     std::fs::remove_dir_all(parent).unwrap();
@@ -2533,7 +2533,7 @@ async fn guarded_file_read_uses_effective_roots_without_model_authority_fields()
         std::env::temp_dir().join(format!("orchestral-guarded-read-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
     let file = root.join("hello.txt");
-    let expected = "abcd你好ef";
+    let expected = "alpha\n你好\nomega\n";
     std::fs::write(&file, expected).unwrap();
     let root = std::fs::canonicalize(&root).unwrap();
     let bounds = ToolPolicyBounds {
@@ -2565,13 +2565,16 @@ async fn guarded_file_read_uses_effective_roots_without_model_authority_fields()
         .get("sandbox_mode")
         .is_none());
     assert!(descriptor.model_schema.input_schema["properties"]
-        .get("truncate")
+        .get("max_bytes")
         .is_none());
     assert!(descriptor.model_schema.input_schema["properties"]
         .get("offset")
         .is_some());
     runtime
-        .register(descriptor, Arc::new(GuardedFileReadExecutor))
+        .register(
+            descriptor,
+            Arc::new(GuardedFileReadExecutor::new(&root).unwrap()),
+        )
         .unwrap();
 
     let first = runtime
@@ -2579,8 +2582,8 @@ async fn guarded_file_read_uses_effective_roots_without_model_authority_fields()
             ToolInvocation {
                 run_id: RunId::new("guarded-file-run"),
                 call_id: ToolCallId::new("guarded-file-call-1"),
-                tool_id: ToolId::new("orchestral/file_read/v2"),
-                arguments: json!({ "path": file.to_string_lossy(), "max_bytes": 5 }),
+                tool_id: ToolId::new("orchestral/file_read/v3"),
+                arguments: json!({ "path": "hello.txt", "limit": 2 }),
             },
             RunToolGrant {
                 bounds: bounds.clone(),
@@ -2599,9 +2602,11 @@ async fn guarded_file_read_uses_effective_roots_without_model_authority_fields()
         } => output,
         other => panic!("first bounded read failed: {other:?}"),
     };
-    assert_eq!(first["content"], json!("abcd"));
-    assert_eq!(first["offset"], json!(0));
-    assert_eq!(first["next_offset"], json!(4));
+    assert_eq!(first["content"], json!("alpha\n你好\n"));
+    assert_eq!(first["start_line"], json!(1));
+    assert_eq!(first["end_line"], json!(2));
+    assert_eq!(first["next_offset"], json!(3));
+    assert_eq!(first["eof"], json!(false));
     assert_eq!(first["truncated"], json!(true));
 
     let second = runtime
@@ -2609,11 +2614,11 @@ async fn guarded_file_read_uses_effective_roots_without_model_authority_fields()
             ToolInvocation {
                 run_id: RunId::new("guarded-file-run"),
                 call_id: ToolCallId::new("guarded-file-call-2"),
-                tool_id: ToolId::new("orchestral/file_read/v2"),
+                tool_id: ToolId::new("orchestral/file_read/v3"),
                 arguments: json!({
-                    "path": file.to_string_lossy(),
+                    "path": "hello.txt",
                     "offset": first["next_offset"],
-                    "max_bytes": 64
+                    "limit": 2
                 }),
             },
             RunToolGrant { bounds },
@@ -2640,6 +2645,7 @@ async fn guarded_file_read_uses_effective_roots_without_model_authority_fields()
         expected
     );
     assert_eq!(second["truncated"], json!(false));
-    assert_eq!(second["next_offset"], second["total_bytes"]);
+    assert_eq!(second["eof"], json!(true));
+    assert_eq!(second["next_offset"], json!(4));
     std::fs::remove_dir_all(root).unwrap();
 }

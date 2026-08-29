@@ -30,7 +30,7 @@ enum ActivityFamily {
 impl ActivityFamily {
     fn for_tool(tool_name: &str) -> Self {
         match tool_name {
-            "file_read" | "artifact_read" => Self::Read,
+            "file_read" | "file_search" | "text_search" | "artifact_read" => Self::Read,
             "exec_command" | "write_stdin" => Self::Command,
             "apply_patch" | "file_write" => Self::Edit,
             "skill_read" => Self::Skill,

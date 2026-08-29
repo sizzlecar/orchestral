@@ -438,7 +438,9 @@ fn local_cli_creates_and_verifies_a_file_with_exec_disabled() {
                     "apply_patch",
                     "artifact_read",
                     "file_read",
-                    "orchestral_request_input"
+                    "file_search",
+                    "orchestral_request_input",
+                    "text_search"
                 ]
             );
             openai_tool_response("read-request", "file_read", json!({"path": "request.txt"}))
@@ -504,6 +506,142 @@ fn local_cli_creates_and_verifies_a_file_with_exec_disabled() {
     assert_eq!(tool_name(exchanges[0]), Some("file_read"));
     assert_eq!(tool_name(exchanges[1]), Some("apply_patch"));
     assert_eq!(tool_name(exchanges[2]), Some("file_read"));
+    assert!(exchanges
+        .iter()
+        .all(|exchange| tool_result_is_error(exchange) == Some(false)));
+}
+
+#[test]
+fn local_cli_discovers_searches_reads_patches_and_rechecks_source() {
+    let _guard = local_e2e_guard();
+    let workspace = TestWorkspace::new("inspect-patch-recheck");
+    fs::create_dir_all(workspace.path("src")).expect("create source fixture directory");
+    fs::create_dir_all(workspace.path("ignored")).expect("create ignored fixture directory");
+    fs::write(workspace.path(".gitignore"), "ignored/\n").expect("write ignore fixture");
+    fs::write(
+        workspace.path("src/service.rs"),
+        concat!(
+            "// TODO_TARGET: return the verified answer\n",
+            "pub fn answer() -> u32 { 41 }\n",
+        ),
+    )
+    .expect("write source fixture");
+    fs::write(
+        workspace.path("ignored/decoy.rs"),
+        "// TODO_TARGET: this path must stay ignored\n",
+    )
+    .expect("write ignored decoy");
+    workspace.disable_exec();
+
+    let (model_endpoint, model_server) = spawn_fixture_http_server(vec![
+        Box::new(|request| {
+            for tool in ["file_search", "text_search", "file_read", "apply_patch"] {
+                assert!(
+                    model_request_has_tool(&request.body, tool),
+                    "missing {tool}"
+                );
+            }
+            openai_tool_response(
+                "discover-rust-files",
+                "file_search",
+                json!({"pattern": "**/*.rs"}),
+            )
+        }),
+        Box::new(|request| {
+            let context = model_request_text(&request.body);
+            assert!(context.contains("src/service.rs"), "{context}");
+            assert!(!context.contains("ignored/decoy.rs"), "{context}");
+            assert!(
+                context.contains("\"completeness\":\"complete\""),
+                "{context}"
+            );
+            openai_tool_response(
+                "find-target-symbol",
+                "text_search",
+                json!({
+                    "pattern": "TODO_TARGET",
+                    "literal": true,
+                    "include": "*.rs"
+                }),
+            )
+        }),
+        Box::new(|request| {
+            let context = model_request_text(&request.body);
+            assert!(context.contains("TODO_TARGET"), "{context}");
+            assert!(context.contains("\"line_number\":1"), "{context}");
+            openai_tool_response(
+                "read-target-file",
+                "file_read",
+                json!({"path": "src/service.rs", "offset": 1, "limit": 20}),
+            )
+        }),
+        Box::new(|request| {
+            let context = model_request_text(&request.body);
+            assert!(context.contains("answer() -> u32 { 41 }"), "{context}");
+            assert!(context.contains("\"eof\":true"), "{context}");
+            openai_tool_response(
+                "patch-target-file",
+                "apply_patch",
+                json!({
+                    "patch": concat!(
+                        "*** Begin Patch\n",
+                        "*** Update File: src/service.rs\n",
+                        "@@\n",
+                        "-pub fn answer() -> u32 { 41 }\n",
+                        "+pub fn answer() -> u32 { 42 }\n",
+                        "*** End Patch"
+                    )
+                }),
+            )
+        }),
+        Box::new(|request| {
+            assert!(model_request_text(&request.body).contains("\"operation\":\"update\""));
+            openai_tool_response(
+                "recheck-target-file",
+                "file_read",
+                json!({"path": "src/service.rs"}),
+            )
+        }),
+        Box::new(|request| {
+            assert!(model_request_text(&request.body).contains("answer() -> u32 { 42 }"));
+            openai_text_response("INSPECT_PATCH_RECHECK_OK")
+        }),
+    ]);
+    workspace.configure_local_openai(&model_endpoint);
+
+    let output = run_to_completion(
+        local_agent_command(
+            &workspace,
+            "inspect-patch-recheck-session",
+            concat!(
+                "Discover the relevant source, locate TODO_TARGET, inspect the exact file, ",
+                "apply the correction, then re-read the result."
+            ),
+            "Find the marked implementation and make it return 42.",
+            true,
+            true,
+        ),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    assert!(output.status.success(), "{}", output.stderr_text());
+    assert_eq!(output.stdout_text().trim(), "INSPECT_PATCH_RECHECK_OK");
+    assert!(fs::read_to_string(workspace.path("src/service.rs"))
+        .unwrap()
+        .contains("answer() -> u32 { 42 }"));
+    output.assert_no_ansi();
+
+    assert_eq!(
+        model_server.join().expect("join local model server").len(),
+        6
+    );
+    let records = session_records(&workspace);
+    let exchanges = tool_exchanges(&records);
+    assert_eq!(exchanges.len(), 5);
+    assert_eq!(tool_name(exchanges[0]), Some("file_search"));
+    assert_eq!(tool_name(exchanges[1]), Some("text_search"));
+    assert_eq!(tool_name(exchanges[2]), Some("file_read"));
+    assert_eq!(tool_name(exchanges[3]), Some("apply_patch"));
+    assert_eq!(tool_name(exchanges[4]), Some("file_read"));
     assert!(exchanges
         .iter()
         .all(|exchange| tool_result_is_error(exchange) == Some(false)));
