@@ -1,59 +1,39 @@
-//! # Orchestral Config
-//!
-//! Unified single-file configuration management for Orchestral.
-//! A single `orchestral.yaml` can configure runtime, planner, LLM providers,
-//! actions, stores, context behavior, and observability settings.
+//! Strict configuration for the Agent Foundation runtime.
 
-mod actions;
 mod loader;
 mod providers;
 
-pub use actions::{ActionInterfaceSpec, ActionSpec, ActionsConfig};
-pub use loader::{load_actions_config, load_config, load_providers_config, ConfigError};
-pub use providers::{
-    ApiKeyError, BackendSpec, LegacyProviderSpec, ModelPolicy, ModelProfile, ProvidersConfig,
-};
+pub use loader::{load_config, load_providers_config, ConfigError};
+pub use providers::{ApiKeyError, BackendSpec, ModelPolicy, ModelProfile, ProvidersConfig};
 
 use std::collections::HashMap;
 
 use serde::Deserialize;
-use serde_json::Value;
 
-/// Top-level configuration schema for Orchestral.
+/// One configuration surface for the Generic Agent composition root.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OrchestralConfig {
-    /// Config schema version.
     #[serde(default = "default_version")]
     pub version: u32,
     #[serde(default)]
     pub app: AppConfig,
     #[serde(default)]
-    pub runtime: RuntimeConfig,
-    #[serde(default)]
-    pub planner: PlannerConfig,
-    #[serde(default)]
-    pub interpreter: InterpreterConfig,
-    #[serde(default)]
-    pub context: ContextConfig,
-    #[serde(default)]
-    pub ingestion: IngestionConfig,
-    #[serde(default)]
-    pub stores: StoresConfig,
-    #[serde(default, alias = "files")]
-    pub blobs: BlobsConfig,
-    #[serde(default)]
-    pub observability: ObservabilityConfig,
+    pub agent: AgentConfig,
     #[serde(default)]
     pub providers: ProvidersConfig,
     #[serde(default)]
-    pub actions: ActionsConfig,
+    pub tools: ToolsConfig,
     #[serde(default)]
-    #[serde(alias = "plugins")]
-    pub extensions: ExtensionsConfig,
-}
-
-fn default_version() -> u32 {
-    1
+    pub mcp: McpConfig,
+    #[serde(default)]
+    pub skills: SkillsConfig,
+    #[serde(default)]
+    pub journal: JournalConfig,
+    #[serde(default)]
+    pub artifacts: ArtifactConfig,
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
 }
 
 impl Default for OrchestralConfig {
@@ -61,43 +41,28 @@ impl Default for OrchestralConfig {
         Self {
             version: default_version(),
             app: AppConfig::default(),
-            runtime: RuntimeConfig::default(),
-            planner: PlannerConfig::default(),
-            interpreter: InterpreterConfig::default(),
-            context: ContextConfig::default(),
-            ingestion: IngestionConfig::default(),
-            stores: StoresConfig::default(),
-            blobs: BlobsConfig::default(),
-            observability: ObservabilityConfig::default(),
+            agent: AgentConfig::default(),
             providers: ProvidersConfig::default(),
-            actions: ActionsConfig::default(),
-            extensions: ExtensionsConfig::default(),
+            tools: ToolsConfig::default(),
+            mcp: McpConfig::default(),
+            skills: SkillsConfig::default(),
+            journal: JournalConfig::default(),
+            artifacts: ArtifactConfig::default(),
+            observability: ObservabilityConfig::default(),
         }
     }
 }
 
-impl OrchestralConfig {
-    pub fn providers(&self) -> &ProvidersConfig {
-        &self.providers
-    }
-
-    pub fn actions(&self) -> &ActionsConfig {
-        &self.actions
-    }
-
-    pub fn extensions(&self) -> &ExtensionsConfig {
-        &self.extensions
-    }
+fn default_version() -> u32 {
+    1
 }
 
-/// Backward-compatible alias.
-pub type OrchestraConfig = OrchestralConfig;
-
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     #[serde(default = "default_app_name")]
     pub name: String,
-    #[serde(default = "default_env")]
+    #[serde(default = "default_environment")]
     pub environment: String,
 }
 
@@ -105,442 +70,196 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             name: default_app_name(),
-            environment: default_env(),
+            environment: default_environment(),
         }
     }
 }
 
 fn default_app_name() -> String {
-    "orchestral".to_string()
+    "orchestral".to_owned()
 }
 
-fn default_env() -> String {
-    "development".to_string()
+fn default_environment() -> String {
+    "development".to_owned()
 }
 
+/// Generic Agent loop and model selection policy.
 #[derive(Debug, Clone, Deserialize)]
-pub struct RuntimeConfig {
-    #[serde(default = "default_max_interactions")]
-    pub max_interactions_per_thread: usize,
-    #[serde(default = "default_true")]
-    pub auto_cleanup: bool,
-    #[serde(default = "default_concurrency_policy")]
-    pub concurrency_policy: String,
-    #[serde(default = "default_true")]
-    pub strict_exports: bool,
-    #[serde(default = "default_max_planner_iterations")]
-    pub max_planner_iterations: usize,
-}
-
-impl Default for RuntimeConfig {
-    fn default() -> Self {
-        Self {
-            max_interactions_per_thread: default_max_interactions(),
-            auto_cleanup: true,
-            concurrency_policy: default_concurrency_policy(),
-            strict_exports: true,
-            max_planner_iterations: default_max_planner_iterations(),
-        }
-    }
-}
-
-fn default_max_interactions() -> usize {
-    10
-}
-
-fn default_true() -> bool {
-    true
-}
-
-fn default_concurrency_policy() -> String {
-    "interrupt_and_start_new".to_string()
-}
-
-fn default_max_planner_iterations() -> usize {
-    6
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct PlannerConfig {
-    #[serde(default = "default_planner_mode")]
-    pub mode: String,
-    /// Backend name for planner LLM calls.
-    #[serde(default, alias = "provider")]
-    pub backend: Option<String>,
-    /// Optional model profile name.
-    #[serde(default)]
-    pub model_profile: Option<String>,
-    /// Optional direct model override.
-    #[serde(default)]
-    pub model: Option<String>,
-    /// Optional direct temperature override.
-    #[serde(default)]
-    pub temperature: Option<f32>,
-    /// Whether planner can dynamically choose backend/model from request metadata.
-    #[serde(default = "default_dynamic_model_selection")]
-    pub dynamic_model_selection: bool,
-    #[serde(default = "default_max_history")]
-    pub max_history: usize,
-    /// Whether to log full planner prompts (system/user). Disabled by default.
-    #[serde(default = "default_false")]
-    pub log_full_prompts: bool,
-}
-
-impl Default for PlannerConfig {
-    fn default() -> Self {
-        Self {
-            mode: default_planner_mode(),
-            backend: None,
-            model_profile: None,
-            model: None,
-            temperature: None,
-            dynamic_model_selection: default_dynamic_model_selection(),
-            max_history: default_max_history(),
-            log_full_prompts: default_false(),
-        }
-    }
-}
-
-fn default_planner_mode() -> String {
-    "llm".to_string()
-}
-
-fn default_max_history() -> usize {
-    20
-}
-
-fn default_dynamic_model_selection() -> bool {
-    true
-}
-
-fn default_false() -> bool {
-    false
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct InterpreterConfig {
-    #[serde(default = "default_interpreter_mode")]
-    pub mode: String,
-    /// Backend name for interpreter LLM calls.
+#[serde(deny_unknown_fields)]
+pub struct AgentConfig {
     #[serde(default)]
     pub backend: Option<String>,
-    /// Optional model profile name.
     #[serde(default)]
     pub model_profile: Option<String>,
-    /// Optional direct model override.
     #[serde(default)]
     pub model: Option<String>,
-    /// Optional direct temperature override.
     #[serde(default)]
     pub temperature: Option<f32>,
-    /// Optional system prompt override.
     #[serde(default)]
     pub system_prompt: Option<String>,
+    #[serde(default = "default_stream_buffer")]
+    pub stream_buffer: usize,
+    /// Optional Host ceiling. Omit it to let a progressing turn continue until
+    /// it settles or reaches an explicit Run resource boundary.
+    #[serde(default)]
+    pub max_model_steps: Option<u64>,
+    #[serde(default)]
+    pub max_tool_calls: Option<u64>,
+    #[serde(default = "default_history_limit")]
+    pub history_limit: usize,
+    #[serde(default = "default_max_context_tokens")]
+    pub max_context_tokens: u64,
+    #[serde(default = "default_reserved_output_tokens")]
+    pub reserved_output_tokens: u64,
+    #[serde(default)]
+    pub compaction: AgentCompactionConfig,
 }
 
-impl Default for InterpreterConfig {
+impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            mode: default_interpreter_mode(),
             backend: None,
             model_profile: None,
             model: None,
             temperature: None,
             system_prompt: None,
-        }
-    }
-}
-
-fn default_interpreter_mode() -> String {
-    "auto".to_string()
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ContextConfig {
-    #[serde(default = "default_history_limit")]
-    pub history_limit: usize,
-    #[serde(default = "default_max_tokens")]
-    pub max_tokens: usize,
-    #[serde(default = "default_true")]
-    pub include_history: bool,
-}
-
-impl Default for ContextConfig {
-    fn default() -> Self {
-        Self {
+            stream_buffer: default_stream_buffer(),
+            max_model_steps: None,
+            max_tool_calls: None,
             history_limit: default_history_limit(),
-            max_tokens: default_max_tokens(),
-            include_history: true,
+            max_context_tokens: default_max_context_tokens(),
+            reserved_output_tokens: default_reserved_output_tokens(),
+            compaction: AgentCompactionConfig::default(),
         }
     }
 }
 
-fn default_history_limit() -> usize {
-    50
-}
-
-fn default_max_tokens() -> usize {
-    4096
-}
-
+/// Host-owned Session compaction policy for the Generic Agent composition.
 #[derive(Debug, Clone, Deserialize)]
-pub struct IngestionConfig {
-    /// Whether automatic parse+embedding pipeline is enabled.
+#[serde(deny_unknown_fields)]
+pub struct AgentCompactionConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Whether ingestion should run asynchronously.
-    #[serde(default = "default_true")]
-    pub asynchronous: bool,
-    /// Maximum file size in MB accepted by ingestion.
-    #[serde(default = "default_ingestion_max_file_size_mb")]
-    pub max_file_size_mb: usize,
-    /// Allowed MIME list. Empty means allow all.
-    #[serde(default)]
-    pub mime_allowlist: Vec<String>,
-    /// Whether assistant-generated artifacts are auto-ingested.
-    #[serde(default = "default_true")]
-    pub auto_for_assistant_outputs: bool,
+    #[serde(default = "default_compaction_minimum_source_records")]
+    pub minimum_source_records: usize,
+    #[serde(default = "default_compaction_keep_recent_records")]
+    pub keep_recent_records: usize,
+    #[serde(default = "default_compaction_summary_chars")]
+    pub summary_max_chars: usize,
 }
 
-impl Default for IngestionConfig {
+impl Default for AgentCompactionConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            asynchronous: true,
-            max_file_size_mb: default_ingestion_max_file_size_mb(),
-            mime_allowlist: Vec::new(),
-            auto_for_assistant_outputs: true,
+            minimum_source_records: default_compaction_minimum_source_records(),
+            keep_recent_records: default_compaction_keep_recent_records(),
+            summary_max_chars: default_compaction_summary_chars(),
         }
     }
 }
 
-fn default_ingestion_max_file_size_mb() -> usize {
-    30
+fn default_compaction_minimum_source_records() -> usize {
+    32
+}
+
+fn default_compaction_keep_recent_records() -> usize {
+    16
+}
+
+fn default_compaction_summary_chars() -> usize {
+    16 * 1024
+}
+
+fn default_stream_buffer() -> usize {
+    128
+}
+
+fn default_history_limit() -> usize {
+    128
+}
+
+fn default_max_context_tokens() -> u64 {
+    128 * 1024
+}
+
+fn default_reserved_output_tokens() -> u64 {
+    4 * 1024
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct StoresConfig {
-    #[serde(default = "default_event_store_spec")]
-    pub event: StoreSpec,
-    #[serde(default = "default_task_store_spec")]
-    pub task: StoreSpec,
+#[serde(deny_unknown_fields)]
+pub struct ToolsConfig {
+    #[serde(default)]
+    pub exec: ExecToolConfig,
+    #[serde(default = "default_tool_timeout_ms")]
+    pub max_timeout_ms: u64,
+    #[serde(default = "default_tool_output_bytes")]
+    pub max_output_bytes: u64,
 }
 
-impl Default for StoresConfig {
+impl Default for ToolsConfig {
     fn default() -> Self {
         Self {
-            event: default_event_store_spec(),
-            task: default_task_store_spec(),
+            exec: ExecToolConfig::default(),
+            max_timeout_ms: default_tool_timeout_ms(),
+            max_output_bytes: default_tool_output_bytes(),
         }
     }
 }
 
-fn default_event_store_spec() -> StoreSpec {
-    StoreSpec::default()
+fn default_tool_timeout_ms() -> u64 {
+    30_000
 }
 
-fn default_task_store_spec() -> StoreSpec {
-    StoreSpec::default()
+fn default_tool_output_bytes() -> u64 {
+    1024 * 1024
+}
+
+/// Unified command execution. The Host resolves one command shell; child
+/// process safety is enforced by the effect sandbox rather than a model-facing
+/// executable allowlist.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecToolConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub shell: Option<String>,
+    /// Exact `host:port` destinations available to commands. Empty denies
+    /// network access.
+    #[serde(default)]
+    pub network_targets: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct StoreSpec {
-    #[serde(default = "default_store_backend")]
-    pub backend: String,
-    #[serde(default)]
-    pub connection_url: Option<String>,
-    /// Optional key prefix/namespace used by backend implementations.
-    #[serde(default)]
-    pub key_prefix: Option<String>,
-}
-
-impl Default for StoreSpec {
-    fn default() -> Self {
-        Self {
-            backend: default_store_backend(),
-            connection_url: None,
-            key_prefix: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct BlobsConfig {
-    #[serde(default = "default_blob_mode")]
-    pub mode: String,
-    #[serde(default)]
-    pub local: LocalBlobsConfig,
-    #[serde(default)]
-    pub s3: S3BlobsConfig,
-    #[serde(default)]
-    pub hybrid: HybridBlobsConfig,
-    #[serde(default)]
-    pub catalog: BlobCatalogConfig,
-}
-
-impl Default for BlobsConfig {
-    fn default() -> Self {
-        Self {
-            mode: default_blob_mode(),
-            local: LocalBlobsConfig::default(),
-            s3: S3BlobsConfig::default(),
-            hybrid: HybridBlobsConfig::default(),
-            catalog: BlobCatalogConfig::default(),
-        }
-    }
-}
-
-fn default_blob_mode() -> String {
-    "local".to_string()
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct LocalBlobsConfig {
-    #[serde(default = "default_blobs_root_dir")]
-    pub root_dir: String,
-}
-
-impl Default for LocalBlobsConfig {
-    fn default() -> Self {
-        Self {
-            root_dir: default_blobs_root_dir(),
-        }
-    }
-}
-
-fn default_blobs_root_dir() -> String {
-    ".orchestral/blobs".to_string()
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct S3BlobsConfig {
-    #[serde(default)]
-    pub endpoint: Option<String>,
-    #[serde(default)]
-    pub region: Option<String>,
-    #[serde(default)]
-    pub bucket: Option<String>,
-    #[serde(default)]
-    pub key_prefix: Option<String>,
-    #[serde(default)]
-    pub access_key_env: Option<String>,
-    #[serde(default)]
-    pub secret_key_env: Option<String>,
-    #[serde(default)]
-    pub force_path_style: Option<bool>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct HybridBlobsConfig {
-    #[serde(default = "default_hybrid_write_to")]
-    pub write_to: String,
-}
-
-impl Default for HybridBlobsConfig {
-    fn default() -> Self {
-        Self {
-            write_to: default_hybrid_write_to(),
-        }
-    }
-}
-
-fn default_hybrid_write_to() -> String {
-    "s3".to_string()
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct BlobCatalogConfig {
-    #[serde(default = "default_blob_catalog_backend")]
-    pub backend: String,
-    #[serde(default)]
-    pub connection_url: Option<String>,
-    #[serde(default = "default_file_catalog_table_prefix")]
-    pub table_prefix: String,
-}
-
-impl Default for BlobCatalogConfig {
-    fn default() -> Self {
-        Self {
-            backend: default_blob_catalog_backend(),
-            connection_url: None,
-            table_prefix: default_file_catalog_table_prefix(),
-        }
-    }
-}
-
-fn default_file_catalog_table_prefix() -> String {
-    "orchestral".to_string()
-}
-
-fn default_store_backend() -> String {
-    "sqlite".to_string()
-}
-
-fn default_blob_catalog_backend() -> String {
-    "in_memory".to_string()
-}
-
-// Backward-compatible aliases.
-pub type FilesConfig = BlobsConfig;
-pub type LocalFilesConfig = LocalBlobsConfig;
-pub type S3FilesConfig = S3BlobsConfig;
-pub type HybridFilesConfig = HybridBlobsConfig;
-pub type FileCatalogConfig = BlobCatalogConfig;
-
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct ExtensionsConfig {
-    #[serde(default)]
-    pub runtime: Vec<RuntimeExtensionSpec>,
-    #[serde(default)]
-    pub mcp: McpExtensionsConfig,
-    #[serde(default, alias = "skills")]
-    pub skill: SkillExtensionsConfig,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct McpExtensionsConfig {
+#[serde(deny_unknown_fields)]
+pub struct McpConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    #[serde(default = "default_true")]
-    pub auto_discover: bool,
-    /// Optional extra config files to scan for MCP servers.
-    #[serde(default)]
-    pub discover_paths: Vec<String>,
-    /// Explicit MCP server declarations in orchestral config.
     #[serde(default)]
     pub servers: Vec<McpServerSpec>,
 }
 
-impl Default for McpExtensionsConfig {
+impl Default for McpConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            auto_discover: true,
-            discover_paths: Vec::new(),
             servers: Vec::new(),
         }
     }
 }
 
+/// Explicit Host MCP server declaration. MCP tools enter through Tool Protocol.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpServerSpec {
     pub name: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
     pub required: bool,
-    #[serde(default)]
-    pub command: Option<String>,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-    #[serde(default)]
-    pub url: Option<String>,
-    #[serde(default)]
-    pub headers: HashMap<String, String>,
-    #[serde(default)]
-    pub bearer_token_env_var: Option<String>,
+    pub transport: McpTransportSpec,
     #[serde(default)]
     pub startup_timeout_ms: Option<u64>,
     #[serde(default)]
@@ -552,58 +271,116 @@ pub struct McpServerSpec {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct SkillExtensionsConfig {
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum McpTransportSpec {
+    Stdio {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: HashMap<String, String>,
+    },
+    StreamableHttp {
+        endpoint: String,
+        #[serde(default)]
+        credential_headers: HashMap<String, McpCredentialHeaderSpec>,
+        #[serde(default)]
+        max_frame_bytes: Option<usize>,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpCredentialHeaderSpec {
+    /// Environment variable resolved only by the application composition root.
+    pub env: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillsConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default = "default_true")]
     pub auto_discover: bool,
-    #[serde(default = "default_max_active_skills")]
-    pub max_active_skills: usize,
-    /// Optional directories to scan for SKILL.md.
     #[serde(default)]
     pub directories: Vec<String>,
 }
 
-impl Default for SkillExtensionsConfig {
+impl Default for SkillsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             auto_discover: true,
-            max_active_skills: default_max_active_skills(),
             directories: Vec::new(),
         }
     }
 }
 
-fn default_max_active_skills() -> usize {
-    3
-}
-
 #[derive(Debug, Clone, Deserialize)]
-pub struct RuntimeExtensionSpec {
-    pub name: String,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Empty means enabled for both cli and server.
-    #[serde(default)]
-    pub targets: Vec<String>,
-    /// Reserved for extension-specific options.
-    #[serde(default)]
-    pub options: Value,
+#[serde(deny_unknown_fields)]
+pub struct JournalConfig {
+    #[serde(default = "default_filesystem_backend")]
+    pub backend: String,
+    #[serde(default = "default_journal_root")]
+    pub root_dir: String,
 }
 
-impl Default for RuntimeExtensionSpec {
+impl Default for JournalConfig {
     fn default() -> Self {
         Self {
-            name: String::new(),
-            enabled: true,
-            targets: Vec::new(),
-            options: Value::Null,
+            backend: default_filesystem_backend(),
+            root_dir: default_journal_root(),
         }
     }
 }
 
+fn default_journal_root() -> String {
+    ".orchestral/agent-journal".to_owned()
+}
+
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactConfig {
+    #[serde(default = "default_filesystem_backend")]
+    pub backend: String,
+    #[serde(default = "default_artifact_root")]
+    pub root_dir: String,
+    #[serde(default = "default_max_artifact_bytes")]
+    pub max_bytes: u64,
+    #[serde(default = "default_artifact_summary_chars")]
+    pub summary_max_chars: usize,
+}
+
+impl Default for ArtifactConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_filesystem_backend(),
+            root_dir: default_artifact_root(),
+            max_bytes: default_max_artifact_bytes(),
+            summary_max_chars: default_artifact_summary_chars(),
+        }
+    }
+}
+
+fn default_filesystem_backend() -> String {
+    "filesystem".to_owned()
+}
+
+fn default_artifact_root() -> String {
+    ".orchestral/artifacts".to_owned()
+}
+
+fn default_max_artifact_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
+fn default_artifact_summary_chars() -> usize {
+    512
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObservabilityConfig {
     #[serde(default = "default_log_level")]
     pub log_level: String,
@@ -624,5 +401,9 @@ impl Default for ObservabilityConfig {
 }
 
 fn default_log_level() -> String {
-    "info".to_string()
+    "info".to_owned()
+}
+
+fn default_true() -> bool {
+    true
 }

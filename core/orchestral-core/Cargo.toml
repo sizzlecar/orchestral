@@ -10,6 +10,10 @@ keywords.workspace = true
 categories.workspace = true
 readme = "../../README.md"
 
+[features]
+default = []
+agent-protocol-schema = ["dep:schemars"]
+
 [dependencies]
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -23,6 +27,10 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 futures-util = { workspace = true }
 bytes = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+serde_jcs = { workspace = true }
+schemars = { version = "1.2.2", optional = true }
 
 
 [dev-dependencies]

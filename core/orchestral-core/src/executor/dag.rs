@@ -127,6 +127,7 @@ impl ExecutionDag {
             })
             .map(|(id, _)| id.clone())
             .collect();
+        self.ready_nodes.sort();
 
         for id in &self.ready_nodes {
             if let Some(node) = self.nodes.get_mut(id) {
@@ -182,20 +183,26 @@ impl ExecutionDag {
 
     /// Get all completed node IDs
     pub fn completed_nodes(&self) -> Vec<&str> {
-        self.nodes
+        let mut completed = self
+            .nodes
             .iter()
             .filter(|(_, n)| n.state == NodeState::Completed)
             .map(|(id, _)| id.as_str())
-            .collect()
+            .collect::<Vec<_>>();
+        completed.sort_unstable();
+        completed
     }
 
     /// Get all failed node IDs
     pub fn failed_nodes(&self) -> Vec<&str> {
-        self.nodes
+        let mut failed = self
+            .nodes
             .iter()
             .filter(|(_, n)| n.state == NodeState::Failed)
             .map(|(id, _)| id.as_str())
-            .collect()
+            .collect::<Vec<_>>();
+        failed.sort_unstable();
+        failed
     }
 
     /// Add a new node dynamically (only if dynamic is enabled)

@@ -1,46 +1,34 @@
 //! # Orchestral Core
 //!
-//! Core abstractions, SPI contracts, configuration, and default in-memory
-//! stores for the Orchestral runtime.
+//! Agent, model, tool, skill, MCP, workflow, and extension contracts.
 //!
 //! This crate provides:
-//! - Intent / Plan / Step / Task / State definitions
-//! - Planner / Normalizer / Executor abstractions
-//! - DAG execution and task-internal scheduling
+//! - Agent Protocol v1 contracts and deterministic reducer
+//! - Model and Tool provider boundaries
+//! - Plan normalization and guarded DAG execution
 //! - Stable SPI contracts for runtime component and hook extensions
 //! - Unified configuration management
-//! - In-memory store implementations (EventStore, TaskStore, EventBus)
-//!
-//! This crate does NOT care about:
-//! - Who the user is
-//! - Whether input is a message
-//! - Whether multiple interactions run concurrently
-//! - How output is displayed
 
-pub mod action;
+pub mod agent_protocol;
+pub mod agent_session;
 pub mod config;
 pub mod executor;
-pub mod interpreter;
 pub mod io;
+pub mod mcp_protocol;
+pub mod model_protocol;
 pub mod normalizer;
-pub mod planner;
+pub mod skill_protocol;
 pub mod spi;
-pub mod store;
+pub mod tool_effect;
+pub mod tool_protocol;
 pub mod types;
+pub mod workflow_state;
 
 /// Prelude for convenient imports
 pub mod prelude {
-    pub use crate::action::{
-        Action, ActionContext, ActionInput, ActionMeta, ActionResult, CancellationToken,
-    };
     pub use crate::executor::{
-        ActionExecutionOptions, ActionPreflightHook, ActionRegistry, DagNode, ExecutionDag,
-        ExecutionProgressEvent, ExecutionProgressReporter, ExecutionResult, Executor,
-        ExecutorContext, NodeState,
-    };
-    pub use crate::interpreter::{
-        InterpretDeltaSink, InterpretError, InterpretRequest, InterpretResult,
-        NoopResultInterpreter, ResultInterpreter,
+        DagNode, ExecutionDag, ExecutionProgressEvent, ExecutionProgressReporter, ExecutionResult,
+        Executor, ExecutorContext, NodeState, StepExecutionPort, StepExecutionRequest, StepOutcome,
     };
     pub use crate::io::{
         BlobHead, BlobId, BlobIoError, BlobMeta, BlobRead, BlobStore, BlobStream, BlobWriteRequest,
@@ -49,36 +37,18 @@ pub mod prelude {
         FixError, NormalizeError, NormalizedPlan, PlanFixer, PlanNormalizer, PlanValidator,
         ValidationError,
     };
-    pub use crate::planner::{
-        ActionCall, HistoryItem, PlanError, Planner, PlannerContext, PlannerLoopContext,
-        PlannerOutput, PlannerRuntimeInfo, SingleAction,
-    };
-    pub use crate::store::{Event, EventStore, Scope, StoreError, TaskStore, WorkingSet};
-    pub use crate::types::{
-        ContinuationState, ContinuationStatus, Intent, IntentContext, Plan, Step, StepId, StepKind,
-        Task, TaskId, TaskState, VerifyDecision, VerifyStatus,
-    };
+    pub use crate::types::{Plan, Step, StepId, StepIoBinding, StepKind, WorkflowId};
+    pub use crate::workflow_state::{Scope, WorkingSet};
 }
 
 // Re-export key types at crate root
-pub use action::{Action, ActionContext, ActionInput, ActionResult};
 pub use executor::{
-    ActionExecutionOptions, ActionPreflightHook, ExecutionDag, ExecutionProgressEvent,
-    ExecutionProgressReporter, ExecutionResult, Executor,
-};
-pub use interpreter::{
-    InterpretDeltaSink, InterpretRequest, InterpretResult, NoopResultInterpreter, ResultInterpreter,
+    ExecutionDag, ExecutionProgressEvent, ExecutionProgressReporter, ExecutionResult, Executor,
+    StepOutcome,
 };
 pub use io::{
     BlobHead, BlobId, BlobIoError, BlobMeta, BlobRead, BlobStore, BlobStream, BlobWriteRequest,
 };
 pub use normalizer::{NormalizedPlan, PlanNormalizer};
-pub use planner::{
-    ActionCall, Planner, PlannerContext, PlannerLoopContext, PlannerOutput, PlannerRuntimeInfo,
-    SingleAction,
-};
-pub use store::{Event, EventStore, StoreError, TaskStore, WorkingSet};
-pub use types::{
-    ContinuationState, ContinuationStatus, Intent, Plan, Step, StepId, Task, TaskId, TaskState,
-    VerifyDecision, VerifyStatus,
-};
+pub use types::{Plan, Step, StepId, StepIoBinding, StepKind, WorkflowId};
+pub use workflow_state::{Scope, WorkingSet};

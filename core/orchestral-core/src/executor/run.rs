@@ -3,15 +3,13 @@ use std::time::Duration;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::time::sleep;
 
-use crate::action::ActionResult;
-use crate::spi::lifecycle::{StepContext, StepDecision};
 use crate::types::{Step, StepId, StepKind};
 
 use super::{
     bind_param_value, build_step_completion_metadata, build_step_start_metadata,
-    choose_terminal_result, execute_action_with_registry_with_options, report_progress,
-    resolve_param_templates, truncate_for_log, truncate_json_for_log, validate_declared_exports,
-    ExecutionDag, ExecutionProgressEvent, ExecutionResult, Executor, ExecutorContext,
+    choose_terminal_result, report_progress, resolve_param_templates, truncate_for_log,
+    truncate_json_for_log, validate_declared_exports, ExecutionDag, ExecutionProgressEvent,
+    ExecutionResult, Executor, ExecutorContext, StepExecutionRequest, StepOutcome,
     MAX_LOG_JSON_CHARS, MAX_LOG_TEXT_CHARS,
 };
 
@@ -24,7 +22,12 @@ impl Executor {
         if dag.is_completed() {
             report_progress(
                 ctx,
-                ExecutionProgressEvent::new(ctx.task_id.clone(), None, None, "task_completed"),
+                ExecutionProgressEvent::new(
+                    ctx.workflow_id.clone(),
+                    None,
+                    None,
+                    "workflow_completed",
+                ),
             )
             .await;
             return ExecutionResult::Completed;
@@ -36,10 +39,10 @@ impl Executor {
             report_progress(
                 ctx,
                 ExecutionProgressEvent::new(
-                    ctx.task_id.clone(),
+                    ctx.workflow_id.clone(),
                     Some(failed_step_id.clone()),
                     None,
-                    "task_failed",
+                    "workflow_failed",
                 )
                 .with_message("execution failed"),
             )
@@ -52,7 +55,7 @@ impl Executor {
 
         report_progress(
             ctx,
-            ExecutionProgressEvent::new(ctx.task_id.clone(), None, None, "task_failed")
+            ExecutionProgressEvent::new(ctx.workflow_id.clone(), None, None, "workflow_failed")
                 .with_message("no ready nodes but DAG not completed"),
         )
         .await;
@@ -89,7 +92,7 @@ impl Executor {
                         report_progress(
                             ctx,
                             ExecutionProgressEvent::new(
-                                ctx.task_id.clone(),
+                                ctx.workflow_id.clone(),
                                 Some(step_id.clone().into()),
                                 Some(action),
                                 "step_waiting_user",
@@ -103,14 +106,13 @@ impl Executor {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("Please provide input")
                                 .to_string(),
-                            approval: None,
                         })
                     }
                     StepKind::WaitEvent => {
                         report_progress(
                             ctx,
                             ExecutionProgressEvent::new(
-                                ctx.task_id.clone(),
+                                ctx.workflow_id.clone(),
                                 Some(step_id.clone().into()),
                                 Some(action),
                                 "step_waiting_event",
@@ -147,7 +149,7 @@ impl Executor {
             if let Some((step, execution_id)) = node_data {
                 dag.mark_running(&step_id);
                 tracing::info!(
-                    task_id = %ctx.task_id,
+                    workflow_id = %ctx.workflow_id,
                     step_id = %step_id,
                     action = %step.action,
                     "step execution started"
@@ -155,7 +157,7 @@ impl Executor {
                 report_progress(
                     ctx,
                     ExecutionProgressEvent::new(
-                        ctx.task_id.clone(),
+                        ctx.workflow_id.clone(),
                         Some(step_id.clone().into()),
                         Some(step.action.clone()),
                         "step_started",
@@ -173,8 +175,16 @@ impl Executor {
             }
         }
 
-        let mut terminal_result: Option<ExecutionResult> = None;
+        let mut completed = Vec::new();
         while let Some((step_id, step, result)) = in_flight.next().await {
+            completed.push((step_id, step, result));
+        }
+        // Futures may complete in any order. Apply their state transitions in
+        // logical Step order so WorkingSet collisions, progress, and terminal
+        // selection replay deterministically.
+        completed.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut terminal_result: Option<ExecutionResult> = None;
+        for (step_id, step, result) in completed {
             self.process_step_result(dag, step_id, step, result, ctx, &mut terminal_result)
                 .await;
         }
@@ -186,31 +196,19 @@ impl Executor {
         dag: &mut ExecutionDag,
         step_id: String,
         step: Step,
-        result: ActionResult,
+        result: StepOutcome,
         ctx: &ExecutorContext,
         terminal_result: &mut Option<ExecutionResult>,
     ) {
-        // Lifecycle hook: after_step
-        if let Some(hooks) = &ctx.lifecycle_hooks {
-            let step_ctx = StepContext::new(
-                ctx.thread_id.clone().unwrap_or_default(),
-                ctx.task_id.to_string(),
-                step_id.clone(),
-                step.action.clone(),
-                ctx.working_set.clone(),
-            );
-            hooks.after_step(&step, &result, &step_ctx).await;
-        }
-
         match result {
-            ActionResult::Success { exports } => {
+            StepOutcome::Success { exports } => {
                 if let Err(error) = validate_declared_exports(&step, &exports, self.strict_exports)
                 {
                     dag.mark_failed(&step_id);
                     report_progress(
                         ctx,
                         ExecutionProgressEvent::new(
-                            ctx.task_id.clone(),
+                            ctx.workflow_id.clone(),
                             Some(step_id.clone().into()),
                             Some(step.action.clone()),
                             "step_failed",
@@ -231,12 +229,12 @@ impl Executor {
                 let completion_metadata = build_step_completion_metadata(&step.action, &exports);
                 let mut ws = ctx.working_set.write().await;
                 for (key, value) in &exports {
-                    ws.set_task(key.clone(), value.clone());
-                    ws.set_task(format!("{}.{}", step.id, key), value.clone());
+                    ws.set_workflow(key.clone(), value.clone());
+                    ws.set_workflow(format!("{}.{}", step.id, key), value.clone());
                 }
                 dag.mark_completed(&step_id);
                 tracing::info!(
-                    task_id = %ctx.task_id,
+                    workflow_id = %ctx.workflow_id,
                     step_id = %step_id,
                     action = %step.action,
                     "step execution completed"
@@ -244,7 +242,7 @@ impl Executor {
                 report_progress(
                     ctx,
                     ExecutionProgressEvent::new(
-                        ctx.task_id.clone(),
+                        ctx.workflow_id.clone(),
                         Some(step_id.clone().into()),
                         Some(step.action.clone()),
                         "step_completed",
@@ -253,59 +251,10 @@ impl Executor {
                 )
                 .await;
             }
-            ActionResult::NeedClarification { question } => {
-                report_progress(
-                    ctx,
-                    ExecutionProgressEvent::new(
-                        ctx.task_id.clone(),
-                        Some(step_id.clone().into()),
-                        Some(step.action.clone()),
-                        "step_waiting_user",
-                    )
-                    .with_message(question.clone()),
-                )
-                .await;
-                choose_terminal_result(
-                    terminal_result,
-                    ExecutionResult::WaitingUser {
-                        step_id: step_id.into(),
-                        prompt: question,
-                        approval: None,
-                    },
-                );
-            }
-            ActionResult::NeedApproval { request } => {
-                let approval_reason = request.reason.clone();
-                let approval_command = request.command.clone();
-                report_progress(
-                    ctx,
-                    ExecutionProgressEvent::new(
-                        ctx.task_id.clone(),
-                        Some(step_id.clone().into()),
-                        Some(step.action.clone()),
-                        "step_waiting_user",
-                    )
-                    .with_message(approval_reason.clone())
-                    .with_metadata(serde_json::json!({
-                        "waiting_kind": "approval",
-                        "approval_reason": approval_reason,
-                        "approval_command": approval_command,
-                    })),
-                )
-                .await;
-                choose_terminal_result(
-                    terminal_result,
-                    ExecutionResult::WaitingUser {
-                        step_id: step_id.into(),
-                        prompt: "Approval required".to_string(),
-                        approval: Some(request),
-                    },
-                );
-            }
-            ActionResult::RetryableError { message, .. } => {
+            StepOutcome::RetryableError { message, .. } => {
                 dag.mark_failed(&step_id);
                 tracing::warn!(
-                    task_id = %ctx.task_id,
+                    workflow_id = %ctx.workflow_id,
                     step_id = %step_id,
                     action = %step.action,
                     error = %truncate_for_log(&message, MAX_LOG_TEXT_CHARS),
@@ -314,7 +263,7 @@ impl Executor {
                 report_progress(
                     ctx,
                     ExecutionProgressEvent::new(
-                        ctx.task_id.clone(),
+                        ctx.workflow_id.clone(),
                         Some(step_id.clone().into()),
                         Some(step.action.clone()),
                         "step_failed",
@@ -330,10 +279,10 @@ impl Executor {
                     },
                 );
             }
-            ActionResult::Error { message } => {
+            StepOutcome::Error { message } => {
                 dag.mark_failed(&step_id);
                 tracing::error!(
-                    task_id = %ctx.task_id,
+                    workflow_id = %ctx.workflow_id,
                     step_id = %step_id,
                     action = %step.action,
                     error = %truncate_for_log(&message, MAX_LOG_TEXT_CHARS),
@@ -342,7 +291,7 @@ impl Executor {
                 report_progress(
                     ctx,
                     ExecutionProgressEvent::new(
-                        ctx.task_id.clone(),
+                        ctx.workflow_id.clone(),
                         Some(step_id.clone().into()),
                         Some(step.action.clone()),
                         "step_failed",
@@ -366,15 +315,19 @@ impl Executor {
         step: &Step,
         execution_id: &str,
         ctx: &ExecutorContext,
-    ) -> ActionResult {
+    ) -> StepOutcome {
         let mut retries_used: u32 = 0;
         let mut current_execution_id = execution_id.to_string();
 
         loop {
+            if ctx.cancellation_token.is_cancelled() {
+                return StepOutcome::error("workflow execution cancelled before Step dispatch");
+            }
+            let attempt = retries_used.saturating_add(1);
             let result = self
-                .execute_step_data(step, &current_execution_id, ctx)
+                .execute_step_data(step, &current_execution_id, attempt, ctx)
                 .await;
-            let ActionResult::RetryableError {
+            let StepOutcome::RetryableError {
                 message,
                 retry_after,
                 attempt: reported_attempt,
@@ -385,7 +338,7 @@ impl Executor {
 
             if retries_used >= self.max_retry_attempts {
                 let total_attempts = retries_used.saturating_add(1);
-                return ActionResult::error(format!(
+                return StepOutcome::error(format!(
                     "{} (retry exhausted after {} attempt(s))",
                     message, total_attempts
                 ));
@@ -394,7 +347,7 @@ impl Executor {
             let delay = retry_after.unwrap_or_else(|| self.compute_retry_backoff(retries_used));
             let next_attempt = retries_used.saturating_add(1);
             tracing::warn!(
-                task_id = %ctx.task_id,
+                workflow_id = %ctx.workflow_id,
                 step_id = %step.id,
                 action = %step.action,
                 message = %truncate_for_log(&message, MAX_LOG_TEXT_CHARS),
@@ -406,7 +359,7 @@ impl Executor {
             report_progress(
                 ctx,
                 ExecutionProgressEvent::new(
-                    ctx.task_id.clone(),
+                    ctx.workflow_id.clone(),
                     Some(step.id.clone()),
                     Some(step.action.clone()),
                     "step_retrying",
@@ -422,7 +375,15 @@ impl Executor {
             .await;
 
             if !delay.is_zero() {
-                sleep(delay).await;
+                tokio::select! {
+                    biased;
+                    _ = ctx.cancellation_token.cancelled() => {
+                        return StepOutcome::error(
+                            "workflow execution cancelled during retry backoff",
+                        );
+                    }
+                    _ = sleep(delay) => {}
+                }
             }
             retries_used = next_attempt;
             current_execution_id = uuid::Uuid::new_v4().to_string();
@@ -447,34 +408,12 @@ impl Executor {
         &self,
         step: &Step,
         execution_id: &str,
+        attempt: u32,
         ctx: &ExecutorContext,
-    ) -> ActionResult {
-        // Lifecycle hook: before_step
-        if let Some(hooks) = &ctx.lifecycle_hooks {
-            let step_ctx = StepContext::new(
-                ctx.thread_id.clone().unwrap_or_default(),
-                ctx.task_id.to_string(),
-                step.id.to_string(),
-                step.action.clone(),
-                ctx.working_set.clone(),
-            );
-            match hooks.before_step(step, &step_ctx).await {
-                StepDecision::Skip { reason } => {
-                    tracing::info!(
-                        step_id = %step.id,
-                        action = %step.action,
-                        reason = %reason,
-                        "step skipped by lifecycle hook"
-                    );
-                    return ActionResult::error(format!("skipped by hook: {}", reason));
-                }
-                StepDecision::Continue => {}
-            }
-        }
-
+    ) -> StepOutcome {
         if tracing::enabled!(tracing::Level::DEBUG) {
             tracing::debug!(
-                task_id = %ctx.task_id,
+                workflow_id = %ctx.workflow_id,
                 step_id = %step.id,
                 action = %step.action,
                 params = %truncate_json_for_log(&step.params, MAX_LOG_JSON_CHARS),
@@ -488,9 +427,9 @@ impl Executor {
         {
             let ws = ctx.working_set.read().await;
             for binding in &step.io_bindings {
-                if let Some(value) = ws.get_task(&binding.from) {
+                if let Some(value) = ws.get_workflow(&binding.from) {
                     tracing::debug!(
-                        task_id = %ctx.task_id,
+                        workflow_id = %ctx.workflow_id,
                         step_id = %step.id,
                         from = %binding.from,
                         to = %binding.to,
@@ -499,26 +438,26 @@ impl Executor {
                         "io binding resolved"
                     );
                     if let Err(error) = bind_param_value(&mut resolved_params, &binding.to, value) {
-                        return ActionResult::error(format!(
+                        return StepOutcome::error(format!(
                             "Invalid io binding for step '{}': {}",
                             step.id, error
                         ));
                     }
                 } else if binding.required {
                     tracing::warn!(
-                        task_id = %ctx.task_id,
+                        workflow_id = %ctx.workflow_id,
                         step_id = %step.id,
                         from = %binding.from,
                         to = %binding.to,
                         "required io binding missing"
                     );
-                    return ActionResult::error(format!(
+                    return StepOutcome::error(format!(
                         "Missing required io binding '{}' from '{}' for step '{}'",
                         binding.to, binding.from, step.id
                     ));
                 } else {
                     tracing::debug!(
-                        task_id = %ctx.task_id,
+                        workflow_id = %ctx.workflow_id,
                         step_id = %step.id,
                         from = %binding.from,
                         to = %binding.to,
@@ -527,40 +466,123 @@ impl Executor {
                 }
             }
             if let Err(error) = resolve_param_templates(&mut resolved_params, &ws) {
-                return ActionResult::error(format!(
+                return StepOutcome::error(format!(
                     "Template resolution failed for step '{}': {}",
                     step.id, error
                 ));
             }
         }
 
-        if step.kind == StepKind::Agent {
-            if let Some(agent_executor) = &self.agent_step_executor {
-                return agent_executor
-                    .execute_agent_step(
-                        step,
-                        resolved_params,
-                        execution_id,
-                        ctx,
-                        self.action_registry.clone(),
-                    )
-                    .await;
-            }
-            return ActionResult::error(format!(
-                "Agent step '{}' is not enabled: missing agent executor",
-                step.id
-            ));
-        }
+        ctx.step_execution_port
+            .execute_step(
+                StepExecutionRequest {
+                    step_id: step.id.clone(),
+                    step_kind: step.kind.clone(),
+                    action: step.action.clone(),
+                    execution_id: execution_id.to_string(),
+                    attempt,
+                    resolved_params,
+                },
+                ctx,
+            )
+            .await
+    }
+}
 
-        execute_action_with_registry_with_options(
-            self.action_registry.clone(),
-            ctx,
-            &step.id,
-            &step.action,
-            execution_id,
-            resolved_params,
-            &self.action_execution_options,
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Instant;
+    use tokio::sync::RwLock;
+    use tokio_util::sync::CancellationToken;
+
+    use crate::executor::StepExecutionPort;
+    use crate::types::WorkflowId;
+    use crate::workflow_state::WorkingSet;
+
+    const CANCELLATION_CASES: usize = 1_000;
+
+    struct AlwaysRetryPort {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl StepExecutionPort for AlwaysRetryPort {
+        async fn execute_step(
+            &self,
+            _request: StepExecutionRequest,
+            _ctx: &ExecutorContext,
+        ) -> StepOutcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            StepOutcome::retryable("retry later", Some(Duration::from_secs(60)), 1)
+        }
+    }
+
+    #[tokio::test]
+    async fn one_thousand_retry_backoff_cancellations_dispatch_no_new_attempt_and_finish_under_one_second(
+    ) {
+        let port = Arc::new(AlwaysRetryPort {
+            calls: AtomicUsize::new(0),
+        });
+        let cancellation = CancellationToken::new();
+        let context = Arc::new(
+            ExecutorContext::new(
+                WorkflowId::new("retry-cancel-workflow"),
+                Arc::new(RwLock::new(WorkingSet::new())),
+                port.clone(),
+            )
+            .with_cancellation_token(cancellation.clone()),
+        );
+        let executor = Arc::new(Executor::new().with_retry_policy(
+            3,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        ));
+        let step = Step::action("retry-cancel-step", "retry");
+        let mut tasks = Vec::with_capacity(CANCELLATION_CASES);
+        for index in 0..CANCELLATION_CASES {
+            let executor = executor.clone();
+            let context = context.clone();
+            let step = step.clone();
+            tasks.push(tokio::spawn(async move {
+                let outcome = executor
+                    .execute_step_with_retry(&step, &format!("execution-{index}"), &context)
+                    .await;
+                (outcome, Instant::now())
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while port.calls.load(Ordering::SeqCst) != CANCELLATION_CASES {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all retry waits are reached before cancellation");
+
+        let cancelled_at = Instant::now();
+        cancellation.cancel();
+        let completed = tokio::time::timeout(
+            Duration::from_secs(1),
+            futures_util::future::join_all(tasks),
         )
         .await
+        .expect("all retry waits observe cancellation within one second");
+        let mut latencies = Vec::with_capacity(CANCELLATION_CASES);
+        for result in completed {
+            let (outcome, finished_at) = result.unwrap();
+            assert!(matches!(
+                outcome,
+                StepOutcome::Error { ref message }
+                    if message == "workflow execution cancelled during retry backoff"
+            ));
+            latencies.push(finished_at.duration_since(cancelled_at));
+        }
+        latencies.sort_unstable();
+        let p99 = latencies[(CANCELLATION_CASES * 99 / 100).saturating_sub(1)];
+        assert!(p99 <= Duration::from_secs(1), "cancel p99 was {p99:?}");
+        assert_eq!(port.calls.load(Ordering::SeqCst), CANCELLATION_CASES);
     }
 }

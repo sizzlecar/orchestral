@@ -1,176 +1,57 @@
-//! LLM provider and model configuration types.
+//! Provider-neutral model backend and model-profile configuration.
 
 use serde::Deserialize;
 use serde_json::Value;
 
-/// Root configuration for LLM providers.
-///
-/// Preferred schema:
-/// - `backends`: vendor/endpoint/auth config
-/// - `models`: model presets + optional guardrails
-///
-/// Legacy compatibility:
-/// - `providers` + `default_provider` still supported and normalized internally.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProvidersConfig {
-    /// Default backend name.
     #[serde(default)]
     pub default_backend: Option<String>,
-    /// Default model profile name.
     #[serde(default)]
     pub default_model: Option<String>,
-    /// Backend definitions (recommended).
     #[serde(default)]
     pub backends: Vec<BackendSpec>,
-    /// Model profiles (recommended).
     #[serde(default)]
     pub models: Vec<ModelProfile>,
-    /// Legacy provider list (still accepted).
-    #[serde(default)]
-    pub providers: Vec<LegacyProviderSpec>,
-    /// Legacy default provider.
-    #[serde(default)]
-    pub default_provider: Option<String>,
 }
 
 impl ProvidersConfig {
-    /// Get backend by name, including normalized legacy providers.
     pub fn get_backend(&self, name: &str) -> Option<BackendSpec> {
-        self.normalized_backends()
-            .into_iter()
-            .find(|p| p.name == name)
+        self.backends.iter().find(|item| item.name == name).cloned()
     }
 
-    /// Get model profile by name, including normalized legacy providers.
     pub fn get_model(&self, name: &str) -> Option<ModelProfile> {
-        self.normalized_models()
-            .into_iter()
-            .find(|m| m.name == name)
+        self.models.iter().find(|item| item.name == name).cloned()
     }
 
-    /// Get default backend.
     pub fn get_default_backend(&self) -> Option<BackendSpec> {
-        if let Some(name) = &self.default_backend {
-            return self.get_backend(name);
-        }
-        if let Some(name) = &self.default_provider {
-            return self.get_backend(name);
-        }
-        self.normalized_backends().into_iter().next()
+        self.default_backend
+            .as_deref()
+            .and_then(|name| self.get_backend(name))
     }
 
-    /// Get default model profile.
     pub fn get_default_model(&self) -> Option<ModelProfile> {
-        if let Some(name) = &self.default_model {
-            return self.get_model(name);
-        }
-        if let Some(name) = &self.default_provider {
-            return self.get_model(name);
-        }
-        self.normalized_models().into_iter().next()
-    }
-
-    /// List all backend names.
-    pub fn backend_names(&self) -> Vec<String> {
-        self.normalized_backends()
-            .into_iter()
-            .map(|p| p.name)
-            .collect()
-    }
-
-    /// List all model profile names.
-    pub fn model_names(&self) -> Vec<String> {
-        self.normalized_models()
-            .into_iter()
-            .map(|m| m.name)
-            .collect()
-    }
-
-    /// Compatibility alias: returns backend names.
-    pub fn names(&self) -> Vec<String> {
-        self.backend_names()
-    }
-
-    /// Compatibility alias: resolves default model first, then default backend.
-    pub fn get_default(&self) -> Option<LegacyProviderSpec> {
-        if let Some(model) = self.get_default_model() {
-            let backend = model
-                .backend
-                .as_ref()
-                .and_then(|name| self.get_backend(name))
-                .or_else(|| self.get_default_backend());
-            if let Some(backend) = backend {
-                return Some(LegacyProviderSpec {
-                    name: model.name,
-                    kind: backend.kind,
-                    model: model.model,
-                    endpoint: backend.endpoint,
-                    api_key_env: backend.api_key_env,
-                    config: model.config,
-                });
-            }
-        }
-        self.providers.first().cloned()
-    }
-
-    /// Merge new schema + legacy schema into backend list.
-    pub fn normalized_backends(&self) -> Vec<BackendSpec> {
-        let mut result = self.backends.clone();
-        for legacy in &self.providers {
-            if !result.iter().any(|b| b.name == legacy.name) {
-                result.push(BackendSpec {
-                    name: legacy.name.clone(),
-                    kind: legacy.kind.clone(),
-                    endpoint: legacy.endpoint.clone(),
-                    api_key_env: legacy.api_key_env.clone(),
-                    config: Value::Null,
-                });
-            }
-        }
-        result
-    }
-
-    /// Merge new schema + legacy schema into model profile list.
-    pub fn normalized_models(&self) -> Vec<ModelProfile> {
-        let mut result = self.models.clone();
-        for legacy in &self.providers {
-            if !result.iter().any(|m| m.name == legacy.name) {
-                result.push(ModelProfile {
-                    name: legacy.name.clone(),
-                    backend: Some(legacy.name.clone()),
-                    model: legacy.model.clone(),
-                    temperature: legacy.get_config("temperature"),
-                    max_tokens: legacy.get_config("max_tokens"),
-                    system_prompt: legacy.get_config("system_prompt"),
-                    policy: ModelPolicy::default(),
-                    config: legacy.config.clone(),
-                });
-            }
-        }
-        result
+        self.default_model
+            .as_deref()
+            .and_then(|name| self.get_model(name))
     }
 }
 
-/// Backend configuration (auth, endpoint, vendor).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackendSpec {
-    /// Backend identifier (e.g. "openai", "google").
     pub name: String,
-    /// Backend kind understood by the SDK.
     pub kind: String,
-    /// Optional custom endpoint URL.
     #[serde(default)]
     pub endpoint: Option<String>,
-    /// Environment variable name containing the API key.
     #[serde(default)]
     pub api_key_env: Option<String>,
-    /// Backend-specific settings.
     #[serde(default)]
     pub config: Value,
 }
 
 impl BackendSpec {
-    /// Resolve the API key from environment variable.
     pub fn resolve_api_key(&self) -> Result<String, ApiKeyError> {
         let candidates = self.api_key_env_candidates();
         let first = candidates
@@ -187,21 +68,20 @@ impl BackendSpec {
         Err(ApiKeyError::EnvNotFound(first))
     }
 
-    /// Read backend config value as typed object.
     pub fn get_config<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T> {
         self.config
             .get(key)
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
     }
 
     fn api_key_env_candidates(&self) -> Vec<String> {
         let mut candidates = Vec::new();
-        if let Some(explicit) = self.api_key_env.as_ref() {
+        if let Some(explicit) = &self.api_key_env {
             candidates.push(explicit.clone());
         }
         for fallback in default_api_key_envs_for_kind(&self.kind) {
-            if !candidates.iter().any(|existing| existing == fallback) {
-                candidates.push(fallback.to_string());
+            if !candidates.iter().any(|candidate| candidate == fallback) {
+                candidates.push((*fallback).to_owned());
             }
         }
         candidates
@@ -212,62 +92,54 @@ fn default_api_key_envs_for_kind(kind: &str) -> &'static [&'static str] {
     match kind.trim().to_ascii_lowercase().as_str() {
         "openai" => &["OPENAI_API_KEY"],
         "google" | "gemini" => &["GOOGLE_API_KEY", "GEMINI_API_KEY"],
-        "anthropic" | "claude" => &["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"],
         "openrouter" => &["OPENROUTER_API_KEY"],
+        "deepseek" => &["DEEPSEEK_API_KEY"],
+        "groq" => &["GROQ_API_KEY"],
+        "xai" => &["XAI_API_KEY"],
+        "mistral" => &["MISTRAL_API_KEY"],
         _ => &[],
     }
 }
 
-/// Model profile used by planner/runtime.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelProfile {
-    /// Profile name (e.g. "fast", "deep_reasoning", "cheap").
     pub name: String,
-    /// Backend reference.
-    #[serde(default)]
-    pub backend: Option<String>,
-    /// Actual model name.
+    pub backend: String,
     pub model: String,
-    /// Optional default temperature.
     #[serde(default)]
     pub temperature: Option<f32>,
-    /// Optional max tokens.
     #[serde(default)]
     pub max_tokens: Option<u32>,
-    /// Optional default system prompt.
     #[serde(default)]
     pub system_prompt: Option<String>,
-    /// Optional guardrails.
     #[serde(default)]
     pub policy: ModelPolicy,
-    /// Extra arbitrary config.
     #[serde(default)]
     pub config: Value,
 }
 
 impl ModelProfile {
-    /// Read model config value as typed object.
     pub fn get_config<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T> {
         self.config
             .get(key)
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
     }
 
-    /// Clamp input temperature with configured guardrails.
     pub fn clamp_temperature(&self, candidate: f32) -> f32 {
         let mut value = candidate;
-        if let Some(min) = self.policy.temperature_min {
-            value = value.max(min);
+        if let Some(minimum) = self.policy.temperature_min {
+            value = value.max(minimum);
         }
-        if let Some(max) = self.policy.temperature_max {
-            value = value.min(max);
+        if let Some(maximum) = self.policy.temperature_max {
+            value = value.min(maximum);
         }
         value
     }
 }
 
-/// Optional model guardrails.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelPolicy {
     #[serde(default)]
     pub temperature_min: Option<f32>,
@@ -275,40 +147,10 @@ pub struct ModelPolicy {
     pub temperature_max: Option<f32>,
 }
 
-/// Legacy provider specification (pre-backend/model split).
-#[derive(Debug, Clone, Deserialize)]
-pub struct LegacyProviderSpec {
-    /// Unique identifier for this provider (e.g., "openai-gpt4").
-    pub name: String,
-    /// Provider type: "openai" | "gemini" | etc.
-    pub kind: String,
-    /// Model identifier (e.g., "gpt-4o-mini", "gemini-1.5-pro").
-    pub model: String,
-    /// Optional custom endpoint URL.
-    #[serde(default)]
-    pub endpoint: Option<String>,
-    /// Environment variable name containing the API key.
-    #[serde(default)]
-    pub api_key_env: Option<String>,
-    /// Provider-specific configuration (temperature, timeout, etc.).
-    #[serde(default)]
-    pub config: Value,
-}
-
-impl LegacyProviderSpec {
-    /// Get a config value as a specific type.
-    pub fn get_config<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T> {
-        self.config
-            .get(key)
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-    }
-}
-
-/// Errors related to API key resolution.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ApiKeyError {
     #[error("API key environment variable not configured")]
     NotConfigured,
-    #[error("Environment variable '{0}' not found")]
+    #[error("environment variable '{0}' was not found")]
     EnvNotFound(String),
 }

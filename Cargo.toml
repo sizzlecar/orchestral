@@ -6,12 +6,21 @@ members = [
     "core/orchestral-runtime",
     "core/orchestral",
 
+    # Concrete infrastructure plugins
+    "plugins/orchestral-agent-journal-fs",
+    "plugins/orchestral-blob-fs",
+    "plugins/orchestral-model-gemini",
+    "plugins/orchestral-model-openai",
+    "plugins/orchestral-mcp-streamable-http",
+
     # Apps
     "apps/orchestral-cli",
-    "apps/orchestral-telegram",
-
     # Examples
     "examples",
+
+    # Protocol conformance (external-consumer boundary)
+    "testing/orchestral-agent-protocol-testkit",
+    "testing/orchestral-model-protocol-testkit",
 ]
 
 [workspace.package]
@@ -44,17 +53,31 @@ thiserror = "1"
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+google-cloud-auth = "1.16.0"
 
 # Utilities
 uuid = { version = "1", features = ["v4", "serde"] }
 futures-util = "0.3"
 bytes = "1"
+sha2 = "0.10"
+hex = "0.4"
+serde_jcs = "0.2"
+base64 = "0.22"
+shell-words = "1"
+globset = "0.4"
+grep-matcher = "0.1"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+ignore = "0.4"
 
 # Internal crates - Core
 orchestral = { path = "core/orchestral" }
 orchestral-core = { path = "core/orchestral-core", version = "0.2.0" }
 orchestral-runtime = { path = "core/orchestral-runtime", version = "0.2.0" }
+orchestral-model-gemini = { path = "plugins/orchestral-model-gemini", version = "0.2.0" }
+orchestral-model-openai = { path = "plugins/orchestral-model-openai", version = "0.2.0" }
+orchestral-model-protocol-testkit = { path = "testing/orchestral-model-protocol-testkit" }
 
 [workspace.dependencies.tokio-test]
 version = "0.4"

@@ -1,6 +1,6 @@
 use crate::types::{Plan, Step, StepId, StepKind};
 
-use super::{agent::agent_output_keys, PlanNormalizer};
+use super::PlanNormalizer;
 
 #[derive(Debug, Default, Clone)]
 pub(super) struct ActionContract {
@@ -8,7 +8,7 @@ pub(super) struct ActionContract {
 }
 
 impl PlanNormalizer {
-    pub(super) fn apply_implicit_contracts(&self, plan: &mut Plan) {
+    pub(super) fn apply_implicit_contracts(&self, plan: &mut Plan, fix_summary: &mut Vec<String>) {
         let known_step_ids = plan
             .steps
             .iter()
@@ -20,15 +20,8 @@ impl PlanNormalizer {
             let original_exports = step.exports.clone();
             let original_params = step.params.clone();
             infer_special_step_kind(step);
-            super::agent::apply_agent_defaults(step);
             derive_depends_on_from_bindings(step);
             derive_depends_on_from_param_templates(step, &known_step_ids);
-
-            if step.kind == StepKind::Agent {
-                if let Some(keys) = agent_output_keys(step) {
-                    step.exports = keys;
-                }
-            }
 
             if let Some(contract) = self.known_actions.get(&step.action) {
                 if !contract.output_keys.is_empty() {
@@ -44,14 +37,31 @@ impl PlanNormalizer {
                     to_kind = ?step.kind,
                     "normalizer inferred step kind"
                 );
+                fix_summary.push(format!(
+                    "step {}: kind changed {:?} -> {:?}",
+                    step.id, original_kind, step.kind
+                ));
             }
             if step.depends_on != original_depends_on {
+                let added: Vec<_> = step
+                    .depends_on
+                    .iter()
+                    .filter(|d| !original_depends_on.contains(d))
+                    .map(|d| d.to_string())
+                    .collect();
                 tracing::debug!(
                     step_id = %step.id,
                     action = %step.action,
                     depends_on = ?step.depends_on,
                     "normalizer derived depends_on from io_bindings/templates"
                 );
+                if !added.is_empty() {
+                    fix_summary.push(format!(
+                        "step {}: added depends_on [{}]",
+                        step.id,
+                        added.join(", ")
+                    ));
+                }
             }
             if step.exports != original_exports {
                 tracing::debug!(
@@ -60,6 +70,11 @@ impl PlanNormalizer {
                     exports = ?step.exports,
                     "normalizer populated exports from action output schema"
                 );
+                fix_summary.push(format!(
+                    "step {}: exports set to [{}]",
+                    step.id,
+                    step.exports.join(", ")
+                ));
             }
             if step.params != original_params {
                 tracing::debug!(
@@ -68,12 +83,13 @@ impl PlanNormalizer {
                     params = ?step.params,
                     "normalizer updated step params"
                 );
+                fix_summary.push(format!("step {}: params adjusted", step.id));
             }
         }
     }
 }
 
-pub(super) fn fix_control_flow_dependencies(plan: &mut Plan) {
+pub(super) fn fix_control_flow_dependencies(plan: &mut Plan, fix_summary: &mut Vec<String>) {
     let step_ids: Vec<StepId> = plan.steps.iter().map(|s| s.id.clone()).collect();
     for i in 0..plan.steps.len() {
         let step = &plan.steps[i];
@@ -89,6 +105,10 @@ pub(super) fn fix_control_flow_dependencies(plan: &mut Plan) {
                 deps = ?preceding,
                 "normalizer auto-assigned depends_on for control-flow step"
             );
+            fix_summary.push(format!(
+                "step {}: auto-assigned depends_on for {:?}",
+                plan.steps[i].id, plan.steps[i].kind
+            ));
             plan.steps[i].depends_on = preceding;
         }
     }
@@ -102,7 +122,6 @@ fn infer_special_step_kind(step: &mut Step) {
     match step.action.as_str() {
         "wait_user" => step.kind = StepKind::WaitUser,
         "wait_event" => step.kind = StepKind::WaitEvent,
-        "agent" => step.kind = StepKind::Agent,
         _ => {}
     }
 }
@@ -207,29 +226,4 @@ pub(super) fn parse_step_binding_source(value: &str) -> Option<(String, &str)> {
         return None;
     }
     Some((source_step.to_string(), source_key))
-}
-
-pub(super) fn output_keys_from_schema(schema: &serde_json::Value) -> Vec<String> {
-    let Some(schema_obj) = schema.as_object() else {
-        return Vec::new();
-    };
-
-    let required: Vec<String> = schema_obj
-        .get("required")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|item| item.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
-    if !required.is_empty() {
-        return required;
-    }
-
-    schema_obj
-        .get("properties")
-        .and_then(|v| v.as_object())
-        .map(|props| props.keys().cloned().collect())
-        .unwrap_or_default()
 }

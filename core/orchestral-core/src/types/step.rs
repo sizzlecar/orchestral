@@ -3,7 +3,7 @@
 //! Step represents an atomic execution unit in a Plan.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::fmt;
 
 /// Strongly-typed Step ID.
@@ -76,8 +76,6 @@ pub enum StepKind {
     WaitEvent,
     /// System built-in step (e.g., resolve_reference)
     System,
-    /// Constrained internal LLM loop for iterative local exploration.
-    Agent,
 }
 
 /// Data binding from an upstream task key to this step's input key.
@@ -122,7 +120,7 @@ pub struct Step {
     /// Unique identifier for this step (logical ID)
     pub id: StepId,
     /// Name of the action to execute.
-    /// Defaults to empty for non-action steps (replan, wait_user, wait_event, agent).
+    /// Defaults to empty for control steps.
     #[serde(default)]
     pub action: String,
     /// Step type for control flow semantics
@@ -179,34 +177,6 @@ impl Step {
             exports: Vec::new(),
             io_bindings: Vec::new(),
             params: Value::Null,
-        }
-    }
-
-    /// Create an agent step.
-    pub fn agent(id: impl Into<StepId>) -> Self {
-        Self {
-            id: id.into(),
-            action: "agent".to_string(),
-            kind: StepKind::Agent,
-            depends_on: Vec::new(),
-            exports: Vec::new(),
-            io_bindings: Vec::new(),
-            params: Value::Null,
-        }
-    }
-
-    /// Create a bounded leaf-agent step.
-    pub fn leaf_agent(id: impl Into<StepId>) -> Self {
-        Self {
-            id: id.into(),
-            action: "agent".to_string(),
-            kind: StepKind::Agent,
-            depends_on: Vec::new(),
-            exports: Vec::new(),
-            io_bindings: Vec::new(),
-            params: json!({
-                "mode": "leaf"
-            }),
         }
     }
 

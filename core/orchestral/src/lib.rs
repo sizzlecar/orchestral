@@ -12,7 +12,8 @@ pub use orchestral_runtime as runtime;
 
 pub use orchestral_core::prelude::*;
 
-// SDK re-exports
-pub use orchestral_runtime::sdk::{
-    Orchestral, OrchestralApp, OrchestralBuilder, RunResult, SdkError,
+// Agent Protocol control-plane SDK re-exports.
+pub use orchestral_runtime::api::AgentApi;
+pub use orchestral_runtime::{
+    AgentClient, AgentController, AgentRunHandle, AgentSdkError, AgentTurn,
 };

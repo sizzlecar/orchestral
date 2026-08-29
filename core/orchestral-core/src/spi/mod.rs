@@ -1,5 +1,3 @@
-pub mod lifecycle;
-
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,9 +10,9 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 use tokio::sync::RwLock;
 
+use crate::agent_protocol::wire::{AgentSessionId, RunId};
 use crate::io::BlobStore;
-use crate::store::{EventStore, InteractionId, TaskStore, ThreadId};
-use crate::types::{StepId, TaskId};
+use crate::types::{StepId, WorkflowId};
 
 pub type SharedComponent = Arc<dyn Any + Send + Sync>;
 
@@ -59,25 +57,18 @@ pub struct RuntimeHookEventEnvelope {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RuntimeHookContext {
-    pub thread_id: ThreadId,
-    pub interaction_id: InteractionId,
-    pub task_id: Option<TaskId>,
+    pub session_id: Option<AgentSessionId>,
+    pub run_id: Option<RunId>,
+    pub workflow_id: Option<WorkflowId>,
     pub step_id: Option<StepId>,
-    pub action: Option<String>,
+    pub tool_name: Option<String>,
     pub message: Option<String>,
     pub metadata: Value,
     pub extensions: Map<String, Value>,
 }
 
-#[derive(Clone)]
-pub struct StoreBundle {
-    pub event_store: Arc<dyn EventStore>,
-    pub task_store: Arc<dyn TaskStore>,
-}
-
 #[derive(Default)]
 pub struct ComponentRegistry {
-    pub stores: Option<StoreBundle>,
     pub blob_store: Option<Arc<dyn BlobStore>>,
     named_components: HashMap<String, SharedComponent>,
 }
@@ -85,11 +76,6 @@ pub struct ComponentRegistry {
 impl ComponentRegistry {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn with_stores(mut self, stores: StoreBundle) -> Self {
-        self.stores = Some(stores);
-        self
     }
 
     pub fn with_blob_store(mut self, blob_store: Arc<dyn BlobStore>) -> Self {
@@ -136,6 +122,14 @@ pub trait RuntimeComponentFactory: Send + Sync {
 #[derive(Debug, Error)]
 #[error("{message}")]
 pub struct HookError {
+    pub message: String,
+}
+
+#[derive(Debug, Error)]
+#[error("runtime hook '{hook_id}' rejected {event_type}: {message}")]
+pub struct HookDispatchError {
+    pub hook_id: String,
+    pub event_type: String,
     pub message: String,
 }
 
@@ -220,14 +214,26 @@ impl HookRegistry {
     }
 
     pub async fn dispatch(&self, event: &RuntimeHookEventEnvelope, context: &RuntimeHookContext) {
+        let _ = self.dispatch_checked(event, context).await;
+    }
+
+    /// Dispatches hooks and surfaces fail-closed rejection to the lifecycle
+    /// owner. Fail-open hook errors are logged and do not fail this call.
+    pub async fn dispatch_checked(
+        &self,
+        event: &RuntimeHookEventEnvelope,
+        context: &RuntimeHookContext,
+    ) -> Result<(), HookDispatchError> {
         let policy = *self.policy.read().await;
         let hooks = self.snapshot_hooks().await;
 
         match policy.mode {
             HookDispatchMode::Sequential => {
                 for hook in hooks {
-                    if !Self::run_hook(policy, hook, event, context).await {
-                        break;
+                    if let Err(error) = Self::run_hook(policy, hook, event, context).await {
+                        if matches!(policy.failure_policy, HookFailurePolicy::FailClosed) {
+                            return Err(error);
+                        }
                     }
                 }
             }
@@ -235,9 +241,15 @@ impl HookRegistry {
                 let futures = hooks
                     .into_iter()
                     .map(|hook| Self::run_hook(policy, hook, event, context));
-                let _ = join_all(futures).await;
+                let results = join_all(futures).await;
+                if matches!(policy.failure_policy, HookFailurePolicy::FailClosed) {
+                    if let Some(error) = results.into_iter().find_map(Result::err) {
+                        return Err(error);
+                    }
+                }
             }
         }
+        Ok(())
     }
 
     async fn run_hook(
@@ -245,7 +257,7 @@ impl HookRegistry {
         hook: Arc<dyn RuntimeHook>,
         event: &RuntimeHookEventEnvelope,
         context: &RuntimeHookContext,
-    ) -> bool {
+    ) -> Result<(), HookDispatchError> {
         let hook_id = hook.id();
         let call = hook.on_event(event, context);
         let result = if let Some(timeout) = policy.timeout {
@@ -258,7 +270,7 @@ impl HookRegistry {
         };
 
         match result {
-            Ok(()) => true,
+            Ok(()) => Ok(()),
             Err(err) => {
                 tracing::warn!(
                     hook_id,
@@ -266,7 +278,11 @@ impl HookRegistry {
                     error = %err,
                     "runtime hook execution failed"
                 );
-                matches!(policy.failure_policy, HookFailurePolicy::FailOpen)
+                Err(HookDispatchError {
+                    hook_id: hook_id.to_owned(),
+                    event_type: event.event_type.clone(),
+                    message: err.message,
+                })
             }
         }
     }
@@ -331,11 +347,11 @@ mod tests {
 
     fn sample_context() -> RuntimeHookContext {
         RuntimeHookContext {
-            thread_id: "thread-1".into(),
-            interaction_id: "interaction-1".into(),
-            task_id: Some("task-1".into()),
+            session_id: Some(AgentSessionId::new("session-1")),
+            run_id: Some(RunId::new("run-1")),
+            workflow_id: Some(WorkflowId::new("workflow-1")),
             step_id: Some("step-1".into()),
-            action: Some("echo".to_string()),
+            tool_name: Some("echo".to_string()),
             message: None,
             metadata: Value::Null,
             extensions: Map::new(),
@@ -366,7 +382,10 @@ mod tests {
             }))
             .await;
 
-        registry.dispatch(&sample_event(), &sample_context()).await;
+        registry
+            .dispatch_checked(&sample_event(), &sample_context())
+            .await
+            .expect("fail-open hook error must not reject lifecycle");
 
         assert_eq!(
             calls.lock().expect("lock").clone(),
@@ -420,8 +439,12 @@ mod tests {
             }))
             .await;
 
-        registry.dispatch(&sample_event(), &sample_context()).await;
+        let error = registry
+            .dispatch_checked(&sample_event(), &sample_context())
+            .await
+            .expect_err("fail-closed hook error must reject lifecycle");
 
         assert!(calls.lock().expect("lock").is_empty());
+        assert_eq!(error.hook_id, "failing");
     }
 }

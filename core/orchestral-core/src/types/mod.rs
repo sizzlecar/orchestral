@@ -1,23 +1,7 @@
-//! Core type definitions for Orchestral
-//!
-//! This module contains the fundamental types used throughout the system:
-//! - Intent: User's goal description
-//! - Plan: LLM-generated execution plan
-//! - Step: Individual execution unit with dependencies
-//! - Task: Stateful execution context
+//! Deterministic workflow types used below the Agent Protocol control plane.
 
-mod continuation;
-mod intent;
-mod patch_candidates;
 mod plan;
 mod step;
-mod task;
-mod verify;
 
-pub use continuation::{ContinuationState, ContinuationStatus};
-pub use intent::{Intent, IntentContext};
-pub use patch_candidates::PatchCandidatesEnvelope;
-pub use plan::Plan;
+pub use plan::{Plan, WorkflowId};
 pub use step::{Step, StepId, StepIoBinding, StepKind};
-pub use task::{Task, TaskId, TaskState, WaitUserReason};
-pub use verify::{VerifyDecision, VerifyStatus};

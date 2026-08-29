@@ -1,1 +1,0 @@
-{"type":"SINGLE_ACTION","action":"http","params":{"method":"GET","url":"https://example.com"},"reason":"fetch a single endpoint"}

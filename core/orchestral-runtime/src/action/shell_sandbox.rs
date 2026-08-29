@@ -1,72 +1,20 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ShellSandboxMode {
-    None,
-    ReadOnly,
-    WorkspaceWrite,
-}
-
-impl ShellSandboxMode {
-    pub fn from_str(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "none" | "off" => Some(Self::None),
-            "read_only" | "readonly" | "ro" => Some(Self::ReadOnly),
-            "workspace_write" | "workspace" | "ws" => Some(Self::WorkspaceWrite),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::ReadOnly => "read_only",
-            Self::WorkspaceWrite => "workspace_write",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ShellSandboxBackendKind {
-    Auto,
-    MacosSeatbelt,
-    LinuxSeccomp,
-    WindowsRestricted,
-}
-
-impl ShellSandboxBackendKind {
-    pub fn from_str(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "auto" => Some(Self::Auto),
-            "seatbelt" | "macos_seatbelt" | "macos" => Some(Self::MacosSeatbelt),
-            "linux_seccomp" | "seccomp" | "linux" => Some(Self::LinuxSeccomp),
-            "windows_restricted" | "windows" => Some(Self::WindowsRestricted),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ShellSandboxPolicy {
-    pub mode: ShellSandboxMode,
-    pub backend: ShellSandboxBackendKind,
-    pub allow_network: bool,
+    pub readable_roots: Vec<PathBuf>,
+    /// Host-owned files required by a toolchain at runtime. These are exposed
+    /// as exact read-only paths, never as readable parent directories.
+    pub readable_files: Vec<PathBuf>,
     pub writable_roots: Vec<PathBuf>,
+    /// Allow the already-sandboxed launcher to execute child programs.
+    /// Filesystem and network effects remain constrained by this profile.
+    pub allow_child_processes: bool,
+    pub launcher_programs: Vec<PathBuf>,
+    pub network_targets: BTreeSet<String>,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub linux_bwrap_path: Option<PathBuf>,
-}
-
-impl Default for ShellSandboxPolicy {
-    fn default() -> Self {
-        Self {
-            mode: ShellSandboxMode::None,
-            backend: ShellSandboxBackendKind::Auto,
-            allow_network: false,
-            writable_roots: Vec::new(),
-            linux_bwrap_path: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +23,10 @@ pub struct SandboxedCommand {
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
     pub backend: &'static str,
+    /// The sandbox launcher establishes a fresh session/process group itself.
+    /// Callers must not make that launcher a process-group leader before it
+    /// executes, because doing so makes a subsequent `setsid` fail.
+    pub backend_starts_new_session: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -135,7 +87,7 @@ impl ShellSandboxBackend for MacosSeatbeltBackend {
             return Err("sandbox-exec not found at /usr/bin/sandbox-exec".to_string());
         }
 
-        let profile = build_macos_profile(&spec.cwd, policy);
+        let profile = build_macos_profile(&spec, policy)?;
         let mut sandboxed_args = vec!["-p".to_string(), profile, spec.program];
         sandboxed_args.extend(spec.args);
         let mut env = spec.env;
@@ -149,6 +101,7 @@ impl ShellSandboxBackend for MacosSeatbeltBackend {
             args: sandboxed_args,
             env,
             backend: self.backend_name(),
+            backend_starts_new_session: false,
         })
     }
 }
@@ -167,6 +120,12 @@ impl ShellSandboxBackend for LinuxBwrapBackend {
         spec: SandboxCommandSpec,
         policy: &ShellSandboxPolicy,
     ) -> Result<SandboxedCommand, String> {
+        if !policy.network_targets.is_empty() {
+            return Err(
+                "target-restricted network is unavailable in the bubblewrap adapter; refusing to widen network access"
+                    .to_owned(),
+            );
+        }
         let bwrap = resolve_linux_bwrap_executable(policy)?;
         let mut args = build_linux_bwrap_args(&spec, policy);
         args.push("--".to_string());
@@ -183,34 +142,8 @@ impl ShellSandboxBackend for LinuxBwrapBackend {
             args,
             env,
             backend: self.backend_name(),
+            backend_starts_new_session: true,
         })
-    }
-}
-
-fn resolve_backend(policy: &ShellSandboxPolicy) -> Box<dyn ShellSandboxBackend> {
-    match policy.backend {
-        ShellSandboxBackendKind::Auto => default_backend_for_platform(),
-        ShellSandboxBackendKind::MacosSeatbelt => {
-            #[cfg(target_os = "macos")]
-            {
-                Box::new(MacosSeatbeltBackend)
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                Box::new(UnsupportedBackend {
-                    backend_name: "macos_seatbelt",
-                    reason: "only available on macOS",
-                })
-            }
-        }
-        ShellSandboxBackendKind::LinuxSeccomp => Box::new(UnsupportedBackend {
-            backend_name: "linux_seccomp",
-            reason: "backend adapter is not implemented yet",
-        }),
-        ShellSandboxBackendKind::WindowsRestricted => Box::new(UnsupportedBackend {
-            backend_name: "windows_restricted",
-            reason: "backend adapter is not implemented yet",
-        }),
     }
 }
 
@@ -246,78 +179,276 @@ pub fn sandbox_command(
     cwd: &Path,
     policy: &ShellSandboxPolicy,
 ) -> Result<SandboxedCommand, String> {
-    let mut env = HashMap::new();
-    if !policy.allow_network {
-        env.insert(
-            "ORCHESTRAL_SANDBOX_NETWORK_DISABLED".to_string(),
-            "1".to_string(),
+    let backend = default_backend_for_platform();
+    sandbox_command_with_backend(program, args, cwd, policy, backend.as_ref())
+}
+
+fn sandbox_command_with_backend(
+    program: String,
+    args: Vec<String>,
+    cwd: &Path,
+    policy: &ShellSandboxPolicy,
+    backend: &dyn ShellSandboxBackend,
+) -> Result<SandboxedCommand, String> {
+    let (program, cwd, policy) = normalize_sandbox_inputs(&program, cwd, policy)?;
+    let env = HashMap::from([(
+        "ORCHESTRAL_SANDBOX_NETWORK_DISABLED".to_owned(),
+        if policy.network_targets.is_empty() {
+            "1".to_owned()
+        } else {
+            "0".to_owned()
+        },
+    )]);
+    let spec = SandboxCommandSpec {
+        program,
+        args,
+        cwd,
+        env,
+    };
+    backend.transform(spec, &policy).map_err(|error| {
+        format!(
+            "{error} (backend={}, mode=workspace_write)",
+            backend.backend_name()
+        )
+    })
+}
+
+fn normalize_sandbox_inputs(
+    program: &str,
+    cwd: &Path,
+    policy: &ShellSandboxPolicy,
+) -> Result<(String, PathBuf, ShellSandboxPolicy), String> {
+    let launch_program = PathBuf::from(program);
+    if !launch_program.is_absolute() {
+        return Err("sandbox executable must be a Host-resolved absolute path".to_owned());
+    }
+    let program_identity = canonical_file(&launch_program, "sandbox executable")?;
+    let cwd = canonical_directory(cwd, "sandbox cwd")?;
+    let readable_roots = canonical_directories(&policy.readable_roots, "readable root")?;
+    let readable_files = canonical_files(&policy.readable_files, "readable file")?;
+    let writable_roots = canonical_directories(&policy.writable_roots, "writable root")?;
+    let launcher_programs = policy
+        .launcher_programs
+        .iter()
+        .map(|path| canonical_file(path, "launcher executable"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let network_targets = normalize_network_targets(&policy.network_targets)?;
+
+    if readable_roots.is_empty()
+        || writable_roots.is_empty()
+        || launcher_programs.is_empty()
+        || !launcher_programs.contains(&program_identity)
+        || !readable_roots.iter().any(|root| cwd.starts_with(root))
+    {
+        return Err(
+            "sandbox requires canonical read/write roots, an allowed executable, and a readable cwd"
+                .to_owned(),
         );
     }
 
-    match policy.mode {
-        ShellSandboxMode::None => Ok(SandboxedCommand {
-            program,
-            args,
-            env,
-            backend: "none",
-        }),
-        _ => {
-            let backend = resolve_backend(policy);
-            let spec = SandboxCommandSpec {
-                program,
-                args,
-                cwd: cwd.to_path_buf(),
-                env,
-            };
-            backend.transform(spec, policy).map_err(|e| {
-                format!(
-                    "{} (backend={}, mode={})",
-                    e,
-                    backend.backend_name(),
-                    policy.mode.as_str()
-                )
-            })
-        }
-    }
+    Ok((
+        launch_program.to_string_lossy().into_owned(),
+        cwd,
+        ShellSandboxPolicy {
+            readable_roots,
+            readable_files,
+            writable_roots,
+            allow_child_processes: policy.allow_child_processes,
+            launcher_programs,
+            network_targets,
+            linux_bwrap_path: policy.linux_bwrap_path.clone(),
+        },
+    ))
 }
 
-pub fn resolve_root_path(cwd: &Path, root: &Path) -> PathBuf {
-    let joined = if root.is_absolute() {
-        root.to_path_buf()
-    } else {
-        cwd.join(root)
-    };
-    std::fs::canonicalize(&joined).unwrap_or(joined)
+fn canonical_directories(paths: &[PathBuf], label: &str) -> Result<Vec<PathBuf>, String> {
+    paths
+        .iter()
+        .map(|path| canonical_directory(path, label))
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map(BTreeSet::into_iter)
+        .map(Iterator::collect)
+}
+
+fn canonical_files(paths: &[PathBuf], label: &str) -> Result<Vec<PathBuf>, String> {
+    paths
+        .iter()
+        .map(|path| canonical_file(path, label))
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map(BTreeSet::into_iter)
+        .map(Iterator::collect)
+}
+
+fn canonical_directory(path: &Path, label: &str) -> Result<PathBuf, String> {
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|error| format!("canonicalize {label} '{}' failed: {error}", path.display()))?;
+    if !canonical.is_dir() {
+        return Err(format!("{label} '{}' is not a directory", path.display()));
+    }
+    Ok(canonical)
+}
+
+fn canonical_file(path: &Path, label: &str) -> Result<PathBuf, String> {
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|error| format!("canonicalize {label} '{}' failed: {error}", path.display()))?;
+    if !canonical.is_file() {
+        return Err(format!("{label} '{}' is not a file", path.display()));
+    }
+    Ok(canonical)
+}
+
+fn normalize_network_targets(targets: &BTreeSet<String>) -> Result<BTreeSet<String>, String> {
+    targets
+        .iter()
+        .map(|target| {
+            let target = target.trim();
+            let (host, port) = target
+                .rsplit_once(':')
+                .ok_or_else(|| format!("network target must use host:port syntax: {target}"))?;
+            let host = host.trim_matches(['[', ']']);
+            if host.is_empty()
+                || !host.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || ".-_:".contains(character)
+                })
+            {
+                return Err(format!("network target has an invalid host: {target}"));
+            }
+            if port.parse::<u16>().ok().filter(|port| *port > 0).is_none() {
+                return Err(format!("network target has an invalid port: {target}"));
+            }
+            let host =
+                if host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1" {
+                    "localhost"
+                } else {
+                    host
+                };
+            Ok(format!("{host}:{port}"))
+        })
+        .collect()
 }
 
 #[cfg(target_os = "macos")]
-fn build_macos_profile(cwd: &Path, policy: &ShellSandboxPolicy) -> String {
+fn build_macos_profile(
+    spec: &SandboxCommandSpec,
+    policy: &ShellSandboxPolicy,
+) -> Result<String, String> {
     let mut profile = String::new();
     profile.push_str("(version 1)\n");
     profile.push_str("(deny default)\n");
-    profile.push_str("(allow process*)\n");
-    profile.push_str("(allow sysctl-read)\n");
-    profile.push_str("(allow file-read*)\n");
-    profile.push_str("(allow file-read* (literal \"/dev/null\"))\n");
-    profile.push_str("(allow file-write* (literal \"/dev/null\"))\n");
-    if policy.allow_network {
-        profile.push_str("(allow network*)\n");
-    }
-
-    if policy.mode == ShellSandboxMode::WorkspaceWrite {
-        let mut roots = policy.writable_roots.clone();
-        if roots.is_empty() {
-            roots.push(cwd.to_path_buf());
-        }
-        for root in roots {
-            let resolved = resolve_root_path(cwd, &root);
+    profile.push_str("(allow process-fork)\n");
+    if policy.allow_child_processes {
+        profile.push_str("(allow process-exec)\n");
+    } else {
+        for program in &policy.launcher_programs {
             profile.push_str(&format!(
-                "(allow file-write* (subpath \"{}\"))\n",
-                escape_profile_string(&resolved.to_string_lossy())
+                "(allow process-exec (literal \"{}\"))\n",
+                escape_profile_string(&program.to_string_lossy())
             ));
         }
     }
-    profile
+    for target in &policy.network_targets {
+        let (host, _) = target
+            .rsplit_once(':')
+            .expect("normalized network target has a host and port");
+        if host != "localhost" {
+            return Err(format!(
+                "exact remote network target '{target}' requires a managed proxy on macOS; refusing broader network access"
+            ));
+        }
+        profile.push_str(&format!(
+            "(allow network-outbound (remote ip \"{}\"))\n",
+            escape_profile_string(target)
+        ));
+    }
+    profile.push_str("(allow sysctl-read)\n");
+
+    let mut literal_reads = BTreeSet::new();
+    let mut subtree_reads = BTreeSet::new();
+    for path in [
+        Path::new("/usr/lib"),
+        Path::new("/usr/share"),
+        Path::new("/System/Library"),
+        Path::new("/System/Cryptexes"),
+        Path::new("/System/Volumes/Preboot/Cryptexes/OS/usr/lib"),
+        Path::new("/System/Volumes/Preboot/Cryptexes/OS/System/Library"),
+        // Xcode command-line drivers load Apple-owned developer frameworks
+        // from these system locations even when the selected SDK lives under
+        // `/Applications/Xcode.app`.
+        Path::new("/Library/Developer"),
+        Path::new("/Library/Apple/System/Library"),
+        Path::new("/etc"),
+        Path::new("/private/etc"),
+    ] {
+        add_path_ancestors(path, &mut literal_reads);
+        subtree_reads.insert(path.to_path_buf());
+    }
+    for path in [
+        Path::new("/usr/bin/sandbox-exec"),
+        Path::new("/dev/null"),
+        // Apple toolchains resolve the active developer directory through this
+        // Host-owned selector before reading SDKs under the approved Xcode root.
+        // Seatbelt observes the physical `/private/var` path while the tool
+        // reports the public `/var` alias, so both exact identities are needed.
+        Path::new("/var/select/developer_dir"),
+        Path::new("/private/var/select/developer_dir"),
+        // macOS resolves the system `sh` implementation through the same
+        // selector mechanism when compiler drivers launch helper scripts.
+        Path::new("/var/select/sh"),
+        Path::new("/private/var/select/sh"),
+        // xcrun/clang consult this non-secret Host preference to confirm the
+        // installed Xcode SDK license before linking.
+        Path::new("/Library/Preferences/com.apple.dt.Xcode.plist"),
+        Path::new("/Library/Preferences/.GlobalPreferences.plist"),
+    ] {
+        add_path_ancestors(path, &mut literal_reads);
+        literal_reads.insert(path.to_path_buf());
+    }
+    for program in &policy.launcher_programs {
+        add_path_ancestors(program, &mut literal_reads);
+        literal_reads.insert(program.clone());
+    }
+    let launch_program = Path::new(&spec.program);
+    add_path_ancestors(launch_program, &mut literal_reads);
+    literal_reads.insert(launch_program.to_path_buf());
+    for root in &policy.readable_roots {
+        add_path_ancestors(root, &mut literal_reads);
+        literal_reads.insert(root.clone());
+        subtree_reads.insert(root.clone());
+    }
+    for file in &policy.readable_files {
+        add_path_ancestors(file, &mut literal_reads);
+        literal_reads.insert(file.clone());
+    }
+    add_path_ancestors(&spec.cwd, &mut literal_reads);
+    literal_reads.insert(spec.cwd.clone());
+
+    for path in literal_reads {
+        profile.push_str(&format!(
+            "(allow file-read* (literal \"{}\"))\n",
+            escape_profile_string(&path.to_string_lossy())
+        ));
+    }
+    for path in subtree_reads {
+        profile.push_str(&format!(
+            "(allow file-read* (subpath \"{}\"))\n",
+            escape_profile_string(&path.to_string_lossy())
+        ));
+    }
+    profile.push_str("(allow file-write* (literal \"/dev/null\"))\n");
+    for root in &policy.writable_roots {
+        profile.push_str(&format!(
+            "(allow file-write* (subpath \"{}\"))\n",
+            escape_profile_string(&root.to_string_lossy())
+        ));
+    }
+    Ok(profile)
+}
+
+#[cfg(target_os = "macos")]
+fn add_path_ancestors(path: &Path, paths: &mut BTreeSet<PathBuf>) {
+    for ancestor in path.ancestors().skip(1) {
+        paths.insert(ancestor.to_path_buf());
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -328,36 +459,23 @@ fn escape_profile_string(input: &str) -> String {
 #[cfg(target_os = "linux")]
 fn resolve_linux_bwrap_executable(policy: &ShellSandboxPolicy) -> Result<PathBuf, String> {
     if let Some(path) = &policy.linux_bwrap_path {
-        if path.exists() {
-            return Ok(path.clone());
-        }
-        return Err(format!(
-            "Configured sandbox_linux_bwrap_path does not exist: {}",
-            path.to_string_lossy()
-        ));
+        return canonical_file(path, "configured bubblewrap executable");
     }
 
-    for candidate in ["bwrap", "bubblewrap"] {
-        if let Some(path) = find_executable_in_path(candidate) {
+    for candidate in [
+        "/usr/bin/bwrap",
+        "/bin/bwrap",
+        "/usr/bin/bubblewrap",
+        "/bin/bubblewrap",
+    ] {
+        if let Ok(path) = canonical_file(Path::new(candidate), "system bubblewrap executable") {
             return Ok(path);
         }
     }
     Err(
-        "bubblewrap executable not found (tried bwrap/bubblewrap in PATH); set config.sandbox_linux_bwrap_path"
+        "trusted bubblewrap executable not found in system paths; set config.sandbox_linux_bwrap_path"
             .to_string(),
     )
-}
-
-#[cfg(target_os = "linux")]
-fn find_executable_in_path(name: &str) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    for base in std::env::split_paths(&path_var) {
-        let candidate = base.join(name);
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
 }
 
 #[cfg(target_os = "linux")]
@@ -369,130 +487,575 @@ fn build_linux_bwrap_args(spec: &SandboxCommandSpec, policy: &ShellSandboxPolicy
         "/proc".to_string(),
         "--dev".to_string(),
         "/dev".to_string(),
-        "--ro-bind".to_string(),
-        "/".to_string(),
-        "/".to_string(),
         "--tmpfs".to_string(),
         "/tmp".to_string(),
         "--tmpfs".to_string(),
         "/var/tmp".to_string(),
     ];
-    if !policy.allow_network {
-        args.push("--unshare-net".to_string());
-    }
+    args.push("--unshare-net".to_string());
     args.push("--chdir".to_string());
     args.push(spec.cwd.to_string_lossy().to_string());
 
-    if policy.mode == ShellSandboxMode::WorkspaceWrite {
-        let mut roots = policy.writable_roots.clone();
-        if roots.is_empty() {
-            roots.push(spec.cwd.clone());
+    for runtime_path in [
+        "/lib",
+        "/lib64",
+        "/usr/lib",
+        "/usr/lib64",
+        // GCC keeps compiler helpers (collect2, lto-wrapper, and on Debian/
+        // Ubuntu the linker plugin it selects) under /usr/libexec. Exposing
+        // only shared-library directories makes an otherwise available host
+        // toolchain fail after it enters the sandbox.
+        "/usr/libexec",
+        "/etc/ld.so.cache",
+    ] {
+        if Path::new(runtime_path).exists() {
+            push_bwrap_bind(&mut args, "--ro-bind", Path::new(runtime_path));
         }
-        for root in roots {
-            let resolved = resolve_root_path(&spec.cwd, &root);
-            let resolved_str = resolved.to_string_lossy().to_string();
-            args.push("--bind".to_string());
-            args.push(resolved_str.clone());
-            args.push(resolved_str);
-        }
+    }
+    for program in &policy.launcher_programs {
+        push_bwrap_bind(&mut args, "--ro-bind", program);
+    }
+    let launch_program = Path::new(&spec.program);
+    if !policy
+        .launcher_programs
+        .iter()
+        .any(|program| program == launch_program)
+    {
+        push_bwrap_bind(&mut args, "--ro-bind", launch_program);
+    }
+    for root in &policy.readable_roots {
+        push_bwrap_bind(&mut args, "--ro-bind", root);
+    }
+    for file in &policy.readable_files {
+        push_bwrap_bind(&mut args, "--ro-bind", file);
+    }
+    for root in &policy.writable_roots {
+        push_bwrap_bind(&mut args, "--bind", root);
     }
 
     args
+}
+
+#[cfg(target_os = "linux")]
+fn push_bwrap_bind(args: &mut Vec<String>, operation: &str, path: &Path) {
+    let path = path.to_string_lossy().into_owned();
+    args.push(operation.to_owned());
+    args.push(path.clone());
+    args.push(path);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_parse_sandbox_mode() {
-        assert_eq!(
-            ShellSandboxMode::from_str("workspace_write"),
-            Some(ShellSandboxMode::WorkspaceWrite)
-        );
-        assert_eq!(
-            ShellSandboxMode::from_str("read_only"),
-            Some(ShellSandboxMode::ReadOnly)
-        );
-        assert_eq!(
-            ShellSandboxMode::from_str("none"),
-            Some(ShellSandboxMode::None)
-        );
-        assert_eq!(ShellSandboxMode::from_str("invalid"), None);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn run_sandboxed(command: SandboxedCommand, cwd: &Path) -> std::process::Output {
+        let mut process = std::process::Command::new(command.program);
+        process
+            .args(command.args)
+            .env_clear()
+            .envs(command.env)
+            .current_dir(cwd);
+        process.output().unwrap()
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn isolated_test_roots(label: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let parent = std::env::temp_dir().join(format!(
+            "orchestral-sandbox-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let workspace = parent.join("workspace");
+        let outside = parent.join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let parent = std::fs::canonicalize(parent).unwrap();
+        let workspace = std::fs::canonicalize(workspace).unwrap();
+        let outside = std::fs::canonicalize(outside).unwrap();
+        (parent, workspace, outside)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn test_parse_sandbox_backend() {
-        assert_eq!(
-            ShellSandboxBackendKind::from_str("auto"),
-            Some(ShellSandboxBackendKind::Auto)
+    fn sandbox_cwd_may_be_read_only_when_writes_use_a_separate_runtime_root() {
+        let (parent, workspace, runtime_root) = isolated_test_roots("read-only-cwd");
+        let executable = std::fs::canonicalize("/bin/echo").unwrap();
+        let normalized = normalize_sandbox_inputs(
+            &executable.to_string_lossy(),
+            &workspace,
+            &ShellSandboxPolicy {
+                readable_roots: vec![workspace.clone(), runtime_root.clone()],
+                readable_files: Vec::new(),
+                writable_roots: vec![runtime_root],
+                allow_child_processes: false,
+                launcher_programs: vec![executable.clone()],
+                network_targets: BTreeSet::new(),
+                linux_bwrap_path: None,
+            },
         );
-        assert_eq!(
-            ShellSandboxBackendKind::from_str("seatbelt"),
-            Some(ShellSandboxBackendKind::MacosSeatbelt)
+        assert!(normalized.is_ok(), "{normalized:?}");
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sandbox_reads_an_exact_host_file_without_exposing_its_sibling() {
+        let (parent, workspace, outside) = isolated_test_roots("exact-readable-file");
+        let allowed = outside.join("allowed.txt");
+        let denied = outside.join("denied.txt");
+        std::fs::write(&allowed, "ORCHESTRAL_ALLOWED_FILE").unwrap();
+        std::fs::write(&denied, "ORCHESTRAL_DENIED_SIBLING").unwrap();
+        let program = std::fs::canonicalize("/bin/cat").unwrap();
+        let command = sandbox_command(
+            program.to_string_lossy().into_owned(),
+            vec![
+                allowed.to_string_lossy().into_owned(),
+                denied.to_string_lossy().into_owned(),
+            ],
+            &workspace,
+            &ShellSandboxPolicy {
+                readable_roots: vec![workspace.clone()],
+                readable_files: vec![allowed],
+                writable_roots: vec![workspace.clone()],
+                allow_child_processes: false,
+                launcher_programs: vec![program],
+                network_targets: BTreeSet::new(),
+                linux_bwrap_path: None,
+            },
+        )
+        .unwrap();
+
+        let output = run_sandboxed(command, &workspace);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("ORCHESTRAL_ALLOWED_FILE"), "{stdout}");
+        assert!(!stdout.contains("ORCHESTRAL_DENIED_SIBLING"), "{stdout}");
+        assert!(
+            !output.status.success(),
+            "the sibling read unexpectedly worked"
         );
-        assert_eq!(
-            ShellSandboxBackendKind::from_str("linux_seccomp"),
-            Some(ShellSandboxBackendKind::LinuxSeccomp)
-        );
-        assert_eq!(
-            ShellSandboxBackendKind::from_str("windows"),
-            Some(ShellSandboxBackendKind::WindowsRestricted)
-        );
-        assert_eq!(ShellSandboxBackendKind::from_str("bad"), None);
+        std::fs::remove_dir_all(parent).unwrap();
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn test_macos_profile_contains_write_root() {
-        let cwd = PathBuf::from(".");
+        let cwd = std::fs::canonicalize(".").unwrap();
+        let program = std::fs::canonicalize("/bin/echo").unwrap();
+        let spec = SandboxCommandSpec {
+            program: program.to_string_lossy().into_owned(),
+            args: vec!["ok".to_owned()],
+            cwd: cwd.clone(),
+            env: HashMap::new(),
+        };
         let policy = ShellSandboxPolicy {
-            mode: ShellSandboxMode::WorkspaceWrite,
-            backend: ShellSandboxBackendKind::Auto,
-            allow_network: false,
-            writable_roots: vec![PathBuf::from(".")],
+            readable_roots: vec![cwd.clone()],
+            readable_files: Vec::new(),
+            writable_roots: vec![cwd.clone()],
+            allow_child_processes: false,
+            launcher_programs: vec![program.clone()],
+            network_targets: BTreeSet::new(),
             linux_bwrap_path: None,
         };
-        let profile = build_macos_profile(&cwd, &policy);
+        let profile = build_macos_profile(&spec, &policy).unwrap();
         assert!(profile.contains("file-write*"));
         assert!(profile.contains("(deny default)"));
         assert!(profile.contains("(literal \"/dev/null\")"));
+        assert!(profile.contains("(literal \"/var/select/developer_dir\")"));
+        assert!(profile.contains("(literal \"/private/var/select/developer_dir\")"));
+        assert!(profile.contains("(literal \"/var/select/sh\")"));
+        assert!(profile.contains("(literal \"/private/var/select/sh\")"));
+        assert!(profile.contains("(literal \"/Library/Preferences/com.apple.dt.Xcode.plist\")"));
+        assert!(profile.contains(&format!(
+            "(allow process-exec (literal \"{}\"))",
+            program.to_string_lossy()
+        )));
+        assert!(!profile.contains("(allow process*)"));
+        assert!(!profile.contains("(allow file-read*)\n"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_resolved_executable_symlink_keeps_its_launch_identity() {
+        let (parent, workspace, _) = isolated_test_roots("executable-symlink");
+        let executable = std::fs::canonicalize("/bin/echo").unwrap();
+        let launch_path = workspace.join("echo-alias");
+        std::os::unix::fs::symlink(&executable, &launch_path).unwrap();
+        let command = sandbox_command(
+            launch_path.to_string_lossy().into_owned(),
+            vec!["SYMLINK_LAUNCH_OK".to_owned()],
+            &workspace,
+            &ShellSandboxPolicy {
+                readable_roots: vec![workspace.clone()],
+                readable_files: Vec::new(),
+                writable_roots: vec![workspace.clone()],
+                allow_child_processes: false,
+                launcher_programs: vec![executable],
+                network_targets: BTreeSet::new(),
+                linux_bwrap_path: None,
+            },
+        )
+        .unwrap();
+
+        let output = run_sandboxed(command, &workspace);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "SYMLINK_LAUNCH_OK"
+        );
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn one_thousand_outside_secret_reads_and_symlink_escape_are_denied() {
+        const ATTEMPTS: usize = 1_000;
+
+        let (parent, workspace, outside) = isolated_test_roots("secret-read");
+        let mut secret_paths = Vec::with_capacity(ATTEMPTS + 1);
+        for index in 0..ATTEMPTS {
+            let path = outside.join(format!("secret-{index}.txt"));
+            std::fs::write(&path, format!("ORCHESTRAL_SENTINEL_SECRET_{index}")).unwrap();
+            secret_paths.push(path.to_string_lossy().into_owned());
+        }
+        let symlink_target = outside.join("symlink-secret.txt");
+        std::fs::write(&symlink_target, "ORCHESTRAL_SENTINEL_SYMLINK").unwrap();
+        let symlink = workspace.join("escape-link.txt");
+        std::os::unix::fs::symlink(&symlink_target, &symlink).unwrap();
+        secret_paths.push(symlink.to_string_lossy().into_owned());
+
+        let program = std::fs::canonicalize("/bin/cat").unwrap();
+        let command = sandbox_command(
+            program.to_string_lossy().into_owned(),
+            secret_paths,
+            &workspace,
+            &ShellSandboxPolicy {
+                readable_roots: vec![workspace.clone()],
+                readable_files: Vec::new(),
+                writable_roots: vec![workspace.clone()],
+                allow_child_processes: false,
+                launcher_programs: vec![program],
+                network_targets: BTreeSet::new(),
+                linux_bwrap_path: None,
+            },
+        )
+        .unwrap();
+        let output = run_sandboxed(command, &workspace);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!output.status.success());
+        assert!(!stdout.contains("ORCHESTRAL_SENTINEL_SECRET_"));
+        assert!(!stdout.contains("ORCHESTRAL_SENTINEL_SYMLINK"));
+
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn allowed_parent_cannot_spawn_an_unlisted_program() {
+        let (parent, workspace, _) = isolated_test_roots("alternate-spawn");
+        let program = std::fs::canonicalize("/bin/bash").unwrap();
+        let command = sandbox_command(
+            program.to_string_lossy().into_owned(),
+            vec![
+                "--noprofile".to_owned(),
+                "--norc".to_owned(),
+                "-c".to_owned(),
+                "/bin/echo ORCHESTRAL_SENTINEL_ALTERNATE_SPAWN".to_owned(),
+            ],
+            &workspace,
+            &ShellSandboxPolicy {
+                readable_roots: vec![workspace.clone()],
+                readable_files: Vec::new(),
+                writable_roots: vec![workspace.clone()],
+                allow_child_processes: false,
+                launcher_programs: vec![program],
+                network_targets: BTreeSet::new(),
+                linux_bwrap_path: None,
+            },
+        )
+        .unwrap();
+        let output = run_sandboxed(command, &workspace);
+        assert!(!output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stdout)
+            .contains("ORCHESTRAL_SENTINEL_ALTERNATE_SPAWN"));
+
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn one_thousand_command_write_escapes_change_zero_outside_files() {
+        const ATTEMPTS: usize = 1_000;
+
+        let (parent, workspace, outside) = isolated_test_roots("write-escape");
+        let child_inside = workspace.join("child-inside.txt");
+        let child_outside = outside.join("child-outside.txt");
+        let mut command_text = format!(
+            "printf created > '{0}/inside.txt'; printf updated >> '{0}/inside.txt'; rm '{0}/inside.txt'\n/bin/sh -c \"printf child-ok > '{1}'\"\n/bin/sh -c \"printf child-escaped > '{2}'\" || true\n",
+            workspace.display(),
+            child_inside.display(),
+            child_outside.display(),
+        );
+        let mut outside_files = Vec::with_capacity(ATTEMPTS);
+        for index in 0..ATTEMPTS {
+            let outside_file = outside.join(format!("outside-{index}.txt"));
+            std::fs::write(&outside_file, format!("ORIGINAL-{index}")).unwrap();
+            outside_files.push(outside_file.clone());
+            let target = match index % 3 {
+                0 => outside_file,
+                1 => workspace
+                    .join("..")
+                    .join("outside")
+                    .join(format!("outside-{index}.txt")),
+                _ => {
+                    let link = workspace.join(format!("escape-{index}.txt"));
+                    std::os::unix::fs::symlink(&outside_file, &link).unwrap();
+                    link
+                }
+            };
+            command_text.push_str(&format!(
+                "if printf MUTATED > '{}'; then printf ESCAPED; fi\n",
+                target.display()
+            ));
+        }
+        let program = std::fs::canonicalize("/bin/sh").unwrap();
+        let command = sandbox_command(
+            program.to_string_lossy().into_owned(),
+            vec!["-c".to_owned(), command_text],
+            &workspace,
+            &ShellSandboxPolicy {
+                readable_roots: vec![
+                    workspace.clone(),
+                    std::fs::canonicalize("/bin").unwrap(),
+                    std::fs::canonicalize("/usr/bin").unwrap(),
+                ],
+                readable_files: Vec::new(),
+                writable_roots: vec![workspace.clone()],
+                allow_child_processes: true,
+                launcher_programs: vec![program],
+                network_targets: BTreeSet::new(),
+                linux_bwrap_path: None,
+            },
+        )
+        .unwrap();
+        let output = run_sandboxed(command, &workspace);
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("ESCAPED"));
+        assert!(!workspace.join("inside.txt").exists());
+        assert_eq!(std::fs::read_to_string(child_inside).unwrap(), "child-ok");
+        assert!(!child_outside.exists());
+        for (index, path) in outside_files.iter().enumerate() {
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap(),
+                format!("ORIGINAL-{index}")
+            );
+        }
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn network_is_denied_by_default_and_exactly_one_host_target_can_be_opened() {
+        let (parent, workspace, _) = isolated_test_roots("network-target");
+        let allowed_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let denied_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let allowed_port = allowed_listener.local_addr().unwrap().port();
+        let denied_port = denied_listener.local_addr().unwrap().port();
+        let python = std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .map(|directory| directory.join("python3"))
+            .find(|candidate| candidate.is_file())
+            .map(|candidate| std::fs::canonicalize(candidate).unwrap())
+            .expect("python3 is installed for the sandbox network test");
+        let shell = std::fs::canonicalize("/bin/sh").unwrap();
+        let mut readable_roots = vec![workspace.clone()];
+        for candidate in [
+            "/bin",
+            "/usr",
+            "/opt/homebrew",
+            "/Library",
+            "/System/Library",
+        ] {
+            if let Ok(path) = std::fs::canonicalize(candidate) {
+                readable_roots.push(path);
+            }
+        }
+        let run = |port: u16, targets: BTreeSet<String>| {
+            let code = format!(
+                "import socket; socket.create_connection(('127.0.0.1', {port}), .5); print('CONNECTED')"
+            );
+            let command = sandbox_command(
+                shell.to_string_lossy().into_owned(),
+                vec![
+                    "-c".to_owned(),
+                    format!(
+                        "PYTHONDONTWRITEBYTECODE=1 '{}' -c \"{}\"",
+                        python.display(),
+                        code
+                    ),
+                ],
+                &workspace,
+                &ShellSandboxPolicy {
+                    readable_roots: readable_roots.clone(),
+                    readable_files: Vec::new(),
+                    writable_roots: vec![workspace.clone()],
+                    allow_child_processes: true,
+                    launcher_programs: vec![shell.clone()],
+                    network_targets: targets,
+                    linux_bwrap_path: None,
+                },
+            )
+            .unwrap();
+            run_sandboxed(command, &workspace)
+        };
+
+        let denied = run(allowed_port, BTreeSet::new());
+        assert!(!denied.status.success());
+        assert!(!String::from_utf8_lossy(&denied.stdout).contains("CONNECTED"));
+
+        let target = format!("127.0.0.1:{allowed_port}");
+        let allowed = run(allowed_port, BTreeSet::from([target.clone()]));
+        assert!(
+            allowed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&allowed.stderr)
+        );
+        assert!(String::from_utf8_lossy(&allowed.stdout).contains("CONNECTED"));
+
+        let wrong_target = run(denied_port, BTreeSet::from([target]));
+        assert!(!wrong_target.status.success());
+        assert!(!String::from_utf8_lossy(&wrong_target.stdout).contains("CONNECTED"));
+
+        drop(allowed_listener);
+        drop(denied_listener);
+        std::fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]
-    fn test_none_mode_passthrough_command() {
-        let policy = ShellSandboxPolicy::default();
-        let output = sandbox_command(
-            "echo".to_string(),
-            vec!["hello".to_string()],
-            Path::new("."),
-            &policy,
-        )
-        .expect("sandbox command");
-        assert_eq!(output.program, "echo");
-        assert_eq!(output.args, vec!["hello".to_string()]);
-        assert_eq!(output.backend, "none");
+    fn network_target_normalization_rejects_profile_injection_and_invalid_ports() {
+        for target in [
+            "",
+            "example.com",
+            "example.com:*",
+            "example.com:0",
+            "example.com:65536",
+            "example.com:443\") (allow network-outbound)",
+        ] {
+            assert!(normalize_network_targets(&BTreeSet::from([target.to_owned()])).is_err());
+        }
+        assert_eq!(
+            normalize_network_targets(&BTreeSet::from(["127.0.0.1:443".to_owned()])).unwrap(),
+            BTreeSet::from(["localhost:443".to_owned()])
+        );
+    }
+
+    #[test]
+    fn one_thousand_unavailable_backend_attempts_fail_closed_without_a_bare_command() {
+        let cwd = std::fs::canonicalize(".").unwrap();
+        let program = if cfg!(windows) {
+            std::env::current_exe().unwrap()
+        } else {
+            std::fs::canonicalize("/bin/echo").unwrap()
+        };
+        let policy = ShellSandboxPolicy {
+            readable_roots: vec![cwd.clone()],
+            readable_files: Vec::new(),
+            writable_roots: vec![cwd.clone()],
+            allow_child_processes: false,
+            launcher_programs: vec![program.clone()],
+            network_targets: BTreeSet::new(),
+            linux_bwrap_path: None,
+        };
+        let unavailable = UnsupportedBackend {
+            backend_name: "test_unavailable",
+            reason: "injected backend outage",
+        };
+        for index in 0..1_000 {
+            let error = sandbox_command_with_backend(
+                program.to_string_lossy().into_owned(),
+                vec![format!("must-not-run-{index}")],
+                &cwd,
+                &policy,
+                &unavailable,
+            )
+            .expect_err("required sandbox outage must never return a bare command");
+            assert!(error.contains("Sandbox backend 'test_unavailable' is unavailable"));
+        }
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn test_linux_bwrap_args_contain_expected_flags() {
+        let cwd = std::fs::canonicalize(".").unwrap();
+        let program = std::fs::canonicalize("/bin/echo").unwrap();
         let spec = SandboxCommandSpec {
-            program: "echo".to_string(),
+            program: program.to_string_lossy().into_owned(),
             args: vec!["ok".to_string()],
-            cwd: PathBuf::from("."),
+            cwd: cwd.clone(),
             env: HashMap::new(),
         };
         let policy = ShellSandboxPolicy {
-            mode: ShellSandboxMode::WorkspaceWrite,
-            backend: ShellSandboxBackendKind::LinuxSeccomp,
-            allow_network: false,
-            writable_roots: vec![PathBuf::from(".")],
+            readable_roots: vec![cwd.clone()],
+            readable_files: Vec::new(),
+            writable_roots: vec![cwd],
+            allow_child_processes: false,
+            launcher_programs: vec![program],
+            network_targets: BTreeSet::new(),
             linux_bwrap_path: None,
         };
         let args = build_linux_bwrap_args(&spec, &policy);
         assert!(args.iter().any(|v| v == "--unshare-net"));
         assert!(args.iter().any(|v| v == "--bind"));
         assert!(args.iter().any(|v| v == "--chdir"));
+        if Path::new("/usr/libexec").is_dir() {
+            assert!(args.windows(3).any(|window| {
+                window[0] == "--ro-bind"
+                    && window[1] == "/usr/libexec"
+                    && window[2] == "/usr/libexec"
+            }));
+        }
+        assert!(!args
+            .windows(3)
+            .any(|window| { window[0] == "--ro-bind" && window[1] == "/" && window[2] == "/" }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_executes_one_allowlisted_program() {
+        let (parent, workspace, _) = isolated_test_roots("linux-exec");
+        let output_path = workspace.join("sandbox-output.txt");
+        let program = std::fs::canonicalize("/bin/bash").unwrap();
+        let command = sandbox_command(
+            program.to_string_lossy().into_owned(),
+            vec![
+                "--noprofile".to_owned(),
+                "--norc".to_owned(),
+                "-c".to_owned(),
+                format!("printf sandbox-ok > '{}'", output_path.display()),
+            ],
+            &workspace,
+            &ShellSandboxPolicy {
+                readable_roots: vec![workspace.clone()],
+                readable_files: Vec::new(),
+                writable_roots: vec![workspace.clone()],
+                allow_child_processes: false,
+                launcher_programs: vec![program],
+                network_targets: BTreeSet::new(),
+                linux_bwrap_path: None,
+            },
+        )
+        .unwrap();
+        let output = run_sandboxed(command, &workspace);
+        assert!(
+            output.status.success(),
+            "bubblewrap execution failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(output_path).unwrap(), "sandbox-ok");
+        std::fs::remove_dir_all(parent).unwrap();
     }
 }

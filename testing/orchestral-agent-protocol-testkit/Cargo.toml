@@ -1,0 +1,17 @@
+[package]
+name = "orchestral-agent-protocol-testkit"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "External conformance testkit for Orchestral Agent Protocol providers"
+license = "MIT"
+
+[dependencies]
+async-trait = "0.1"
+futures-util = "0.3"
+orchestral-core = { path = "../../core/orchestral-core", features = ["agent-protocol-schema"] }
+schemars = "1.2.2"
+serde_json = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }

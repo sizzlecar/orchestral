@@ -27,6 +27,14 @@ jobs:
           toolchain: 1.91.0
           components: rustfmt,clippy
 
+      - name: Install Linux sandbox backend
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
+          if sysctl -N kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl --write kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
@@ -37,11 +45,14 @@ jobs:
             exit 1
           fi
 
+      - name: Agent surface hard-cut gate
+        run: bash scripts/check_agent_surface.sh
+
       - name: Format check
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Test
         run: cargo test --workspace --all-targets

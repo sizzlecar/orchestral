@@ -1,0 +1,21 @@
+[package]
+name = "orchestral-model-openai"
+description = "OpenAI-compatible ModelBackend plugin for Orchestral"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+orchestral-core = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+orchestral-model-protocol-testkit = { workspace = true }

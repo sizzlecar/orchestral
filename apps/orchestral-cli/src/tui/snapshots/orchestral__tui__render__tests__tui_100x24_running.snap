@@ -1,0 +1,28 @@
+---
+source: apps/orchestral-cli/src/tui/render.rs
+expression: "render_to_string(&state, 100, 24)"
+---
+  Orchestral  ·  gemini-2.5-flash                                                        ● running
+  › 阅读核心代码，说明执行链路并给出证据。
+
+  ✓ Read 1 file
+      └ core/orchestral-core/src/agent_protocol/types.rs
+  • Running 1 command
+      └ rg -n "ToolActivity" core apps
+
+  • 我正在核对模型循环与工具执行边界。▌
+
+
+
+
+
+
+
+
+
+
+  ⠸ Working (1m 12s · ctrl+c to interrupt) · 1 background terminal running
+
+  › Add guidance while Orchestral works…
+
+  enter steer  ·  ctrl+c interrupt                                   pgup/pgdn scroll  ·  esc quit
