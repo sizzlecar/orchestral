@@ -1,3 +1,5 @@
+use super::GenericAgentConfig;
+
 mod run_limit_tests {
     use super::super::*;
     use orchestral_core::agent_protocol::wire::{
@@ -202,4 +204,15 @@ mod run_limit_tests {
         assert_eq!(policy.effective_tool_calls(Some(100)), Some(80));
         assert_eq!(policy.effective_tool_calls(Some(30)), Some(30));
     }
+}
+
+#[test]
+fn default_agent_contract_preserves_requested_end_states_and_scope() {
+    let config = GenericAgentConfig::new("test/provider", "test/agent");
+
+    assert!(config.system_prompt.contains("requested final states"));
+    assert!(config.system_prompt.contains("verify them before delivery"));
+    assert!(config
+        .system_prompt
+        .contains("unrequested integration, publication, cleanup, or reversal"));
 }
