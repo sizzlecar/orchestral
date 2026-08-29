@@ -667,8 +667,13 @@ pub(super) fn remove_pending_approval(
 }
 
 pub(super) fn approval_scope_names(binding: &ApprovalBinding) -> Result<Vec<String>, AgentFailure> {
+    // The broker retains the complete typed CapabilityRequest in ApprovalBinding.
+    // This projection is deliberately compact human-facing metadata: rendering
+    // every workspace path or environment variable can hide the operation the
+    // user is actually deciding on, without strengthening the exact approval.
     binding
-        .requested_scopes
+        .requested_capabilities
+        .effects
         .iter()
         .map(|scope| {
             serde_json::to_value(scope)

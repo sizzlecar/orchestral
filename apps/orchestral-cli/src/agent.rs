@@ -45,11 +45,11 @@ use orchestral_model_gemini::{
 use orchestral_model_openai::{OpenAiCompatibleBackend, OpenAiCompatibleConfig};
 use orchestral_runtime::tools::{
     guarded_apply_patch_descriptor, guarded_artifact_read_descriptor, guarded_file_read_descriptor,
-    guarded_file_search_descriptor, guarded_text_search_descriptor,
+    guarded_file_search_descriptor, guarded_file_write_descriptor, guarded_text_search_descriptor,
     workspace_exec_command_descriptor, workspace_write_stdin_descriptor,
     CommandEnvironmentSnapshot, GuardedApplyPatchExecutor, GuardedArtifactReadExecutor,
     GuardedExecCommandExecutor, GuardedFileReadExecutor, GuardedFileSearchExecutor,
-    GuardedTextSearchExecutor, GuardedWriteStdinExecutor,
+    GuardedFileWriteExecutor, GuardedTextSearchExecutor, GuardedWriteStdinExecutor,
 };
 use orchestral_runtime::{
     AgentClient, AgentControlEvent, AgentController, ContinuationPolicy,
@@ -207,6 +207,9 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
     } = build_cli_tool_runtime(&config, &mcp_configs, effect_journal, artifact_store)?;
     let mut mcp_restriction = run_grant.bounds.clone();
     mcp_restriction.approval = ApprovalPolicy::Required;
+    // MCP transports retain their exact configured endpoints. Generic exec's
+    // reviewable open-network ceiling must never bleed into this lane.
+    mcp_restriction.network.allow_unrestricted = false;
     let mcp_registry = McpToolsAdapterRegistry::register(
         tool_runtime.as_ref(),
         mcp_configs,
@@ -423,6 +426,7 @@ fn build_cli_tool_runtime(
         },
         network: NetworkPolicy {
             allowed_targets: allowed_network_targets,
+            allow_unrestricted: exec_enabled,
         },
         environment: EnvironmentPolicy {
             allowed_variables: allowed_environment,
@@ -457,6 +461,7 @@ fn build_cli_tool_runtime(
             .as_ref()
             .map(|host| host.network_targets.clone())
             .unwrap_or_default(),
+        allow_unrestricted: true,
     };
     exec_bounds.environment = EnvironmentPolicy {
         allowed_variables: exec_host
@@ -529,6 +534,17 @@ fn build_cli_tool_runtime(
             ),
         )
         .context("register guarded text_search Tool")?;
+    runtime
+        .register(
+            guarded_file_write_descriptor(ToolRestriction {
+                bounds: bounds.clone(),
+            }),
+            Arc::new(
+                GuardedFileWriteExecutor::new(&workspace)
+                    .context("open file_write workspace capability")?,
+            ),
+        )
+        .context("register guarded file_write Tool")?;
     runtime
         .register(
             guarded_apply_patch_descriptor(ToolRestriction {

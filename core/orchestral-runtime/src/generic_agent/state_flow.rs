@@ -678,7 +678,7 @@ pub(super) fn publish_tool_activity(
     call_id: &ModelToolCallId,
     tool_name: &str,
     state: ToolActivityState,
-    details: &[String],
+    evidence: &[ToolActivityEvidence],
 ) {
     let activity_id = format!(
         "generic-{}-tool-{round}-{}",
@@ -696,7 +696,7 @@ pub(super) fn publish_tool_activity(
                 activity_id: ToolActivityId::new(activity_id),
                 tool_name: tool_name.to_owned(),
                 state,
-                details: details.to_vec(),
+                evidence: evidence.to_vec(),
             },
         },
     );

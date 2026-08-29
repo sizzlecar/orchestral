@@ -12,19 +12,284 @@ use crate::tool_runtime::{GuardedToolExecution, GuardedToolExecutor};
 use async_trait::async_trait;
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions, Permissions};
-use orchestral_core::agent_protocol::wire::Digest;
+use orchestral_core::agent_protocol::wire::{
+    Digest, ToolActivityEvidence, ToolDiffLine, ToolDiffLineKind, ToolFileActivityKind,
+};
 use orchestral_core::tool_protocol::{
-    EffectScope, ModelToolSchema, ToolConcurrency, ToolDescriptor, ToolId, ToolIdempotency,
+    CapabilityRequest, CapabilitySelector, EffectScope, ModelToolSchema, ToolConcurrency,
+    ToolDescriptor, ToolId, ToolIdempotency, ToolInvocation, ToolOperationPlan, ToolOperationRisk,
     ToolOutcome, ToolRestriction,
 };
 use serde_json::{json, Map, Value};
 
 use super::patch_parser::{
-    apply_update_hunks, parse_patch, ParsedPatch, PatchOperation, PatchPath, MAX_PATCH_BYTES,
+    apply_update_hunks, parse_patch, parse_path, ParsedPatch, PatchOperation, PatchPath,
+    MAX_PATCH_BYTES,
 };
 use super::support::canonical_roots;
 
 const MAX_RESULTING_FILE_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+pub struct GuardedFileWriteExecutor {
+    workspace: PathBuf,
+    workspace_dir: Arc<Dir>,
+}
+
+impl GuardedFileWriteExecutor {
+    pub fn new(workspace: impl AsRef<Path>) -> io::Result<Self> {
+        let workspace = std::fs::canonicalize(workspace)?;
+        if !workspace.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file_write workspace must be a directory",
+            ));
+        }
+        let workspace_dir = Dir::open_ambient_dir(&workspace, ambient_authority())?;
+        Ok(Self {
+            workspace,
+            workspace_dir: Arc::new(workspace_dir),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileWriteMode {
+    Create,
+    Replace,
+}
+
+impl FileWriteMode {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "create" => Some(Self::Create),
+            "replace" => Some(Self::Replace),
+            _ => None,
+        }
+    }
+}
+
+struct FileWriteRequest<'a> {
+    path: PatchPath,
+    content: &'a str,
+    mode: FileWriteMode,
+    expected_digest: Option<&'a str>,
+}
+
+impl<'a> FileWriteRequest<'a> {
+    fn parse(invocation: &'a ToolInvocation) -> Result<Self, ToolOutcome> {
+        let arguments = &invocation.arguments;
+        let path = arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| rejected("file_write_path_missing", "file_write requires a path"))?;
+        let path = parse_path(path)
+            .map_err(|error| rejected("file_write_path_invalid", error.to_string()))?;
+        let content = arguments
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                rejected(
+                    "file_write_content_missing",
+                    "file_write requires UTF-8 content",
+                )
+            })?;
+        if content.len() > MAX_RESULTING_FILE_BYTES {
+            return Err(file_too_large(path.display(), content.len()).into_outcome(0));
+        }
+        if content.contains('\0') {
+            return Err(rejected(
+                "file_write_content_invalid",
+                "file_write content contains a NUL byte",
+            ));
+        }
+        let mode = arguments
+            .get("mode")
+            .and_then(Value::as_str)
+            .and_then(FileWriteMode::parse)
+            .ok_or_else(|| {
+                rejected(
+                    "file_write_mode_invalid",
+                    "file_write mode must be 'create' or 'replace'",
+                )
+            })?;
+        let expected_digest = arguments.get("expected_digest").and_then(Value::as_str);
+        match (mode, expected_digest) {
+            (FileWriteMode::Create, Some(_)) => {
+                return Err(rejected(
+                    "file_write_precondition_invalid",
+                    "create mode does not accept expected_digest",
+                ))
+            }
+            (FileWriteMode::Replace, Some(digest)) if Digest::new(digest).is_sha256() => {}
+            (FileWriteMode::Replace, _) => {
+                return Err(rejected(
+                    "file_write_precondition_missing",
+                    "replace mode requires the complete-file content_digest from file_read",
+                ))
+            }
+            (FileWriteMode::Create, None) => {}
+        }
+        Ok(Self {
+            path,
+            content,
+            mode,
+            expected_digest,
+        })
+    }
+
+    fn operation_label(&self) -> &'static str {
+        match self.mode {
+            FileWriteMode::Create => "Create",
+            FileWriteMode::Replace => "Replace",
+        }
+    }
+}
+
+#[async_trait]
+impl GuardedToolExecutor for GuardedFileWriteExecutor {
+    fn planning_contract(&self) -> Value {
+        json!({ "contract": "orchestral.file-write-planner/v1" })
+    }
+
+    fn activity_evidence(
+        &self,
+        invocation: &ToolInvocation,
+        _outcome: Option<&ToolOutcome>,
+    ) -> Vec<ToolActivityEvidence> {
+        let Ok(request) = FileWriteRequest::parse(invocation) else {
+            return Vec::new();
+        };
+        let (diff, diff_omitted) = if request.mode == FileWriteMode::Create {
+            added_content_preview(request.content)
+        } else {
+            (Vec::new(), 0)
+        };
+        vec![ToolActivityEvidence::File {
+            operation: match request.mode {
+                FileWriteMode::Create => ToolFileActivityKind::Create,
+                FileWriteMode::Replace => ToolFileActivityKind::Update,
+            },
+            path: request.path.display().to_owned(),
+            diff,
+            diff_omitted,
+        }]
+    }
+
+    fn plan_operation(
+        &self,
+        invocation: &ToolInvocation,
+        _descriptor: &ToolDescriptor,
+        _effective_policy: &orchestral_core::tool_protocol::EffectiveToolPolicy,
+    ) -> Result<ToolOperationPlan, ToolOutcome> {
+        let request = FileWriteRequest::parse(invocation)?;
+        let target = self
+            .workspace
+            .join(request.path.relative())
+            .to_string_lossy()
+            .into_owned();
+        let mut required_capabilities = CapabilityRequest::default();
+        if request.mode == FileWriteMode::Replace {
+            required_capabilities.insert_resource(
+                EffectScope::FilesystemRead,
+                CapabilitySelector::Exact(target.clone()),
+            );
+        }
+        required_capabilities.insert_resource(
+            EffectScope::FilesystemWrite,
+            CapabilitySelector::Exact(target),
+        );
+        Ok(ToolOperationPlan {
+            required_capabilities,
+            risk: ToolOperationRisk::Routine,
+            summary: format!(
+                "{} workspace file '{}'",
+                request.operation_label(),
+                request.path.display()
+            ),
+        })
+    }
+
+    fn approval_summary(&self, invocation: &ToolInvocation) -> String {
+        FileWriteRequest::parse(invocation)
+            .map(|request| {
+                format!(
+                    "{} workspace file '{}'",
+                    request.operation_label(),
+                    request.path.display()
+                )
+            })
+            .unwrap_or_else(|_| "Apply an invalid file_write request".to_owned())
+    }
+
+    async fn execute(&self, execution: GuardedToolExecution) -> ToolOutcome {
+        if execution.cancellation.is_cancelled() {
+            return ToolOutcome::Cancelled;
+        }
+        let request = match FileWriteRequest::parse(&execution.invocation) {
+            Ok(request) => request,
+            Err(outcome) => return outcome,
+        };
+        let roots = match EffectiveRoots::from_execution(&execution) {
+            Ok(roots) => roots,
+            Err(error) => return error.into_outcome(0),
+        };
+        let target =
+            match resolve_target(&self.workspace_dir, &self.workspace, &roots, &request.path) {
+                Ok(target) => target,
+                Err(error) => return error.into_outcome(0),
+            };
+        let (operation, before, permissions, create_only) = match request.mode {
+            FileWriteMode::Create => {
+                if let Err(error) = require_absent_file(&target) {
+                    return error.into_outcome(0);
+                }
+                ("add", None, None, true)
+            }
+            FileWriteMode::Replace => {
+                let (before, permissions) = match read_regular_text(&target) {
+                    Ok(value) => value,
+                    Err(error) => return error.into_outcome(0),
+                };
+                let before_digest = Digest::sha256(&before);
+                if request.expected_digest != Some(before_digest.as_str()) {
+                    return rejected(
+                        "file_write_conflict",
+                        format!(
+                            "'{}' changed since file_read; inspect it again before replacing",
+                            request.path.display()
+                        ),
+                    );
+                }
+                ("update", Some(before), Some(permissions), false)
+            }
+        };
+        let after = request.content.as_bytes();
+        if before.as_deref() == Some(after) {
+            return ToolOutcome::Completed {
+                output: json!({ "changed_files": 0, "changes": [] }).into(),
+            };
+        }
+        if execution.cancellation.is_cancelled() {
+            return ToolOutcome::Cancelled;
+        }
+        if let Err(error) = atomic_write(&target, after, permissions, create_only) {
+            return error.into_outcome(0);
+        }
+        ToolOutcome::Completed {
+            output: json!({
+                "changed_files": 1,
+                "changes": [change_output(
+                    operation,
+                    &request.path,
+                    before.as_deref(),
+                    Some(after),
+                )],
+            })
+            .into(),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct GuardedApplyPatchExecutor {
@@ -55,6 +320,63 @@ impl GuardedApplyPatchExecutor {
 
 #[async_trait]
 impl GuardedToolExecutor for GuardedApplyPatchExecutor {
+    fn planning_contract(&self) -> Value {
+        json!({ "contract": "orchestral.apply-patch-planner/v2" })
+    }
+
+    fn activity_evidence(
+        &self,
+        invocation: &ToolInvocation,
+        _outcome: Option<&ToolOutcome>,
+    ) -> Vec<ToolActivityEvidence> {
+        patch_activity_evidence(invocation)
+    }
+
+    fn plan_operation(
+        &self,
+        invocation: &ToolInvocation,
+        _descriptor: &ToolDescriptor,
+        _effective_policy: &orchestral_core::tool_protocol::EffectiveToolPolicy,
+    ) -> Result<ToolOperationPlan, ToolOutcome> {
+        let patch = invocation
+            .arguments
+            .get("patch")
+            .and_then(Value::as_str)
+            .ok_or_else(|| rejected("patch_missing", "apply_patch requires a patch string"))?;
+        let parsed =
+            parse_patch(patch).map_err(|error| rejected("patch_invalid", error.to_string()))?;
+        let mut required_capabilities = CapabilityRequest::default();
+        let mut risk = ToolOperationRisk::Routine;
+        for operation in &parsed.operations {
+            let target = self
+                .workspace
+                .join(operation.path().relative())
+                .to_string_lossy()
+                .into_owned();
+            if matches!(
+                operation,
+                PatchOperation::Update { .. } | PatchOperation::Delete { .. }
+            ) {
+                required_capabilities.insert_resource(
+                    EffectScope::FilesystemRead,
+                    CapabilitySelector::Exact(target.clone()),
+                );
+            }
+            required_capabilities.insert_resource(
+                EffectScope::FilesystemWrite,
+                CapabilitySelector::Exact(target),
+            );
+            if matches!(operation, PatchOperation::Delete { .. }) {
+                risk = ToolOperationRisk::Destructive;
+            }
+        }
+        Ok(ToolOperationPlan {
+            required_capabilities,
+            risk,
+            summary: parsed_patch_summary(&parsed),
+        })
+    }
+
     fn approval_summary(
         &self,
         invocation: &orchestral_core::tool_protocol::ToolInvocation,
@@ -65,19 +387,7 @@ impl GuardedToolExecutor for GuardedApplyPatchExecutor {
         let Ok(parsed) = parse_patch(patch) else {
             return "Apply a workspace patch that failed preflight parsing".to_owned();
         };
-        let mut changes = parsed
-            .operations
-            .iter()
-            .take(8)
-            .map(|operation| format!("{} {}", operation.label(), operation.path().display()))
-            .collect::<Vec<_>>();
-        if parsed.operations.len() > changes.len() {
-            changes.push(format!(
-                "and {} more",
-                parsed.operations.len() - changes.len()
-            ));
-        }
-        format!("Apply workspace patch: {}", changes.join(", "))
+        parsed_patch_summary(&parsed)
     }
 
     async fn execute(&self, execution: GuardedToolExecution) -> ToolOutcome {
@@ -131,6 +441,166 @@ impl GuardedToolExecutor for GuardedApplyPatchExecutor {
     }
 }
 
+fn patch_activity_evidence(invocation: &ToolInvocation) -> Vec<ToolActivityEvidence> {
+    const MAX_FILES: usize = 15;
+    let Some(patch) = invocation.arguments.get("patch").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let Ok(parsed) = parse_patch(patch) else {
+        return Vec::new();
+    };
+    let previews = patch_diff_previews(patch, parsed.operations.len());
+    let mut evidence = parsed
+        .operations
+        .iter()
+        .take(MAX_FILES)
+        .enumerate()
+        .map(|(index, operation)| {
+            let preview = previews.get(index).cloned().unwrap_or_default();
+            ToolActivityEvidence::File {
+                operation: match operation {
+                    PatchOperation::Add { .. } => ToolFileActivityKind::Create,
+                    PatchOperation::Update { .. } => ToolFileActivityKind::Update,
+                    PatchOperation::Delete { .. } => ToolFileActivityKind::Delete,
+                },
+                path: operation.path().display().to_owned(),
+                diff: preview.lines,
+                diff_omitted: preview.omitted,
+            }
+        })
+        .collect::<Vec<_>>();
+    if parsed.operations.len() > MAX_FILES {
+        evidence.push(ToolActivityEvidence::Omitted {
+            count: u32::try_from(parsed.operations.len() - MAX_FILES).unwrap_or(u32::MAX),
+        });
+    }
+    evidence
+}
+
+#[derive(Debug, Clone, Default)]
+struct DiffPreview {
+    lines: Vec<ToolDiffLine>,
+    omitted: u32,
+}
+
+fn patch_diff_previews(patch: &str, operation_count: usize) -> Vec<DiffPreview> {
+    const MAX_LINES_PER_FILE: usize = 16;
+    #[derive(Clone, Copy)]
+    enum Mode {
+        Add,
+        Update,
+        Delete,
+    }
+
+    let mut previews = vec![DiffPreview::default(); operation_count];
+    let mut current = None::<(usize, Mode)>;
+    let mut next_index = 0usize;
+    for line in patch.lines() {
+        let mode = if line.starts_with("*** Add File: ") {
+            Some(Mode::Add)
+        } else if line.starts_with("*** Update File: ") {
+            Some(Mode::Update)
+        } else if line.starts_with("*** Delete File: ") {
+            Some(Mode::Delete)
+        } else {
+            None
+        };
+        if let Some(mode) = mode {
+            current = (next_index < operation_count).then_some((next_index, mode));
+            next_index = next_index.saturating_add(1);
+            continue;
+        }
+        let Some((index, mode)) = current else {
+            continue;
+        };
+        let change = match mode {
+            Mode::Add => line
+                .strip_prefix('+')
+                .map(|text| (ToolDiffLineKind::Addition, text)),
+            Mode::Update if line.starts_with("@@") => None,
+            Mode::Update => line
+                .strip_prefix('+')
+                .map(|text| (ToolDiffLineKind::Addition, text))
+                .or_else(|| {
+                    line.strip_prefix('-')
+                        .map(|text| (ToolDiffLineKind::Deletion, text))
+                })
+                .or_else(|| {
+                    line.strip_prefix(' ')
+                        .map(|text| (ToolDiffLineKind::Context, text))
+                }),
+            Mode::Delete => None,
+        };
+        if let Some((kind, text)) = change {
+            let preview = &mut previews[index];
+            if preview.lines.len() < MAX_LINES_PER_FILE {
+                preview.lines.push(ToolDiffLine {
+                    kind,
+                    text: bounded_diff_text(text),
+                });
+            } else {
+                preview.omitted = preview.omitted.saturating_add(1);
+            }
+        }
+    }
+    previews
+}
+
+fn added_content_preview(content: &str) -> (Vec<ToolDiffLine>, u32) {
+    const MAX_LINES: usize = 16;
+    let mut lines = Vec::new();
+    let mut omitted = 0u32;
+    for line in content.lines() {
+        if lines.len() < MAX_LINES {
+            lines.push(ToolDiffLine {
+                kind: ToolDiffLineKind::Addition,
+                text: bounded_diff_text(line),
+            });
+        } else {
+            omitted = omitted.saturating_add(1);
+        }
+    }
+    (lines, omitted)
+}
+
+fn bounded_diff_text(value: &str) -> String {
+    const MAX_CHARS: usize = 240;
+    let mut chars = value.chars();
+    let mut text = chars
+        .by_ref()
+        .take(MAX_CHARS)
+        .map(|character| {
+            if character == '\t' {
+                ' '
+            } else if character.is_control() {
+                '�'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    if chars.next().is_some() {
+        text.push('…');
+    }
+    text
+}
+
+fn parsed_patch_summary(parsed: &ParsedPatch) -> String {
+    let mut changes = parsed
+        .operations
+        .iter()
+        .take(8)
+        .map(|operation| format!("{} {}", operation.label(), operation.path().display()))
+        .collect::<Vec<_>>();
+    if parsed.operations.len() > changes.len() {
+        changes.push(format!(
+            "and {} more",
+            parsed.operations.len() - changes.len()
+        ));
+    }
+    format!("Apply workspace patch: {}", changes.join(", "))
+}
+
 pub fn guarded_apply_patch_descriptor(restriction: ToolRestriction) -> ToolDescriptor {
     ToolDescriptor {
         tool_id: ToolId::new("orchestral/apply_patch/v1"),
@@ -156,34 +626,84 @@ pub fn guarded_apply_patch_descriptor(restriction: ToolRestriction) -> ToolDescr
                 "additionalProperties": false
             }),
         },
-        output_schema: json!({
-            "type": "object",
-            "required": ["changed_files", "changes"],
-            "properties": {
-                "changed_files": { "type": "integer" },
-                "changes": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "required": ["operation", "path", "bytes"],
-                        "properties": {
-                            "operation": { "type": "string" },
-                            "path": { "type": "string" },
-                            "bytes": { "type": "integer" },
-                            "before_digest": { "type": "string" },
-                            "after_digest": { "type": "string" }
-                        },
-                        "additionalProperties": false
-                    }
-                }
-            },
-            "additionalProperties": false
-        }),
+        output_schema: file_change_output_schema(),
         effect_scopes: BTreeSet::from([EffectScope::FilesystemRead, EffectScope::FilesystemWrite]),
         restriction,
         idempotency: ToolIdempotency::NonIdempotent,
         concurrency: ToolConcurrency::PerRunSerial,
     }
+}
+
+pub fn guarded_file_write_descriptor(restriction: ToolRestriction) -> ToolDescriptor {
+    ToolDescriptor {
+        tool_id: ToolId::new("orchestral/file_write/v1"),
+        model_schema: ModelToolSchema {
+            name: "file_write".to_owned(),
+            description: concat!(
+                "Create a new UTF-8 text file or intentionally replace a complete existing file ",
+                "inside the Host-approved workspace. Use mode='create' only when the path must ",
+                "not exist. Use mode='replace' only after reading the complete file from offset 1 ",
+                "through eof, and pass that file_read content_digest as expected_digest. Use ",
+                "apply_patch instead for targeted edits to existing files. Parent directories ",
+                "must already exist."
+            )
+            .to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["path", "content", "mode"],
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Normalized workspace-relative target path."
+                    },
+                    "content": {
+                        "type": "string",
+                        "maxLength": MAX_RESULTING_FILE_BYTES
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["create", "replace"]
+                    },
+                    "expected_digest": {
+                        "type": "string",
+                        "description": "Required only for replace: complete-file content_digest returned by file_read."
+                    }
+                },
+                "additionalProperties": false
+            }),
+        },
+        output_schema: file_change_output_schema(),
+        effect_scopes: BTreeSet::from([EffectScope::FilesystemRead, EffectScope::FilesystemWrite]),
+        restriction,
+        idempotency: ToolIdempotency::NonIdempotent,
+        concurrency: ToolConcurrency::PerRunSerial,
+    }
+}
+
+fn file_change_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["changed_files", "changes"],
+        "properties": {
+            "changed_files": { "type": "integer" },
+            "changes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["operation", "path", "bytes"],
+                    "properties": {
+                        "operation": { "type": "string" },
+                        "path": { "type": "string" },
+                        "bytes": { "type": "integer" },
+                        "before_digest": { "type": "string" },
+                        "after_digest": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                }
+            }
+        },
+        "additionalProperties": false
+    })
 }
 
 #[derive(Debug)]
@@ -274,28 +794,37 @@ impl PreparedChange {
             ),
             Self::Delete { path, before, .. } => ("delete", path, Some(before.as_slice()), None),
         };
-        let mut value = Map::from_iter([
-            ("operation".to_owned(), Value::String(operation.to_owned())),
-            ("path".to_owned(), Value::String(path.display().to_owned())),
-            (
-                "bytes".to_owned(),
-                Value::from(after.or(before).map_or(0, <[u8]>::len) as u64),
-            ),
-        ]);
-        if let Some(before) = before {
-            value.insert(
-                "before_digest".to_owned(),
-                Value::String(Digest::sha256(before).to_string()),
-            );
-        }
-        if let Some(after) = after {
-            value.insert(
-                "after_digest".to_owned(),
-                Value::String(Digest::sha256(after).to_string()),
-            );
-        }
-        Value::Object(value)
+        change_output(operation, path, before, after)
     }
+}
+
+fn change_output(
+    operation: &str,
+    path: &PatchPath,
+    before: Option<&[u8]>,
+    after: Option<&[u8]>,
+) -> Value {
+    let mut value = Map::from_iter([
+        ("operation".to_owned(), Value::String(operation.to_owned())),
+        ("path".to_owned(), Value::String(path.display().to_owned())),
+        (
+            "bytes".to_owned(),
+            Value::from(after.or(before).map_or(0, <[u8]>::len) as u64),
+        ),
+    ]);
+    if let Some(before) = before {
+        value.insert(
+            "before_digest".to_owned(),
+            Value::String(Digest::sha256(before).to_string()),
+        );
+    }
+    if let Some(after) = after {
+        value.insert(
+            "after_digest".to_owned(),
+            Value::String(Digest::sha256(after).to_string()),
+        );
+    }
+    Value::Object(value)
 }
 
 fn prepare_patch(
@@ -767,8 +1296,65 @@ mod tests {
     use std::path::PathBuf;
 
     use cap_std::{ambient_authority, fs::Dir};
+    use orchestral_core::agent_protocol::wire::{
+        RunId, ToolActivityEvidence, ToolDiffLine, ToolDiffLineKind, ToolFileActivityKind,
+    };
+    use orchestral_core::tool_protocol::{ToolCallId, ToolId, ToolInvocation};
+    use serde_json::json;
 
-    use super::{commit_change, parse_patch, prepare_patch, EffectiveRoots};
+    use super::{
+        commit_change, parse_patch, patch_activity_evidence, prepare_patch, EffectiveRoots,
+    };
+
+    #[test]
+    fn patch_adapter_emits_structured_file_and_diff_evidence() {
+        let invocation = ToolInvocation {
+            run_id: RunId::new("run-evidence"),
+            call_id: ToolCallId::new("call-evidence"),
+            tool_id: ToolId::new("orchestral/apply_patch/v1"),
+            arguments: json!({
+                "patch": concat!(
+                    "*** Begin Patch\n",
+                    "*** Update File: src/lib.rs\n",
+                    "@@\n",
+                    "-old\n",
+                    "+new\n",
+                    "*** Add File: tests/new.rs\n",
+                    "+test\n",
+                    "*** End Patch"
+                )
+            }),
+        };
+        assert_eq!(
+            patch_activity_evidence(&invocation),
+            vec![
+                ToolActivityEvidence::File {
+                    operation: ToolFileActivityKind::Update,
+                    path: "src/lib.rs".to_owned(),
+                    diff: vec![
+                        ToolDiffLine {
+                            kind: ToolDiffLineKind::Deletion,
+                            text: "old".to_owned(),
+                        },
+                        ToolDiffLine {
+                            kind: ToolDiffLineKind::Addition,
+                            text: "new".to_owned(),
+                        },
+                    ],
+                    diff_omitted: 0,
+                },
+                ToolActivityEvidence::File {
+                    operation: ToolFileActivityKind::Create,
+                    path: "tests/new.rs".to_owned(),
+                    diff: vec![ToolDiffLine {
+                        kind: ToolDiffLineKind::Addition,
+                        text: "test".to_owned(),
+                    }],
+                    diff_omitted: 0,
+                },
+            ]
+        );
+    }
 
     #[test]
     fn captured_parent_capability_prevents_symlink_swap_escape() {

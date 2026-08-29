@@ -6,11 +6,11 @@ expression: "render_to_string(&state, 120, 40)"
   › 按照发布检查 Skill 验证 checkout 服务；如果远程查询失败，就用本地测试恢复。
 
   ✓ Loaded 1 skill
-      └ code-fix
+    └ code-fix
   × Called 1 MCP tool · 1 failed
-      └ mcp__inventory__deployment_color (failed)
+    └ mcp__inventory__deployment_color (failed)
   ✓ Ran 1 command
-      └ cargo test -p orchestral-cli
+    └ cargo test -p orchestral-cli
 
   • 已恢复完成：MCP 查询超时，但本地发布检查的 18 项测试全部通过；没有发现需要修改的文件。
 

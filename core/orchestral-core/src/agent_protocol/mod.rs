@@ -31,7 +31,8 @@ pub mod wire {
         ReconciliationProofRef, RequestId, RequestResolution, ResourceBinding, ResourceBindingId,
         ResourceBindingMode, ResourceBindingSkip, ResourceBindingSkipCode, ResourceCapability,
         ResourceId, ResourceKind, ResourceRef, ResourceRevision, RunId, RunLimitKind, RunLimits,
-        SchemaRef, TelemetryId, ToolActivityId, ToolActivityState, UsageReport,
+        SchemaRef, TelemetryId, ToolActivityEvidence, ToolActivityId, ToolActivityState,
+        ToolDiffLine, ToolDiffLineKind, ToolFileActivityKind, UsageReport,
     };
 }
 

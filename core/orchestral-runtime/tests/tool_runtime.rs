@@ -18,15 +18,14 @@ use orchestral_core::tool_effect::{
     ToolEffectEvent, ToolEffectEventDraft, ToolEffectEventId, ToolEffectJournalRecord,
     ToolEffectJournalStore, ToolEffectKey, ToolEffectPhase,
 };
-#[cfg(target_os = "macos")]
 use orchestral_core::tool_protocol::HostApprovalIssuer;
 use orchestral_core::tool_protocol::{
-    ApprovalPolicy, EffectScope, EffectiveToolPolicy, EnvironmentPolicy, FilesystemPolicy,
-    HostApprovalVerifier, HostToolPolicy, InMemoryApprovalCapabilityStore,
-    InteractiveCommandPolicy, ModelToolSchema, NetworkPolicy, ProcessPolicy, RunToolGrant,
-    SandboxPolicy, ToolCallId, ToolConcurrency, ToolDescriptor, ToolId, ToolIdempotency,
-    ToolInvocation, ToolOperationPlan, ToolOperationRisk, ToolOutcome, ToolOutput,
-    ToolPolicyBounds, ToolRestriction, TransportLaunchPolicy,
+    ApprovalPolicy, CapabilityRequest, CapabilitySelector, EffectScope, EffectiveToolPolicy,
+    EnvironmentPolicy, FilesystemPolicy, HostApprovalVerifier, HostToolPolicy,
+    InMemoryApprovalCapabilityStore, InteractiveCommandPolicy, ModelToolSchema, NetworkPolicy,
+    ProcessPolicy, RunToolGrant, SandboxPolicy, ToolCallId, ToolConcurrency, ToolDescriptor,
+    ToolId, ToolIdempotency, ToolInvocation, ToolOperationPlan, ToolOperationRisk, ToolOutcome,
+    ToolOutput, ToolPolicyBounds, ToolRestriction, TransportLaunchPolicy,
 };
 use orchestral_runtime::{
     tool_permission_decision_digest,
@@ -64,6 +63,10 @@ fn strings(values: &[&str]) -> BTreeSet<String> {
 
 fn effects(values: &[EffectScope]) -> BTreeSet<EffectScope> {
     values.iter().copied().collect()
+}
+
+fn capabilities(values: &[EffectScope]) -> CapabilityRequest {
+    CapabilityRequest::from_effects(effects(values))
 }
 
 fn interactive_process(command_shells: BTreeSet<String>) -> ProcessPolicy {
@@ -206,6 +209,12 @@ struct EchoExecutor {
 
 struct PlannedEchoExecutor {
     calls: AtomicUsize,
+    operation: ToolOperationPlan,
+}
+
+struct LeaseEchoExecutor {
+    calls: AtomicUsize,
+    saw_approved_network_lease: AtomicBool,
     operation: ToolOperationPlan,
 }
 
@@ -446,6 +455,34 @@ impl GuardedToolExecutor for PlannedEchoExecutor {
     }
 }
 
+#[async_trait]
+impl GuardedToolExecutor for LeaseEchoExecutor {
+    fn planning_contract(&self) -> serde_json::Value {
+        json!({ "contract": "test.lease-echo/v1" })
+    }
+
+    fn plan_operation(
+        &self,
+        _invocation: &ToolInvocation,
+        _descriptor: &ToolDescriptor,
+        _effective_policy: &EffectiveToolPolicy,
+    ) -> Result<ToolOperationPlan, ToolOutcome> {
+        Ok(self.operation.clone())
+    }
+
+    async fn execute(&self, execution: GuardedToolExecution) -> ToolOutcome {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.saw_approved_network_lease.store(
+            execution.lease.was_approved()
+                && execution.lease.granted().requires(EffectScope::Network),
+            Ordering::SeqCst,
+        );
+        ToolOutcome::Completed {
+            output: json!({ "result": execution.invocation.arguments["value"].clone() }).into(),
+        }
+    }
+}
+
 async fn seed_effect_trace(
     journal: &Arc<InMemoryToolEffectJournalStore>,
     bounds: &ToolPolicyBounds,
@@ -482,7 +519,7 @@ async fn seed_effect_trace(
         policy_digest: effective.digest().unwrap(),
         descriptor_digest: descriptor.digest().unwrap(),
         idempotency: descriptor.idempotency,
-        effect_scopes: operation.effect_scopes,
+        effect_scopes: operation.required_capabilities.effects,
     };
     let key = prepared.key();
     journal
@@ -556,8 +593,106 @@ async fn approval_required_never_calls_executor() {
     let GuardedToolResult::ApprovalRequired { binding, .. } = result else {
         panic!("expected an approval request");
     };
-    assert_eq!(binding.requested_scopes, effects(&[EffectScope::Process]));
+    assert_eq!(
+        binding.requested_capabilities,
+        capabilities(&[EffectScope::Process])
+    );
     assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn network_authority_is_requested_before_permission_and_resumes_with_one_lease() {
+    let mut bounds = policy(ApprovalPolicy::NotRequired);
+    bounds.sandbox.required = true;
+    bounds
+        .allowed_effects
+        .extend([EffectScope::Network, EffectScope::ExternalSideEffect]);
+    bounds.network.allow_unrestricted = true;
+
+    let mut required_capabilities = CapabilityRequest::from_effects(BTreeSet::from([
+        EffectScope::Process,
+        EffectScope::Network,
+        EffectScope::ExternalSideEffect,
+    ]));
+    required_capabilities.insert_resource(EffectScope::Network, CapabilitySelector::Unrestricted);
+    required_capabilities.insert_resource(
+        EffectScope::ExternalSideEffect,
+        CapabilitySelector::Unrestricted,
+    );
+    let operation = ToolOperationPlan {
+        required_capabilities: required_capabilities.clone(),
+        risk: ToolOperationRisk::Elevated,
+        summary: "Connect to an external service".to_owned(),
+    };
+    let executor = Arc::new(LeaseEchoExecutor {
+        calls: AtomicUsize::new(0),
+        saw_approved_network_lease: AtomicBool::new(false),
+        operation: operation.clone(),
+    });
+    let runtime =
+        runtime(bounds.clone()).with_permission_policy(Arc::new(WorkspacePermissionPolicy));
+    let mut tool = descriptor(bounds.clone(), ToolConcurrency::ParallelSafe);
+    tool.effect_scopes = bounds.allowed_effects.clone();
+    runtime.register(tool, executor.clone()).unwrap();
+
+    let first = runtime
+        .invoke(
+            invocation("network"),
+            RunToolGrant {
+                bounds: bounds.clone(),
+            },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    let GuardedToolResult::ApprovalRequired { binding, .. } = first else {
+        panic!("ungranted network authority must enter approval")
+    };
+    assert_eq!(binding.requested_capabilities, required_capabilities);
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+
+    let capability = HostApprovalIssuer::new(SIGNING_KEY)
+        .unwrap()
+        .issue(binding, i64::MAX)
+        .unwrap();
+    let resumed = runtime
+        .invoke(
+            invocation("network"),
+            RunToolGrant {
+                bounds: bounds.clone(),
+            },
+            Some(capability.clone()),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(
+        resumed,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Completed { .. },
+            cached: false,
+        }
+    ));
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+    assert!(executor.saw_approved_network_lease.load(Ordering::SeqCst));
+
+    let mut other_invocation = invocation("network");
+    other_invocation.call_id = ToolCallId::new("call-2");
+    let replay = runtime
+        .invoke(
+            other_invocation,
+            RunToolGrant { bounds },
+            Some(capability),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(
+        replay,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Rejected { ref code, .. },
+            cached: false,
+        } if code == "approval_binding_mismatch"
+    ));
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -574,8 +709,7 @@ async fn workspace_policy_authorizes_the_planned_effects_not_the_tool_envelope()
     let runtime = runtime_with_effect_journal(bounds.clone(), journal.clone())
         .with_permission_policy(Arc::new(WorkspacePermissionPolicy));
     let operation = ToolOperationPlan {
-        effect_scopes: effects(&[EffectScope::Process]),
-        targets: strings(&["workspace"]),
+        required_capabilities: capabilities(&[EffectScope::Process]),
         risk: ToolOperationRisk::Elevated,
         summary: "Update the sandboxed workspace".to_owned(),
     };
@@ -609,7 +743,10 @@ async fn workspace_policy_authorizes_the_planned_effects_not_the_tool_envelope()
     let key = ToolEffectKey::new(RunId::new("run-1"), ToolCallId::new("call-1"));
     let records = journal.load_effect(&key).await.unwrap();
     let projection = replay_tool_effect(&key, &records).unwrap().unwrap();
-    assert_eq!(projection.prepared.effect_scopes, operation.effect_scopes);
+    assert_eq!(
+        projection.prepared.effect_scopes,
+        operation.required_capabilities.effects
+    );
     assert_eq!(
         projection.prepared.operation_digest,
         operation.digest().unwrap()
@@ -623,8 +760,7 @@ async fn workspace_policy_routes_destructive_operations_to_exact_review() {
     let runtime =
         runtime(bounds.clone()).with_permission_policy(Arc::new(WorkspacePermissionPolicy));
     let operation = ToolOperationPlan {
-        effect_scopes: effects(&[EffectScope::Process]),
-        targets: strings(&["workspace"]),
+        required_capabilities: capabilities(&[EffectScope::Process]),
         risk: ToolOperationRisk::Destructive,
         summary: "Reset workspace state".to_owned(),
     };
@@ -650,7 +786,10 @@ async fn workspace_policy_routes_destructive_operations_to_exact_review() {
     let GuardedToolResult::ApprovalRequired { binding, summary } = result else {
         panic!("destructive operation must require review")
     };
-    assert_eq!(binding.requested_scopes, operation.effect_scopes);
+    assert_eq!(
+        binding.requested_capabilities,
+        operation.required_capabilities
+    );
     assert_eq!(binding.operation_digest, operation.digest().unwrap());
     assert_eq!(summary, operation.summary);
     assert_eq!(executor.calls.load(Ordering::SeqCst), 0);

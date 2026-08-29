@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
 
-use orchestral_core::agent_protocol::wire::Digest;
+use orchestral_core::agent_protocol::wire::{Digest, ToolActivityEvidence};
 use orchestral_core::mcp_protocol::{
     McpProtocolEra, McpServerId, McpServerSnapshot, McpToolSnapshot, McpTransportAuthority,
     McpTransportCancellation, McpTransportConnection, McpTransportError, McpTransportFactory,
@@ -18,15 +18,16 @@ use orchestral_core::mcp_protocol::{
     MCP_STATELESS_PROTOCOL_2026_07_28,
 };
 use orchestral_core::tool_protocol::{
-    ApprovalCapabilityStore, ApprovalPolicy, EffectScope, ModelToolSchema, ToolConcurrency,
-    ToolDescriptor, ToolId, ToolIdempotency, ToolOutcome, ToolRestriction,
+    ApprovalCapabilityStore, ApprovalPolicy, CapabilityRequest, CapabilitySelector, EffectScope,
+    ModelToolSchema, ToolConcurrency, ToolDescriptor, ToolId, ToolIdempotency, ToolInvocation,
+    ToolOperationPlan, ToolOperationRisk, ToolOutcome, ToolRestriction,
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::tool_runtime::{
     GuardedToolExecution, GuardedToolExecutor, GuardedToolRuntime, ToolRuntimeError,
 };
-use crate::tools::shell_sandbox::{sandbox_command, ShellSandboxPolicy};
+use crate::tools::shell_sandbox::{sandbox_command, SandboxNetworkAccess, ShellSandboxPolicy};
 
 const DEFAULT_MCP_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SAFE_MCP_HEADER_INTEGER: u64 = 9_007_199_254_740_991;
@@ -398,7 +399,7 @@ impl McpTransportFactory for StdioMcpTransportFactory {
                 writable_roots: self.sandbox.writable_roots.iter().cloned().collect(),
                 allow_child_processes: false,
                 launcher_programs: vec![self.program.clone()],
-                network_targets: BTreeSet::new(),
+                network: SandboxNetworkAccess::Disabled,
                 linux_bwrap_path: None,
             },
         )
@@ -1242,6 +1243,90 @@ struct GuardedMcpToolExecutor {
 
 #[async_trait]
 impl GuardedToolExecutor for GuardedMcpToolExecutor {
+    fn planning_contract(&self) -> Value {
+        json!({
+            "contract": "orchestral.mcp-operation-planner/v1",
+            "transportBinding": self.manager.config.transport.authority().binding_digest,
+            "tool": self.tool_name,
+        })
+    }
+
+    fn activity_evidence(
+        &self,
+        _invocation: &ToolInvocation,
+        _outcome: Option<&ToolOutcome>,
+    ) -> Vec<ToolActivityEvidence> {
+        vec![ToolActivityEvidence::Note {
+            text: format!("{}/{}", self.manager.config.server_id, self.tool_name),
+        }]
+    }
+
+    fn plan_operation(
+        &self,
+        invocation: &ToolInvocation,
+        descriptor: &ToolDescriptor,
+        _effective_policy: &orchestral_core::tool_protocol::EffectiveToolPolicy,
+    ) -> Result<ToolOperationPlan, ToolOutcome> {
+        let mut required_capabilities =
+            CapabilityRequest::from_effects(self.manager.config.effect_scopes());
+        for program in self.manager.config.allowed_programs() {
+            required_capabilities
+                .insert_resource(EffectScope::Process, CapabilitySelector::Exact(program));
+        }
+        for root in self.manager.config.filesystem_read_roots() {
+            required_capabilities.insert_resource(
+                EffectScope::FilesystemRead,
+                CapabilitySelector::Subtree(root),
+            );
+        }
+        for root in self.manager.config.filesystem_write_roots() {
+            required_capabilities.insert_resource(
+                EffectScope::FilesystemWrite,
+                CapabilitySelector::Subtree(root),
+            );
+        }
+        for target in self.manager.config.allowed_network_targets() {
+            required_capabilities
+                .insert_resource(EffectScope::Network, CapabilitySelector::Exact(target));
+        }
+        for name in self.manager.config.environment_names() {
+            required_capabilities.insert_resource(
+                EffectScope::EnvironmentRead,
+                CapabilitySelector::Exact(name),
+            );
+        }
+        for reference in self.manager.config.credential_references() {
+            required_capabilities.insert_resource(
+                EffectScope::SecretRead,
+                CapabilitySelector::Exact(reference),
+            );
+        }
+        if required_capabilities
+            .effects
+            .contains(&EffectScope::ExternalSideEffect)
+        {
+            required_capabilities.insert_resource(
+                EffectScope::ExternalSideEffect,
+                CapabilitySelector::Exact(format!(
+                    "mcp:{}:{}",
+                    self.manager.config.server_id, self.tool_name
+                )),
+            );
+        }
+        let operation = ToolOperationPlan {
+            required_capabilities,
+            risk: ToolOperationRisk::Elevated,
+            summary: self.approval_summary(invocation),
+        };
+        operation
+            .validate_envelope(&descriptor.effect_scopes)
+            .map_err(|error| ToolOutcome::Rejected {
+                code: "mcp_operation_invalid".to_owned(),
+                message: error.message,
+            })?;
+        Ok(operation)
+    }
+
     fn approval_summary(
         &self,
         invocation: &orchestral_core::tool_protocol::ToolInvocation,
@@ -1257,7 +1342,7 @@ impl GuardedToolExecutor for GuardedMcpToolExecutor {
     }
 
     async fn execute(&self, execution: GuardedToolExecution) -> ToolOutcome {
-        if execution.approval.is_none()
+        if !execution.lease.was_approved()
             || execution.effective_policy.bounds().approval != ApprovalPolicy::Required
         {
             return ToolOutcome::Rejected {

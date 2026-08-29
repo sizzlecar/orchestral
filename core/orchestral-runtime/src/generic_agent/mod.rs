@@ -27,7 +27,7 @@ use orchestral_core::agent_protocol::{
         PendingRequestPayload, Provenance, ProviderCommandDisposition, ProviderCommandOutcome,
         RequestId, RequestResolution, ResourceBindingMode, ResourceBindingSkip,
         ResourceBindingSkipCode, ResourceCapability, ResourceKind, RunId, RunLimitKind,
-        TelemetryId, ToolActivityId, ToolActivityState, UsageReport,
+        TelemetryId, ToolActivityEvidence, ToolActivityId, ToolActivityState, UsageReport,
     },
     AGENT_PROTOCOL_V1,
 };
@@ -230,9 +230,11 @@ impl GenericAgentConfig {
                 "as acceptance constraints: establish them before dependent work and verify ",
                 "them before delivery. Do not broaden completed work with unrequested ",
                 "integration, publication, cleanup, or reversal. ",
-                "Prefer a dedicated Tool over a shell equivalent when one is ",
-                "available. For workspace text changes, inspect the target, use apply_patch, ",
-                "and run relevant verification. Treat every Tool failure as an observation to ",
+                "Prefer a dedicated Tool over a shell equivalent when one is available. For ",
+                "workspace text changes, use file_write to create a file or intentionally ",
+                "replace a complete file, and use apply_patch for targeted changes to existing ",
+                "files. Inspect existing content before changing it and run relevant ",
+                "verification. Treat every Tool failure as an observation to ",
                 "correct or safely work around; report completion only from successful evidence."
             )
             .to_owned(),

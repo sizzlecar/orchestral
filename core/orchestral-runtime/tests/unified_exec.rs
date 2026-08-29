@@ -13,7 +13,9 @@ use orchestral_core::tool_protocol::{
     ProcessPolicy, RunToolGrant, SandboxPolicy, ToolCallId, ToolId, ToolInvocation, ToolOutcome,
     ToolOutput, ToolPolicyBounds, ToolRestriction, TransportLaunchPolicy,
 };
-use orchestral_core::tool_protocol::{EffectScope, ToolOperationPlan, ToolOperationRisk};
+use orchestral_core::tool_protocol::{
+    CapabilityRequest, EffectScope, ToolOperationPlan, ToolOperationRisk,
+};
 #[cfg(target_os = "macos")]
 use orchestral_runtime::tools::{
     guarded_exec_command_descriptor, guarded_write_stdin_descriptor,
@@ -44,8 +46,9 @@ fn effects() -> BTreeSet<EffectScope> {
 
 fn test_operation(summary: &str) -> ToolOperationPlan {
     ToolOperationPlan {
-        effect_scopes: BTreeSet::from([EffectScope::Process]),
-        targets: BTreeSet::from(["test-process".to_owned()]),
+        required_capabilities: CapabilityRequest::from_effects(BTreeSet::from([
+            EffectScope::Process,
+        ])),
         risk: ToolOperationRisk::Routine,
         summary: summary.to_owned(),
     }

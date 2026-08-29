@@ -184,7 +184,7 @@ impl AgentApprovalBridge for InMemoryHostApprovalBroker {
 mod tests {
     use super::*;
     use orchestral_core::agent_protocol::wire::{Digest, RunId};
-    use orchestral_core::tool_protocol::{EffectScope, ToolCallId, ToolId};
+    use orchestral_core::tool_protocol::{CapabilityRequest, EffectScope, ToolCallId, ToolId};
     use std::collections::BTreeSet;
 
     #[tokio::test]
@@ -198,7 +198,9 @@ mod tests {
             args_digest: Digest::sha256("args"),
             operation_digest: Digest::sha256("operation"),
             permission_digest: Digest::sha256("permission"),
-            requested_scopes: BTreeSet::from([EffectScope::Process]),
+            requested_capabilities: CapabilityRequest::from_effects(BTreeSet::from([
+                EffectScope::Process,
+            ])),
             policy_digest: Digest::sha256("policy"),
         };
         broker.stage(&request_id, binding.clone()).await.unwrap();
@@ -222,7 +224,9 @@ mod tests {
             args_digest: Digest::sha256("args-1"),
             operation_digest: Digest::sha256("operation-1"),
             permission_digest: Digest::sha256("permission"),
-            requested_scopes: BTreeSet::from([EffectScope::Process]),
+            requested_capabilities: CapabilityRequest::from_effects(BTreeSet::from([
+                EffectScope::Process,
+            ])),
             policy_digest: Digest::sha256("policy"),
         };
         let second = ApprovalBinding {

@@ -10,8 +10,11 @@ use orchestral_core::tool_protocol::{
     ToolOutput, ToolPolicyBounds, ToolRestriction,
 };
 use orchestral_runtime::{
-    tools::{guarded_apply_patch_descriptor, GuardedApplyPatchExecutor},
-    GuardedToolResult, GuardedToolRuntime,
+    tools::{
+        guarded_apply_patch_descriptor, guarded_file_write_descriptor, GuardedApplyPatchExecutor,
+        GuardedFileWriteExecutor,
+    },
+    GuardedToolResult, GuardedToolRuntime, WorkspacePermissionPolicy,
 };
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -99,12 +102,90 @@ fn patch_runtime(
     (runtime, bounds)
 }
 
+fn file_write_runtime(
+    workspace: &TestWorkspace,
+) -> (
+    GuardedToolRuntime<InMemoryApprovalCapabilityStore>,
+    ToolPolicyBounds,
+) {
+    let mut bounds = patch_bounds(&workspace.root, ApprovalPolicy::NotRequired);
+    bounds.sandbox.required = true;
+    bounds
+        .sandbox
+        .allowed_profiles
+        .insert("workspace".to_owned());
+    let verifier =
+        HostApprovalVerifier::new(SIGNING_KEY, InMemoryApprovalCapabilityStore::default()).unwrap();
+    let runtime = GuardedToolRuntime::new(
+        HostToolPolicy {
+            bounds: bounds.clone(),
+        },
+        verifier,
+    )
+    .unwrap()
+    .with_permission_policy(Arc::new(WorkspacePermissionPolicy));
+    runtime
+        .register(
+            guarded_file_write_descriptor(ToolRestriction {
+                bounds: bounds.clone(),
+            }),
+            Arc::new(GuardedFileWriteExecutor::new(&workspace.root).unwrap()),
+        )
+        .unwrap();
+    (runtime, bounds)
+}
+
+fn patch_workspace_runtime(
+    workspace: &TestWorkspace,
+) -> (
+    GuardedToolRuntime<InMemoryApprovalCapabilityStore>,
+    ToolPolicyBounds,
+) {
+    let mut bounds = patch_bounds(&workspace.root, ApprovalPolicy::NotRequired);
+    bounds.sandbox.required = true;
+    bounds
+        .sandbox
+        .allowed_profiles
+        .insert("workspace".to_owned());
+    let verifier =
+        HostApprovalVerifier::new(SIGNING_KEY, InMemoryApprovalCapabilityStore::default()).unwrap();
+    let runtime = GuardedToolRuntime::new(
+        HostToolPolicy {
+            bounds: bounds.clone(),
+        },
+        verifier,
+    )
+    .unwrap()
+    .with_permission_policy(Arc::new(WorkspacePermissionPolicy));
+    runtime
+        .register(
+            guarded_apply_patch_descriptor(ToolRestriction {
+                bounds: bounds.clone(),
+            }),
+            Arc::new(GuardedApplyPatchExecutor::new(&workspace.root).unwrap()),
+        )
+        .unwrap();
+    (runtime, bounds)
+}
+
 fn invocation(call_id: impl Into<String>, patch: impl Into<String>) -> ToolInvocation {
     ToolInvocation {
         run_id: RunId::new("apply-patch-run"),
         call_id: ToolCallId::new(call_id),
         tool_id: ToolId::new("orchestral/apply_patch/v1"),
         arguments: json!({ "patch": patch.into() }),
+    }
+}
+
+fn file_write_invocation(
+    call_id: impl Into<String>,
+    arguments: serde_json::Value,
+) -> ToolInvocation {
+    ToolInvocation {
+        run_id: RunId::new("file-write-run"),
+        call_id: ToolCallId::new(call_id),
+        tool_id: ToolId::new("orchestral/file_write/v1"),
+        arguments,
     }
 }
 
@@ -126,6 +207,24 @@ async fn invoke(
         .await
 }
 
+async fn invoke_file_write(
+    runtime: &GuardedToolRuntime<InMemoryApprovalCapabilityStore>,
+    bounds: &ToolPolicyBounds,
+    call_id: impl Into<String>,
+    arguments: serde_json::Value,
+) -> GuardedToolResult {
+    runtime
+        .invoke(
+            file_write_invocation(call_id, arguments),
+            RunToolGrant {
+                bounds: bounds.clone(),
+            },
+            None,
+            CancellationToken::new(),
+        )
+        .await
+}
+
 fn completed(result: &GuardedToolResult) -> &serde_json::Value {
     let GuardedToolResult::Outcome {
         outcome: ToolOutcome::Completed {
@@ -137,6 +236,174 @@ fn completed(result: &GuardedToolResult) -> &serde_json::Value {
         panic!("expected completed inline result, got {result:?}")
     };
     output
+}
+
+#[tokio::test]
+async fn file_write_creates_and_conditionally_replaces_complete_text() {
+    let workspace = TestWorkspace::new("file-write-lifecycle");
+    let (runtime, bounds) = file_write_runtime(&workspace);
+
+    let created = invoke_file_write(
+        &runtime,
+        &bounds,
+        "create",
+        json!({
+            "path": "src.rs",
+            "content": "pub fn value() -> u32 { 1 }\n",
+            "mode": "create"
+        }),
+    )
+    .await;
+    let output = completed(&created);
+    assert_eq!(output["changed_files"], 1);
+    assert_eq!(output["changes"][0]["operation"], "add");
+    let original = std::fs::read(workspace.path("src.rs")).unwrap();
+    let expected_digest = orchestral_core::agent_protocol::wire::Digest::sha256(&original);
+
+    let replaced = invoke_file_write(
+        &runtime,
+        &bounds,
+        "replace",
+        json!({
+            "path": "src.rs",
+            "content": "pub fn value() -> u32 { 2 }\n",
+            "mode": "replace",
+            "expected_digest": expected_digest,
+        }),
+    )
+    .await;
+    let output = completed(&replaced);
+    assert_eq!(output["changed_files"], 1);
+    assert_eq!(output["changes"][0]["operation"], "update");
+    assert_eq!(
+        std::fs::read_to_string(workspace.path("src.rs")).unwrap(),
+        "pub fn value() -> u32 { 2 }\n"
+    );
+}
+
+#[tokio::test]
+async fn file_write_preconditions_prevent_accidental_overwrite_and_escape() {
+    let workspace = TestWorkspace::new("file-write-preconditions");
+    std::fs::write(workspace.path("stable.txt"), "stable\n").unwrap();
+    let (runtime, bounds) = file_write_runtime(&workspace);
+
+    let missing_digest = invoke_file_write(
+        &runtime,
+        &bounds,
+        "missing-digest",
+        json!({
+            "path": "stable.txt",
+            "content": "changed\n",
+            "mode": "replace"
+        }),
+    )
+    .await;
+    assert!(matches!(
+        missing_digest,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Rejected { ref code, .. },
+            ..
+        } if code == "file_write_precondition_missing"
+    ));
+
+    let stale = invoke_file_write(
+        &runtime,
+        &bounds,
+        "stale",
+        json!({
+            "path": "stable.txt",
+            "content": "changed\n",
+            "mode": "replace",
+            "expected_digest": orchestral_core::agent_protocol::wire::Digest::sha256("older\n"),
+        }),
+    )
+    .await;
+    assert!(matches!(
+        stale,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Rejected { ref code, .. },
+            ..
+        } if code == "file_write_conflict"
+    ));
+
+    let escape = invoke_file_write(
+        &runtime,
+        &bounds,
+        "escape",
+        json!({
+            "path": "../outside.txt",
+            "content": "escape\n",
+            "mode": "create"
+        }),
+    )
+    .await;
+    assert!(matches!(
+        escape,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Rejected { .. },
+            ..
+        }
+    ));
+    assert_eq!(
+        std::fs::read_to_string(workspace.path("stable.txt")).unwrap(),
+        "stable\n"
+    );
+}
+
+#[tokio::test]
+async fn workspace_policy_auto_runs_safe_patch_but_reviews_delete() {
+    let workspace = TestWorkspace::new("patch-risk");
+    std::fs::write(workspace.path("source.txt"), "one\n").unwrap();
+    std::fs::write(workspace.path("delete.txt"), "keep until approved\n").unwrap();
+    let (runtime, bounds) = patch_workspace_runtime(&workspace);
+
+    let update = invoke(
+        &runtime,
+        &bounds,
+        "update",
+        "*** Begin Patch\n*** Update File: source.txt\n@@\n-one\n+two\n*** End Patch",
+    )
+    .await;
+    completed(&update);
+    assert_eq!(
+        std::fs::read_to_string(workspace.path("source.txt")).unwrap(),
+        "two\n"
+    );
+
+    let delete_call = invocation(
+        "delete",
+        "*** Begin Patch\n*** Delete File: delete.txt\n*** End Patch",
+    );
+    let first = runtime
+        .invoke(
+            delete_call.clone(),
+            RunToolGrant {
+                bounds: bounds.clone(),
+            },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    let GuardedToolResult::ApprovalRequired { binding, summary } = first else {
+        panic!("destructive patch should require exact review")
+    };
+    assert!(summary.contains("delete delete.txt"));
+    assert!(workspace.path("delete.txt").exists());
+
+    let capability = HostApprovalIssuer::new(SIGNING_KEY)
+        .unwrap()
+        .issue(binding, i64::MAX)
+        .unwrap();
+    let result = runtime
+        .invoke(
+            delete_call,
+            RunToolGrant { bounds },
+            Some(capability),
+            CancellationToken::new(),
+        )
+        .await;
+    completed(&result);
+    assert!(!workspace.path("delete.txt").exists());
 }
 
 #[tokio::test]

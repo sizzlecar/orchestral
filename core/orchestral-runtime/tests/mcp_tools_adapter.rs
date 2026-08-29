@@ -298,6 +298,7 @@ fn http_bounds(config: &GuardedMcpServerConfig, timeout_ms: u64) -> ToolPolicyBo
         filesystem: FilesystemPolicy::default(),
         network: NetworkPolicy {
             allowed_targets: config.allowed_network_targets(),
+            allow_unrestricted: false,
         },
         environment: EnvironmentPolicy::default(),
         allowed_credentials: config.credential_references(),

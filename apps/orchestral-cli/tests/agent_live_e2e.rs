@@ -422,7 +422,7 @@ fn local_cli_creates_and_verifies_a_file_with_exec_disabled() {
     const CONTEXT_MARKER: &str = "需求上下文=雪豹-7319🧩";
     const GENERATED_CONTENT: &str = "generated from 雪豹-7319🧩\n";
 
-    let workspace = TestWorkspace::new("patch-without-shell");
+    let workspace = TestWorkspace::new("write-without-shell");
     fs::write(
         workspace.path("request.txt"),
         format!("{CONTEXT_MARKER}\nCreate generated.txt from this request.\n"),
@@ -439,6 +439,7 @@ fn local_cli_creates_and_verifies_a_file_with_exec_disabled() {
                     "artifact_read",
                     "file_read",
                     "file_search",
+                    "file_write",
                     "orchestral_request_input",
                     "text_search"
                 ]
@@ -449,14 +450,11 @@ fn local_cli_creates_and_verifies_a_file_with_exec_disabled() {
             assert!(model_request_text(&request.body).contains(CONTEXT_MARKER));
             openai_tool_response(
                 "create-generated",
-                "apply_patch",
+                "file_write",
                 json!({
-                    "patch": concat!(
-                        "*** Begin Patch\n",
-                        "*** Add File: generated.txt\n",
-                        "+generated from 雪豹-7319🧩\n",
-                        "*** End Patch"
-                    )
+                    "path": "generated.txt",
+                    "content": GENERATED_CONTENT,
+                    "mode": "create"
                 }),
             )
         }),
@@ -479,7 +477,7 @@ fn local_cli_creates_and_verifies_a_file_with_exec_disabled() {
     let output = run_to_completion(
         local_agent_command(
             &workspace,
-            "patch-without-shell-session",
+            "write-without-shell-session",
             concat!(
                 "Use workspace Tools to inspect the request, make the requested file change, ",
                 "verify the resulting file, then report only the success marker."
@@ -504,7 +502,7 @@ fn local_cli_creates_and_verifies_a_file_with_exec_disabled() {
     let exchanges = tool_exchanges(&records);
     assert_eq!(exchanges.len(), 3);
     assert_eq!(tool_name(exchanges[0]), Some("file_read"));
-    assert_eq!(tool_name(exchanges[1]), Some("apply_patch"));
+    assert_eq!(tool_name(exchanges[1]), Some("file_write"));
     assert_eq!(tool_name(exchanges[2]), Some("file_read"));
     assert!(exchanges
         .iter()

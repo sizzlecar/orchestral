@@ -9,6 +9,8 @@ mod builtin;
 mod mcp;
 #[path = "action/shell_sandbox.rs"]
 pub(crate) mod shell_sandbox;
+#[path = "action/windows_sandbox.rs"]
+pub(crate) mod windows_sandbox;
 
 pub use builtin::*;
 pub use mcp::{

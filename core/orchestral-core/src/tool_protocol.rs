@@ -103,6 +103,124 @@ pub enum EffectScope {
     ExternalSideEffect,
 }
 
+/// Host-normalized selector for a resource required by one operation.
+///
+/// `Unrestricted` is deliberately explicit. An adapter that cannot enforce an
+/// exact resource boundary must request this wider selector before policy is
+/// evaluated; it may never silently widen an `Exact` request at execution
+/// time.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "scope", content = "value", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CapabilitySelector {
+    /// No narrower resource identity exists for this effect.
+    Unscoped,
+    /// One exact Host-normalized resource identity.
+    Exact(String),
+    /// One canonical hierarchy root, such as a filesystem subtree.
+    Subtree(String),
+    /// Open-world access for the named effect.
+    Unrestricted,
+}
+
+/// One typed resource requirement. The effect is part of the identity so a
+/// read lease can never be reused as a write lease for the same path.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityResource {
+    pub effect: EffectScope,
+    pub selector: CapabilitySelector,
+}
+
+/// Complete authority requested by one inspected operation.
+///
+/// This is intent, not permission. It is produced before policy evaluation and
+/// remains unchanged whether the eventual decision is automatic, interactive,
+/// or denied.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityRequest {
+    #[serde(default)]
+    pub effects: BTreeSet<EffectScope>,
+    #[serde(default)]
+    pub resources: BTreeSet<CapabilityResource>,
+}
+
+impl CapabilityRequest {
+    pub fn from_effects(effects: BTreeSet<EffectScope>) -> Self {
+        Self {
+            effects,
+            resources: BTreeSet::new(),
+        }
+    }
+
+    pub fn insert_resource(&mut self, effect: EffectScope, selector: CapabilitySelector) {
+        self.effects.insert(effect);
+        self.resources
+            .insert(CapabilityResource { effect, selector });
+    }
+
+    pub fn requires(&self, effect: EffectScope) -> bool {
+        self.effects.contains(&effect)
+    }
+
+    pub fn resources_for(&self, effect: EffectScope) -> impl Iterator<Item = &CapabilitySelector> {
+        self.resources
+            .iter()
+            .filter(move |resource| resource.effect == effect)
+            .map(|resource| &resource.selector)
+    }
+
+    pub fn validate(&self) -> Result<(), ToolProtocolError> {
+        for resource in &self.resources {
+            if !self.effects.contains(&resource.effect) {
+                return Err(ToolProtocolError::new(
+                    ToolProtocolErrorCode::InvalidInvocation,
+                    "capability resource must belong to a requested effect",
+                ));
+            }
+            match &resource.selector {
+                CapabilitySelector::Exact(value) | CapabilitySelector::Subtree(value)
+                    if value.trim().is_empty()
+                        || value.chars().any(char::is_control)
+                        || value != value.trim() =>
+                {
+                    return Err(ToolProtocolError::new(
+                        ToolProtocolErrorCode::InvalidInvocation,
+                        "capability resource identities must be normalized non-empty strings",
+                    ));
+                }
+                CapabilitySelector::Unrestricted
+                    if !matches!(
+                        resource.effect,
+                        EffectScope::Network | EffectScope::ExternalSideEffect
+                    ) =>
+                {
+                    return Err(ToolProtocolError::new(
+                        ToolProtocolErrorCode::InvalidInvocation,
+                        "unrestricted capability selectors are limited to open-world effects",
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if self.effects.contains(&EffectScope::Network)
+            && self.resources_for(EffectScope::Network).next().is_none()
+        {
+            return Err(ToolProtocolError::new(
+                ToolProtocolErrorCode::InvalidInvocation,
+                "network operations must declare exact or unrestricted network authority",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn digest(&self) -> Result<Digest, ToolProtocolError> {
+        self.validate()?;
+        canonical_json_digest(self)
+    }
+}
+
 /// Host-normalized risk carried by one concrete Tool operation.
 ///
 /// This is deliberately smaller than a policy decision. A planner describes
@@ -130,10 +248,7 @@ pub enum ToolOperationRisk {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolOperationPlan {
-    #[serde(default)]
-    pub effect_scopes: BTreeSet<EffectScope>,
-    #[serde(default)]
-    pub targets: BTreeSet<String>,
+    pub required_capabilities: CapabilityRequest,
     #[serde(default)]
     pub risk: ToolOperationRisk,
     pub summary: String,
@@ -141,13 +256,8 @@ pub struct ToolOperationPlan {
 
 impl ToolOperationPlan {
     pub fn validate_shape(&self) -> Result<(), ToolProtocolError> {
-        if self.summary.trim().is_empty()
-            || self.summary.chars().any(char::is_control)
-            || self
-                .targets
-                .iter()
-                .any(|target| target.trim().is_empty() || target.chars().any(char::is_control))
-        {
+        self.required_capabilities.validate()?;
+        if self.summary.trim().is_empty() || self.summary.chars().any(char::is_control) {
             return Err(ToolProtocolError::new(
                 ToolProtocolErrorCode::InvalidInvocation,
                 "Tool operation plan requires a safe summary and normalized targets",
@@ -161,7 +271,11 @@ impl ToolOperationPlan {
         effect_envelope: &BTreeSet<EffectScope>,
     ) -> Result<(), ToolProtocolError> {
         self.validate_shape()?;
-        if !self.effect_scopes.is_subset(effect_envelope) {
+        if !self
+            .required_capabilities
+            .effects
+            .is_subset(effect_envelope)
+        {
             return Err(ToolProtocolError::new(
                 ToolProtocolErrorCode::PolicyDenied,
                 "planned Tool effects exceed the registered effect envelope",
@@ -174,13 +288,11 @@ impl ToolOperationPlan {
         self.validate_shape()?;
         #[derive(Serialize)]
         struct AuthorityView<'a> {
-            effect_scopes: &'a BTreeSet<EffectScope>,
-            targets: &'a BTreeSet<String>,
+            required_capabilities: &'a CapabilityRequest,
             risk: ToolOperationRisk,
         }
         canonical_json_digest(&AuthorityView {
-            effect_scopes: &self.effect_scopes,
-            targets: &self.targets,
+            required_capabilities: &self.required_capabilities,
             risk: self.risk,
         })
     }
@@ -279,6 +391,11 @@ pub struct FilesystemPolicy {
 pub struct NetworkPolicy {
     #[serde(default)]
     pub allowed_targets: BTreeSet<String>,
+    /// Hard ceiling for open-world network access. This does not authorize an
+    /// invocation by itself: the operation must still request unrestricted
+    /// network and the permission policy will normally require approval.
+    #[serde(default)]
+    pub allow_unrestricted: bool,
 }
 
 /// Host-only environment restriction. `inherit_host_environment` is narrowed
@@ -386,6 +503,8 @@ impl ToolPolicyBounds {
                     &self.network.allowed_targets,
                     &other.network.allowed_targets,
                 ),
+                allow_unrestricted: self.network.allow_unrestricted
+                    && other.network.allow_unrestricted,
             },
             environment: EnvironmentPolicy {
                 allowed_variables: set_intersection(
@@ -437,6 +556,7 @@ impl ToolPolicyBounds {
                 .network
                 .allowed_targets
                 .is_subset(&ceiling.network.allowed_targets)
+            && (!self.network.allow_unrestricted || ceiling.network.allow_unrestricted)
             && self
                 .environment
                 .allowed_variables
@@ -636,6 +756,76 @@ impl EffectiveToolPolicy {
             && (!self.bounds.sandbox.required || !self.bounds.sandbox.allowed_profiles.is_empty())
     }
 
+    /// Checks both the effect envelope and the normalized resource ceiling.
+    /// Policy review can authorize a request within this ceiling, but can
+    /// never widen it.
+    pub fn authorizes_request(&self, requested: &CapabilityRequest) -> bool {
+        if requested.validate().is_err() || !self.authorizes_scopes(&requested.effects) {
+            return false;
+        }
+        requested.resources.iter().all(|resource| {
+            let exact_or_subtree = |allowed: &BTreeSet<String>| match &resource.selector {
+                CapabilitySelector::Exact(value) | CapabilitySelector::Subtree(value) => {
+                    allowed.iter().any(|root| {
+                        let value = std::path::Path::new(value);
+                        let root = std::path::Path::new(root);
+                        value == root || value.starts_with(root)
+                    })
+                }
+                CapabilitySelector::Unscoped => true,
+                CapabilitySelector::Unrestricted => false,
+            };
+            match resource.effect {
+                EffectScope::FilesystemRead => {
+                    exact_or_subtree(&self.bounds.filesystem.readable_roots)
+                }
+                EffectScope::FilesystemWrite => {
+                    exact_or_subtree(&self.bounds.filesystem.writable_roots)
+                }
+                EffectScope::Network => match &resource.selector {
+                    CapabilitySelector::Exact(target) => {
+                        self.bounds.network.allowed_targets.contains(target)
+                            || self.bounds.network.allow_unrestricted
+                    }
+                    CapabilitySelector::Unrestricted => self.bounds.network.allow_unrestricted,
+                    _ => false,
+                },
+                EffectScope::EnvironmentRead => match &resource.selector {
+                    CapabilitySelector::Exact(name) => {
+                        self.bounds.environment.allowed_variables.contains(name)
+                    }
+                    CapabilitySelector::Unscoped => true,
+                    _ => false,
+                },
+                EffectScope::SecretRead => match &resource.selector {
+                    CapabilitySelector::Exact(reference) => {
+                        self.bounds.allowed_credentials.contains(reference)
+                    }
+                    CapabilitySelector::Unscoped => true,
+                    _ => false,
+                },
+                EffectScope::Process => match &resource.selector {
+                    CapabilitySelector::Exact(program) => {
+                        self.bounds
+                            .process
+                            .interactive
+                            .command_shells
+                            .contains(program)
+                            || self
+                                .bounds
+                                .process
+                                .transport
+                                .allowed_programs
+                                .contains(program)
+                    }
+                    CapabilitySelector::Unscoped => true,
+                    _ => false,
+                },
+                EffectScope::ArtifactRead | EffectScope::ExternalSideEffect => true,
+            }
+        })
+    }
+
     pub fn requires_approval(&self) -> bool {
         self.bounds.approval == ApprovalPolicy::Required
     }
@@ -801,7 +991,10 @@ pub struct ApprovalBinding {
     /// for this operation. A retry cannot turn a previously reviewed
     /// operation into an automatically authorized one.
     pub permission_digest: Digest,
-    pub requested_scopes: BTreeSet<EffectScope>,
+    /// Exact authority request reviewed by policy and, when required, by the
+    /// user. This prevents an approval for one resource from authorizing a
+    /// different resource with the same coarse effect class.
+    pub requested_capabilities: CapabilityRequest,
     pub policy_digest: Digest,
 }
 
@@ -820,7 +1013,7 @@ impl ApprovalBinding {
                 "permission decision requires a SHA-256 digest",
             ));
         }
-        if !effective_policy.authorizes_scopes(&operation.effect_scopes) {
+        if !effective_policy.authorizes_request(&operation.required_capabilities) {
             return Err(ToolProtocolError::new(
                 ToolProtocolErrorCode::PolicyDenied,
                 "requested effects are outside the effective policy",
@@ -833,7 +1026,7 @@ impl ApprovalBinding {
             args_digest: invocation.args_digest()?,
             operation_digest: operation.digest()?,
             permission_digest,
-            requested_scopes: operation.effect_scopes.clone(),
+            requested_capabilities: operation.required_capabilities.clone(),
             policy_digest: effective_policy.digest()?,
         })
     }
@@ -1225,9 +1418,13 @@ mod tests {
     }
 
     fn operation(values: &[EffectScope]) -> ToolOperationPlan {
+        let mut required_capabilities = CapabilityRequest::from_effects(effects(values));
+        if values.contains(&EffectScope::Network) {
+            required_capabilities
+                .insert_resource(EffectScope::Network, CapabilitySelector::Unrestricted);
+        }
         ToolOperationPlan {
-            effect_scopes: effects(values),
-            targets: strings(&["workspace"]),
+            required_capabilities,
             risk: ToolOperationRisk::Routine,
             summary: "test operation".to_owned(),
         }
@@ -1257,6 +1454,7 @@ mod tests {
             },
             network: NetworkPolicy {
                 allowed_targets: strings(&["api.example", "docs.example"]),
+                allow_unrestricted: true,
             },
             environment: EnvironmentPolicy {
                 allowed_variables: strings(&["PATH", "LANG"]),
@@ -1299,6 +1497,39 @@ mod tests {
             invocation_keys,
             strings(&["run_id", "call_id", "tool_id", "arguments"])
         );
+    }
+
+    #[test]
+    fn network_request_cannot_hide_or_silently_widen_its_resource_scope() {
+        let missing = CapabilityRequest::from_effects(effects(&[EffectScope::Network]));
+        assert_eq!(
+            missing.validate().unwrap_err().code,
+            ToolProtocolErrorCode::InvalidInvocation
+        );
+
+        let mut exact = CapabilityRequest::from_effects(effects(&[EffectScope::Network]));
+        exact.insert_resource(
+            EffectScope::Network,
+            CapabilitySelector::Exact("api.example".to_owned()),
+        );
+        let mut unrestricted = CapabilityRequest::from_effects(effects(&[EffectScope::Network]));
+        unrestricted.insert_resource(EffectScope::Network, CapabilitySelector::Unrestricted);
+        assert_ne!(exact.digest().unwrap(), unrestricted.digest().unwrap());
+
+        let mut exact_only = bounds(&[EffectScope::Network], ApprovalPolicy::NotRequired);
+        exact_only.network.allow_unrestricted = false;
+        let policy = EffectiveToolPolicy::resolve(
+            &HostToolPolicy {
+                bounds: exact_only.clone(),
+            },
+            &RunToolGrant {
+                bounds: exact_only.clone(),
+            },
+            &ToolRestriction { bounds: exact_only },
+        )
+        .unwrap();
+        assert!(policy.authorizes_request(&exact));
+        assert!(!policy.authorizes_request(&unrestricted));
     }
 
     #[test]
@@ -1536,6 +1767,7 @@ mod tests {
                     seed,
                     &["api.example", "docs.example", "127.0.0.1"],
                 ),
+                allow_unrestricted: next_random(seed) & 1 == 1,
             },
             environment: EnvironmentPolicy {
                 allowed_variables: generated_strings(seed, &["PATH", "LANG", "TOKEN"]),

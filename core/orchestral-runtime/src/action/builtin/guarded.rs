@@ -10,7 +10,7 @@ use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use orchestral_core::agent_protocol::wire::Digest;
+use orchestral_core::agent_protocol::wire::{Digest, ToolActivityEvidence, ToolFileActivityKind};
 use orchestral_core::tool_protocol::{
     ApprovalPolicy, EffectScope, ModelToolSchema, ToolConcurrency, ToolDescriptor, ToolId,
     ToolIdempotency, ToolOutcome, ToolRestriction,
@@ -21,7 +21,7 @@ use tokio::process::{Child, Command};
 use tokio::time::timeout;
 
 use crate::tool_runtime::{GuardedToolExecution, GuardedToolExecutor};
-use crate::tools::shell_sandbox::{sandbox_command, ShellSandboxPolicy};
+use crate::tools::shell_sandbox::{sandbox_command, SandboxNetworkAccess, ShellSandboxPolicy};
 
 use super::support::{
     build_allowlisted_env, canonical_roots, read_stream_limited, stderr_preview,
@@ -177,6 +177,26 @@ impl GuardedFileReadExecutor {
 
 #[async_trait]
 impl GuardedToolExecutor for GuardedFileReadExecutor {
+    fn activity_evidence(
+        &self,
+        invocation: &orchestral_core::tool_protocol::ToolInvocation,
+        _outcome: Option<&ToolOutcome>,
+    ) -> Vec<ToolActivityEvidence> {
+        invocation
+            .arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .and_then(activity_path)
+            .map(|path| ToolActivityEvidence::File {
+                operation: ToolFileActivityKind::Read,
+                path,
+                diff: Vec::new(),
+                diff_omitted: 0,
+            })
+            .into_iter()
+            .collect()
+    }
+
     async fn execute(&self, execution: GuardedToolExecution) -> ToolOutcome {
         if execution.cancellation.is_cancelled() {
             return ToolOutcome::Cancelled;
@@ -324,6 +344,30 @@ impl GuardedToolExecutor for GuardedFileReadExecutor {
             .into(),
         }
     }
+}
+
+fn activity_path(value: &str) -> Option<String> {
+    const MAX_CHARS: usize = 512;
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let mut chars = value.chars();
+    let mut path = chars
+        .by_ref()
+        .take(MAX_CHARS)
+        .map(|character| {
+            if character.is_control() {
+                '�'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    if chars.next().is_some() {
+        path.push('…');
+    }
+    Some(path)
 }
 
 pub fn guarded_file_read_descriptor(restriction: ToolRestriction) -> ToolDescriptor {
@@ -680,7 +724,7 @@ impl GuardedToolExecutor for GuardedShellExecutor {
     }
 
     async fn execute(&self, execution: GuardedToolExecution) -> ToolOutcome {
-        let Some(approval) = execution.approval.as_ref() else {
+        let Some(approval) = execution.lease.approval() else {
             return rejected(
                 "approval_proof_missing",
                 "shell execution requires a verified Host approval capability",
@@ -772,7 +816,7 @@ impl GuardedToolExecutor for GuardedShellExecutor {
                 .iter()
                 .map(PathBuf::from)
                 .collect(),
-            network_targets: BTreeSet::new(),
+            network: SandboxNetworkAccess::Disabled,
             linux_bwrap_path: None,
         };
         let sandboxed = match sandbox_command(command, args, &cwd, &sandbox_policy) {
