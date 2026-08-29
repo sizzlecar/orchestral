@@ -181,6 +181,7 @@ fn primary_count(family: &ActivityFamily, calls: &[&ActivityCall]) -> usize {
         let files = calls
             .iter()
             .flat_map(|call| call.details.iter())
+            .filter(|detail| is_file_operation_detail(detail))
             .collect::<std::collections::BTreeSet<_>>();
         if !files.is_empty() {
             return files.len();
@@ -196,9 +197,13 @@ fn projected_details(calls: &[&ActivityCall]) -> Vec<String> {
     let mut details = Vec::new();
     for call in ordered {
         for detail in &call.details {
-            let detail = if call.state == ToolActivityState::Failed {
+            let annotate_terminal_state = is_file_operation_detail(detail)
+                || (!detail.starts_with('+')
+                    && !detail.starts_with('-')
+                    && !detail.starts_with("Error ["));
+            let detail = if call.state == ToolActivityState::Failed && annotate_terminal_state {
                 format!("{detail} (failed)")
-            } else if call.state == ToolActivityState::Cancelled {
+            } else if call.state == ToolActivityState::Cancelled && annotate_terminal_state {
                 format!("{detail} (cancelled)")
             } else {
                 detail.clone()
@@ -219,6 +224,12 @@ fn projected_details(calls: &[&ActivityCall]) -> Vec<String> {
         details[details.len() - 2].clone(),
         details[details.len() - 1].clone(),
     ]
+}
+
+fn is_file_operation_detail(detail: &str) -> bool {
+    ["Add ", "Update ", "Delete "]
+        .iter()
+        .any(|prefix| detail.starts_with(prefix))
 }
 
 fn family_summary(family: &ActivityFamily, status: ActivityStatus, count: usize) -> String {
@@ -375,5 +386,44 @@ mod tests {
                 status: ActivityStatus::Cancelled,
             }]
         );
+    }
+
+    #[test]
+    fn patch_preview_lines_do_not_inflate_the_edited_file_count() {
+        let mut reducer = ActivityReducer::default();
+        reducer.begin_run();
+        let projection = reducer.observe(
+            "patch-1".to_owned(),
+            "apply_patch".to_owned(),
+            ToolActivityState::Succeeded,
+            vec![
+                "Update src/lib.rs".to_owned(),
+                "-old".to_owned(),
+                "+new".to_owned(),
+            ],
+        );
+        assert!(projection.summary.starts_with("Edited 1 file"));
+    }
+
+    #[test]
+    fn patch_failure_keeps_the_parser_error_readable() {
+        let mut reducer = ActivityReducer::default();
+        reducer.begin_run();
+        let projection = reducer.observe(
+            "patch-1".to_owned(),
+            "apply_patch".to_owned(),
+            ToolActivityState::Failed,
+            vec![
+                "Add src/new.rs".to_owned(),
+                "Error [patch_invalid] Add File lines must start with '+'".to_owned(),
+            ],
+        );
+        assert!(projection.summary.contains("Add src/new.rs (failed)"));
+        assert!(projection
+            .summary
+            .contains("Error [patch_invalid] Add File lines must start with '+'"));
+        assert!(!projection
+            .summary
+            .contains("Error [patch_invalid] Add File lines must start with '+' (failed)"));
     }
 }

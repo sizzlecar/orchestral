@@ -24,8 +24,8 @@ use tokio::time::MissedTickBehavior;
 use super::terminal::TerminalSession;
 use super::{render, update, ApprovalChoice, UiEffect, UiMsg, UiPhase, UiState};
 
-const RECONCILE_INTERVAL: Duration = Duration::from_millis(200);
-const ANIMATION_INTERVAL: Duration = Duration::from_millis(80);
+const RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
+const ANIMATION_INTERVAL: Duration = Duration::from_millis(200);
 static COMMAND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) async fn run_tui(
@@ -44,12 +44,17 @@ pub(crate) async fn run_tui(
     let mut animation_tick = tokio::time::interval(ANIMATION_INTERVAL);
     animation_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut process_events = process_supervisor.subscribe();
+    let mut process_events_open = true;
+    let mut needs_redraw = true;
     let mut quit = false;
 
     while !quit {
-        terminal
-            .draw(|frame| render(frame, &state))
-            .context("render TUI")?;
+        if needs_redraw {
+            terminal
+                .draw(|frame| render(frame, &state))
+                .context("render TUI")?;
+            needs_redraw = false;
+        }
         tokio::select! {
             event = input.next() => {
                 let event = event.context("terminal event stream closed")?
@@ -68,23 +73,30 @@ pub(crate) async fn run_tui(
                         &mut state,
                     ).await?;
                 }
+                needs_redraw = true;
             }
             forwarded = agent_rx.recv() => {
                 if let Some(forwarded) = forwarded {
                     handle_forwarded(forwarded, &mut active, &mut state).await?;
+                    needs_redraw = true;
                 }
             }
             _ = reconcile_tick.tick(), if active.is_some() => {
                 if reconcile_active(&mut active, &mut state).await? {
                     stop_active(&mut active);
                 }
+                needs_redraw = true;
             }
             _ = animation_tick.tick(), if active.is_some() => {
                 update(&mut state, UiMsg::Tick { now: Instant::now() });
+                needs_redraw = true;
             }
-            process_event = process_events.recv(), if active.is_some() => {
+            process_event = process_events.recv(), if active.is_some() && process_events_open => {
                 match process_event {
-                    Ok(event) => project_process_event(&mut state, event),
+                    Ok(event) => {
+                        project_process_event(&mut state, event);
+                        needs_redraw = true;
+                    }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         if let Some(run_id) = state.run_id.as_deref() {
                             let run_id = RunId::new(run_id);
@@ -96,10 +108,13 @@ pub(crate) async fn run_tui(
                                         session_ids: sessions.into_iter().map(|id| id.get()).collect(),
                                     },
                                 );
+                                needs_redraw = true;
                             }
                         }
                     }
-                    Err(broadcast::error::RecvError::Closed) => {}
+                    Err(broadcast::error::RecvError::Closed) => {
+                        process_events_open = false;
+                    }
                 }
             }
         }

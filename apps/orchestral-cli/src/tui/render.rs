@@ -91,7 +91,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     let block = Block::default().padding(Padding::horizontal(CONTENT_PADDING));
     let inner = block.inner(area);
-    let lines = transcript_lines(state);
+    let lines = transcript_lines(state, inner.width.max(1));
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     let wrapped = paragraph.line_count(inner.width.max(1));
     let max_scroll = wrapped.saturating_sub(inner.height as usize) as u16;
@@ -102,7 +102,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     frame.render_widget(paragraph.block(block).scroll((scroll, 0)), area);
 }
 
-fn transcript_lines(state: &UiState) -> Vec<Line<'static>> {
+fn transcript_lines(state: &UiState, width: u16) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if state.transcript.is_empty() && state.streamed_text().is_empty() {
         lines.push(Line::from(Span::styled(
@@ -115,7 +115,7 @@ fn transcript_lines(state: &UiState) -> Vec<Line<'static>> {
         if previous_role.is_some_and(|previous| should_separate(previous, entry.role)) {
             lines.push(Line::default());
         }
-        push_entry_lines(&mut lines, entry);
+        push_entry_lines(&mut lines, entry, width);
         previous_role = Some(entry.role);
     }
     let stream = state.streamed_text();
@@ -123,7 +123,7 @@ fn transcript_lines(state: &UiState) -> Vec<Line<'static>> {
         if !lines.is_empty() {
             lines.push(Line::default());
         }
-        push_markdown(&mut lines, "• ", &stream, ASSISTANT, true);
+        push_markdown(&mut lines, "• ", &stream, ASSISTANT, true, width);
     }
     lines
 }
@@ -135,10 +135,12 @@ fn should_separate(previous: TranscriptRole, current: TranscriptRole) -> bool {
     )
 }
 
-fn push_entry_lines(lines: &mut Vec<Line<'static>>, entry: &TranscriptEntry) {
+fn push_entry_lines(lines: &mut Vec<Line<'static>>, entry: &TranscriptEntry, width: u16) {
     match entry.role {
         TranscriptRole::User => push_plain(lines, "› ", &entry.text, USER),
-        TranscriptRole::Assistant => push_markdown(lines, "• ", &entry.text, ASSISTANT, false),
+        TranscriptRole::Assistant => {
+            push_markdown(lines, "• ", &entry.text, ASSISTANT, false, width)
+        }
         TranscriptRole::System => push_plain(lines, "○ ", &entry.text, MUTED),
         TranscriptRole::Error => push_plain(lines, "■ ", &entry.text, ERROR),
         TranscriptRole::Tool => {
@@ -180,8 +182,31 @@ fn push_status_text(lines: &mut Vec<Line<'static>>, prefix: &str, text: &str, st
                 },
                 style.add_modifier(Modifier::BOLD),
             ),
-            Span::styled(part.to_owned(), if index == 0 { ASSISTANT } else { MUTED }),
+            Span::styled(
+                part.to_owned(),
+                if index == 0 {
+                    ASSISTANT
+                } else {
+                    activity_detail_style(part)
+                },
+            ),
         ]));
+    }
+}
+
+fn activity_detail_style(detail: &str) -> Style {
+    let detail = detail.trim_start().strip_prefix("└ ").unwrap_or(detail);
+    if detail.starts_with("+ ") || detail.starts_with('+') {
+        SUCCESS
+    } else if detail.starts_with("- ") || detail.starts_with('-') || detail.starts_with("Error [") {
+        ERROR
+    } else if ["Add ", "Update ", "Delete "]
+        .iter()
+        .any(|prefix| detail.starts_with(prefix))
+    {
+        ASSISTANT.add_modifier(Modifier::BOLD)
+    } else {
+        MUTED
     }
 }
 
@@ -191,21 +216,43 @@ fn push_markdown(
     text: &str,
     style: Style,
     streaming: bool,
+    width: u16,
 ) {
     let indent = " ".repeat(UnicodeWidthStr::width(prefix));
     let mut first_content = true;
     let mut in_code_block = false;
     let start_len = lines.len();
 
-    for source in text.split('\n') {
+    let source_lines = text.split('\n').collect::<Vec<_>>();
+    let mut index = 0;
+    while index < source_lines.len() {
+        let source = source_lines[index];
         let trimmed = source.trim_start();
         if trimmed.starts_with("```") {
             in_code_block = !in_code_block;
+            index += 1;
             continue;
         }
         if source.is_empty() {
             lines.push(Line::default());
+            index += 1;
             continue;
+        }
+
+        if !in_code_block {
+            if let Some((table, consumed)) = MarkdownTable::parse(&source_lines[index..]) {
+                push_markdown_table(
+                    lines,
+                    &table,
+                    prefix,
+                    &indent,
+                    &mut first_content,
+                    style,
+                    width,
+                );
+                index += consumed;
+                continue;
+            }
         }
 
         let current_prefix = if first_content { prefix } else { &indent };
@@ -226,6 +273,7 @@ fn push_markdown(
             spans.extend(inline_markdown_spans(content, line_style));
         }
         lines.push(Line::from(spans));
+        index += 1;
     }
 
     if lines.len() == start_len {
@@ -238,6 +286,206 @@ fn push_markdown(
             lines.push(Line::from(Span::styled("• ▌", ACCENT)));
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MarkdownTable {
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+}
+
+impl MarkdownTable {
+    fn parse(lines: &[&str]) -> Option<(Self, usize)> {
+        let headers = parse_table_row(lines.first()?)?;
+        let separators = parse_table_row(lines.get(1)?)?;
+        if headers.len() < 2
+            || separators.len() != headers.len()
+            || !separators.iter().all(|cell| is_table_separator(cell))
+        {
+            return None;
+        }
+
+        let mut rows = Vec::new();
+        let mut consumed = 2;
+        while let Some(line) = lines.get(consumed) {
+            let Some(row) = parse_table_row(line) else {
+                break;
+            };
+            if row.len() != headers.len() {
+                break;
+            }
+            rows.push(row);
+            consumed += 1;
+        }
+        Some((Self { headers, rows }, consumed))
+    }
+}
+
+fn parse_table_row(source: &str) -> Option<Vec<String>> {
+    let mut source = source.trim();
+    if !source.contains('|') {
+        return None;
+    }
+    source = source.strip_prefix('|').unwrap_or(source);
+    source = source.strip_suffix('|').unwrap_or(source);
+    let cells = source
+        .split('|')
+        .map(|cell| plain_table_cell(cell.trim()))
+        .collect::<Vec<_>>();
+    (cells.len() >= 2).then_some(cells)
+}
+
+fn plain_table_cell(cell: &str) -> String {
+    cell.replace("**", "").replace('`', "")
+}
+
+fn is_table_separator(cell: &str) -> bool {
+    let rule = cell.trim().trim_start_matches(':').trim_end_matches(':');
+    rule.len() >= 3 && rule.chars().all(|character| character == '-')
+}
+
+fn push_markdown_table(
+    lines: &mut Vec<Line<'static>>,
+    table: &MarkdownTable,
+    prefix: &str,
+    indent: &str,
+    first_content: &mut bool,
+    style: Style,
+    width: u16,
+) {
+    let prefix_width = UnicodeWidthStr::width(prefix);
+    let available = usize::from(width).saturating_sub(prefix_width).max(1);
+    let columns = table.headers.len();
+    let separator_width = columns.saturating_sub(1).saturating_mul(3);
+    let content_width = available.saturating_sub(separator_width);
+
+    if content_width < columns.saturating_mul(4) {
+        push_vertical_table(lines, table, prefix, indent, first_content, style);
+        return;
+    }
+
+    let base_width = content_width / columns;
+    let remainder = content_width % columns;
+    let widths = (0..columns)
+        .map(|index| base_width + usize::from(index < remainder))
+        .collect::<Vec<_>>();
+
+    push_table_row(
+        lines,
+        &table.headers,
+        &widths,
+        prefix,
+        indent,
+        first_content,
+        style.add_modifier(Modifier::BOLD),
+    );
+    let separator = widths
+        .iter()
+        .map(|width| "─".repeat(*width))
+        .collect::<Vec<_>>()
+        .join("─┼─");
+    lines.push(Line::from(vec![
+        Span::styled(indent.to_owned(), MUTED),
+        Span::styled(separator, MUTED),
+    ]));
+    for row in &table.rows {
+        push_table_row(lines, row, &widths, prefix, indent, first_content, style);
+    }
+}
+
+fn push_table_row(
+    lines: &mut Vec<Line<'static>>,
+    cells: &[String],
+    widths: &[usize],
+    prefix: &str,
+    indent: &str,
+    first_content: &mut bool,
+    style: Style,
+) {
+    let wrapped = cells
+        .iter()
+        .zip(widths)
+        .map(|(cell, width)| wrap_display_width(cell, *width))
+        .collect::<Vec<_>>();
+    let row_height = wrapped.iter().map(Vec::len).max().unwrap_or(1);
+    for line_index in 0..row_height {
+        let mut spans = vec![Span::styled(
+            take_content_prefix(prefix, indent, first_content),
+            MUTED,
+        )];
+        for (column, width) in widths.iter().enumerate() {
+            if column > 0 {
+                spans.push(Span::styled(" │ ", MUTED));
+            }
+            let value = wrapped[column]
+                .get(line_index)
+                .map(String::as_str)
+                .unwrap_or("");
+            let padding = width.saturating_sub(UnicodeWidthStr::width(value));
+            spans.push(Span::styled(
+                format!("{value}{}", " ".repeat(padding)),
+                style,
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+}
+
+fn push_vertical_table(
+    lines: &mut Vec<Line<'static>>,
+    table: &MarkdownTable,
+    prefix: &str,
+    indent: &str,
+    first_content: &mut bool,
+    style: Style,
+) {
+    for (row_index, row) in table.rows.iter().enumerate() {
+        if row_index > 0 {
+            lines.push(Line::default());
+        }
+        for (header, value) in table.headers.iter().zip(row) {
+            lines.push(Line::from(vec![
+                Span::styled(take_content_prefix(prefix, indent, first_content), MUTED),
+                Span::styled(format!("{header}: "), style.add_modifier(Modifier::BOLD)),
+                Span::styled(value.clone(), style),
+            ]));
+        }
+    }
+    if table.rows.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(take_content_prefix(prefix, indent, first_content), MUTED),
+            Span::styled(
+                table.headers.join(" · "),
+                style.add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+}
+
+fn take_content_prefix(prefix: &str, indent: &str, first_content: &mut bool) -> String {
+    let current = if *first_content { prefix } else { indent };
+    *first_content = false;
+    current.to_owned()
+}
+
+fn wrap_display_width(value: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut result = Vec::new();
+    let mut line = String::new();
+    let mut line_width = 0_usize;
+    for character in value.chars() {
+        let character_width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+        if line_width > 0 && line_width.saturating_add(character_width) > width {
+            result.push(std::mem::take(&mut line));
+            line_width = 0;
+        }
+        line.push(character);
+        line_width = line_width.saturating_add(character_width);
+    }
+    if !line.is_empty() || result.is_empty() {
+        result.push(line);
+    }
+    result
 }
 
 fn markdown_line(source: &str, style: Style) -> (String, &str, Style) {
@@ -848,6 +1096,24 @@ mod tests {
         assert!(rendered.contains("│ 24 tests passed"), "{rendered}");
         assert!(!rendered.contains("**"), "{rendered}");
         assert!(!rendered.contains("```"), "{rendered}");
+    }
+
+    #[test]
+    fn completed_assistant_markdown_table_is_width_aware() {
+        let mut state = UiState::new("session-table", "model-table");
+        state.phase = UiPhase::Completed;
+        state.transcript.push(TranscriptEntry::assistant(
+            "answer-table",
+            "| 维度 | 当前状态 | 演进建议 |\n| --- | --- | --- |\n| 任务规划 | 单循环 | 动态 Plan |\n| 记忆机制 | 简单压缩 | 长期缓存 |",
+        ));
+
+        let rendered = render_to_string(&state, 72, 16);
+        assert!(rendered.contains("维度"), "{rendered}");
+        assert!(rendered.contains("任务规划"), "{rendered}");
+        assert!(rendered.contains("动态 Plan"), "{rendered}");
+        assert!(rendered.contains('│'), "{rendered}");
+        assert!(rendered.contains('┼'), "{rendered}");
+        assert!(!rendered.contains("| ---"), "{rendered}");
     }
 
     #[test]

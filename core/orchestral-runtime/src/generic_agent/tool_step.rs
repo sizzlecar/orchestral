@@ -398,6 +398,12 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
             }
             result => result,
         };
+        let terminal_activity_details = match &result {
+            GuardedToolResult::Outcome { outcome, .. } => {
+                tool_terminal_activity_details(&call.name, &activity_details, outcome)
+            }
+            GuardedToolResult::ApprovalRequired { .. } => activity_details.clone(),
+        };
         match result {
             GuardedToolResult::ApprovalRequired { binding, .. } => {
                 publish_tool_activity(
@@ -407,7 +413,7 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                     &call.call_id,
                     &call.name,
                     ToolActivityState::Failed,
-                    &activity_details,
+                    &terminal_activity_details,
                 );
                 emit_failure(
                     &inner,
@@ -435,7 +441,7 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                     &call.call_id,
                     &call.name,
                     ToolActivityState::Cancelled,
-                    &activity_details,
+                    &terminal_activity_details,
                 );
                 // The effect journal deliberately retains UnknownEffect, while
                 // the Agent Run still observes the user's cancellation as its
@@ -467,7 +473,7 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                     &call.call_id,
                     &call.name,
                     ToolActivityState::Failed,
-                    &activity_details,
+                    &terminal_activity_details,
                 );
                 if let Err(failure) = append_effect_uncertainty(
                     &inner,
@@ -501,7 +507,7 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                     &call.call_id,
                     &call.name,
                     ToolActivityState::Cancelled,
-                    &activity_details,
+                    &terminal_activity_details,
                 );
                 emit_cancel(&inner, &request, &user_message);
                 return ToolBatchExecution::Terminal;
@@ -522,7 +528,7 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                     } else {
                         ToolActivityState::Succeeded
                     },
-                    &activity_details,
+                    &terminal_activity_details,
                 );
                 tool_results.push(ModelContent::ToolResult {
                     call_id: call.call_id,
@@ -541,8 +547,9 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
 }
 
 /// Selects a small presentation-safe subset of Tool arguments for activity
-/// telemetry. This is deliberately allowlisted by Tool family: credentials,
-/// arbitrary MCP arguments, and full patches/results never enter the UI path.
+/// telemetry. This is deliberately allowlisted by Tool family: credentials and
+/// arbitrary MCP arguments never enter the UI path, while patches expose only
+/// a bounded local preview.
 fn tool_activity_details(tool_name: &str, arguments: &serde_json::Value) -> Vec<String> {
     match tool_name {
         "exec_command" => string_argument(arguments, "cmd").into_iter().collect(),
@@ -570,23 +577,74 @@ fn patch_file_details(arguments: &serde_json::Value) -> Vec<String> {
     let Some(patch) = arguments.get("patch").and_then(serde_json::Value::as_str) else {
         return Vec::new();
     };
-    patch
-        .lines()
-        .filter_map(|line| {
-            [
-                ("*** Add File: ", "Add"),
-                ("*** Update File: ", "Update"),
-                ("*** Delete File: ", "Delete"),
-            ]
-            .into_iter()
-            .find_map(|(prefix, label)| {
-                line.strip_prefix(prefix)
-                    .and_then(bounded_activity_detail)
-                    .map(|path| format!("{label} {path}"))
-            })
-        })
-        .take(8)
-        .collect()
+    let mut details = Vec::new();
+    for line in patch.lines() {
+        let operation = [
+            ("*** Add File: ", "Add"),
+            ("*** Update File: ", "Update"),
+            ("*** Delete File: ", "Delete"),
+        ]
+        .into_iter()
+        .find_map(|(prefix, label)| {
+            line.strip_prefix(prefix)
+                .and_then(bounded_activity_detail)
+                .map(|path| format!("{label} {path}"))
+        });
+        if let Some(operation) = operation {
+            details.push(operation);
+        } else if (line.starts_with('+') || line.starts_with('-'))
+            && !line.starts_with("+++")
+            && !line.starts_with("---")
+        {
+            if let Some(line) = bounded_patch_line(line) {
+                details.push(line);
+            }
+        }
+        if details.len() == 8 {
+            break;
+        }
+    }
+    details
+}
+
+fn tool_terminal_activity_details(
+    tool_name: &str,
+    base: &[String],
+    outcome: &ToolOutcome,
+) -> Vec<String> {
+    if tool_name != "apply_patch" {
+        return base.to_vec();
+    }
+    let (code, message) = match outcome {
+        ToolOutcome::Rejected { code, message } | ToolOutcome::Failed { code, message, .. } => {
+            (code, message)
+        }
+        _ => return base.to_vec(),
+    };
+    let Some(error) = bounded_activity_detail(&format!("Error [{code}] {message}")) else {
+        return base.to_vec();
+    };
+    let mut details = base.iter().take(7).cloned().collect::<Vec<_>>();
+    details.push(error);
+    details
+}
+
+fn bounded_patch_line(value: &str) -> Option<String> {
+    const MAX_CHARS: usize = 160;
+    let normalized = value.trim_end_matches('\r');
+    if normalized.len() <= 1 {
+        return None;
+    }
+    let count = normalized.chars().count();
+    Some(if count > MAX_CHARS {
+        normalized
+            .chars()
+            .take(MAX_CHARS - 1)
+            .chain(['…'])
+            .collect()
+    } else {
+        normalized.to_owned()
+    })
 }
 
 fn bounded_activity_detail(value: &str) -> Option<String> {
@@ -642,7 +700,13 @@ mod activity_detail_tests {
                     "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old\n+new\n*** Add File: tests/new.rs\n+test\n*** End Patch"
                 }),
             ),
-            vec!["Update src/lib.rs", "Add tests/new.rs"]
+            vec![
+                "Update src/lib.rs",
+                "-old",
+                "+new",
+                "Add tests/new.rs",
+                "+test"
+            ]
         );
         assert!(tool_activity_details(
             "mcp__service__lookup",
@@ -650,5 +714,24 @@ mod activity_detail_tests {
         )
         .iter()
         .all(|detail| !detail.contains("must-not-render")));
+    }
+
+    #[test]
+    fn patch_failure_preview_includes_the_real_tool_error() {
+        let details = tool_terminal_activity_details(
+            "apply_patch",
+            &["Add src/new.rs".to_owned()],
+            &ToolOutcome::Rejected {
+                code: "patch_invalid".to_owned(),
+                message: "Add File lines must start with '+'".to_owned(),
+            },
+        );
+        assert_eq!(
+            details,
+            vec![
+                "Add src/new.rs",
+                "Error [patch_invalid] Add File lines must start with '+'"
+            ]
+        );
     }
 }
