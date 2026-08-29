@@ -37,7 +37,7 @@ pub struct SandboxCommandSpec {
     pub env: HashMap<String, String>,
 }
 
-trait ShellSandboxBackend {
+pub(crate) trait ShellSandboxBackend {
     fn backend_name(&self) -> &'static str;
     fn transform(
         &self,
@@ -160,10 +160,7 @@ fn default_backend_for_platform() -> Box<dyn ShellSandboxBackend> {
 
     #[cfg(target_os = "windows")]
     {
-        return Box::new(UnsupportedBackend {
-            backend_name: "windows_restricted",
-            reason: "backend adapter is not implemented yet",
-        });
+        return Box::new(crate::tools::windows_sandbox::WindowsRestrictedBackend::default());
     }
 
     #[allow(unreachable_code)]
