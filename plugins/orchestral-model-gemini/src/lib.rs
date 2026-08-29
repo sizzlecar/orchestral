@@ -1,6 +1,7 @@
 //! Gemini-native HTTP adapter for the canonical Orchestral Model Protocol.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::error::Error as _;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -462,6 +463,8 @@ struct GeminiStreamState {
     sequence: u64,
     next_call: u64,
     finish_reason: Option<ModelFinishReason>,
+    raw_finish_reason: Option<String>,
+    prompt_block_reason: Option<String>,
     last_usage: Option<ModelUsage>,
     emitted_content: bool,
     terminated: bool,
@@ -509,6 +512,14 @@ impl GeminiStreamState {
                     .unwrap_or("Gemini returned an error"),
             ));
         }
+        if let Some(block_reason) = response
+            .pointer("/promptFeedback/blockReason")
+            .and_then(Value::as_str)
+            .filter(|reason| !reason.is_empty())
+        {
+            self.prompt_block_reason = Some(block_reason.to_owned());
+            self.finish_reason = Some(ModelFinishReason::ContentFilter);
+        }
         if let Some(candidate) = response
             .get("candidates")
             .and_then(Value::as_array)
@@ -539,6 +550,7 @@ impl GeminiStreamState {
                 .and_then(Value::as_str)
                 .filter(|reason| !reason.is_empty())
             {
+                self.raw_finish_reason = Some(reason.to_owned());
                 self.finish_reason = Some(map_finish_reason(reason));
             }
         }
@@ -614,12 +626,16 @@ impl GeminiStreamState {
             .finish_reason
             .clone()
             .unwrap_or(ModelFinishReason::Stop);
+        if self.prompt_block_reason.is_some() {
+            reason = ModelFinishReason::ContentFilter;
+        }
         if self.next_call > 0 && reason == ModelFinishReason::Stop {
             reason = ModelFinishReason::ToolCalls;
         }
         if !self.emitted_content && reason != ModelFinishReason::ContentFilter {
-            return Err(ModelError::protocol(
-                "Gemini stream contained neither text nor function calls",
+            return Err(empty_generation_error(
+                self.raw_finish_reason.as_deref(),
+                self.last_usage.as_ref(),
             ));
         }
         self.emit(ModelEvent::Finish { reason })?;
@@ -643,6 +659,8 @@ fn gemini_event_stream(
         sequence: 0,
         next_call: 0,
         finish_reason: None,
+        raw_finish_reason: None,
+        prompt_block_reason: None,
         last_usage: None,
         emitted_content: false,
         terminated: false,
@@ -849,28 +867,47 @@ fn parse_response(
                 .unwrap_or("Gemini returned an error"),
         ));
     }
+    let prompt_blocked = response
+        .pointer("/promptFeedback/blockReason")
+        .and_then(Value::as_str)
+        .is_some_and(|reason| !reason.is_empty());
     let candidate = response
         .get("candidates")
         .and_then(Value::as_array)
-        .and_then(|candidates| candidates.first())
-        .ok_or_else(|| ModelError::protocol("Gemini response contains no candidate"))?;
+        .and_then(|candidates| candidates.first());
+    let Some(candidate) = candidate else {
+        if prompt_blocked {
+            return Ok(sequence_events(
+                request,
+                vec![ModelEvent::Finish {
+                    reason: ModelFinishReason::ContentFilter,
+                }],
+            ));
+        }
+        return Err(ModelError::protocol(
+            "Gemini response contains no candidate",
+        ));
+    };
     let parts = candidate
         .pointer("/content/parts")
         .and_then(Value::as_array)
         .ok_or_else(|| ModelError::protocol("Gemini candidate contains no parts"))?;
     let mut payloads = Vec::new();
     let mut tool_count = 0_usize;
+    let mut emitted_content = false;
     for (index, part) in parts.iter().enumerate() {
         if let Some(text) = part
             .get("text")
             .and_then(Value::as_str)
             .filter(|text| !text.is_empty())
         {
+            emitted_content = true;
             payloads.push(ModelEvent::TextDelta {
                 delta: text.to_owned(),
             });
         }
         if let Some(call) = part.get("functionCall") {
+            emitted_content = true;
             let name = call
                 .get("name")
                 .and_then(Value::as_str)
@@ -914,31 +951,26 @@ fn parse_response(
             tool_count += 1;
         }
     }
-    if let Some(usage) = response.get("usageMetadata") {
+    let usage = response.get("usageMetadata").map(|usage| ModelUsage {
+        input_tokens: usage.get("promptTokenCount").and_then(Value::as_u64),
+        output_tokens: usage.get("candidatesTokenCount").and_then(Value::as_u64),
+    });
+    if let Some(usage) = usage.as_ref() {
         payloads.push(ModelEvent::Usage {
-            usage: ModelUsage {
-                input_tokens: usage.get("promptTokenCount").and_then(Value::as_u64),
-                output_tokens: usage.get("candidatesTokenCount").and_then(Value::as_u64),
-            },
+            usage: usage.clone(),
         });
     }
-    if payloads.is_empty() {
-        return Err(ModelError::protocol(
-            "Gemini response contains neither text nor function calls",
-        ));
-    }
+    let raw_finish_reason = candidate.get("finishReason").and_then(Value::as_str);
     let reason = if tool_count > 0 {
         ModelFinishReason::ToolCalls
     } else {
-        match candidate.get("finishReason").and_then(Value::as_str) {
-            Some("STOP") | None => ModelFinishReason::Stop,
-            Some("MAX_TOKENS") => ModelFinishReason::Length,
-            Some("SAFETY") | Some("BLOCKLIST") | Some("PROHIBITED_CONTENT") => {
-                ModelFinishReason::ContentFilter
-            }
-            Some(_) => ModelFinishReason::Other,
-        }
+        raw_finish_reason
+            .map(map_finish_reason)
+            .unwrap_or(ModelFinishReason::Stop)
     };
+    if !emitted_content && reason != ModelFinishReason::ContentFilter {
+        return Err(empty_generation_error(raw_finish_reason, usage.as_ref()));
+    }
     payloads.push(ModelEvent::Finish { reason });
     Ok(sequence_events(request, payloads))
 }
@@ -967,8 +999,63 @@ fn cancelled_error() -> ModelError {
     ModelError::new(ModelErrorCode::Cancelled, "model request cancelled")
 }
 
+fn empty_generation_error(finish_reason: Option<&str>, usage: Option<&ModelUsage>) -> ModelError {
+    let finish_reason = finish_reason.unwrap_or("missing");
+    ModelError::new(
+        ModelErrorCode::Unavailable,
+        format!(
+            "Gemini returned an empty generation (finishReason={finish_reason}); the request can be retried"
+        ),
+    )
+    .with_retryable(true)
+    .with_details(json!({
+        "kind": "empty_generation",
+        "finish_reason": finish_reason,
+        "usage": usage.map(|usage| json!({
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+        })),
+    }))
+}
+
 fn map_transport_error(error: reqwest::Error) -> ModelError {
-    ModelError::new(ModelErrorCode::Unavailable, error.to_string()).with_retryable(true)
+    let kind = if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_request() {
+        "request"
+    } else if error.is_body() {
+        "response_body"
+    } else if error.is_decode() {
+        "decode"
+    } else {
+        "transport"
+    };
+    let mut message = error.to_string();
+    let mut source = error.source();
+    let mut depth = 0;
+    while let Some(cause) = source {
+        let cause_message = cause.to_string();
+        if !cause_message.is_empty() && !message.contains(&cause_message) {
+            message.push_str(": ");
+            message.push_str(&cause_message);
+        }
+        source = cause.source();
+        depth += 1;
+        if depth == 4 {
+            break;
+        }
+    }
+    ModelError::new(ModelErrorCode::Unavailable, message)
+        .with_retryable(true)
+        .with_details(json!({
+            "kind": kind,
+            "timeout": error.is_timeout(),
+            "connect": error.is_connect(),
+            "status": error.status().map(|status| status.as_u16()),
+            "url": error.url().map(|url| url.as_str()),
+        }))
 }
 
 fn map_http_error(status: StatusCode, body: &[u8]) -> ModelError {
@@ -1471,6 +1558,59 @@ mod tests {
                 reason: ModelFinishReason::ToolCalls
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn empty_stop_generation_is_retryable_unavailable_not_protocol() {
+        let request = request();
+        let bytes = Bytes::from_static(
+            b"data: {\"candidates\":[{\"content\":{\"parts\":[]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":9,\"candidatesTokenCount\":0}}\n\n",
+        );
+        let mut stream = gemini_event_stream(
+            request,
+            stream::iter([Ok::<Bytes, reqwest::Error>(bytes)]).boxed(),
+            CancellationToken::new(),
+            128,
+        );
+        assert!(matches!(
+            stream.next().await.expect("usage event").expect("usage"),
+            ModelStreamEvent {
+                payload: ModelEvent::Usage { .. },
+                ..
+            }
+        ));
+        let error = stream
+            .next()
+            .await
+            .expect("empty generation error")
+            .expect_err("empty STOP must not complete successfully");
+        assert_eq!(error.code, ModelErrorCode::Unavailable);
+        assert!(error.retryable);
+        assert!(error.message.contains("finishReason=STOP"));
+        assert_eq!(error.details["kind"], "empty_generation");
+    }
+
+    #[tokio::test]
+    async fn prompt_feedback_block_maps_to_content_filter_finish() {
+        let request = request();
+        let bytes =
+            Bytes::from_static(b"data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\"}}\n\n");
+        let mut stream = gemini_event_stream(
+            request,
+            stream::iter([Ok::<Bytes, reqwest::Error>(bytes)]).boxed(),
+            CancellationToken::new(),
+            128,
+        );
+        assert!(matches!(
+            stream.next().await.expect("finish event").expect("finish"),
+            ModelStreamEvent {
+                payload: ModelEvent::Finish {
+                    reason: ModelFinishReason::ContentFilter
+                },
+                ..
+            }
+        ));
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]
