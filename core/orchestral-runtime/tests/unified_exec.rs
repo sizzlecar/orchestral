@@ -1,30 +1,36 @@
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(target_os = "macos")]
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::sync::Arc;
 use std::time::Duration;
 
 use orchestral_core::agent_protocol::wire::RunId;
+#[cfg(target_os = "macos")]
 use orchestral_core::tool_protocol::{
-    ApprovalPolicy, EffectScope, EnvironmentPolicy, FilesystemPolicy, HostApprovalIssuer,
-    HostApprovalVerifier, HostToolPolicy, InMemoryApprovalCapabilityStore,
-    InteractiveCommandPolicy, NetworkPolicy, ProcessPolicy, RunToolGrant, SandboxPolicy,
-    ToolCallId, ToolId, ToolInvocation, ToolOperationPlan, ToolOperationRisk, ToolOutcome,
+    ApprovalPolicy, EnvironmentPolicy, FilesystemPolicy, HostApprovalIssuer, HostApprovalVerifier,
+    HostToolPolicy, InMemoryApprovalCapabilityStore, InteractiveCommandPolicy, NetworkPolicy,
+    ProcessPolicy, RunToolGrant, SandboxPolicy, ToolCallId, ToolId, ToolInvocation, ToolOutcome,
     ToolOutput, ToolPolicyBounds, ToolRestriction, TransportLaunchPolicy,
 };
+use orchestral_core::tool_protocol::{EffectScope, ToolOperationPlan, ToolOperationRisk};
+#[cfg(target_os = "macos")]
 use orchestral_runtime::tools::{
     guarded_exec_command_descriptor, guarded_write_stdin_descriptor,
     workspace_exec_command_descriptor, CommandEnvironmentSnapshot, GuardedExecCommandExecutor,
     GuardedWriteStdinExecutor, GUARDED_EXEC_SANDBOX_PROFILE,
 };
-use orchestral_runtime::{
-    ExecProcessError, ExecSessionStatus, ExecSpawnSpec, GuardedToolResult, GuardedToolRuntime,
-    ProcessSupervisor, WorkspacePermissionPolicy,
-};
+use orchestral_runtime::{ExecProcessError, ExecSessionStatus, ExecSpawnSpec, ProcessSupervisor};
+#[cfg(target_os = "macos")]
+use orchestral_runtime::{GuardedToolResult, GuardedToolRuntime, WorkspacePermissionPolicy};
+#[cfg(target_os = "macos")]
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(target_os = "macos")]
 const SIGNING_KEY: &[u8] = b"0123456789abcdef0123456789abcdef";
 
+#[cfg(target_os = "macos")]
 fn effects() -> BTreeSet<EffectScope> {
     BTreeSet::from([
         EffectScope::Process,
@@ -45,6 +51,7 @@ fn test_operation(summary: &str) -> ToolOperationPlan {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn bounds(workspace: &Path, shell: &Path) -> ToolPolicyBounds {
     let workspace = workspace.to_string_lossy().into_owned();
     let shell = shell.to_string_lossy().into_owned();
@@ -78,12 +85,14 @@ fn bounds(workspace: &Path, shell: &Path) -> ToolPolicyBounds {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn runtime(bounds: ToolPolicyBounds) -> GuardedToolRuntime<InMemoryApprovalCapabilityStore> {
     let verifier =
         HostApprovalVerifier::new(SIGNING_KEY, InMemoryApprovalCapabilityStore::default()).unwrap();
     GuardedToolRuntime::new(HostToolPolicy { bounds }, verifier).unwrap()
 }
 
+#[cfg(target_os = "macos")]
 fn invocation(run: &str, call: &str, tool: &str, arguments: Value) -> ToolInvocation {
     ToolInvocation {
         run_id: RunId::new(run),
@@ -93,6 +102,7 @@ fn invocation(run: &str, call: &str, tool: &str, arguments: Value) -> ToolInvoca
     }
 }
 
+#[cfg(target_os = "macos")]
 fn inline_output(result: GuardedToolResult) -> Value {
     match result {
         GuardedToolResult::Outcome {
