@@ -722,7 +722,7 @@ fn project_telemetry(run: &mut ActiveRun, state: &mut UiState, telemetry: AgentT
             activity_id,
             tool_name,
             state: activity_state,
-            details,
+            evidence,
         } => {
             update(
                 state,
@@ -730,7 +730,7 @@ fn project_telemetry(run: &mut ActiveRun, state: &mut UiState, telemetry: AgentT
                     activity_id: activity_id.as_str().to_owned(),
                     tool_name,
                     state: activity_state,
-                    details,
+                    evidence,
                 },
             );
         }

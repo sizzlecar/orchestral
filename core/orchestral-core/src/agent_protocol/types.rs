@@ -2417,6 +2417,114 @@ pub enum ToolActivityState {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "agent-protocol-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ToolFileActivityKind {
+    Read,
+    Create,
+    Update,
+    Delete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "agent-protocol-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ToolDiffLineKind {
+    Context,
+    Addition,
+    Deletion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "agent-protocol-schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ToolDiffLine {
+    pub kind: ToolDiffLineKind,
+    pub text: String,
+}
+
+impl ToolDiffLine {
+    fn validate_integrity(&self) -> Result<(), AgentProtocolError> {
+        if !is_safe_tool_activity_text(&self.text, 512, true) {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidSpec,
+                "Tool diff evidence must contain bounded presentation-safe text",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Bounded, Host-selected evidence about one Tool operation.
+///
+/// This is deliberately semantic rather than a copy of arbitrary Tool JSON:
+/// adapters describe their own operations, while Agent clients only aggregate
+/// and render the stable evidence vocabulary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "agent-protocol-schema", derive(schemars::JsonSchema))]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[non_exhaustive]
+pub enum ToolActivityEvidence {
+    Command {
+        command: String,
+    },
+    File {
+        operation: ToolFileActivityKind,
+        path: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        diff: Vec<ToolDiffLine>,
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        diff_omitted: u32,
+    },
+    Note {
+        text: String,
+    },
+    Error {
+        code: String,
+        message: String,
+    },
+    Omitted {
+        count: u32,
+    },
+}
+
+impl ToolActivityEvidence {
+    pub fn validate_integrity(&self) -> Result<(), AgentProtocolError> {
+        let valid = match self {
+            Self::Command { command } => is_safe_tool_activity_text(command, 512, false),
+            Self::File { path, diff, .. } => {
+                is_safe_tool_activity_text(path, 512, false)
+                    && diff.len() <= 24
+                    && diff.iter().all(|line| line.validate_integrity().is_ok())
+            }
+            Self::Note { text } => is_safe_tool_activity_text(text, 512, false),
+            Self::Error { code, message } => {
+                is_safe_tool_activity_text(code, 128, false)
+                    && is_safe_tool_activity_text(message, 512, false)
+            }
+            Self::Omitted { count } => *count > 0,
+        };
+        if !valid {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidSpec,
+                "Tool activity evidence must be bounded and presentation-safe",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn is_safe_tool_activity_text(value: &str, max_chars: usize, allow_empty: bool) -> bool {
+    (allow_empty || !value.trim().is_empty())
+        && value.chars().count() <= max_chars
+        && !value.chars().any(char::is_control)
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "agent-protocol-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -2435,11 +2543,10 @@ pub enum AgentTelemetry {
         activity_id: ToolActivityId,
         tool_name: String,
         state: ToolActivityState,
-        /// Bounded, presentation-safe operation details selected by the Host
-        /// (for example a command preview or workspace-relative file paths).
-        /// Raw Tool arguments and results must never be copied here wholesale.
+        /// Bounded semantic evidence selected by the Host. Raw Tool arguments
+        /// and results must never be copied here wholesale.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        details: Vec<String>,
+        evidence: Vec<ToolActivityEvidence>,
     },
     Extension {
         #[cfg_attr(
@@ -2478,19 +2585,19 @@ impl AgentTelemetry {
             Self::ToolActivity {
                 activity_id,
                 tool_name,
-                details,
+                evidence,
                 ..
             } => {
                 if activity_id.is_empty()
                     || tool_name.trim().is_empty()
-                    || details.len() > 8
-                    || details
+                    || evidence.len() > 16
+                    || evidence
                         .iter()
-                        .any(|detail| detail.trim().is_empty() || detail.chars().count() > 512)
+                        .any(|item| item.validate_integrity().is_err())
                 {
                     return Err(AgentProtocolError::new(
                         AgentProtocolErrorCode::InvalidSpec,
-                        "Tool activity telemetry requires an activity_id, tool_name, and at most eight non-empty bounded details",
+                        "Tool activity telemetry requires an activity_id, tool_name, and at most sixteen valid evidence items",
                     ));
                 }
                 Ok(())
@@ -3352,7 +3459,12 @@ mod tests {
             activity_id: ToolActivityId::new("activity-1"),
             tool_name: "file_read".to_owned(),
             state: ToolActivityState::Succeeded,
-            details: vec!["core/src/lib.rs".to_owned()],
+            evidence: vec![ToolActivityEvidence::File {
+                operation: ToolFileActivityKind::Read,
+                path: "core/src/lib.rs".to_owned(),
+                diff: Vec::new(),
+                diff_omitted: 0,
+            }],
         };
         telemetry
             .validate_integrity()
@@ -3360,7 +3472,8 @@ mod tests {
         let value = serde_json::to_value(&telemetry).expect("Tool activity serializes");
         assert_eq!(value["type"], "tool_activity");
         assert_eq!(value["state"], "succeeded");
-        assert_eq!(value["details"][0], "core/src/lib.rs");
+        assert_eq!(value["evidence"][0]["type"], "file");
+        assert_eq!(value["evidence"][0]["path"], "core/src/lib.rs");
         assert!(serde_json::from_value::<AgentTelemetry>(value)
             .expect("Tool activity deserializes")
             .validate_integrity()
@@ -3369,7 +3482,7 @@ mod tests {
             activity_id: ToolActivityId::new(""),
             tool_name: "file_read".to_owned(),
             state: ToolActivityState::Running,
-            details: Vec::new(),
+            evidence: Vec::new(),
         }
         .validate_integrity()
         .is_err());
@@ -3377,7 +3490,9 @@ mod tests {
             activity_id: ToolActivityId::new("activity-2"),
             tool_name: "exec_command".to_owned(),
             state: ToolActivityState::Running,
-            details: vec!["x".repeat(513)],
+            evidence: vec![ToolActivityEvidence::Command {
+                command: "x".repeat(513),
+            }],
         }
         .validate_integrity()
         .is_err());

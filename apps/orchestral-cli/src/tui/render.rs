@@ -5,7 +5,7 @@ use ratatui::widgets::{Block, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-use super::activity::ActivityStatus;
+use super::activity::{ActivityDetail, ActivityDetailStyle, ActivityStatus};
 use super::state::{PendingOverlay, TranscriptEntry, TranscriptRole, UiPhase, UiState};
 
 const MUTED: Style = Style::new().fg(Color::DarkGray);
@@ -152,6 +152,7 @@ fn push_entry_lines(lines: &mut Vec<Line<'static>>, entry: &TranscriptEntry, wid
                 None => ("· ", MUTED),
             };
             push_status_text(lines, symbol, &entry.text, style);
+            push_activity_details(lines, &entry.tool_details);
         }
     }
 }
@@ -182,31 +183,29 @@ fn push_status_text(lines: &mut Vec<Line<'static>>, prefix: &str, text: &str, st
                 },
                 style.add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                part.to_owned(),
-                if index == 0 {
-                    ASSISTANT
-                } else {
-                    activity_detail_style(part)
-                },
-            ),
+            Span::styled(part.to_owned(), if index == 0 { ASSISTANT } else { MUTED }),
         ]));
     }
 }
 
-fn activity_detail_style(detail: &str) -> Style {
-    let detail = detail.trim_start().strip_prefix("└ ").unwrap_or(detail);
-    if detail.starts_with("+ ") || detail.starts_with('+') {
-        SUCCESS
-    } else if detail.starts_with("- ") || detail.starts_with('-') || detail.starts_with("Error [") {
-        ERROR
-    } else if ["Add ", "Update ", "Delete "]
-        .iter()
-        .any(|prefix| detail.starts_with(prefix))
-    {
-        ASSISTANT.add_modifier(Modifier::BOLD)
-    } else {
-        MUTED
+fn push_activity_details(lines: &mut Vec<Line<'static>>, details: &[ActivityDetail]) {
+    for detail in details {
+        let prefix = if detail.depth == 0 {
+            "  └ "
+        } else {
+            "      "
+        };
+        let style = match detail.style {
+            ActivityDetailStyle::Primary => ASSISTANT.add_modifier(Modifier::BOLD),
+            ActivityDetailStyle::Context => MUTED,
+            ActivityDetailStyle::Addition => SUCCESS,
+            ActivityDetailStyle::Deletion | ActivityDetailStyle::Error => ERROR,
+            ActivityDetailStyle::Muted => MUTED,
+        };
+        lines.push(Line::from(vec![
+            Span::styled(prefix.to_owned(), MUTED),
+            Span::styled(detail.text.clone(), style),
+        ]));
     }
 }
 
@@ -840,13 +839,55 @@ mod tests {
     use std::time::Duration;
 
     use insta::assert_snapshot;
-    use orchestral_core::agent_protocol::wire::ToolActivityState;
+    use orchestral_core::agent_protocol::wire::{
+        ToolActivityEvidence, ToolActivityState, ToolDiffLine, ToolDiffLineKind,
+        ToolFileActivityKind,
+    };
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use unicode_width::UnicodeWidthStr;
 
     use super::render;
     use crate::tui::{update, TranscriptEntry, UiMsg, UiPhase, UiState};
+
+    fn command_evidence(command: &str) -> Vec<ToolActivityEvidence> {
+        vec![ToolActivityEvidence::Command {
+            command: command.to_owned(),
+        }]
+    }
+
+    fn file_evidence(path: &str) -> Vec<ToolActivityEvidence> {
+        vec![ToolActivityEvidence::File {
+            operation: ToolFileActivityKind::Read,
+            path: path.to_owned(),
+            diff: Vec::new(),
+            diff_omitted: 0,
+        }]
+    }
+
+    fn note_evidence(text: &str) -> Vec<ToolActivityEvidence> {
+        vec![ToolActivityEvidence::Note {
+            text: text.to_owned(),
+        }]
+    }
+
+    fn edit_evidence(path: &str) -> Vec<ToolActivityEvidence> {
+        vec![ToolActivityEvidence::File {
+            operation: ToolFileActivityKind::Update,
+            path: path.to_owned(),
+            diff: vec![
+                ToolDiffLine {
+                    kind: ToolDiffLineKind::Deletion,
+                    text: "let visible = false;".to_owned(),
+                },
+                ToolDiffLine {
+                    kind: ToolDiffLineKind::Addition,
+                    text: "let visible = true;".to_owned(),
+                },
+            ],
+            diff_omitted: 0,
+        }]
+    }
 
     #[test]
     fn snapshot_40x12_cjk_emoji_tool_and_approval() {
@@ -862,7 +903,7 @@ mod tests {
                 activity_id: "shell-test".to_owned(),
                 tool_name: "exec_command".to_owned(),
                 state: ToolActivityState::Running,
-                details: vec!["cargo test -p orchestral-runtime".to_owned()],
+                evidence: command_evidence("cargo test -p orchestral-runtime"),
             },
         );
         update(
@@ -912,7 +953,7 @@ mod tests {
                 activity_id: "inspect-runtime".to_owned(),
                 tool_name: "file_read".to_owned(),
                 state: ToolActivityState::Succeeded,
-                details: vec!["core/orchestral-runtime/src/generic_agent/model_step.rs".to_owned()],
+                evidence: file_evidence("core/orchestral-runtime/src/generic_agent/model_step.rs"),
             },
         );
         update(
@@ -946,7 +987,7 @@ mod tests {
                 activity_id: "read-core".to_owned(),
                 tool_name: "file_read".to_owned(),
                 state: ToolActivityState::Succeeded,
-                details: vec!["core/orchestral-core/src/agent_protocol/types.rs".to_owned()],
+                evidence: file_evidence("core/orchestral-core/src/agent_protocol/types.rs"),
             },
         );
         update(
@@ -955,7 +996,16 @@ mod tests {
                 activity_id: "search-flow".to_owned(),
                 tool_name: "exec_command".to_owned(),
                 state: ToolActivityState::Running,
-                details: vec!["rg -n \"ToolActivity\" core apps".to_owned()],
+                evidence: command_evidence("rg -n \"ToolActivity\" core apps"),
+            },
+        );
+        update(
+            &mut state,
+            UiMsg::ToolActivity {
+                activity_id: "edit-flow".to_owned(),
+                tool_name: "apply_patch".to_owned(),
+                state: ToolActivityState::Succeeded,
+                evidence: edit_evidence("apps/orchestral-cli/src/tui/activity.rs"),
             },
         );
         update(
@@ -993,7 +1043,7 @@ mod tests {
                 activity_id: "skill-read".to_owned(),
                 tool_name: "skill_read".to_owned(),
                 state: ToolActivityState::Succeeded,
-                details: vec!["code-fix".to_owned()],
+                evidence: note_evidence("code-fix"),
             },
         );
         update(
@@ -1002,7 +1052,7 @@ mod tests {
                 activity_id: "mcp-inventory".to_owned(),
                 tool_name: "mcp__inventory__deployment_color".to_owned(),
                 state: ToolActivityState::Failed,
-                details: vec!["mcp__inventory__deployment_color".to_owned()],
+                evidence: note_evidence("mcp__inventory__deployment_color"),
             },
         );
         update(
@@ -1011,7 +1061,7 @@ mod tests {
                 activity_id: "exec-start".to_owned(),
                 tool_name: "exec_command".to_owned(),
                 state: ToolActivityState::Succeeded,
-                details: vec!["cargo test -p orchestral-cli".to_owned()],
+                evidence: command_evidence("cargo test -p orchestral-cli"),
             },
         );
         update(
@@ -1020,7 +1070,7 @@ mod tests {
                 activity_id: "exec-poll".to_owned(),
                 tool_name: "write_stdin".to_owned(),
                 state: ToolActivityState::Succeeded,
-                details: Vec::new(),
+                evidence: Vec::new(),
             },
         );
         update(

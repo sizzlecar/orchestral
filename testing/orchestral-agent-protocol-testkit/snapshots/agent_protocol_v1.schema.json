@@ -1339,11 +1339,11 @@
             "activity_id": {
               "$ref": "#/$defs/ToolActivityId"
             },
-            "details": {
-              "description": "Bounded, presentation-safe operation details selected by the Host\n(for example a command preview or workspace-relative file paths).\nRaw Tool arguments and results must never be copied here wholesale.",
+            "evidence": {
+              "description": "Bounded semantic evidence selected by the Host. Raw Tool arguments\nand results must never be copied here wholesale.",
               "type": "array",
               "items": {
-                "type": "string"
+                "$ref": "#/$defs/ToolActivityEvidence"
               }
             },
             "state": {
@@ -2522,6 +2522,117 @@
       "description": "Stable telemetry item identifier.",
       "type": "string"
     },
+    "ToolActivityEvidence": {
+      "description": "Bounded, Host-selected evidence about one Tool operation.\n\nThis is deliberately semantic rather than a copy of arbitrary Tool JSON:\nadapters describe their own operations, while Agent clients only aggregate\nand render the stable evidence vocabulary.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "command"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "command"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "diff": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/ToolDiffLine"
+              }
+            },
+            "diff_omitted": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "operation": {
+              "$ref": "#/$defs/ToolFileActivityKind"
+            },
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "file"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "operation",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "note"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "text"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "error"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "code",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "count": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "omitted"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "count"
+          ]
+        }
+      ]
+    },
     "ToolActivityId": {
       "description": "Stable identifier for one Tool activity across state transitions.",
       "type": "string"
@@ -2533,6 +2644,39 @@
         "succeeded",
         "failed",
         "cancelled"
+      ]
+    },
+    "ToolDiffLine": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/ToolDiffLineKind"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "text"
+      ]
+    },
+    "ToolDiffLineKind": {
+      "type": "string",
+      "enum": [
+        "context",
+        "addition",
+        "deletion"
+      ]
+    },
+    "ToolFileActivityKind": {
+      "type": "string",
+      "enum": [
+        "read",
+        "create",
+        "update",
+        "delete"
       ]
     },
     "UsageReport": {

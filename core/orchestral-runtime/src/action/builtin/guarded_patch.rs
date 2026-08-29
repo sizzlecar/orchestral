@@ -12,7 +12,9 @@ use crate::tool_runtime::{GuardedToolExecution, GuardedToolExecutor};
 use async_trait::async_trait;
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions, Permissions};
-use orchestral_core::agent_protocol::wire::Digest;
+use orchestral_core::agent_protocol::wire::{
+    Digest, ToolActivityEvidence, ToolDiffLine, ToolDiffLineKind, ToolFileActivityKind,
+};
 use orchestral_core::tool_protocol::{
     CapabilityRequest, CapabilitySelector, EffectScope, ModelToolSchema, ToolConcurrency,
     ToolDescriptor, ToolId, ToolIdempotency, ToolInvocation, ToolOperationPlan, ToolOperationRisk,
@@ -148,6 +150,30 @@ impl<'a> FileWriteRequest<'a> {
 impl GuardedToolExecutor for GuardedFileWriteExecutor {
     fn planning_contract(&self) -> Value {
         json!({ "contract": "orchestral.file-write-planner/v1" })
+    }
+
+    fn activity_evidence(
+        &self,
+        invocation: &ToolInvocation,
+        _outcome: Option<&ToolOutcome>,
+    ) -> Vec<ToolActivityEvidence> {
+        let Ok(request) = FileWriteRequest::parse(invocation) else {
+            return Vec::new();
+        };
+        let (diff, diff_omitted) = if request.mode == FileWriteMode::Create {
+            added_content_preview(request.content)
+        } else {
+            (Vec::new(), 0)
+        };
+        vec![ToolActivityEvidence::File {
+            operation: match request.mode {
+                FileWriteMode::Create => ToolFileActivityKind::Create,
+                FileWriteMode::Replace => ToolFileActivityKind::Update,
+            },
+            path: request.path.display().to_owned(),
+            diff,
+            diff_omitted,
+        }]
     }
 
     fn plan_operation(
@@ -298,6 +324,14 @@ impl GuardedToolExecutor for GuardedApplyPatchExecutor {
         json!({ "contract": "orchestral.apply-patch-planner/v2" })
     }
 
+    fn activity_evidence(
+        &self,
+        invocation: &ToolInvocation,
+        _outcome: Option<&ToolOutcome>,
+    ) -> Vec<ToolActivityEvidence> {
+        patch_activity_evidence(invocation)
+    }
+
     fn plan_operation(
         &self,
         invocation: &ToolInvocation,
@@ -405,6 +439,150 @@ impl GuardedToolExecutor for GuardedApplyPatchExecutor {
             .into(),
         }
     }
+}
+
+fn patch_activity_evidence(invocation: &ToolInvocation) -> Vec<ToolActivityEvidence> {
+    const MAX_FILES: usize = 15;
+    let Some(patch) = invocation.arguments.get("patch").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let Ok(parsed) = parse_patch(patch) else {
+        return Vec::new();
+    };
+    let previews = patch_diff_previews(patch, parsed.operations.len());
+    let mut evidence = parsed
+        .operations
+        .iter()
+        .take(MAX_FILES)
+        .enumerate()
+        .map(|(index, operation)| {
+            let preview = previews.get(index).cloned().unwrap_or_default();
+            ToolActivityEvidence::File {
+                operation: match operation {
+                    PatchOperation::Add { .. } => ToolFileActivityKind::Create,
+                    PatchOperation::Update { .. } => ToolFileActivityKind::Update,
+                    PatchOperation::Delete { .. } => ToolFileActivityKind::Delete,
+                },
+                path: operation.path().display().to_owned(),
+                diff: preview.lines,
+                diff_omitted: preview.omitted,
+            }
+        })
+        .collect::<Vec<_>>();
+    if parsed.operations.len() > MAX_FILES {
+        evidence.push(ToolActivityEvidence::Omitted {
+            count: u32::try_from(parsed.operations.len() - MAX_FILES).unwrap_or(u32::MAX),
+        });
+    }
+    evidence
+}
+
+#[derive(Debug, Clone, Default)]
+struct DiffPreview {
+    lines: Vec<ToolDiffLine>,
+    omitted: u32,
+}
+
+fn patch_diff_previews(patch: &str, operation_count: usize) -> Vec<DiffPreview> {
+    const MAX_LINES_PER_FILE: usize = 16;
+    #[derive(Clone, Copy)]
+    enum Mode {
+        Add,
+        Update,
+        Delete,
+    }
+
+    let mut previews = vec![DiffPreview::default(); operation_count];
+    let mut current = None::<(usize, Mode)>;
+    let mut next_index = 0usize;
+    for line in patch.lines() {
+        let mode = if line.starts_with("*** Add File: ") {
+            Some(Mode::Add)
+        } else if line.starts_with("*** Update File: ") {
+            Some(Mode::Update)
+        } else if line.starts_with("*** Delete File: ") {
+            Some(Mode::Delete)
+        } else {
+            None
+        };
+        if let Some(mode) = mode {
+            current = (next_index < operation_count).then_some((next_index, mode));
+            next_index = next_index.saturating_add(1);
+            continue;
+        }
+        let Some((index, mode)) = current else {
+            continue;
+        };
+        let change = match mode {
+            Mode::Add => line
+                .strip_prefix('+')
+                .map(|text| (ToolDiffLineKind::Addition, text)),
+            Mode::Update if line.starts_with("@@") => None,
+            Mode::Update => line
+                .strip_prefix('+')
+                .map(|text| (ToolDiffLineKind::Addition, text))
+                .or_else(|| {
+                    line.strip_prefix('-')
+                        .map(|text| (ToolDiffLineKind::Deletion, text))
+                })
+                .or_else(|| {
+                    line.strip_prefix(' ')
+                        .map(|text| (ToolDiffLineKind::Context, text))
+                }),
+            Mode::Delete => None,
+        };
+        if let Some((kind, text)) = change {
+            let preview = &mut previews[index];
+            if preview.lines.len() < MAX_LINES_PER_FILE {
+                preview.lines.push(ToolDiffLine {
+                    kind,
+                    text: bounded_diff_text(text),
+                });
+            } else {
+                preview.omitted = preview.omitted.saturating_add(1);
+            }
+        }
+    }
+    previews
+}
+
+fn added_content_preview(content: &str) -> (Vec<ToolDiffLine>, u32) {
+    const MAX_LINES: usize = 16;
+    let mut lines = Vec::new();
+    let mut omitted = 0u32;
+    for line in content.lines() {
+        if lines.len() < MAX_LINES {
+            lines.push(ToolDiffLine {
+                kind: ToolDiffLineKind::Addition,
+                text: bounded_diff_text(line),
+            });
+        } else {
+            omitted = omitted.saturating_add(1);
+        }
+    }
+    (lines, omitted)
+}
+
+fn bounded_diff_text(value: &str) -> String {
+    const MAX_CHARS: usize = 240;
+    let mut chars = value.chars();
+    let mut text = chars
+        .by_ref()
+        .take(MAX_CHARS)
+        .map(|character| {
+            if character == '\t' {
+                ' '
+            } else if character.is_control() {
+                '�'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    if chars.next().is_some() {
+        text.push('…');
+    }
+    text
 }
 
 fn parsed_patch_summary(parsed: &ParsedPatch) -> String {
@@ -1118,8 +1296,65 @@ mod tests {
     use std::path::PathBuf;
 
     use cap_std::{ambient_authority, fs::Dir};
+    use orchestral_core::agent_protocol::wire::{
+        RunId, ToolActivityEvidence, ToolDiffLine, ToolDiffLineKind, ToolFileActivityKind,
+    };
+    use orchestral_core::tool_protocol::{ToolCallId, ToolId, ToolInvocation};
+    use serde_json::json;
 
-    use super::{commit_change, parse_patch, prepare_patch, EffectiveRoots};
+    use super::{
+        commit_change, parse_patch, patch_activity_evidence, prepare_patch, EffectiveRoots,
+    };
+
+    #[test]
+    fn patch_adapter_emits_structured_file_and_diff_evidence() {
+        let invocation = ToolInvocation {
+            run_id: RunId::new("run-evidence"),
+            call_id: ToolCallId::new("call-evidence"),
+            tool_id: ToolId::new("orchestral/apply_patch/v1"),
+            arguments: json!({
+                "patch": concat!(
+                    "*** Begin Patch\n",
+                    "*** Update File: src/lib.rs\n",
+                    "@@\n",
+                    "-old\n",
+                    "+new\n",
+                    "*** Add File: tests/new.rs\n",
+                    "+test\n",
+                    "*** End Patch"
+                )
+            }),
+        };
+        assert_eq!(
+            patch_activity_evidence(&invocation),
+            vec![
+                ToolActivityEvidence::File {
+                    operation: ToolFileActivityKind::Update,
+                    path: "src/lib.rs".to_owned(),
+                    diff: vec![
+                        ToolDiffLine {
+                            kind: ToolDiffLineKind::Deletion,
+                            text: "old".to_owned(),
+                        },
+                        ToolDiffLine {
+                            kind: ToolDiffLineKind::Addition,
+                            text: "new".to_owned(),
+                        },
+                    ],
+                    diff_omitted: 0,
+                },
+                ToolActivityEvidence::File {
+                    operation: ToolFileActivityKind::Create,
+                    path: "tests/new.rs".to_owned(),
+                    diff: vec![ToolDiffLine {
+                        kind: ToolDiffLineKind::Addition,
+                        text: "test".to_owned(),
+                    }],
+                    diff_omitted: 0,
+                },
+            ]
+        );
+    }
 
     #[test]
     fn captured_parent_capability_prevents_symlink_swap_escape() {

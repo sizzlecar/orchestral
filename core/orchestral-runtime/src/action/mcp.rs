@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
 
-use orchestral_core::agent_protocol::wire::Digest;
+use orchestral_core::agent_protocol::wire::{Digest, ToolActivityEvidence};
 use orchestral_core::mcp_protocol::{
     McpProtocolEra, McpServerId, McpServerSnapshot, McpToolSnapshot, McpTransportAuthority,
     McpTransportCancellation, McpTransportConnection, McpTransportError, McpTransportFactory,
@@ -1249,6 +1249,16 @@ impl GuardedToolExecutor for GuardedMcpToolExecutor {
             "transportBinding": self.manager.config.transport.authority().binding_digest,
             "tool": self.tool_name,
         })
+    }
+
+    fn activity_evidence(
+        &self,
+        _invocation: &ToolInvocation,
+        _outcome: Option<&ToolOutcome>,
+    ) -> Vec<ToolActivityEvidence> {
+        vec![ToolActivityEvidence::Note {
+            text: format!("{}/{}", self.manager.config.server_id, self.tool_name),
+        }]
     }
 
     fn plan_operation(

@@ -49,7 +49,7 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
     let mut tool_results = Vec::with_capacity(parsed_calls.len());
     let mut retained_artifacts = BTreeMap::<String, ArtifactRefWithDigest>::new();
     for (call, arguments) in parsed_calls {
-        let activity_details = tool_activity_details(&call.name, &arguments);
+        let internal_activity_evidence = internal_tool_activity_evidence(&call.name, &arguments);
         if cancellation.is_cancelled() {
             emit_cancel(&inner, &request, &user_message);
             return ToolBatchExecution::Terminal;
@@ -110,7 +110,7 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                 &call.call_id,
                 &call.name,
                 ToolActivityState::Running,
-                &activity_details,
+                &internal_activity_evidence,
             );
             let observation =
                 match execute_skill_read(&inner, &request, skills, round, &call.call_id, arguments)
@@ -133,7 +133,7 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                 } else {
                     ToolActivityState::Succeeded
                 },
-                &activity_details,
+                &internal_activity_evidence,
             );
             tool_results.push(ModelContent::ToolResult {
                 call_id: call.call_id,
@@ -206,7 +206,7 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                 &call.call_id,
                 &call.name,
                 ToolActivityState::Running,
-                &activity_details,
+                &internal_activity_evidence,
             );
             let observation = match execute_workflow_call(
                 inner.clone(),
@@ -284,7 +284,7 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                 } else {
                     ToolActivityState::Succeeded
                 },
-                &activity_details,
+                &internal_activity_evidence,
             );
             let Some(workflow_event_id) = publish_workflow_output(
                 &inner,
@@ -334,6 +334,10 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
             tool_id,
             arguments,
         };
+        let activity_evidence = tools
+            .runtime
+            .activity_evidence(&invocation, None)
+            .unwrap_or_default();
         publish_tool_activity(
             &inner,
             &run_id,
@@ -341,7 +345,7 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
             &call.call_id,
             &call.name,
             ToolActivityState::Running,
-            &activity_details,
+            &activity_evidence,
         );
         let result = tools
             .runtime
@@ -372,7 +376,7 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                         tools
                             .runtime
                             .invoke(
-                                invocation,
+                                invocation.clone(),
                                 tools.run_grant.clone(),
                                 Some(capability),
                                 cancellation.clone(),
@@ -398,11 +402,15 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
             }
             result => result,
         };
-        let terminal_activity_details = match &result {
+        let terminal_activity_evidence = match &result {
             GuardedToolResult::Outcome { outcome, .. } => {
-                tool_terminal_activity_details(&call.name, &activity_details, outcome)
+                let base = tools
+                    .runtime
+                    .activity_evidence(&invocation, Some(outcome))
+                    .unwrap_or_else(|_| activity_evidence.clone());
+                tool_terminal_activity_evidence(&base, outcome)
             }
-            GuardedToolResult::ApprovalRequired { .. } => activity_details.clone(),
+            GuardedToolResult::ApprovalRequired { .. } => activity_evidence.clone(),
         };
         match result {
             GuardedToolResult::ApprovalRequired { binding, .. } => {
@@ -413,7 +421,7 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                     &call.call_id,
                     &call.name,
                     ToolActivityState::Failed,
-                    &terminal_activity_details,
+                    &terminal_activity_evidence,
                 );
                 emit_failure(
                     &inner,
@@ -441,7 +449,7 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                     &call.call_id,
                     &call.name,
                     ToolActivityState::Cancelled,
-                    &terminal_activity_details,
+                    &terminal_activity_evidence,
                 );
                 // The effect journal deliberately retains UnknownEffect, while
                 // the Agent Run still observes the user's cancellation as its
@@ -473,7 +481,7 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                     &call.call_id,
                     &call.name,
                     ToolActivityState::Failed,
-                    &terminal_activity_details,
+                    &terminal_activity_evidence,
                 );
                 if let Err(failure) = append_effect_uncertainty(
                     &inner,
@@ -507,7 +515,7 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                     &call.call_id,
                     &call.name,
                     ToolActivityState::Cancelled,
-                    &terminal_activity_details,
+                    &terminal_activity_evidence,
                 );
                 emit_cancel(&inner, &request, &user_message);
                 return ToolBatchExecution::Terminal;
@@ -528,7 +536,7 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                     } else {
                         ToolActivityState::Succeeded
                     },
-                    &terminal_activity_details,
+                    &terminal_activity_evidence,
                 );
                 tool_results.push(ModelContent::ToolResult {
                     call_id: call.call_id,
@@ -546,105 +554,49 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
     }
 }
 
-/// Selects a small presentation-safe subset of Tool arguments for activity
-/// telemetry. This is deliberately allowlisted by Tool family: credentials and
-/// arbitrary MCP arguments never enter the UI path, while patches expose only
-/// a bounded local preview.
-fn tool_activity_details(tool_name: &str, arguments: &serde_json::Value) -> Vec<String> {
+/// Internal control Tools are owned by the Generic Agent rather than the
+/// guarded Tool registry, so their small semantic projection stays here.
+fn internal_tool_activity_evidence(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+) -> Vec<ToolActivityEvidence> {
     match tool_name {
-        "exec_command" => string_argument(arguments, "cmd").into_iter().collect(),
-        "file_read" | "artifact_read" | "file_write" => {
-            string_argument(arguments, "path").into_iter().collect()
-        }
-        "apply_patch" => patch_file_details(arguments),
-        SKILL_READ_TOOL_NAME => string_argument(arguments, "name").into_iter().collect(),
-        WORKFLOW_TOOL_NAME => string_argument(arguments, "workflow_id")
-            .into_iter()
-            .collect(),
-        name if name.starts_with("mcp__") => bounded_activity_detail(name).into_iter().collect(),
+        SKILL_READ_TOOL_NAME => note_argument(arguments, "name"),
+        WORKFLOW_TOOL_NAME => note_argument(arguments, "workflow_id"),
         _ => Vec::new(),
     }
 }
 
-fn string_argument(arguments: &serde_json::Value, name: &str) -> Option<String> {
+fn note_argument(arguments: &serde_json::Value, name: &str) -> Vec<ToolActivityEvidence> {
     arguments
         .get(name)
         .and_then(serde_json::Value::as_str)
         .and_then(bounded_activity_detail)
-}
-
-fn patch_file_details(arguments: &serde_json::Value) -> Vec<String> {
-    let Some(patch) = arguments.get("patch").and_then(serde_json::Value::as_str) else {
-        return Vec::new();
-    };
-    let mut details = Vec::new();
-    for line in patch.lines() {
-        let operation = [
-            ("*** Add File: ", "Add"),
-            ("*** Update File: ", "Update"),
-            ("*** Delete File: ", "Delete"),
-        ]
+        .map(|text| ToolActivityEvidence::Note { text })
         .into_iter()
-        .find_map(|(prefix, label)| {
-            line.strip_prefix(prefix)
-                .and_then(bounded_activity_detail)
-                .map(|path| format!("{label} {path}"))
-        });
-        if let Some(operation) = operation {
-            details.push(operation);
-        } else if (line.starts_with('+') || line.starts_with('-'))
-            && !line.starts_with("+++")
-            && !line.starts_with("---")
-        {
-            if let Some(line) = bounded_patch_line(line) {
-                details.push(line);
-            }
-        }
-        if details.len() == 8 {
-            break;
-        }
-    }
-    details
+        .collect()
 }
 
-fn tool_terminal_activity_details(
-    tool_name: &str,
-    base: &[String],
+fn tool_terminal_activity_evidence(
+    base: &[ToolActivityEvidence],
     outcome: &ToolOutcome,
-) -> Vec<String> {
-    if tool_name != "apply_patch" {
-        return base.to_vec();
-    }
+) -> Vec<ToolActivityEvidence> {
     let (code, message) = match outcome {
         ToolOutcome::Rejected { code, message } | ToolOutcome::Failed { code, message, .. } => {
-            (code, message)
+            (code.as_str(), message.as_str())
         }
+        ToolOutcome::UnknownEffect { message } => ("unknown_effect", message.as_str()),
         _ => return base.to_vec(),
     };
-    let Some(error) = bounded_activity_detail(&format!("Error [{code}] {message}")) else {
+    let Some(code) = bounded_activity_detail(code) else {
         return base.to_vec();
     };
-    let mut details = base.iter().take(7).cloned().collect::<Vec<_>>();
-    details.push(error);
-    details
-}
-
-fn bounded_patch_line(value: &str) -> Option<String> {
-    const MAX_CHARS: usize = 160;
-    let normalized = value.trim_end_matches('\r');
-    if normalized.len() <= 1 {
-        return None;
-    }
-    let count = normalized.chars().count();
-    Some(if count > MAX_CHARS {
-        normalized
-            .chars()
-            .take(MAX_CHARS - 1)
-            .chain(['…'])
-            .collect()
-    } else {
-        normalized.to_owned()
-    })
+    let Some(message) = bounded_activity_detail(message) else {
+        return base.to_vec();
+    };
+    let mut evidence = base.iter().take(15).cloned().collect::<Vec<_>>();
+    evidence.push(ToolActivityEvidence::Error { code, message });
+    evidence
 }
 
 fn bounded_activity_detail(value: &str) -> Option<String> {
@@ -685,52 +637,50 @@ mod activity_detail_tests {
     use super::*;
 
     #[test]
-    fn command_and_patch_previews_are_bounded_and_selective() {
+    fn internal_tool_evidence_is_bounded_and_selective() {
         assert_eq!(
-            tool_activity_details(
-                "exec_command",
-                &serde_json::json!({ "cmd": "git switch -c feat/visible-work" }),
+            internal_tool_activity_evidence(
+                SKILL_READ_TOOL_NAME,
+                &serde_json::json!({ "name": "rust-workflow" }),
             ),
-            vec!["git switch -c feat/visible-work"]
+            vec![ToolActivityEvidence::Note {
+                text: "rust-workflow".to_owned()
+            }]
         );
-        assert_eq!(
-            tool_activity_details(
-                "apply_patch",
-                &serde_json::json!({
-                    "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old\n+new\n*** Add File: tests/new.rs\n+test\n*** End Patch"
-                }),
-            ),
-            vec![
-                "Update src/lib.rs",
-                "-old",
-                "+new",
-                "Add tests/new.rs",
-                "+test"
-            ]
-        );
-        assert!(tool_activity_details(
-            "mcp__service__lookup",
+        assert!(internal_tool_activity_evidence(
+            "unknown_tool",
             &serde_json::json!({ "secret": "must-not-render" }),
         )
-        .iter()
-        .all(|detail| !detail.contains("must-not-render")));
+        .is_empty());
     }
 
     #[test]
-    fn patch_failure_preview_includes_the_real_tool_error() {
-        let details = tool_terminal_activity_details(
-            "apply_patch",
-            &["Add src/new.rs".to_owned()],
+    fn terminal_evidence_includes_the_real_tool_error() {
+        let evidence = tool_terminal_activity_evidence(
+            &[ToolActivityEvidence::File {
+                operation: orchestral_core::agent_protocol::wire::ToolFileActivityKind::Create,
+                path: "src/new.rs".to_owned(),
+                diff: Vec::new(),
+                diff_omitted: 0,
+            }],
             &ToolOutcome::Rejected {
                 code: "patch_invalid".to_owned(),
                 message: "Add File lines must start with '+'".to_owned(),
             },
         );
         assert_eq!(
-            details,
+            evidence,
             vec![
-                "Add src/new.rs",
-                "Error [patch_invalid] Add File lines must start with '+'"
+                ToolActivityEvidence::File {
+                    operation: orchestral_core::agent_protocol::wire::ToolFileActivityKind::Create,
+                    path: "src/new.rs".to_owned(),
+                    diff: Vec::new(),
+                    diff_omitted: 0,
+                },
+                ToolActivityEvidence::Error {
+                    code: "patch_invalid".to_owned(),
+                    message: "Add File lines must start with '+'".to_owned(),
+                }
             ]
         );
     }

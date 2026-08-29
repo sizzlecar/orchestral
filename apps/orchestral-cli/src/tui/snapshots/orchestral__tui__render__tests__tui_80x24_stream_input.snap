@@ -11,7 +11,7 @@ expression: "render_to_string(&state, 80, 24)"
   time.
 
   ✓ Read 1 file
-      └ core/orchestral-runtime/src/generic_agent/model_step.rs
+    └ Read core/orchestral-runtime/src/generic_agent/model_step.rs
 
   • Agent 边界。🚀▌
 

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use orchestral_core::agent_protocol::wire::ToolActivityEvidence;
 use orchestral_core::tool_protocol::{
     ApprovalPolicy, CapabilityRequest, CapabilitySelector, EffectScope, ModelToolSchema,
     ToolConcurrency, ToolDescriptor, ToolId, ToolIdempotency, ToolInvocation, ToolOperationPlan,
@@ -129,6 +130,22 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
             "runtime_readable_files": self.runtime_readable_files,
             "environment_names": self.environment.names(),
         })
+    }
+
+    fn activity_evidence(
+        &self,
+        invocation: &ToolInvocation,
+        _outcome: Option<&ToolOutcome>,
+    ) -> Vec<ToolActivityEvidence> {
+        invocation
+            .arguments
+            .get("cmd")
+            .and_then(Value::as_str)
+            .filter(|command| !command.trim().is_empty())
+            .map(display_command)
+            .map(|command| ToolActivityEvidence::Command { command })
+            .into_iter()
+            .collect()
     }
 
     fn plan_operation(

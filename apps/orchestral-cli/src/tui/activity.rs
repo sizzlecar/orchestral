@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
-use orchestral_core::agent_protocol::wire::ToolActivityState;
+use orchestral_core::agent_protocol::wire::{
+    ToolActivityEvidence, ToolActivityState, ToolDiffLineKind, ToolFileActivityKind,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ActivityStatus {
@@ -15,6 +17,24 @@ pub(crate) struct ActivityProjection {
     pub id: String,
     pub summary: String,
     pub status: ActivityStatus,
+    pub details: Vec<ActivityDetail>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActivityDetailStyle {
+    Primary,
+    Context,
+    Addition,
+    Deletion,
+    Error,
+    Muted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActivityDetail {
+    pub text: String,
+    pub depth: u8,
+    pub style: ActivityDetailStyle,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -28,7 +48,37 @@ enum ActivityFamily {
 }
 
 impl ActivityFamily {
-    fn for_tool(tool_name: &str) -> Self {
+    fn for_activity(tool_name: &str, evidence: &[ToolActivityEvidence]) -> Self {
+        if evidence.iter().any(|item| {
+            matches!(
+                item,
+                ToolActivityEvidence::File {
+                    operation: ToolFileActivityKind::Create
+                        | ToolFileActivityKind::Update
+                        | ToolFileActivityKind::Delete,
+                    ..
+                }
+            )
+        }) {
+            return Self::Edit;
+        }
+        if evidence.iter().any(|item| {
+            matches!(
+                item,
+                ToolActivityEvidence::File {
+                    operation: ToolFileActivityKind::Read,
+                    ..
+                }
+            )
+        }) {
+            return Self::Read;
+        }
+        if evidence
+            .iter()
+            .any(|item| matches!(item, ToolActivityEvidence::Command { .. }))
+        {
+            return Self::Command;
+        }
         match tool_name {
             "file_read" | "file_search" | "text_search" | "artifact_read" => Self::Read,
             "exec_command" | "write_stdin" => Self::Command,
@@ -56,7 +106,7 @@ struct ActivityCall {
     family: ActivityFamily,
     tool_name: String,
     state: ToolActivityState,
-    details: Vec<String>,
+    evidence: Vec<ToolActivityEvidence>,
     order: u64,
 }
 
@@ -79,16 +129,16 @@ impl ActivityReducer {
         activity_id: String,
         tool_name: String,
         state: ToolActivityState,
-        details: Vec<String>,
+        evidence: Vec<ToolActivityEvidence>,
     ) -> ActivityProjection {
-        let family = ActivityFamily::for_tool(&tool_name);
+        let family = ActivityFamily::for_activity(&tool_name, &evidence);
         match self.calls.get_mut(&activity_id) {
             Some(call) if call.family == family => {
                 if call.state == ToolActivityState::Running {
                     call.state = state;
                 }
-                if !details.is_empty() {
-                    call.details = details;
+                if !evidence.is_empty() {
+                    call.evidence = evidence;
                 }
             }
             Some(_) => {}
@@ -100,7 +150,7 @@ impl ActivityReducer {
                         family: family.clone(),
                         tool_name,
                         state,
-                        details,
+                        evidence,
                         order: self.next_order,
                     },
                 );
@@ -151,14 +201,11 @@ impl ActivityReducer {
         if cancelled > 0 {
             summary.push_str(&format!(" · {cancelled} cancelled"));
         }
-        for detail in projected_details(&calls) {
-            summary.push_str("\n  └ ");
-            summary.push_str(&detail);
-        }
         ActivityProjection {
             id: format!("{}:{}", self.generation, family.id()),
             summary,
             status,
+            details: projected_details(&calls),
         }
     }
 }
@@ -180,8 +227,18 @@ fn primary_count(family: &ActivityFamily, calls: &[&ActivityCall]) -> usize {
     if family == &ActivityFamily::Edit {
         let files = calls
             .iter()
-            .flat_map(|call| call.details.iter())
-            .filter(|detail| is_file_operation_detail(detail))
+            .flat_map(|call| call.evidence.iter())
+            .filter_map(|item| match item {
+                ToolActivityEvidence::File {
+                    operation:
+                        ToolFileActivityKind::Create
+                        | ToolFileActivityKind::Update
+                        | ToolFileActivityKind::Delete,
+                    path,
+                    ..
+                } => Some(path),
+                _ => None,
+            })
             .collect::<std::collections::BTreeSet<_>>();
         if !files.is_empty() {
             return files.len();
@@ -190,46 +247,107 @@ fn primary_count(family: &ActivityFamily, calls: &[&ActivityCall]) -> usize {
     calls.len()
 }
 
-fn projected_details(calls: &[&ActivityCall]) -> Vec<String> {
-    const MAX_VISIBLE: usize = 4;
+fn projected_details(calls: &[&ActivityCall]) -> Vec<ActivityDetail> {
+    const MAX_VISIBLE: usize = 20;
+    const HEAD_VISIBLE: usize = 8;
+    const TAIL_VISIBLE: usize = MAX_VISIBLE - HEAD_VISIBLE - 1;
     let mut ordered = calls.to_vec();
     ordered.sort_by_key(|call| call.order);
     let mut details = Vec::new();
     for call in ordered {
-        for detail in &call.details {
-            let annotate_terminal_state = is_file_operation_detail(detail)
-                || (!detail.starts_with('+')
-                    && !detail.starts_with('-')
-                    && !detail.starts_with("Error ["));
-            let detail = if call.state == ToolActivityState::Failed && annotate_terminal_state {
-                format!("{detail} (failed)")
-            } else if call.state == ToolActivityState::Cancelled && annotate_terminal_state {
-                format!("{detail} (cancelled)")
-            } else {
-                detail.clone()
-            };
-            if !details.contains(&detail) {
-                details.push(detail);
-            }
+        for item in &call.evidence {
+            details.extend(project_evidence(item, call.state));
         }
     }
     if details.len() <= MAX_VISIBLE {
         return details;
     }
     let omitted = details.len() - MAX_VISIBLE;
-    vec![
-        details[0].clone(),
-        details[1].clone(),
-        format!("… {omitted} more"),
-        details[details.len() - 2].clone(),
-        details[details.len() - 1].clone(),
-    ]
+    let mut bounded = details
+        .iter()
+        .take(HEAD_VISIBLE)
+        .cloned()
+        .collect::<Vec<_>>();
+    bounded.push(ActivityDetail {
+        text: format!("… {omitted} more lines"),
+        depth: 0,
+        style: ActivityDetailStyle::Muted,
+    });
+    bounded.extend(details.iter().skip(details.len() - TAIL_VISIBLE).cloned());
+    bounded
 }
 
-fn is_file_operation_detail(detail: &str) -> bool {
-    ["Add ", "Update ", "Delete "]
-        .iter()
-        .any(|prefix| detail.starts_with(prefix))
+fn project_evidence(
+    evidence: &ToolActivityEvidence,
+    state: ToolActivityState,
+) -> Vec<ActivityDetail> {
+    let terminal_suffix = match state {
+        ToolActivityState::Failed => " (failed)",
+        ToolActivityState::Cancelled => " (cancelled)",
+        ToolActivityState::Running | ToolActivityState::Succeeded => "",
+    };
+    match evidence {
+        ToolActivityEvidence::Command { command } => vec![ActivityDetail {
+            text: format!("{command}{terminal_suffix}"),
+            depth: 0,
+            style: ActivityDetailStyle::Primary,
+        }],
+        ToolActivityEvidence::File {
+            operation,
+            path,
+            diff,
+            diff_omitted,
+        } => {
+            let operation = match operation {
+                ToolFileActivityKind::Read => "Read",
+                ToolFileActivityKind::Create => "Add",
+                ToolFileActivityKind::Update => "Update",
+                ToolFileActivityKind::Delete => "Delete",
+            };
+            let mut details = vec![ActivityDetail {
+                text: format!("{operation} {path}{terminal_suffix}"),
+                depth: 0,
+                style: ActivityDetailStyle::Primary,
+            }];
+            details.extend(diff.iter().map(|line| ActivityDetail {
+                text: match line.kind {
+                    ToolDiffLineKind::Context => format!("  {}", line.text),
+                    ToolDiffLineKind::Addition => format!("+ {}", line.text),
+                    ToolDiffLineKind::Deletion => format!("- {}", line.text),
+                },
+                depth: 1,
+                style: match line.kind {
+                    ToolDiffLineKind::Context => ActivityDetailStyle::Context,
+                    ToolDiffLineKind::Addition => ActivityDetailStyle::Addition,
+                    ToolDiffLineKind::Deletion => ActivityDetailStyle::Deletion,
+                },
+            }));
+            if *diff_omitted > 0 {
+                details.push(ActivityDetail {
+                    text: format!("… {diff_omitted} diff lines omitted"),
+                    depth: 1,
+                    style: ActivityDetailStyle::Muted,
+                });
+            }
+            details
+        }
+        ToolActivityEvidence::Note { text } => vec![ActivityDetail {
+            text: format!("{text}{terminal_suffix}"),
+            depth: 0,
+            style: ActivityDetailStyle::Primary,
+        }],
+        ToolActivityEvidence::Error { code, message } => vec![ActivityDetail {
+            text: format!("Error [{code}] {message}"),
+            depth: 0,
+            style: ActivityDetailStyle::Error,
+        }],
+        ToolActivityEvidence::Omitted { count } => vec![ActivityDetail {
+            text: format!("… {count} more operations"),
+            depth: 0,
+            style: ActivityDetailStyle::Muted,
+        }],
+        _ => Vec::new(),
+    }
 }
 
 fn family_summary(family: &ActivityFamily, status: ActivityStatus, count: usize) -> String {
@@ -294,6 +412,7 @@ mod tests {
                 id: "1:read".to_owned(),
                 summary: "Read 16 files".to_owned(),
                 status: ActivityStatus::Succeeded,
+                details: Vec::new(),
             })
         );
     }
@@ -303,13 +422,15 @@ mod tests {
         let mut reducer = ActivityReducer::default();
         reducer.begin_run();
         let mut projection = None;
-        for index in 0..7 {
+        for index in 0..24 {
             let id = format!("command-{index}");
             reducer.observe(
                 id.clone(),
                 "exec_command".to_owned(),
                 ToolActivityState::Running,
-                vec![format!("command {index}")],
+                vec![ToolActivityEvidence::Command {
+                    command: format!("command {index}"),
+                }],
             );
             projection = Some(reducer.observe(
                 id,
@@ -319,11 +440,16 @@ mod tests {
             ));
         }
         let projection = projection.expect("command projection");
-        assert!(projection.summary.starts_with("Ran 7 commands"));
-        assert!(projection.summary.contains("command 0"));
-        assert!(projection.summary.contains("… 3 more"));
-        assert!(projection.summary.contains("command 6"));
-        assert!(!projection.summary.contains("command 3"));
+        assert!(projection.summary.starts_with("Ran 24 commands"));
+        let details = projection
+            .details
+            .iter()
+            .map(|detail| detail.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(details.contains(&"command 0"));
+        assert!(details.contains(&"… 4 more lines"));
+        assert!(details.contains(&"command 23"));
+        assert!(!details.contains(&"command 10"));
     }
 
     #[test]
@@ -384,6 +510,7 @@ mod tests {
                 id: "1:edit".to_owned(),
                 summary: "Edited 1 file · 1 cancelled".to_owned(),
                 status: ActivityStatus::Cancelled,
+                details: Vec::new(),
             }]
         );
     }
@@ -396,13 +523,27 @@ mod tests {
             "patch-1".to_owned(),
             "apply_patch".to_owned(),
             ToolActivityState::Succeeded,
-            vec![
-                "Update src/lib.rs".to_owned(),
-                "-old".to_owned(),
-                "+new".to_owned(),
-            ],
+            vec![ToolActivityEvidence::File {
+                operation: ToolFileActivityKind::Update,
+                path: "src/lib.rs".to_owned(),
+                diff: vec![
+                    orchestral_core::agent_protocol::wire::ToolDiffLine {
+                        kind: ToolDiffLineKind::Deletion,
+                        text: "old".to_owned(),
+                    },
+                    orchestral_core::agent_protocol::wire::ToolDiffLine {
+                        kind: ToolDiffLineKind::Addition,
+                        text: "new".to_owned(),
+                    },
+                ],
+                diff_omitted: 0,
+            }],
         );
         assert!(projection.summary.starts_with("Edited 1 file"));
+        assert!(projection
+            .details
+            .iter()
+            .any(|detail| detail.text == "+ new"));
     }
 
     #[test]
@@ -414,16 +555,27 @@ mod tests {
             "apply_patch".to_owned(),
             ToolActivityState::Failed,
             vec![
-                "Add src/new.rs".to_owned(),
-                "Error [patch_invalid] Add File lines must start with '+'".to_owned(),
+                ToolActivityEvidence::File {
+                    operation: ToolFileActivityKind::Create,
+                    path: "src/new.rs".to_owned(),
+                    diff: Vec::new(),
+                    diff_omitted: 0,
+                },
+                ToolActivityEvidence::Error {
+                    code: "patch_invalid".to_owned(),
+                    message: "Add File lines must start with '+'".to_owned(),
+                },
             ],
         );
-        assert!(projection.summary.contains("Add src/new.rs (failed)"));
-        assert!(projection
-            .summary
-            .contains("Error [patch_invalid] Add File lines must start with '+'"));
-        assert!(!projection
-            .summary
-            .contains("Error [patch_invalid] Add File lines must start with '+' (failed)"));
+        let details = projection
+            .details
+            .iter()
+            .map(|detail| detail.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(details.contains(&"Add src/new.rs (failed)"));
+        assert!(details.contains(&"Error [patch_invalid] Add File lines must start with '+'"));
+        assert!(
+            !details.contains(&"Error [patch_invalid] Add File lines must start with '+' (failed)")
+        );
     }
 }

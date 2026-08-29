@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
-use orchestral_core::agent_protocol::wire::ToolActivityState;
+use orchestral_core::agent_protocol::wire::{ToolActivityEvidence, ToolActivityState};
 
-use super::activity::{ActivityProjection, ActivityReducer, ActivityStatus};
+use super::activity::{ActivityDetail, ActivityProjection, ActivityReducer, ActivityStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UiPhase {
@@ -41,6 +41,7 @@ pub(crate) struct TranscriptEntry {
     pub role: TranscriptRole,
     pub text: String,
     pub tool_status: Option<ActivityStatus>,
+    pub tool_details: Vec<ActivityDetail>,
 }
 
 impl TranscriptEntry {
@@ -50,6 +51,7 @@ impl TranscriptEntry {
             role: TranscriptRole::User,
             text: text.into(),
             tool_status: None,
+            tool_details: Vec::new(),
         }
     }
 
@@ -59,6 +61,7 @@ impl TranscriptEntry {
             role: TranscriptRole::Assistant,
             text: text.into(),
             tool_status: None,
+            tool_details: Vec::new(),
         }
     }
 
@@ -68,6 +71,7 @@ impl TranscriptEntry {
             role: TranscriptRole::System,
             text: text.into(),
             tool_status: None,
+            tool_details: Vec::new(),
         }
     }
 
@@ -77,6 +81,7 @@ impl TranscriptEntry {
             role: TranscriptRole::Error,
             text: text.into(),
             tool_status: None,
+            tool_details: Vec::new(),
         }
     }
 }
@@ -161,7 +166,7 @@ pub(crate) enum UiMsg {
         activity_id: String,
         tool_name: String,
         state: ToolActivityState,
-        details: Vec<String>,
+        evidence: Vec<ToolActivityEvidence>,
     },
     ProgressReported {
         summary: String,
@@ -334,6 +339,7 @@ impl UiState {
         {
             entry.text = projection.summary;
             entry.tool_status = Some(projection.status);
+            entry.tool_details = projection.details;
             return;
         }
         self.transcript.push(TranscriptEntry {
@@ -341,6 +347,7 @@ impl UiState {
             role: TranscriptRole::Tool,
             text: projection.summary,
             tool_status: Some(projection.status),
+            tool_details: projection.details,
         });
     }
 
@@ -457,12 +464,12 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             activity_id,
             tool_name,
             state: activity_state,
-            details,
+            evidence,
         } => {
             let projection =
                 state
                     .activity_reducer
-                    .observe(activity_id, tool_name, activity_state, details);
+                    .observe(activity_id, tool_name, activity_state, evidence);
             state.upsert_tool(projection);
         }
         UiMsg::ProgressReported { summary } => state.working_detail = Some(summary),
@@ -1020,7 +1027,7 @@ mod tests {
                     activity_id: activity_id.clone(),
                     tool_name: "file_read".to_owned(),
                     state: ToolActivityState::Running,
-                    details: Vec::new(),
+                    evidence: Vec::new(),
                 },
             );
             update(
@@ -1029,7 +1036,7 @@ mod tests {
                     activity_id,
                     tool_name: "file_read".to_owned(),
                     state: ToolActivityState::Succeeded,
-                    details: Vec::new(),
+                    evidence: Vec::new(),
                 },
             );
         }

@@ -10,7 +10,7 @@ use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use orchestral_core::agent_protocol::wire::Digest;
+use orchestral_core::agent_protocol::wire::{Digest, ToolActivityEvidence, ToolFileActivityKind};
 use orchestral_core::tool_protocol::{
     ApprovalPolicy, EffectScope, ModelToolSchema, ToolConcurrency, ToolDescriptor, ToolId,
     ToolIdempotency, ToolOutcome, ToolRestriction,
@@ -177,6 +177,26 @@ impl GuardedFileReadExecutor {
 
 #[async_trait]
 impl GuardedToolExecutor for GuardedFileReadExecutor {
+    fn activity_evidence(
+        &self,
+        invocation: &orchestral_core::tool_protocol::ToolInvocation,
+        _outcome: Option<&ToolOutcome>,
+    ) -> Vec<ToolActivityEvidence> {
+        invocation
+            .arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .and_then(activity_path)
+            .map(|path| ToolActivityEvidence::File {
+                operation: ToolFileActivityKind::Read,
+                path,
+                diff: Vec::new(),
+                diff_omitted: 0,
+            })
+            .into_iter()
+            .collect()
+    }
+
     async fn execute(&self, execution: GuardedToolExecution) -> ToolOutcome {
         if execution.cancellation.is_cancelled() {
             return ToolOutcome::Cancelled;
@@ -324,6 +344,30 @@ impl GuardedToolExecutor for GuardedFileReadExecutor {
             .into(),
         }
     }
+}
+
+fn activity_path(value: &str) -> Option<String> {
+    const MAX_CHARS: usize = 512;
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let mut chars = value.chars();
+    let mut path = chars
+        .by_ref()
+        .take(MAX_CHARS)
+        .map(|character| {
+            if character.is_control() {
+                '�'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    if chars.next().is_some() {
+        path.push('…');
+    }
+    Some(path)
 }
 
 pub fn guarded_file_read_descriptor(restriction: ToolRestriction) -> ToolDescriptor {

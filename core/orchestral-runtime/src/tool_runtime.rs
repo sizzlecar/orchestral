@@ -12,7 +12,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::FutureExt;
 use futures_util::StreamExt;
-use orchestral_core::agent_protocol::wire::{ArtifactRef, ArtifactRefWithDigest, Digest, RunId};
+use orchestral_core::agent_protocol::wire::{
+    ArtifactRef, ArtifactRefWithDigest, Digest, RunId, ToolActivityEvidence,
+};
 use orchestral_core::io::{BlobId, BlobIoError, BlobStore, BlobWriteRequest};
 use orchestral_core::spi::{HookRegistry, RuntimeHookContext, RuntimeHookEventEnvelope, SpiMeta};
 use orchestral_core::tool_effect::{
@@ -149,6 +151,19 @@ pub trait GuardedToolExecutor: Send + Sync {
             invocation.tool_id.as_str(),
             args_digest
         )
+    }
+
+    /// Projects bounded, presentation-safe evidence for Agent clients.
+    ///
+    /// The Tool adapter owns this projection because it understands its own
+    /// argument and result contracts. Generic Agent loops and UIs must not
+    /// reverse-engineer arbitrary Tool JSON or dispatch on Tool names.
+    fn activity_evidence(
+        &self,
+        _invocation: &ToolInvocation,
+        _outcome: Option<&ToolOutcome>,
+    ) -> Vec<ToolActivityEvidence> {
+        Vec::new()
     }
 
     async fn execute(&self, execution: GuardedToolExecution) -> ToolOutcome;
@@ -339,6 +354,12 @@ pub trait AgentToolRuntime: Send + Sync {
 
     fn resolve_tool_id(&self, model_name: &str) -> Result<Option<ToolId>, ToolRuntimeError>;
 
+    fn activity_evidence(
+        &self,
+        invocation: &ToolInvocation,
+        outcome: Option<&ToolOutcome>,
+    ) -> Result<Vec<ToolActivityEvidence>, ToolRuntimeError>;
+
     /// Reads one durable effect projection without changing its phase.
     /// Workflow recovery uses this to reject an entire replay before any new
     /// sibling Tool is dispatched when one prior invocation is unresolved.
@@ -404,6 +425,8 @@ pub enum ToolRuntimeError {
     DuplicateModelName(String),
     #[error("Tool Runtime execution contract cannot be encoded: {0}")]
     InvalidExecutionContract(String),
+    #[error("Tool activity evidence is invalid: {0}")]
+    InvalidActivityEvidence(String),
     #[error("Tool Runtime state is unavailable")]
     StateUnavailable,
 }
@@ -913,6 +936,35 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
             .values()
             .find(|registered| registered.descriptor.model_schema.name == model_name)
             .map(|registered| registered.descriptor.tool_id.clone()))
+    }
+
+    pub fn activity_evidence(
+        &self,
+        invocation: &ToolInvocation,
+        outcome: Option<&ToolOutcome>,
+    ) -> Result<Vec<ToolActivityEvidence>, ToolRuntimeError> {
+        invocation
+            .validate()
+            .map_err(|error| ToolRuntimeError::InvalidActivityEvidence(error.message))?;
+        let Some(registered) = self.registered_tool(&invocation.tool_id)? else {
+            return Ok(Vec::new());
+        };
+        registered
+            .descriptor
+            .model_schema
+            .validate_arguments(&invocation.arguments)
+            .map_err(|error| ToolRuntimeError::InvalidActivityEvidence(error.message))?;
+        let evidence = registered.executor.activity_evidence(invocation, outcome);
+        if evidence.len() > 16 {
+            return Err(ToolRuntimeError::InvalidActivityEvidence(
+                "a Tool adapter emitted more than sixteen evidence items".to_owned(),
+            ));
+        }
+        for item in &evidence {
+            item.validate_integrity()
+                .map_err(|error| ToolRuntimeError::InvalidActivityEvidence(error.message))?;
+        }
+        Ok(evidence)
     }
 
     /// Replays only durable Tool state. This path can close an Observed result
@@ -1822,6 +1874,14 @@ where
 
     fn resolve_tool_id(&self, model_name: &str) -> Result<Option<ToolId>, ToolRuntimeError> {
         GuardedToolRuntime::resolve_tool_id(self, model_name)
+    }
+
+    fn activity_evidence(
+        &self,
+        invocation: &ToolInvocation,
+        outcome: Option<&ToolOutcome>,
+    ) -> Result<Vec<ToolActivityEvidence>, ToolRuntimeError> {
+        GuardedToolRuntime::activity_evidence(self, invocation, outcome)
     }
 
     async fn inspect_effect(
