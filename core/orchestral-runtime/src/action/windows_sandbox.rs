@@ -12,7 +12,10 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 #[allow(unused_imports)]
-use super::shell_sandbox::{SandboxCommandSpec, SandboxedCommand, ShellSandboxBackend, ShellSandboxPolicy};
+use super::shell_sandbox::{
+    SandboxCommandSpec, SandboxNetworkAccess, SandboxedCommand, ShellSandboxBackend,
+    ShellSandboxPolicy,
+};
 
 /// Windows process integrity level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -153,7 +156,10 @@ impl WindowsSandboxWsbConfig {
 
         if let Some(cmd) = &self.logon_command {
             xml.push_str("  <LogonCommand>\n");
-            xml.push_str(&format!("    <Command>{}</Command>\n", escape_xml_text(cmd)));
+            xml.push_str(&format!(
+                "    <Command>{}</Command>\n",
+                escape_xml_text(cmd)
+            ));
             xml.push_str("  </LogonCommand>\n");
         }
 
@@ -177,7 +183,9 @@ pub fn quote_windows_arg(arg: &str) -> String {
         return "\"\"".to_owned();
     }
 
-    let needs_quotes = arg.chars().any(|c| c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '"');
+    let needs_quotes = arg
+        .chars()
+        .any(|c| c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '"');
     if !needs_quotes {
         return arg.to_owned();
     }
@@ -216,19 +224,10 @@ pub fn quote_windows_arg(arg: &str) -> String {
 }
 
 /// Windows Restricted Execution Sandbox Backend.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct WindowsRestrictedBackend {
     pub job_limits: WindowsJobLimits,
     pub token_policy: WindowsTokenPolicy,
-}
-
-impl Default for WindowsRestrictedBackend {
-    fn default() -> Self {
-        Self {
-            job_limits: WindowsJobLimits::default(),
-            token_policy: WindowsTokenPolicy::default(),
-        }
-    }
 }
 
 impl ShellSandboxBackend for WindowsRestrictedBackend {
@@ -242,9 +241,9 @@ impl ShellSandboxBackend for WindowsRestrictedBackend {
         policy: &ShellSandboxPolicy,
     ) -> Result<SandboxedCommand, String> {
         // Enforce network isolation
-        let network_disabled = policy.network_targets.is_empty();
-        if !network_disabled {
-            for target in &policy.network_targets {
+        let network_disabled = policy.network.is_disabled();
+        if let SandboxNetworkAccess::ExactTargets(targets) = &policy.network {
+            for target in targets {
                 let (host, _) = target
                     .rsplit_once(':')
                     .ok_or_else(|| format!("Invalid network target format: {target}"))?;
@@ -257,7 +256,10 @@ impl ShellSandboxBackend for WindowsRestrictedBackend {
         }
 
         // Validate cwd is within readable roots
-        let cwd_allowed = policy.readable_roots.iter().any(|root| spec.cwd.starts_with(root));
+        let cwd_allowed = policy
+            .readable_roots
+            .iter()
+            .any(|root| spec.cwd.starts_with(root));
         if !cwd_allowed {
             return Err(format!(
                 "Working directory '{}' is outside sandbox readable roots",
@@ -282,11 +284,18 @@ impl ShellSandboxBackend for WindowsRestrictedBackend {
         );
         env.insert(
             "ORCHESTRAL_SANDBOX_NETWORK_DISABLED".to_string(),
-            if network_disabled { "1".to_string() } else { "0".to_string() },
+            if network_disabled {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            },
         );
         env.insert(
             "ORCHESTRAL_SANDBOX_INTEGRITY_LEVEL".to_string(),
-            self.token_policy.integrity_level.as_sid_suffix().to_string(),
+            self.token_policy
+                .integrity_level
+                .as_sid_suffix()
+                .to_string(),
         );
 
         Ok(SandboxedCommand {
@@ -313,9 +322,18 @@ mod tests {
 
     #[test]
     fn test_quote_windows_arg_with_quotes_and_backslashes() {
-        assert_eq!(quote_windows_arg(r#"C:\Program Files\"#), r#""C:\Program Files\\""#);
-        assert_eq!(quote_windows_arg(r#"foo "bar" baz"#), r#""foo \"bar\" baz""#);
-        assert_eq!(quote_windows_arg(r#"C:\test with space\a\"#), r#""C:\test with space\a\\""#);
+        assert_eq!(
+            quote_windows_arg(r#"C:\Program Files\"#),
+            r#""C:\Program Files\\""#
+        );
+        assert_eq!(
+            quote_windows_arg(r#"foo "bar" baz"#),
+            r#""foo \"bar\" baz""#
+        );
+        assert_eq!(
+            quote_windows_arg(r#"C:\test with space\a\"#),
+            r#""C:\test with space\a\\""#
+        );
         assert_eq!(quote_windows_arg(r#"C:\test\a\"#), r#"C:\test\a\"#);
         assert_eq!(quote_windows_arg(r#"\"#), r#"\"#);
         assert_eq!(quote_windows_arg(r#"\ "#), r#""\ ""#);
@@ -329,7 +347,9 @@ mod tests {
             mapped_folders: vec![
                 WsbMappedFolder {
                     host_folder: PathBuf::from("C:\\workspace"),
-                    sandbox_folder: Some(PathBuf::from("C:\\Users\\WDAGUtilityAccount\\Desktop\\workspace")),
+                    sandbox_folder: Some(PathBuf::from(
+                        "C:\\Users\\WDAGUtilityAccount\\Desktop\\workspace",
+                    )),
                     read_only: false,
                 },
                 WsbMappedFolder {
@@ -357,7 +377,9 @@ mod tests {
         assert_eq!(policy.integrity_level, WindowsIntegrityLevel::Low);
         assert_eq!(policy.integrity_level.as_sid_suffix(), "S-1-16-4096");
         assert!(policy.stripped_privileges.contains("SeDebugPrivilege"));
-        assert!(policy.stripped_privileges.contains("SeCreateTokenPrivilege"));
+        assert!(policy
+            .stripped_privileges
+            .contains("SeCreateTokenPrivilege"));
         assert!(policy.disable_all_privileges);
     }
 
@@ -382,19 +404,36 @@ mod tests {
             env: HashMap::new(),
         };
 
-        let mut policy = ShellSandboxPolicy::default();
-        policy.readable_roots = vec![cwd.clone()];
-        policy.writable_roots = vec![cwd.clone()];
-        policy.launcher_programs = vec![program.clone()];
+        let policy = ShellSandboxPolicy {
+            readable_roots: vec![cwd.clone()],
+            writable_roots: vec![cwd.clone()],
+            launcher_programs: vec![program.clone()],
+            ..ShellSandboxPolicy::default()
+        };
 
         let result = backend.transform(spec, &policy);
         assert!(result.is_ok());
         let cmd = result.unwrap();
         assert_eq!(cmd.backend, "windows_restricted");
         assert!(cmd.backend_starts_new_session);
-        assert_eq!(cmd.env.get("ORCHESTRAL_SANDBOX_BACKEND").map(|s| s.as_str()), Some("windows_restricted"));
-        assert_eq!(cmd.env.get("ORCHESTRAL_SANDBOX_NETWORK_DISABLED").map(|s| s.as_str()), Some("1"));
-        assert_eq!(cmd.env.get("ORCHESTRAL_SANDBOX_INTEGRITY_LEVEL").map(|s| s.as_str()), Some("S-1-16-4096"));
+        assert_eq!(
+            cmd.env
+                .get("ORCHESTRAL_SANDBOX_BACKEND")
+                .map(|s| s.as_str()),
+            Some("windows_restricted")
+        );
+        assert_eq!(
+            cmd.env
+                .get("ORCHESTRAL_SANDBOX_NETWORK_DISABLED")
+                .map(|s| s.as_str()),
+            Some("1")
+        );
+        assert_eq!(
+            cmd.env
+                .get("ORCHESTRAL_SANDBOX_INTEGRITY_LEVEL")
+                .map(|s| s.as_str()),
+            Some("S-1-16-4096")
+        );
     }
 
     #[test]
@@ -411,14 +450,18 @@ mod tests {
             env: HashMap::new(),
         };
 
-        let mut policy = ShellSandboxPolicy::default();
-        policy.readable_roots = vec![cwd.clone()];
-        policy.writable_roots = vec![cwd];
-        policy.launcher_programs = vec![program];
+        let policy = ShellSandboxPolicy {
+            readable_roots: vec![cwd.clone()],
+            writable_roots: vec![cwd],
+            launcher_programs: vec![program],
+            ..ShellSandboxPolicy::default()
+        };
 
         let result = backend.transform(spec, &policy);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not registered in launcher_programs whitelist"));
+        assert!(result
+            .unwrap_err()
+            .contains("not registered in launcher_programs whitelist"));
     }
 
     #[test]
@@ -434,14 +477,18 @@ mod tests {
             env: HashMap::new(),
         };
 
-        let mut policy = ShellSandboxPolicy::default();
-        policy.readable_roots = vec![PathBuf::from("/workspace")];
-        policy.writable_roots = vec![PathBuf::from("/workspace")];
-        policy.launcher_programs = vec![program];
+        let policy = ShellSandboxPolicy {
+            readable_roots: vec![PathBuf::from("/workspace")],
+            writable_roots: vec![PathBuf::from("/workspace")],
+            launcher_programs: vec![program],
+            ..ShellSandboxPolicy::default()
+        };
 
         let result = backend.transform(spec, &policy);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("outside sandbox readable roots"));
+        assert!(result
+            .unwrap_err()
+            .contains("outside sandbox readable roots"));
     }
 
     #[test]
@@ -457,20 +504,45 @@ mod tests {
             env: HashMap::new(),
         };
 
-        let mut policy = ShellSandboxPolicy::default();
-        policy.readable_roots = vec![cwd.clone()];
-        policy.writable_roots = vec![cwd.clone()];
-        policy.launcher_programs = vec![program.clone()];
-        policy.network_targets.insert("localhost:8080".to_string());
+        let policy = ShellSandboxPolicy {
+            readable_roots: vec![cwd.clone()],
+            writable_roots: vec![cwd.clone()],
+            launcher_programs: vec![program.clone()],
+            network: SandboxNetworkAccess::ExactTargets(BTreeSet::from([
+                "localhost:8080".to_string()
+            ])),
+            ..ShellSandboxPolicy::default()
+        };
 
         let result = backend.transform(spec.clone(), &policy);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap().env.get("ORCHESTRAL_SANDBOX_NETWORK_DISABLED").map(|s| s.as_str()), Some("0"));
+        assert_eq!(
+            result
+                .unwrap()
+                .env
+                .get("ORCHESTRAL_SANDBOX_NETWORK_DISABLED")
+                .map(|s| s.as_str()),
+            Some("0")
+        );
 
         let mut remote_policy = policy.clone();
-        remote_policy.network_targets.insert("example.com:443".to_string());
-        let result = backend.transform(spec, &remote_policy);
+        remote_policy.network =
+            SandboxNetworkAccess::ExactTargets(BTreeSet::from(["example.com:443".to_string()]));
+        let result = backend.transform(spec.clone(), &remote_policy);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("restricted on Windows without a proxy"));
+        assert!(result
+            .unwrap_err()
+            .contains("restricted on Windows without a proxy"));
+
+        let mut unrestricted_policy = policy;
+        unrestricted_policy.network = SandboxNetworkAccess::Unrestricted;
+        let result = backend.transform(spec, &unrestricted_policy).unwrap();
+        assert_eq!(
+            result
+                .env
+                .get("ORCHESTRAL_SANDBOX_NETWORK_DISABLED")
+                .map(String::as_str),
+            Some("0")
+        );
     }
 }

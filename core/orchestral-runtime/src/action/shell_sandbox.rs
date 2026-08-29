@@ -1,6 +1,21 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
+/// Network boundary that the selected OS sandbox must materialize exactly.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SandboxNetworkAccess {
+    #[default]
+    Disabled,
+    ExactTargets(BTreeSet<String>),
+    Unrestricted,
+}
+
+impl SandboxNetworkAccess {
+    pub fn is_disabled(&self) -> bool {
+        matches!(self, Self::Disabled)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ShellSandboxPolicy {
     pub readable_roots: Vec<PathBuf>,
@@ -12,7 +27,7 @@ pub struct ShellSandboxPolicy {
     /// Filesystem and network effects remain constrained by this profile.
     pub allow_child_processes: bool,
     pub launcher_programs: Vec<PathBuf>,
-    pub network_targets: BTreeSet<String>,
+    pub network: SandboxNetworkAccess,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub linux_bwrap_path: Option<PathBuf>,
 }
@@ -120,7 +135,7 @@ impl ShellSandboxBackend for LinuxBwrapBackend {
         spec: SandboxCommandSpec,
         policy: &ShellSandboxPolicy,
     ) -> Result<SandboxedCommand, String> {
-        if !policy.network_targets.is_empty() {
+        if matches!(policy.network, SandboxNetworkAccess::ExactTargets(_)) {
             return Err(
                 "target-restricted network is unavailable in the bubblewrap adapter; refusing to widen network access"
                     .to_owned(),
@@ -190,7 +205,7 @@ fn sandbox_command_with_backend(
     let (program, cwd, policy) = normalize_sandbox_inputs(&program, cwd, policy)?;
     let env = HashMap::from([(
         "ORCHESTRAL_SANDBOX_NETWORK_DISABLED".to_owned(),
-        if policy.network_targets.is_empty() {
+        if policy.network.is_disabled() {
             "1".to_owned()
         } else {
             "0".to_owned()
@@ -229,7 +244,7 @@ fn normalize_sandbox_inputs(
         .iter()
         .map(|path| canonical_file(path, "launcher executable"))
         .collect::<Result<Vec<_>, _>>()?;
-    let network_targets = normalize_network_targets(&policy.network_targets)?;
+    let network = normalize_network_access(&policy.network)?;
 
     if readable_roots.is_empty()
         || writable_roots.is_empty()
@@ -252,7 +267,7 @@ fn normalize_sandbox_inputs(
             writable_roots,
             allow_child_processes: policy.allow_child_processes,
             launcher_programs,
-            network_targets,
+            network,
             linux_bwrap_path: policy.linux_bwrap_path.clone(),
         },
     ))
@@ -324,6 +339,16 @@ fn normalize_network_targets(targets: &BTreeSet<String>) -> Result<BTreeSet<Stri
         .collect()
 }
 
+fn normalize_network_access(access: &SandboxNetworkAccess) -> Result<SandboxNetworkAccess, String> {
+    match access {
+        SandboxNetworkAccess::Disabled => Ok(SandboxNetworkAccess::Disabled),
+        SandboxNetworkAccess::ExactTargets(targets) => {
+            normalize_network_targets(targets).map(SandboxNetworkAccess::ExactTargets)
+        }
+        SandboxNetworkAccess::Unrestricted => Ok(SandboxNetworkAccess::Unrestricted),
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn build_macos_profile(
     spec: &SandboxCommandSpec,
@@ -343,19 +368,25 @@ fn build_macos_profile(
             ));
         }
     }
-    for target in &policy.network_targets {
-        let (host, _) = target
-            .rsplit_once(':')
-            .expect("normalized network target has a host and port");
-        if host != "localhost" {
-            return Err(format!(
-                "exact remote network target '{target}' requires a managed proxy on macOS; refusing broader network access"
-            ));
+    match &policy.network {
+        SandboxNetworkAccess::Disabled => {}
+        SandboxNetworkAccess::Unrestricted => profile.push_str("(allow network-outbound)\n"),
+        SandboxNetworkAccess::ExactTargets(targets) => {
+            for target in targets {
+                let (host, _) = target
+                    .rsplit_once(':')
+                    .expect("normalized network target has a host and port");
+                if host != "localhost" {
+                    return Err(format!(
+                        "exact remote network target '{target}' requires a managed proxy on macOS; refusing broader network access"
+                    ));
+                }
+                profile.push_str(&format!(
+                    "(allow network-outbound (remote ip \"{}\"))\n",
+                    escape_profile_string(target)
+                ));
+            }
         }
-        profile.push_str(&format!(
-            "(allow network-outbound (remote ip \"{}\"))\n",
-            escape_profile_string(target)
-        ));
     }
     profile.push_str("(allow sysctl-read)\n");
 
@@ -489,7 +520,9 @@ fn build_linux_bwrap_args(spec: &SandboxCommandSpec, policy: &ShellSandboxPolicy
         "--tmpfs".to_string(),
         "/var/tmp".to_string(),
     ];
-    args.push("--unshare-net".to_string());
+    if policy.network.is_disabled() {
+        args.push("--unshare-net".to_string());
+    }
     args.push("--chdir".to_string());
     args.push(spec.cwd.to_string_lossy().to_string());
 
@@ -586,7 +619,7 @@ mod tests {
                 writable_roots: vec![runtime_root],
                 allow_child_processes: false,
                 launcher_programs: vec![executable.clone()],
-                network_targets: BTreeSet::new(),
+                network: SandboxNetworkAccess::Disabled,
                 linux_bwrap_path: None,
             },
         );
@@ -616,7 +649,7 @@ mod tests {
                 writable_roots: vec![workspace.clone()],
                 allow_child_processes: false,
                 launcher_programs: vec![program],
-                network_targets: BTreeSet::new(),
+                network: SandboxNetworkAccess::Disabled,
                 linux_bwrap_path: None,
             },
         )
@@ -650,7 +683,7 @@ mod tests {
             writable_roots: vec![cwd.clone()],
             allow_child_processes: false,
             launcher_programs: vec![program.clone()],
-            network_targets: BTreeSet::new(),
+            network: SandboxNetworkAccess::Disabled,
             linux_bwrap_path: None,
         };
         let profile = build_macos_profile(&spec, &policy).unwrap();
@@ -687,7 +720,7 @@ mod tests {
                 writable_roots: vec![workspace.clone()],
                 allow_child_processes: false,
                 launcher_programs: vec![executable],
-                network_targets: BTreeSet::new(),
+                network: SandboxNetworkAccess::Disabled,
                 linux_bwrap_path: None,
             },
         )
@@ -735,7 +768,7 @@ mod tests {
                 writable_roots: vec![workspace.clone()],
                 allow_child_processes: false,
                 launcher_programs: vec![program],
-                network_targets: BTreeSet::new(),
+                network: SandboxNetworkAccess::Disabled,
                 linux_bwrap_path: None,
             },
         )
@@ -769,7 +802,7 @@ mod tests {
                 writable_roots: vec![workspace.clone()],
                 allow_child_processes: false,
                 launcher_programs: vec![program],
-                network_targets: BTreeSet::new(),
+                network: SandboxNetworkAccess::Disabled,
                 linux_bwrap_path: None,
             },
         )
@@ -833,7 +866,7 @@ mod tests {
                 writable_roots: vec![workspace.clone()],
                 allow_child_processes: true,
                 launcher_programs: vec![program],
-                network_targets: BTreeSet::new(),
+                network: SandboxNetworkAccess::Disabled,
                 linux_bwrap_path: None,
             },
         )
@@ -901,7 +934,7 @@ mod tests {
                     writable_roots: vec![workspace.clone()],
                     allow_child_processes: true,
                     launcher_programs: vec![shell.clone()],
-                    network_targets: targets,
+                    network: SandboxNetworkAccess::ExactTargets(targets),
                     linux_bwrap_path: None,
                 },
             )
@@ -949,6 +982,54 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn approved_unrestricted_network_is_explicit_in_the_macos_profile() {
+        let cwd = std::fs::canonicalize(".").unwrap();
+        let program = std::fs::canonicalize("/bin/sh").unwrap();
+        let spec = SandboxCommandSpec {
+            program: program.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            cwd: cwd.clone(),
+            env: HashMap::new(),
+        };
+        let policy = ShellSandboxPolicy {
+            readable_roots: vec![cwd.clone()],
+            readable_files: Vec::new(),
+            writable_roots: vec![cwd],
+            allow_child_processes: false,
+            launcher_programs: vec![program],
+            network: SandboxNetworkAccess::Unrestricted,
+            linux_bwrap_path: None,
+        };
+        let profile = build_macos_profile(&spec, &policy).unwrap();
+        assert!(profile.contains("(allow network-outbound)"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn approved_unrestricted_network_keeps_the_host_network_namespace() {
+        let cwd = std::fs::canonicalize(".").unwrap();
+        let program = std::fs::canonicalize("/bin/sh").unwrap();
+        let spec = SandboxCommandSpec {
+            program: program.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            cwd: cwd.clone(),
+            env: HashMap::new(),
+        };
+        let policy = ShellSandboxPolicy {
+            readable_roots: vec![cwd.clone()],
+            readable_files: Vec::new(),
+            writable_roots: vec![cwd],
+            allow_child_processes: false,
+            launcher_programs: vec![program],
+            network: SandboxNetworkAccess::Unrestricted,
+            linux_bwrap_path: None,
+        };
+        let args = build_linux_bwrap_args(&spec, &policy);
+        assert!(!args.iter().any(|value| value == "--unshare-net"));
+    }
+
     #[test]
     fn one_thousand_unavailable_backend_attempts_fail_closed_without_a_bare_command() {
         let cwd = std::fs::canonicalize(".").unwrap();
@@ -963,7 +1044,7 @@ mod tests {
             writable_roots: vec![cwd.clone()],
             allow_child_processes: false,
             launcher_programs: vec![program.clone()],
-            network_targets: BTreeSet::new(),
+            network: SandboxNetworkAccess::Disabled,
             linux_bwrap_path: None,
         };
         let unavailable = UnsupportedBackend {
@@ -1000,7 +1081,7 @@ mod tests {
             writable_roots: vec![cwd],
             allow_child_processes: false,
             launcher_programs: vec![program],
-            network_targets: BTreeSet::new(),
+            network: SandboxNetworkAccess::Disabled,
             linux_bwrap_path: None,
         };
         let args = build_linux_bwrap_args(&spec, &policy);
@@ -1040,7 +1121,7 @@ mod tests {
                 writable_roots: vec![workspace.clone()],
                 allow_child_processes: false,
                 launcher_programs: vec![program],
-                network_targets: BTreeSet::new(),
+                network: SandboxNetworkAccess::Disabled,
                 linux_bwrap_path: None,
             },
         )

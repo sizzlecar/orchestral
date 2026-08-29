@@ -22,14 +22,63 @@ use orchestral_core::tool_effect::{
     ToolEffectPhase, ToolEffectProjection,
 };
 use orchestral_core::tool_protocol::{
-    ApprovalBinding, ApprovalCapability, ApprovalCapabilityStore, ApprovalPolicy, EffectScope,
-    EffectiveToolPolicy, HostApprovalVerifier, HostToolPolicy, ModelToolSchema, RunToolGrant,
-    ToolArtifact, ToolCallId, ToolConcurrency, ToolDescriptor, ToolId, ToolIdempotency,
-    ToolInvocation, ToolOperationPlan, ToolOperationRisk, ToolOutcome, ToolOutput,
-    ToolProtocolError, ToolProtocolErrorCode, VerifiedApprovalCapability,
+    ApprovalBinding, ApprovalCapability, ApprovalCapabilityStore, ApprovalPolicy,
+    CapabilityRequest, CapabilitySelector, EffectScope, EffectiveToolPolicy, HostApprovalVerifier,
+    HostToolPolicy, ModelToolSchema, RunToolGrant, ToolArtifact, ToolCallId, ToolConcurrency,
+    ToolDescriptor, ToolId, ToolIdempotency, ToolInvocation, ToolOperationPlan, ToolOperationRisk,
+    ToolOutcome, ToolOutput, ToolProtocolError, ToolProtocolErrorCode, VerifiedApprovalCapability,
 };
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
+
+/// Host-issued, operation-bound authority consumed by one executor dispatch.
+///
+/// Automatic policy and interactive approval produce the same executor-facing
+/// object. Executors therefore consume granted authority instead of inferring
+/// it from configuration or from the presence of a user prompt.
+#[derive(Debug, Clone)]
+pub struct CapabilityLease {
+    operation_digest: Digest,
+    granted: CapabilityRequest,
+    approval: Option<VerifiedApprovalCapability>,
+}
+
+impl CapabilityLease {
+    fn policy(operation: &ToolOperationPlan) -> Result<Self, ToolProtocolError> {
+        Ok(Self {
+            operation_digest: operation.digest()?,
+            granted: operation.required_capabilities.clone(),
+            approval: None,
+        })
+    }
+
+    fn approved(
+        operation: &ToolOperationPlan,
+        approval: VerifiedApprovalCapability,
+    ) -> Result<Self, ToolProtocolError> {
+        Ok(Self {
+            operation_digest: operation.digest()?,
+            granted: operation.required_capabilities.clone(),
+            approval: Some(approval),
+        })
+    }
+
+    pub fn operation_digest(&self) -> &Digest {
+        &self.operation_digest
+    }
+
+    pub fn granted(&self) -> &CapabilityRequest {
+        &self.granted
+    }
+
+    pub fn was_approved(&self) -> bool {
+        self.approval.is_some()
+    }
+
+    pub fn approval(&self) -> Option<&VerifiedApprovalCapability> {
+        self.approval.as_ref()
+    }
+}
 
 /// The only context passed to a production Tool executor.
 ///
@@ -42,7 +91,7 @@ pub struct GuardedToolExecution {
     /// within this plan as well as the effective authority ceiling.
     pub operation: ToolOperationPlan,
     pub effective_policy: EffectiveToolPolicy,
-    pub approval: Option<VerifiedApprovalCapability>,
+    pub lease: CapabilityLease,
     pub cancellation: CancellationToken,
 }
 
@@ -67,9 +116,18 @@ pub trait GuardedToolExecutor: Send + Sync {
         descriptor: &ToolDescriptor,
         _effective_policy: &EffectiveToolPolicy,
     ) -> Result<ToolOperationPlan, ToolOutcome> {
+        let mut required_capabilities =
+            CapabilityRequest::from_effects(descriptor.effect_scopes.clone());
+        // A generic executor cannot claim an enforceable target boundary for
+        // open-world network access. It must request the wider capability and
+        // let Host policy decide; silently omitting Network would bypass the
+        // approval control plane.
+        if required_capabilities.requires(EffectScope::Network) {
+            required_capabilities
+                .insert_resource(EffectScope::Network, CapabilitySelector::Unrestricted);
+        }
         Ok(ToolOperationPlan {
-            effect_scopes: descriptor.effect_scopes.clone(),
-            targets: Default::default(),
+            required_capabilities,
             risk: ToolOperationRisk::Routine,
             summary: sanitize_approval_summary(
                 &self.approval_summary(invocation),
@@ -182,7 +240,7 @@ impl ToolPermissionPolicy for WorkspacePermissionPolicy {
                 operation.risk,
                 ToolOperationRisk::Routine | ToolOperationRisk::Elevated
             )
-            || operation.effect_scopes.iter().any(|scope| {
+            || operation.required_capabilities.effects.iter().any(|scope| {
                 matches!(
                     scope,
                     EffectScope::Network
@@ -191,7 +249,7 @@ impl ToolPermissionPolicy for WorkspacePermissionPolicy {
                 )
             })
             || (!bounds.sandbox.required
-                && operation.effect_scopes.iter().any(|scope| {
+                && operation.required_capabilities.effects.iter().any(|scope| {
                     matches!(scope, EffectScope::Process | EffectScope::FilesystemWrite)
                 }))
         {
@@ -667,12 +725,8 @@ enum InvocationState {
 }
 
 enum DurableInvocationStart {
-    Execute {
-        verified_approval: Option<VerifiedApprovalCapability>,
-    },
-    Replay {
-        outcome: ToolOutcome,
-    },
+    Execute { lease: Box<CapabilityLease> },
+    Replay { outcome: ToolOutcome },
 }
 
 struct PlannedInvocation {
@@ -920,7 +974,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
             .map_err(|error| {
                 tool_outcome_recovery_error("invalid_operation_plan", error.message)
             })?;
-        if !effective_policy.authorizes_scopes(&operation.effect_scopes) {
+        if !effective_policy.authorizes_request(&operation.required_capabilities) {
             return Err(tool_outcome_recovery_error(
                 "policy_denied",
                 "tool effects are outside the effective Host policy",
@@ -951,7 +1005,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
                 tool_outcome_recovery_error("invalid_descriptor", error.message)
             })?,
             idempotency: registered.descriptor.idempotency,
-            effect_scopes: operation.effect_scopes.clone(),
+            effect_scopes: operation.required_capabilities.effects.clone(),
         };
         let key = prepared.key();
 
@@ -1083,7 +1137,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
         if let Err(error) = operation.validate_envelope(&registered.descriptor.effect_scopes) {
             return rejected("invalid_operation_plan", error.message);
         }
-        if !effective_policy.authorizes_scopes(&operation.effect_scopes) {
+        if !effective_policy.authorizes_request(&operation.required_capabilities) {
             return rejected(
                 "policy_denied",
                 "tool effects are outside the effective Host policy",
@@ -1134,7 +1188,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
             Err(result) => return *result,
         };
 
-        let verified_approval = loop {
+        let lease = loop {
             // Register the waiter before observing the state to avoid a missed
             // notification between unlocking and awaiting.
             let changed = entry.changed.notified();
@@ -1161,9 +1215,9 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
                         )
                         .await
                     {
-                        Ok(DurableInvocationStart::Execute { verified_approval }) => {
+                        Ok(DurableInvocationStart::Execute { lease }) => {
                             *state = InvocationState::Running;
-                            break verified_approval;
+                            break *lease;
                         }
                         Ok(DurableInvocationStart::Replay { outcome }) => {
                             *state = InvocationState::Completed(outcome.clone());
@@ -1197,7 +1251,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
                     invocation,
                     operation,
                     effective_policy,
-                    verified_approval,
+                    lease,
                     execution_cancellation,
                 )
                 .await
@@ -1264,7 +1318,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
                 .digest()
                 .map_err(|error| rejected("invalid_descriptor", error.message))?,
             idempotency: registered.descriptor.idempotency,
-            effect_scopes: operation.effect_scopes.clone(),
+            effect_scopes: operation.required_capabilities.effects.clone(),
         };
         let key = prepared.key();
 
@@ -1312,7 +1366,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
                             cached: false,
                         });
                     }
-                    let (verified_approval, authorization) =
+                    let (lease, authorization) =
                         if matches!(permission, ToolPermissionDecision::RequireApproval) {
                             let Some(capability) = approval else {
                                 return Err(GuardedToolResult::ApprovalRequired {
@@ -1336,9 +1390,15 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
                             let evidence = ToolAuthorizationEvidence::Approval {
                                 nonce: verified.nonce().clone(),
                             };
-                            (Some(verified), evidence)
+                            let lease = CapabilityLease::approved(operation, verified).map_err(
+                                |error| rejected("invalid_capability_lease", error.message),
+                            )?;
+                            (lease, evidence)
                         } else {
-                            (None, ToolAuthorizationEvidence::Policy)
+                            let lease = CapabilityLease::policy(operation).map_err(|error| {
+                                rejected("invalid_capability_lease", error.message)
+                            })?;
+                            (lease, ToolAuthorizationEvidence::Policy)
                         };
                     let appended = self
                         .effect_journal
@@ -1359,7 +1419,11 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
                         )
                         .await;
                     match appended {
-                        Ok(_) => return Ok(DurableInvocationStart::Execute { verified_approval }),
+                        Ok(_) => {
+                            return Ok(DurableInvocationStart::Execute {
+                                lease: Box::new(lease),
+                            })
+                        }
                         Err(ToolEffectError::SequenceConflict { .. }) => continue,
                         Err(error) => return Err(effect_journal_rejected(error)),
                     }
@@ -1683,7 +1747,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
         invocation: ToolInvocation,
         operation: ToolOperationPlan,
         effective_policy: EffectiveToolPolicy,
-        approval: Option<VerifiedApprovalCapability>,
+        lease: CapabilityLease,
         cancellation: CancellationToken,
     ) -> ToolOutcome {
         let timeout_ms = effective_policy.bounds().max_timeout_ms;
@@ -1692,7 +1756,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
             invocation,
             operation,
             effective_policy: effective_policy.clone(),
-            approval,
+            lease,
             cancellation: cancellation.clone(),
         });
         let execution = AssertUnwindSafe(execution).catch_unwind();

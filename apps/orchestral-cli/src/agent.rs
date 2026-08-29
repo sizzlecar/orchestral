@@ -207,6 +207,9 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
     } = build_cli_tool_runtime(&config, &mcp_configs, effect_journal, artifact_store)?;
     let mut mcp_restriction = run_grant.bounds.clone();
     mcp_restriction.approval = ApprovalPolicy::Required;
+    // MCP transports retain their exact configured endpoints. Generic exec's
+    // reviewable open-network ceiling must never bleed into this lane.
+    mcp_restriction.network.allow_unrestricted = false;
     let mcp_registry = McpToolsAdapterRegistry::register(
         tool_runtime.as_ref(),
         mcp_configs,
@@ -423,6 +426,7 @@ fn build_cli_tool_runtime(
         },
         network: NetworkPolicy {
             allowed_targets: allowed_network_targets,
+            allow_unrestricted: exec_enabled,
         },
         environment: EnvironmentPolicy {
             allowed_variables: allowed_environment,
@@ -457,6 +461,7 @@ fn build_cli_tool_runtime(
             .as_ref()
             .map(|host| host.network_targets.clone())
             .unwrap_or_default(),
+        allow_unrestricted: true,
     };
     exec_bounds.environment = EnvironmentPolicy {
         allowed_variables: exec_host

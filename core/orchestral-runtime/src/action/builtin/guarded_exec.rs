@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use orchestral_core::tool_protocol::{
-    ApprovalPolicy, EffectScope, ModelToolSchema, ToolConcurrency, ToolDescriptor, ToolId,
-    ToolIdempotency, ToolInvocation, ToolOperationPlan, ToolOperationRisk, ToolOutcome,
-    ToolRestriction,
+    ApprovalPolicy, CapabilityRequest, CapabilitySelector, EffectScope, ModelToolSchema,
+    ToolConcurrency, ToolDescriptor, ToolId, ToolIdempotency, ToolInvocation, ToolOperationPlan,
+    ToolOperationRisk, ToolOutcome, ToolRestriction,
 };
 use serde_json::{json, Map, Value};
 
@@ -18,7 +18,7 @@ use crate::exec_process::{
     ProcessSupervisor,
 };
 use crate::tool_runtime::{GuardedToolExecution, GuardedToolExecutor};
-use crate::tools::shell_sandbox::{sandbox_command, ShellSandboxPolicy};
+use crate::tools::shell_sandbox::{sandbox_command, SandboxNetworkAccess, ShellSandboxPolicy};
 
 use super::support::{canonical_roots, truncate_utf8_lossy};
 
@@ -171,59 +171,78 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let strictly_read_only = classification.read_only && !interactive;
-        let mut effect_scopes = BTreeSet::from([
+        let mut required_capabilities = CapabilityRequest::from_effects(BTreeSet::from([
             EffectScope::Process,
             EffectScope::FilesystemRead,
             // Even a read-only command needs the Host-owned runtime temp
             // directory. The executor grants no workspace write access for
             // this class of operation.
             EffectScope::FilesystemWrite,
-        ]);
+        ]));
+        required_capabilities.insert_resource(
+            EffectScope::Process,
+            CapabilitySelector::Exact(self.shell.to_string_lossy().into_owned()),
+        );
+        required_capabilities.insert_resource(
+            EffectScope::FilesystemRead,
+            CapabilitySelector::Exact(cwd.to_string_lossy().into_owned()),
+        );
         if !effective_policy
             .bounds()
             .environment
             .allowed_variables
             .is_empty()
         {
-            effect_scopes.insert(EffectScope::EnvironmentRead);
+            required_capabilities
+                .effects
+                .insert(EffectScope::EnvironmentRead);
         }
-        if classification.network && !effective_policy.bounds().network.allowed_targets.is_empty() {
-            effect_scopes.insert(EffectScope::Network);
-            effect_scopes.insert(EffectScope::ExternalSideEffect);
+        if classification.network {
+            // Current process sandboxes can enforce either no network or an
+            // open network namespace. Request that actual authority instead
+            // of pretending a hostname allow-list can be enforced.
+            required_capabilities
+                .insert_resource(EffectScope::Network, CapabilitySelector::Unrestricted);
+            required_capabilities.insert_resource(
+                EffectScope::ExternalSideEffect,
+                CapabilitySelector::Unrestricted,
+            );
         }
-        let mut targets = BTreeSet::from([
-            format!("process-shell:{}", self.shell.display()),
-            format!("workdir:{}", cwd.display()),
-        ]);
-        for root in readable_roots
-            .iter()
-            .chain(self.runtime_readable_roots.iter())
-        {
-            targets.insert(format!("read:{}", root.display()));
-        }
-        for file in &self.runtime_readable_files {
-            targets.insert(format!("read:{}", file.display()));
+        // Runtime/toolchain roots are sealed Host dependencies captured by
+        // this executor's planning contract. They are not invocation-selected
+        // authority and therefore do not belong in the user's per-operation
+        // lease. The sandbox still materializes those fixed read-only roots.
+        for root in &readable_roots {
+            required_capabilities.insert_resource(
+                EffectScope::FilesystemRead,
+                CapabilitySelector::Subtree(root.to_string_lossy().into_owned()),
+            );
         }
         if strictly_read_only {
             for root in &writable_roots {
-                targets.insert(format!("write:{}/.orchestral/tmp", root.display()));
+                required_capabilities.insert_resource(
+                    EffectScope::FilesystemWrite,
+                    CapabilitySelector::Subtree(
+                        root.join(".orchestral/tmp").to_string_lossy().into_owned(),
+                    ),
+                );
             }
         } else {
             for root in &writable_roots {
-                targets.insert(format!("write:{}", root.display()));
-            }
-            if classification.network {
-                for target in &effective_policy.bounds().network.allowed_targets {
-                    targets.insert(format!("network:{target}"));
-                }
+                required_capabilities.insert_resource(
+                    EffectScope::FilesystemWrite,
+                    CapabilitySelector::Subtree(root.to_string_lossy().into_owned()),
+                );
             }
         }
         for name in &effective_policy.bounds().environment.allowed_variables {
-            targets.insert(format!("environment:{name}"));
+            required_capabilities.insert_resource(
+                EffectScope::EnvironmentRead,
+                CapabilitySelector::Exact(name.clone()),
+            );
         }
         let operation = ToolOperationPlan {
-            effect_scopes,
-            targets,
+            required_capabilities,
             risk: if classification.destructive {
                 ToolOperationRisk::Destructive
             } else if strictly_read_only {
@@ -333,14 +352,9 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
         } else {
             writable_roots
         };
-        let network_targets = if execution
-            .operation
-            .effect_scopes
-            .contains(&EffectScope::Network)
-        {
-            bounds.network.allowed_targets.clone()
-        } else {
-            BTreeSet::new()
+        let network = match sandbox_network_access(execution.lease.granted()) {
+            Ok(network) => network,
+            Err(outcome) => return outcome,
         };
         let mut sandbox_reads = readable_roots;
         sandbox_reads.extend(self.runtime_readable_roots.iter().cloned());
@@ -357,7 +371,7 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
                 writable_roots: sandbox_writes,
                 allow_child_processes: true,
                 launcher_programs: vec![self.shell.clone()],
-                network_targets,
+                network,
                 linux_bwrap_path: None,
             },
         ) {
@@ -365,9 +379,9 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
             Err(message) => return failed("exec_sandbox_setup", message, false),
         };
         let mut environment = if execution
-            .operation
-            .effect_scopes
-            .contains(&EffectScope::EnvironmentRead)
+            .lease
+            .granted()
+            .requires(EffectScope::EnvironmentRead)
         {
             self.environment
                 .filtered(&bounds.environment.allowed_variables)
@@ -484,25 +498,24 @@ impl GuardedToolExecutor for GuardedWriteStdinExecutor {
         let origin = snapshot.operation;
         // Input can trigger only the authority already held by this exact
         // supervised process. A pure poll cannot trigger new process behavior.
-        let effect_scopes = if has_input {
-            origin.effect_scopes
+        let mut required_capabilities = if has_input {
+            origin.required_capabilities
         } else {
-            BTreeSet::from([EffectScope::Process])
+            CapabilityRequest::from_effects(BTreeSet::from([EffectScope::Process]))
         };
         let input_preview = invocation
             .arguments
             .get("chars")
             .and_then(Value::as_str)
             .map(display_payload);
-        let mut targets = if has_input {
-            origin.targets
-        } else {
-            BTreeSet::new()
-        };
-        targets.insert(format!("exec-session:{}", session_id.get()));
+        if has_input {
+            required_capabilities.insert_resource(
+                EffectScope::ExternalSideEffect,
+                CapabilitySelector::Exact(format!("exec-session:{}", session_id.get())),
+            );
+        }
         let operation = ToolOperationPlan {
-            effect_scopes,
-            targets,
+            required_capabilities,
             risk: if has_input {
                 ToolOperationRisk::Elevated
             } else {
@@ -688,6 +701,37 @@ fn exec_effects() -> BTreeSet<EffectScope> {
         EffectScope::EnvironmentRead,
         EffectScope::ExternalSideEffect,
     ])
+}
+
+fn sandbox_network_access(
+    request: &CapabilityRequest,
+) -> Result<SandboxNetworkAccess, ToolOutcome> {
+    if !request.requires(EffectScope::Network) {
+        return Ok(SandboxNetworkAccess::Disabled);
+    }
+    let mut exact = BTreeSet::new();
+    for selector in request.resources_for(EffectScope::Network) {
+        match selector {
+            CapabilitySelector::Exact(target) => {
+                exact.insert(target.clone());
+            }
+            CapabilitySelector::Unrestricted => return Ok(SandboxNetworkAccess::Unrestricted),
+            _ => {
+                return Err(rejected(
+                    "exec_network_lease_invalid",
+                    "network lease cannot be materialized by the process sandbox",
+                ))
+            }
+        }
+    }
+    if exact.is_empty() {
+        Err(rejected(
+            "exec_network_lease_missing",
+            "network effect has no granted network resource",
+        ))
+    } else {
+        Ok(SandboxNetworkAccess::ExactTargets(exact))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

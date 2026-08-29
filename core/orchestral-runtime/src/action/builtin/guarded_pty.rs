@@ -17,7 +17,7 @@ use crate::tool_runtime::{GuardedToolExecution, GuardedToolExecutor};
 
 use super::guarded::GuardedProgramAliases;
 use super::support::{build_allowlisted_env, canonical_roots};
-use crate::tools::shell_sandbox::{sandbox_command, ShellSandboxPolicy};
+use crate::tools::shell_sandbox::{sandbox_command, SandboxNetworkAccess, ShellSandboxPolicy};
 
 pub const GUARDED_PTY_SANDBOX_PROFILE: &str = "orchestral.pty.process.v1";
 
@@ -182,7 +182,7 @@ impl GuardedToolExecutor for GuardedPtyCreateExecutor {
                 .iter()
                 .map(PathBuf::from)
                 .collect(),
-            network_targets: BTreeSet::new(),
+            network: SandboxNetworkAccess::Disabled,
             linux_bwrap_path: None,
         };
         let sandboxed = match sandbox_command(command, args, &cwd, &sandbox_policy) {
@@ -596,7 +596,7 @@ fn guarded_process_effects() -> BTreeSet<EffectScope> {
 }
 
 fn require_approval(execution: &GuardedToolExecution) -> Result<(), ToolOutcome> {
-    let Some(approval) = execution.approval.as_ref() else {
+    let Some(approval) = execution.lease.approval() else {
         return Err(rejected(
             "approval_proof_missing",
             "PTY mutation requires a verified Host approval capability",

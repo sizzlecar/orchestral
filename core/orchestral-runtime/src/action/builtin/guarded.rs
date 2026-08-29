@@ -21,7 +21,7 @@ use tokio::process::{Child, Command};
 use tokio::time::timeout;
 
 use crate::tool_runtime::{GuardedToolExecution, GuardedToolExecutor};
-use crate::tools::shell_sandbox::{sandbox_command, ShellSandboxPolicy};
+use crate::tools::shell_sandbox::{sandbox_command, SandboxNetworkAccess, ShellSandboxPolicy};
 
 use super::support::{
     build_allowlisted_env, canonical_roots, read_stream_limited, stderr_preview,
@@ -680,7 +680,7 @@ impl GuardedToolExecutor for GuardedShellExecutor {
     }
 
     async fn execute(&self, execution: GuardedToolExecution) -> ToolOutcome {
-        let Some(approval) = execution.approval.as_ref() else {
+        let Some(approval) = execution.lease.approval() else {
             return rejected(
                 "approval_proof_missing",
                 "shell execution requires a verified Host approval capability",
@@ -772,7 +772,7 @@ impl GuardedToolExecutor for GuardedShellExecutor {
                 .iter()
                 .map(PathBuf::from)
                 .collect(),
-            network_targets: BTreeSet::new(),
+            network: SandboxNetworkAccess::Disabled,
             linux_bwrap_path: None,
         };
         let sandboxed = match sandbox_command(command, args, &cwd, &sandbox_policy) {

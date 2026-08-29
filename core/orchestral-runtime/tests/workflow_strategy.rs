@@ -662,7 +662,7 @@ async fn recovery_preflight_blocks_all_siblings_when_one_effect_is_unresolved() 
         policy_digest: effective_policy.digest().expect("policy digest"),
         descriptor_digest: descriptor.digest().expect("descriptor digest"),
         idempotency: descriptor.idempotency,
-        effect_scopes: operation.effect_scopes,
+        effect_scopes: operation.required_capabilities.effects,
         invocation,
     };
     let key_a = ToolEffectKey::new(run_id.clone(), call_a);
