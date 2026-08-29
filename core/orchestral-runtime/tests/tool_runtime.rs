@@ -18,9 +18,11 @@ use orchestral_core::tool_effect::{
     ToolEffectEvent, ToolEffectEventDraft, ToolEffectEventId, ToolEffectJournalRecord,
     ToolEffectJournalStore, ToolEffectKey, ToolEffectPhase,
 };
+#[cfg(target_os = "macos")]
+use orchestral_core::tool_protocol::HostApprovalIssuer;
 use orchestral_core::tool_protocol::{
     ApprovalPolicy, EffectScope, EffectiveToolPolicy, EnvironmentPolicy, FilesystemPolicy,
-    HostApprovalIssuer, HostApprovalVerifier, HostToolPolicy, InMemoryApprovalCapabilityStore,
+    HostApprovalVerifier, HostToolPolicy, InMemoryApprovalCapabilityStore,
     InteractiveCommandPolicy, ModelToolSchema, NetworkPolicy, ProcessPolicy, RunToolGrant,
     SandboxPolicy, ToolCallId, ToolConcurrency, ToolDescriptor, ToolId, ToolIdempotency,
     ToolInvocation, ToolOperationPlan, ToolOperationRisk, ToolOutcome, ToolOutput,
@@ -30,8 +32,7 @@ use orchestral_runtime::{
     tool_permission_decision_digest,
     tools::{
         guarded_artifact_read_descriptor, guarded_file_read_descriptor, guarded_shell_descriptor,
-        guarded_shell_descriptor_with_program_aliases, GuardedArtifactReadExecutor,
-        GuardedFileReadExecutor, GuardedProgramAliases, GuardedShellExecutor,
+        GuardedArtifactReadExecutor, GuardedFileReadExecutor, GuardedShellExecutor,
         GUARDED_SHELL_SANDBOX_PROFILE,
     },
     DescriptorPermissionPolicy, GuardedToolExecution, GuardedToolExecutor, GuardedToolResult,
@@ -44,9 +45,10 @@ use orchestral_runtime::{
     tools::{
         guarded_pty_close_descriptor, guarded_pty_create_descriptor,
         guarded_pty_create_descriptor_with_program_aliases, guarded_pty_list_descriptor,
-        guarded_pty_read_descriptor, guarded_pty_write_descriptor, GuardedPtyCloseExecutor,
-        GuardedPtyCreateExecutor, GuardedPtyListExecutor, GuardedPtyReadExecutor,
-        GuardedPtyWriteExecutor, GUARDED_PTY_SANDBOX_PROFILE,
+        guarded_pty_read_descriptor, guarded_pty_write_descriptor,
+        guarded_shell_descriptor_with_program_aliases, GuardedProgramAliases,
+        GuardedPtyCloseExecutor, GuardedPtyCreateExecutor, GuardedPtyListExecutor,
+        GuardedPtyReadExecutor, GuardedPtyWriteExecutor, GUARDED_PTY_SANDBOX_PROFILE,
     },
     PtyProcessManager,
 };
