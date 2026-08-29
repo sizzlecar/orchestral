@@ -1601,7 +1601,7 @@ fn live_e3_mcp_discovers_and_uses_the_configured_service_three_times() {
             true,
         );
         command.arg(
-            "Consult the configured deployment inventory and report the current color for service checkout.",
+            "Consult the configured deployment inventory and report the exact current color value for service checkout without shortening or normalizing it.",
         );
         let output = run_with_approval(command, true, PROCESS_TIMEOUT);
         assert!(output.status.success(), "{}", output.stderr_text());
