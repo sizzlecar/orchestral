@@ -7,7 +7,14 @@ cd "${ROOT_DIR}"
 forbidden_paths=(
   "REFACTOR_PLAN.md"
   "apps/orchestral-cli/src/scenario.rs"
-  "apps/orchestral-cli/src/tui"
+  # The TUI remains a supported product surface. Only its retired,
+  # pre-agent-protocol implementation modules must stay removed.
+  "apps/orchestral-cli/src/tui/bottom_pane"
+  "apps/orchestral-cli/src/tui/event_loop.rs"
+  "apps/orchestral-cli/src/tui/protocol.rs"
+  "apps/orchestral-cli/src/tui/ui.rs"
+  "apps/orchestral-cli/src/tui/update.rs"
+  "apps/orchestral-cli/src/tui/widgets"
   "apps/orchestral-server"
   "configs/orchestral.yaml"
   "core/orchestral-runtime/src/api/runtime.rs"
