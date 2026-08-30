@@ -400,6 +400,9 @@ fn build_cli_tool_runtime(
         .iter()
         .flat_map(GuardedMcpServerConfig::allowed_network_targets)
         .collect::<BTreeSet<_>>();
+    let mcp_allows_unrestricted_network = mcp_configs
+        .iter()
+        .any(GuardedMcpServerConfig::allows_unrestricted_network);
     let mut allowed_network_targets = mcp_network_targets.clone();
     if let Some(host) = &exec_host {
         allowed_network_targets.extend(host.network_targets.iter().cloned());
@@ -419,7 +422,9 @@ fn build_cli_tool_runtime(
     let mcp_restriction = ToolRestriction {
         bounds: ToolPolicyBounds {
             allowed_effects: mcp_effects.clone(),
-            approval: ApprovalPolicy::Required,
+            // Explicit `mcp add`/Host configuration trusts the transport.
+            // Per-call approval is derived from standard MCP Tool annotations.
+            approval: ApprovalPolicy::NotRequired,
             sandbox: SandboxPolicy {
                 required: !mcp_sandbox_profiles.is_empty(),
                 allowed_profiles: mcp_sandbox_profiles.clone(),
@@ -437,7 +442,7 @@ fn build_cli_tool_runtime(
             },
             network: NetworkPolicy {
                 allowed_targets: mcp_network_targets,
-                allow_unrestricted: false,
+                allow_unrestricted: mcp_allows_unrestricted_network,
             },
             environment: EnvironmentPolicy {
                 allowed_variables: mcp_environment,
@@ -481,7 +486,7 @@ fn build_cli_tool_runtime(
         },
         network: NetworkPolicy {
             allowed_targets: allowed_network_targets,
-            allow_unrestricted: host_execution_enabled,
+            allow_unrestricted: host_execution_enabled || mcp_allows_unrestricted_network,
         },
         environment: EnvironmentPolicy {
             allowed_variables: allowed_environment,
@@ -886,18 +891,18 @@ fn configured_mcp_servers(
     }
     let workspace = std::fs::canonicalize(std::env::current_dir().context("resolve workspace")?)
         .context("canonicalize workspace")?;
-    let mut manifest_paths = Vec::new();
+    let mut trusted_user_paths = Vec::new();
     match crate::mcp_config::user_registry_path() {
-        Ok(path) if path.is_file() => manifest_paths.push(path),
+        Ok(path) if path.is_file() => trusted_user_paths.push(path),
         Ok(_) => {}
         Err(error) => tracing::debug!(%error, "user MCP registry path is unavailable"),
     }
-    manifest_paths.extend(cli_manifest_paths.iter().cloned());
     let specs = crate::mcp_config::load_server_manifests(
         &workspace,
         &config.mcp.servers,
         &config.mcp.import_files,
-        &manifest_paths,
+        &trusted_user_paths,
+        cli_manifest_paths,
     )?;
     let mut servers = Vec::new();
     for spec in specs.iter().filter(|server| server.enabled) {
@@ -912,6 +917,7 @@ fn configured_mcp_servers(
                     readable_roots,
                     writable_roots,
                     network_targets,
+                    allow_unrestricted_network,
                 } => {
                     let program = resolve_host_program(command)?;
                     let cwd =
@@ -935,6 +941,7 @@ fn configured_mcp_servers(
                             writes,
                             network_targets.iter().cloned().collect(),
                         )
+                        .with_unrestricted_network(*allow_unrestricted_network)
                         .with_child_processes(*allow_child_processes)
                         .with_private_runtime_home(runtime_root),
                     )?))

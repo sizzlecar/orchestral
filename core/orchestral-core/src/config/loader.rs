@@ -185,6 +185,7 @@ fn validate_mcp(config: &OrchestralConfig) -> Result<(), ConfigError> {
                 readable_roots,
                 writable_roots,
                 network_targets,
+                allow_unrestricted_network,
                 ..
             } => {
                 if command.trim().is_empty()
@@ -196,6 +197,7 @@ fn validate_mcp(config: &OrchestralConfig) -> Result<(), ConfigError> {
                     || network_targets
                         .iter()
                         .any(|target| !valid_network_target(target))
+                    || (*allow_unrestricted_network && !network_targets.is_empty())
                 {
                     return invalid("MCP stdio declaration is invalid");
                 }
@@ -368,6 +370,24 @@ mcp:
         .unwrap();
         assert!(matches!(
             validate_config(&config),
+            Err(ConfigError::Invalid(message)) if message.contains("stdio declaration")
+        ));
+
+        let conflicting_network = serde_yaml::from_str::<OrchestralConfig>(
+            r#"
+mcp:
+  servers:
+    - name: local
+      transport:
+        type: stdio
+        command: /bin/echo
+        network_targets: [localhost:4317]
+        allow_unrestricted_network: true
+"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_config(&conflicting_network),
             Err(ConfigError::Invalid(message)) if message.contains("stdio declaration")
         ));
     }

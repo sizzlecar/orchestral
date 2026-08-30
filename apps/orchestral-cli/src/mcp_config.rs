@@ -45,6 +45,13 @@ pub(crate) struct JsonMcpServer {
     pub(crate) writable_roots: Vec<String>,
     #[serde(default, rename = "networkTargets", alias = "network_targets")]
     pub(crate) network_targets: Vec<String>,
+    #[serde(
+        default,
+        rename = "allowUnrestrictedNetwork",
+        alias = "allow_unrestricted_network",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) allow_unrestricted_network: Option<bool>,
     #[serde(default)]
     pub(crate) disabled: bool,
     #[serde(default)]
@@ -155,6 +162,7 @@ pub(crate) fn load_server_manifests(
     workspace: &Path,
     inline: &[McpServerSpec],
     configured_files: &[String],
+    trusted_user_files: &[PathBuf],
     cli_files: &[PathBuf],
 ) -> anyhow::Result<Vec<McpServerSpec>> {
     let mut resolved = BTreeMap::<String, (String, McpServerSpec)>::new();
@@ -164,9 +172,10 @@ pub(crate) fn load_server_manifests(
 
     let files = configured_files
         .iter()
-        .map(PathBuf::from)
-        .chain(cli_files.iter().cloned());
-    for path in files {
+        .map(|path| (PathBuf::from(path), false))
+        .chain(trusted_user_files.iter().cloned().map(|path| (path, true)))
+        .chain(cli_files.iter().cloned().map(|path| (path, false)));
+    for (path, trusted_user_registration) in files {
         let path = if path.is_absolute() {
             path
         } else {
@@ -181,7 +190,7 @@ pub(crate) fn load_server_manifests(
             .with_context(|| format!("parse MCP manifest '{source}'"))?;
         let base = path.parent().unwrap_or(workspace);
         for (name, server) in manifest.servers {
-            let spec = server.into_spec(name, base, &source)?;
+            let spec = server.into_spec(name, base, &source, trusted_user_registration)?;
             insert_unique(&mut resolved, &source, spec)?;
         }
     }
@@ -206,7 +215,13 @@ fn insert_unique(
 }
 
 impl JsonMcpServer {
-    fn into_spec(self, name: String, base: &Path, source: &str) -> anyhow::Result<McpServerSpec> {
+    fn into_spec(
+        self,
+        name: String,
+        base: &Path,
+        source: &str,
+        trusted_user_registration: bool,
+    ) -> anyhow::Result<McpServerSpec> {
         if self
             .transport_type
             .as_deref()
@@ -250,6 +265,12 @@ impl JsonMcpServer {
                 readable_roots,
                 writable_roots,
                 network_targets: self.network_targets,
+                // Legacy user registrations predate this field. Treat only
+                // that Host-owned registry as trusted transport configuration;
+                // project/imported manifests remain network-denied by default.
+                allow_unrestricted_network: self
+                    .allow_unrestricted_network
+                    .unwrap_or(trusted_user_registration),
             },
             startup_timeout_ms: self.startup_timeout_ms,
             tool_timeout_ms: self.tool_timeout_ms,
@@ -321,13 +342,14 @@ mod tests {
         )
         .unwrap();
 
-        let specs = load_server_manifests(&root, &[], &[], &[path]).unwrap();
+        let specs = load_server_manifests(&root, &[], &[], &[], &[path]).unwrap();
         assert_eq!(specs.len(), 1);
         let McpTransportSpec::Stdio {
             command,
             cwd,
             readable_roots,
             network_targets,
+            allow_unrestricted_network,
             ..
         } = &specs[0].transport
         else {
@@ -343,6 +365,49 @@ mod tests {
             &[root.join("bin").to_string_lossy().into_owned()]
         );
         assert_eq!(network_targets, &["localhost:4317"]);
+        assert!(!*allow_unrestricted_network);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn only_user_registry_defaults_legacy_stdio_to_host_network() {
+        let root = test_root("legacy-user-network");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let path = root.join("mcp.json");
+        std::fs::write(
+            &path,
+            r#"{
+  "mcpServers": {
+    "legacy": {
+      "type": "stdio",
+      "command": "/bin/echo"
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let project =
+            load_server_manifests(&root, &[], &[], &[], std::slice::from_ref(&path)).unwrap();
+        let trusted_user = load_server_manifests(&root, &[], &[], &[path], &[]).unwrap();
+        let McpTransportSpec::Stdio {
+            allow_unrestricted_network: project_network,
+            ..
+        } = &project[0].transport
+        else {
+            panic!("expected project stdio manifest")
+        };
+        let McpTransportSpec::Stdio {
+            allow_unrestricted_network: user_network,
+            ..
+        } = &trusted_user[0].transport
+        else {
+            panic!("expected user stdio manifest")
+        };
+        assert!(!project_network);
+        assert!(*user_network);
 
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -362,6 +427,7 @@ mod tests {
                 readable_roots: Vec::new(),
                 writable_roots: Vec::new(),
                 network_targets: Vec::new(),
+                allow_unrestricted_network: false,
             },
             startup_timeout_ms: None,
             tool_timeout_ms: None,

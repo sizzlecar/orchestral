@@ -1181,6 +1181,7 @@ fn local_cli_discovers_calls_and_journals_an_mcp_tool() {
                     "tools": [{
                         "name": "lookup_marker",
                         "description": "Return the configured E2E marker",
+                        "annotations": {"readOnlyHint": true, "openWorldHint": true},
                         "inputSchema": {
                             "type": "object",
                             "required": ["key"],
@@ -1216,7 +1217,7 @@ fn local_cli_discovers_calls_and_journals_an_mcp_tool() {
     ]);
     workspace.configure_local_openai(&model_endpoint);
 
-    let output = run_with_approval(
+    let output = run_to_completion(
         local_default_agent_command(
             &workspace,
             "mcp-entrypoint-session",
@@ -1224,12 +1225,11 @@ fn local_cli_discovers_calls_and_journals_an_mcp_tool() {
             false,
             true,
         ),
-        true,
         LOCAL_PROCESS_TIMEOUT,
     );
     assert!(output.status.success(), "{}", output.stderr_text());
     assert_eq!(output.stdout_text().trim(), "MCP_E2E_OK");
-    assert!(output.stderr_text().contains(APPROVAL_PROMPT));
+    assert!(!output.stderr_text().contains(APPROVAL_PROMPT));
     assert!(!output.stdout_text().contains(APPROVAL_PROMPT));
     output.assert_no_ansi();
 
@@ -1259,8 +1259,8 @@ fn local_cli_discovers_calls_and_journals_an_mcp_tool() {
     assert_eq!(exchanges.len(), 1);
     assert_eq!(tool_name(exchanges[0]), Some("mcp__fixture__lookup_marker"));
     assert_eq!(tool_result_is_error(exchanges[0]), Some(false));
-    assert_eq!(run_payload_count(&workspace, "request_opened"), 1);
-    assert_eq!(run_payload_count(&workspace, "request_resolved"), 1);
+    assert_eq!(run_payload_count(&workspace, "request_opened"), 0);
+    assert_eq!(run_payload_count(&workspace, "request_resolved"), 0);
 }
 
 #[test]
@@ -1440,6 +1440,10 @@ fn mcp_user_registry_add_list_get_remove_round_trip() {
         serde_json::from_str(&listed.stdout_text()).expect("list emits registry JSON");
     assert_eq!(registry["mcpServers"]["fixture"]["command"], "/bin/echo");
     assert_eq!(
+        registry["mcpServers"]["fixture"]["allowUnrestrictedNetwork"],
+        true
+    );
+    assert_eq!(
         registry["mcpServers"]["fixture"]["env"]["FIXTURE_MODE"],
         "e2e"
     );
@@ -1479,6 +1483,13 @@ fn user_registered_stdio_mcp_is_automatically_loaded_and_called() {
     const MCP_RESULT_MARKER: &str = "LOCAL_MCP_RESULT_海豚_7319🔌";
 
     let workspace = TestWorkspace::new("local-mcp-manifest");
+    let (network_endpoint, network_server) = spawn_fixture_http_server(vec![Box::new(|request| {
+        assert_eq!(request.body, json!({"probe": "seekee-like-sidecar"}));
+        FixtureHttpResponse {
+            content_type: "text/plain",
+            body: MCP_RESULT_MARKER.as_bytes().to_vec(),
+        }
+    })]);
     let script = format!(
         r#"
 while IFS= read -r line; do
@@ -1487,10 +1498,11 @@ while IFS= read -r line; do
       printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"supportedVersions":["2026-07-28"],"capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"local-fixture","version":"1"}}}}}}'
       ;;
     *'"method":"tools/list"'*)
-      printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"resultType":"complete","ttlMs":1000,"cacheScope":"private","tools":[{{"name":"lookup_marker","description":"Return the local MCP fixture marker","inputSchema":{{"type":"object","required":["key"],"properties":{{"key":{{"type":"string"}}}},"additionalProperties":false}}}}]}}}}'
+      printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"resultType":"complete","ttlMs":1000,"cacheScope":"private","tools":[{{"name":"lookup_marker","description":"Return the local MCP fixture marker","annotations":{{"readOnlyHint":true,"openWorldHint":true}},"inputSchema":{{"type":"object","required":["key"],"properties":{{"key":{{"type":"string"}}}},"additionalProperties":false}}}}]}}}}'
       ;;
     *'"method":"tools/call"'*'"name":"lookup_marker"'*)
-      printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"resultType":"complete","content":[{{"type":"text","text":"{MCP_RESULT_MARKER}"}}],"isError":false}}}}'
+      remote=$(/usr/bin/curl --silent --fail --request POST --header 'Content-Type: application/json' --data '{{"probe":"seekee-like-sidecar"}}' '{network_endpoint}/status')
+      printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"resultType\":\"complete\",\"content\":[{{\"type\":\"text\",\"text\":\"$remote\"}}],\"isError\":false}}}}"
       ;;
   esac
 done
@@ -1511,6 +1523,22 @@ done
     let registered = run_to_completion(register, LOCAL_PROCESS_TIMEOUT);
     assert!(registered.status.success(), "{}", registered.stderr_text());
     assert!(registered.stdout_text().contains("Added user MCP server"));
+
+    // Simulate a registration written by an older Orchestral release. The
+    // Host-owned user registry must migrate this trust default at load time so
+    // existing MCP servers do not need to be removed and added again.
+    let registry_path = orchestral_home.join("mcp.json");
+    let mut legacy_registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(&registry_path).expect("read MCP registry")).unwrap();
+    legacy_registry["mcpServers"]["localfixture"]
+        .as_object_mut()
+        .unwrap()
+        .remove("allowUnrestrictedNetwork");
+    fs::write(
+        &registry_path,
+        serde_json::to_vec_pretty(&legacy_registry).unwrap(),
+    )
+    .unwrap();
 
     let (model_endpoint, model_server) = spawn_fixture_http_server(vec![
         Box::new(|_| {
@@ -1538,11 +1566,11 @@ done
         .arg("local-mcp-registry-session")
         .arg("--no-skills")
         .arg("Use the local MCP lookup_marker tool with key 能力.");
-    let output = run_with_approval(command, true, LOCAL_PROCESS_TIMEOUT);
+    let output = run_to_completion(command, LOCAL_PROCESS_TIMEOUT);
 
     assert!(output.status.success(), "{}", output.stderr_text());
     assert_eq!(output.stdout_text().trim(), "LOCAL_MCP_E2E_OK");
-    assert!(output.stderr_text().contains(APPROVAL_PROMPT));
+    assert!(!output.stderr_text().contains(APPROVAL_PROMPT));
     output.assert_no_ansi();
 
     let model_requests = model_server.join().expect("join local model server");
@@ -1561,6 +1589,13 @@ done
         Some("mcp__localfixture__lookup_marker")
     );
     assert_eq!(tool_result_is_error(exchanges[0]), Some(false));
+    assert_eq!(
+        network_server
+            .join()
+            .expect("join local MCP network fixture")
+            .len(),
+        1
+    );
 }
 
 #[test]

@@ -152,6 +152,7 @@ impl StreamableHttpMcpTransportFactory {
             filesystem_write_roots: BTreeSet::new(),
             sandbox_profiles: BTreeSet::new(),
             network_targets: BTreeSet::from([endpoint.as_str().to_owned()]),
+            allow_unrestricted_network: false,
             environment_variables: BTreeSet::new(),
             credential_references,
         };

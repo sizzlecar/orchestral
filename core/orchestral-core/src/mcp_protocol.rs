@@ -75,6 +75,9 @@ pub struct McpTransportAuthority {
     pub filesystem_write_roots: BTreeSet<String>,
     pub sandbox_profiles: BTreeSet<String>,
     pub network_targets: BTreeSet<String>,
+    /// The explicitly registered transport may use the Host network without
+    /// pretending that a domain allow-list can be enforced by every OS.
+    pub allow_unrestricted_network: bool,
     pub environment_variables: BTreeSet<String>,
     pub credential_references: BTreeSet<String>,
 }
@@ -109,8 +112,13 @@ impl McpTransportAuthority {
                 != self.filesystem_read_roots.is_empty()
                 && self.effect_scopes.contains(&EffectScope::FilesystemWrite)
                     != self.filesystem_write_roots.is_empty());
-        let network_authority_matches =
-            self.effect_scopes.contains(&EffectScope::Network) != self.network_targets.is_empty();
+        let has_network_authority =
+            self.allow_unrestricted_network || !self.network_targets.is_empty();
+        let network_authority_is_exclusive =
+            !self.allow_unrestricted_network || self.network_targets.is_empty();
+        let network_authority_matches = self.effect_scopes.contains(&EffectScope::Network)
+            == has_network_authority
+            && network_authority_is_exclusive;
         if !required_effects.is_subset(&self.effect_scopes)
             || !filesystem_authority_matches
             || !network_authority_matches
@@ -138,6 +146,7 @@ impl McpTransportAuthority {
                     || !self.filesystem_read_roots.is_empty()
                     || !self.filesystem_write_roots.is_empty()
                     || !self.sandbox_profiles.is_empty()
+                    || self.allow_unrestricted_network
                     || !self.environment_variables.is_empty() =>
             {
                 Err(McpProtocolError::Invalid(
@@ -238,6 +247,30 @@ pub enum McpProtocolEra {
     LegacyHandshake,
 }
 
+/// Standard MCP Tool annotations used by the Host's approval policy. These are
+/// server assertions rather than granted capabilities. Missing or ambiguous
+/// annotations are reviewed conservatively.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpToolAnnotations {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub read_only_hint: Option<bool>,
+    #[serde(default)]
+    pub destructive_hint: Option<bool>,
+    #[serde(default)]
+    pub idempotent_hint: Option<bool>,
+    #[serde(default)]
+    pub open_world_hint: Option<bool>,
+}
+
+impl McpToolAnnotations {
+    pub fn requires_approval(&self) -> bool {
+        self.destructive_hint == Some(true) || self.read_only_hint != Some(true)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpToolSnapshot {
@@ -246,6 +279,8 @@ pub struct McpToolSnapshot {
     pub description: String,
     pub input_schema: Value,
     pub output_schema: Option<Value>,
+    #[serde(default)]
+    pub annotations: McpToolAnnotations,
     pub schema_digest: Digest,
 }
 
@@ -257,6 +292,7 @@ struct McpToolDigestView<'a> {
     description: &'a str,
     input_schema: &'a Value,
     output_schema: &'a Option<Value>,
+    annotations: &'a McpToolAnnotations,
 }
 
 impl McpToolSnapshot {
@@ -267,12 +303,31 @@ impl McpToolSnapshot {
         input_schema: Value,
         output_schema: Option<Value>,
     ) -> Result<Self, McpProtocolError> {
+        Self::seal_with_annotations(
+            server_id,
+            name,
+            description,
+            input_schema,
+            output_schema,
+            McpToolAnnotations::default(),
+        )
+    }
+
+    pub fn seal_with_annotations(
+        server_id: McpServerId,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: Value,
+        output_schema: Option<Value>,
+        annotations: McpToolAnnotations,
+    ) -> Result<Self, McpProtocolError> {
         let mut snapshot = Self {
             server_id,
             name: name.into(),
             description: description.into(),
             input_schema,
             output_schema,
+            annotations,
             schema_digest: Digest::sha256([]),
         };
         snapshot.schema_digest = snapshot.computed_digest()?;
@@ -288,6 +343,7 @@ impl McpToolSnapshot {
             description: &self.description,
             input_schema: &self.input_schema,
             output_schema: &self.output_schema,
+            annotations: &self.annotations,
         })
     }
 
@@ -473,5 +529,56 @@ mod tests {
         )
         .unwrap();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn tool_annotations_drive_conservative_host_review() {
+        assert!(McpToolAnnotations::default().requires_approval());
+        assert!(McpToolAnnotations {
+            read_only_hint: Some(false),
+            ..McpToolAnnotations::default()
+        }
+        .requires_approval());
+        assert!(!McpToolAnnotations {
+            read_only_hint: Some(true),
+            ..McpToolAnnotations::default()
+        }
+        .requires_approval());
+        assert!(McpToolAnnotations {
+            read_only_hint: Some(true),
+            destructive_hint: Some(true),
+            ..McpToolAnnotations::default()
+        }
+        .requires_approval());
+    }
+
+    #[test]
+    fn tool_revision_binds_annotations() {
+        let server = McpServerId::new("demo");
+        let read_only = McpToolSnapshot::seal_with_annotations(
+            server.clone(),
+            "lookup",
+            "lookup tool",
+            json!({"type": "object"}),
+            None,
+            McpToolAnnotations {
+                read_only_hint: Some(true),
+                ..McpToolAnnotations::default()
+            },
+        )
+        .unwrap();
+        let destructive = McpToolSnapshot::seal_with_annotations(
+            server,
+            "lookup",
+            "lookup tool",
+            json!({"type": "object"}),
+            None,
+            McpToolAnnotations {
+                destructive_hint: Some(true),
+                ..McpToolAnnotations::default()
+            },
+        )
+        .unwrap();
+        assert_ne!(read_only.schema_digest, destructive.schema_digest);
     }
 }

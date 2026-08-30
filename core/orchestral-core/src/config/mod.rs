@@ -307,9 +307,14 @@ pub enum McpTransportSpec {
         #[serde(default)]
         writable_roots: Vec<String>,
         /// Exact `host:port` destinations available to this local process.
-        /// Empty keeps network access disabled.
+        /// Mutually exclusive with unrestricted Host network access.
         #[serde(default)]
         network_targets: Vec<String>,
+        /// Permit the explicitly registered local MCP process to use the Host
+        /// network. User-level `mcp add` enables this by default, matching the
+        /// trust boundary established by registering the process itself.
+        #[serde(default)]
+        allow_unrestricted_network: bool,
     },
     StreamableHttp {
         endpoint: String,

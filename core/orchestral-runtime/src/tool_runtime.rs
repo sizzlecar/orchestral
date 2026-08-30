@@ -262,10 +262,10 @@ impl ToolPermissionPolicy for DescriptorPermissionPolicy {
 
 /// Default interactive workspace policy used by the CLI.
 ///
-/// Routine and non-destructive workspace mutation stay inside the mandatory
-/// sandbox and run automatically. Destructive operations, open-world effects,
-/// secrets, and any Tool that statically requires approval still route to the
-/// reviewer.
+/// Routine operations asserted by Host-owned planners and non-destructive
+/// workspace mutation stay inside the configured sandbox and run
+/// automatically. Destructive or ambiguous open-world operations, secrets,
+/// and any Tool that statically requires approval still route to the reviewer.
 #[derive(Debug, Default)]
 pub struct WorkspacePermissionPolicy;
 
@@ -292,15 +292,18 @@ impl ToolPermissionPolicy for WorkspacePermissionPolicy {
                 operation.risk,
                 ToolOperationRisk::Routine | ToolOperationRisk::Elevated
             )
-            || operation.required_capabilities.effects.iter().any(|scope| {
-                matches!(
-                    scope,
-                    EffectScope::Network
-                        | EffectScope::SecretRead
-                        | EffectScope::ExternalSideEffect
-                        | EffectScope::HostExecution
-                )
-            })
+            || operation
+                .required_capabilities
+                .effects
+                .iter()
+                .any(|scope| matches!(scope, EffectScope::SecretRead | EffectScope::HostExecution))
+            || (operation.risk != ToolOperationRisk::Routine
+                && operation.required_capabilities.effects.iter().any(|scope| {
+                    matches!(
+                        scope,
+                        EffectScope::Network | EffectScope::ExternalSideEffect
+                    )
+                }))
             || (!bounds.sandbox.required
                 && operation.required_capabilities.effects.iter().any(|scope| {
                     matches!(scope, EffectScope::Process | EffectScope::FilesystemWrite)

@@ -70,6 +70,11 @@ struct AddArgs {
     #[arg(long = "network", value_name = "HOST:PORT")]
     network_targets: Vec<String>,
 
+    /// Disable Host network access for this MCP process. User-registered
+    /// local MCP servers inherit Host network access by default.
+    #[arg(long, conflicts_with = "network_targets")]
+    no_network: bool,
+
     /// Forbid the MCP process from creating children. By default the complete
     /// process tree is allowed but remains inside the same sandbox.
     #[arg(long)]
@@ -150,6 +155,7 @@ fn add(path: &Path, args: AddArgs) -> anyhow::Result<()> {
     for target in &args.network_targets {
         validate_network_target(target)?;
     }
+    let allow_unrestricted_network = !args.no_network && args.network_targets.is_empty();
     let server = JsonMcpServer {
         transport_type: Some("stdio".to_owned()),
         command: program,
@@ -166,6 +172,7 @@ fn add(path: &Path, args: AddArgs) -> anyhow::Result<()> {
             .map(|path| path.to_string_lossy().into_owned())
             .collect(),
         network_targets: args.network_targets,
+        allow_unrestricted_network: Some(allow_unrestricted_network),
         disabled: false,
         required: args.required,
         startup_timeout_ms: None,

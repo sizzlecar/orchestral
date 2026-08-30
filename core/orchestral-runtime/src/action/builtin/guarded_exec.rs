@@ -319,7 +319,7 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
         }
         let risk = if classification.destructive {
             ToolOperationRisk::Destructive
-        } else if host_execution {
+        } else if host_execution || classification.network {
             ToolOperationRisk::Elevated
         } else if strictly_read_only {
             ToolOperationRisk::Routine
@@ -478,7 +478,7 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
         let strictly_read_only = classification.read_only && !tty;
         let expected_risk = if classification.destructive {
             ToolOperationRisk::Destructive
-        } else if host_execution {
+        } else if host_execution || classification.network {
             ToolOperationRisk::Elevated
         } else if strictly_read_only {
             ToolOperationRisk::Routine

@@ -12,15 +12,15 @@ use tokio::time::timeout;
 
 use orchestral_core::agent_protocol::wire::{Digest, ToolActivityEvidence};
 use orchestral_core::mcp_protocol::{
-    McpProtocolEra, McpServerId, McpServerSnapshot, McpToolSnapshot, McpTransportAuthority,
-    McpTransportCancellation, McpTransportConnection, McpTransportError, McpTransportFactory,
-    McpTransportKind, McpTransportRequest, MCP_LATEST_LEGACY_PROTOCOL,
+    McpProtocolEra, McpServerId, McpServerSnapshot, McpToolAnnotations, McpToolSnapshot,
+    McpTransportAuthority, McpTransportCancellation, McpTransportConnection, McpTransportError,
+    McpTransportFactory, McpTransportKind, McpTransportRequest, MCP_LATEST_LEGACY_PROTOCOL,
     MCP_STATELESS_PROTOCOL_2026_07_28,
 };
 use orchestral_core::tool_protocol::{
-    ApprovalCapabilityStore, ApprovalPolicy, CapabilityRequest, CapabilitySelector, EffectScope,
-    ModelToolSchema, ToolConcurrency, ToolDescriptor, ToolId, ToolIdempotency, ToolInvocation,
-    ToolOperationPlan, ToolOperationRisk, ToolOutcome, ToolRestriction,
+    ApprovalCapabilityStore, CapabilityRequest, CapabilitySelector, EffectScope, ModelToolSchema,
+    ToolConcurrency, ToolDescriptor, ToolId, ToolIdempotency, ToolInvocation, ToolOperationPlan,
+    ToolOperationRisk, ToolOutcome, ToolRestriction,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -239,6 +239,7 @@ pub struct StdioMcpSandboxPolicy {
     readable_roots: BTreeSet<PathBuf>,
     writable_roots: BTreeSet<PathBuf>,
     network_targets: BTreeSet<String>,
+    allow_unrestricted_network: bool,
     private_runtime_home: Option<PathBuf>,
     allow_child_processes: bool,
 }
@@ -251,6 +252,7 @@ impl StdioMcpSandboxPolicy {
             readable_roots: BTreeSet::from([root.clone()]),
             writable_roots: BTreeSet::from([root]),
             network_targets: BTreeSet::new(),
+            allow_unrestricted_network: false,
             private_runtime_home: None,
             allow_child_processes: false,
         }
@@ -270,6 +272,7 @@ impl StdioMcpSandboxPolicy {
             readable_roots,
             writable_roots,
             network_targets,
+            allow_unrestricted_network: false,
             private_runtime_home: None,
             allow_child_processes: false,
         }
@@ -279,6 +282,14 @@ impl StdioMcpSandboxPolicy {
     /// descendant remains confined by this server's filesystem/network policy.
     pub fn with_child_processes(mut self, allow: bool) -> Self {
         self.allow_child_processes = allow;
+        self
+    }
+
+    /// Uses the Host network for an explicitly registered local MCP process.
+    /// This is transport trust established by configuration, not authority
+    /// supplied by a model Tool call.
+    pub fn with_unrestricted_network(mut self, allow: bool) -> Self {
+        self.allow_unrestricted_network = allow;
         self
     }
 
@@ -304,6 +315,12 @@ impl StdioMcpSandboxPolicy {
             .collect::<Result<BTreeSet<_>, _>>()?;
         let network_targets = normalize_network_targets(&self.network_targets)
             .map_err(McpToolsAdapterError::InvalidConfig)?;
+        if self.allow_unrestricted_network && !network_targets.is_empty() {
+            return Err(McpToolsAdapterError::InvalidConfig(
+                "MCP stdio network authority must be exact targets or unrestricted, not both"
+                    .to_owned(),
+            ));
+        }
         let private_runtime_home = self
             .private_runtime_home
             .as_deref()
@@ -330,6 +347,7 @@ impl StdioMcpSandboxPolicy {
             readable_roots,
             writable_roots,
             network_targets,
+            allow_unrestricted_network: self.allow_unrestricted_network,
             private_runtime_home,
             allow_child_processes: self.allow_child_processes,
         })
@@ -395,7 +413,7 @@ impl StdioMcpTransportFactory {
         if !environment.is_empty() {
             effect_scopes.insert(EffectScope::SecretRead);
         }
-        if !sandbox.network_targets.is_empty() {
+        if sandbox.allow_unrestricted_network || !sandbox.network_targets.is_empty() {
             effect_scopes.insert(EffectScope::Network);
         }
         let binding = json!({
@@ -407,6 +425,7 @@ impl StdioMcpTransportFactory {
             "readableRoots": sandbox.readable_roots.iter().map(|root| root.to_string_lossy()).collect::<Vec<_>>(),
             "writableRoots": sandbox.writable_roots.iter().map(|root| root.to_string_lossy()).collect::<Vec<_>>(),
             "networkTargets": &sandbox.network_targets,
+            "allowUnrestrictedNetwork": sandbox.allow_unrestricted_network,
             "privateRuntimeHome": sandbox.private_runtime_home.as_ref().map(|path| path.to_string_lossy()),
             "allowChildProcesses": sandbox.allow_child_processes,
             "sandboxProfile": MCP_STDIO_SANDBOX_PROFILE,
@@ -434,6 +453,7 @@ impl StdioMcpTransportFactory {
                 .collect(),
             sandbox_profiles: BTreeSet::from([MCP_STDIO_SANDBOX_PROFILE.to_owned()]),
             network_targets: sandbox.network_targets.clone(),
+            allow_unrestricted_network: sandbox.allow_unrestricted_network,
             environment_variables: environment.keys().cloned().collect(),
             credential_references: BTreeSet::new(),
         };
@@ -467,7 +487,9 @@ impl McpTransportFactory for StdioMcpTransportFactory {
                 writable_roots: self.sandbox.writable_roots.iter().cloned().collect(),
                 allow_child_processes: self.sandbox.allow_child_processes,
                 launcher_programs: vec![self.program.clone()],
-                network: if self.sandbox.network_targets.is_empty() {
+                network: if self.sandbox.allow_unrestricted_network {
+                    SandboxNetworkAccess::Unrestricted
+                } else if self.sandbox.network_targets.is_empty() {
                     SandboxNetworkAccess::Disabled
                 } else {
                     SandboxNetworkAccess::ExactTargets(self.sandbox.network_targets.clone())
@@ -578,6 +600,10 @@ impl GuardedMcpServerConfig {
 
     pub fn allowed_network_targets(&self) -> BTreeSet<String> {
         self.transport.authority().network_targets.clone()
+    }
+
+    pub fn allows_unrestricted_network(&self) -> bool {
+        self.transport.authority().allow_unrestricted_network
     }
 
     pub fn filesystem_read_roots(&self) -> BTreeSet<String> {
@@ -1094,13 +1120,25 @@ fn parse_guarded_tool_snapshot(
                 }
             }
         }
+        let annotations = raw
+            .get("annotations")
+            .cloned()
+            .map(serde_json::from_value::<McpToolAnnotations>)
+            .transpose()
+            .map_err(|error| {
+                McpToolsAdapterError::Protocol(format!(
+                    "MCP Tool '{name}' returned invalid annotations: {error}"
+                ))
+            })?
+            .unwrap_or_default();
         snapshots.push(
-            McpToolSnapshot::seal(
+            McpToolSnapshot::seal_with_annotations(
                 config.server_id.clone(),
                 name,
                 raw.get("description").and_then(Value::as_str).unwrap_or(""),
                 input_schema,
                 raw.get("outputSchema").cloned(),
+                annotations,
             )
             .map_err(|error| McpToolsAdapterError::Protocol(error.to_string()))?,
         );
@@ -1143,11 +1181,6 @@ impl McpToolsAdapterRegistry {
             .bounds
             .validate()
             .map_err(|error| McpToolsAdapterError::InvalidConfig(error.to_string()))?;
-        if restriction.bounds.approval != ApprovalPolicy::Required {
-            return Err(McpToolsAdapterError::InvalidConfig(
-                "MCP Tool restriction must require exact Host approval".to_owned(),
-            ));
-        }
         let mut configured_ids = BTreeSet::new();
         for config in &configs {
             config.validate()?;
@@ -1163,6 +1196,7 @@ impl McpToolsAdapterRegistry {
             let write_roots = config.filesystem_write_roots();
             let sandbox_profiles = config.sandbox_profiles();
             let network_targets = config.allowed_network_targets();
+            let allow_unrestricted_network = config.allows_unrestricted_network();
             let environment = config.environment_names();
             let credentials = config.credential_references();
             if !config
@@ -1176,6 +1210,7 @@ impl McpToolsAdapterRegistry {
                 || !sandbox_profiles.is_subset(&restriction.bounds.sandbox.allowed_profiles)
                 || (!sandbox_profiles.is_empty() && !restriction.bounds.sandbox.required)
                 || !network_targets.is_subset(&restriction.bounds.network.allowed_targets)
+                || (allow_unrestricted_network && !restriction.bounds.network.allow_unrestricted)
                 || !environment.is_subset(&restriction.bounds.environment.allowed_variables)
                 || !credentials.is_subset(&restriction.bounds.allowed_credentials)
             {
@@ -1276,6 +1311,7 @@ impl McpToolsAdapterRegistry {
                     Arc::new(GuardedMcpToolExecutor {
                         manager: manager.clone(),
                         tool_name: tool.name.clone(),
+                        annotations: tool.annotations.clone(),
                     }) as Arc<dyn GuardedToolExecutor>,
                 ));
             }
@@ -1329,7 +1365,6 @@ fn mcp_server_restriction(
 ) -> ToolRestriction {
     let mut bounds = ceiling.bounds.clone();
     bounds.allowed_effects = config.effect_scopes();
-    bounds.approval = ApprovalPolicy::Required;
     bounds.sandbox.allowed_profiles = config.sandbox_profiles();
     bounds.sandbox.required = !bounds.sandbox.allowed_profiles.is_empty();
     bounds.process.interactive = Default::default();
@@ -1338,7 +1373,7 @@ fn mcp_server_restriction(
     bounds.filesystem.readable_roots = config.filesystem_read_roots();
     bounds.filesystem.writable_roots = config.filesystem_write_roots();
     bounds.network.allowed_targets = config.allowed_network_targets();
-    bounds.network.allow_unrestricted = false;
+    bounds.network.allow_unrestricted = config.allows_unrestricted_network();
     bounds.environment.allowed_variables = config.environment_names();
     bounds.environment.inherit_host_environment = false;
     bounds.allowed_credentials = config.credential_references();
@@ -1354,6 +1389,7 @@ async fn shutdown_mcp_managers(managers: &BTreeMap<McpServerId, Arc<McpServerCon
 struct GuardedMcpToolExecutor {
     manager: Arc<McpServerConnectionManager>,
     tool_name: String,
+    annotations: McpToolAnnotations,
 }
 
 #[async_trait]
@@ -1400,9 +1436,14 @@ impl GuardedToolExecutor for GuardedMcpToolExecutor {
                 CapabilitySelector::Subtree(root),
             );
         }
-        for target in self.manager.config.allowed_network_targets() {
+        if self.manager.config.allows_unrestricted_network() {
             required_capabilities
-                .insert_resource(EffectScope::Network, CapabilitySelector::Exact(target));
+                .insert_resource(EffectScope::Network, CapabilitySelector::Unrestricted);
+        } else {
+            for target in self.manager.config.allowed_network_targets() {
+                required_capabilities
+                    .insert_resource(EffectScope::Network, CapabilitySelector::Exact(target));
+            }
         }
         for name in self.manager.config.environment_names() {
             required_capabilities.insert_resource(
@@ -1430,7 +1471,13 @@ impl GuardedToolExecutor for GuardedMcpToolExecutor {
         }
         let operation = ToolOperationPlan {
             required_capabilities,
-            risk: ToolOperationRisk::Elevated,
+            risk: if self.annotations.destructive_hint == Some(true) {
+                ToolOperationRisk::Destructive
+            } else if self.annotations.requires_approval() {
+                ToolOperationRisk::Elevated
+            } else {
+                ToolOperationRisk::Routine
+            },
             summary: self.approval_summary(invocation),
         };
         operation
@@ -1457,14 +1504,6 @@ impl GuardedToolExecutor for GuardedMcpToolExecutor {
     }
 
     async fn execute(&self, execution: GuardedToolExecution) -> ToolOutcome {
-        if !execution.lease.was_approved()
-            || execution.effective_policy.bounds().approval != ApprovalPolicy::Required
-        {
-            return ToolOutcome::Rejected {
-                code: "mcp_approval_missing".to_owned(),
-                message: "MCP Tool requires verified Host approval".to_owned(),
-            };
-        }
         let bounds = execution.effective_policy.bounds();
         let programs = self.manager.config.allowed_programs();
         let allow_child_processes = self.manager.config.allows_child_processes();
@@ -1472,6 +1511,7 @@ impl GuardedToolExecutor for GuardedMcpToolExecutor {
         let write_roots = self.manager.config.filesystem_write_roots();
         let sandbox_profiles = self.manager.config.sandbox_profiles();
         let network_targets = self.manager.config.allowed_network_targets();
+        let allow_unrestricted_network = self.manager.config.allows_unrestricted_network();
         let environment = self.manager.config.environment_names();
         let credentials = self.manager.config.credential_references();
         if !programs.is_subset(&bounds.process.transport.allowed_programs)
@@ -1481,6 +1521,7 @@ impl GuardedToolExecutor for GuardedMcpToolExecutor {
             || !sandbox_profiles.is_subset(&bounds.sandbox.allowed_profiles)
             || (!sandbox_profiles.is_empty() && !bounds.sandbox.required)
             || !network_targets.is_subset(&bounds.network.allowed_targets)
+            || (allow_unrestricted_network && !bounds.network.allow_unrestricted)
             || !environment.is_subset(&bounds.environment.allowed_variables)
             || !credentials.is_subset(&bounds.allowed_credentials)
         {
@@ -2304,6 +2345,7 @@ mod mcp_lifecycle_gate_tests {
         replay_tool_effect, InMemoryToolEffectJournalStore, ToolEffectJournalStore, ToolEffectKey,
         ToolEffectPhase,
     };
+    use orchestral_core::tool_protocol::ApprovalPolicy;
     use orchestral_core::tool_protocol::{
         HostApprovalIssuer, HostApprovalVerifier, HostToolPolicy, InMemoryApprovalCapabilityStore,
         RunToolGrant, ToolCallId, ToolInvocation, ToolOutput, ToolPolicyBounds,
@@ -2444,6 +2486,7 @@ mod mcp_lifecycle_gate_tests {
                     filesystem_write_roots,
                     sandbox_profiles,
                     network_targets,
+                    allow_unrestricted_network: false,
                     environment_variables: BTreeSet::new(),
                     credential_references: BTreeSet::new(),
                 },
@@ -2685,6 +2728,7 @@ mod mcp_lifecycle_gate_tests {
         bounds.sandbox.allowed_profiles = authority.sandbox_profiles.clone();
         bounds.sandbox.required = !authority.sandbox_profiles.is_empty();
         bounds.network.allowed_targets = authority.network_targets.clone();
+        bounds.network.allow_unrestricted = authority.allow_unrestricted_network;
         bounds.environment.allowed_variables = authority.environment_variables.clone();
         bounds.allowed_credentials = authority.credential_references.clone();
         bounds
@@ -2961,6 +3005,7 @@ mod mcp_lifecycle_gate_tests {
                     filesystem_write_roots: BTreeSet::from(["/fault/write".to_owned()]),
                     sandbox_profiles: BTreeSet::from([MCP_STDIO_SANDBOX_PROFILE.to_owned()]),
                     network_targets: BTreeSet::new(),
+                    allow_unrestricted_network: false,
                     environment_variables: BTreeSet::from([format!("SENTINEL_ENV_{index}")]),
                     credential_references: BTreeSet::new(),
                 }
@@ -2979,6 +3024,7 @@ mod mcp_lifecycle_gate_tests {
                     filesystem_write_roots: BTreeSet::new(),
                     sandbox_profiles: BTreeSet::new(),
                     network_targets: BTreeSet::from(["http://127.0.0.1/fault-mcp".to_owned()]),
+                    allow_unrestricted_network: false,
                     environment_variables: BTreeSet::new(),
                     credential_references: BTreeSet::from([format!("env:SENTINEL_TOKEN_{index}")]),
                 }
