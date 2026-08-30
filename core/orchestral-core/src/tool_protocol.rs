@@ -101,6 +101,10 @@ pub enum EffectScope {
     EnvironmentRead,
     SecretRead,
     ExternalSideEffect,
+    /// Execute a process outside the default OS sandbox. This is an explicit
+    /// Host capability, not a model-controlled sandbox switch. Operations
+    /// requesting it must remain bound to an exact approval capability.
+    HostExecution,
 }
 
 /// Host-normalized selector for a resource required by one operation.
@@ -191,10 +195,14 @@ impl CapabilityRequest {
                     ));
                 }
                 CapabilitySelector::Unrestricted
-                    if !matches!(
+                    if !(matches!(
                         resource.effect,
                         EffectScope::Network | EffectScope::ExternalSideEffect
-                    ) =>
+                    ) || self.effects.contains(&EffectScope::HostExecution)
+                        && matches!(
+                            resource.effect,
+                            EffectScope::FilesystemRead | EffectScope::FilesystemWrite
+                        )) =>
                 {
                     return Err(ToolProtocolError::new(
                         ToolProtocolErrorCode::InvalidInvocation,
@@ -211,6 +219,40 @@ impl CapabilityRequest {
                 ToolProtocolErrorCode::InvalidInvocation,
                 "network operations must declare exact or unrestricted network authority",
             ));
+        }
+        if self.effects.contains(&EffectScope::HostExecution) {
+            let ambient_effects = [
+                EffectScope::Process,
+                EffectScope::Network,
+                EffectScope::FilesystemRead,
+                EffectScope::FilesystemWrite,
+                EffectScope::ExternalSideEffect,
+            ];
+            if ambient_effects
+                .into_iter()
+                .any(|effect| !self.effects.contains(&effect))
+            {
+                return Err(ToolProtocolError::new(
+                    ToolProtocolErrorCode::InvalidInvocation,
+                    "Host execution must declare process, unrestricted filesystem/network, and external-side-effect authority",
+                ));
+            }
+            for effect in [
+                EffectScope::Network,
+                EffectScope::FilesystemRead,
+                EffectScope::FilesystemWrite,
+                EffectScope::ExternalSideEffect,
+            ] {
+                if !self
+                    .resources_for(effect)
+                    .any(|selector| matches!(selector, CapabilitySelector::Unrestricted))
+                {
+                    return Err(ToolProtocolError::new(
+                        ToolProtocolErrorCode::InvalidInvocation,
+                        "Host execution ambient effects must use unrestricted selectors",
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -783,12 +825,26 @@ impl EffectiveToolPolicy {
                 CapabilitySelector::Unrestricted => false,
             };
             match resource.effect {
-                EffectScope::FilesystemRead => {
-                    exact_or_subtree(&self.bounds.filesystem.readable_roots)
-                }
-                EffectScope::FilesystemWrite => {
-                    exact_or_subtree(&self.bounds.filesystem.writable_roots)
-                }
+                EffectScope::FilesystemRead => match &resource.selector {
+                    CapabilitySelector::Unrestricted => {
+                        requested.effects.contains(&EffectScope::HostExecution)
+                            && self
+                                .bounds
+                                .allowed_effects
+                                .contains(&EffectScope::HostExecution)
+                    }
+                    _ => exact_or_subtree(&self.bounds.filesystem.readable_roots),
+                },
+                EffectScope::FilesystemWrite => match &resource.selector {
+                    CapabilitySelector::Unrestricted => {
+                        requested.effects.contains(&EffectScope::HostExecution)
+                            && self
+                                .bounds
+                                .allowed_effects
+                                .contains(&EffectScope::HostExecution)
+                    }
+                    _ => exact_or_subtree(&self.bounds.filesystem.writable_roots),
+                },
                 EffectScope::Network => match &resource.selector {
                     CapabilitySelector::Exact(target) => {
                         self.bounds.network.allowed_targets.contains(target)
@@ -828,7 +884,9 @@ impl EffectiveToolPolicy {
                     CapabilitySelector::Unscoped => true,
                     _ => false,
                 },
-                EffectScope::ArtifactRead | EffectScope::ExternalSideEffect => true,
+                EffectScope::ArtifactRead
+                | EffectScope::ExternalSideEffect
+                | EffectScope::HostExecution => true,
             }
         })
     }
@@ -838,7 +896,9 @@ impl EffectiveToolPolicy {
     }
 }
 
-/// Host-normalized invocation. Its JSON surface has no authority fields.
+/// Host-normalized invocation. Arguments may express requested effects (for
+/// example an escalated execution mode), but never carry a grant, approval,
+/// lease, or other authority. Only the Host can issue those capabilities.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolInvocation {
@@ -1541,6 +1601,103 @@ mod tests {
     }
 
     #[test]
+    fn unrestricted_filesystem_requires_explicit_host_execution_authority() {
+        let mut hidden_widening = CapabilityRequest::from_effects(effects(&[
+            EffectScope::FilesystemRead,
+            EffectScope::FilesystemWrite,
+        ]));
+        hidden_widening.insert_resource(
+            EffectScope::FilesystemRead,
+            CapabilitySelector::Unrestricted,
+        );
+        hidden_widening.insert_resource(
+            EffectScope::FilesystemWrite,
+            CapabilitySelector::Unrestricted,
+        );
+        assert_eq!(
+            hidden_widening.validate().unwrap_err().code,
+            ToolProtocolErrorCode::InvalidInvocation
+        );
+
+        let underdeclared_host_execution = CapabilityRequest::from_effects(effects(&[
+            EffectScope::Process,
+            EffectScope::HostExecution,
+        ]));
+        assert_eq!(
+            underdeclared_host_execution.validate().unwrap_err().code,
+            ToolProtocolErrorCode::InvalidInvocation
+        );
+
+        let mut host_execution = CapabilityRequest::from_effects(effects(&[
+            EffectScope::Process,
+            EffectScope::Network,
+            EffectScope::FilesystemRead,
+            EffectScope::FilesystemWrite,
+            EffectScope::ExternalSideEffect,
+            EffectScope::HostExecution,
+        ]));
+        host_execution.insert_resource(EffectScope::Network, CapabilitySelector::Unrestricted);
+        host_execution.insert_resource(
+            EffectScope::FilesystemRead,
+            CapabilitySelector::Unrestricted,
+        );
+        host_execution.insert_resource(
+            EffectScope::FilesystemWrite,
+            CapabilitySelector::Unrestricted,
+        );
+        host_execution.insert_resource(
+            EffectScope::ExternalSideEffect,
+            CapabilitySelector::Unrestricted,
+        );
+        host_execution.validate().unwrap();
+
+        let common = bounds(
+            &[
+                EffectScope::Process,
+                EffectScope::Network,
+                EffectScope::FilesystemRead,
+                EffectScope::FilesystemWrite,
+                EffectScope::ExternalSideEffect,
+                EffectScope::HostExecution,
+            ],
+            ApprovalPolicy::Required,
+        );
+        let policy = EffectiveToolPolicy::resolve(
+            &HostToolPolicy {
+                bounds: common.clone(),
+            },
+            &RunToolGrant {
+                bounds: common.clone(),
+            },
+            &ToolRestriction { bounds: common },
+        )
+        .unwrap();
+        assert!(policy.authorizes_request(&host_execution));
+
+        let without_host_execution = bounds(
+            &[
+                EffectScope::Process,
+                EffectScope::FilesystemRead,
+                EffectScope::FilesystemWrite,
+            ],
+            ApprovalPolicy::Required,
+        );
+        let policy = EffectiveToolPolicy::resolve(
+            &HostToolPolicy {
+                bounds: without_host_execution.clone(),
+            },
+            &RunToolGrant {
+                bounds: without_host_execution.clone(),
+            },
+            &ToolRestriction {
+                bounds: without_host_execution,
+            },
+        )
+        .unwrap();
+        assert!(!policy.authorizes_request(&host_execution));
+    }
+
+    #[test]
     fn effective_policy_is_the_restrictive_intersection() {
         let host = HostToolPolicy {
             bounds: bounds(
@@ -1723,7 +1880,7 @@ mod tests {
     }
 
     fn generated_bounds(seed: &mut u64) -> ToolPolicyBounds {
-        const EFFECTS: [EffectScope; 8] = [
+        const EFFECTS: [EffectScope; 9] = [
             EffectScope::Process,
             EffectScope::Network,
             EffectScope::FilesystemRead,
@@ -1732,6 +1889,7 @@ mod tests {
             EffectScope::EnvironmentRead,
             EffectScope::SecretRead,
             EffectScope::ExternalSideEffect,
+            EffectScope::HostExecution,
         ];
         let allowed_effects = EFFECTS
             .into_iter()

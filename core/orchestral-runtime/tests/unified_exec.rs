@@ -41,6 +41,7 @@ fn effects() -> BTreeSet<EffectScope> {
         EffectScope::FilesystemWrite,
         EffectScope::EnvironmentRead,
         EffectScope::ExternalSideEffect,
+        EffectScope::HostExecution,
     ])
 }
 
@@ -77,7 +78,10 @@ fn bounds(workspace: &Path, shell: &Path) -> ToolPolicyBounds {
             readable_roots: BTreeSet::from([workspace.clone()]),
             writable_roots: BTreeSet::from([workspace]),
         },
-        network: NetworkPolicy::default(),
+        network: NetworkPolicy {
+            allowed_targets: BTreeSet::new(),
+            allow_unrestricted: true,
+        },
         environment: EnvironmentPolicy {
             allowed_variables: BTreeSet::from(["PATH".to_owned(), "VISIBLE".to_owned()]),
             inherit_host_environment: false,
@@ -803,5 +807,169 @@ async fn workspace_auto_run_confines_reads_and_mutations_to_the_real_sandbox() {
         }
     ));
     assert_eq!(std::fs::read_to_string(&mutation).unwrap(), "mutation");
+    std::fs::remove_dir_all(parent).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn host_execution_requires_an_exact_approval_and_can_use_an_external_workdir() {
+    let parent = std::env::temp_dir().join(format!(
+        "orchestral-host-execution-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let workspace = parent.join("workspace");
+    let external = parent.join("external");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&external).unwrap();
+    std::fs::write(external.join("evidence.txt"), "approved-host-evidence").unwrap();
+    let workspace = std::fs::canonicalize(workspace).unwrap();
+    let external = std::fs::canonicalize(external).unwrap();
+    let shell = std::fs::canonicalize("/bin/sh").unwrap();
+    let bounds = bounds(&workspace, &shell);
+    let runtime =
+        runtime(bounds.clone()).with_permission_policy(Arc::new(WorkspacePermissionPolicy));
+    runtime
+        .register(
+            workspace_exec_command_descriptor(ToolRestriction {
+                bounds: bounds.clone(),
+            }),
+            Arc::new(
+                GuardedExecCommandExecutor::new(
+                    Arc::new(ProcessSupervisor::new(16 * 1024).unwrap()),
+                    shell,
+                    [PathBuf::from("/bin"), PathBuf::from("/usr/bin")],
+                    [],
+                    CommandEnvironmentSnapshot::default(),
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+
+    let default_request = invocation(
+        "host-execution-run",
+        "default-outside-workdir",
+        "orchestral/exec_command/v1",
+        json!({ "cmd": "pwd", "workdir": external }),
+    );
+    assert!(matches!(
+        runtime
+            .invoke(
+                default_request,
+                RunToolGrant {
+                    bounds: bounds.clone(),
+                },
+                None,
+                CancellationToken::new(),
+            )
+            .await,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Rejected { ref code, .. },
+            ..
+        } if code == "exec_workdir_invalid"
+    ));
+
+    let missing_justification = invocation(
+        "host-execution-run",
+        "missing-justification",
+        "orchestral/exec_command/v1",
+        json!({
+            "cmd": "cat evidence.txt",
+            "workdir": external,
+            "sandbox_permissions": "require_escalated"
+        }),
+    );
+    assert!(matches!(
+        runtime
+            .invoke(
+                missing_justification,
+                RunToolGrant {
+                    bounds: bounds.clone(),
+                },
+                None,
+                CancellationToken::new(),
+            )
+            .await,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Rejected { ref code, .. },
+            ..
+        } if code == "exec_escalation_justification_missing"
+    ));
+
+    let unresolved_external = invocation(
+        "host-execution-run",
+        "unresolved-external-workdir",
+        "orchestral/exec_command/v1",
+        json!({
+            "cmd": "pwd",
+            "workdir": parent.join("not-inspected-before-approval"),
+            "sandbox_permissions": "require_escalated",
+            "justification": "Use the external directory requested by the user"
+        }),
+    );
+    assert!(matches!(
+        runtime
+            .invoke(
+                unresolved_external,
+                RunToolGrant {
+                    bounds: bounds.clone(),
+                },
+                None,
+                CancellationToken::new(),
+            )
+            .await,
+        GuardedToolResult::ApprovalRequired { .. }
+    ));
+
+    let escalated = invocation(
+        "host-execution-run",
+        "approved-outside-workdir",
+        "orchestral/exec_command/v1",
+        json!({
+            "cmd": "cat evidence.txt",
+            "workdir": external,
+            "sandbox_permissions": "require_escalated",
+            "justification": "Read the user-requested fixture outside the current workspace",
+            "yield_time_ms": 1000
+        }),
+    );
+    let escalation_result = runtime
+        .invoke(
+            escalated.clone(),
+            RunToolGrant {
+                bounds: bounds.clone(),
+            },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    let GuardedToolResult::ApprovalRequired { binding, summary } = escalation_result else {
+        panic!("Host execution must enter the approval bridge: {escalation_result:?}")
+    };
+    assert!(binding
+        .requested_capabilities
+        .requires(EffectScope::HostExecution));
+    assert!(summary.contains("outside the workspace sandbox"));
+    assert!(summary.contains("user-requested fixture"));
+    assert!(summary.contains(external.to_string_lossy().as_ref()));
+
+    let approval = HostApprovalIssuer::new(SIGNING_KEY)
+        .unwrap()
+        .issue(binding, i64::MAX)
+        .unwrap();
+    let output = inline_output(
+        runtime
+            .invoke(
+                escalated,
+                RunToolGrant { bounds },
+                Some(approval),
+                CancellationToken::new(),
+            )
+            .await,
+    );
+    assert_eq!(output["exit_code"], json!(0));
+    assert_eq!(output["stdout"], json!("approved-host-evidence"));
+    assert_eq!(output["sandbox_backend"], json!("host-approved"));
+
     std::fs::remove_dir_all(parent).unwrap();
 }

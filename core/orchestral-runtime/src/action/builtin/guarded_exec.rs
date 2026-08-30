@@ -24,6 +24,8 @@ use crate::tools::shell_sandbox::{sandbox_command, SandboxNetworkAccess, ShellSa
 use super::support::{canonical_roots, truncate_utf8_lossy};
 
 pub const GUARDED_EXEC_SANDBOX_PROFILE: &str = "orchestral.exec_command.v1";
+const DEFAULT_SANDBOX_PERMISSION: &str = "use_default";
+const REQUIRE_ESCALATED_PERMISSION: &str = "require_escalated";
 
 /// Immutable Host environment captured when the Agent runtime is composed.
 /// Tool calls only receive the intersection with their effective policy.
@@ -124,7 +126,7 @@ impl GuardedWriteStdinExecutor {
 impl GuardedToolExecutor for GuardedExecCommandExecutor {
     fn planning_contract(&self) -> Value {
         json!({
-            "contract": "orchestral.exec-command-operation-planner/v3",
+            "contract": "orchestral.exec-command-operation-planner/v4",
             "shell": self.shell,
             "runtime_readable_roots": self.runtime_readable_roots,
             "runtime_readable_files": self.runtime_readable_files,
@@ -165,6 +167,19 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
                 "cmd must be a non-empty string",
             ));
         };
+        let host_execution = requested_host_execution(&invocation.arguments)?;
+        let justification = escalation_justification(&invocation.arguments, host_execution)?;
+        if host_execution
+            && !effective_policy
+                .bounds()
+                .allowed_effects
+                .contains(&EffectScope::HostExecution)
+        {
+            return Err(rejected(
+                "exec_host_execution_denied",
+                "Host configuration does not permit execution outside the default sandbox",
+            ));
+        }
         let readable_roots = canonical_roots(&effective_policy.bounds().filesystem.readable_roots)
             .map_err(|message| rejected("exec_read_root_invalid", message))?;
         let writable_roots = canonical_roots(&effective_policy.bounds().filesystem.writable_roots)
@@ -175,12 +190,19 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
                 "exec_command requires readable and writable workspace roots",
             ));
         }
-        let cwd = resolve_workdir(
-            invocation.arguments.get("workdir"),
-            &readable_roots,
-            &writable_roots,
-        )
-        .map_err(|message| rejected("exec_workdir_invalid", message))?;
+        let sandboxed_cwd = if host_execution {
+            validate_host_workdir_argument(invocation.arguments.get("workdir"))?;
+            None
+        } else {
+            Some(
+                resolve_workdir(
+                    invocation.arguments.get("workdir"),
+                    &readable_roots,
+                    &writable_roots,
+                )
+                .map_err(|message| rejected("exec_workdir_invalid", message))?,
+            )
+        };
         let classification = classify_command(cmd);
         let interactive = invocation
             .arguments
@@ -200,10 +222,12 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
             EffectScope::Process,
             CapabilitySelector::Exact(self.shell.to_string_lossy().into_owned()),
         );
-        required_capabilities.insert_resource(
-            EffectScope::FilesystemRead,
-            CapabilitySelector::Exact(cwd.to_string_lossy().into_owned()),
-        );
+        if let Some(cwd) = &sandboxed_cwd {
+            required_capabilities.insert_resource(
+                EffectScope::FilesystemRead,
+                CapabilitySelector::Exact(cwd.to_string_lossy().into_owned()),
+            );
+        }
         if !effective_policy
             .bounds()
             .environment
@@ -214,12 +238,45 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
                 .effects
                 .insert(EffectScope::EnvironmentRead);
         }
-        if classification.network {
-            // Current process sandboxes can enforce either no network or an
-            // open network namespace. Request that actual authority instead
-            // of pretending a hostname allow-list can be enforced.
+        if host_execution {
+            // Host execution intentionally leaves the default OS sandbox. Its
+            // broad authority is represented explicitly instead of silently
+            // widening workspace selectors during execution.
+            required_capabilities
+                .effects
+                .insert(EffectScope::HostExecution);
+            required_capabilities.insert_resource(
+                EffectScope::FilesystemRead,
+                CapabilitySelector::Unrestricted,
+            );
+            required_capabilities.insert_resource(
+                EffectScope::FilesystemWrite,
+                CapabilitySelector::Unrestricted,
+            );
             required_capabilities
                 .insert_resource(EffectScope::Network, CapabilitySelector::Unrestricted);
+            required_capabilities.insert_resource(
+                EffectScope::ExternalSideEffect,
+                CapabilitySelector::Unrestricted,
+            );
+        } else if classification.network {
+            let network = &effective_policy.bounds().network;
+            if network.allow_unrestricted {
+                required_capabilities
+                    .insert_resource(EffectScope::Network, CapabilitySelector::Unrestricted);
+            } else if network.allowed_targets.is_empty() {
+                return Err(rejected(
+                    "exec_network_denied",
+                    "Host configuration does not permit network access for this command",
+                ));
+            } else {
+                for target in &network.allowed_targets {
+                    required_capabilities.insert_resource(
+                        EffectScope::Network,
+                        CapabilitySelector::Exact(target.clone()),
+                    );
+                }
+            }
             required_capabilities.insert_resource(
                 EffectScope::ExternalSideEffect,
                 CapabilitySelector::Unrestricted,
@@ -229,27 +286,29 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
         // this executor's planning contract. They are not invocation-selected
         // authority and therefore do not belong in the user's per-operation
         // lease. The sandbox still materializes those fixed read-only roots.
-        for root in &readable_roots {
-            required_capabilities.insert_resource(
-                EffectScope::FilesystemRead,
-                CapabilitySelector::Subtree(root.to_string_lossy().into_owned()),
-            );
-        }
-        if strictly_read_only {
-            for root in &writable_roots {
+        if !host_execution {
+            for root in &readable_roots {
                 required_capabilities.insert_resource(
-                    EffectScope::FilesystemWrite,
-                    CapabilitySelector::Subtree(
-                        root.join(".orchestral/tmp").to_string_lossy().into_owned(),
-                    ),
-                );
-            }
-        } else {
-            for root in &writable_roots {
-                required_capabilities.insert_resource(
-                    EffectScope::FilesystemWrite,
+                    EffectScope::FilesystemRead,
                     CapabilitySelector::Subtree(root.to_string_lossy().into_owned()),
                 );
+            }
+            if strictly_read_only {
+                for root in &writable_roots {
+                    required_capabilities.insert_resource(
+                        EffectScope::FilesystemWrite,
+                        CapabilitySelector::Subtree(
+                            root.join(".orchestral/tmp").to_string_lossy().into_owned(),
+                        ),
+                    );
+                }
+            } else {
+                for root in &writable_roots {
+                    required_capabilities.insert_resource(
+                        EffectScope::FilesystemWrite,
+                        CapabilitySelector::Subtree(root.to_string_lossy().into_owned()),
+                    );
+                }
             }
         }
         for name in &effective_policy.bounds().environment.allowed_variables {
@@ -258,16 +317,28 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
                 CapabilitySelector::Exact(name.clone()),
             );
         }
+        let risk = if classification.destructive {
+            ToolOperationRisk::Destructive
+        } else if host_execution {
+            ToolOperationRisk::Elevated
+        } else if strictly_read_only {
+            ToolOperationRisk::Routine
+        } else {
+            ToolOperationRisk::Elevated
+        };
+        let summary = if host_execution {
+            host_execution_summary(
+                &invocation.arguments,
+                cmd,
+                justification.unwrap_or("Host execution requested"),
+            )
+        } else {
+            format!("Execute in workspace sandbox: {}", display_command(cmd))
+        };
         let operation = ToolOperationPlan {
             required_capabilities,
-            risk: if classification.destructive {
-                ToolOperationRisk::Destructive
-            } else if strictly_read_only {
-                ToolOperationRisk::Routine
-            } else {
-                ToolOperationRisk::Elevated
-            },
-            summary: format!("Execute in workspace sandbox: {}", display_command(cmd)),
+            risk,
+            summary,
         };
         operation
             .validate_envelope(&descriptor.effect_scopes)
@@ -281,19 +352,58 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
             .get("cmd")
             .and_then(Value::as_str)
             .unwrap_or("<invalid-command>");
-        format!("Execute in workspace sandbox: {}", display_command(cmd))
+        if requested_host_execution(&invocation.arguments).unwrap_or(false) {
+            let reason = invocation
+                .arguments
+                .get("justification")
+                .and_then(Value::as_str)
+                .unwrap_or("No justification supplied");
+            host_execution_summary(&invocation.arguments, cmd, reason)
+        } else {
+            format!("Execute in workspace sandbox: {}", display_command(cmd))
+        }
     }
 
     async fn execute(&self, execution: GuardedToolExecution) -> ToolOutcome {
         if execution.cancellation.is_cancelled() {
             return ToolOutcome::Cancelled;
         }
+        let host_execution = match requested_host_execution(&execution.invocation.arguments) {
+            Ok(value) => value,
+            Err(outcome) => return outcome,
+        };
+        if let Err(outcome) =
+            escalation_justification(&execution.invocation.arguments, host_execution)
+        {
+            return outcome;
+        }
+        if host_execution
+            && (!host_execution_capabilities_are_complete(execution.lease.granted())
+                || !execution.lease.was_approved())
+        {
+            return rejected(
+                "exec_escalation_not_approved",
+                "Host execution requires an exact verified approval capability",
+            );
+        }
+        if !host_execution
+            && execution
+                .lease
+                .granted()
+                .requires(EffectScope::HostExecution)
+        {
+            return rejected(
+                "exec_operation_mismatch",
+                "planned Host execution no longer matches the invocation",
+            );
+        }
         let bounds = execution.effective_policy.bounds();
-        if !bounds.sandbox.required
-            || !bounds
-                .sandbox
-                .allowed_profiles
-                .contains(GUARDED_EXEC_SANDBOX_PROFILE)
+        if !host_execution
+            && (!bounds.sandbox.required
+                || !bounds
+                    .sandbox
+                    .allowed_profiles
+                    .contains(GUARDED_EXEC_SANDBOX_PROFILE))
         {
             return rejected(
                 "exec_sandbox_denied",
@@ -338,11 +448,19 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
             Ok(_) => return rejected("exec_write_root_denied", "no writable workspace root"),
             Err(message) => return rejected("exec_write_root_invalid", message),
         };
-        let cwd = match resolve_workdir(
-            execution.invocation.arguments.get("workdir"),
-            &readable_roots,
-            &writable_roots,
-        ) {
+        let cwd = match if host_execution {
+            resolve_host_workdir(
+                execution.invocation.arguments.get("workdir"),
+                &readable_roots,
+                &writable_roots,
+            )
+        } else {
+            resolve_workdir(
+                execution.invocation.arguments.get("workdir"),
+                &readable_roots,
+                &writable_roots,
+            )
+        } {
             Ok(cwd) => cwd,
             Err(message) => return rejected("exec_workdir_invalid", message),
         };
@@ -358,43 +476,70 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
             .unwrap_or(false);
         let classification = classify_command(cmd);
         let strictly_read_only = classification.read_only && !tty;
-        if strictly_read_only != (execution.operation.risk == ToolOperationRisk::Routine) {
+        let expected_risk = if classification.destructive {
+            ToolOperationRisk::Destructive
+        } else if host_execution {
+            ToolOperationRisk::Elevated
+        } else if strictly_read_only {
+            ToolOperationRisk::Routine
+        } else {
+            ToolOperationRisk::Elevated
+        };
+        if execution.operation.risk != expected_risk {
             return rejected(
                 "exec_operation_mismatch",
                 "planned command risk no longer matches the executable sandbox profile",
             );
         }
-        let sandbox_writes = if strictly_read_only {
-            vec![runtime_temp.clone()]
-        } else {
-            writable_roots
-        };
-        let network = match sandbox_network_access(execution.lease.granted()) {
-            Ok(network) => network,
-            Err(outcome) => return outcome,
-        };
-        let mut sandbox_reads = readable_roots;
-        sandbox_reads.extend(self.runtime_readable_roots.iter().cloned());
-        sandbox_reads.push(runtime_temp.clone());
-        sandbox_reads.sort();
-        sandbox_reads.dedup();
-        let sandboxed = match sandbox_command(
-            shell_identity,
-            shell_arguments(cmd),
-            &cwd,
-            &ShellSandboxPolicy {
-                readable_roots: sandbox_reads,
-                readable_files: self.runtime_readable_files.clone(),
-                writable_roots: sandbox_writes,
-                allow_child_processes: true,
-                launcher_programs: vec![self.shell.clone()],
-                network,
-                linux_bwrap_path: None,
-            },
-        ) {
-            Ok(command) => command,
-            Err(message) => return failed("exec_sandbox_setup", message, false),
-        };
+        let (program, args, sandbox_environment, backend_starts_new_session, backend) =
+            if host_execution {
+                (
+                    shell_identity,
+                    shell_arguments(cmd),
+                    BTreeMap::new(),
+                    false,
+                    "host-approved".to_owned(),
+                )
+            } else {
+                let sandbox_writes = if strictly_read_only {
+                    vec![runtime_temp.clone()]
+                } else {
+                    writable_roots
+                };
+                let network = match sandbox_network_access(execution.lease.granted()) {
+                    Ok(network) => network,
+                    Err(outcome) => return outcome,
+                };
+                let mut sandbox_reads = readable_roots;
+                sandbox_reads.extend(self.runtime_readable_roots.iter().cloned());
+                sandbox_reads.push(runtime_temp.clone());
+                sandbox_reads.sort();
+                sandbox_reads.dedup();
+                let sandboxed = match sandbox_command(
+                    shell_identity,
+                    shell_arguments(cmd),
+                    &cwd,
+                    &ShellSandboxPolicy {
+                        readable_roots: sandbox_reads,
+                        readable_files: self.runtime_readable_files.clone(),
+                        writable_roots: sandbox_writes,
+                        allow_child_processes: true,
+                        launcher_programs: vec![self.shell.clone()],
+                        network,
+                        linux_bwrap_path: None,
+                    },
+                ) {
+                    Ok(command) => command,
+                    Err(message) => return failed("exec_sandbox_setup", message, false),
+                };
+                (
+                    sandboxed.program,
+                    sandboxed.args,
+                    sandboxed.env.into_iter().collect::<BTreeMap<_, _>>(),
+                    sandboxed.backend_starts_new_session,
+                    sandboxed.backend.to_owned(),
+                )
+            };
         let mut environment = if execution
             .lease
             .granted()
@@ -405,7 +550,7 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
         } else {
             BTreeMap::new()
         };
-        environment.extend(sandboxed.env);
+        environment.extend(sandbox_environment);
         let runtime_temp = runtime_temp.to_string_lossy().into_owned();
         for name in ["TMPDIR", "TMP", "TEMP"] {
             environment.insert(name.to_owned(), runtime_temp.clone());
@@ -422,12 +567,12 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
             .manager
             .spawn(ExecSpawnSpec {
                 run_id: execution.invocation.run_id.clone(),
-                program: sandboxed.program,
-                args: sandboxed.args,
+                program,
+                args,
                 cwd,
                 environment,
                 tty,
-                backend_starts_new_session: sandboxed.backend_starts_new_session,
+                backend_starts_new_session,
                 operation: execution.operation.clone(),
             })
             .await
@@ -466,7 +611,7 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
             Err(error) => return exec_error(error),
         };
         ToolOutcome::Completed {
-            output: render_result(result, session_id, max_output_bytes, sandboxed.backend).into(),
+            output: render_result(result, session_id, max_output_bytes, &backend).into(),
         }
     }
 }
@@ -632,11 +777,21 @@ pub fn workspace_exec_command_descriptor(restriction: ToolRestriction) -> ToolDe
 
 fn build_exec_command_descriptor(mut restriction: ToolRestriction) -> ToolDescriptor {
     apply_exec_restriction(&mut restriction);
+    let effect_scopes = restricted_exec_effects(&restriction);
     ToolDescriptor {
         tool_id: ToolId::new("orchestral/exec_command/v1"),
         model_schema: ModelToolSchema {
             name: "exec_command".to_owned(),
-            description: "Run a shell command in the workspace. Short commands return directly; interactive or still-running commands return a session_id for write_stdin.".to_owned(),
+            description: concat!(
+                "Run a shell command. Commands use the workspace sandbox by default. ",
+                "When that sandbox prevents an operation the user requested, retry with ",
+                "sandbox_permissions='require_escalated' and a concise justification; ",
+                "the Host will decide whether to ask the user. Never tell the user to run ",
+                "the command manually merely because escalation is required. Short commands ",
+                "return directly; interactive or still-running commands return a session_id ",
+                "for write_stdin."
+            )
+            .to_owned(),
             input_schema: json!({
                 "type": "object",
                 "required": ["cmd"],
@@ -645,13 +800,18 @@ fn build_exec_command_descriptor(mut restriction: ToolRestriction) -> ToolDescri
                     "workdir": { "type": "string", "minLength": 1 },
                     "tty": { "type": "boolean" },
                     "yield_time_ms": { "type": "integer", "minimum": 1 },
-                    "max_output_tokens": { "type": "integer", "minimum": 1 }
+                    "max_output_tokens": { "type": "integer", "minimum": 1 },
+                    "sandbox_permissions": {
+                        "type": "string",
+                        "enum": ["use_default", "require_escalated"]
+                    },
+                    "justification": { "type": "string", "minLength": 1 }
                 },
                 "additionalProperties": false
             }),
         },
         output_schema: exec_output_schema(),
-        effect_scopes: exec_effects(),
+        effect_scopes,
         restriction,
         idempotency: ToolIdempotency::NonIdempotent,
         concurrency: ToolConcurrency::PerRunSerial,
@@ -673,6 +833,7 @@ pub fn workspace_write_stdin_descriptor(restriction: ToolRestriction) -> ToolDes
 
 fn build_write_stdin_descriptor(mut restriction: ToolRestriction) -> ToolDescriptor {
     apply_exec_restriction(&mut restriction);
+    let effect_scopes = restricted_exec_effects(&restriction);
     ToolDescriptor {
         tool_id: ToolId::new("orchestral/write_stdin/v1"),
         model_schema: ModelToolSchema {
@@ -693,7 +854,7 @@ fn build_write_stdin_descriptor(mut restriction: ToolRestriction) -> ToolDescrip
             }),
         },
         output_schema: exec_output_schema(),
-        effect_scopes: exec_effects(),
+        effect_scopes,
         restriction,
         idempotency: ToolIdempotency::NonIdempotent,
         concurrency: ToolConcurrency::PerRunSerial,
@@ -717,7 +878,91 @@ fn exec_effects() -> BTreeSet<EffectScope> {
         EffectScope::FilesystemWrite,
         EffectScope::EnvironmentRead,
         EffectScope::ExternalSideEffect,
+        EffectScope::HostExecution,
     ])
+}
+
+fn restricted_exec_effects(restriction: &ToolRestriction) -> BTreeSet<EffectScope> {
+    exec_effects()
+        .intersection(&restriction.bounds.allowed_effects)
+        .copied()
+        .collect()
+}
+
+fn requested_host_execution(arguments: &Value) -> Result<bool, ToolOutcome> {
+    match arguments
+        .get("sandbox_permissions")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_SANDBOX_PERMISSION)
+    {
+        DEFAULT_SANDBOX_PERMISSION => Ok(false),
+        REQUIRE_ESCALATED_PERMISSION => Ok(true),
+        _ => Err(rejected(
+            "exec_sandbox_permissions_invalid",
+            "sandbox_permissions must be 'use_default' or 'require_escalated'",
+        )),
+    }
+}
+
+fn escalation_justification(
+    arguments: &Value,
+    host_execution: bool,
+) -> Result<Option<&str>, ToolOutcome> {
+    let justification = arguments
+        .get("justification")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if host_execution && justification.is_none() {
+        return Err(rejected(
+            "exec_escalation_justification_missing",
+            "require_escalated needs a concise non-empty justification for Host review",
+        ));
+    }
+    Ok(justification)
+}
+
+fn host_execution_capabilities_are_complete(request: &CapabilityRequest) -> bool {
+    [
+        EffectScope::HostExecution,
+        EffectScope::Network,
+        EffectScope::FilesystemRead,
+        EffectScope::FilesystemWrite,
+        EffectScope::ExternalSideEffect,
+    ]
+    .into_iter()
+    .all(|effect| request.requires(effect))
+        && [
+            EffectScope::Network,
+            EffectScope::FilesystemRead,
+            EffectScope::FilesystemWrite,
+            EffectScope::ExternalSideEffect,
+        ]
+        .into_iter()
+        .all(|effect| {
+            request
+                .resources_for(effect)
+                .any(|selector| matches!(selector, CapabilitySelector::Unrestricted))
+        })
+}
+
+fn host_execution_summary(arguments: &Value, command: &str, justification: &str) -> String {
+    let workdir = arguments
+        .get("workdir")
+        .and_then(Value::as_str)
+        .map(display_payload);
+    match workdir {
+        Some(workdir) => format!(
+            "Execute outside the workspace sandbox (workdir: {workdir}): {}; Reason: {}",
+            display_command(command),
+            display_payload(justification)
+        ),
+        None => format!(
+            "Execute outside the workspace sandbox: {}; Reason: {}",
+            display_command(command),
+            display_payload(justification)
+        ),
+    }
 }
 
 fn sandbox_network_access(
@@ -962,6 +1207,17 @@ fn exec_output_schema() -> Value {
     })
 }
 
+fn validate_host_workdir_argument(value: Option<&Value>) -> Result<(), ToolOutcome> {
+    match value {
+        Some(Value::String(path)) if !path.trim().is_empty() => Ok(()),
+        Some(_) => Err(rejected(
+            "exec_workdir_invalid",
+            "workdir must be a non-empty string",
+        )),
+        None => Ok(()),
+    }
+}
+
 fn resolve_workdir(
     value: Option<&Value>,
     readable_roots: &[PathBuf],
@@ -993,6 +1249,35 @@ fn resolve_workdir(
             "workdir is outside the Host-approved workspace: {}",
             cwd.display()
         ));
+    }
+    Ok(cwd)
+}
+
+fn resolve_host_workdir(
+    value: Option<&Value>,
+    readable_roots: &[PathBuf],
+    writable_roots: &[PathBuf],
+) -> Result<PathBuf, String> {
+    let base = writable_roots
+        .first()
+        .or_else(|| readable_roots.first())
+        .ok_or_else(|| "no workspace root is available".to_owned())?;
+    let requested = match value {
+        Some(Value::String(path)) if !path.trim().is_empty() => {
+            let path = Path::new(path);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                base.join(path)
+            }
+        }
+        Some(_) => return Err("workdir must be a non-empty string".to_owned()),
+        None => base.clone(),
+    };
+    let cwd = std::fs::canonicalize(&requested)
+        .map_err(|error| format!("resolve workdir '{}': {error}", requested.display()))?;
+    if !cwd.is_dir() {
+        return Err(format!("workdir is not a directory: {}", cwd.display()));
     }
     Ok(cwd)
 }

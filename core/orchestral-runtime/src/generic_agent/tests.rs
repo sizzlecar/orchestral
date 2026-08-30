@@ -215,4 +215,10 @@ fn default_agent_contract_preserves_requested_end_states_and_scope() {
     assert!(config
         .system_prompt
         .contains("unrequested integration, publication, cleanup, or reversal"));
+    assert!(config
+        .system_prompt
+        .contains("sandbox_permissions='require_escalated'"));
+    assert!(config
+        .system_prompt
+        .contains("do not offload the command to the user"));
 }

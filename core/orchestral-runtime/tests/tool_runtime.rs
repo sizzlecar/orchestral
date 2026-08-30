@@ -841,6 +841,60 @@ async fn permission_spi_cannot_relax_a_required_static_policy() {
 }
 
 #[tokio::test]
+async fn permission_spi_cannot_auto_authorize_host_execution() {
+    let mut bounds = policy(ApprovalPolicy::NotRequired);
+    bounds.allowed_effects.extend([
+        EffectScope::Network,
+        EffectScope::FilesystemRead,
+        EffectScope::FilesystemWrite,
+        EffectScope::ExternalSideEffect,
+        EffectScope::HostExecution,
+    ]);
+    bounds.network.allow_unrestricted = true;
+    let runtime =
+        runtime(bounds.clone()).with_permission_policy(Arc::new(AlwaysAllowPermissionPolicy));
+    let mut required_capabilities = capabilities(&[
+        EffectScope::Process,
+        EffectScope::Network,
+        EffectScope::FilesystemRead,
+        EffectScope::FilesystemWrite,
+        EffectScope::ExternalSideEffect,
+        EffectScope::HostExecution,
+    ]);
+    for effect in [
+        EffectScope::Network,
+        EffectScope::FilesystemRead,
+        EffectScope::FilesystemWrite,
+        EffectScope::ExternalSideEffect,
+    ] {
+        required_capabilities.insert_resource(effect, CapabilitySelector::Unrestricted);
+    }
+    let operation = ToolOperationPlan {
+        required_capabilities,
+        risk: ToolOperationRisk::Elevated,
+        summary: "Execute outside the default sandbox".to_owned(),
+    };
+    let executor = Arc::new(PlannedEchoExecutor {
+        calls: AtomicUsize::new(0),
+        operation,
+    });
+    let mut tool = descriptor(bounds.clone(), ToolConcurrency::ParallelSafe);
+    tool.effect_scopes = bounds.allowed_effects.clone();
+    runtime.register(tool, executor.clone()).unwrap();
+
+    let result = runtime
+        .invoke(
+            invocation("hello"),
+            RunToolGrant { bounds },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(result, GuardedToolResult::ApprovalRequired { .. }));
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn permission_spi_cannot_relax_a_denied_static_policy() {
     let bounds = policy(ApprovalPolicy::Deny);
     let runtime =

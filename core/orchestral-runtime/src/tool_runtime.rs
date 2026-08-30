@@ -80,6 +80,43 @@ impl CapabilityLease {
     pub fn approval(&self) -> Option<&VerifiedApprovalCapability> {
         self.approval.as_ref()
     }
+
+    /// Revalidates the non-serializable lease at the final executor boundary.
+    /// This keeps a cloned lease from being reused with a different
+    /// invocation, operation, or effective Host policy by an adapter.
+    pub fn validate_for(
+        &self,
+        invocation: &ToolInvocation,
+        operation: &ToolOperationPlan,
+        effective_policy: &EffectiveToolPolicy,
+    ) -> Result<(), ToolProtocolError> {
+        let operation_digest = operation.digest()?;
+        if self.operation_digest != operation_digest
+            || self.granted != operation.required_capabilities
+        {
+            return Err(ToolProtocolError::new(
+                ToolProtocolErrorCode::CapabilityBindingMismatch,
+                "capability lease does not match the dispatched Tool operation",
+            ));
+        }
+        if let Some(approval) = &self.approval {
+            let binding = approval.binding();
+            if binding.run_id != invocation.run_id
+                || binding.call_id != invocation.call_id
+                || binding.tool_id != invocation.tool_id
+                || binding.args_digest != invocation.args_digest()?
+                || binding.operation_digest != operation_digest
+                || binding.requested_capabilities != self.granted
+                || binding.policy_digest != effective_policy.digest()?
+            {
+                return Err(ToolProtocolError::new(
+                    ToolProtocolErrorCode::CapabilityBindingMismatch,
+                    "approved capability lease does not match the executor dispatch",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The only context passed to a production Tool executor.
@@ -261,6 +298,7 @@ impl ToolPermissionPolicy for WorkspacePermissionPolicy {
                     EffectScope::Network
                         | EffectScope::SecretRead
                         | EffectScope::ExternalSideEffect
+                        | EffectScope::HostExecution
                 )
             })
             || (!bounds.sandbox.required
@@ -280,8 +318,27 @@ impl ToolPermissionPolicy for WorkspacePermissionPolicy {
 /// policy can relax.
 fn constrain_permission_decision(
     effective_policy: &EffectiveToolPolicy,
+    operation: &ToolOperationPlan,
     proposed: ToolPermissionDecision,
 ) -> ToolPermissionDecision {
+    // Leaving the configured OS sandbox is never an automatic policy path.
+    // Even a pluggable policy that would otherwise allow the operation must
+    // produce an exact, verified Host approval capability for this effect.
+    let proposed = if operation
+        .required_capabilities
+        .requires(EffectScope::HostExecution)
+    {
+        match proposed {
+            ToolPermissionDecision::Deny { code, message } => {
+                ToolPermissionDecision::Deny { code, message }
+            }
+            ToolPermissionDecision::Allow | ToolPermissionDecision::RequireApproval => {
+                ToolPermissionDecision::RequireApproval
+            }
+        }
+    } else {
+        proposed
+    };
     match effective_policy.bounds().approval {
         ApprovalPolicy::Deny => ToolPermissionDecision::Deny {
             code: "approval_policy_denied".to_owned(),
@@ -1034,6 +1091,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
         }
         let permission = constrain_permission_decision(
             &effective_policy,
+            &operation,
             self.permission_policy
                 .decide(&registered.descriptor, &operation, &effective_policy),
         );
@@ -1197,6 +1255,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
         }
         let permission = constrain_permission_decision(
             &effective_policy,
+            &operation,
             self.permission_policy
                 .decide(&registered.descriptor, &operation, &effective_policy),
         );
@@ -1802,6 +1861,12 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
         lease: CapabilityLease,
         cancellation: CancellationToken,
     ) -> ToolOutcome {
+        if let Err(error) = lease.validate_for(&invocation, &operation, &effective_policy) {
+            return ToolOutcome::Rejected {
+                code: "invalid_capability_lease".to_owned(),
+                message: error.message,
+            };
+        }
         let timeout_ms = effective_policy.bounds().max_timeout_ms;
         let output_invocation = invocation.clone();
         let execution = registered.executor.execute(GuardedToolExecution {

@@ -234,7 +234,11 @@ impl GenericAgentConfig {
                 "workspace text changes, use file_write to create a file or intentionally ",
                 "replace a complete file, and use apply_patch for targeted changes to existing ",
                 "files. Inspect existing content before changing it and run relevant ",
-                "verification. Treat every Tool failure as an observation to ",
+                "verification. Permission is owned by the Host, not inferred by you. When an ",
+                "exec_command needed for the user's request cannot run in the default sandbox, ",
+                "request sandbox_permissions='require_escalated' with a concise justification ",
+                "so the Host can apply policy or ask the user; do not offload the command to the ",
+                "user merely because approval is needed. Treat every Tool failure as an observation to ",
                 "correct or safely work around; report completion only from successful evidence."
             )
             .to_owned(),

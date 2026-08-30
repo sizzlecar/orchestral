@@ -676,7 +676,7 @@ pub(super) fn approval_scope_names(binding: &ApprovalBinding) -> Result<Vec<Stri
         .effects
         .iter()
         .map(|scope| {
-            serde_json::to_value(scope)
+            let name = serde_json::to_value(scope)
                 .ok()
                 .and_then(|value| value.as_str().map(str::to_owned))
                 .ok_or_else(|| {
@@ -685,7 +685,22 @@ pub(super) fn approval_scope_names(binding: &ApprovalBinding) -> Result<Vec<Stri
                         "Tool effect scope could not be represented in Agent Protocol",
                         false,
                     )
-                })
+                })?;
+            let unrestricted =
+                binding
+                    .requested_capabilities
+                    .resources_for(*scope)
+                    .any(|selector| {
+                        matches!(
+                            selector,
+                            orchestral_core::tool_protocol::CapabilitySelector::Unrestricted
+                        )
+                    });
+            Ok(if unrestricted {
+                format!("{name}:unrestricted")
+            } else {
+                name
+            })
         })
         .collect()
 }
