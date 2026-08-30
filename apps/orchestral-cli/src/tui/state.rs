@@ -128,13 +128,6 @@ pub(crate) enum UiEffect {
     CancelRun {
         run_id: String,
     },
-    CopyText {
-        text: String,
-        label: String,
-    },
-    OpenUrl {
-        url: String,
-    },
     Quit,
 }
 
@@ -149,9 +142,6 @@ pub(crate) enum UiMsg {
     MoveCursorEnd,
     Submit,
     Approval(ApprovalChoice),
-    CopyLatestOutput,
-    CopyLatestLink,
-    OpenLatestLink,
     Cancel,
     Quit,
     ScrollUp(usize),
@@ -272,38 +262,6 @@ impl UiState {
 
     pub(crate) fn active_process_count(&self) -> usize {
         self.active_processes.len()
-    }
-
-    pub(crate) fn latest_copyable_output(&self) -> Option<String> {
-        let stream = self.streamed_text();
-        if !stream.is_empty() {
-            return Some(stream);
-        }
-        self.transcript
-            .iter()
-            .rev()
-            .find(|entry| entry.role == TranscriptRole::Assistant && !entry.text.is_empty())
-            .map(|entry| entry.text.clone())
-    }
-
-    pub(crate) fn latest_https_url(&self) -> Option<String> {
-        let stream = self.streamed_text();
-        extract_last_https_url(&stream).or_else(|| {
-            self.transcript
-                .iter()
-                .rev()
-                .filter(|entry| entry.role == TranscriptRole::Assistant)
-                .find_map(|entry| extract_last_https_url(&entry.text))
-        })
-    }
-
-    pub(crate) fn has_copyable_output(&self) -> bool {
-        !self.stream_chunks.is_empty()
-            || self
-                .transcript
-                .iter()
-                .rev()
-                .any(|entry| entry.role == TranscriptRole::Assistant && !entry.text.is_empty())
     }
 
     #[cfg(test)]
@@ -458,9 +416,6 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
         | UiMsg::MoveCursorEnd => {}
         UiMsg::Submit => return submit(state),
         UiMsg::Approval(choice) => return resolve_approval(state, choice),
-        UiMsg::CopyLatestOutput => return copy_latest_output(state),
-        UiMsg::CopyLatestLink => return copy_latest_link(state),
-        UiMsg::OpenLatestLink => return open_latest_link(state),
         UiMsg::Cancel => return cancel(state),
         UiMsg::Quit => return vec![UiEffect::Quit],
         UiMsg::ScrollUp(rows) => state.scroll_back = state.scroll_back.saturating_add(rows),
@@ -639,18 +594,6 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
 }
 
 fn submit(state: &mut UiState) -> Vec<UiEffect> {
-    let local_command = match state.composer.trim() {
-        "/copy" => Some(UiMsg::CopyLatestOutput),
-        "/copy-link" => Some(UiMsg::CopyLatestLink),
-        "/open" => Some(UiMsg::OpenLatestLink),
-        _ => None,
-    };
-    if let Some(command) = local_command {
-        state.composer.clear();
-        state.composer_cursor = 0;
-        return update(state, command);
-    }
-
     if state.phase.accepts_new_run() {
         let Some(input) = state.take_composer() else {
             return Vec::new();
@@ -703,104 +646,6 @@ fn submit(state: &mut UiState) -> Vec<UiEffect> {
     }
 
     Vec::new()
-}
-
-fn copy_latest_output(state: &mut UiState) -> Vec<UiEffect> {
-    let Some(text) = state.latest_copyable_output() else {
-        set_local_notice(state, "Nothing to copy yet", false);
-        return Vec::new();
-    };
-    vec![UiEffect::CopyText {
-        text,
-        label: "latest Agent reply".to_owned(),
-    }]
-}
-
-fn copy_latest_link(state: &mut UiState) -> Vec<UiEffect> {
-    let Some(text) = state.latest_https_url() else {
-        set_local_notice(state, "No HTTPS link in the Agent replies", false);
-        return Vec::new();
-    };
-    vec![UiEffect::CopyText {
-        text,
-        label: "latest link".to_owned(),
-    }]
-}
-
-fn open_latest_link(state: &mut UiState) -> Vec<UiEffect> {
-    let Some(url) = state.latest_https_url() else {
-        set_local_notice(state, "No HTTPS link in the Agent replies", false);
-        return Vec::new();
-    };
-    vec![UiEffect::OpenUrl { url }]
-}
-
-fn set_local_notice(state: &mut UiState, message: &str, is_error: bool) {
-    let id = "tui-local-action";
-    if let Some(entry) = state
-        .transcript
-        .iter_mut()
-        .find(|entry| entry.id.as_deref() == Some(id))
-    {
-        entry.text = message.to_owned();
-        entry.role = if is_error {
-            TranscriptRole::Error
-        } else {
-            TranscriptRole::System
-        };
-        return;
-    }
-    let mut entry = if is_error {
-        TranscriptEntry::error(id, message)
-    } else {
-        TranscriptEntry::system(message)
-    };
-    entry.id = Some(id.to_owned());
-    state.transcript.push(entry);
-}
-
-fn extract_last_https_url(text: &str) -> Option<String> {
-    let mut last = None;
-    for (start, _) in text.match_indices("https://") {
-        let tail = &text[start..];
-        let end = tail
-            .char_indices()
-            .find_map(|(index, character)| {
-                (index > 0 && is_url_terminator(character)).then_some(index)
-            })
-            .unwrap_or(tail.len());
-        let mut candidate = tail[..end].trim_end_matches(['.', ',', ';', ':']);
-        if text[..start].ends_with('(') {
-            candidate = candidate.strip_suffix(')').unwrap_or(candidate);
-        }
-        let Ok(parsed) = url::Url::parse(candidate) else {
-            continue;
-        };
-        if parsed.scheme() == "https" && parsed.host_str().is_some() {
-            last = Some(candidate.to_owned());
-        }
-    }
-    last
-}
-
-fn is_url_terminator(character: char) -> bool {
-    character.is_whitespace()
-        || matches!(
-            character,
-            '<' | '>'
-                | '"'
-                | '\''
-                | '`'
-                | '。'
-                | '，'
-                | '；'
-                | '！'
-                | '？'
-                | '、'
-                | '）'
-                | '】'
-                | '》'
-        )
 }
 
 fn resolve_approval(state: &mut UiState, choice: ApprovalChoice) -> Vec<UiEffect> {
@@ -1091,51 +936,6 @@ mod tests {
         update(&mut state, UiMsg::MoveCursorEnd);
         update(&mut state, UiMsg::InsertText("\n第二行".to_owned()));
         assert_eq!(state.composer, "中B\n第二行");
-    }
-
-    #[test]
-    fn local_copy_and_open_commands_never_become_agent_turns() {
-        let mut state = UiState::new("session", "model");
-        let url = "https://login.example.test/oauth?state=abc&scope=mcp";
-        state.transcript.push(TranscriptEntry::assistant(
-            "login",
-            format!("Authorize with [this link]({url})."),
-        ));
-
-        assert_eq!(
-            type_and_submit(&mut state, "/copy"),
-            vec![UiEffect::CopyText {
-                text: format!("Authorize with [this link]({url})."),
-                label: "latest Agent reply".to_owned(),
-            }]
-        );
-        assert_eq!(
-            type_and_submit(&mut state, "/copy-link"),
-            vec![UiEffect::CopyText {
-                text: url.to_owned(),
-                label: "latest link".to_owned(),
-            }]
-        );
-        assert_eq!(
-            type_and_submit(&mut state, "/open"),
-            vec![UiEffect::OpenUrl {
-                url: url.to_owned()
-            }]
-        );
-        assert!(state.composer.is_empty());
-        assert_eq!(state.phase, UiPhase::Idle);
-    }
-
-    #[test]
-    fn https_link_extraction_handles_markdown_and_cjk_punctuation() {
-        assert_eq!(
-            extract_last_https_url(
-                "first https://old.example.test。 login [here](https://new.example.test/callback?x=1&y=2)。"
-            )
-            .as_deref(),
-            Some("https://new.example.test/callback?x=1&y=2")
-        );
-        assert_eq!(extract_last_https_url("ignore http://insecure.test"), None);
     }
 
     #[test]

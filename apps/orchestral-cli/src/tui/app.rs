@@ -177,9 +177,6 @@ fn key_message(key: KeyEvent, state: &UiState) -> Option<UiMsg> {
             KeyCode::Char('c') | KeyCode::Char('C') => Some(UiMsg::Cancel),
             KeyCode::Char('a') | KeyCode::Char('A') => Some(UiMsg::MoveCursorStart),
             KeyCode::Char('e') | KeyCode::Char('E') => Some(UiMsg::MoveCursorEnd),
-            KeyCode::Char('y') | KeyCode::Char('Y') => Some(UiMsg::CopyLatestOutput),
-            KeyCode::Char('l') | KeyCode::Char('L') => Some(UiMsg::CopyLatestLink),
-            KeyCode::Char('o') | KeyCode::Char('O') => Some(UiMsg::OpenLatestLink),
             _ => None,
         };
     }
@@ -350,37 +347,6 @@ async fn execute_effects(
                     }
                 }
             }
-            UiEffect::CopyText { text, label } => match copy_text_to_clipboard(&text) {
-                Ok(()) => notice(
-                    state,
-                    "clipboard-status",
-                    format!("Copied {label} to clipboard"),
-                    false,
-                ),
-                Err(error) => notice(state, "clipboard-status", error, true),
-            },
-            UiEffect::OpenUrl { url } => match webbrowser::open(&url) {
-                Ok(()) => notice(
-                    state,
-                    "browser-status",
-                    "Opened the latest link in your browser",
-                    false,
-                ),
-                Err(error) => match copy_text_to_clipboard(&url) {
-                    Ok(()) => notice(
-                        state,
-                        "browser-status",
-                        format!("Browser launch failed ({error}); copied the link instead"),
-                        true,
-                    ),
-                    Err(copy_error) => notice(
-                        state,
-                        "browser-status",
-                        format!("Browser launch failed ({error}); {copy_error}"),
-                        true,
-                    ),
-                },
-            },
             UiEffect::Quit => {
                 if let Some(run) = active.as_ref() {
                     let _ = run.handle.cancel("TUI exited by user").await;
@@ -390,14 +356,6 @@ async fn execute_effects(
         }
     }
     Ok(false)
-}
-
-fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
-    let mut clipboard =
-        arboard::Clipboard::new().map_err(|error| format!("Clipboard unavailable: {error}"))?;
-    clipboard
-        .set_text(text.to_owned())
-        .map_err(|error| format!("Clipboard unavailable: {error}"))
 }
 
 fn matching_active<'a>(
@@ -915,23 +873,5 @@ mod tests {
             super::terminal_event_message(event(MouseEventKind::Down(MouseButton::Left)), &state),
             None
         );
-    }
-
-    #[test]
-    fn host_output_shortcuts_do_not_become_composer_text() {
-        let state = UiState::new("session", "model");
-        for (character, expected) in [
-            ('y', UiMsg::CopyLatestOutput),
-            ('l', UiMsg::CopyLatestLink),
-            ('o', UiMsg::OpenLatestLink),
-        ] {
-            assert_eq!(
-                key_message(
-                    KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL),
-                    &state,
-                ),
-                Some(expected)
-            );
-        }
     }
 }

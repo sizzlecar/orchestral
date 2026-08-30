@@ -25,4 +25,4 @@ expression: "render_to_string(&state, 80, 24)"
   › orchestral-runtime
     保留协议兼容性
 
-  enter reply  ·  ctrl+c interrupt              pgup/pgdn · ^y copy · esc quit
+  enter reply  ·  ctrl+c interrupt               pgup/pgdn scroll  ·  esc quit

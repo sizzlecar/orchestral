@@ -41,4 +41,4 @@ expression: "render_to_string(&state, 120, 40)"
 
   › Ask Orchestral to do anything…
 
-  enter send  ·  shift+enter newline                                                    pgup/pgdn · ^y copy · esc quit
+  enter send  ·  shift+enter newline                                                     pgup/pgdn scroll  ·  esc quit
