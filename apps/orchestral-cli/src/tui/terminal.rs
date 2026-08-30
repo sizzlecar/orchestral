@@ -1,9 +1,7 @@
 use std::io::{self, Stdout, Write};
 
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-};
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -24,13 +22,7 @@ impl TerminalSession {
     pub(crate) fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        if let Err(error) = execute!(
-            stdout,
-            EnterAlternateScreen,
-            EnableMouseCapture,
-            EnableBracketedPaste,
-            Hide
-        ) {
+        if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, Hide) {
             let _ = disable_raw_mode();
             return Err(error);
         }
@@ -65,7 +57,6 @@ impl TerminalSession {
         if let Err(error) = execute!(
             self.terminal.backend_mut(),
             DisableBracketedPaste,
-            DisableMouseCapture,
             LeaveAlternateScreen,
             Show
         ) {
@@ -92,13 +83,7 @@ impl Drop for TerminalSession {
 
 fn restore_process_terminal() {
     let mut stdout = io::stdout();
-    let _ = execute!(
-        stdout,
-        DisableBracketedPaste,
-        DisableMouseCapture,
-        LeaveAlternateScreen,
-        Show
-    );
+    let _ = execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen, Show);
     let _ = stdout.flush();
     let _ = disable_raw_mode();
 }

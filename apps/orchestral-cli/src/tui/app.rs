@@ -3,9 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use crossterm::event::{
-    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
-};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
 use orchestral_core::agent_protocol::wire::{
     AgentCommand, AgentCommandEnvelope, AgentEvent, AgentJournalRecord, AgentRunState,
@@ -159,11 +157,10 @@ fn terminal_event_message(event: Event, state: &UiState) -> Option<UiMsg> {
     match event {
         Event::Key(key) => key_message(key, state),
         Event::Paste(text) => Some(UiMsg::InsertText(text)),
-        Event::Mouse(mouse) => match mouse.kind {
-            MouseEventKind::ScrollUp => Some(UiMsg::ScrollUp(3)),
-            MouseEventKind::ScrollDown => Some(UiMsg::ScrollDown(3)),
-            _ => None,
-        },
+        // The TUI deliberately does not enable terminal mouse capture. Mouse
+        // drag therefore remains the terminal's native text selection/copy
+        // gesture; transcript scrolling stays available via PgUp/PgDn.
+        Event::Mouse(_) => None,
         Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => None,
     }
 }
@@ -807,9 +804,7 @@ fn stop_active(active: &mut Option<ActiveRun>) {
 mod tests {
     use super::key_message;
     use crate::tui::{ApprovalChoice, UiMsg, UiPhase, UiState};
-    use crossterm::event::{
-        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-    };
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     #[test]
     fn approval_keys_cannot_become_composer_text() {
@@ -847,31 +842,6 @@ mod tests {
                 &state,
             ),
             Some(UiMsg::InsertText("中文\nemoji 🚀".to_owned()))
-        );
-    }
-
-    #[test]
-    fn mouse_wheel_maps_to_bounded_transcript_scroll() {
-        let state = UiState::new("session", "model");
-        let event = |kind| {
-            crossterm::event::Event::Mouse(MouseEvent {
-                kind,
-                column: 0,
-                row: 0,
-                modifiers: KeyModifiers::NONE,
-            })
-        };
-        assert_eq!(
-            super::terminal_event_message(event(MouseEventKind::ScrollUp), &state),
-            Some(UiMsg::ScrollUp(3))
-        );
-        assert_eq!(
-            super::terminal_event_message(event(MouseEventKind::ScrollDown), &state),
-            Some(UiMsg::ScrollDown(3))
-        );
-        assert_eq!(
-            super::terminal_event_message(event(MouseEventKind::Down(MouseButton::Left)), &state),
-            None
         );
     }
 }
