@@ -525,9 +525,22 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             summary,
             session_approval_available,
         } => {
+            let same_request = state.run_id.as_deref() == Some(run_id.as_str())
+                && matches!(
+                    &state.pending,
+                    Some(PendingOverlay::Approval {
+                        request_id: current_request_id,
+                        ..
+                    }) if current_request_id == &request_id
+                );
+            if !same_request
+                || (state.approval_choice == ApprovalChoice::AllowSession
+                    && !session_approval_available)
+            {
+                state.approval_choice = ApprovalChoice::Allow;
+            }
             state.run_id = Some(run_id);
             state.phase = UiPhase::WaitingApproval;
-            state.approval_choice = ApprovalChoice::Allow;
             state.pending = Some(PendingOverlay::Approval {
                 request_id,
                 summary,
@@ -903,6 +916,21 @@ mod tests {
 
         update(&mut state, UiMsg::SelectApproval(ApprovalChoice::Deny));
         assert_eq!(state.approval_choice, ApprovalChoice::Deny);
+
+        update(
+            &mut state,
+            UiMsg::WaitingApproval {
+                run_id: "run".to_owned(),
+                request_id: "approval-a".to_owned(),
+                summary: "First approval, reconciled again".to_owned(),
+                session_approval_available: true,
+            },
+        );
+        assert_eq!(
+            state.approval_choice,
+            ApprovalChoice::Deny,
+            "reconciling the same request must not reset keyboard selection"
+        );
 
         assert_eq!(
             update(&mut state, UiMsg::Approval(ApprovalChoice::AllowSession)),

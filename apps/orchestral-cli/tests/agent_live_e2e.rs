@@ -358,7 +358,13 @@ fn tui_pty_resolves_input_and_approval_then_cancels_another_run() {
 
     tui.send_paste("start the approval flow");
     tui.wait_for_text("Effects:", LOCAL_PROCESS_TIMEOUT);
-    tui.send(b"a");
+    // Move to Deny, let multiple reconciliation ticks replay the same
+    // durable approval request, then move back to Allow and confirm. A
+    // non-idempotent projection resets to Allow during the pause and turns
+    // the final Up+Enter into an accidental denial.
+    tui.send(b"\x1b[B");
+    thread::sleep(Duration::from_millis(1_100));
+    tui.send(b"\x1b[A\r");
     tui.wait_for_text("APPROVAL_RESOLVED_OK", LOCAL_PROCESS_TIMEOUT);
     tui.wait_for_text_count("✓ done", 2, LOCAL_PROCESS_TIMEOUT);
 
