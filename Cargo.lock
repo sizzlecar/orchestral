@@ -1891,6 +1891,7 @@ dependencies = [
  "clap",
  "crossterm",
  "futures-util",
+ "getrandom 0.3.4",
  "insta",
  "orchestral-agent-journal-fs",
  "orchestral-blob-fs",

@@ -267,6 +267,7 @@ tools:
   max_output_bytes: 1048576
   exec:
     enabled: true
+    allow_host_execution: true
     network_targets: []
 
 mcp:

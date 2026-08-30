@@ -107,6 +107,20 @@ impl TestWorkspace {
         });
     }
 
+    fn configure_host_execution(&self, enabled: bool) {
+        self.rewrite_config(|config| {
+            let exec = config
+                .get_mut("tools")
+                .and_then(|value| value.get_mut("exec"))
+                .and_then(serde_yaml::Value::as_mapping_mut)
+                .expect("E2E config has tools.exec");
+            exec.insert(
+                serde_yaml::Value::String("allow_host_execution".into()),
+                serde_yaml::Value::Bool(enabled),
+            );
+        });
+    }
+
     fn configure_mcp_server(&self, endpoint: &str) {
         self.rewrite_config(|config| {
             let mcp = config
@@ -1247,6 +1261,153 @@ fn local_cli_discovers_calls_and_journals_an_mcp_tool() {
     assert_eq!(tool_result_is_error(exchanges[0]), Some(false));
     assert_eq!(run_payload_count(&workspace, "request_opened"), 1);
     assert_eq!(run_payload_count(&workspace, "request_resolved"), 1);
+}
+
+#[test]
+fn local_cli_routes_structured_host_execution_through_the_approval_prompt() {
+    let _guard = local_e2e_guard();
+    const EXTERNAL_MARKER: &str = "HOST_EXECUTION_APPROVED_雪豹_7319";
+    const FINAL_MARKER: &str = "HOST_APPROVAL_E2E_OK";
+
+    let workspace = TestWorkspace::new("host-approval");
+    let external = TestWorkspace::new("host-approval-external");
+    fs::write(external.path("evidence.txt"), EXTERNAL_MARKER)
+        .expect("write external approval fixture");
+    let external_root = external
+        .root
+        .canonicalize()
+        .expect("canonicalize external approval fixture")
+        .to_string_lossy()
+        .to_string();
+
+    let (model_endpoint, model_server) = spawn_fixture_http_server(vec![
+        Box::new(move |request| {
+            assert!(model_request_has_tool(&request.body, "exec_command"));
+            let request_json = request.body.to_string();
+            assert!(
+                request_json.contains("sandbox_permissions"),
+                "{request_json}"
+            );
+            assert!(request_json.contains("require_escalated"), "{request_json}");
+            let context = model_request_text(&request.body);
+            assert!(
+                context.contains("do not offload the command to the user"),
+                "{context}"
+            );
+            openai_tool_response(
+                "approved-host-read",
+                "exec_command",
+                json!({
+                    "cmd": "cat evidence.txt",
+                    "workdir": external_root,
+                    "sandbox_permissions": "require_escalated",
+                    "justification": "Read the external fixture explicitly requested by the user",
+                    "yield_time_ms": 1_000
+                }),
+            )
+        }),
+        Box::new(|request| {
+            let context = model_request_text(&request.body);
+            assert!(context.contains(EXTERNAL_MARKER), "{context}");
+            assert!(
+                context.contains("\"sandbox_backend\":\"host-approved\""),
+                "{context}"
+            );
+            openai_text_response(FINAL_MARKER)
+        }),
+    ]);
+    workspace.configure_local_openai(&model_endpoint);
+
+    let output = run_with_approval(
+        local_default_agent_command(
+            &workspace,
+            "host-approval-session",
+            "Read evidence.txt from the supplied external workdir and report the result.",
+            true,
+            true,
+        ),
+        true,
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    assert!(output.status.success(), "{}", output.stderr_text());
+    assert_eq!(output.stdout_text().trim(), FINAL_MARKER);
+    let stderr = output.stderr_text();
+    assert!(stderr.contains(APPROVAL_PROMPT), "{stderr}");
+    assert!(stderr.contains("outside the workspace sandbox"), "{stderr}");
+    assert!(stderr.contains("host_execution"), "{stderr}");
+    output.assert_no_ansi();
+
+    assert_eq!(
+        model_server
+            .join()
+            .expect("join Host approval model server")
+            .len(),
+        2
+    );
+    let records = session_records(&workspace);
+    let exchanges = tool_exchanges(&records);
+    assert_eq!(exchanges.len(), 1);
+    assert_eq!(tool_name(exchanges[0]), Some("exec_command"));
+    assert_eq!(tool_result_is_error(exchanges[0]), Some(false));
+}
+
+#[test]
+fn local_cli_host_execution_ceiling_denies_without_prompt_or_spawn() {
+    let _guard = local_e2e_guard();
+    const FINAL_MARKER: &str = "HOST_EXECUTION_CEILING_OK";
+
+    let workspace = TestWorkspace::new("host-execution-ceiling");
+    let external = TestWorkspace::new("host-execution-ceiling-external");
+    let escaped = external.path("must-not-exist.txt");
+    let external_root = external
+        .root
+        .canonicalize()
+        .expect("canonicalize external approval fixture")
+        .to_string_lossy()
+        .to_string();
+    let (model_endpoint, model_server) = spawn_fixture_http_server(vec![
+        Box::new(move |_request| {
+            openai_tool_response(
+                "denied-host-write",
+                "exec_command",
+                json!({
+                    "cmd": "printf should-not-run > must-not-exist.txt",
+                    "workdir": external_root,
+                    "sandbox_permissions": "require_escalated",
+                    "justification": "Exercise the disabled Host execution boundary"
+                }),
+            )
+        }),
+        Box::new(|request| {
+            let context = model_request_text(&request.body);
+            assert!(context.contains("exec_host_execution_denied"), "{context}");
+            openai_text_response(FINAL_MARKER)
+        }),
+    ]);
+    workspace.configure_local_openai(&model_endpoint);
+    workspace.configure_host_execution(false);
+
+    let output = run_to_completion(
+        local_default_agent_command(
+            &workspace,
+            "host-execution-ceiling-session",
+            "Try the requested Host execution and report its actual outcome.",
+            true,
+            true,
+        ),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    assert!(output.status.success(), "{}", output.stderr_text());
+    assert_eq!(output.stdout_text().trim(), FINAL_MARKER);
+    assert!(!output.stderr_text().contains(APPROVAL_PROMPT));
+    assert!(!escaped.exists(), "denied Host execution reached spawn");
+    assert_eq!(
+        model_server
+            .join()
+            .expect("join Host ceiling model server")
+            .len(),
+        2
+    );
 }
 
 #[test]

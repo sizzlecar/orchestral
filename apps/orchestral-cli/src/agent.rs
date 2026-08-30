@@ -97,6 +97,7 @@ struct CliJournalStores {
 
 struct CliExecHost {
     shell: PathBuf,
+    allow_host_execution: bool,
     runtime_readable_roots: Vec<PathBuf>,
     runtime_readable_files: Vec<PathBuf>,
     environment_names: BTreeSet<String>,
@@ -348,6 +349,9 @@ fn build_cli_tool_runtime(
         .map(|host| BTreeSet::from([host.shell.to_string_lossy().into_owned()]))
         .unwrap_or_default();
     let exec_enabled = exec_host.is_some();
+    let host_execution_enabled = exec_host
+        .as_ref()
+        .is_some_and(|host| host.allow_host_execution);
     let mcp_effects = mcp_configs
         .iter()
         .flat_map(GuardedMcpServerConfig::effect_scopes)
@@ -379,6 +383,9 @@ fn build_cli_tool_runtime(
             EffectScope::EnvironmentRead,
             EffectScope::ExternalSideEffect,
         ]);
+    }
+    if host_execution_enabled {
+        allowed_effects.insert(EffectScope::HostExecution);
     }
     allowed_effects.extend(mcp_effects.iter().copied());
     let mcp_environment = mcp_configs
@@ -474,7 +481,7 @@ fn build_cli_tool_runtime(
         },
         network: NetworkPolicy {
             allowed_targets: allowed_network_targets,
-            allow_unrestricted: exec_enabled,
+            allow_unrestricted: host_execution_enabled,
         },
         environment: EnvironmentPolicy {
             allowed_variables: allowed_environment,
@@ -512,6 +519,11 @@ fn build_cli_tool_runtime(
         EffectScope::EnvironmentRead,
         EffectScope::ExternalSideEffect,
     ]);
+    if host_execution_enabled {
+        exec_bounds
+            .allowed_effects
+            .insert(EffectScope::HostExecution);
+    }
     exec_bounds.sandbox.allowed_profiles =
         BTreeSet::from([orchestral_runtime::tools::GUARDED_EXEC_SANDBOX_PROFILE.to_owned()]);
     exec_bounds.sandbox.required = true;
@@ -527,7 +539,7 @@ fn build_cli_tool_runtime(
             .as_ref()
             .map(|host| host.network_targets.clone())
             .unwrap_or_default(),
-        allow_unrestricted: true,
+        allow_unrestricted: host_execution_enabled,
     };
     exec_bounds.environment = EnvironmentPolicy {
         allowed_variables: exec_host
@@ -537,16 +549,15 @@ fn build_cli_tool_runtime(
         inherit_host_environment: false,
     };
     exec_bounds.allowed_credentials.clear();
-    let signing_material = Digest::sha256(unique_id("cli-approval-key", 0));
+    let mut signing_material = [0_u8; 32];
+    getrandom::fill(&mut signing_material)
+        .map_err(|error| anyhow::anyhow!("generate Host approval signing key: {error}"))?;
     let approval_broker = Arc::new(
-        InMemoryHostApprovalBroker::new(signing_material.as_str().as_bytes())
-            .context("create Host approval broker")?,
+        InMemoryHostApprovalBroker::new(signing_material).context("create Host approval broker")?,
     );
-    let verifier = HostApprovalVerifier::new(
-        signing_material.as_str().as_bytes(),
-        InMemoryApprovalCapabilityStore::default(),
-    )
-    .context("create Host approval verifier")?;
+    let verifier =
+        HostApprovalVerifier::new(signing_material, InMemoryApprovalCapabilityStore::default())
+            .context("create Host approval verifier")?;
     let runtime = Arc::new(
         GuardedToolRuntime::new_with_effect_journal_and_artifacts(
             HostToolPolicy {
@@ -772,6 +783,7 @@ fn configured_exec_host(config: &OrchestralConfig) -> anyhow::Result<Option<CliE
     .map(str::to_owned)
     .collect::<BTreeSet<_>>();
     Ok(Some(CliExecHost {
+        allow_host_execution: config.tools.exec.allow_host_execution,
         runtime_readable_roots: exec_runtime_readable_roots(&shell),
         runtime_readable_files: exec_runtime_readable_files(),
         shell,

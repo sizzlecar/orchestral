@@ -226,8 +226,14 @@ pub struct ExecToolConfig {
     pub enabled: bool,
     #[serde(default)]
     pub shell: Option<String>,
-    /// Exact `host:port` destinations available to commands. Empty denies
-    /// network access.
+    /// Allows an invocation to request exact user approval for execution
+    /// outside the default OS sandbox. This is a hard Host ceiling and is
+    /// disabled by default in the library configuration.
+    #[serde(default)]
+    pub allow_host_execution: bool,
+    /// Exact `host:port` destinations available inside the default sandbox.
+    /// Empty denies sandboxed network access. Approved Host execution, when
+    /// explicitly enabled above, carries its own unrestricted network scope.
     #[serde(default)]
     pub network_targets: Vec<String>,
 }
