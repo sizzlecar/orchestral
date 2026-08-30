@@ -1250,8 +1250,70 @@ fn local_cli_discovers_calls_and_journals_an_mcp_tool() {
 }
 
 #[test]
+fn mcp_user_registry_add_list_get_remove_round_trip() {
+    let _guard = local_e2e_guard();
+    let workspace = TestWorkspace::new("mcp-registry-crud");
+    let orchestral_home = workspace.path("user-config");
+
+    let mut add = root_command(&workspace);
+    add.env("ORCHESTRAL_HOME", &orchestral_home)
+        .arg("mcp")
+        .arg("add")
+        .arg("fixture")
+        .arg("--env")
+        .arg("FIXTURE_MODE=e2e")
+        .arg("--")
+        .arg("/bin/echo")
+        .arg("--stdio");
+    let added = run_to_completion(add, LOCAL_PROCESS_TIMEOUT);
+    assert!(added.status.success(), "{}", added.stderr_text());
+
+    let mut list = root_command(&workspace);
+    list.env("ORCHESTRAL_HOME", &orchestral_home)
+        .arg("mcp")
+        .arg("list")
+        .arg("--json");
+    let listed = run_to_completion(list, LOCAL_PROCESS_TIMEOUT);
+    assert!(listed.status.success(), "{}", listed.stderr_text());
+    let registry: serde_json::Value =
+        serde_json::from_str(&listed.stdout_text()).expect("list emits registry JSON");
+    assert_eq!(registry["mcpServers"]["fixture"]["command"], "/bin/echo");
+    assert_eq!(
+        registry["mcpServers"]["fixture"]["env"]["FIXTURE_MODE"],
+        "e2e"
+    );
+
+    let mut get = root_command(&workspace);
+    get.env("ORCHESTRAL_HOME", &orchestral_home)
+        .arg("mcp")
+        .arg("get")
+        .arg("fixture")
+        .arg("--json");
+    let fetched = run_to_completion(get, LOCAL_PROCESS_TIMEOUT);
+    assert!(fetched.status.success(), "{}", fetched.stderr_text());
+    let server: serde_json::Value =
+        serde_json::from_str(&fetched.stdout_text()).expect("get emits server JSON");
+    assert_eq!(server["args"], json!(["--stdio"]));
+
+    let mut remove = root_command(&workspace);
+    remove
+        .env("ORCHESTRAL_HOME", &orchestral_home)
+        .arg("mcp")
+        .arg("remove")
+        .arg("fixture");
+    let removed = run_to_completion(remove, LOCAL_PROCESS_TIMEOUT);
+    assert!(removed.status.success(), "{}", removed.stderr_text());
+
+    let persisted: serde_json::Value = serde_json::from_slice(
+        &fs::read(orchestral_home.join("mcp.json")).expect("read persisted MCP registry"),
+    )
+    .expect("parse persisted MCP registry");
+    assert_eq!(persisted["mcpServers"], json!({}));
+}
+
+#[test]
 #[cfg(unix)]
-fn local_cli_manifest_launches_scoped_stdio_mcp_and_calls_its_tool() {
+fn user_registered_stdio_mcp_is_automatically_loaded_and_called() {
     let _guard = local_e2e_guard();
     const MCP_RESULT_MARKER: &str = "LOCAL_MCP_RESULT_海豚_7319🔌";
 
@@ -1273,25 +1335,21 @@ while IFS= read -r line; do
 done
 "#
     );
-    let manifest_path = workspace.path("local.mcp.json");
-    fs::write(
-        &manifest_path,
-        serde_json::to_vec_pretty(&json!({
-            "mcpServers": {
-                "localfixture": {
-                    "type": "stdio",
-                    "command": "/bin/sh",
-                    "args": ["-c", script],
-                    "cwd": ".",
-                    "required": true,
-                    "startupTimeoutMs": 5000,
-                    "toolTimeoutMs": 5000
-                }
-            }
-        }))
-        .expect("serialize local MCP manifest"),
-    )
-    .expect("write local MCP manifest");
+    let orchestral_home = workspace.path("user-config");
+    let mut register = root_command(&workspace);
+    register
+        .env("ORCHESTRAL_HOME", &orchestral_home)
+        .arg("mcp")
+        .arg("add")
+        .arg("localfixture")
+        .arg("--required")
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg(&script);
+    let registered = run_to_completion(register, LOCAL_PROCESS_TIMEOUT);
+    assert!(registered.status.success(), "{}", registered.stderr_text());
+    assert!(registered.stdout_text().contains("Added user MCP server"));
 
     let (model_endpoint, model_server) = spawn_fixture_http_server(vec![
         Box::new(|_| {
@@ -1307,6 +1365,7 @@ done
 
     let mut command = root_command(&workspace);
     command
+        .env("ORCHESTRAL_HOME", &orchestral_home)
         .env("OPENAI_API_KEY", "fixture-key")
         .arg("--backend")
         .arg("openai")
@@ -1315,9 +1374,7 @@ done
         .arg("--temperature")
         .arg("0")
         .arg("--session-id")
-        .arg("local-mcp-manifest-session")
-        .arg("--mcp-config")
-        .arg(&manifest_path)
+        .arg("local-mcp-registry-session")
         .arg("--no-skills")
         .arg("Use the local MCP lookup_marker tool with key 能力.");
     let output = run_with_approval(command, true, LOCAL_PROCESS_TIMEOUT);

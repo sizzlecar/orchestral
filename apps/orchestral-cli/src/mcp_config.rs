@@ -5,55 +5,150 @@
 //! it cannot silently become ambient Agent authority.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context};
 use orchestral_core::config::{McpServerSpec, McpTransportSpec};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct JsonMcpManifest {
+pub(crate) struct JsonMcpManifest {
     #[serde(rename = "mcpServers")]
-    servers: BTreeMap<String, JsonStdioServer>,
+    pub(crate) servers: BTreeMap<String, JsonMcpServer>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct JsonStdioServer {
-    #[serde(default, rename = "type")]
-    transport_type: Option<String>,
-    command: String,
+pub(crate) struct JsonMcpServer {
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub(crate) transport_type: Option<String>,
+    pub(crate) command: String,
     #[serde(default)]
-    args: Vec<String>,
+    pub(crate) args: Vec<String>,
     #[serde(default)]
-    env: HashMap<String, String>,
+    pub(crate) env: HashMap<String, String>,
     #[serde(
         default = "default_true",
         rename = "allowChildProcesses",
         alias = "allow_child_processes"
     )]
-    allow_child_processes: bool,
-    #[serde(default)]
-    cwd: Option<String>,
+    pub(crate) allow_child_processes: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cwd: Option<String>,
     #[serde(default, rename = "readableRoots", alias = "readable_roots")]
-    readable_roots: Vec<String>,
+    pub(crate) readable_roots: Vec<String>,
     #[serde(default, rename = "writableRoots", alias = "writable_roots")]
-    writable_roots: Vec<String>,
+    pub(crate) writable_roots: Vec<String>,
     #[serde(default, rename = "networkTargets", alias = "network_targets")]
-    network_targets: Vec<String>,
+    pub(crate) network_targets: Vec<String>,
     #[serde(default)]
-    disabled: bool,
+    pub(crate) disabled: bool,
     #[serde(default)]
-    required: bool,
+    pub(crate) required: bool,
     #[serde(default, rename = "startupTimeoutMs", alias = "startup_timeout_ms")]
-    startup_timeout_ms: Option<u64>,
+    pub(crate) startup_timeout_ms: Option<u64>,
     #[serde(default, rename = "toolTimeoutMs", alias = "tool_timeout_ms")]
-    tool_timeout_ms: Option<u64>,
+    pub(crate) tool_timeout_ms: Option<u64>,
     #[serde(default, rename = "enabledTools", alias = "enabled_tools")]
-    enabled_tools: Vec<String>,
+    pub(crate) enabled_tools: Vec<String>,
     #[serde(default, rename = "disabledTools", alias = "disabled_tools")]
-    disabled_tools: Vec<String>,
+    pub(crate) disabled_tools: Vec<String>,
+}
+
+impl JsonMcpServer {
+    pub(crate) fn display_target(&self) -> (&'static str, String) {
+        let mut command = self.command.clone();
+        for argument in &self.args {
+            command.push(' ');
+            command.push_str(argument);
+        }
+        ("stdio", command)
+    }
+}
+
+/// User-managed MCP registrations are trusted Host configuration, not ambient
+/// files discovered in a repository. `ORCHESTRAL_HOME` is the explicit escape
+/// hatch; otherwise follow XDG and then the conventional user config path.
+pub(crate) fn user_registry_path() -> anyhow::Result<PathBuf> {
+    if let Some(root) = std::env::var_os("ORCHESTRAL_HOME") {
+        return absolute_config_root(PathBuf::from(root)).map(|root| root.join("mcp.json"));
+    }
+    if let Some(root) = std::env::var_os("XDG_CONFIG_HOME") {
+        return absolute_config_root(PathBuf::from(root))
+            .map(|root| root.join("orchestral/mcp.json"));
+    }
+    if let Some(root) = std::env::var_os("HOME") {
+        return absolute_config_root(PathBuf::from(root))
+            .map(|root| root.join(".config/orchestral/mcp.json"));
+    }
+    if let Some(root) = std::env::var_os("APPDATA") {
+        return absolute_config_root(PathBuf::from(root))
+            .map(|root| root.join("orchestral/mcp.json"));
+    }
+    bail!("cannot resolve user config directory; set ORCHESTRAL_HOME")
+}
+
+fn absolute_config_root(root: PathBuf) -> anyhow::Result<PathBuf> {
+    if !root.is_absolute() {
+        bail!(
+            "user config directory '{}' must be absolute",
+            root.display()
+        );
+    }
+    Ok(root)
+}
+
+pub(crate) fn load_registry(path: &Path) -> anyhow::Result<JsonMcpManifest> {
+    if !path.exists() {
+        return Ok(JsonMcpManifest::default());
+    }
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("read MCP registry '{}'", path.display()))?;
+    serde_json::from_str(&content)
+        .with_context(|| format!("parse MCP registry '{}'", path.display()))
+}
+
+pub(crate) fn save_registry(path: &Path, registry: &JsonMcpManifest) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .context("MCP registry path has no parent directory")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create MCP config directory '{}'", parent.display()))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = parent.join(format!(".mcp.json.{}.{nonce}.tmp", std::process::id()));
+    let bytes = serde_json::to_vec_pretty(registry).context("serialize MCP registry")?;
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let write_result = (|| -> anyhow::Result<()> {
+        let mut file = options
+            .open(&temporary)
+            .with_context(|| format!("create temporary MCP registry '{}'", temporary.display()))?;
+        file.write_all(&bytes)
+            .with_context(|| format!("write temporary MCP registry '{}'", temporary.display()))?;
+        file.write_all(b"\n")
+            .with_context(|| format!("finish temporary MCP registry '{}'", temporary.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync temporary MCP registry '{}'", temporary.display()))?;
+        fs::rename(&temporary, path)
+            .with_context(|| format!("replace MCP registry '{}'", path.display()))?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result
 }
 
 pub(crate) fn load_server_manifests(
@@ -110,7 +205,7 @@ fn insert_unique(
     Ok(())
 }
 
-impl JsonStdioServer {
+impl JsonMcpServer {
     fn into_spec(self, name: String, base: &Path, source: &str) -> anyhow::Result<McpServerSpec> {
         if self
             .transport_type

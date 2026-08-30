@@ -874,11 +874,18 @@ fn configured_mcp_servers(
     }
     let workspace = std::fs::canonicalize(std::env::current_dir().context("resolve workspace")?)
         .context("canonicalize workspace")?;
+    let mut manifest_paths = Vec::new();
+    match crate::mcp_config::user_registry_path() {
+        Ok(path) if path.is_file() => manifest_paths.push(path),
+        Ok(_) => {}
+        Err(error) => tracing::debug!(%error, "user MCP registry path is unavailable"),
+    }
+    manifest_paths.extend(cli_manifest_paths.iter().cloned());
     let specs = crate::mcp_config::load_server_manifests(
         &workspace,
         &config.mcp.servers,
         &config.mcp.import_files,
-        cli_manifest_paths,
+        &manifest_paths,
     )?;
     let mut servers = Vec::new();
     for spec in specs.iter().filter(|server| server.enabled) {

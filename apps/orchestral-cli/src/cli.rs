@@ -1,7 +1,7 @@
 use std::env;
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 use crate::envfile::load_env_file;
 use crate::runtime::ModelOverrides;
@@ -13,6 +13,8 @@ use crate::runtime::ModelOverrides;
     version
 )]
 pub struct Cli {
+    #[command(subcommand)]
+    command: Option<CliCommand>,
     #[arg(long)]
     config: Option<PathBuf>,
     #[arg(long)]
@@ -47,6 +49,12 @@ pub struct Cli {
     input: Vec<String>,
 }
 
+#[derive(Debug, Subcommand)]
+enum CliCommand {
+    /// Manage MCP servers registered for this user.
+    Mcp(crate::mcp_command::McpCommand),
+}
+
 impl Cli {
     fn model_overrides(&self) -> ModelOverrides {
         ModelOverrides {
@@ -62,6 +70,11 @@ impl Cli {
             load_env_file(env_file)?;
         }
         ensure_log_filter(self.verbose);
+        if let Some(command) = self.command {
+            return match command {
+                CliCommand::Mcp(command) => command.run().await,
+            };
+        }
         let model_overrides = self.model_overrides();
         crate::agent::run(crate::agent::AgentRunOptions {
             config: self.config,
@@ -97,7 +110,29 @@ mod tests {
         let parsed = Cli::try_parse_from(["orchestral", "inspect this repository"])
             .expect("a positional prompt must start the Agent directly");
         assert_eq!(parsed.input, ["inspect this repository"]);
-        assert_eq!(Cli::command().get_subcommands().count(), 0);
+        assert!(parsed.command.is_none());
+        assert_eq!(
+            Cli::command()
+                .get_subcommands()
+                .map(clap::Command::get_name)
+                .collect::<Vec<_>>(),
+            ["mcp"]
+        );
+    }
+
+    #[test]
+    fn mcp_management_does_not_add_an_agent_subcommand() {
+        let parsed = Cli::try_parse_from([
+            "orchestral",
+            "mcp",
+            "add",
+            "local",
+            "--",
+            "/bin/example-mcp",
+        ])
+        .expect("MCP registration must be a management subcommand");
+        assert!(matches!(parsed.command, Some(super::CliCommand::Mcp(_))));
+        assert!(parsed.input.is_empty());
     }
 
     #[test]
