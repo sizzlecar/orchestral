@@ -26,6 +26,10 @@ pub struct ShellSandboxPolicy {
     /// Allow the already-sandboxed launcher to execute child programs.
     /// Filesystem and network effects remain constrained by this profile.
     pub allow_child_processes: bool,
+    /// Allow an explicitly trusted integration process to ask the Host OS to
+    /// open a URL or application UI. Ordinary Agent shell commands leave this
+    /// disabled.
+    pub allow_host_ui: bool,
     pub launcher_programs: Vec<PathBuf>,
     pub network: SandboxNetworkAccess,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -266,6 +270,7 @@ fn normalize_sandbox_inputs(
             readable_files,
             writable_roots,
             allow_child_processes: policy.allow_child_processes,
+            allow_host_ui: policy.allow_host_ui,
             launcher_programs,
             network,
             linux_bwrap_path: policy.linux_bwrap_path.clone(),
@@ -418,6 +423,33 @@ fn build_macos_profile(
 "#,
         );
     }
+    if policy.allow_host_ui {
+        // `/usr/bin/open` delegates URL/application activation to
+        // LaunchServices. This grants that OS service boundary only; it does
+        // not move OAuth state or protocol handling into the Agent Host.
+        profile.push_str(
+            r#"(with-filter (process-path "/usr/bin/open")
+  (allow file-read*))
+(with-filter (process-path "/usr/bin/open")
+  (allow ipc-posix-shm-read* (ipc-posix-name-prefix "apple.cfprefs.")))
+(with-filter (process-path "/usr/bin/open")
+  (allow mach-lookup
+    (global-name "com.apple.cfprefsd.daemon")
+    (global-name "com.apple.cfprefsd.agent")
+    (local-name "com.apple.cfprefsd.agent")
+    (global-name "com.apple.coreservices.launchservicesd")
+    (global-name "com.apple.coreservices.appleevents")
+    (global-name "com.apple.coreservices.quarantine-resolver")
+    (global-name "com.apple.lsd.mapdb")))
+(with-filter (process-path "/usr/bin/open")
+  (allow user-preference-read))
+(with-filter (process-path "/usr/bin/open")
+  (allow appleevent-send))
+(with-filter (process-path "/usr/bin/open")
+  (allow lsopen))
+"#,
+        );
+    }
     profile.push_str("(allow sysctl-read)\n");
 
     let mut literal_reads = BTreeSet::new();
@@ -439,6 +471,18 @@ fn build_macos_profile(
     ] {
         add_path_ancestors(path, &mut literal_reads);
         subtree_reads.insert(path.to_path_buf());
+    }
+    if policy.allow_host_ui {
+        // LaunchServices resolves bundle registrations through the standard
+        // application roots. These are system application bundles, not the
+        // user's documents or home directory.
+        for path in [
+            Path::new("/Applications"),
+            Path::new("/System/Applications"),
+        ] {
+            add_path_ancestors(path, &mut literal_reads);
+            subtree_reads.insert(path.to_path_buf());
+        }
     }
     for path in [
         Path::new("/usr/bin/sandbox-exec"),
@@ -464,6 +508,11 @@ fn build_macos_profile(
     for program in &policy.launcher_programs {
         add_path_ancestors(program, &mut literal_reads);
         literal_reads.insert(program.clone());
+    }
+    if policy.allow_host_ui {
+        let open = Path::new("/usr/bin/open");
+        add_path_ancestors(open, &mut literal_reads);
+        literal_reads.insert(open.to_path_buf());
     }
     let launch_program = Path::new(&spec.program);
     add_path_ancestors(launch_program, &mut literal_reads);
@@ -648,6 +697,7 @@ mod tests {
                 readable_files: Vec::new(),
                 writable_roots: vec![runtime_root],
                 allow_child_processes: false,
+                allow_host_ui: false,
                 launcher_programs: vec![executable.clone()],
                 network: SandboxNetworkAccess::Disabled,
                 linux_bwrap_path: None,
@@ -678,6 +728,7 @@ mod tests {
                 readable_files: vec![allowed],
                 writable_roots: vec![workspace.clone()],
                 allow_child_processes: false,
+                allow_host_ui: false,
                 launcher_programs: vec![program],
                 network: SandboxNetworkAccess::Disabled,
                 linux_bwrap_path: None,
@@ -712,6 +763,7 @@ mod tests {
             readable_files: Vec::new(),
             writable_roots: vec![cwd.clone()],
             allow_child_processes: false,
+            allow_host_ui: false,
             launcher_programs: vec![program.clone()],
             network: SandboxNetworkAccess::Disabled,
             linux_bwrap_path: None,
@@ -749,6 +801,7 @@ mod tests {
                 readable_files: Vec::new(),
                 writable_roots: vec![workspace.clone()],
                 allow_child_processes: false,
+                allow_host_ui: false,
                 launcher_programs: vec![executable],
                 network: SandboxNetworkAccess::Disabled,
                 linux_bwrap_path: None,
@@ -797,6 +850,7 @@ mod tests {
                 readable_files: Vec::new(),
                 writable_roots: vec![workspace.clone()],
                 allow_child_processes: false,
+                allow_host_ui: false,
                 launcher_programs: vec![program],
                 network: SandboxNetworkAccess::Disabled,
                 linux_bwrap_path: None,
@@ -831,6 +885,7 @@ mod tests {
                 readable_files: Vec::new(),
                 writable_roots: vec![workspace.clone()],
                 allow_child_processes: false,
+                allow_host_ui: false,
                 launcher_programs: vec![program],
                 network: SandboxNetworkAccess::Disabled,
                 linux_bwrap_path: None,
@@ -895,6 +950,7 @@ mod tests {
                 readable_files: Vec::new(),
                 writable_roots: vec![workspace.clone()],
                 allow_child_processes: true,
+                allow_host_ui: false,
                 launcher_programs: vec![program],
                 network: SandboxNetworkAccess::Disabled,
                 linux_bwrap_path: None,
@@ -963,6 +1019,7 @@ mod tests {
                     readable_files: Vec::new(),
                     writable_roots: vec![workspace.clone()],
                     allow_child_processes: true,
+                    allow_host_ui: false,
                     launcher_programs: vec![shell.clone()],
                     network: SandboxNetworkAccess::ExactTargets(targets),
                     linux_bwrap_path: None,
@@ -1028,6 +1085,7 @@ mod tests {
             readable_files: Vec::new(),
             writable_roots: vec![cwd],
             allow_child_processes: false,
+            allow_host_ui: false,
             launcher_programs: vec![program],
             network: SandboxNetworkAccess::Unrestricted,
             linux_bwrap_path: None,
@@ -1038,6 +1096,71 @@ mod tests {
         assert!(profile.contains("(allow network-inbound (local ip \"localhost:*\"))"));
         assert!(profile.contains("com.apple.SystemConfiguration.DNSConfiguration"));
         assert!(profile.contains("com.apple.SecurityServer"));
+        assert!(!profile.contains("com.apple.coreservices.launchservicesd"));
+        assert!(!profile.contains("(allow appleevent-send)"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn registered_host_ui_is_explicit_in_the_macos_profile() {
+        let cwd = std::fs::canonicalize(".").unwrap();
+        let program = std::fs::canonicalize("/bin/sh").unwrap();
+        let spec = SandboxCommandSpec {
+            program: program.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            cwd: cwd.clone(),
+            env: HashMap::new(),
+        };
+        let policy = ShellSandboxPolicy {
+            readable_roots: vec![cwd.clone()],
+            readable_files: Vec::new(),
+            writable_roots: vec![cwd],
+            allow_child_processes: true,
+            allow_host_ui: true,
+            launcher_programs: vec![program],
+            network: SandboxNetworkAccess::Unrestricted,
+            linux_bwrap_path: None,
+        };
+        let profile = build_macos_profile(&spec, &policy).unwrap();
+        assert!(profile.contains("com.apple.coreservices.launchservicesd"));
+        assert!(profile.contains("com.apple.coreservices.appleevents"));
+        assert!(profile.contains("com.apple.coreservices.quarantine-resolver"));
+        assert!(profile.contains("com.apple.lsd.mapdb"));
+        assert!(profile.contains("(allow appleevent-send)"));
+        assert!(profile.contains("(allow lsopen)"));
+        assert!(profile.contains("(allow file-read* (literal \"/usr/bin/open\"))"));
+        assert!(profile.contains("(with-filter (process-path \"/usr/bin/open\")"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn registered_host_ui_can_resolve_an_application_through_launch_services() {
+        let (parent, workspace, _) = isolated_test_roots("host-ui");
+        let shell = std::fs::canonicalize("/bin/sh").unwrap();
+        let command = sandbox_command(
+            shell.to_string_lossy().into_owned(),
+            vec!["-c".to_owned(), "/usr/bin/open -Ra Safari".to_owned()],
+            &workspace,
+            &ShellSandboxPolicy {
+                readable_roots: vec![workspace.clone()],
+                readable_files: Vec::new(),
+                writable_roots: vec![workspace.clone()],
+                allow_child_processes: true,
+                allow_host_ui: true,
+                launcher_programs: vec![shell],
+                network: SandboxNetworkAccess::Disabled,
+                linux_bwrap_path: None,
+            },
+        )
+        .unwrap();
+
+        let output = run_sandboxed(command, &workspace);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::remove_dir_all(parent).unwrap();
     }
 
     #[cfg(target_os = "macos")]
@@ -1073,6 +1196,7 @@ mod tests {
                 readable_files: Vec::new(),
                 writable_roots: vec![workspace.clone()],
                 allow_child_processes: true,
+                allow_host_ui: false,
                 launcher_programs: vec![python],
                 network: SandboxNetworkAccess::Unrestricted,
                 linux_bwrap_path: None,
@@ -1106,6 +1230,7 @@ mod tests {
             readable_files: Vec::new(),
             writable_roots: vec![cwd],
             allow_child_processes: false,
+            allow_host_ui: false,
             launcher_programs: vec![program],
             network: SandboxNetworkAccess::Unrestricted,
             linux_bwrap_path: None,
@@ -1127,6 +1252,7 @@ mod tests {
             readable_files: Vec::new(),
             writable_roots: vec![cwd.clone()],
             allow_child_processes: false,
+            allow_host_ui: false,
             launcher_programs: vec![program.clone()],
             network: SandboxNetworkAccess::Disabled,
             linux_bwrap_path: None,
@@ -1164,6 +1290,7 @@ mod tests {
             readable_files: Vec::new(),
             writable_roots: vec![cwd],
             allow_child_processes: false,
+            allow_host_ui: false,
             launcher_programs: vec![program],
             network: SandboxNetworkAccess::Disabled,
             linux_bwrap_path: None,
@@ -1204,6 +1331,7 @@ mod tests {
                 readable_files: Vec::new(),
                 writable_roots: vec![workspace.clone()],
                 allow_child_processes: false,
+                allow_host_ui: false,
                 launcher_programs: vec![program],
                 network: SandboxNetworkAccess::Disabled,
                 linux_bwrap_path: None,

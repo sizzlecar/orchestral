@@ -524,6 +524,7 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
                         readable_files: self.runtime_readable_files.clone(),
                         writable_roots: sandbox_writes,
                         allow_child_processes: true,
+                        allow_host_ui: false,
                         launcher_programs: vec![self.shell.clone()],
                         network,
                         linux_bwrap_path: None,

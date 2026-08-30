@@ -913,6 +913,7 @@ fn configured_mcp_servers(
                     args,
                     env,
                     allow_child_processes,
+                    allow_host_ui,
                     cwd,
                     readable_roots,
                     writable_roots,
@@ -943,6 +944,7 @@ fn configured_mcp_servers(
                         )
                         .with_unrestricted_network(*allow_unrestricted_network)
                         .with_child_processes(*allow_child_processes)
+                        .with_host_ui(*allow_host_ui)
                         .with_private_runtime_home(runtime_root),
                     )?))
                 }

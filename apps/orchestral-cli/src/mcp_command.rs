@@ -162,6 +162,7 @@ fn add(path: &Path, args: AddArgs) -> anyhow::Result<()> {
         args: command.collect(),
         env: args.env.into_iter().collect::<HashMap<_, _>>(),
         allow_child_processes: !args.no_child_processes,
+        allow_host_ui: Some(!args.no_child_processes),
         cwd: cwd.map(|path| path.to_string_lossy().into_owned()),
         readable_roots: readable_roots
             .into_iter()

@@ -148,6 +148,7 @@ impl StreamableHttpMcpTransportFactory {
             effect_scopes,
             process_programs: BTreeSet::new(),
             allow_child_processes: false,
+            allow_host_ui: false,
             filesystem_read_roots: BTreeSet::new(),
             filesystem_write_roots: BTreeSet::new(),
             sandbox_profiles: BTreeSet::new(),

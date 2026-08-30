@@ -294,6 +294,11 @@ pub enum McpTransportSpec {
         /// MCP server's filesystem/network sandbox (needed by npx/uvx/sh).
         #[serde(default = "default_true")]
         allow_child_processes: bool,
+        /// Permit the registered local MCP process to ask the operating
+        /// system to open URLs or application UI. User-level registrations
+        /// enable this by default; project manifests remain denied.
+        #[serde(default)]
+        allow_host_ui: bool,
         /// Working directory exposed to the local MCP process. Relative paths
         /// are resolved from the Agent workspace by the application Host.
         #[serde(default)]

@@ -37,6 +37,13 @@ pub(crate) struct JsonMcpServer {
         alias = "allow_child_processes"
     )]
     pub(crate) allow_child_processes: bool,
+    #[serde(
+        default,
+        rename = "allowHostUi",
+        alias = "allow_host_ui",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) allow_host_ui: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cwd: Option<String>,
     #[serde(default, rename = "readableRoots", alias = "readable_roots")]
@@ -261,6 +268,12 @@ impl JsonMcpServer {
                 args: self.args,
                 env: self.env,
                 allow_child_processes: self.allow_child_processes,
+                // A user explicitly registered this executable as a Host
+                // integration. Let the MCP own browser OAuth and similar UI
+                // flows. Repository/imported manifests get no such authority.
+                allow_host_ui: self
+                    .allow_host_ui
+                    .unwrap_or(trusted_user_registration && self.allow_child_processes),
                 cwd,
                 readable_roots,
                 writable_roots,
@@ -371,7 +384,7 @@ mod tests {
     }
 
     #[test]
-    fn only_user_registry_defaults_legacy_stdio_to_host_network() {
+    fn only_user_registry_defaults_legacy_stdio_to_host_capabilities() {
         let root = test_root("legacy-user-network");
         std::fs::create_dir_all(&root).unwrap();
         let root = std::fs::canonicalize(root).unwrap();
@@ -394,6 +407,7 @@ mod tests {
         let trusted_user = load_server_manifests(&root, &[], &[], &[path], &[]).unwrap();
         let McpTransportSpec::Stdio {
             allow_unrestricted_network: project_network,
+            allow_host_ui: project_host_ui,
             ..
         } = &project[0].transport
         else {
@@ -401,13 +415,16 @@ mod tests {
         };
         let McpTransportSpec::Stdio {
             allow_unrestricted_network: user_network,
+            allow_host_ui: user_host_ui,
             ..
         } = &trusted_user[0].transport
         else {
             panic!("expected user stdio manifest")
         };
         assert!(!project_network);
+        assert!(!project_host_ui);
         assert!(*user_network);
+        assert!(*user_host_ui);
 
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -423,6 +440,7 @@ mod tests {
                 args: Vec::new(),
                 env: HashMap::new(),
                 allow_child_processes: true,
+                allow_host_ui: false,
                 cwd: None,
                 readable_roots: Vec::new(),
                 writable_roots: Vec::new(),

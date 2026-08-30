@@ -175,6 +175,7 @@ impl GuardedToolExecutor for GuardedPtyCreateExecutor {
             readable_files: Vec::new(),
             writable_roots: writable_roots.clone(),
             allow_child_processes: false,
+            allow_host_ui: false,
             launcher_programs: bounds
                 .process
                 .interactive

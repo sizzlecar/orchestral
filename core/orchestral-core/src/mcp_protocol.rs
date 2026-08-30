@@ -71,6 +71,10 @@ pub struct McpTransportAuthority {
     /// Whether the registered transport launcher may form a process tree.
     /// Descendants remain inside the same filesystem/network sandbox.
     pub allow_child_processes: bool,
+    /// Whether this registered local transport may ask the operating system to
+    /// open a URL or application UI. This lets a stdio MCP own flows such as
+    /// browser OAuth without making the Agent Host own that protocol.
+    pub allow_host_ui: bool,
     pub filesystem_read_roots: BTreeSet<String>,
     pub filesystem_write_roots: BTreeSet<String>,
     pub sandbox_profiles: BTreeSet<String>,
@@ -143,6 +147,7 @@ impl McpTransportAuthority {
                 if self.network_targets.len() != 1
                     || !self.process_programs.is_empty()
                     || self.allow_child_processes
+                    || self.allow_host_ui
                     || !self.filesystem_read_roots.is_empty()
                     || !self.filesystem_write_roots.is_empty()
                     || !self.sandbox_profiles.is_empty()

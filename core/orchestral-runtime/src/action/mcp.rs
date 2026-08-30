@@ -242,6 +242,7 @@ pub struct StdioMcpSandboxPolicy {
     allow_unrestricted_network: bool,
     private_runtime_home: Option<PathBuf>,
     allow_child_processes: bool,
+    allow_host_ui: bool,
 }
 
 impl StdioMcpSandboxPolicy {
@@ -255,6 +256,7 @@ impl StdioMcpSandboxPolicy {
             allow_unrestricted_network: false,
             private_runtime_home: None,
             allow_child_processes: false,
+            allow_host_ui: false,
         }
     }
 
@@ -275,6 +277,7 @@ impl StdioMcpSandboxPolicy {
             allow_unrestricted_network: false,
             private_runtime_home: None,
             allow_child_processes: false,
+            allow_host_ui: false,
         }
     }
 
@@ -282,6 +285,14 @@ impl StdioMcpSandboxPolicy {
     /// descendant remains confined by this server's filesystem/network policy.
     pub fn with_child_processes(mut self, allow: bool) -> Self {
         self.allow_child_processes = allow;
+        self
+    }
+
+    /// Allows this registered MCP transport to invoke the operating system's
+    /// URL/application opener. The MCP still owns the protocol (for example,
+    /// OAuth); the Host only materializes the declared OS capability.
+    pub fn with_host_ui(mut self, allow: bool) -> Self {
+        self.allow_host_ui = allow;
         self
     }
 
@@ -321,6 +332,11 @@ impl StdioMcpSandboxPolicy {
                     .to_owned(),
             ));
         }
+        if self.allow_host_ui && !self.allow_child_processes {
+            return Err(McpToolsAdapterError::InvalidConfig(
+                "MCP stdio Host UI access requires child-process authority".to_owned(),
+            ));
+        }
         let private_runtime_home = self
             .private_runtime_home
             .as_deref()
@@ -350,6 +366,7 @@ impl StdioMcpSandboxPolicy {
             allow_unrestricted_network: self.allow_unrestricted_network,
             private_runtime_home,
             allow_child_processes: self.allow_child_processes,
+            allow_host_ui: self.allow_host_ui,
         })
     }
 }
@@ -428,6 +445,7 @@ impl StdioMcpTransportFactory {
             "allowUnrestrictedNetwork": sandbox.allow_unrestricted_network,
             "privateRuntimeHome": sandbox.private_runtime_home.as_ref().map(|path| path.to_string_lossy()),
             "allowChildProcesses": sandbox.allow_child_processes,
+            "allowHostUi": sandbox.allow_host_ui,
             "sandboxProfile": MCP_STDIO_SANDBOX_PROFILE,
             "maxFrameBytes": DEFAULT_MCP_MAX_FRAME_BYTES,
         });
@@ -441,6 +459,7 @@ impl StdioMcpTransportFactory {
             effect_scopes,
             process_programs: BTreeSet::from([program.to_string_lossy().to_string()]),
             allow_child_processes: sandbox.allow_child_processes,
+            allow_host_ui: sandbox.allow_host_ui,
             filesystem_read_roots: sandbox
                 .readable_roots
                 .iter()
@@ -486,6 +505,7 @@ impl McpTransportFactory for StdioMcpTransportFactory {
                 readable_files: Vec::new(),
                 writable_roots: self.sandbox.writable_roots.iter().cloned().collect(),
                 allow_child_processes: self.sandbox.allow_child_processes,
+                allow_host_ui: self.sandbox.allow_host_ui,
                 launcher_programs: vec![self.program.clone()],
                 network: if self.sandbox.allow_unrestricted_network {
                     SandboxNetworkAccess::Unrestricted
@@ -2482,6 +2502,7 @@ mod mcp_lifecycle_gate_tests {
                     effect_scopes,
                     process_programs,
                     allow_child_processes: false,
+                    allow_host_ui: false,
                     filesystem_read_roots,
                     filesystem_write_roots,
                     sandbox_profiles,
@@ -3001,6 +3022,7 @@ mod mcp_lifecycle_gate_tests {
                     ]),
                     process_programs: BTreeSet::from(["/fault/mcp".to_owned()]),
                     allow_child_processes: false,
+                    allow_host_ui: false,
                     filesystem_read_roots: BTreeSet::from(["/fault/read".to_owned()]),
                     filesystem_write_roots: BTreeSet::from(["/fault/write".to_owned()]),
                     sandbox_profiles: BTreeSet::from([MCP_STDIO_SANDBOX_PROFILE.to_owned()]),
@@ -3020,6 +3042,7 @@ mod mcp_lifecycle_gate_tests {
                     ]),
                     process_programs: BTreeSet::new(),
                     allow_child_processes: false,
+                    allow_host_ui: false,
                     filesystem_read_roots: BTreeSet::new(),
                     filesystem_write_roots: BTreeSet::new(),
                     sandbox_profiles: BTreeSet::new(),

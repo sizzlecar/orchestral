@@ -181,6 +181,8 @@ fn validate_mcp(config: &OrchestralConfig) -> Result<(), ConfigError> {
         match &server.transport {
             McpTransportSpec::Stdio {
                 command,
+                allow_child_processes,
+                allow_host_ui,
                 cwd,
                 readable_roots,
                 writable_roots,
@@ -189,6 +191,7 @@ fn validate_mcp(config: &OrchestralConfig) -> Result<(), ConfigError> {
                 ..
             } => {
                 if command.trim().is_empty()
+                    || (*allow_host_ui && !*allow_child_processes)
                     || cwd.as_deref().is_some_and(|path| path.trim().is_empty())
                     || readable_roots
                         .iter()
