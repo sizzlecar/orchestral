@@ -24,6 +24,7 @@ const PROCESS_TIMEOUT: Duration = Duration::from_secs(120);
 const LIVE_CODING_PROCESS_TIMEOUT: Duration = Duration::from_secs(240);
 const LOCAL_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 const APPROVAL_PROMPT: &str = "Allow this exact operation? [y/N]";
+const SESSION_APPROVAL_PROMPT: &str = "Approve? [y] once / [a] this session / [N] deny";
 
 static LIVE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static LOCAL_E2E_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1408,6 +1409,136 @@ fn local_cli_discovers_calls_and_journals_an_mcp_tool() {
     assert_eq!(tool_result_is_error(exchanges[0]), Some(false));
     assert_eq!(run_payload_count(&workspace, "request_opened"), 0);
     assert_eq!(run_payload_count(&workspace, "request_resolved"), 0);
+}
+
+#[test]
+fn local_cli_remembers_a_risky_mcp_approval_for_the_host_session() {
+    let _guard = local_e2e_guard();
+    const FIRST_RESULT: &str = "MCP_SESSION_FIRST_7319";
+    const SECOND_RESULT: &str = "MCP_SESSION_SECOND_4827";
+    const FINAL_RESULT: &str = "MCP_SESSION_APPROVAL_OK";
+
+    let workspace = TestWorkspace::new("mcp-session-approval");
+    let (mcp_base, mcp_server) = spawn_fixture_http_server(vec![
+        Box::new(|request| {
+            mcp_json_response(
+                request,
+                json!({
+                    "supportedVersions": ["2026-07-28"],
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "fixture", "version": "1"}
+                }),
+            )
+        }),
+        Box::new(|request| {
+            mcp_sse_response(
+                request,
+                json!({
+                    "resultType": "complete",
+                    "ttlMs": 1000,
+                    "cacheScope": "private",
+                    "tools": [{
+                        "name": "publish_marker",
+                        "description": "Publish one marker to an external fixture",
+                        "annotations": {
+                            "readOnlyHint": false,
+                            "openWorldHint": true,
+                            "idempotentHint": true
+                        },
+                        "inputSchema": {
+                            "type": "object",
+                            "required": ["value"],
+                            "properties": {"value": {"type": "string"}},
+                            "additionalProperties": false
+                        }
+                    }]
+                }),
+            )
+        }),
+        Box::new(|request| {
+            assert_eq!(request.body["params"]["arguments"]["value"], "first");
+            mcp_json_response(
+                request,
+                json!({
+                    "resultType": "complete",
+                    "content": [{"type": "text", "text": FIRST_RESULT}],
+                    "isError": false
+                }),
+            )
+        }),
+        Box::new(|request| {
+            assert_eq!(request.body["params"]["arguments"]["value"], "second");
+            mcp_json_response(
+                request,
+                json!({
+                    "resultType": "complete",
+                    "content": [{"type": "text", "text": SECOND_RESULT}],
+                    "isError": false
+                }),
+            )
+        }),
+    ]);
+    workspace.configure_mcp_server(&format!("{mcp_base}/mcp"));
+
+    let (model_endpoint, model_server) = spawn_fixture_http_server(vec![
+        Box::new(|_| {
+            openai_tool_response(
+                "mcp-session-first",
+                "mcp__fixture__publish_marker",
+                json!({"value": "first"}),
+            )
+        }),
+        Box::new(|request| {
+            assert!(model_request_text(&request.body).contains(FIRST_RESULT));
+            openai_tool_response(
+                "mcp-session-second",
+                "mcp__fixture__publish_marker",
+                json!({"value": "second"}),
+            )
+        }),
+        Box::new(|request| {
+            assert!(model_request_text(&request.body).contains(SECOND_RESULT));
+            openai_text_response(FINAL_RESULT)
+        }),
+    ]);
+    workspace.configure_local_openai(&model_endpoint);
+
+    let output = run_with_piped_input(
+        local_default_agent_command(
+            &workspace,
+            "mcp-session-approval",
+            "Publish the first marker, then publish the second marker with the same MCP Tool.",
+            false,
+            true,
+        ),
+        b"a\n",
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    assert!(output.status.success(), "{}", output.stderr_text());
+    assert_eq!(output.stdout_text().trim(), FINAL_RESULT);
+    assert_eq!(
+        output
+            .stderr_text()
+            .matches(SESSION_APPROVAL_PROMPT)
+            .count(),
+        1,
+        "a remembered session decision must suppress the second prompt: {}",
+        output.stderr_text()
+    );
+    output.assert_no_ansi();
+
+    let model_requests = model_server.join().expect("join local model server");
+    assert_eq!(model_requests.len(), 3);
+    let mcp_requests = mcp_server.join().expect("join local MCP server");
+    assert_eq!(mcp_requests.len(), 4);
+    assert_eq!(mcp_requests[2].body["method"], "tools/call");
+    assert_eq!(mcp_requests[3].body["method"], "tools/call");
+
+    let records = session_records(&workspace);
+    let exchanges = tool_exchanges(&records);
+    assert_eq!(exchanges.len(), 2);
+    assert_eq!(run_payload_count(&workspace, "request_opened"), 2);
+    assert_eq!(run_payload_count(&workspace, "request_resolved"), 2);
 }
 
 #[test]

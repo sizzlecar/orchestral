@@ -850,13 +850,37 @@ fn render_pending(
                 area,
             );
         }
-        PendingOverlay::Approval { summary, .. } => {
+        PendingOverlay::Approval {
+            summary,
+            session_approval_available,
+            ..
+        } => {
             let block = Block::default().padding(Padding::horizontal(CONTENT_PADDING));
             let inner = block.inner(area);
+            let mut actions = vec![approval_option_line(
+                'a',
+                "Allow once",
+                ApprovalChoice::Allow,
+                approval_choice,
+            )];
+            if *session_approval_available {
+                actions.push(approval_option_line(
+                    's',
+                    "Allow for session",
+                    ApprovalChoice::AllowSession,
+                    approval_choice,
+                ));
+            }
+            actions.push(approval_option_line(
+                'd',
+                "Deny",
+                ApprovalChoice::Deny,
+                approval_choice,
+            ));
             let rows = Layout::vertical([
                 Constraint::Length(1),
                 Constraint::Min(0),
-                Constraint::Length(2),
+                Constraint::Length(u16::try_from(actions.len()).unwrap_or(3)),
             ])
             .split(inner);
             frame.render_widget(block, area);
@@ -871,13 +895,7 @@ fn render_pending(
                 Paragraph::new(summary.as_str()).wrap(Wrap { trim: false }),
                 rows[1],
             );
-            frame.render_widget(
-                Paragraph::new(vec![
-                    approval_option_line('a', "Allow once", ApprovalChoice::Allow, approval_choice),
-                    approval_option_line('d', "Deny", ApprovalChoice::Deny, approval_choice),
-                ]),
-                rows[2],
-            );
+            frame.render_widget(Paragraph::new(actions), rows[2]);
         }
     }
 }
@@ -908,9 +926,16 @@ fn pending_height(state: &UiState, width: u16) -> u16 {
         Some(PendingOverlay::Input { prompt, .. }) => 2_u16.saturating_add(
             u16::try_from(wrapped_rows(prompt, inner_width).clamp(1, 3)).unwrap_or(3),
         ),
-        Some(PendingOverlay::Approval { summary, .. }) => 3_u16.saturating_add(
-            u16::try_from(wrapped_rows(summary, inner_width).clamp(1, 3)).unwrap_or(3),
-        ),
+        Some(PendingOverlay::Approval {
+            summary,
+            session_approval_available,
+            ..
+        }) => {
+            let actions = if *session_approval_available { 3 } else { 2 };
+            1_u16.saturating_add(actions).saturating_add(
+                u16::try_from(wrapped_rows(summary, inner_width).clamp(1, 3)).unwrap_or(3),
+            )
+        }
         None => 0,
     }
 }
@@ -1048,6 +1073,7 @@ mod tests {
                 run_id: "run-small".to_owned(),
                 request_id: "approval-small".to_owned(),
                 summary: "Run workspace tests with cargo".to_owned(),
+                session_approval_available: false,
             },
         );
         assert_snapshot!("tui_40x12_approval", render_to_string(&state, 40, 12));
@@ -1063,12 +1089,14 @@ mod tests {
                 request_id: "approval-long".to_owned(),
                 summary: "A long approval explanation with filesystem, process, environment, and network effects. "
                     .repeat(12),
+                session_approval_available: true,
             },
         );
 
         for (width, height) in [(20, 6), (50, 6), (50, 10)] {
             let rendered = render_to_string(&state, width, height);
             assert!(rendered.contains("› a  Allow once"), "{rendered}");
+            assert!(rendered.contains("s  Allow for"), "{rendered}");
             assert!(rendered.contains("d  Deny"), "{rendered}");
             if width >= 50 {
                 assert!(rendered.contains("enter confirm"), "{rendered}");

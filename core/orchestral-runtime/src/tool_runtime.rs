@@ -168,6 +168,7 @@ pub trait GuardedToolExecutor: Send + Sync {
         Ok(ToolOperationPlan {
             required_capabilities,
             risk: ToolOperationRisk::Routine,
+            session_approval_scope: None,
             summary: sanitize_approval_summary(
                 &self.approval_summary(invocation),
                 &invocation.tool_id,

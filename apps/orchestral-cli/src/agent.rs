@@ -1535,43 +1535,65 @@ async fn resolve_cli_request(
         }
         PendingRequestPayload::Approval {
             requested_scope,
+            session_approval_scope,
             reason,
             ..
         } => {
-            eprintln!("\nApproval required: {reason}");
-            eprintln!("Effects: {}", requested_scope.join(", "));
-            eprint!("Allow this exact operation? [y/N] ");
-            io::stderr().flush().context("flush approval prompt")?;
-            let answer = tokio::select! {
-                line = lines.next_line() => line.context("read approval decision")?,
-                signal = tokio::signal::ctrl_c() => {
-                    signal.context("listen for Ctrl-C")?;
-                    eprintln!("\nCancelling current Agent Run...");
-                    if let Err(error) = controller.cancel(run_id, "CLI interrupted during approval").await {
-                        tracing::debug!(%error, "Agent Run reached terminal while cancellation was sent");
-                    }
-                    return Ok(false);
-                }
-            };
-            let allow = answer.as_deref().is_some_and(|answer| {
-                matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
-            });
-            if allow {
-                let now_ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as i64;
-                let grant_ref = approval_broker
-                    .approve(&request.request_id, now_ms.saturating_add(5 * 60 * 1_000))
-                    .context("issue exact Host approval grant")?;
+            if let Some(grant_ref) = approval_broker
+                .approve_if_remembered(&request.request_id, approval_expiry_ms())
+                .context("apply remembered Host approval")?
+            {
                 RequestResolution::Approval {
                     decision: ApprovalDecision::Allow,
                     grant_ref: Some(grant_ref),
                 }
             } else {
-                RequestResolution::Approval {
-                    decision: ApprovalDecision::Deny,
-                    grant_ref: None,
+                eprintln!("\nApproval required: {reason}");
+                eprintln!("Effects: {}", requested_scope.join(", "));
+                if session_approval_scope.is_some() {
+                    eprint!("Approve? [y] once / [a] this session / [N] deny ");
+                } else {
+                    eprint!("Allow this exact operation? [y/N] ");
+                }
+                io::stderr().flush().context("flush approval prompt")?;
+                let answer = tokio::select! {
+                    line = lines.next_line() => line.context("read approval decision")?,
+                    signal = tokio::signal::ctrl_c() => {
+                        signal.context("listen for Ctrl-C")?;
+                        eprintln!("\nCancelling current Agent Run...");
+                        if let Err(error) = controller.cancel(run_id, "CLI interrupted during approval").await {
+                            tracing::debug!(%error, "Agent Run reached terminal while cancellation was sent");
+                        }
+                        return Ok(false);
+                    }
+                };
+                let answer = answer
+                    .as_deref()
+                    .map(str::trim)
+                    .map(str::to_ascii_lowercase)
+                    .unwrap_or_default();
+                let approve_session = session_approval_scope.is_some()
+                    && matches!(answer.as_str(), "a" | "always" | "session");
+                let approve_once = matches!(answer.as_str(), "y" | "yes");
+                if approve_session || approve_once {
+                    let grant_ref = if approve_session {
+                        approval_broker
+                            .approve_for_session(&request.request_id, approval_expiry_ms())
+                            .context("remember Host approval for session")?
+                    } else {
+                        approval_broker
+                            .approve(&request.request_id, approval_expiry_ms())
+                            .context("issue exact Host approval grant")?
+                    };
+                    RequestResolution::Approval {
+                        decision: ApprovalDecision::Allow,
+                        grant_ref: Some(grant_ref),
+                    }
+                } else {
+                    RequestResolution::Approval {
+                        decision: ApprovalDecision::Deny,
+                        grant_ref: None,
+                    }
                 }
             }
         }
@@ -1640,6 +1662,14 @@ fn unique_id(prefix: &str, sequence: u64) -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("{prefix}-{}-{epoch_nanos}-{sequence}", std::process::id())
+}
+
+fn approval_expiry_ms() -> i64 {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    now_ms.saturating_add(5 * 60 * 1_000)
 }
 
 fn select_entry_mode(

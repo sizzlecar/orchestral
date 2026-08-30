@@ -88,8 +88,15 @@ impl TranscriptEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PendingOverlay {
-    Input { request_id: String, prompt: String },
-    Approval { request_id: String, summary: String },
+    Input {
+        request_id: String,
+        prompt: String,
+    },
+    Approval {
+        request_id: String,
+        summary: String,
+        session_approval_available: bool,
+    },
 }
 
 impl PendingOverlay {
@@ -103,6 +110,7 @@ impl PendingOverlay {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ApprovalChoice {
     Allow,
+    AllowSession,
     Deny,
 }
 
@@ -190,6 +198,7 @@ pub(crate) enum UiMsg {
         run_id: String,
         request_id: String,
         summary: String,
+        session_approval_available: bool,
     },
     RequestResolved {
         request_id: String,
@@ -514,6 +523,7 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             run_id,
             request_id,
             summary,
+            session_approval_available,
         } => {
             state.run_id = Some(run_id);
             state.phase = UiPhase::WaitingApproval;
@@ -521,6 +531,7 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             state.pending = Some(PendingOverlay::Approval {
                 request_id,
                 summary,
+                session_approval_available,
             });
         }
         UiMsg::RequestResolved { request_id } => {
@@ -657,12 +668,21 @@ fn submit(state: &mut UiState) -> Vec<UiEffect> {
 }
 
 fn resolve_approval(state: &mut UiState, choice: ApprovalChoice) -> Vec<UiEffect> {
-    let (Some(run_id), Some(PendingOverlay::Approval { request_id, .. })) =
-        (state.run_id.clone(), state.pending.clone())
+    let (
+        Some(run_id),
+        Some(PendingOverlay::Approval {
+            request_id,
+            session_approval_available,
+            ..
+        }),
+    ) = (state.run_id.clone(), state.pending.clone())
     else {
         return Vec::new();
     };
     if state.phase != UiPhase::WaitingApproval {
+        return Vec::new();
+    }
+    if choice == ApprovalChoice::AllowSession && !session_approval_available {
         return Vec::new();
     }
     state.pending = None;
@@ -749,6 +769,7 @@ mod tests {
                 run_id: "run-a".to_owned(),
                 request_id: "approval-a".to_owned(),
                 summary: "Run cargo test".to_owned(),
+                session_approval_available: false,
             },
         );
         assert_eq!(state.phase, UiPhase::WaitingApproval);
@@ -768,6 +789,7 @@ mod tests {
                 run_id: "run-a".to_owned(),
                 request_id: "approval-b".to_owned(),
                 summary: "Publish artifact".to_owned(),
+                session_approval_available: false,
             },
         );
         assert_eq!(
@@ -874,6 +896,7 @@ mod tests {
                 run_id: "run".to_owned(),
                 request_id: "approval-a".to_owned(),
                 summary: "First approval".to_owned(),
+                session_approval_available: true,
             },
         );
         assert_eq!(state.approval_choice, ApprovalChoice::Allow);
@@ -881,12 +904,22 @@ mod tests {
         update(&mut state, UiMsg::SelectApproval(ApprovalChoice::Deny));
         assert_eq!(state.approval_choice, ApprovalChoice::Deny);
 
+        assert_eq!(
+            update(&mut state, UiMsg::Approval(ApprovalChoice::AllowSession)),
+            vec![UiEffect::ResolveApproval {
+                run_id: "run".to_owned(),
+                request_id: "approval-a".to_owned(),
+                choice: ApprovalChoice::AllowSession,
+            }]
+        );
+
         update(
             &mut state,
             UiMsg::WaitingApproval {
                 run_id: "run".to_owned(),
                 request_id: "approval-b".to_owned(),
                 summary: "Second approval".to_owned(),
+                session_approval_available: false,
             },
         );
         assert_eq!(state.approval_choice, ApprovalChoice::Allow);
@@ -999,6 +1032,7 @@ mod tests {
                 run_id: "run-a".to_owned(),
                 request_id: "approval-a".to_owned(),
                 summary: "Run a command".to_owned(),
+                session_approval_available: false,
             },
         );
         update(

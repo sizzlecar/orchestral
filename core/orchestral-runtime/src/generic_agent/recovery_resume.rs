@@ -662,7 +662,7 @@ pub(super) async fn resume_observed_approval(
                 .invoke(
                     invocation,
                     tools.run_grant.clone(),
-                    Some(capability),
+                    Some(*capability),
                     cancellation.clone(),
                 )
                 .await

@@ -1880,6 +1880,7 @@ mod tests {
                     PendingRequestKind::Approval => PendingRequestPayload::Approval {
                         operation_digest: Digest::sha256("operation"),
                         requested_scope: vec!["workspace/write".to_owned()],
+                        session_approval_scope: None,
                         reason: "write is required".to_owned(),
                     },
                     PendingRequestKind::ExternalAction => PendingRequestPayload::ExternalAction {

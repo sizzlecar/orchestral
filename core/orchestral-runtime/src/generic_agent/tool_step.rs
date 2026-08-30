@@ -378,7 +378,7 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                             .invoke(
                                 invocation.clone(),
                                 tools.run_grant.clone(),
-                                Some(capability),
+                                Some(*capability),
                                 cancellation.clone(),
                             )
                             .await

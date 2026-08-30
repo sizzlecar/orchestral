@@ -52,6 +52,7 @@ fn test_operation(summary: &str) -> ToolOperationPlan {
             EffectScope::Process,
         ])),
         risk: ToolOperationRisk::Routine,
+        session_approval_scope: None,
         summary: summary.to_owned(),
     }
 }

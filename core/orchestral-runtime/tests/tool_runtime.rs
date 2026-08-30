@@ -622,6 +622,7 @@ async fn network_authority_is_requested_before_permission_and_resumes_with_one_l
     let operation = ToolOperationPlan {
         required_capabilities: required_capabilities.clone(),
         risk: ToolOperationRisk::Elevated,
+        session_approval_scope: None,
         summary: "Connect to an external service".to_owned(),
     };
     let executor = Arc::new(LeaseEchoExecutor {
@@ -711,6 +712,7 @@ async fn workspace_policy_authorizes_the_planned_effects_not_the_tool_envelope()
     let operation = ToolOperationPlan {
         required_capabilities: capabilities(&[EffectScope::Process]),
         risk: ToolOperationRisk::Elevated,
+        session_approval_scope: None,
         summary: "Update the sandboxed workspace".to_owned(),
     };
     let executor = Arc::new(PlannedEchoExecutor {
@@ -762,6 +764,7 @@ async fn workspace_policy_routes_destructive_operations_to_exact_review() {
     let operation = ToolOperationPlan {
         required_capabilities: capabilities(&[EffectScope::Process]),
         risk: ToolOperationRisk::Destructive,
+        session_approval_scope: None,
         summary: "Reset workspace state".to_owned(),
     };
     let executor = Arc::new(PlannedEchoExecutor {
@@ -872,6 +875,7 @@ async fn permission_spi_cannot_auto_authorize_host_execution() {
     let operation = ToolOperationPlan {
         required_capabilities,
         risk: ToolOperationRisk::Elevated,
+        session_approval_scope: None,
         summary: "Execute outside the default sandbox".to_owned(),
     };
     let executor = Arc::new(PlannedEchoExecutor {

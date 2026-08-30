@@ -338,6 +338,7 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
         let operation = ToolOperationPlan {
             required_capabilities,
             risk,
+            session_approval_scope: None,
             summary,
         };
         operation
@@ -688,6 +689,7 @@ impl GuardedToolExecutor for GuardedWriteStdinExecutor {
             } else {
                 ToolOperationRisk::Routine
             },
+            session_approval_scope: None,
             summary: if has_input && session_has_exited {
                 format!(
                     "Read final output from exited exec session {}; requested input will not be delivered",

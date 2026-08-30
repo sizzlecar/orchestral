@@ -1565,6 +1565,11 @@ pub enum PendingRequestPayload {
     Approval {
         operation_digest: Digest,
         requested_scope: Vec<String>,
+        /// Opaque Host review class that may be remembered for this
+        /// interactive session. It never replaces the exact operation digest
+        /// or the single-use approval grant.
+        #[serde(default)]
+        session_approval_scope: Option<Digest>,
         reason: String,
     },
     ExternalAction {
@@ -1603,9 +1608,13 @@ impl PendingRequestPayload {
             Self::Approval {
                 operation_digest,
                 requested_scope,
+                session_approval_scope,
                 reason,
             } => {
                 if !operation_digest.is_sha256()
+                    || session_approval_scope
+                        .as_ref()
+                        .is_some_and(|scope| !scope.is_sha256())
                     || requested_scope.is_empty()
                     || requested_scope.iter().any(|scope| scope.trim().is_empty())
                     || reason.trim().is_empty()

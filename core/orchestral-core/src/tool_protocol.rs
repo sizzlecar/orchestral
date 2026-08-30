@@ -293,6 +293,12 @@ pub struct ToolOperationPlan {
     pub required_capabilities: CapabilityRequest,
     #[serde(default)]
     pub risk: ToolOperationRisk,
+    /// Stable Tool-defined review class that a Host may remember for the
+    /// lifetime of one interactive session. This never grants authority by
+    /// itself: every invocation still receives a fresh capability bound to
+    /// its exact arguments and operation.
+    #[serde(default)]
+    pub session_approval_scope: Option<Digest>,
     pub summary: String,
 }
 
@@ -303,6 +309,16 @@ impl ToolOperationPlan {
             return Err(ToolProtocolError::new(
                 ToolProtocolErrorCode::InvalidInvocation,
                 "Tool operation plan requires a safe summary and normalized targets",
+            ));
+        }
+        if self
+            .session_approval_scope
+            .as_ref()
+            .is_some_and(|scope| !scope.is_sha256())
+        {
+            return Err(ToolProtocolError::new(
+                ToolProtocolErrorCode::InvalidInvocation,
+                "session approval scope must be a SHA-256 digest",
             ));
         }
         Ok(())
@@ -1062,6 +1078,10 @@ pub struct ApprovalBinding {
     /// user. This prevents an approval for one resource from authorizing a
     /// different resource with the same coarse effect class.
     pub requested_capabilities: CapabilityRequest,
+    /// Optional review class used only by the Host's in-session decision
+    /// cache. The signed capability remains exact and single-use.
+    #[serde(default)]
+    pub session_approval_scope: Option<Digest>,
     pub policy_digest: Digest,
 }
 
@@ -1094,6 +1114,7 @@ impl ApprovalBinding {
             operation_digest: operation.digest()?,
             permission_digest,
             requested_capabilities: operation.required_capabilities.clone(),
+            session_approval_scope: operation.session_approval_scope.clone(),
             policy_digest: effective_policy.digest()?,
         })
     }
@@ -1128,6 +1149,12 @@ impl ApprovalCapability {
             || !self.claims.binding.args_digest.is_sha256()
             || !self.claims.binding.operation_digest.is_sha256()
             || !self.claims.binding.permission_digest.is_sha256()
+            || self
+                .claims
+                .binding
+                .session_approval_scope
+                .as_ref()
+                .is_some_and(|scope| !scope.is_sha256())
             || !self.claims.binding.policy_digest.is_sha256()
             || !self.authenticator.is_sha256()
         {
@@ -1493,6 +1520,7 @@ mod tests {
         ToolOperationPlan {
             required_capabilities,
             risk: ToolOperationRisk::Routine,
+            session_approval_scope: None,
             summary: "test operation".to_owned(),
         }
     }

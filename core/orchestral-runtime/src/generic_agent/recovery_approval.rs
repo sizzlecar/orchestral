@@ -136,9 +136,11 @@ pub(super) async fn prepare_recovered_approval(
             PendingRequestPayload::Approval {
                 operation_digest: actual_digest,
                 requested_scope: actual_scope,
+                session_approval_scope,
                 reason,
             } if actual_digest == &operation_digest
                 && actual_scope == &requested_scope
+                && session_approval_scope == &binding.session_approval_scope
                 && summary.as_ref().is_none_or(|expected| reason == expected)
         );
     if !request_matches {

@@ -357,7 +357,7 @@ pub(super) fn remove_pending_input(inner: &GenericInner, run_id: &RunId, request
 }
 
 pub(super) enum ApprovalWaitOutcome {
-    Allowed(ApprovalCapability),
+    Allowed(Box<ApprovalCapability>),
     Denied,
     Cancelled,
     Failed(AgentFailure),
@@ -479,6 +479,7 @@ pub(super) async fn await_tool_approval(
                     payload: PendingRequestPayload::Approval {
                         operation_digest,
                         requested_scope,
+                        session_approval_scope: binding.session_approval_scope.clone(),
                         reason: summary,
                     },
                 },
@@ -592,7 +593,7 @@ pub(super) fn approval_response_outcome(response: ApprovalResponse) -> ApprovalW
                 ..
             },
             Some(capability),
-        ) => ApprovalWaitOutcome::Allowed(capability),
+        ) => ApprovalWaitOutcome::Allowed(Box::new(capability)),
         (
             RequestResolution::Approval {
                 decision: ApprovalDecision::Deny,

@@ -1337,6 +1337,7 @@ impl McpToolsAdapterRegistry {
                         manager: manager.clone(),
                         tool_name: tool.name.clone(),
                         annotations: tool.annotations.clone(),
+                        session_approval_scope: tool.schema_digest.clone(),
                     }) as Arc<dyn GuardedToolExecutor>,
                 ));
             }
@@ -1415,6 +1416,7 @@ struct GuardedMcpToolExecutor {
     manager: Arc<McpServerConnectionManager>,
     tool_name: String,
     annotations: McpToolAnnotations,
+    session_approval_scope: Digest,
 }
 
 fn mcp_tool_idempotency(annotations: &McpToolAnnotations) -> ToolIdempotency {
@@ -1513,6 +1515,10 @@ impl GuardedToolExecutor for GuardedMcpToolExecutor {
             } else {
                 ToolOperationRisk::Routine
             },
+            // Like Codex's server + Tool session key, but sealed to the full
+            // discovered schema and annotations so a changed Tool contract
+            // cannot inherit an earlier decision.
+            session_approval_scope: Some(self.session_approval_scope.clone()),
             summary: self.approval_summary(invocation),
         };
         operation

@@ -289,6 +289,7 @@ impl GuardedToolExecutor for GuardedFileWriteExecutor {
         Ok(ToolOperationPlan {
             required_capabilities,
             risk: ToolOperationRisk::Routine,
+            session_approval_scope: None,
             summary: format!(
                 "{} file '{}' in workspace '{}'",
                 request.operation_label(),
@@ -485,6 +486,7 @@ impl GuardedToolExecutor for GuardedApplyPatchExecutor {
         Ok(ToolOperationPlan {
             required_capabilities,
             risk,
+            session_approval_scope: None,
             summary: format!(
                 "{} in workspace '{}'",
                 parsed_patch_summary(&parsed),

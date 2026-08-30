@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -75,12 +76,17 @@ pub(crate) async fn run_tui(
             }
             forwarded = agent_rx.recv() => {
                 if let Some(forwarded) = forwarded {
-                    handle_forwarded(forwarded, &mut active, &mut state).await?;
+                    handle_forwarded(
+                        forwarded,
+                        &approval_broker,
+                        &mut active,
+                        &mut state,
+                    ).await?;
                     needs_redraw = true;
                 }
             }
             _ = reconcile_tick.tick(), if active.is_some() => {
-                if reconcile_active(&mut active, &mut state).await? {
+                if reconcile_active(&mut active, &mut state, &approval_broker).await? {
                     stop_active(&mut active);
                 }
                 needs_redraw = true;
@@ -138,6 +144,7 @@ struct ActiveRun {
     observer: JoinHandle<()>,
     last_run_seq: u64,
     delta_order: u64,
+    auto_resolved_approvals: BTreeSet<String>,
 }
 
 enum ForwardedAgentEvent {
@@ -178,11 +185,27 @@ fn key_message(key: KeyEvent, state: &UiState) -> Option<UiMsg> {
         };
     }
     if state.phase == UiPhase::WaitingApproval {
+        let session_available = matches!(
+            &state.pending,
+            Some(super::state::PendingOverlay::Approval {
+                session_approval_available: true,
+                ..
+            })
+        );
         return match key.code {
             KeyCode::Char('a') | KeyCode::Char('A') => Some(UiMsg::Approval(ApprovalChoice::Allow)),
+            KeyCode::Char('s') | KeyCode::Char('S') if session_available => {
+                Some(UiMsg::Approval(ApprovalChoice::AllowSession))
+            }
             KeyCode::Char('d') | KeyCode::Char('D') => Some(UiMsg::Approval(ApprovalChoice::Deny)),
-            KeyCode::Up => Some(UiMsg::SelectApproval(ApprovalChoice::Allow)),
-            KeyCode::Down => Some(UiMsg::SelectApproval(ApprovalChoice::Deny)),
+            KeyCode::Up => Some(UiMsg::SelectApproval(previous_approval_choice(
+                state.approval_choice,
+                session_available,
+            ))),
+            KeyCode::Down => Some(UiMsg::SelectApproval(next_approval_choice(
+                state.approval_choice,
+                session_available,
+            ))),
             KeyCode::Enter => Some(UiMsg::Approval(state.approval_choice)),
             KeyCode::Esc => Some(UiMsg::Quit),
             KeyCode::PageUp => Some(UiMsg::ScrollUp(5)),
@@ -214,6 +237,23 @@ fn key_message(key: KeyEvent, state: &UiState) -> Option<UiMsg> {
     }
 }
 
+fn next_approval_choice(current: ApprovalChoice, session_available: bool) -> ApprovalChoice {
+    match (current, session_available) {
+        (ApprovalChoice::Allow, true) => ApprovalChoice::AllowSession,
+        (ApprovalChoice::Allow, false) | (ApprovalChoice::AllowSession, _) => ApprovalChoice::Deny,
+        (ApprovalChoice::Deny, _) => ApprovalChoice::Allow,
+    }
+}
+
+fn previous_approval_choice(current: ApprovalChoice, session_available: bool) -> ApprovalChoice {
+    match (current, session_available) {
+        (ApprovalChoice::Allow, _) => ApprovalChoice::Deny,
+        (ApprovalChoice::AllowSession, _) => ApprovalChoice::Allow,
+        (ApprovalChoice::Deny, true) => ApprovalChoice::AllowSession,
+        (ApprovalChoice::Deny, false) => ApprovalChoice::Allow,
+    }
+}
+
 async fn execute_effects(
     effects: Vec<UiEffect>,
     client: &AgentClient,
@@ -239,9 +279,10 @@ async fn execute_effects(
                                     observer,
                                     last_run_seq: 0,
                                     delta_order: 0,
+                                    auto_resolved_approvals: BTreeSet::new(),
                                 });
                                 update(state, UiMsg::RunStarted { run_id });
-                                if reconcile_active(active, state).await? {
+                                if reconcile_active(active, state, approval_broker).await? {
                                     stop_active(active);
                                 }
                             }
@@ -297,14 +338,14 @@ async fn execute_effects(
                 if let Some(run) = matching_active(active, &run_id, state) {
                     let request_id = RequestId::new(request_id);
                     let response = match choice {
-                        ApprovalChoice::Allow => {
-                            let now_ms = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as i64;
-                            match approval_broker
-                                .approve(&request_id, now_ms.saturating_add(5 * 60 * 1_000))
-                            {
+                        ApprovalChoice::Allow | ApprovalChoice::AllowSession => {
+                            let grant = if choice == ApprovalChoice::AllowSession {
+                                approval_broker
+                                    .approve_for_session(&request_id, approval_expiry_ms())
+                            } else {
+                                approval_broker.approve(&request_id, approval_expiry_ms())
+                            };
+                            match grant {
                                 Ok(grant_ref) => RequestResolution::Approval {
                                     decision: ApprovalDecision::Allow,
                                     grant_ref: Some(grant_ref),
@@ -418,6 +459,7 @@ async fn observe_run(
 
 async fn handle_forwarded(
     forwarded: ForwardedAgentEvent,
+    approval_broker: &Arc<InMemoryHostApprovalBroker>,
     active: &mut Option<ActiveRun>,
     state: &mut UiState,
 ) -> Result<()> {
@@ -443,12 +485,12 @@ async fn handle_forwarded(
             ..
         }
         | ForwardedAgentEvent::Lagged { .. } => {
-            if reconcile_active(active, state).await? {
+            if reconcile_active(active, state, approval_broker).await? {
                 stop_active(active);
             }
         }
         ForwardedAgentEvent::Closed { .. } => {
-            if reconcile_active(active, state).await? {
+            if reconcile_active(active, state, approval_broker).await? {
                 stop_active(active);
             } else {
                 notice(
@@ -464,7 +506,11 @@ async fn handle_forwarded(
     Ok(())
 }
 
-async fn reconcile_active(active: &mut Option<ActiveRun>, state: &mut UiState) -> Result<bool> {
+async fn reconcile_active(
+    active: &mut Option<ActiveRun>,
+    state: &mut UiState,
+    approval_broker: &Arc<InMemoryHostApprovalBroker>,
+) -> Result<bool> {
     let Some(run) = active.as_mut() else {
         return Ok(false);
     };
@@ -507,12 +553,80 @@ async fn reconcile_active(active: &mut Option<ActiveRun>, state: &mut UiState) -
         }
         _ if state.phase != UiPhase::Cancelling => {
             if let Some(request) = view.pending_requests.first() {
-                project_pending(state, run.handle.run_id(), request);
+                if !try_resolve_remembered_approval(run, state, approval_broker, request).await? {
+                    project_pending(state, run.handle.run_id(), request);
+                }
             }
         }
         _ => {}
     }
     Ok(false)
+}
+
+async fn try_resolve_remembered_approval(
+    run: &mut ActiveRun,
+    state: &mut UiState,
+    approval_broker: &Arc<InMemoryHostApprovalBroker>,
+    request: &PendingRequest,
+) -> Result<bool> {
+    if !matches!(
+        &request.payload,
+        PendingRequestPayload::Approval {
+            session_approval_scope: Some(_),
+            ..
+        }
+    ) {
+        return Ok(false);
+    }
+    let request_key = request.request_id.as_str().to_owned();
+    if run.auto_resolved_approvals.contains(&request_key) {
+        return Ok(true);
+    }
+    let grant_ref =
+        match approval_broker.approve_if_remembered(&request.request_id, approval_expiry_ms()) {
+            Ok(Some(grant_ref)) => grant_ref,
+            Ok(None) => return Ok(false),
+            Err(error) => {
+                notice(
+                    state,
+                    "session-approval-error",
+                    format!("Could not apply remembered approval: {error}"),
+                    true,
+                );
+                return Ok(false);
+            }
+        };
+    let response = RequestResolution::Approval {
+        decision: ApprovalDecision::Allow,
+        grant_ref: Some(grant_ref),
+    };
+    let command = AgentCommandEnvelope::new(
+        next_command_id("session-approval"),
+        run.handle.run_id().clone(),
+        Some(request.request_id.clone()),
+        AgentCommand::ResolveRequest { response },
+    )
+    .context("build remembered TUI approval command")?;
+    let ack = run
+        .handle
+        .command(command)
+        .await
+        .context("resolve remembered TUI approval")?;
+    let accepted = matches!(
+        &ack.state,
+        CommandAckState::Accepted { .. } | CommandAckState::Applied { .. }
+    );
+    project_ack(state, ack, "remembered approval");
+    if accepted {
+        run.auto_resolved_approvals.insert(request_key);
+        update(
+            state,
+            UiMsg::RequestResolved {
+                request_id: request.request_id.as_str().to_owned(),
+            },
+        );
+    }
+    Ok(accepted)
 }
 
 fn project_durable(state: &mut UiState, record: &AgentJournalRecord) -> bool {
@@ -622,6 +736,7 @@ fn project_pending(state: &mut UiState, run_id: &RunId, request: &PendingRequest
         }
         PendingRequestPayload::Approval {
             requested_scope,
+            session_approval_scope,
             reason,
             ..
         } => {
@@ -631,6 +746,7 @@ fn project_pending(state: &mut UiState, run_id: &RunId, request: &PendingRequest
                     run_id: run_id.as_str().to_owned(),
                     request_id: request.request_id.as_str().to_owned(),
                     summary: format!("{reason}\nEffects: {}", requested_scope.join(", ")),
+                    session_approval_available: session_approval_scope.is_some(),
                 },
             );
         }
@@ -797,6 +913,14 @@ fn next_command_id(kind: &str) -> CommandId {
     ))
 }
 
+fn approval_expiry_ms() -> i64 {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    now_ms.saturating_add(5 * 60 * 1_000)
+}
+
 fn stop_active(active: &mut Option<ActiveRun>) {
     if let Some(run) = active.take() {
         run.observer.abort();
@@ -847,6 +971,35 @@ mod tests {
         assert_eq!(
             key_message(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &state),
             Some(UiMsg::SelectApproval(ApprovalChoice::Allow))
+        );
+
+        crate::tui::update(
+            &mut state,
+            UiMsg::WaitingApproval {
+                run_id: "run".to_owned(),
+                request_id: "mcp-approval".to_owned(),
+                summary: "Call a risky MCP Tool".to_owned(),
+                session_approval_available: true,
+            },
+        );
+        assert_eq!(
+            key_message(
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+                &state
+            ),
+            Some(UiMsg::Approval(ApprovalChoice::AllowSession))
+        );
+        assert_eq!(
+            key_message(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &state),
+            Some(UiMsg::SelectApproval(ApprovalChoice::AllowSession))
+        );
+        crate::tui::update(
+            &mut state,
+            UiMsg::SelectApproval(ApprovalChoice::AllowSession),
+        );
+        assert_eq!(
+            key_message(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &state),
+            Some(UiMsg::SelectApproval(ApprovalChoice::Deny))
         );
     }
 

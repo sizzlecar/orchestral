@@ -1,12 +1,12 @@
 //! Host-owned bridge from Agent approval requests to Tool capabilities.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use orchestral_core::agent_protocol::wire::{ApprovalGrantRef, RequestId};
+use orchestral_core::agent_protocol::wire::{ApprovalGrantRef, Digest, RequestId};
 use orchestral_core::tool_protocol::{
-    ApprovalBinding, ApprovalCapability, HostApprovalIssuer, ToolProtocolError,
+    ApprovalBinding, ApprovalCapability, HostApprovalIssuer, ToolId, ToolProtocolError,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -20,6 +20,8 @@ pub enum ApprovalBridgeError {
     RequestNotFound(RequestId),
     #[error("approval grant was not found or did not match its operation: {0}")]
     GrantMismatch(ApprovalGrantRef),
+    #[error("approval request cannot be remembered for this session: {0}")]
+    SessionScopeUnavailable(RequestId),
     #[error("approval bridge state is unavailable")]
     Unavailable,
 }
@@ -56,11 +58,44 @@ struct StoredGrant {
     capability: ApprovalCapability,
 }
 
+/// A remembered decision is narrower than a Tool and wider than one exact
+/// invocation. Tool planners opt in with a sealed review scope; the Host also
+/// binds policy and capability shape so a wider operation cannot inherit it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SessionApprovalKey {
+    tool_id: ToolId,
+    review_scope: Digest,
+    capabilities_digest: Digest,
+    permission_digest: Digest,
+    policy_digest: Digest,
+}
+
+fn session_approval_key(
+    binding: &ApprovalBinding,
+) -> Result<Option<SessionApprovalKey>, ApprovalBridgeError> {
+    let Some(review_scope) = binding.session_approval_scope.clone() else {
+        return Ok(None);
+    };
+    if !review_scope.is_sha256() {
+        return Err(ApprovalBridgeError::Invalid(
+            "session approval scope must be a SHA-256 digest".to_owned(),
+        ));
+    }
+    Ok(Some(SessionApprovalKey {
+        tool_id: binding.tool_id.clone(),
+        review_scope,
+        capabilities_digest: binding.requested_capabilities.digest()?,
+        permission_digest: binding.permission_digest.clone(),
+        policy_digest: binding.policy_digest.clone(),
+    }))
+}
+
 #[derive(Default)]
 struct BrokerState {
     pending: BTreeMap<RequestId, ApprovalBinding>,
     issued_by_request: BTreeMap<RequestId, ApprovalGrantRef>,
     grants: BTreeMap<ApprovalGrantRef, StoredGrant>,
+    session_approvals: BTreeSet<SessionApprovalKey>,
 }
 
 /// Minimal embedded Host implementation used by CLI and tests.
@@ -89,6 +124,64 @@ impl InMemoryHostApprovalBroker {
             .state
             .lock()
             .map_err(|_| ApprovalBridgeError::Unavailable)?;
+        self.issue_exact(&mut state, request_id, expires_at_unix_ms)
+    }
+
+    /// Remembers the Host user's decision for this Tool-defined review class,
+    /// then issues a fresh exact grant for the current request.
+    pub fn approve_for_session(
+        &self,
+        request_id: &RequestId,
+        expires_at_unix_ms: i64,
+    ) -> Result<ApprovalGrantRef, ApprovalBridgeError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ApprovalBridgeError::Unavailable)?;
+        let binding = state
+            .pending
+            .get(request_id)
+            .cloned()
+            .ok_or_else(|| ApprovalBridgeError::RequestNotFound(request_id.clone()))?;
+        let key = session_approval_key(&binding)?
+            .ok_or_else(|| ApprovalBridgeError::SessionScopeUnavailable(request_id.clone()))?;
+        let grant_ref = self.issue_exact(&mut state, request_id, expires_at_unix_ms)?;
+        state.session_approvals.insert(key);
+        Ok(grant_ref)
+    }
+
+    /// Issues a new exact single-use grant when an equivalent review class was
+    /// approved earlier in this Host session.
+    pub fn approve_if_remembered(
+        &self,
+        request_id: &RequestId,
+        expires_at_unix_ms: i64,
+    ) -> Result<Option<ApprovalGrantRef>, ApprovalBridgeError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ApprovalBridgeError::Unavailable)?;
+        let binding = state
+            .pending
+            .get(request_id)
+            .cloned()
+            .ok_or_else(|| ApprovalBridgeError::RequestNotFound(request_id.clone()))?;
+        let Some(key) = session_approval_key(&binding)? else {
+            return Ok(None);
+        };
+        if !state.session_approvals.contains(&key) {
+            return Ok(None);
+        }
+        self.issue_exact(&mut state, request_id, expires_at_unix_ms)
+            .map(Some)
+    }
+
+    fn issue_exact(
+        &self,
+        state: &mut BrokerState,
+        request_id: &RequestId,
+        expires_at_unix_ms: i64,
+    ) -> Result<ApprovalGrantRef, ApprovalBridgeError> {
         if let Some(existing) = state.issued_by_request.get(request_id) {
             return Ok(existing.clone());
         }
@@ -201,6 +294,7 @@ mod tests {
             requested_capabilities: CapabilityRequest::from_effects(BTreeSet::from([
                 EffectScope::Process,
             ])),
+            session_approval_scope: None,
             policy_digest: Digest::sha256("policy"),
         };
         broker.stage(&request_id, binding.clone()).await.unwrap();
@@ -227,6 +321,7 @@ mod tests {
             requested_capabilities: CapabilityRequest::from_effects(BTreeSet::from([
                 EffectScope::Process,
             ])),
+            session_approval_scope: None,
             policy_digest: Digest::sha256("policy"),
         };
         let second = ApprovalBinding {
@@ -248,5 +343,77 @@ mod tests {
             broker.resolve(&first_request, &grant_ref, &first).await,
             Err(ApprovalBridgeError::GrantMismatch(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn remembered_decision_issues_fresh_exact_grants_for_the_same_review_scope() {
+        let broker = InMemoryHostApprovalBroker::new(b"0123456789abcdef0123456789abcdef").unwrap();
+        let first_request = RequestId::new("request-1");
+        let second_request = RequestId::new("request-2");
+        let first = ApprovalBinding {
+            run_id: RunId::new("run-1"),
+            call_id: ToolCallId::new("call-1"),
+            tool_id: ToolId::new("mcp/seekee/run/v1"),
+            args_digest: Digest::sha256("args-1"),
+            operation_digest: Digest::sha256("operation-1"),
+            permission_digest: Digest::sha256("permission"),
+            requested_capabilities: CapabilityRequest::from_effects(BTreeSet::from([
+                EffectScope::ExternalSideEffect,
+            ])),
+            session_approval_scope: Some(Digest::sha256("seekee/run/schema")),
+            policy_digest: Digest::sha256("policy"),
+        };
+        broker.stage(&first_request, first.clone()).await.unwrap();
+        let first_ref = broker
+            .approve_for_session(&first_request, i64::MAX)
+            .unwrap();
+        let first_capability = broker
+            .resolve(&first_request, &first_ref, &first)
+            .await
+            .unwrap();
+
+        let second = ApprovalBinding {
+            run_id: RunId::new("run-2"),
+            call_id: ToolCallId::new("call-2"),
+            args_digest: Digest::sha256("args-2"),
+            operation_digest: Digest::sha256("operation-2"),
+            ..first.clone()
+        };
+        broker.stage(&second_request, second.clone()).await.unwrap();
+        let second_ref = broker
+            .approve_if_remembered(&second_request, i64::MAX)
+            .unwrap()
+            .expect("same review scope should be remembered");
+        let second_capability = broker
+            .resolve(&second_request, &second_ref, &second)
+            .await
+            .unwrap();
+
+        assert_eq!(second_capability.claims.binding, second);
+        assert_ne!(
+            first_capability.claims.nonce, second_capability.claims.nonce,
+            "remembered decisions must not reuse a capability"
+        );
+
+        let changed_scope_request = RequestId::new("request-3");
+        let changed_scope = ApprovalBinding {
+            run_id: RunId::new("run-3"),
+            call_id: ToolCallId::new("call-3"),
+            args_digest: Digest::sha256("args-3"),
+            operation_digest: Digest::sha256("operation-3"),
+            session_approval_scope: Some(Digest::sha256("seekee/run/changed-schema")),
+            ..first
+        };
+        broker
+            .stage(&changed_scope_request, changed_scope)
+            .await
+            .unwrap();
+        assert!(
+            broker
+                .approve_if_remembered(&changed_scope_request, i64::MAX)
+                .unwrap()
+                .is_none(),
+            "a changed Tool schema must require a new review"
+        );
     }
 }

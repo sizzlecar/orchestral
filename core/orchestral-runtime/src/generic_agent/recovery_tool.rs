@@ -132,7 +132,7 @@ pub(super) async fn resume_observed_tool(
                         .invoke(
                             invocation,
                             tools.run_grant.clone(),
-                            Some(capability),
+                            Some(*capability),
                             cancellation.clone(),
                         )
                         .await
