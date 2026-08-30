@@ -414,29 +414,39 @@ impl ProcessSupervisor {
             ));
         }
         let session = self.session(run_id, session_id)?;
-        if input.is_some_and(|input| !input.is_empty()) {
+        let requested_input = input.filter(|input| !input.is_empty());
+        let input_to_deliver = if requested_input.is_some() {
             match session.lifecycle.status()? {
-                ExecSessionStatus::Running => {}
-                ExecSessionStatus::Exited { .. } => {
-                    return Err(ExecProcessError::Io(
-                        "exec process has already exited".to_owned(),
-                    ))
-                }
+                ExecSessionStatus::Running => requested_input,
+                // A process can exit after exec_command reports it as alive but
+                // before the model's follow-up write arrives. Preserve the
+                // terminal observation instead of turning that normal race into
+                // a Tool failure.
+                ExecSessionStatus::Exited { .. } => None,
                 ExecSessionStatus::Terminated => return Err(ExecProcessError::Cancelled),
                 ExecSessionStatus::Failed { message } => return Err(ExecProcessError::Io(message)),
             }
-        }
+        } else {
+            None
+        };
         let result = match session.process.clone() {
             ManagedProcess::Pipe(process) => {
-                if let Some(input) = input {
-                    process.send(input).await?;
+                if let Some(input) = input_to_deliver {
+                    if let Err(error) = process.send(input).await {
+                        if !matches!(
+                            session.lifecycle.status()?,
+                            ExecSessionStatus::Exited { .. }
+                        ) {
+                            return Err(error);
+                        }
+                    }
                 }
                 process
                     .poll(&session.lifecycle, session.started, wait, cancellation)
                     .await?
             }
             ManagedProcess::Pty { process_id } => {
-                if let Some(input) = input.filter(|input| !input.is_empty()) {
+                if let Some(input) = input_to_deliver {
                     let pty = self.pty.clone();
                     let run_id = run_id.clone();
                     let process_id = process_id.clone();
@@ -685,15 +695,15 @@ fn spawn_exit_watcher(
             };
             match observed {
                 Ok(Some(exit_code)) => {
-                    if let ManagedProcess::Pipe(process) = &session.process {
-                        process.stdin.lock().await.take();
-                    }
                     let _ = transition_session(
                         &events,
                         &key,
                         &session,
                         ExecSessionStatus::Exited { exit_code },
                     );
+                    if let ManagedProcess::Pipe(process) = &session.process {
+                        process.stdin.lock().await.take();
+                    }
                     return;
                 }
                 Ok(None) => {}

@@ -19,8 +19,9 @@ use orchestral_core::tool_protocol::{
 #[cfg(target_os = "macos")]
 use orchestral_runtime::tools::{
     guarded_exec_command_descriptor, guarded_write_stdin_descriptor,
-    workspace_exec_command_descriptor, CommandEnvironmentSnapshot, GuardedExecCommandExecutor,
-    GuardedWriteStdinExecutor, GUARDED_EXEC_SANDBOX_PROFILE,
+    workspace_exec_command_descriptor, workspace_write_stdin_descriptor,
+    CommandEnvironmentSnapshot, GuardedExecCommandExecutor, GuardedWriteStdinExecutor,
+    GUARDED_EXEC_SANDBOX_PROFILE,
 };
 use orchestral_runtime::{ExecProcessError, ExecSessionStatus, ExecSpawnSpec, ProcessSupervisor};
 #[cfg(target_os = "macos")]
@@ -285,18 +286,85 @@ async fn process_supervisor_observes_and_reaps_pipe_exit_without_model_polling()
         .write_and_poll(
             &run_id,
             session_id,
-            None,
+            Some("\u{3}"),
             Duration::from_secs(1),
             &CancellationToken::new(),
         )
         .await
-        .expect("terminal output remains retrievable once");
+        .expect("an input/exit race returns terminal output once");
     assert_eq!(final_result.stdout, "supervised-output");
     assert_eq!(final_result.exit_code, Some(0));
     assert!(matches!(
         manager.snapshot(&run_id, session_id),
         Err(ExecProcessError::NotFound(_))
     ));
+    std::fs::remove_dir_all(parent).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn guarded_write_stdin_observes_an_exit_race_without_requesting_input_authority() {
+    let parent = std::env::temp_dir().join(format!(
+        "orchestral-exec-exit-race-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&parent).unwrap();
+    let workspace = std::fs::canonicalize(&parent).unwrap();
+    let shell = std::fs::canonicalize("/bin/sh").unwrap();
+    let bounds = bounds(&workspace, &shell);
+    let runtime = runtime(bounds.clone());
+    let manager = Arc::new(ProcessSupervisor::new(16 * 1024).unwrap());
+    runtime
+        .register(
+            workspace_write_stdin_descriptor(ToolRestriction {
+                bounds: bounds.clone(),
+            }),
+            Arc::new(GuardedWriteStdinExecutor::new(manager.clone())),
+        )
+        .unwrap();
+
+    let run_id = RunId::new("guarded-exit-race");
+    let mut events = manager.subscribe();
+    let session_id = manager
+        .spawn(ExecSpawnSpec {
+            run_id: run_id.clone(),
+            program: shell.to_string_lossy().into_owned(),
+            args: vec!["-c".to_owned(), "printf final-output".to_owned()],
+            cwd: workspace.clone(),
+            environment: BTreeMap::new(),
+            tty: false,
+            backend_starts_new_session: false,
+            operation: test_operation("run a finite process"),
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if events.recv().await.unwrap().snapshot.status.is_terminal() {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("process exit is observed");
+
+    let result = runtime
+        .invoke(
+            invocation(
+                "guarded-exit-race",
+                "interrupt-after-exit",
+                "orchestral/write_stdin/v1",
+                json!({ "session_id": session_id.get(), "chars": "\u{3}" }),
+            ),
+            RunToolGrant { bounds },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    let output = inline_output(result);
+    assert_eq!(output["exit_code"], json!(0));
+    assert_eq!(output["output"], json!("final-output"));
+    assert!(manager.list(&run_id).unwrap().is_empty());
     std::fs::remove_dir_all(parent).unwrap();
 }
 

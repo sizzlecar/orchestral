@@ -651,16 +651,20 @@ impl GuardedToolExecutor for GuardedWriteStdinExecutor {
             .manager
             .snapshot(&invocation.run_id, session_id)
             .map_err(|error| rejected("exec_session_unavailable", error.to_string()))?;
-        if has_input && snapshot.status != ExecSessionStatus::Running {
+        let session_is_running = snapshot.status == ExecSessionStatus::Running;
+        let session_has_exited = matches!(snapshot.status, ExecSessionStatus::Exited { .. });
+        if has_input && !session_is_running && !session_has_exited {
             return Err(rejected(
-                "exec_session_exited",
-                "cannot send input to a terminal exec session",
+                "exec_session_terminal",
+                "cannot send input because the exec session is no longer running",
             ));
         }
         let origin = snapshot.operation;
         // Input can trigger only the authority already held by this exact
-        // supervised process. A pure poll cannot trigger new process behavior.
-        let mut required_capabilities = if has_input {
+        // supervised process. A pure poll, including observation after an exit
+        // race, cannot trigger new process behavior.
+        let input_will_be_delivered = has_input && session_is_running;
+        let mut required_capabilities = if input_will_be_delivered {
             origin.required_capabilities
         } else {
             CapabilityRequest::from_effects(BTreeSet::from([EffectScope::Process]))
@@ -670,7 +674,7 @@ impl GuardedToolExecutor for GuardedWriteStdinExecutor {
             .get("chars")
             .and_then(Value::as_str)
             .map(display_payload);
-        if has_input {
+        if input_will_be_delivered {
             required_capabilities.insert_resource(
                 EffectScope::ExternalSideEffect,
                 CapabilitySelector::Exact(format!("exec-session:{}", session_id.get())),
@@ -678,12 +682,17 @@ impl GuardedToolExecutor for GuardedWriteStdinExecutor {
         }
         let operation = ToolOperationPlan {
             required_capabilities,
-            risk: if has_input {
+            risk: if input_will_be_delivered {
                 ToolOperationRisk::Elevated
             } else {
                 ToolOperationRisk::Routine
             },
-            summary: if let Some(input) = input_preview {
+            summary: if has_input && session_has_exited {
+                format!(
+                    "Read final output from exited exec session {}; requested input will not be delivered",
+                    session_id.get()
+                )
+            } else if let Some(input) = input_preview {
                 format!("Send input to exec session {}: {input}", session_id.get())
             } else {
                 format!("Poll exec session {}", session_id.get())
@@ -838,9 +847,12 @@ fn build_write_stdin_descriptor(mut restriction: ToolRestriction) -> ToolDescrip
         tool_id: ToolId::new("orchestral/write_stdin/v1"),
         model_schema: ModelToolSchema {
             name: "write_stdin".to_owned(),
-            description:
-                "Send characters to a running exec session, or omit chars to poll for new output."
-                    .to_owned(),
+            description: concat!(
+                "Send characters to a running exec session, or omit chars to poll for new output. ",
+                "If the process exits before input can be delivered, the call returns its final ",
+                "output and exit status instead of failing."
+            )
+            .to_owned(),
             input_schema: json!({
                 "type": "object",
                 "required": ["session_id"],
