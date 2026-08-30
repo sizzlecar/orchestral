@@ -372,7 +372,14 @@ fn build_macos_profile(
     }
     match &policy.network {
         SandboxNetworkAccess::Disabled => {}
-        SandboxNetworkAccess::Unrestricted => profile.push_str("(allow network-outbound)\n"),
+        SandboxNetworkAccess::Unrestricted => {
+            profile.push_str("(allow network-outbound)\n");
+            // OAuth-style local MCP authentication needs an ephemeral loopback
+            // callback listener. Keep inbound authority on localhost even when
+            // outbound access is unrestricted.
+            profile.push_str("(allow network-bind (local ip \"localhost:*\"))\n");
+            profile.push_str("(allow network-inbound (local ip \"localhost:*\"))\n");
+        }
         SandboxNetworkAccess::ExactTargets(targets) => {
             for target in targets {
                 let (host, _) = target
@@ -389,6 +396,27 @@ fn build_macos_profile(
                 ));
             }
         }
+    }
+    if !policy.network.is_disabled() {
+        // Socket permission alone is insufficient on macOS. Native TLS and
+        // DNS clients consult these Host services through Mach and AF_SYSTEM;
+        // denying them surfaces only as a generic HTTP transport error.
+        profile.push_str(
+            r#"(allow system-socket
+  (require-all
+    (socket-domain AF_SYSTEM)
+    (socket-protocol 2)))
+(allow mach-lookup
+  (global-name "com.apple.bsd.dirhelper")
+  (global-name "com.apple.system.opendirectoryd.membership")
+  (global-name "com.apple.SecurityServer")
+  (global-name "com.apple.networkd")
+  (global-name "com.apple.ocspd")
+  (global-name "com.apple.trustd.agent")
+  (global-name "com.apple.SystemConfiguration.DNSConfiguration")
+  (global-name "com.apple.SystemConfiguration.configd"))
+"#,
+        );
     }
     profile.push_str("(allow sysctl-read)\n");
 
@@ -1006,6 +1034,60 @@ mod tests {
         };
         let profile = build_macos_profile(&spec, &policy).unwrap();
         assert!(profile.contains("(allow network-outbound)"));
+        assert!(profile.contains("(allow network-bind (local ip \"localhost:*\"))"));
+        assert!(profile.contains("(allow network-inbound (local ip \"localhost:*\"))"));
+        assert!(profile.contains("com.apple.SystemConfiguration.DNSConfiguration"));
+        assert!(profile.contains("com.apple.SecurityServer"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn approved_unrestricted_network_supports_a_loopback_oauth_callback() {
+        let (parent, workspace, _) = isolated_test_roots("oauth-callback");
+        let python = std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .map(|directory| directory.join("python3"))
+            .find(|candidate| candidate.is_file())
+            .map(|candidate| std::fs::canonicalize(candidate).unwrap())
+            .expect("python3 is installed for the sandbox callback test");
+        let code = concat!(
+            "import socket; ",
+            "listener=socket.socket(); listener.bind(('127.0.0.1', 0)); listener.listen(1); ",
+            "client=socket.create_connection(listener.getsockname(), 1); ",
+            "server,_=listener.accept(); client.sendall(b'X'); ",
+            "assert server.recv(1)==b'X'; print('CALLBACK_OK')",
+        );
+        let mut readable_roots = vec![workspace.clone()];
+        for candidate in ["/usr", "/opt/homebrew", "/Library", "/System/Library"] {
+            if let Ok(path) = std::fs::canonicalize(candidate) {
+                readable_roots.push(path);
+            }
+        }
+        let command = sandbox_command(
+            python.to_string_lossy().into_owned(),
+            vec!["-c".to_owned(), code.to_owned()],
+            &workspace,
+            &ShellSandboxPolicy {
+                readable_roots,
+                readable_files: Vec::new(),
+                writable_roots: vec![workspace.clone()],
+                allow_child_processes: true,
+                launcher_programs: vec![python],
+                network: SandboxNetworkAccess::Unrestricted,
+                linux_bwrap_path: None,
+            },
+        )
+        .unwrap();
+
+        let output = run_sandboxed(command, &workspace);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("CALLBACK_OK"));
+        std::fs::remove_dir_all(parent).unwrap();
     }
 
     #[cfg(target_os = "linux")]
