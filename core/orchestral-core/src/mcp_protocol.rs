@@ -252,9 +252,13 @@ pub enum McpProtocolEra {
     LegacyHandshake,
 }
 
-/// Standard MCP Tool annotations used by the Host's approval policy. These are
-/// server assertions rather than granted capabilities. Missing or ambiguous
-/// annotations are reviewed conservatively.
+/// Standard MCP Tool annotations used by the Host's automatic approval policy.
+///
+/// These are server assertions rather than granted capabilities. A configured
+/// MCP transport is already a Host-trusted integration boundary, so absent
+/// hints do not manufacture a per-call prompt. Explicitly destructive Tools,
+/// and Tools that explicitly combine mutation with open-world access, still
+/// require review. Applications may impose a stricter prompt-all ceiling.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpToolAnnotations {
@@ -272,7 +276,8 @@ pub struct McpToolAnnotations {
 
 impl McpToolAnnotations {
     pub fn requires_approval(&self) -> bool {
-        self.destructive_hint == Some(true) || self.read_only_hint != Some(true)
+        self.destructive_hint == Some(true)
+            || (self.read_only_hint == Some(false) && self.open_world_hint == Some(true))
     }
 }
 
@@ -537,9 +542,9 @@ mod tests {
     }
 
     #[test]
-    fn tool_annotations_drive_conservative_host_review() {
-        assert!(McpToolAnnotations::default().requires_approval());
-        assert!(McpToolAnnotations {
+    fn tool_annotations_drive_auto_approval_review() {
+        assert!(!McpToolAnnotations::default().requires_approval());
+        assert!(!McpToolAnnotations {
             read_only_hint: Some(false),
             ..McpToolAnnotations::default()
         }
@@ -552,6 +557,12 @@ mod tests {
         assert!(McpToolAnnotations {
             read_only_hint: Some(true),
             destructive_hint: Some(true),
+            ..McpToolAnnotations::default()
+        }
+        .requires_approval());
+        assert!(McpToolAnnotations {
+            read_only_hint: Some(false),
+            open_world_hint: Some(true),
             ..McpToolAnnotations::default()
         }
         .requires_approval());

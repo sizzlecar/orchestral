@@ -1412,6 +1412,40 @@ struct GuardedMcpToolExecutor {
     annotations: McpToolAnnotations,
 }
 
+/// Describes the business operation initiated through an already-authorized
+/// MCP transport. Process launch, transport cache roots, environment, and
+/// credentials belong to the immutable server binding and must not be copied
+/// into every user-facing Tool approval request.
+fn mcp_operation_capabilities(
+    config: &GuardedMcpServerConfig,
+    tool_name: &str,
+    annotations: &McpToolAnnotations,
+) -> CapabilityRequest {
+    let transport_effects = config.effect_scopes();
+    let mut required = CapabilityRequest::default();
+
+    if transport_effects.contains(&EffectScope::Network) {
+        if config.allows_unrestricted_network() {
+            required.insert_resource(EffectScope::Network, CapabilitySelector::Unrestricted);
+        } else {
+            for target in config.allowed_network_targets() {
+                required.insert_resource(EffectScope::Network, CapabilitySelector::Exact(target));
+            }
+        }
+    }
+
+    let can_change_external_state =
+        annotations.read_only_hint != Some(true) || annotations.destructive_hint == Some(true);
+    if can_change_external_state && transport_effects.contains(&EffectScope::ExternalSideEffect) {
+        required.insert_resource(
+            EffectScope::ExternalSideEffect,
+            CapabilitySelector::Exact(format!("mcp:{}:{tool_name}", config.server_id)),
+        );
+    }
+
+    required
+}
+
 #[async_trait]
 impl GuardedToolExecutor for GuardedMcpToolExecutor {
     fn planning_contract(&self) -> Value {
@@ -1438,57 +1472,8 @@ impl GuardedToolExecutor for GuardedMcpToolExecutor {
         descriptor: &ToolDescriptor,
         _effective_policy: &orchestral_core::tool_protocol::EffectiveToolPolicy,
     ) -> Result<ToolOperationPlan, ToolOutcome> {
-        let mut required_capabilities =
-            CapabilityRequest::from_effects(self.manager.config.effect_scopes());
-        for program in self.manager.config.allowed_programs() {
-            required_capabilities
-                .insert_resource(EffectScope::Process, CapabilitySelector::Exact(program));
-        }
-        for root in self.manager.config.filesystem_read_roots() {
-            required_capabilities.insert_resource(
-                EffectScope::FilesystemRead,
-                CapabilitySelector::Subtree(root),
-            );
-        }
-        for root in self.manager.config.filesystem_write_roots() {
-            required_capabilities.insert_resource(
-                EffectScope::FilesystemWrite,
-                CapabilitySelector::Subtree(root),
-            );
-        }
-        if self.manager.config.allows_unrestricted_network() {
-            required_capabilities
-                .insert_resource(EffectScope::Network, CapabilitySelector::Unrestricted);
-        } else {
-            for target in self.manager.config.allowed_network_targets() {
-                required_capabilities
-                    .insert_resource(EffectScope::Network, CapabilitySelector::Exact(target));
-            }
-        }
-        for name in self.manager.config.environment_names() {
-            required_capabilities.insert_resource(
-                EffectScope::EnvironmentRead,
-                CapabilitySelector::Exact(name),
-            );
-        }
-        for reference in self.manager.config.credential_references() {
-            required_capabilities.insert_resource(
-                EffectScope::SecretRead,
-                CapabilitySelector::Exact(reference),
-            );
-        }
-        if required_capabilities
-            .effects
-            .contains(&EffectScope::ExternalSideEffect)
-        {
-            required_capabilities.insert_resource(
-                EffectScope::ExternalSideEffect,
-                CapabilitySelector::Exact(format!(
-                    "mcp:{}:{}",
-                    self.manager.config.server_id, self.tool_name
-                )),
-            );
-        }
+        let required_capabilities =
+            mcp_operation_capabilities(&self.manager.config, &self.tool_name, &self.annotations);
         let operation = ToolOperationPlan {
             required_capabilities,
             risk: if self.annotations.destructive_hint == Some(true) {
@@ -1644,9 +1629,41 @@ fn validate_mcp_call_result(
         }
     }
     if result.get("isError").and_then(Value::as_bool) == Some(true) {
-        return Err(GuardedMcpCallError::ToolError(result.to_string()));
+        return Err(GuardedMcpCallError::ToolError(mcp_tool_error_message(
+            &result,
+        )));
     }
     Ok(result)
+}
+
+/// MCP Tool failures commonly carry actionable JSON inside text content. Keep
+/// that payload readable for both the model and TUI instead of stringifying
+/// the whole `CallToolResult`, which double-escapes the actual error.
+fn mcp_tool_error_message(result: &Value) -> String {
+    if let Some(structured) = result
+        .get("structuredContent")
+        .filter(|value| !value.is_null())
+    {
+        return serde_json::to_string(structured).unwrap_or_else(|_| structured.to_string());
+    }
+
+    let text = result
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            (item.get("type").and_then(Value::as_str) == Some("text"))
+                .then(|| item.get("text").and_then(Value::as_str))
+                .flatten()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !text.trim().is_empty() {
+        text
+    } else {
+        result.to_string()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2753,6 +2770,148 @@ mod mcp_lifecycle_gate_tests {
         bounds.environment.allowed_variables = authority.environment_variables.clone();
         bounds.allowed_credentials = authority.credential_references.clone();
         bounds
+    }
+
+    #[test]
+    fn mcp_operation_does_not_reapprove_transport_authority() {
+        let factory = FaultFactory::new(FaultStage::Healthy);
+        let config = fault_config(factory, Duration::from_secs(1));
+
+        let unknown = mcp_operation_capabilities(&config, "run", &McpToolAnnotations::default());
+        assert_eq!(
+            unknown.effects,
+            BTreeSet::from([EffectScope::ExternalSideEffect])
+        );
+        assert!(!unknown.effects.contains(&EffectScope::Process));
+        assert!(!unknown.effects.contains(&EffectScope::FilesystemRead));
+        assert!(!unknown.effects.contains(&EffectScope::FilesystemWrite));
+        assert!(!unknown.effects.contains(&EffectScope::SecretRead));
+
+        let read_only = mcp_operation_capabilities(
+            &config,
+            "lookup",
+            &McpToolAnnotations {
+                read_only_hint: Some(true),
+                ..McpToolAnnotations::default()
+            },
+        );
+        assert!(read_only.effects.is_empty());
+        assert!(read_only.resources.is_empty());
+    }
+
+    #[test]
+    fn mcp_operation_keeps_logical_network_effect_without_transport_secrets() {
+        let factory = FaultFactory::new(FaultStage::Discover);
+        let config = fault_config(factory, Duration::from_secs(1));
+        let request = mcp_operation_capabilities(
+            &config,
+            "lookup",
+            &McpToolAnnotations {
+                read_only_hint: Some(true),
+                ..McpToolAnnotations::default()
+            },
+        );
+
+        assert_eq!(request.effects, BTreeSet::from([EffectScope::Network]));
+        assert_eq!(
+            request
+                .resources_for(EffectScope::Network)
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([CapabilitySelector::Exact(
+                "http://127.0.0.1/fault-mcp".to_owned()
+            )])
+        );
+    }
+
+    #[test]
+    fn mcp_tool_error_prefers_structured_content_then_plain_text() {
+        assert_eq!(
+            mcp_tool_error_message(&json!({
+                "structuredContent": {"error": {"code": "bad_args"}},
+                "content": [{"type": "text", "text": "fallback"}],
+                "isError": true
+            })),
+            r#"{"error":{"code":"bad_args"}}"#
+        );
+        assert_eq!(
+            mcp_tool_error_message(&json!({
+                "content": [
+                    {"type": "text", "text": "first"},
+                    {"type": "image", "data": "ignored"},
+                    {"type": "text", "text": "second"}
+                ],
+                "isError": true
+            })),
+            "first\nsecond"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_auto_policy_runs_unannotated_registered_mcp_without_prompt() {
+        let factory = FaultFactory::new(FaultStage::Healthy);
+        let config = fault_config(factory.clone(), Duration::from_secs(1));
+        let mut bounds = authority_bounds(factory.authority());
+        bounds.approval = ApprovalPolicy::NotRequired;
+        let journal = Arc::new(InMemoryToolEffectJournalStore::default());
+        let verifier =
+            HostApprovalVerifier::new(GATE_SIGNING_KEY, InMemoryApprovalCapabilityStore::default())
+                .unwrap();
+        let runtime = Arc::new(
+            GuardedToolRuntime::new_with_effect_journal(
+                HostToolPolicy {
+                    bounds: bounds.clone(),
+                },
+                verifier,
+                journal.clone(),
+            )
+            .unwrap()
+            .with_permission_policy(Arc::new(crate::tool_runtime::WorkspacePermissionPolicy)),
+        );
+        let registry = McpToolsAdapterRegistry::register(
+            runtime.as_ref(),
+            vec![config],
+            ToolRestriction {
+                bounds: bounds.clone(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let run_id = RunId::new("auto-mcp");
+        let call_id = ToolCallId::new("call-1");
+        let result = runtime
+            .invoke(
+                ToolInvocation {
+                    run_id: run_id.clone(),
+                    call_id: call_id.clone(),
+                    tool_id: ToolId::new("mcp/fault-healthy/echo/v1"),
+                    arguments: json!({}),
+                },
+                RunToolGrant {
+                    bounds: bounds.clone(),
+                },
+                None,
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            GuardedToolResult::Outcome {
+                outcome: ToolOutcome::Completed { .. },
+                cached: false
+            }
+        ));
+        let key = ToolEffectKey::new(run_id, call_id);
+        let records = journal.load_effect(&key).await.unwrap();
+        let projection = replay_tool_effect(&key, &records).unwrap().unwrap();
+        assert_eq!(
+            projection.prepared.effect_scopes,
+            BTreeSet::from([EffectScope::ExternalSideEffect])
+        );
+        registry.shutdown().await;
+        factory.state.assert_released();
     }
 
     fn gate_runtime(
