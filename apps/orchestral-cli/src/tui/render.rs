@@ -6,7 +6,9 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use super::activity::{ActivityDetail, ActivityDetailStyle, ActivityStatus};
-use super::state::{PendingOverlay, TranscriptEntry, TranscriptRole, UiPhase, UiState};
+use super::state::{
+    ApprovalChoice, PendingOverlay, TranscriptEntry, TranscriptRole, UiPhase, UiState,
+};
 
 const MUTED: Style = Style::new().fg(Color::DarkGray);
 const ACCENT: Style = Style::new().fg(Color::Cyan);
@@ -48,7 +50,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, state: &UiState) {
     render_transcript(frame, rows[1], state);
     render_working_status(frame, rows[2], state);
     if let Some(pending) = &state.pending {
-        render_pending(frame, rows[3], pending);
+        render_pending(frame, rows[3], pending, state.approval_choice);
     }
     render_composer(frame, rows[4], state);
     render_footer(frame, rows[5], state);
@@ -632,26 +634,145 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         ),
         prompt_area,
     );
-    let content = if state.composer.is_empty() {
-        Text::from(Line::from(Span::styled(
-            composer_placeholder(state.phase),
-            MUTED.add_modifier(Modifier::ITALIC),
-        )))
+    let mut cursor = None;
+    if state.composer.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Text::from(Line::from(Span::styled(
+                composer_placeholder(state.phase),
+                MUTED.add_modifier(Modifier::ITALIC),
+            )))),
+            content_area,
+        );
     } else {
-        Text::styled(state.composer.clone(), ASSISTANT)
-    };
-    frame.render_widget(
-        Paragraph::new(content).wrap(Wrap { trim: false }),
-        content_area,
-    );
+        let layout = composer_layout(
+            &state.composer,
+            state.composer_cursor,
+            usize::from(content_area.width.max(1)),
+        );
+        let scroll = layout.scroll_for_height(usize::from(content_area.height.max(1)));
+        cursor = Some((
+            layout.cursor_column,
+            layout.cursor_row.saturating_sub(scroll),
+        ));
+        frame.render_widget(
+            Paragraph::new(Text::from(
+                layout
+                    .lines
+                    .into_iter()
+                    .map(|line| Line::styled(line, ASSISTANT))
+                    .collect::<Vec<_>>(),
+            ))
+            .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
+            content_area,
+        );
+    }
 
     if !matches!(state.phase, UiPhase::WaitingApproval | UiPhase::Cancelling)
         && content_area.width > 0
         && content_area.height > 0
     {
-        let (x, y) = composer_cursor(state, content_area);
-        frame.set_cursor_position((x, y));
+        let (column, row) = cursor.unwrap_or_default();
+        frame.set_cursor_position((
+            content_area.x
+                + u16::try_from(column)
+                    .unwrap_or(u16::MAX)
+                    .min(content_area.width - 1),
+            content_area.y
+                + u16::try_from(row)
+                    .unwrap_or(u16::MAX)
+                    .min(content_area.height - 1),
+        ));
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ComposerLayout {
+    lines: Vec<String>,
+    cursor_row: usize,
+    cursor_column: usize,
+}
+
+impl ComposerLayout {
+    fn scroll_for_height(&self, height: usize) -> usize {
+        self.cursor_row.saturating_sub(height.saturating_sub(1))
+    }
+}
+
+fn composer_layout(value: &str, cursor: usize, width: usize) -> ComposerLayout {
+    let width = width.max(1);
+    let cursor = floor_char_boundary(value, cursor.min(value.len()));
+    let mut lines = Vec::new();
+    let mut cursor_position = None;
+    let mut source_offset = 0_usize;
+    let logical_lines = value.split('\n').collect::<Vec<_>>();
+
+    for (logical_index, logical_line) in logical_lines.iter().enumerate() {
+        let mut rendered_line = String::new();
+        let mut rendered_width = 0_usize;
+        let mut grapheme_offset = 0_usize;
+        let span = Span::raw(*logical_line);
+
+        for grapheme in span.styled_graphemes(Style::default()) {
+            let relative_start = logical_line[grapheme_offset..]
+                .find(grapheme.symbol)
+                .map_or(grapheme_offset, |found| grapheme_offset + found);
+            let relative_end = relative_start.saturating_add(grapheme.symbol.len());
+            let grapheme_width = UnicodeWidthStr::width(grapheme.symbol);
+
+            if rendered_width > 0 && rendered_width.saturating_add(grapheme_width) > width {
+                lines.push(std::mem::take(&mut rendered_line));
+                rendered_width = 0;
+            }
+
+            let grapheme_start = source_offset.saturating_add(relative_start);
+            let grapheme_end = source_offset.saturating_add(relative_end);
+            if cursor == grapheme_start {
+                cursor_position = Some((lines.len(), rendered_width));
+            } else if cursor > grapheme_start && cursor < grapheme_end {
+                let within_grapheme = cursor.saturating_sub(grapheme_start);
+                let prefix_width = UnicodeWidthStr::width(&grapheme.symbol[..within_grapheme]);
+                cursor_position = Some((lines.len(), rendered_width.saturating_add(prefix_width)));
+            }
+
+            rendered_line.push_str(grapheme.symbol);
+            rendered_width = rendered_width.saturating_add(grapheme_width);
+            grapheme_offset = relative_end;
+        }
+
+        let logical_end = source_offset.saturating_add(logical_line.len());
+        let cursor_ends_full_line = cursor == logical_end && rendered_width >= width;
+        if cursor == logical_end {
+            cursor_position = Some((
+                lines.len() + usize::from(cursor_ends_full_line),
+                if cursor_ends_full_line {
+                    0
+                } else {
+                    rendered_width
+                },
+            ));
+        }
+        lines.push(rendered_line);
+
+        let is_last_logical_line = logical_index + 1 == logical_lines.len();
+        if is_last_logical_line && cursor_ends_full_line {
+            lines.push(String::new());
+        }
+        source_offset = logical_end.saturating_add(usize::from(!is_last_logical_line));
+    }
+
+    let (cursor_row, cursor_column) = cursor_position.unwrap_or_default();
+    ComposerLayout {
+        lines,
+        cursor_row,
+        cursor_column,
+    }
+}
+
+fn floor_char_boundary(value: &str, mut index: usize) -> usize {
+    while !value.is_char_boundary(index) {
+        index = index.saturating_sub(1);
+    }
+    index
 }
 
 fn composer_placeholder(phase: UiPhase) -> &'static str {
@@ -672,7 +793,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     );
     if area.width < 64 {
         let shortcuts = match state.phase {
-            UiPhase::WaitingApproval => "  a allow once · d deny · esc quit",
+            UiPhase::WaitingApproval => "  ↑/↓ select · enter confirm · a/d · esc quit",
             UiPhase::WaitingInput => "  enter reply · ctrl+c stop · esc quit",
             UiPhase::Running => "  enter steer · ctrl+c stop · esc quit",
             UiPhase::Cancelling => "  stopping current run… · esc quit",
@@ -685,7 +806,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     let columns =
         Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)]).split(area);
     let left = match state.phase {
-        UiPhase::WaitingApproval => "  a allow once  ·  d deny",
+        UiPhase::WaitingApproval => "  ↑/↓ select  ·  enter confirm  ·  a/d shortcut",
         UiPhase::WaitingInput => "  enter reply  ·  ctrl+c interrupt",
         UiPhase::Running => "  enter steer  ·  ctrl+c interrupt",
         UiPhase::Cancelling => "  stopping current run…",
@@ -701,13 +822,18 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     );
 }
 
-fn render_pending(frame: &mut Frame<'_>, area: Rect, pending: &PendingOverlay) {
+fn render_pending(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    pending: &PendingOverlay,
+    approval_choice: ApprovalChoice,
+) {
     if area.is_empty() {
         return;
     }
-    let mut lines = Vec::new();
     match pending {
         PendingOverlay::Input { prompt, .. } => {
+            let mut lines = Vec::new();
             lines.push(Line::from(Span::styled(
                 "? Input requested",
                 ACCENT.add_modifier(Modifier::BOLD),
@@ -717,29 +843,63 @@ fn render_pending(frame: &mut Frame<'_>, area: Rect, pending: &PendingOverlay) {
                 "Reply below, then press Enter",
                 MUTED,
             )));
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .wrap(Wrap { trim: false })
+                    .block(Block::default().padding(Padding::horizontal(CONTENT_PADDING))),
+                area,
+            );
         }
         PendingOverlay::Approval { summary, .. } => {
-            lines.push(Line::from(Span::styled(
-                "! Approval required",
-                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            )));
-            lines.extend(summary.lines().map(|line| Line::from(line.to_owned())));
-            lines.push(Line::from(vec![
-                Span::styled("› a", ACCENT.add_modifier(Modifier::BOLD)),
-                Span::raw("  Allow once"),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("  d", MUTED.add_modifier(Modifier::BOLD)),
-                Span::raw("  Deny"),
-            ]));
+            let block = Block::default().padding(Padding::horizontal(CONTENT_PADDING));
+            let inner = block.inner(area);
+            let rows = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(2),
+            ])
+            .split(inner);
+            frame.render_widget(block, area);
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "! Approval required",
+                    Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ))),
+                rows[0],
+            );
+            frame.render_widget(
+                Paragraph::new(summary.as_str()).wrap(Wrap { trim: false }),
+                rows[1],
+            );
+            frame.render_widget(
+                Paragraph::new(vec![
+                    approval_option_line('a', "Allow once", ApprovalChoice::Allow, approval_choice),
+                    approval_option_line('d', "Deny", ApprovalChoice::Deny, approval_choice),
+                ]),
+                rows[2],
+            );
         }
     }
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .block(Block::default().padding(Padding::horizontal(CONTENT_PADDING))),
-        area,
-    );
+}
+
+fn approval_option_line(
+    key: char,
+    label: &'static str,
+    choice: ApprovalChoice,
+    selected: ApprovalChoice,
+) -> Line<'static> {
+    let is_selected = choice == selected;
+    let marker = if is_selected { "› " } else { "  " };
+    let key_style = if is_selected {
+        ACCENT.add_modifier(Modifier::BOLD)
+    } else {
+        MUTED.add_modifier(Modifier::BOLD)
+    };
+    let label_style = if is_selected { ASSISTANT } else { MUTED };
+    Line::from(vec![
+        Span::styled(format!("{marker}{key}"), key_style),
+        Span::styled(format!("  {label}"), label_style),
+    ])
 }
 
 fn pending_height(state: &UiState, width: u16) -> u16 {
@@ -781,35 +941,11 @@ fn composer_height(state: &UiState, width: u16) -> u16 {
         return 0;
     }
     let inner_width = width.saturating_sub(2 * CONTENT_PADDING + 2).max(1) as usize;
-    let rows = state
-        .composer
-        .split('\n')
-        .map(|line| UnicodeWidthStr::width(line).max(1).div_ceil(inner_width))
-        .sum::<usize>()
+    let rows = composer_layout(&state.composer, state.composer_cursor, inner_width)
+        .lines
+        .len()
         .clamp(1, 5);
     u16::try_from(rows).unwrap_or(5).saturating_add(2)
-}
-
-fn composer_cursor(state: &UiState, inner: Rect) -> (u16, u16) {
-    let before = &state.composer[..state.composer_cursor.min(state.composer.len())];
-    let mut row = 0_usize;
-    let mut column = 0_usize;
-    let width = inner.width.max(1) as usize;
-    for (index, line) in before.split('\n').enumerate() {
-        if index > 0 {
-            row += 1;
-        }
-        let line_width = UnicodeWidthStr::width(line);
-        row += line_width / width;
-        column = line_width % width;
-    }
-    (
-        inner.x
-            + u16::try_from(column)
-                .unwrap_or(u16::MAX)
-                .min(inner.width - 1),
-        inner.y + u16::try_from(row).unwrap_or(u16::MAX).min(inner.height - 1),
-    )
 }
 
 fn phase_style(phase: UiPhase) -> Style {
@@ -847,7 +983,7 @@ mod tests {
     use ratatui::Terminal;
     use unicode_width::UnicodeWidthStr;
 
-    use super::render;
+    use super::{composer_layout, render};
     use crate::tui::{update, TranscriptEntry, UiMsg, UiPhase, UiState};
 
     fn command_evidence(command: &str) -> Vec<ToolActivityEvidence> {
@@ -915,6 +1051,61 @@ mod tests {
             },
         );
         assert_snapshot!("tui_40x12_approval", render_to_string(&state, 40, 12));
+    }
+
+    #[test]
+    fn long_approval_summary_cannot_push_actions_out_of_view() {
+        let mut state = UiState::new("session-approval", "model-approval");
+        update(
+            &mut state,
+            UiMsg::WaitingApproval {
+                run_id: "run-approval".to_owned(),
+                request_id: "approval-long".to_owned(),
+                summary: "A long approval explanation with filesystem, process, environment, and network effects. "
+                    .repeat(12),
+            },
+        );
+
+        for (width, height) in [(20, 6), (50, 6), (50, 10)] {
+            let rendered = render_to_string(&state, width, height);
+            assert!(rendered.contains("› a  Allow once"), "{rendered}");
+            assert!(rendered.contains("d  Deny"), "{rendered}");
+            if width >= 50 {
+                assert!(rendered.contains("enter confirm"), "{rendered}");
+            }
+        }
+    }
+
+    #[test]
+    fn cjk_composer_wrap_uses_display_cells_instead_of_byte_or_char_counts() {
+        let layout = composer_layout("中文输入光标", "中文输入光标".len(), 5);
+
+        assert_eq!(layout.lines, ["中文", "输入", "光标"]);
+        assert_eq!((layout.cursor_row, layout.cursor_column), (2, 4));
+    }
+
+    #[test]
+    fn long_cjk_composer_scrolls_to_the_end_cursor() {
+        let mut state = UiState::new("session-composer", "model-composer");
+        let input = format!("{}末", "中".repeat(64));
+        update(&mut state, UiMsg::InsertText(input.clone()));
+        update(&mut state, UiMsg::MoveCursorStart);
+        update(&mut state, UiMsg::MoveCursorEnd);
+        assert_eq!(state.composer_cursor, input.len());
+
+        let backend = TestBackend::new(30, 12);
+        let mut terminal = Terminal::new(backend).expect("create TestBackend terminal");
+        terminal
+            .draw(|frame| render(frame, &state))
+            .expect("render long CJK composer");
+
+        let cursor = terminal.backend().cursor_position();
+        assert_eq!(cursor.y, 9, "cursor should follow the last wrapped row");
+        assert_eq!(
+            terminal.backend().buffer()[(cursor.x.saturating_sub(2), cursor.y)].symbol(),
+            "末",
+            "last input character should remain visible immediately before the cursor"
+        );
     }
 
     #[test]

@@ -141,6 +141,7 @@ pub(crate) enum UiMsg {
     MoveCursorStart,
     MoveCursorEnd,
     Submit,
+    SelectApproval(ApprovalChoice),
     Approval(ApprovalChoice),
     Cancel,
     Quit,
@@ -220,6 +221,7 @@ pub(crate) struct UiState {
     pub composer: String,
     pub composer_cursor: usize,
     pub pending: Option<PendingOverlay>,
+    pub approval_choice: ApprovalChoice,
     pub scroll_back: usize,
     pub working_detail: Option<String>,
     pub working_elapsed: Duration,
@@ -243,6 +245,7 @@ impl UiState {
             composer: String::new(),
             composer_cursor: 0,
             pending: None,
+            approval_choice: ApprovalChoice::Allow,
             scroll_back: 0,
             working_detail: None,
             working_elapsed: Duration::ZERO,
@@ -415,6 +418,10 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
         | UiMsg::MoveCursorStart
         | UiMsg::MoveCursorEnd => {}
         UiMsg::Submit => return submit(state),
+        UiMsg::SelectApproval(choice) if state.phase == UiPhase::WaitingApproval => {
+            state.approval_choice = choice;
+        }
+        UiMsg::SelectApproval(_) => {}
         UiMsg::Approval(choice) => return resolve_approval(state, choice),
         UiMsg::Cancel => return cancel(state),
         UiMsg::Quit => return vec![UiEffect::Quit],
@@ -510,6 +517,7 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
         } => {
             state.run_id = Some(run_id);
             state.phase = UiPhase::WaitingApproval;
+            state.approval_choice = ApprovalChoice::Allow;
             state.pending = Some(PendingOverlay::Approval {
                 request_id,
                 summary,
@@ -855,6 +863,33 @@ mod tests {
         ] {
             assert!(update(&mut state, msg).is_empty());
         }
+    }
+
+    #[test]
+    fn approval_selection_is_scoped_to_the_current_prompt() {
+        let mut state = UiState::new("session", "model");
+        update(
+            &mut state,
+            UiMsg::WaitingApproval {
+                run_id: "run".to_owned(),
+                request_id: "approval-a".to_owned(),
+                summary: "First approval".to_owned(),
+            },
+        );
+        assert_eq!(state.approval_choice, ApprovalChoice::Allow);
+
+        update(&mut state, UiMsg::SelectApproval(ApprovalChoice::Deny));
+        assert_eq!(state.approval_choice, ApprovalChoice::Deny);
+
+        update(
+            &mut state,
+            UiMsg::WaitingApproval {
+                run_id: "run".to_owned(),
+                request_id: "approval-b".to_owned(),
+                summary: "Second approval".to_owned(),
+            },
+        );
+        assert_eq!(state.approval_choice, ApprovalChoice::Allow);
     }
 
     #[test]

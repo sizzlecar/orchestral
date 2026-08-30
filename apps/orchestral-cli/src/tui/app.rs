@@ -181,9 +181,12 @@ fn key_message(key: KeyEvent, state: &UiState) -> Option<UiMsg> {
         return match key.code {
             KeyCode::Char('a') | KeyCode::Char('A') => Some(UiMsg::Approval(ApprovalChoice::Allow)),
             KeyCode::Char('d') | KeyCode::Char('D') => Some(UiMsg::Approval(ApprovalChoice::Deny)),
+            KeyCode::Up => Some(UiMsg::SelectApproval(ApprovalChoice::Allow)),
+            KeyCode::Down => Some(UiMsg::SelectApproval(ApprovalChoice::Deny)),
+            KeyCode::Enter => Some(UiMsg::Approval(state.approval_choice)),
             KeyCode::Esc => Some(UiMsg::Quit),
-            KeyCode::PageUp | KeyCode::Up => Some(UiMsg::ScrollUp(5)),
-            KeyCode::PageDown | KeyCode::Down => Some(UiMsg::ScrollDown(5)),
+            KeyCode::PageUp => Some(UiMsg::ScrollUp(5)),
+            KeyCode::PageDown => Some(UiMsg::ScrollDown(5)),
             _ => None,
         };
     }
@@ -830,6 +833,20 @@ mod tests {
                 &state
             ),
             None
+        );
+
+        assert_eq!(
+            key_message(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &state),
+            Some(UiMsg::SelectApproval(ApprovalChoice::Deny))
+        );
+        crate::tui::update(&mut state, UiMsg::SelectApproval(ApprovalChoice::Deny));
+        assert_eq!(
+            key_message(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &state),
+            Some(UiMsg::Approval(ApprovalChoice::Deny))
+        );
+        assert_eq!(
+            key_message(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &state),
+            Some(UiMsg::SelectApproval(ApprovalChoice::Allow))
         );
     }
 
