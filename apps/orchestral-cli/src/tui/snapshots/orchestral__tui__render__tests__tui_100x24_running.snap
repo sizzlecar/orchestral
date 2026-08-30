@@ -25,4 +25,4 @@ expression: "render_to_string(&state, 100, 24)"
 
   › Add guidance while Orchestral works…
 
-  enter steer  ·  ctrl+c interrupt                                   pgup/pgdn scroll  ·  esc quit
+  enter steer  ·  ctrl+c interrupt                                  pgup/pgdn · ^y copy · esc quit

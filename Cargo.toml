@@ -71,6 +71,7 @@ grep-matcher = "0.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 ignore = "0.4"
+url = "2"
 
 # Internal crates - Core
 orchestral = { path = "core/orchestral" }

@@ -519,6 +519,24 @@ fn inline_markdown_spans(mut text: &str, style: Style) -> Vec<Span<'static>> {
     while !text.is_empty() {
         let bold = closed_delimiter(text, "**");
         let code = closed_delimiter(text, "`");
+        let link = closed_markdown_link(text);
+        let next_inline_start = [bold.map(|value| value.0), code.map(|value| value.0)]
+            .into_iter()
+            .flatten()
+            .min();
+        if let Some((start, label_end, url_end)) = link {
+            if next_inline_start.is_none_or(|inline_start| start <= inline_start) {
+                if start > 0 {
+                    spans.push(Span::styled(text[..start].to_owned(), style));
+                }
+                spans.push(Span::styled(
+                    text[start + 1..label_end].to_owned(),
+                    ACCENT.add_modifier(Modifier::UNDERLINED),
+                ));
+                text = &text[url_end + 1..];
+                continue;
+            }
+        }
         let selected = match (bold, code) {
             (Some(bold), Some(code)) if bold.0 <= code.0 => Some((bold, "**", true)),
             (Some(_), Some(code)) => Some((code, "`", false)),
@@ -547,6 +565,19 @@ fn inline_markdown_spans(mut text: &str, style: Style) -> Vec<Span<'static>> {
         text = &text[end + delimiter.len()..];
     }
     spans
+}
+
+fn closed_markdown_link(text: &str) -> Option<(usize, usize, usize)> {
+    let start = text.find('[')?;
+    let label_end = text[start + 1..].find("](")? + start + 1;
+    if label_end == start + 1 {
+        return None;
+    }
+    let url_start = label_end + 2;
+    let url_end = text[url_start..].find(')')? + url_start;
+    let url = &text[url_start..url_end];
+    (url.starts_with("https://") || url.starts_with("http://"))
+        .then_some((start, label_end, url_end))
 }
 
 fn closed_delimiter(text: &str, delimiter: &str) -> Option<(usize, usize)> {
@@ -677,6 +708,8 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
             UiPhase::Running => "  enter steer · ctrl+c stop · esc quit",
             UiPhase::Cancelling => "  stopping current run… · esc quit",
             _ if active => "  ctrl+c stop · esc quit",
+            _ if state.latest_https_url().is_some() => "  ^y copy · ^o open link · esc quit",
+            _ if state.has_copyable_output() => "  ^y copy · esc quit",
             _ => "  enter send · esc quit",
         };
         frame.render_widget(Paragraph::new(shortcuts).style(MUTED), area);
@@ -693,8 +726,15 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         _ => "  enter send  ·  shift+enter newline",
     };
     frame.render_widget(Paragraph::new(left).style(MUTED), columns[0]);
+    let right = if state.latest_https_url().is_some() {
+        "^y copy · ^o open link · esc quit  "
+    } else if state.has_copyable_output() {
+        "pgup/pgdn · ^y copy · esc quit  "
+    } else {
+        "pgup/pgdn scroll  ·  esc quit  "
+    };
     frame.render_widget(
-        Paragraph::new("pgup/pgdn scroll  ·  esc quit  ")
+        Paragraph::new(right)
             .style(MUTED)
             .alignment(Alignment::Right),
         columns[1],
@@ -1146,6 +1186,22 @@ mod tests {
         assert!(rendered.contains("│ 24 tests passed"), "{rendered}");
         assert!(!rendered.contains("**"), "{rendered}");
         assert!(!rendered.contains("```"), "{rendered}");
+    }
+
+    #[test]
+    fn markdown_links_render_a_compact_label_and_remain_host_actionable() {
+        let mut state = UiState::new("session-link", "model-link");
+        state.phase = UiPhase::Completed;
+        let url = "https://login.example.test/oauth?state=abc&scope=mcp";
+        state.transcript.push(TranscriptEntry::assistant(
+            "answer-link",
+            format!("请 [在浏览器登录]({url}) 后继续。"),
+        ));
+
+        let rendered = render_to_string(&state, 70, 10);
+        assert!(rendered.contains("请 在浏览器登录 后继续。"), "{rendered}");
+        assert!(!rendered.contains(url), "{rendered}");
+        assert_eq!(state.latest_https_url().as_deref(), Some(url));
     }
 
     #[test]
