@@ -337,7 +337,7 @@ fn project_evidence(
             style: ActivityDetailStyle::Primary,
         }],
         ToolActivityEvidence::Error { code, message } => vec![ActivityDetail {
-            text: format!("Error [{code}] {message}"),
+            text: format!("Error [{code}] {}", compact_error_message(message)),
             depth: 0,
             style: ActivityDetailStyle::Error,
         }],
@@ -348,6 +348,17 @@ fn project_evidence(
         }],
         _ => Vec::new(),
     }
+}
+
+fn compact_error_message(message: &str) -> String {
+    const MAX_CHARS: usize = 800;
+    let compact = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = compact.chars();
+    let mut bounded = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        bounded.push('…');
+    }
+    bounded
 }
 
 fn family_summary(family: &ActivityFamily, status: ActivityStatus, count: usize) -> String {
@@ -577,5 +588,16 @@ mod tests {
         assert!(
             !details.contains(&"Error [patch_invalid] Add File lines must start with '+' (failed)")
         );
+    }
+
+    #[test]
+    fn structured_tool_errors_are_compact_and_bounded() {
+        assert_eq!(
+            compact_error_message("reason: schema omitted\n\nhow_to_get: search first"),
+            "reason: schema omitted how_to_get: search first"
+        );
+        let bounded = compact_error_message(&"远程错误".repeat(500));
+        assert!(bounded.chars().count() <= 801);
+        assert!(bounded.ends_with('…'));
     }
 }

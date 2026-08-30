@@ -824,7 +824,12 @@ impl McpServerConnectionManager {
                         .cancel_request(request_id, "Host deadline exceeded")
                         .await;
                     Err(GuardedMcpCallError::UnknownEffect(
-                        "MCP call timed out after dispatch; remote effect is unknown".to_owned(),
+                        format!(
+                            "MCP server '{}' Tool '{}' timed out after {} ms after dispatch; remote effect is unknown",
+                            self.config.server_id,
+                            tool_name,
+                            self.config.tool_timeout.as_millis()
+                        ),
                     ))
                 }
             }
@@ -1319,7 +1324,7 @@ impl McpToolsAdapterRegistry {
                     }),
                     effect_scopes: manager.config.effect_scopes(),
                     restriction: server_restriction.clone(),
-                    idempotency: ToolIdempotency::NonIdempotent,
+                    idempotency: mcp_tool_idempotency(&tool.annotations),
                     concurrency: ToolConcurrency::GlobalSerial,
                 };
                 if let Err(error) = descriptor.validate() {
@@ -1410,6 +1415,31 @@ struct GuardedMcpToolExecutor {
     manager: Arc<McpServerConnectionManager>,
     tool_name: String,
     annotations: McpToolAnnotations,
+}
+
+fn mcp_tool_idempotency(annotations: &McpToolAnnotations) -> ToolIdempotency {
+    if annotations.read_only_hint == Some(true) || annotations.idempotent_hint == Some(true) {
+        ToolIdempotency::Idempotent
+    } else {
+        ToolIdempotency::NonIdempotent
+    }
+}
+
+fn mcp_unknown_effect_outcome(annotations: &McpToolAnnotations, message: String) -> ToolOutcome {
+    if matches!(
+        mcp_tool_idempotency(annotations),
+        ToolIdempotency::Idempotent
+    ) {
+        ToolOutcome::Failed {
+            code: "mcp_call_interrupted".to_owned(),
+            message: format!(
+                "{message}; the MCP Tool is annotated read-only or idempotent and may be retried"
+            ),
+            retryable: true,
+        }
+    } else {
+        ToolOutcome::UnknownEffect { message }
+    }
 }
 
 /// Describes the business operation initiated through an already-authorized
@@ -1582,7 +1612,7 @@ impl GuardedToolExecutor for GuardedMcpToolExecutor {
                 retryable: false,
             },
             Err(GuardedMcpCallError::UnknownEffect(message)) => {
-                ToolOutcome::UnknownEffect { message }
+                mcp_unknown_effect_outcome(&self.annotations, message)
             }
             Err(GuardedMcpCallError::Cancelled) => ToolOutcome::Cancelled,
         }
@@ -1644,7 +1674,7 @@ fn mcp_tool_error_message(result: &Value) -> String {
         .get("structuredContent")
         .filter(|value| !value.is_null())
     {
-        return serde_json::to_string(structured).unwrap_or_else(|_| structured.to_string());
+        return actionable_mcp_error(structured);
     }
 
     let text = result
@@ -1657,6 +1687,12 @@ fn mcp_tool_error_message(result: &Value) -> String {
                 .then(|| item.get("text").and_then(Value::as_str))
                 .flatten()
         })
+        .map(|text| {
+            embedded_json(text)
+                .as_ref()
+                .map(actionable_mcp_error)
+                .unwrap_or_else(|| text.to_owned())
+        })
         .collect::<Vec<_>>()
         .join("\n");
     if !text.trim().is_empty() {
@@ -1664,6 +1700,89 @@ fn mcp_tool_error_message(result: &Value) -> String {
     } else {
         result.to_string()
     }
+}
+
+fn embedded_json(text: &str) -> Option<Value> {
+    let mut value = serde_json::from_str::<Value>(text.trim()).ok()?;
+    for _ in 0..2 {
+        let Value::String(nested) = &value else {
+            break;
+        };
+        let Ok(parsed) = serde_json::from_str::<Value>(nested.trim()) else {
+            break;
+        };
+        value = parsed;
+    }
+    Some(value)
+}
+
+fn actionable_mcp_error(value: &Value) -> String {
+    const KEYS: &[&str] = &["code", "message", "reason", "how_to_get", "hint"];
+    const MAX_ITEMS: usize = 8;
+    const MAX_CHARS: usize = 4_096;
+
+    fn collect(value: &Value, output: &mut Vec<(String, String)>) {
+        if output.len() >= MAX_ITEMS {
+            return;
+        }
+        match value {
+            Value::Object(fields) => {
+                for key in KEYS {
+                    let Some(value) = fields.get(*key) else {
+                        continue;
+                    };
+                    let rendered = match value {
+                        Value::String(value) => value.trim().to_owned(),
+                        Value::Null => continue,
+                        value => value.to_string(),
+                    };
+                    if !rendered.is_empty()
+                        && !output.iter().any(|(existing_key, existing)| {
+                            existing_key == key && existing == &rendered
+                        })
+                    {
+                        output.push(((*key).to_owned(), rendered));
+                        if output.len() >= MAX_ITEMS {
+                            return;
+                        }
+                    }
+                }
+                for value in fields.values() {
+                    collect(value, output);
+                    if output.len() >= MAX_ITEMS {
+                        return;
+                    }
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    collect(value, output);
+                    if output.len() >= MAX_ITEMS {
+                        return;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut fields = Vec::new();
+    collect(value, &mut fields);
+    let message = if fields.is_empty() {
+        serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+    } else {
+        fields
+            .into_iter()
+            .map(|(key, value)| format!("{key}: {value}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    let mut chars = message.chars();
+    let mut bounded = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        bounded.push('…');
+    }
+    bounded
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2832,7 +2951,7 @@ mod mcp_lifecycle_gate_tests {
                 "content": [{"type": "text", "text": "fallback"}],
                 "isError": true
             })),
-            r#"{"error":{"code":"bad_args"}}"#
+            "code: bad_args"
         );
         assert_eq!(
             mcp_tool_error_message(&json!({
@@ -2845,6 +2964,61 @@ mod mcp_lifecycle_gate_tests {
             })),
             "first\nsecond"
         );
+        assert_eq!(
+            mcp_tool_error_message(&json!({
+                "content": [{
+                    "type": "text",
+                    "text": serde_json::to_string(&json!({
+                        "capability_schema": {
+                            "how_to_get": "Call search_capabilities first"
+                        },
+                        "reason": "schema omitted"
+                    })).unwrap()
+                }],
+                "isError": true
+            })),
+            "reason: schema omitted; how_to_get: Call search_capabilities first"
+        );
+    }
+
+    #[test]
+    fn mcp_idempotency_follows_standard_annotations() {
+        assert_eq!(
+            mcp_tool_idempotency(&McpToolAnnotations {
+                read_only_hint: Some(true),
+                ..McpToolAnnotations::default()
+            }),
+            ToolIdempotency::Idempotent
+        );
+        assert_eq!(
+            mcp_tool_idempotency(&McpToolAnnotations {
+                idempotent_hint: Some(true),
+                ..McpToolAnnotations::default()
+            }),
+            ToolIdempotency::Idempotent
+        );
+        assert_eq!(
+            mcp_tool_idempotency(&McpToolAnnotations::default()),
+            ToolIdempotency::NonIdempotent
+        );
+        assert!(matches!(
+            mcp_unknown_effect_outcome(
+                &McpToolAnnotations {
+                    read_only_hint: Some(true),
+                    ..McpToolAnnotations::default()
+                },
+                "timed out".to_owned()
+            ),
+            ToolOutcome::Failed {
+                ref code,
+                retryable: true,
+                ..
+            } if code == "mcp_call_interrupted"
+        ));
+        assert!(matches!(
+            mcp_unknown_effect_outcome(&McpToolAnnotations::default(), "timed out".to_owned()),
+            ToolOutcome::UnknownEffect { .. }
+        ));
     }
 
     #[tokio::test]

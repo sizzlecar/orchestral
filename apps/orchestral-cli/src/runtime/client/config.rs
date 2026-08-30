@@ -263,7 +263,7 @@ providers:
       max_tokens: 8192
 
 tools:
-  max_timeout_ms: 30000
+  max_timeout_ms: 130000
   max_output_bytes: 1048576
   exec:
     enabled: true

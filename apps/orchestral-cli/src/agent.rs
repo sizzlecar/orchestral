@@ -1072,7 +1072,10 @@ fn configured_mcp_servers(
             required: spec.required,
             transport,
             startup_timeout: Duration::from_millis(spec.startup_timeout_ms.unwrap_or(15_000)),
-            tool_timeout: Duration::from_millis(spec.tool_timeout_ms.unwrap_or(20_000)),
+            // Match Codex's proven default: remote MCP operations routinely
+            // include search, authentication, and service fan-out that exceed
+            // a generic short Tool deadline.
+            tool_timeout: Duration::from_millis(spec.tool_timeout_ms.unwrap_or(120_000)),
             enabled_tools: spec.enabled_tools.iter().cloned().collect(),
             disabled_tools: spec.disabled_tools.iter().cloned().collect(),
         };

@@ -209,7 +209,7 @@ impl Default for ToolsConfig {
 }
 
 fn default_tool_timeout_ms() -> u64 {
-    30_000
+    130_000
 }
 
 fn default_tool_output_bytes() -> u64 {
