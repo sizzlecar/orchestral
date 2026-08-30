@@ -44,6 +44,12 @@ pub struct Cli {
     no_skills: bool,
     #[arg(long)]
     verbose: bool,
+    /// Use DIR as the primary Agent workspace instead of the process directory.
+    #[arg(short = 'C', long = "cwd", value_name = "DIR")]
+    cwd: Option<PathBuf>,
+    /// Add another read-write workspace root. May be repeated.
+    #[arg(long = "add-dir", value_name = "DIR")]
+    add_dirs: Vec<PathBuf>,
     /// A single turn. When omitted, starts an interactive conversation.
     #[arg(value_name = "INPUT")]
     input: Vec<String>,
@@ -86,6 +92,8 @@ impl Cli {
             no_mcp: self.no_mcp,
             mcp_config: self.mcp_config,
             no_skills: self.no_skills,
+            cwd: self.cwd,
+            add_dirs: self.add_dirs,
         })
         .await
     }
@@ -152,6 +160,26 @@ mod tests {
                 PathBuf::from("project.mcp.json"),
                 PathBuf::from("/host/user.mcp.json"),
             ]
+        );
+    }
+
+    #[test]
+    fn primary_and_additional_workspaces_are_explicit_repeatable_inputs() {
+        let parsed = Cli::try_parse_from([
+            "orchestral",
+            "-C",
+            "/work/primary",
+            "--add-dir",
+            "/work/shared",
+            "--add-dir",
+            "/work/other",
+            "inspect both projects",
+        ])
+        .unwrap();
+        assert_eq!(parsed.cwd, Some(PathBuf::from("/work/primary")));
+        assert_eq!(
+            parsed.add_dirs,
+            [PathBuf::from("/work/shared"), PathBuf::from("/work/other")]
         );
     }
 }

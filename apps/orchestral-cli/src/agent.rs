@@ -79,6 +79,58 @@ pub struct AgentRunOptions {
     pub no_mcp: bool,
     pub mcp_config: Vec<PathBuf>,
     pub no_skills: bool,
+    pub cwd: Option<PathBuf>,
+    pub add_dirs: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct CliWorkspaceSet {
+    primary: PathBuf,
+    additional: Vec<PathBuf>,
+}
+
+impl CliWorkspaceSet {
+    fn resolve(primary: Option<&Path>, additional: &[PathBuf]) -> anyhow::Result<Self> {
+        let process_cwd = std::env::current_dir().context("resolve process directory")?;
+        let requested_primary = primary.unwrap_or(&process_cwd);
+        let primary = canonical_workspace_directory(requested_primary, "primary workspace")?;
+        let mut seen = BTreeSet::from([primary.clone()]);
+        let mut resolved_additional = Vec::new();
+        for requested in additional {
+            let requested = if requested.is_absolute() {
+                requested.clone()
+            } else {
+                primary.join(requested)
+            };
+            let resolved = canonical_workspace_directory(&requested, "additional workspace")?;
+            if seen.insert(resolved.clone()) {
+                resolved_additional.push(resolved);
+            }
+        }
+        Ok(Self {
+            primary,
+            additional: resolved_additional,
+        })
+    }
+
+    fn roots(&self) -> impl Iterator<Item = &PathBuf> {
+        std::iter::once(&self.primary).chain(self.additional.iter())
+    }
+
+    fn root_strings(&self) -> BTreeSet<String> {
+        self.roots()
+            .map(|root| root.to_string_lossy().into_owned())
+            .collect()
+    }
+}
+
+fn canonical_workspace_directory(path: &Path, label: &str) -> anyhow::Result<PathBuf> {
+    let canonical = std::fs::canonicalize(path)
+        .with_context(|| format!("resolve {label} '{}'", path.display()))?;
+    if !canonical.is_dir() {
+        bail!("{label} is not a directory: '{}'", canonical.display());
+    }
+    Ok(canonical)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +166,7 @@ struct CliToolComposition {
 }
 
 pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
+    let workspaces = CliWorkspaceSet::resolve(options.cwd.as_deref(), &options.add_dirs)?;
     let config_path = prepare_runtime_config_path(
         options.config,
         &options.model_overrides,
@@ -158,11 +211,14 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
         );
         agent_config.system_prompt.push_str(system_prompt.trim());
     }
-    let workspace = std::fs::canonicalize(std::env::current_dir().context("resolve workspace")?)
-        .context("canonicalize Agent workspace")?;
+    let workspace_context = serde_json::json!({
+        "primary": workspaces.primary,
+        "additional": workspaces.additional,
+    });
     agent_config.system_prompt.push_str(&format!(
-        "\n\n<environment_context>\n  <cwd>{}</cwd>\n</environment_context>",
-        workspace.display()
+        "\n\n<environment_context>\n  <cwd>{}</cwd>\n  <workspace_roots>{}</workspace_roots>\n</environment_context>",
+        workspaces.primary.display(),
+        workspace_context
     ));
     let CliJournalStores {
         run: run_journal,
@@ -194,7 +250,7 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
     let mcp_configs = if options.no_mcp {
         Vec::new()
     } else {
-        configured_mcp_servers(&config, &options.mcp_config)?
+        configured_mcp_servers(&config, &options.mcp_config, &workspaces.primary)?
     };
     let artifact_store = ToolArtifactStore::new(
         build_cli_blob_store(&config)?,
@@ -208,7 +264,13 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
         mcp_restriction,
         approval_broker,
         process_supervisor,
-    } = build_cli_tool_runtime(&config, &mcp_configs, effect_journal, artifact_store)?;
+    } = build_cli_tool_runtime(
+        &config,
+        &mcp_configs,
+        effect_journal,
+        artifact_store,
+        &workspaces,
+    )?;
     let mcp_registry = McpToolsAdapterRegistry::register(
         tool_runtime.as_ref(),
         mcp_configs,
@@ -223,7 +285,7 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
     let skills = if options.no_skills {
         None
     } else {
-        build_cli_skill_runtime(&config)?
+        build_cli_skill_runtime(&config, &workspaces.primary)?
     };
     let provider = match skills.clone() {
         Some(skills) => {
@@ -339,10 +401,9 @@ fn build_cli_tool_runtime(
     mcp_configs: &[GuardedMcpServerConfig],
     effect_journal: Arc<dyn ToolEffectJournalStore>,
     artifact_store: ToolArtifactStore,
+    workspaces: &CliWorkspaceSet,
 ) -> anyhow::Result<CliToolComposition> {
-    let workspace = std::fs::canonicalize(std::env::current_dir().context("resolve workspace")?)
-        .context("canonicalize workspace")?;
-    let workspace = workspace.to_string_lossy().to_string();
+    let workspace_roots = workspaces.root_strings();
     let exec_host = configured_exec_host(config)?;
     let exec_programs = exec_host
         .as_ref()
@@ -415,9 +476,9 @@ fn build_cli_tool_runtime(
         .iter()
         .flat_map(GuardedMcpServerConfig::sandbox_profiles)
         .collect::<BTreeSet<_>>();
-    let mut readable_roots = BTreeSet::from([workspace.clone()]);
+    let mut readable_roots = workspace_roots.clone();
     readable_roots.extend(mcp_readable_roots.iter().cloned());
-    let mut writable_roots = BTreeSet::from([workspace.clone()]);
+    let mut writable_roots = workspace_roots.clone();
     writable_roots.extend(mcp_writable_roots.iter().cloned());
     let mcp_restriction = ToolRestriction {
         bounds: ToolPolicyBounds {
@@ -506,8 +567,8 @@ fn build_cli_tool_runtime(
     workspace_bounds.sandbox.allowed_profiles = BTreeSet::from(["workspace_read".to_owned()]);
     workspace_bounds.process = ProcessPolicy::default();
     workspace_bounds.filesystem = FilesystemPolicy {
-        readable_roots: BTreeSet::from([workspace.clone()]),
-        writable_roots: BTreeSet::from([workspace.clone()]),
+        readable_roots: workspace_roots.clone(),
+        writable_roots: workspace_roots,
     };
     workspace_bounds.network = NetworkPolicy::default();
     workspace_bounds.environment = EnvironmentPolicy::default();
@@ -589,8 +650,11 @@ fn build_cli_tool_runtime(
                 bounds: workspace_bounds.clone(),
             }),
             Arc::new(
-                GuardedFileReadExecutor::new(&workspace)
-                    .context("open file_read workspace capability")?,
+                GuardedFileReadExecutor::new_with_roots(
+                    &workspaces.primary,
+                    &workspaces.additional,
+                )
+                .context("open file_read workspace capability")?,
             ),
         )
         .context("register guarded file_read Tool")?;
@@ -600,8 +664,11 @@ fn build_cli_tool_runtime(
                 bounds: workspace_bounds.clone(),
             }),
             Arc::new(
-                GuardedFileSearchExecutor::new(&workspace)
-                    .context("open file_search workspace capability")?,
+                GuardedFileSearchExecutor::new_with_roots(
+                    &workspaces.primary,
+                    &workspaces.additional,
+                )
+                .context("open file_search workspace capability")?,
             ),
         )
         .context("register guarded file_search Tool")?;
@@ -611,8 +678,11 @@ fn build_cli_tool_runtime(
                 bounds: workspace_bounds.clone(),
             }),
             Arc::new(
-                GuardedTextSearchExecutor::new(&workspace)
-                    .context("open text_search workspace capability")?,
+                GuardedTextSearchExecutor::new_with_roots(
+                    &workspaces.primary,
+                    &workspaces.additional,
+                )
+                .context("open text_search workspace capability")?,
             ),
         )
         .context("register guarded text_search Tool")?;
@@ -622,8 +692,11 @@ fn build_cli_tool_runtime(
                 bounds: workspace_bounds.clone(),
             }),
             Arc::new(
-                GuardedFileWriteExecutor::new(&workspace)
-                    .context("open file_write workspace capability")?,
+                GuardedFileWriteExecutor::new_with_roots(
+                    &workspaces.primary,
+                    &workspaces.additional,
+                )
+                .context("open file_write workspace capability")?,
             ),
         )
         .context("register guarded file_write Tool")?;
@@ -633,8 +706,11 @@ fn build_cli_tool_runtime(
                 bounds: workspace_bounds,
             }),
             Arc::new(
-                GuardedApplyPatchExecutor::new(&workspace)
-                    .context("open apply_patch workspace capability")?,
+                GuardedApplyPatchExecutor::new_with_roots(
+                    &workspaces.primary,
+                    &workspaces.additional,
+                )
+                .context("open apply_patch workspace capability")?,
             ),
         )
         .context("register guarded apply_patch Tool")?;
@@ -695,12 +771,13 @@ fn build_cli_blob_store(config: &OrchestralConfig) -> anyhow::Result<Arc<dyn Blo
     }
 }
 
-fn build_cli_skill_runtime(config: &OrchestralConfig) -> anyhow::Result<Option<Arc<SkillRuntime>>> {
+fn build_cli_skill_runtime(
+    config: &OrchestralConfig,
+    workspace: &Path,
+) -> anyhow::Result<Option<Arc<SkillRuntime>>> {
     if !config.skills.enabled {
         return Ok(None);
     }
-    let workspace = std::fs::canonicalize(std::env::current_dir().context("resolve workspace")?)
-        .context("canonicalize Skill workspace")?;
     let mut roots = Vec::new();
     for (index, configured) in config.skills.directories.iter().enumerate() {
         let path = PathBuf::from(configured);
@@ -885,12 +962,11 @@ fn exec_runtime_readable_roots(shell: &Path) -> Vec<PathBuf> {
 fn configured_mcp_servers(
     config: &OrchestralConfig,
     cli_manifest_paths: &[PathBuf],
+    workspace: &Path,
 ) -> anyhow::Result<Vec<GuardedMcpServerConfig>> {
     if !config.mcp.enabled {
         return Ok(Vec::new());
     }
-    let workspace = std::fs::canonicalize(std::env::current_dir().context("resolve workspace")?)
-        .context("canonicalize workspace")?;
     let mut trusted_user_paths = Vec::new();
     match crate::mcp_config::user_registry_path() {
         Ok(path) if path.is_file() => trusted_user_paths.push(path),
@@ -898,7 +974,7 @@ fn configured_mcp_servers(
         Err(error) => tracing::debug!(%error, "user MCP registry path is unavailable"),
     }
     let specs = crate::mcp_config::load_server_manifests(
-        &workspace,
+        workspace,
         &config.mcp.servers,
         &config.mcp.import_files,
         &trusted_user_paths,
@@ -922,13 +998,13 @@ fn configured_mcp_servers(
                 } => {
                     let program = resolve_host_program(command)?;
                     let cwd =
-                        resolve_mcp_directory(&workspace, cwd.as_deref().unwrap_or("."), "cwd")?;
+                        resolve_mcp_directory(workspace, cwd.as_deref().unwrap_or("."), "cwd")?;
                     let mut reads =
-                        resolve_mcp_directories(&workspace, readable_roots, "readable root")?;
+                        resolve_mcp_directories(workspace, readable_roots, "readable root")?;
                     reads.insert(cwd.clone());
                     let mut writes =
-                        resolve_mcp_directories(&workspace, writable_roots, "writable root")?;
-                    let runtime_root = prepare_mcp_runtime_root(&workspace, &spec.name)?;
+                        resolve_mcp_directories(workspace, writable_roots, "writable root")?;
+                    let runtime_root = prepare_mcp_runtime_root(workspace, &spec.name)?;
                     writes.insert(runtime_root.clone());
                     Ok(Arc::new(StdioMcpTransportFactory::new(
                         PathBuf::from(program),
@@ -1584,7 +1660,9 @@ fn select_entry_mode(
 
 #[cfg(test)]
 mod entry_mode_tests {
-    use super::{select_entry_mode, EntryMode};
+    use std::path::PathBuf;
+
+    use super::{select_entry_mode, unique_id, CliWorkspaceSet, EntryMode};
 
     #[test]
     fn explicit_prompt_is_always_headless() {
@@ -1611,5 +1689,24 @@ mod entry_mode_tests {
     fn interactive_stdin_without_terminal_output_is_rejected() {
         let error = select_entry_mode(None, true, false).unwrap_err();
         assert!(error.to_string().contains("requires a TTY on stdout"));
+    }
+
+    #[test]
+    fn additional_workspace_paths_are_resolved_from_the_primary_workspace() {
+        let root = std::env::temp_dir().join(unique_id("orchestral-workspace-set-test", 0));
+        let primary = root.join("primary");
+        let additional = primary.join("../shared");
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&additional).unwrap();
+
+        let workspaces =
+            CliWorkspaceSet::resolve(Some(&primary), &[PathBuf::from("../shared")]).unwrap();
+        assert_eq!(workspaces.primary, std::fs::canonicalize(&primary).unwrap());
+        assert_eq!(
+            workspaces.additional,
+            [std::fs::canonicalize(&additional).unwrap()]
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

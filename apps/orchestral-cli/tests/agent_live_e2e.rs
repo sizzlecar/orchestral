@@ -693,6 +693,153 @@ fn local_cli_discovers_searches_reads_patches_and_rechecks_source() {
 }
 
 #[test]
+fn local_cli_uses_structured_tools_across_an_added_workspace() {
+    let _guard = local_e2e_guard();
+    let workspace = TestWorkspace::new("workspace-set-host");
+    let project = TestWorkspace::new("workspace-set-project");
+    fs::create_dir_all(project.path("src")).expect("create added project source directory");
+    fs::write(
+        project.path("src/service.rs"),
+        "pub fn workspace_value() -> u32 { 7 }\n",
+    )
+    .expect("write added project source");
+    workspace.disable_exec();
+    let selector = project
+        .root
+        .canonicalize()
+        .expect("canonicalize added workspace")
+        .to_string_lossy()
+        .into_owned();
+
+    let selector_for_search = selector.clone();
+    let selector_for_text = selector.clone();
+    let selector_for_read = selector.clone();
+    let selector_for_patch = selector.clone();
+    let selector_for_verify = selector.clone();
+    let selector_for_context = selector.clone();
+    let (model_endpoint, model_server) = spawn_fixture_http_server(vec![
+        Box::new(move |request| {
+            let context = model_request_text(&request.body);
+            assert!(context.contains(&selector_for_context), "{context}");
+            for tool in ["file_search", "text_search", "file_read", "apply_patch"] {
+                assert!(
+                    model_request_has_tool(&request.body, tool),
+                    "missing {tool}"
+                );
+            }
+            assert!(!model_request_has_tool(&request.body, "exec_command"));
+            openai_tool_response(
+                "added-workspace-files",
+                "file_search",
+                json!({
+                    "workspace": selector_for_search,
+                    "pattern": "**/*.rs"
+                }),
+            )
+        }),
+        Box::new(move |request| {
+            let context = model_request_text(&request.body);
+            assert!(context.contains("src/service.rs"), "{context}");
+            openai_tool_response(
+                "added-workspace-symbol",
+                "text_search",
+                json!({
+                    "workspace": selector_for_text,
+                    "pattern": "workspace_value",
+                    "literal": true
+                }),
+            )
+        }),
+        Box::new(move |request| {
+            assert!(model_request_text(&request.body).contains("workspace_value"));
+            openai_tool_response(
+                "added-workspace-read",
+                "file_read",
+                json!({
+                    "workspace": selector_for_read,
+                    "path": "src/service.rs"
+                }),
+            )
+        }),
+        Box::new(move |request| {
+            assert!(model_request_text(&request.body).contains("u32 { 7 }"));
+            openai_tool_response(
+                "added-workspace-patch",
+                "apply_patch",
+                json!({
+                    "workspace": selector_for_patch,
+                    "patch": concat!(
+                        "*** Begin Patch\n",
+                        "*** Update File: src/service.rs\n",
+                        "@@\n",
+                        "-pub fn workspace_value() -> u32 { 7 }\n",
+                        "+pub fn workspace_value() -> u32 { 8 }\n",
+                        "*** End Patch"
+                    )
+                }),
+            )
+        }),
+        Box::new(move |request| {
+            assert!(model_request_text(&request.body).contains("\"operation\":\"update\""));
+            openai_tool_response(
+                "added-workspace-verify",
+                "file_read",
+                json!({
+                    "workspace": selector_for_verify,
+                    "path": "src/service.rs"
+                }),
+            )
+        }),
+        Box::new(|request| {
+            assert!(model_request_text(&request.body).contains("u32 { 8 }"));
+            openai_text_response("WORKSPACE_SET_OK")
+        }),
+    ]);
+    workspace.configure_local_openai(&model_endpoint);
+
+    let mut command = root_command(&workspace);
+    command
+        .env("OPENAI_API_KEY", "fixture-key")
+        .arg("--backend")
+        .arg("openai")
+        .arg("--model")
+        .arg("fixture-model")
+        .arg("--temperature")
+        .arg("0")
+        .arg("--session-id")
+        .arg("workspace-set-session")
+        .arg("--system-prompt")
+        .arg("Use only dedicated file tools; inspect, patch, and verify the added project.")
+        .arg("--no-mcp")
+        .arg("--no-skills")
+        .arg("--add-dir")
+        .arg(&project.root)
+        .arg("Fix the implementation in the added project.");
+    let output = run_to_completion(command, LOCAL_PROCESS_TIMEOUT);
+    assert!(output.status.success(), "{}", output.stderr_text());
+    assert_eq!(output.stdout_text().trim(), "WORKSPACE_SET_OK");
+    assert!(!output.stderr_text().contains(APPROVAL_PROMPT));
+    assert!(fs::read_to_string(project.path("src/service.rs"))
+        .unwrap()
+        .contains("u32 { 8 }"));
+    assert!(!workspace.path("src/service.rs").exists());
+
+    assert_eq!(
+        model_server
+            .join()
+            .expect("join workspace-set model server")
+            .len(),
+        6
+    );
+    let records = session_records(&workspace);
+    let exchanges = tool_exchanges(&records);
+    assert_eq!(exchanges.len(), 5);
+    assert!(exchanges
+        .iter()
+        .all(|exchange| tool_result_is_error(exchange) == Some(false)));
+}
+
+#[test]
 fn local_cli_reads_patches_and_runs_a_guarded_verification() {
     let _guard = local_e2e_guard();
     let workspace = TestWorkspace::new("patch-and-verify");

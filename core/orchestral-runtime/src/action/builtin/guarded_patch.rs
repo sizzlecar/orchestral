@@ -3,7 +3,7 @@
 //! The model supplies patch intent only. Workspace identity, filesystem roots,
 //! approval, effect journaling, and cancellation remain Host-owned.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,24 +31,103 @@ use super::support::canonical_roots;
 const MAX_RESULTING_FILE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
+struct MutationWorkspace {
+    root: PathBuf,
+    selector: String,
+    dir: Arc<Dir>,
+}
+
+#[derive(Debug, Clone)]
+struct MutationWorkspaceSet {
+    primary: String,
+    by_selector: BTreeMap<String, MutationWorkspace>,
+}
+
+impl MutationWorkspaceSet {
+    fn new<I, P>(primary: impl AsRef<Path>, additional: I) -> io::Result<Self>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let primary = Self::open(primary)?;
+        let primary_selector = primary.selector.clone();
+        let mut by_selector = BTreeMap::from([(primary_selector.clone(), primary)]);
+        for root in additional {
+            let workspace = Self::open(root)?;
+            by_selector
+                .entry(workspace.selector.clone())
+                .or_insert(workspace);
+        }
+        Ok(Self {
+            primary: primary_selector,
+            by_selector,
+        })
+    }
+
+    fn open(root: impl AsRef<Path>) -> io::Result<MutationWorkspace> {
+        let root = std::fs::canonicalize(root)?;
+        if !root.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "mutation workspace must be a directory",
+            ));
+        }
+        let selector = root.to_string_lossy().into_owned();
+        let dir = Arc::new(Dir::open_ambient_dir(&root, ambient_authority())?);
+        Ok(MutationWorkspace {
+            root,
+            selector,
+            dir,
+        })
+    }
+
+    fn select(&self, invocation: &ToolInvocation) -> Result<&MutationWorkspace, ToolOutcome> {
+        let selector = invocation
+            .arguments
+            .get("workspace")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|selector| !selector.is_empty())
+            .unwrap_or(&self.primary);
+        self.by_selector.get(selector).ok_or_else(|| {
+            rejected(
+                "workspace_unknown",
+                format!(
+                    "workspace must be one of the exact Host-provided roots: {}",
+                    self.by_selector
+                        .keys()
+                        .map(|root| format!("'{root}'"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )
+        })
+    }
+
+    fn primary(&self) -> &MutationWorkspace {
+        self.by_selector
+            .get(&self.primary)
+            .expect("primary workspace is inserted during construction")
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct GuardedFileWriteExecutor {
-    workspace: PathBuf,
-    workspace_dir: Arc<Dir>,
+    workspaces: MutationWorkspaceSet,
 }
 
 impl GuardedFileWriteExecutor {
     pub fn new(workspace: impl AsRef<Path>) -> io::Result<Self> {
-        let workspace = std::fs::canonicalize(workspace)?;
-        if !workspace.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "file_write workspace must be a directory",
-            ));
-        }
-        let workspace_dir = Dir::open_ambient_dir(&workspace, ambient_authority())?;
+        Self::new_with_roots(workspace, std::iter::empty::<PathBuf>())
+    }
+
+    pub fn new_with_roots<I, P>(primary: impl AsRef<Path>, additional: I) -> io::Result<Self>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
         Ok(Self {
-            workspace,
-            workspace_dir: Arc::new(workspace_dir),
+            workspaces: MutationWorkspaceSet::new(primary, additional)?,
         })
     }
 }
@@ -160,6 +239,9 @@ impl GuardedToolExecutor for GuardedFileWriteExecutor {
         let Ok(request) = FileWriteRequest::parse(invocation) else {
             return Vec::new();
         };
+        let Ok(workspace) = self.workspaces.select(invocation) else {
+            return Vec::new();
+        };
         let (diff, diff_omitted) = if request.mode == FileWriteMode::Create {
             added_content_preview(request.content)
         } else {
@@ -170,7 +252,11 @@ impl GuardedToolExecutor for GuardedFileWriteExecutor {
                 FileWriteMode::Create => ToolFileActivityKind::Create,
                 FileWriteMode::Replace => ToolFileActivityKind::Update,
             },
-            path: request.path.display().to_owned(),
+            path: workspace
+                .root
+                .join(request.path.relative())
+                .to_string_lossy()
+                .into_owned(),
             diff,
             diff_omitted,
         }]
@@ -183,8 +269,9 @@ impl GuardedToolExecutor for GuardedFileWriteExecutor {
         _effective_policy: &orchestral_core::tool_protocol::EffectiveToolPolicy,
     ) -> Result<ToolOperationPlan, ToolOutcome> {
         let request = FileWriteRequest::parse(invocation)?;
-        let target = self
-            .workspace
+        let workspace = self.workspaces.select(invocation)?;
+        let target = workspace
+            .root
             .join(request.path.relative())
             .to_string_lossy()
             .into_owned();
@@ -203,21 +290,24 @@ impl GuardedToolExecutor for GuardedFileWriteExecutor {
             required_capabilities,
             risk: ToolOperationRisk::Routine,
             summary: format!(
-                "{} workspace file '{}'",
+                "{} file '{}' in workspace '{}'",
                 request.operation_label(),
-                request.path.display()
+                request.path.display(),
+                workspace.selector,
             ),
         })
     }
 
     fn approval_summary(&self, invocation: &ToolInvocation) -> String {
         FileWriteRequest::parse(invocation)
-            .map(|request| {
-                format!(
-                    "{} workspace file '{}'",
+            .and_then(|request| {
+                let workspace = self.workspaces.select(invocation)?;
+                Ok(format!(
+                    "{} file '{}' in workspace '{}'",
                     request.operation_label(),
-                    request.path.display()
-                )
+                    request.path.display(),
+                    workspace.selector,
+                ))
             })
             .unwrap_or_else(|_| "Apply an invalid file_write request".to_owned())
     }
@@ -230,15 +320,23 @@ impl GuardedToolExecutor for GuardedFileWriteExecutor {
             Ok(request) => request,
             Err(outcome) => return outcome,
         };
+        let workspace = match self.workspaces.select(&execution.invocation) {
+            Ok(workspace) => workspace,
+            Err(outcome) => return outcome,
+        };
         let roots = match EffectiveRoots::from_execution(&execution) {
             Ok(roots) => roots,
             Err(error) => return error.into_outcome(0),
         };
-        let target =
-            match resolve_target(&self.workspace_dir, &self.workspace, &roots, &request.path) {
-                Ok(target) => target,
-                Err(error) => return error.into_outcome(0),
-            };
+        let target = match resolve_target(
+            workspace.dir.as_ref(),
+            &workspace.root,
+            &roots,
+            &request.path,
+        ) {
+            Ok(target) => target,
+            Err(error) => return error.into_outcome(0),
+        };
         let (operation, before, permissions, create_only) = match request.mode {
             FileWriteMode::Create => {
                 if let Err(error) = require_absent_file(&target) {
@@ -267,7 +365,12 @@ impl GuardedToolExecutor for GuardedFileWriteExecutor {
         let after = request.content.as_bytes();
         if before.as_deref() == Some(after) {
             return ToolOutcome::Completed {
-                output: json!({ "changed_files": 0, "changes": [] }).into(),
+                output: json!({
+                    "workspace": workspace.selector,
+                    "changed_files": 0,
+                    "changes": []
+                })
+                .into(),
             };
         }
         if execution.cancellation.is_cancelled() {
@@ -278,6 +381,7 @@ impl GuardedToolExecutor for GuardedFileWriteExecutor {
         }
         ToolOutcome::Completed {
             output: json!({
+                "workspace": workspace.selector,
                 "changed_files": 1,
                 "changes": [change_output(
                     operation,
@@ -293,28 +397,26 @@ impl GuardedToolExecutor for GuardedFileWriteExecutor {
 
 #[derive(Debug, Clone)]
 pub struct GuardedApplyPatchExecutor {
-    workspace: PathBuf,
-    workspace_dir: Arc<Dir>,
+    workspaces: MutationWorkspaceSet,
 }
 
 impl GuardedApplyPatchExecutor {
     pub fn new(workspace: impl AsRef<Path>) -> io::Result<Self> {
-        let workspace = std::fs::canonicalize(workspace)?;
-        if !workspace.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "apply_patch workspace must be a directory",
-            ));
-        }
-        let workspace_dir = Dir::open_ambient_dir(&workspace, ambient_authority())?;
+        Self::new_with_roots(workspace, std::iter::empty::<PathBuf>())
+    }
+
+    pub fn new_with_roots<I, P>(primary: impl AsRef<Path>, additional: I) -> io::Result<Self>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
         Ok(Self {
-            workspace,
-            workspace_dir: Arc::new(workspace_dir),
+            workspaces: MutationWorkspaceSet::new(primary, additional)?,
         })
     }
 
     pub fn workspace(&self) -> &Path {
-        &self.workspace
+        &self.workspaces.primary().root
     }
 }
 
@@ -329,7 +431,16 @@ impl GuardedToolExecutor for GuardedApplyPatchExecutor {
         invocation: &ToolInvocation,
         _outcome: Option<&ToolOutcome>,
     ) -> Vec<ToolActivityEvidence> {
-        patch_activity_evidence(invocation)
+        let mut evidence = patch_activity_evidence(invocation);
+        let Ok(workspace) = self.workspaces.select(invocation) else {
+            return evidence;
+        };
+        for item in &mut evidence {
+            if let ToolActivityEvidence::File { path, .. } = item {
+                *path = workspace.root.join(&*path).to_string_lossy().into_owned();
+            }
+        }
+        evidence
     }
 
     fn plan_operation(
@@ -345,11 +456,12 @@ impl GuardedToolExecutor for GuardedApplyPatchExecutor {
             .ok_or_else(|| rejected("patch_missing", "apply_patch requires a patch string"))?;
         let parsed =
             parse_patch(patch).map_err(|error| rejected("patch_invalid", error.to_string()))?;
+        let workspace = self.workspaces.select(invocation)?;
         let mut required_capabilities = CapabilityRequest::default();
         let mut risk = ToolOperationRisk::Routine;
         for operation in &parsed.operations {
-            let target = self
-                .workspace
+            let target = workspace
+                .root
                 .join(operation.path().relative())
                 .to_string_lossy()
                 .into_owned();
@@ -373,7 +485,11 @@ impl GuardedToolExecutor for GuardedApplyPatchExecutor {
         Ok(ToolOperationPlan {
             required_capabilities,
             risk,
-            summary: parsed_patch_summary(&parsed),
+            summary: format!(
+                "{} in workspace '{}'",
+                parsed_patch_summary(&parsed),
+                workspace.selector
+            ),
         })
     }
 
@@ -387,7 +503,14 @@ impl GuardedToolExecutor for GuardedApplyPatchExecutor {
         let Ok(parsed) = parse_patch(patch) else {
             return "Apply a workspace patch that failed preflight parsing".to_owned();
         };
-        parsed_patch_summary(&parsed)
+        let Ok(workspace) = self.workspaces.select(invocation) else {
+            return "Apply a patch to an unknown workspace".to_owned();
+        };
+        format!(
+            "{} in workspace '{}'",
+            parsed_patch_summary(&parsed),
+            workspace.selector
+        )
     }
 
     async fn execute(&self, execution: GuardedToolExecution) -> ToolOutcome {
@@ -406,11 +529,16 @@ impl GuardedToolExecutor for GuardedApplyPatchExecutor {
             Ok(parsed) => parsed,
             Err(error) => return rejected("patch_invalid", error.to_string()),
         };
+        let workspace = match self.workspaces.select(&execution.invocation) {
+            Ok(workspace) => workspace,
+            Err(outcome) => return outcome,
+        };
         let roots = match EffectiveRoots::from_execution(&execution) {
             Ok(roots) => roots,
             Err(error) => return error.into_outcome(0),
         };
-        let prepared = match prepare_patch(&self.workspace_dir, &self.workspace, &roots, parsed) {
+        let prepared = match prepare_patch(workspace.dir.as_ref(), &workspace.root, &roots, parsed)
+        {
             Ok(prepared) => prepared,
             Err(error) => return error.into_outcome(0),
         };
@@ -433,6 +561,7 @@ impl GuardedToolExecutor for GuardedApplyPatchExecutor {
         }
         ToolOutcome::Completed {
             output: json!({
+                "workspace": workspace.selector,
                 "changed_files": output.len(),
                 "changes": output,
             })
@@ -611,7 +740,8 @@ pub fn guarded_apply_patch_descriptor(restriction: ToolRestriction) -> ToolDescr
                 "The patch must use `*** Begin Patch` / `*** End Patch` and one or more ",
                 "exact directives: `*** Add File: path`, `*** Update File: path` with `@@` ",
                 "hunks, or `*** Delete File: path`; each path directive requires the colon. ",
-                "Paths must be normalized workspace-relative paths."
+                "Paths must be normalized paths relative to the selected workspace. When multiple ",
+                "workspaces are provided, select one with its exact canonical workspace root."
             )
             .to_owned(),
             input_schema: json!({
@@ -621,6 +751,10 @@ pub fn guarded_apply_patch_descriptor(restriction: ToolRestriction) -> ToolDescr
                     "patch": {
                         "type": "string",
                         "maxLength": MAX_PATCH_BYTES
+                    },
+                    "workspace": {
+                        "type": "string",
+                        "description": "Optional exact Host-provided canonical workspace root. Omit to use the primary workspace."
                     }
                 },
                 "additionalProperties": false
@@ -641,11 +775,12 @@ pub fn guarded_file_write_descriptor(restriction: ToolRestriction) -> ToolDescri
             name: "file_write".to_owned(),
             description: concat!(
                 "Create a new UTF-8 text file or intentionally replace a complete existing file ",
-                "inside the Host-approved workspace. Use mode='create' only when the path must ",
+                "inside a Host-approved workspace. Use mode='create' only when the path must ",
                 "not exist. Use mode='replace' only after reading the complete file from offset 1 ",
                 "through eof, and pass that file_read content_digest as expected_digest. Use ",
                 "apply_patch instead for targeted edits to existing files. Parent directories ",
-                "must already exist."
+                "must already exist. When multiple workspaces are provided, select one with its ",
+                "exact canonical workspace root."
             )
             .to_owned(),
             input_schema: json!({
@@ -654,7 +789,11 @@ pub fn guarded_file_write_descriptor(restriction: ToolRestriction) -> ToolDescri
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Normalized workspace-relative target path."
+                        "description": "Normalized path relative to the selected workspace."
+                    },
+                    "workspace": {
+                        "type": "string",
+                        "description": "Optional exact Host-provided canonical workspace root. Omit to use the primary workspace."
                     },
                     "content": {
                         "type": "string",
@@ -683,8 +822,9 @@ pub fn guarded_file_write_descriptor(restriction: ToolRestriction) -> ToolDescri
 fn file_change_output_schema() -> Value {
     json!({
         "type": "object",
-        "required": ["changed_files", "changes"],
+        "required": ["workspace", "changed_files", "changes"],
         "properties": {
+            "workspace": { "type": "string" },
             "changed_files": { "type": "integer" },
             "changes": {
                 "type": "array",

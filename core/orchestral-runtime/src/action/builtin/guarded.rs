@@ -25,7 +25,7 @@ use crate::tools::shell_sandbox::{sandbox_command, SandboxNetworkAccess, ShellSa
 
 use super::support::{
     build_allowlisted_env, canonical_roots, read_stream_limited, stderr_preview,
-    truncate_utf8_lossy, GuardedWorkspace, WorkspacePathError,
+    truncate_utf8_lossy, GuardedWorkspaceSet, WorkspacePathError,
 };
 
 pub const GUARDED_SHELL_SANDBOX_PROFILE: &str = "orchestral.shell.exec.v1";
@@ -164,13 +164,21 @@ const FILE_READ_OUTPUT_RESERVE_BYTES: usize = 2 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct GuardedFileReadExecutor {
-    workspace: GuardedWorkspace,
+    workspaces: GuardedWorkspaceSet,
 }
 
 impl GuardedFileReadExecutor {
     pub fn new(workspace: impl AsRef<Path>) -> io::Result<Self> {
+        Self::new_with_roots(workspace, std::iter::empty::<PathBuf>())
+    }
+
+    pub fn new_with_roots<I, P>(primary: impl AsRef<Path>, additional: I) -> io::Result<Self>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
         Ok(Self {
-            workspace: GuardedWorkspace::new(workspace)?,
+            workspaces: GuardedWorkspaceSet::new(primary, additional)?,
         })
     }
 }
@@ -182,11 +190,25 @@ impl GuardedToolExecutor for GuardedFileReadExecutor {
         invocation: &orchestral_core::tool_protocol::ToolInvocation,
         _outcome: Option<&ToolOutcome>,
     ) -> Vec<ToolActivityEvidence> {
+        let workspace = self
+            .workspaces
+            .select(
+                invocation
+                    .arguments
+                    .get("workspace")
+                    .and_then(Value::as_str),
+            )
+            .ok();
         invocation
             .arguments
             .get("path")
             .and_then(Value::as_str)
             .and_then(activity_path)
+            .map(|path| {
+                workspace
+                    .map(|workspace| workspace.root().join(&path).to_string_lossy().into_owned())
+                    .unwrap_or(path)
+            })
             .map(|path| ToolActivityEvidence::File {
                 operation: ToolFileActivityKind::Read,
                 path,
@@ -225,7 +247,17 @@ impl GuardedToolExecutor for GuardedFileReadExecutor {
                 "file_read path must be a non-empty string",
             );
         };
-        let target = match self.workspace.resolve_existing(raw_path, &roots) {
+        let workspace = match self.workspaces.select(
+            execution
+                .invocation
+                .arguments
+                .get("workspace")
+                .and_then(Value::as_str),
+        ) {
+            Ok(workspace) => workspace,
+            Err(error) => return workspace_path_outcome(error),
+        };
+        let target = match workspace.resolve_existing(raw_path, &roots) {
             Ok(target) => target,
             Err(error) => return workspace_path_outcome(error),
         };
@@ -327,6 +359,7 @@ impl GuardedToolExecutor for GuardedFileReadExecutor {
         };
         ToolOutcome::Completed {
             output: json!({
+                "workspace": workspace.selector(),
                 "path": target.display(),
                 "revision": revision,
                 "content": page.content,
@@ -375,7 +408,7 @@ pub fn guarded_file_read_descriptor(restriction: ToolRestriction) -> ToolDescrip
         tool_id: ToolId::new("orchestral/file_read/v3"),
         model_schema: ModelToolSchema {
             name: "file_read".to_owned(),
-            description: "Read UTF-8 source text by 1-indexed line range from a Host-approved workspace-relative path. Continue with next_offset when eof is false; truncation reasons are always explicit."
+            description: "Read UTF-8 source text by 1-indexed line range from a Host-approved workspace-relative path. When multiple workspaces are provided, select one with its exact canonical workspace root. Continue with next_offset when eof is false; truncation reasons are always explicit."
                 .to_owned(),
             input_schema: json!({
                 "type": "object",
@@ -383,7 +416,11 @@ pub fn guarded_file_read_descriptor(restriction: ToolRestriction) -> ToolDescrip
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Path relative to the composed workspace; absolute paths and parent traversal are rejected."
+                        "description": "Path relative to the selected workspace; absolute paths and parent traversal are rejected."
+                    },
+                    "workspace": {
+                        "type": "string",
+                        "description": "Optional exact Host-provided canonical workspace root. Omit to use the primary workspace."
                     },
                     "offset": {
                         "type": "integer",
@@ -403,11 +440,12 @@ pub fn guarded_file_read_descriptor(restriction: ToolRestriction) -> ToolDescrip
         output_schema: json!({
             "type": "object",
             "required": [
-                "path", "revision", "content", "content_digest", "start_line", "end_line",
+                "workspace", "path", "revision", "content", "content_digest", "start_line", "end_line",
                 "next_offset", "eof", "truncated", "truncation_reasons",
                 "truncated_line_numbers", "file_size_bytes", "scanned_bytes"
             ],
             "properties": {
+                "workspace": { "type": "string" },
                 "path": { "type": "string" },
                 "revision": { "type": "string" },
                 "content": { "type": "string" },

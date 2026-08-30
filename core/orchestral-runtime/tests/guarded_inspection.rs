@@ -556,3 +556,114 @@ async fn search_tools_never_follow_workspace_symlinks() {
     assert_eq!(text["count"], 0);
     fs::remove_dir_all(parent).unwrap();
 }
+
+#[tokio::test]
+async fn inspection_tools_select_an_exact_host_provided_workspace() {
+    let primary = temp_workspace("workspace-set-primary");
+    let additional = temp_workspace("workspace-set-additional");
+    fs::write(
+        primary.join("primary.rs"),
+        "const PRIMARY: &str = \"one\";\n",
+    )
+    .unwrap();
+    fs::write(
+        additional.join("secondary.rs"),
+        "const SECONDARY: &str = \"workspace-set-sentinel\";\n",
+    )
+    .unwrap();
+
+    let mut policy = bounds(&primary, 64 * 1024);
+    policy
+        .filesystem
+        .readable_roots
+        .insert(additional.to_string_lossy().into_owned());
+    let runtime = new_runtime(policy.clone());
+    runtime
+        .register(
+            guarded_file_read_descriptor(ToolRestriction {
+                bounds: policy.clone(),
+            }),
+            Arc::new(GuardedFileReadExecutor::new_with_roots(&primary, [&additional]).unwrap()),
+        )
+        .unwrap();
+    runtime
+        .register(
+            guarded_file_search_descriptor(ToolRestriction {
+                bounds: policy.clone(),
+            }),
+            Arc::new(GuardedFileSearchExecutor::new_with_roots(&primary, [&additional]).unwrap()),
+        )
+        .unwrap();
+    runtime
+        .register(
+            guarded_text_search_descriptor(ToolRestriction {
+                bounds: policy.clone(),
+            }),
+            Arc::new(GuardedTextSearchExecutor::new_with_roots(&primary, [&additional]).unwrap()),
+        )
+        .unwrap();
+
+    let selector = additional.to_string_lossy();
+    let read = completed(
+        invoke(
+            &runtime,
+            policy.clone(),
+            "workspace-set-read",
+            "orchestral/file_read/v3",
+            json!({"workspace": selector.as_ref(), "path": "secondary.rs"}),
+        )
+        .await,
+    );
+    assert_eq!(read["workspace"], additional.to_string_lossy().as_ref());
+    assert!(read["content"]
+        .as_str()
+        .unwrap()
+        .contains("workspace-set-sentinel"));
+
+    let paths = completed(
+        invoke(
+            &runtime,
+            policy.clone(),
+            "workspace-set-files",
+            "orchestral/file_search/v1",
+            json!({"workspace": selector.as_ref(), "pattern": "*.rs"}),
+        )
+        .await,
+    );
+    assert_eq!(paths["matches"], json!(["secondary.rs"]));
+
+    let text = completed(
+        invoke(
+            &runtime,
+            policy.clone(),
+            "workspace-set-text",
+            "orchestral/text_search/v1",
+            json!({
+                "workspace": selector.as_ref(),
+                "pattern": "workspace-set-sentinel",
+                "literal": true
+            }),
+        )
+        .await,
+    );
+    assert_eq!(text["count"], 1);
+
+    let unknown = invoke(
+        &runtime,
+        policy,
+        "workspace-set-unknown",
+        "orchestral/file_read/v3",
+        json!({"workspace": "/not/host/provided", "path": "secondary.rs"}),
+    )
+    .await;
+    assert!(matches!(
+        unknown,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Rejected { ref code, .. },
+            ..
+        } if code == "workspace_unknown"
+    ));
+
+    fs::remove_dir_all(primary).unwrap();
+    fs::remove_dir_all(additional).unwrap();
+}

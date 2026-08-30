@@ -282,6 +282,129 @@ async fn file_write_creates_and_conditionally_replaces_complete_text() {
 }
 
 #[tokio::test]
+async fn mutation_tools_write_only_to_the_selected_host_workspace() {
+    let primary = TestWorkspace::new("workspace-set-primary");
+    let additional = TestWorkspace::new("workspace-set-additional");
+    let mut bounds = patch_bounds(&primary.root, ApprovalPolicy::NotRequired);
+    let additional_root = additional.root.to_string_lossy().into_owned();
+    bounds
+        .filesystem
+        .readable_roots
+        .insert(additional_root.clone());
+    bounds
+        .filesystem
+        .writable_roots
+        .insert(additional_root.clone());
+    bounds.sandbox.required = true;
+    bounds
+        .sandbox
+        .allowed_profiles
+        .insert("workspace".to_owned());
+    let verifier =
+        HostApprovalVerifier::new(SIGNING_KEY, InMemoryApprovalCapabilityStore::default()).unwrap();
+    let runtime = GuardedToolRuntime::new(
+        HostToolPolicy {
+            bounds: bounds.clone(),
+        },
+        verifier,
+    )
+    .unwrap()
+    .with_permission_policy(Arc::new(WorkspacePermissionPolicy));
+    runtime
+        .register(
+            guarded_file_write_descriptor(ToolRestriction {
+                bounds: bounds.clone(),
+            }),
+            Arc::new(
+                GuardedFileWriteExecutor::new_with_roots(&primary.root, [&additional.root])
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
+    runtime
+        .register(
+            guarded_apply_patch_descriptor(ToolRestriction {
+                bounds: bounds.clone(),
+            }),
+            Arc::new(
+                GuardedApplyPatchExecutor::new_with_roots(&primary.root, [&additional.root])
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
+
+    let created = invoke_file_write(
+        &runtime,
+        &bounds,
+        "workspace-set-create",
+        json!({
+            "workspace": additional_root.as_str(),
+            "path": "selected.txt",
+            "content": "before\n",
+            "mode": "create"
+        }),
+    )
+    .await;
+    assert_eq!(completed(&created)["workspace"], additional_root.as_str());
+    assert!(!primary.path("selected.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(additional.path("selected.txt")).unwrap(),
+        "before\n"
+    );
+
+    let patched = runtime
+        .invoke(
+            ToolInvocation {
+                run_id: RunId::new("workspace-set-patch-run"),
+                call_id: ToolCallId::new("workspace-set-patch"),
+                tool_id: ToolId::new("orchestral/apply_patch/v1"),
+                arguments: json!({
+                    "workspace": additional_root.as_str(),
+                    "patch": concat!(
+                        "*** Begin Patch\n",
+                        "*** Update File: selected.txt\n",
+                        "@@\n",
+                        "-before\n",
+                        "+after\n",
+                        "*** End Patch"
+                    )
+                }),
+            },
+            RunToolGrant {
+                bounds: bounds.clone(),
+            },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(completed(&patched)["workspace"], additional_root.as_str());
+    assert_eq!(
+        std::fs::read_to_string(additional.path("selected.txt")).unwrap(),
+        "after\n"
+    );
+
+    let unknown = invoke_file_write(
+        &runtime,
+        &bounds,
+        "workspace-set-unknown",
+        json!({
+            "workspace": "/not/host/provided",
+            "path": "denied.txt",
+            "content": "denied\n",
+            "mode": "create"
+        }),
+    )
+    .await;
+    assert!(matches!(
+        unknown,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Rejected { ref code, .. },
+            ..
+        } if code == "workspace_unknown"
+    ));
+}
+
+#[tokio::test]
 async fn file_write_preconditions_prevent_accidental_overwrite_and_escape() {
     let workspace = TestWorkspace::new("file-write-preconditions");
     std::fs::write(workspace.path("stable.txt"), "stable\n").unwrap();
@@ -427,7 +550,7 @@ async fn one_patch_tool_adds_updates_and_deletes_without_shell() {
             .unwrap()
             .keys()
             .collect::<Vec<_>>(),
-        vec!["patch"]
+        vec!["patch", "workspace"]
     );
 
     let result = invoke(

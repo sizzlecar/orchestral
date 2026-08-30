@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
@@ -25,6 +25,19 @@ pub(super) fn canonical_roots(roots: &BTreeSet<String>) -> Result<Vec<PathBuf>, 
 #[derive(Debug, Clone)]
 pub(super) struct GuardedWorkspace {
     root: PathBuf,
+    selector: String,
+}
+
+/// Composition-time set of Host-authorized workspaces.
+///
+/// The primary workspace remains the default for backward compatibility. A
+/// model can select another workspace only by passing the exact canonical root
+/// published by the Host. Paths inside every workspace remain relative, so the
+/// same traversal and symlink checks apply regardless of which root is used.
+#[derive(Debug, Clone)]
+pub(super) struct GuardedWorkspaceSet {
+    primary: String,
+    by_selector: BTreeMap<String, GuardedWorkspace>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,7 +71,8 @@ impl GuardedWorkspace {
                 "guarded workspace must be a directory",
             ));
         }
-        Ok(Self { root })
+        let selector = root.to_string_lossy().into_owned();
+        Ok(Self { root, selector })
     }
 
     pub(super) fn resolve_existing(
@@ -96,11 +110,60 @@ impl GuardedWorkspace {
         &self.root
     }
 
+    pub(super) fn selector(&self) -> &str {
+        &self.selector
+    }
+
     pub(super) fn display_path(&self, canonical: &Path) -> String {
         canonical
             .strip_prefix(&self.root)
             .map(display_relative_path)
             .unwrap_or_else(|_| canonical.to_string_lossy().replace('\\', "/"))
+    }
+}
+
+impl GuardedWorkspaceSet {
+    pub(super) fn new<I, P>(primary: impl AsRef<Path>, additional: I) -> io::Result<Self>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let primary = GuardedWorkspace::new(primary)?;
+        let primary_selector = primary.selector().to_owned();
+        let mut by_selector = BTreeMap::from([(primary_selector.clone(), primary)]);
+        for root in additional {
+            let workspace = GuardedWorkspace::new(root)?;
+            by_selector
+                .entry(workspace.selector().to_owned())
+                .or_insert(workspace);
+        }
+        Ok(Self {
+            primary: primary_selector,
+            by_selector,
+        })
+    }
+
+    pub(super) fn select(
+        &self,
+        selector: Option<&str>,
+    ) -> Result<&GuardedWorkspace, WorkspacePathError> {
+        let selector = selector
+            .map(str::trim)
+            .filter(|selector| !selector.is_empty())
+            .unwrap_or(&self.primary);
+        self.by_selector
+            .get(selector)
+            .ok_or_else(|| WorkspacePathError::Rejected {
+                code: "workspace_unknown",
+                message: format!(
+                    "workspace must be one of the exact Host-provided roots: {}",
+                    self.by_selector
+                        .keys()
+                        .map(|root| format!("'{root}'"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            })
     }
 }
 

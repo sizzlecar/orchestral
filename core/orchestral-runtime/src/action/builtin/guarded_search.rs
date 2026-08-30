@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::tool_runtime::{GuardedToolExecution, GuardedToolExecutor};
 
-use super::support::{canonical_roots, GuardedWorkspace, WorkspacePathError};
+use super::support::{canonical_roots, GuardedWorkspace, GuardedWorkspaceSet, WorkspacePathError};
 
 const DEFAULT_FILE_SEARCH_LIMIT: usize = 100;
 const MAX_FILE_SEARCH_LIMIT: usize = 500;
@@ -56,13 +56,21 @@ const NOISE_DIRECTORIES: &[&str] = &[
 
 #[derive(Debug, Clone)]
 pub struct GuardedFileSearchExecutor {
-    workspace: GuardedWorkspace,
+    workspaces: GuardedWorkspaceSet,
 }
 
 impl GuardedFileSearchExecutor {
     pub fn new(workspace: impl AsRef<Path>) -> io::Result<Self> {
+        Self::new_with_roots(workspace, std::iter::empty::<PathBuf>())
+    }
+
+    pub fn new_with_roots<I, P>(primary: impl AsRef<Path>, additional: I) -> io::Result<Self>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
         Ok(Self {
-            workspace: GuardedWorkspace::new(workspace)?,
+            workspaces: GuardedWorkspaceSet::new(primary, additional)?,
         })
     }
 }
@@ -100,7 +108,17 @@ impl GuardedToolExecutor for GuardedFileSearchExecutor {
             .get("path")
             .and_then(Value::as_str)
             .unwrap_or(".");
-        let target = match self.workspace.resolve_existing(path, &roots) {
+        let workspace = match self.workspaces.select(
+            execution
+                .invocation
+                .arguments
+                .get("workspace")
+                .and_then(Value::as_str),
+        ) {
+            Ok(workspace) => workspace.clone(),
+            Err(error) => return workspace_path_outcome(error),
+        };
+        let target = match workspace.resolve_existing(path, &roots) {
             Ok(target) => target,
             Err(error) => return workspace_path_outcome(error),
         };
@@ -123,7 +141,7 @@ impl GuardedToolExecutor for GuardedFileSearchExecutor {
         };
         let cancellation = execution.cancellation.clone();
         let scan_cancellation = cancellation.clone();
-        let workspace = self.workspace.clone();
+        let workspace_selector = workspace.selector().to_owned();
         let root = target.canonical().to_path_buf();
         let root_display = target.display();
         let task = tokio::task::spawn_blocking(move || {
@@ -144,7 +162,7 @@ impl GuardedToolExecutor for GuardedFileSearchExecutor {
         };
         match result {
             Ok(BlockingSearch::Completed(page)) => ToolOutcome::Completed {
-                output: search_page_output(root_display, page).into(),
+                output: search_page_output(workspace_selector, root_display, page).into(),
             },
             Ok(BlockingSearch::Cancelled) => ToolOutcome::Cancelled,
             Err(error) => failed("file_search_worker_failed", error.to_string(), true),
@@ -157,7 +175,7 @@ pub fn guarded_file_search_descriptor(restriction: ToolRestriction) -> ToolDescr
         tool_id: ToolId::new("orchestral/file_search/v1"),
         model_schema: ModelToolSchema {
             name: "file_search".to_owned(),
-            description: "Find workspace-relative file paths with a glob. Respects .gitignore, includes hidden source files, skips dependency/build noise, never follows symlinks, and reports partial results explicitly."
+            description: "Find paths inside a Host-approved workspace with a glob. When multiple workspaces are provided, select one with its exact canonical workspace root. Respects .gitignore, includes hidden source files, skips dependency/build noise, never follows symlinks, and reports partial results explicitly."
                 .to_owned(),
             input_schema: json!({
                 "type": "object",
@@ -169,7 +187,11 @@ pub fn guarded_file_search_descriptor(restriction: ToolRestriction) -> ToolDescr
                     },
                     "path": {
                         "type": "string",
-                        "description": "Workspace-relative directory to search. Defaults to `.`."
+                        "description": "Directory relative to the selected workspace. Defaults to `.`."
+                    },
+                    "workspace": {
+                        "type": "string",
+                        "description": "Optional exact Host-provided canonical workspace root. Omit to use the primary workspace."
                     },
                     "case_sensitive": {
                         "type": "boolean",
@@ -202,13 +224,21 @@ pub fn guarded_file_search_descriptor(restriction: ToolRestriction) -> ToolDescr
 
 #[derive(Debug, Clone)]
 pub struct GuardedTextSearchExecutor {
-    workspace: GuardedWorkspace,
+    workspaces: GuardedWorkspaceSet,
 }
 
 impl GuardedTextSearchExecutor {
     pub fn new(workspace: impl AsRef<Path>) -> io::Result<Self> {
+        Self::new_with_roots(workspace, std::iter::empty::<PathBuf>())
+    }
+
+    pub fn new_with_roots<I, P>(primary: impl AsRef<Path>, additional: I) -> io::Result<Self>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
         Ok(Self {
-            workspace: GuardedWorkspace::new(workspace)?,
+            workspaces: GuardedWorkspaceSet::new(primary, additional)?,
         })
     }
 }
@@ -259,7 +289,17 @@ impl GuardedToolExecutor for GuardedTextSearchExecutor {
             .get("path")
             .and_then(Value::as_str)
             .unwrap_or(".");
-        let target = match self.workspace.resolve_existing(path, &roots) {
+        let workspace = match self.workspaces.select(
+            execution
+                .invocation
+                .arguments
+                .get("workspace")
+                .and_then(Value::as_str),
+        ) {
+            Ok(workspace) => workspace.clone(),
+            Err(error) => return workspace_path_outcome(error),
+        };
+        let target = match workspace.resolve_existing(path, &roots) {
             Ok(target) => target,
             Err(error) => return workspace_path_outcome(error),
         };
@@ -276,7 +316,7 @@ impl GuardedToolExecutor for GuardedTextSearchExecutor {
         };
         let cancellation = execution.cancellation.clone();
         let scan_cancellation = cancellation.clone();
-        let workspace = self.workspace.clone();
+        let workspace_selector = workspace.selector().to_owned();
         let root = target.canonical().to_path_buf();
         let root_display = target.display();
         let spec = TextScanSpec {
@@ -296,7 +336,7 @@ impl GuardedToolExecutor for GuardedTextSearchExecutor {
         };
         match result {
             Ok(BlockingSearch::Completed(page)) => ToolOutcome::Completed {
-                output: search_page_output(root_display, page).into(),
+                output: search_page_output(workspace_selector, root_display, page).into(),
             },
             Ok(BlockingSearch::Cancelled) => ToolOutcome::Cancelled,
             Err(error) => failed("text_search_worker_failed", error.to_string(), true),
@@ -309,7 +349,7 @@ pub fn guarded_text_search_descriptor(restriction: ToolRestriction) -> ToolDescr
         tool_id: ToolId::new("orchestral/text_search/v1"),
         model_schema: ModelToolSchema {
             name: "text_search".to_owned(),
-            description: "Search UTF-8 workspace files with ripgrep's streaming Rust matcher using a regular expression or literal. Results are resource-bounded, gitignore-aware, and explicitly complete or partial."
+            description: "Search UTF-8 files inside a Host-approved workspace with ripgrep's streaming Rust matcher using a regular expression or literal. When multiple workspaces are provided, select one with its exact canonical workspace root. Results are resource-bounded, gitignore-aware, and explicitly complete or partial."
                 .to_owned(),
             input_schema: json!({
                 "type": "object",
@@ -329,7 +369,11 @@ pub fn guarded_text_search_descriptor(restriction: ToolRestriction) -> ToolDescr
                     },
                     "path": {
                         "type": "string",
-                        "description": "Workspace-relative file or directory. Defaults to `.`."
+                        "description": "File or directory relative to the selected workspace. Defaults to `.`."
+                    },
+                    "workspace": {
+                        "type": "string",
+                        "description": "Optional exact Host-provided canonical workspace root. Omit to use the primary workspace."
                     },
                     "include": {
                         "type": "string",
@@ -1001,10 +1045,15 @@ fn enforce_output_budget<T: serde::Serialize>(page: &mut SearchPage<T>, max_byte
     }
 }
 
-fn search_page_output<T: serde::Serialize>(root: String, page: SearchPage<T>) -> Value {
+fn search_page_output<T: serde::Serialize>(
+    workspace: String,
+    root: String,
+    page: SearchPage<T>,
+) -> Value {
     let complete = page.reasons.is_empty();
     let count = page.matches.len();
     json!({
+        "workspace": workspace,
         "root": root,
         "matches": page.matches,
         "count": count,
@@ -1031,10 +1080,11 @@ fn search_output_schema(matches: Value) -> Value {
     json!({
         "type": "object",
         "required": [
-            "root", "matches", "count", "completeness", "partial_reasons",
+            "workspace", "root", "matches", "count", "completeness", "partial_reasons",
             "refinement", "warnings", "stats"
         ],
         "properties": {
+            "workspace": { "type": "string" },
             "root": { "type": "string" },
             "matches": matches,
             "count": { "type": "integer" },
