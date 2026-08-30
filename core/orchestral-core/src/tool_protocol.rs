@@ -355,13 +355,16 @@ pub struct InteractiveCommandPolicy {
     pub allow_child_processes: bool,
 }
 
-/// Exact executable identities allowed to establish Host-configured
-/// transports such as MCP stdio connections.
+/// Process-tree authority used only to establish Host-configured transports
+/// such as MCP stdio connections. It is independent from model-facing command
+/// execution, and every descendant remains inside the transport sandbox.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TransportLaunchPolicy {
     #[serde(default)]
     pub allowed_programs: BTreeSet<String>,
+    #[serde(default)]
+    pub allow_child_processes: bool,
 }
 
 /// Process authority keeps generic commands and infrastructure transports in
@@ -486,6 +489,8 @@ impl ToolPolicyBounds {
                         &self.process.transport.allowed_programs,
                         &other.process.transport.allowed_programs,
                     ),
+                    allow_child_processes: self.process.transport.allow_child_processes
+                        && other.process.transport.allow_child_processes,
                 },
             },
             filesystem: FilesystemPolicy {
@@ -544,6 +549,8 @@ impl ToolPolicyBounds {
                 .transport
                 .allowed_programs
                 .is_subset(&ceiling.process.transport.allowed_programs)
+            && (!self.process.transport.allow_child_processes
+                || ceiling.process.transport.allow_child_processes)
             && self
                 .filesystem
                 .readable_roots
@@ -1446,6 +1453,7 @@ mod tests {
                 },
                 transport: TransportLaunchPolicy {
                     allowed_programs: strings(&["git", "rg"]),
+                    allow_child_processes: true,
                 },
             },
             filesystem: FilesystemPolicy {
@@ -1753,6 +1761,7 @@ mod tests {
                 },
                 transport: TransportLaunchPolicy {
                     allowed_programs: generated_strings(seed, &["node", "python", "mcp"]),
+                    allow_child_processes: next_random(seed) & 1 == 1,
                 },
             },
             filesystem: FilesystemPolicy {

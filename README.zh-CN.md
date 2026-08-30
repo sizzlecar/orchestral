@@ -117,6 +117,18 @@ MCP 调用都继续经过 Host policy 与 Effect Journal。
 `mcp.servers` 支持 Host 配置的 stdio 与 Streamable HTTP transport，发现的方法会成为经过统一
 Guarded Runtime 的命名空间 Tool，而不是提示词。
 
+本地 MCP 与远程 MCP 使用同一个 Host Registry。可通过
+`orchestral --mcp-config PATH` 显式加载 `.mcp.json`；仅仅因为仓库中存在该文件，
+Orchestral 不会自动执行它。本地进程使用精确可执行文件和隔离的私有 HOME，其 cwd、
+读写目录、环境变量及网络权限均与通用 Shell 分离。为兼容 `npx`、`uvx` 和 shell wrapper，
+注册的启动器默认可形成进程树，但所有子进程仍受该 MCP 沙箱约束；单进程服务可设置
+`allowChildProcesses: false`。也可以在主配置中固定 Manifest：
+
+```yaml
+mcp:
+  import_files: [.mcp.json]
+```
+
 ## SDK
 
 公共 SDK 就是 Agent 控制面：`AgentClient` 启动 Run，`AgentRunHandle` 提供事件订阅、

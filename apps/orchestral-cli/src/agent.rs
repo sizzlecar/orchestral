@@ -77,6 +77,7 @@ pub struct AgentRunOptions {
     pub system_prompt: Option<String>,
     pub input: Option<String>,
     pub no_mcp: bool,
+    pub mcp_config: Vec<PathBuf>,
     pub no_skills: bool,
 }
 
@@ -106,6 +107,7 @@ struct CliExecHost {
 struct CliToolComposition {
     runtime: Arc<GuardedToolRuntime<InMemoryApprovalCapabilityStore>>,
     run_grant: RunToolGrant,
+    mcp_restriction: ToolRestriction,
     approval_broker: Arc<InMemoryHostApprovalBroker>,
     process_supervisor: Arc<ProcessSupervisor>,
 }
@@ -191,7 +193,7 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
     let mcp_configs = if options.no_mcp {
         Vec::new()
     } else {
-        configured_mcp_servers(&config)?
+        configured_mcp_servers(&config, &options.mcp_config)?
     };
     let artifact_store = ToolArtifactStore::new(
         build_cli_blob_store(&config)?,
@@ -202,20 +204,14 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
     let CliToolComposition {
         runtime: tool_runtime,
         run_grant,
+        mcp_restriction,
         approval_broker,
         process_supervisor,
     } = build_cli_tool_runtime(&config, &mcp_configs, effect_journal, artifact_store)?;
-    let mut mcp_restriction = run_grant.bounds.clone();
-    mcp_restriction.approval = ApprovalPolicy::Required;
-    // MCP transports retain their exact configured endpoints. Generic exec's
-    // reviewable open-network ceiling must never bleed into this lane.
-    mcp_restriction.network.allow_unrestricted = false;
     let mcp_registry = McpToolsAdapterRegistry::register(
         tool_runtime.as_ref(),
         mcp_configs,
-        ToolRestriction {
-            bounds: mcp_restriction,
-        },
+        mcp_restriction,
         CancellationToken::new(),
     )
     .await
@@ -360,6 +356,17 @@ fn build_cli_tool_runtime(
         .iter()
         .flat_map(GuardedMcpServerConfig::allowed_programs)
         .collect::<BTreeSet<_>>();
+    let transport_allows_children = mcp_configs
+        .iter()
+        .any(GuardedMcpServerConfig::allows_child_processes);
+    let mcp_readable_roots = mcp_configs
+        .iter()
+        .flat_map(GuardedMcpServerConfig::filesystem_read_roots)
+        .collect::<BTreeSet<_>>();
+    let mcp_writable_roots = mcp_configs
+        .iter()
+        .flat_map(GuardedMcpServerConfig::filesystem_write_roots)
+        .collect::<BTreeSet<_>>();
     let mut allowed_effects = BTreeSet::from([
         EffectScope::FilesystemRead,
         EffectScope::FilesystemWrite,
@@ -374,34 +381,74 @@ fn build_cli_tool_runtime(
         ]);
     }
     allowed_effects.extend(mcp_effects.iter().copied());
-    let mut allowed_environment = mcp_configs
+    let mcp_environment = mcp_configs
         .iter()
         .flat_map(GuardedMcpServerConfig::environment_names)
         .collect::<BTreeSet<_>>();
+    let mut allowed_environment = mcp_environment.clone();
     if let Some(host) = &exec_host {
         allowed_environment.extend(host.environment_names.iter().cloned());
     }
-    let mut allowed_network_targets = mcp_configs
+    let mcp_network_targets = mcp_configs
         .iter()
         .flat_map(GuardedMcpServerConfig::allowed_network_targets)
         .collect::<BTreeSet<_>>();
+    let mut allowed_network_targets = mcp_network_targets.clone();
     if let Some(host) = &exec_host {
         allowed_network_targets.extend(host.network_targets.iter().cloned());
     }
     let allowed_credentials = mcp_configs
         .iter()
         .flat_map(GuardedMcpServerConfig::credential_references)
-        .collect();
+        .collect::<BTreeSet<_>>();
     let mcp_sandbox_profiles = mcp_configs
         .iter()
         .flat_map(GuardedMcpServerConfig::sandbox_profiles)
         .collect::<BTreeSet<_>>();
-    let writable_roots = BTreeSet::from([workspace.clone()]);
+    let mut readable_roots = BTreeSet::from([workspace.clone()]);
+    readable_roots.extend(mcp_readable_roots.iter().cloned());
+    let mut writable_roots = BTreeSet::from([workspace.clone()]);
+    writable_roots.extend(mcp_writable_roots.iter().cloned());
+    let mcp_restriction = ToolRestriction {
+        bounds: ToolPolicyBounds {
+            allowed_effects: mcp_effects.clone(),
+            approval: ApprovalPolicy::Required,
+            sandbox: SandboxPolicy {
+                required: !mcp_sandbox_profiles.is_empty(),
+                allowed_profiles: mcp_sandbox_profiles.clone(),
+            },
+            process: ProcessPolicy {
+                interactive: InteractiveCommandPolicy::default(),
+                transport: TransportLaunchPolicy {
+                    allowed_programs: transport_programs.clone(),
+                    allow_child_processes: transport_allows_children,
+                },
+            },
+            filesystem: FilesystemPolicy {
+                readable_roots: mcp_readable_roots,
+                writable_roots: mcp_writable_roots,
+            },
+            network: NetworkPolicy {
+                allowed_targets: mcp_network_targets,
+                allow_unrestricted: false,
+            },
+            environment: EnvironmentPolicy {
+                allowed_variables: mcp_environment,
+                inherit_host_environment: false,
+            },
+            allowed_credentials: allowed_credentials.clone(),
+            max_timeout_ms: Some(config.tools.max_timeout_ms),
+            max_output_bytes: Some(config.tools.max_output_bytes),
+        },
+    };
     let bounds = ToolPolicyBounds {
         allowed_effects,
         approval: ApprovalPolicy::NotRequired,
         sandbox: SandboxPolicy {
-            required: true,
+            // The Host ceiling admits both sandboxed local capabilities and
+            // non-process transports. Each tool lane decides whether its own
+            // sandbox is mandatory.
+            required: false,
             allowed_profiles: BTreeSet::from([
                 "workspace_read".to_owned(),
                 orchestral_runtime::tools::GUARDED_EXEC_SANDBOX_PROFILE.to_owned(),
@@ -418,10 +465,11 @@ fn build_cli_tool_runtime(
             },
             transport: TransportLaunchPolicy {
                 allowed_programs: transport_programs,
+                allow_child_processes: transport_allows_children,
             },
         },
         filesystem: FilesystemPolicy {
-            readable_roots: BTreeSet::from([workspace.clone()]),
+            readable_roots,
             writable_roots,
         },
         network: NetworkPolicy {
@@ -436,6 +484,22 @@ fn build_cli_tool_runtime(
         max_timeout_ms: Some(config.tools.max_timeout_ms),
         max_output_bytes: Some(config.tools.max_output_bytes),
     };
+    let mut workspace_bounds = bounds.clone();
+    workspace_bounds.allowed_effects = BTreeSet::from([
+        EffectScope::FilesystemRead,
+        EffectScope::FilesystemWrite,
+        EffectScope::ArtifactRead,
+    ]);
+    workspace_bounds.sandbox.required = true;
+    workspace_bounds.sandbox.allowed_profiles = BTreeSet::from(["workspace_read".to_owned()]);
+    workspace_bounds.process = ProcessPolicy::default();
+    workspace_bounds.filesystem = FilesystemPolicy {
+        readable_roots: BTreeSet::from([workspace.clone()]),
+        writable_roots: BTreeSet::from([workspace.clone()]),
+    };
+    workspace_bounds.network = NetworkPolicy::default();
+    workspace_bounds.environment = EnvironmentPolicy::default();
+    workspace_bounds.allowed_credentials.clear();
     // Tool restrictions are capability-local. MCP transport programs,
     // credentials, environment names, and network targets never become
     // ambient authority for generic command execution.
@@ -450,12 +514,14 @@ fn build_cli_tool_runtime(
     ]);
     exec_bounds.sandbox.allowed_profiles =
         BTreeSet::from([orchestral_runtime::tools::GUARDED_EXEC_SANDBOX_PROFILE.to_owned()]);
+    exec_bounds.sandbox.required = true;
     exec_bounds.process.interactive = InteractiveCommandPolicy {
         enabled: true,
         command_shells: exec_programs,
         allow_child_processes: true,
     };
     exec_bounds.process.transport = TransportLaunchPolicy::default();
+    exec_bounds.filesystem = workspace_bounds.filesystem.clone();
     exec_bounds.network = NetworkPolicy {
         allowed_targets: exec_host
             .as_ref()
@@ -496,7 +562,7 @@ fn build_cli_tool_runtime(
     runtime
         .register(
             guarded_artifact_read_descriptor(ToolRestriction {
-                bounds: bounds.clone(),
+                bounds: workspace_bounds.clone(),
             }),
             Arc::new(GuardedArtifactReadExecutor::new(artifact_store)),
         )
@@ -504,7 +570,7 @@ fn build_cli_tool_runtime(
     runtime
         .register(
             guarded_file_read_descriptor(ToolRestriction {
-                bounds: bounds.clone(),
+                bounds: workspace_bounds.clone(),
             }),
             Arc::new(
                 GuardedFileReadExecutor::new(&workspace)
@@ -515,7 +581,7 @@ fn build_cli_tool_runtime(
     runtime
         .register(
             guarded_file_search_descriptor(ToolRestriction {
-                bounds: bounds.clone(),
+                bounds: workspace_bounds.clone(),
             }),
             Arc::new(
                 GuardedFileSearchExecutor::new(&workspace)
@@ -526,7 +592,7 @@ fn build_cli_tool_runtime(
     runtime
         .register(
             guarded_text_search_descriptor(ToolRestriction {
-                bounds: bounds.clone(),
+                bounds: workspace_bounds.clone(),
             }),
             Arc::new(
                 GuardedTextSearchExecutor::new(&workspace)
@@ -537,7 +603,7 @@ fn build_cli_tool_runtime(
     runtime
         .register(
             guarded_file_write_descriptor(ToolRestriction {
-                bounds: bounds.clone(),
+                bounds: workspace_bounds.clone(),
             }),
             Arc::new(
                 GuardedFileWriteExecutor::new(&workspace)
@@ -548,7 +614,7 @@ fn build_cli_tool_runtime(
     runtime
         .register(
             guarded_apply_patch_descriptor(ToolRestriction {
-                bounds: bounds.clone(),
+                bounds: workspace_bounds,
             }),
             Arc::new(
                 GuardedApplyPatchExecutor::new(&workspace)
@@ -595,6 +661,7 @@ fn build_cli_tool_runtime(
     Ok(CliToolComposition {
         runtime,
         run_grant: RunToolGrant { bounds },
+        mcp_restriction,
         approval_broker,
         process_supervisor,
     })
@@ -800,25 +867,57 @@ fn exec_runtime_readable_roots(shell: &Path) -> Vec<PathBuf> {
 /// are composed here; discovered methods publish as guarded Tools.
 fn configured_mcp_servers(
     config: &OrchestralConfig,
+    cli_manifest_paths: &[PathBuf],
 ) -> anyhow::Result<Vec<GuardedMcpServerConfig>> {
     if !config.mcp.enabled {
         return Ok(Vec::new());
     }
     let workspace = std::fs::canonicalize(std::env::current_dir().context("resolve workspace")?)
         .context("canonicalize workspace")?;
+    let specs = crate::mcp_config::load_server_manifests(
+        &workspace,
+        &config.mcp.servers,
+        &config.mcp.import_files,
+        cli_manifest_paths,
+    )?;
     let mut servers = Vec::new();
-    for spec in config.mcp.servers.iter().filter(|server| server.enabled) {
+    for spec in specs.iter().filter(|server| server.enabled) {
         let transport = (|| -> anyhow::Result<Arc<dyn McpTransportFactory>> {
             match &spec.transport {
-                McpTransportSpec::Stdio { command, args, env } => {
+                McpTransportSpec::Stdio {
+                    command,
+                    args,
+                    env,
+                    allow_child_processes,
+                    cwd,
+                    readable_roots,
+                    writable_roots,
+                    network_targets,
+                } => {
                     let program = resolve_host_program(command)?;
+                    let cwd =
+                        resolve_mcp_directory(&workspace, cwd.as_deref().unwrap_or("."), "cwd")?;
+                    let mut reads =
+                        resolve_mcp_directories(&workspace, readable_roots, "readable root")?;
+                    reads.insert(cwd.clone());
+                    let mut writes =
+                        resolve_mcp_directories(&workspace, writable_roots, "writable root")?;
+                    let runtime_root = prepare_mcp_runtime_root(&workspace, &spec.name)?;
+                    writes.insert(runtime_root.clone());
                     Ok(Arc::new(StdioMcpTransportFactory::new(
                         PathBuf::from(program),
                         args.clone(),
                         env.iter()
                             .map(|(key, value)| (key.clone(), value.clone()))
                             .collect(),
-                        StdioMcpSandboxPolicy::workspace(workspace.clone()),
+                        StdioMcpSandboxPolicy::scoped(
+                            cwd,
+                            reads,
+                            writes,
+                            network_targets.iter().cloned().collect(),
+                        )
+                        .with_child_processes(*allow_child_processes)
+                        .with_private_runtime_home(runtime_root),
                     )?))
                 }
                 McpTransportSpec::StreamableHttp {
@@ -884,6 +983,47 @@ fn configured_mcp_servers(
         servers.push(server);
     }
     Ok(servers)
+}
+
+fn resolve_mcp_directories(
+    workspace: &Path,
+    configured: &[String],
+    label: &str,
+) -> anyhow::Result<BTreeSet<PathBuf>> {
+    configured
+        .iter()
+        .map(|path| resolve_mcp_directory(workspace, path, label))
+        .collect()
+}
+
+fn resolve_mcp_directory(
+    workspace: &Path,
+    configured: &str,
+    label: &str,
+) -> anyhow::Result<PathBuf> {
+    let path = PathBuf::from(configured);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        workspace.join(path)
+    };
+    let canonical = std::fs::canonicalize(&path)
+        .with_context(|| format!("canonicalize MCP stdio {label} '{}'", path.display()))?;
+    if !canonical.is_dir() {
+        bail!("MCP stdio {label} '{}' is not a directory", path.display());
+    }
+    Ok(canonical)
+}
+
+fn prepare_mcp_runtime_root(workspace: &Path, server_name: &str) -> anyhow::Result<PathBuf> {
+    let identity = Digest::sha256(server_name.as_bytes());
+    let root = workspace
+        .join(".orchestral/mcp")
+        .join(&identity.as_str()[..16]);
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("create MCP runtime directory '{}'", root.display()))?;
+    std::fs::canonicalize(&root)
+        .with_context(|| format!("canonicalize MCP runtime directory '{}'", root.display()))
 }
 
 fn resolve_host_program(program: &str) -> anyhow::Result<String> {

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use orchestral_core::agent_protocol::wire::RunId;
-use orchestral_core::mcp_protocol::{McpProtocolEra, McpServerId};
+use orchestral_core::mcp_protocol::{McpProtocolEra, McpServerId, McpTransportFactory};
 use orchestral_core::tool_effect::{
     replay_tool_effect, InMemoryToolEffectJournalStore, ToolEffectJournalStore, ToolEffectKey,
     ToolEffectPhase,
@@ -187,6 +187,57 @@ fn canonical_shell() -> PathBuf {
     std::fs::canonicalize("/bin/bash").expect("/bin/bash should exist")
 }
 
+#[test]
+fn scoped_local_stdio_manifest_preserves_exact_resource_authority() {
+    let parent = unique_path("mcp-scoped-authority");
+    let workspace = parent.join("workspace");
+    let bundle = parent.join("bundle");
+    let runtime = parent.join("runtime");
+    for directory in [&workspace, &bundle, &runtime] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    let workspace = std::fs::canonicalize(workspace).unwrap();
+    let bundle = std::fs::canonicalize(bundle).unwrap();
+    let runtime = std::fs::canonicalize(runtime).unwrap();
+    let program = canonical_shell();
+    let factory = StdioMcpTransportFactory::new(
+        program.clone(),
+        Vec::new(),
+        BTreeMap::new(),
+        StdioMcpSandboxPolicy::scoped(
+            workspace.clone(),
+            BTreeSet::from([workspace.clone(), bundle.clone()]),
+            BTreeSet::from([runtime.clone()]),
+            BTreeSet::from(["localhost:4317".to_owned()]),
+        ),
+    )
+    .unwrap();
+    let authority = factory.authority();
+
+    assert_eq!(
+        authority.process_programs,
+        BTreeSet::from([program.to_string_lossy().into_owned()])
+    );
+    assert_eq!(
+        authority.filesystem_read_roots,
+        BTreeSet::from([
+            workspace.to_string_lossy().into_owned(),
+            bundle.to_string_lossy().into_owned(),
+        ])
+    );
+    assert_eq!(
+        authority.filesystem_write_roots,
+        BTreeSet::from([runtime.to_string_lossy().into_owned()])
+    );
+    assert_eq!(
+        authority.network_targets,
+        BTreeSet::from(["localhost:4317".to_owned()])
+    );
+    assert!(authority.effect_scopes.contains(&EffectScope::Network));
+
+    std::fs::remove_dir_all(parent).unwrap();
+}
+
 fn bounds(program: &Path, root: &Path, timeout_ms: u64) -> ToolPolicyBounds {
     let root = std::fs::canonicalize(root).unwrap();
     ToolPolicyBounds {
@@ -205,6 +256,7 @@ fn bounds(program: &Path, root: &Path, timeout_ms: u64) -> ToolPolicyBounds {
             interactive: Default::default(),
             transport: TransportLaunchPolicy {
                 allowed_programs: BTreeSet::from([program.to_string_lossy().to_string()]),
+                allow_child_processes: false,
             },
         },
         filesystem: FilesystemPolicy {
@@ -305,6 +357,136 @@ fn http_bounds(config: &GuardedMcpServerConfig, timeout_ms: u64) -> ToolPolicyBo
         max_timeout_ms: Some(timeout_ms),
         max_output_bytes: Some(16 * 1024),
     }
+}
+
+fn authority_bounds(config: &GuardedMcpServerConfig, timeout_ms: u64) -> ToolPolicyBounds {
+    ToolPolicyBounds {
+        allowed_effects: config.effect_scopes(),
+        approval: ApprovalPolicy::Required,
+        sandbox: SandboxPolicy {
+            required: !config.sandbox_profiles().is_empty(),
+            allowed_profiles: config.sandbox_profiles(),
+        },
+        process: ProcessPolicy {
+            interactive: Default::default(),
+            transport: TransportLaunchPolicy {
+                allowed_programs: config.allowed_programs(),
+                allow_child_processes: config.allows_child_processes(),
+            },
+        },
+        filesystem: FilesystemPolicy {
+            readable_roots: config.filesystem_read_roots(),
+            writable_roots: config.filesystem_write_roots(),
+        },
+        network: NetworkPolicy {
+            allowed_targets: config.allowed_network_targets(),
+            allow_unrestricted: false,
+        },
+        environment: EnvironmentPolicy {
+            allowed_variables: config.environment_names(),
+            inherit_host_environment: false,
+        },
+        allowed_credentials: config.credential_references(),
+        max_timeout_ms: Some(timeout_ms),
+        max_output_bytes: Some(16 * 1024),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires ORCHESTRAL_E2E_LOCAL_MCP_BINARY pointing to an external stdio MCP executable"]
+async fn live_external_local_mcp_binary_discovers_tools_through_scoped_transport() {
+    let program = PathBuf::from(
+        std::env::var_os("ORCHESTRAL_E2E_LOCAL_MCP_BINARY")
+            .expect("set ORCHESTRAL_E2E_LOCAL_MCP_BINARY"),
+    );
+    let program = std::fs::canonicalize(program).unwrap();
+    let parent = unique_path("external-local-mcp");
+    let workspace = parent.join("workspace");
+    let runtime_root = parent.join("runtime");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&runtime_root).unwrap();
+    let workspace = std::fs::canonicalize(workspace).unwrap();
+    let runtime_root = std::fs::canonicalize(runtime_root).unwrap();
+    let config = GuardedMcpServerConfig {
+        server_id: McpServerId::new("external-local"),
+        required: true,
+        transport: Arc::new(
+            StdioMcpTransportFactory::new(
+                program,
+                Vec::new(),
+                BTreeMap::new(),
+                StdioMcpSandboxPolicy::scoped(
+                    workspace.clone(),
+                    BTreeSet::from([workspace]),
+                    BTreeSet::from([runtime_root.clone()]),
+                    BTreeSet::new(),
+                )
+                .with_private_runtime_home(runtime_root),
+            )
+            .unwrap(),
+        ),
+        startup_timeout: Duration::from_secs(10),
+        tool_timeout: Duration::from_secs(30),
+        enabled_tools: BTreeSet::new(),
+        disabled_tools: BTreeSet::new(),
+    };
+    let bounds = authority_bounds(&config, 30_000);
+    let runtime = runtime(
+        bounds.clone(),
+        Arc::new(InMemoryToolEffectJournalStore::default()),
+    );
+    let registry = McpToolsAdapterRegistry::register(
+        runtime.as_ref(),
+        vec![config],
+        ToolRestriction { bounds },
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert!(registry.tool_count() > 0);
+    assert_eq!(
+        registry.server_names(),
+        BTreeSet::from(["external-local".to_owned()])
+    );
+    registry.shutdown().await;
+    std::fs::remove_dir_all(parent).unwrap();
+}
+
+#[tokio::test]
+async fn local_mcp_startup_failure_reports_bounded_stderr() {
+    let parent = unique_path("mcp-stderr");
+    std::fs::create_dir_all(&parent).unwrap();
+    let parent = std::fs::canonicalize(parent).unwrap();
+    let program = canonical_shell();
+    let config = config(
+        program.clone(),
+        "printf 'LOCAL_MCP_STARTUP_SENTINEL\\n' >&2; exit 23".to_owned(),
+        Duration::from_secs(2),
+        &parent,
+    );
+    let policy = bounds(&program, &parent, 5_000);
+    let runtime = runtime(
+        policy.clone(),
+        Arc::new(InMemoryToolEffectJournalStore::default()),
+    );
+    let error = match McpToolsAdapterRegistry::register(
+        runtime.as_ref(),
+        vec![config],
+        ToolRestriction { bounds: policy },
+        CancellationToken::new(),
+    )
+    .await
+    {
+        Err(error) => error.to_string(),
+        Ok(registry) => {
+            registry.shutdown().await;
+            panic!("failed local MCP server unexpectedly registered")
+        }
+    };
+
+    assert!(error.contains("LOCAL_MCP_STARTUP_SENTINEL"), "{error}");
+    std::fs::remove_dir_all(parent).unwrap();
 }
 
 fn invocation(call_id: &str, tool: &str) -> ToolInvocation {

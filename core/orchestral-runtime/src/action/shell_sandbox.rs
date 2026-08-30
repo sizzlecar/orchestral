@@ -309,7 +309,9 @@ fn canonical_file(path: &Path, label: &str) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
-fn normalize_network_targets(targets: &BTreeSet<String>) -> Result<BTreeSet<String>, String> {
+pub(crate) fn normalize_network_targets(
+    targets: &BTreeSet<String>,
+) -> Result<BTreeSet<String>, String> {
     targets
         .iter()
         .map(|target| {

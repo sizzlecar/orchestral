@@ -125,6 +125,36 @@ resources resolve from that Skill's directory. MCP stays separate: `mcp.servers`
 Host-configured stdio or Streamable HTTP transports, and discovered MCP methods become guarded,
 namespaced Tools rather than prompt text.
 
+Local MCP servers use the same Host registry as remote servers. An explicit `.mcp.json` can be
+loaded with `orchestral --mcp-config PATH`; it is never auto-executed merely because a repository
+contains one. Orchestral resolves the exact executable, gives it an isolated private HOME, and
+limits its cwd, read/write roots, environment, and network independently from generic shell Tools.
+Registered launchers may form a process tree by default (for `npx`, `uvx`, or shell wrappers), but
+every descendant remains inside that MCP server's sandbox; set `allowChildProcesses: false` for a
+single-process server.
+The same manifest can be pinned in the main config with `mcp.import_files`:
+
+```yaml
+mcp:
+  import_files: [.mcp.json]
+```
+
+```json
+{
+  "mcpServers": {
+    "local": {
+      "type": "stdio",
+      "command": "/absolute/path/to/server",
+      "args": [],
+      "allowChildProcesses": true,
+      "cwd": ".",
+      "readableRoots": ["/absolute/path/to/server-bundle"],
+      "networkTargets": ["localhost:4317"]
+    }
+  }
+}
+```
+
 ## SDK
 
 The public SDK is the Agent control plane: `AgentClient` starts Runs and `AgentRunHandle`

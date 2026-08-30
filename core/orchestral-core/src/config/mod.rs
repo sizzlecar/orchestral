@@ -237,6 +237,10 @@ pub struct ExecToolConfig {
 pub struct McpConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Explicit MCP manifest files composed by the application Host. Files
+    /// are never auto-executed merely because they exist in a repository.
+    #[serde(default)]
+    pub import_files: Vec<String>,
     #[serde(default)]
     pub servers: Vec<McpServerSpec>,
 }
@@ -245,6 +249,7 @@ impl Default for McpConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            import_files: Vec::new(),
             servers: Vec::new(),
         }
     }
@@ -279,6 +284,26 @@ pub enum McpTransportSpec {
         args: Vec<String>,
         #[serde(default)]
         env: HashMap<String, String>,
+        /// Permit the registered launcher to form a process tree inside this
+        /// MCP server's filesystem/network sandbox (needed by npx/uvx/sh).
+        #[serde(default = "default_true")]
+        allow_child_processes: bool,
+        /// Working directory exposed to the local MCP process. Relative paths
+        /// are resolved from the Agent workspace by the application Host.
+        #[serde(default)]
+        cwd: Option<String>,
+        /// Additional read-only filesystem roots required by the MCP server.
+        /// The resolved cwd remains readable even when this list is empty.
+        #[serde(default)]
+        readable_roots: Vec<String>,
+        /// Additional writable filesystem roots. The application Host always
+        /// supplies a private MCP runtime directory separately.
+        #[serde(default)]
+        writable_roots: Vec<String>,
+        /// Exact `host:port` destinations available to this local process.
+        /// Empty keeps network access disabled.
+        #[serde(default)]
+        network_targets: Vec<String>,
     },
     StreamableHttp {
         endpoint: String,

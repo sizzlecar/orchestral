@@ -68,6 +68,9 @@ pub struct McpTransportAuthority {
     pub binding_digest: Digest,
     pub effect_scopes: BTreeSet<EffectScope>,
     pub process_programs: BTreeSet<String>,
+    /// Whether the registered transport launcher may form a process tree.
+    /// Descendants remain inside the same filesystem/network sandbox.
+    pub allow_child_processes: bool,
     pub filesystem_read_roots: BTreeSet<String>,
     pub filesystem_write_roots: BTreeSet<String>,
     pub sandbox_profiles: BTreeSet<String>,
@@ -106,8 +109,11 @@ impl McpTransportAuthority {
                 != self.filesystem_read_roots.is_empty()
                 && self.effect_scopes.contains(&EffectScope::FilesystemWrite)
                     != self.filesystem_write_roots.is_empty());
+        let network_authority_matches =
+            self.effect_scopes.contains(&EffectScope::Network) != self.network_targets.is_empty();
         if !required_effects.is_subset(&self.effect_scopes)
             || !filesystem_authority_matches
+            || !network_authority_matches
             || (!self.credential_references.is_empty()
                 && !self.effect_scopes.contains(&EffectScope::SecretRead))
         {
@@ -119,16 +125,16 @@ impl McpTransportAuthority {
             McpTransportKind::Stdio
                 if self.process_programs.len() != 1
                     || self.filesystem_read_roots.is_empty()
-                    || self.sandbox_profiles.len() != 1
-                    || !self.network_targets.is_empty() =>
+                    || self.sandbox_profiles.len() != 1 =>
             {
                 Err(McpProtocolError::Invalid(
-                    "stdio MCP transport authority requires one program, readable roots, one sandbox profile, and no network target".to_owned(),
+                    "stdio MCP transport authority requires one program, readable roots, and one sandbox profile".to_owned(),
                 ))
             }
             McpTransportKind::StreamableHttp
                 if self.network_targets.len() != 1
                     || !self.process_programs.is_empty()
+                    || self.allow_child_processes
                     || !self.filesystem_read_roots.is_empty()
                     || !self.filesystem_write_roots.is_empty()
                     || !self.sandbox_profiles.is_empty()

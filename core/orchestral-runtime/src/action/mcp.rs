@@ -1,13 +1,13 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
 
 use orchestral_core::agent_protocol::wire::{Digest, ToolActivityEvidence};
@@ -27,12 +27,15 @@ use tokio_util::sync::CancellationToken;
 use crate::tool_runtime::{
     GuardedToolExecution, GuardedToolExecutor, GuardedToolRuntime, ToolRuntimeError,
 };
-use crate::tools::shell_sandbox::{sandbox_command, SandboxNetworkAccess, ShellSandboxPolicy};
+use crate::tools::shell_sandbox::{
+    normalize_network_targets, sandbox_command, SandboxNetworkAccess, ShellSandboxPolicy,
+};
 
 const DEFAULT_MCP_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SAFE_MCP_HEADER_INTEGER: u64 = 9_007_199_254_740_991;
 const MCP_TRANSPORT_CLOSE_TIMEOUT: Duration = Duration::from_millis(750);
 const MCP_PROCESS_REAP_TIMEOUT: Duration = Duration::from_millis(500);
+const MCP_STDERR_CAPTURE_BYTES: usize = 16 * 1024;
 pub const MCP_STDIO_SANDBOX_PROFILE: &str = "orchestral.mcp.stdio.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,6 +238,9 @@ pub struct StdioMcpSandboxPolicy {
     cwd: PathBuf,
     readable_roots: BTreeSet<PathBuf>,
     writable_roots: BTreeSet<PathBuf>,
+    network_targets: BTreeSet<String>,
+    private_runtime_home: Option<PathBuf>,
+    allow_child_processes: bool,
 }
 
 impl StdioMcpSandboxPolicy {
@@ -244,12 +250,49 @@ impl StdioMcpSandboxPolicy {
             cwd: root.clone(),
             readable_roots: BTreeSet::from([root.clone()]),
             writable_roots: BTreeSet::from([root]),
+            network_targets: BTreeSet::new(),
+            private_runtime_home: None,
+            allow_child_processes: false,
         }
+    }
+
+    /// Builds one explicit local-MCP process boundary. The executable itself
+    /// is bound separately by [`StdioMcpTransportFactory`]; these roots cover
+    /// only the server's data access and never widen generic command Tools.
+    pub fn scoped(
+        cwd: impl Into<PathBuf>,
+        readable_roots: BTreeSet<PathBuf>,
+        writable_roots: BTreeSet<PathBuf>,
+        network_targets: BTreeSet<String>,
+    ) -> Self {
+        Self {
+            cwd: cwd.into(),
+            readable_roots,
+            writable_roots,
+            network_targets,
+            private_runtime_home: None,
+            allow_child_processes: false,
+        }
+    }
+
+    /// Allows launchers such as npx/uvx/sh to form a process tree. Every
+    /// descendant remains confined by this server's filesystem/network policy.
+    pub fn with_child_processes(mut self, allow: bool) -> Self {
+        self.allow_child_processes = allow;
+        self
+    }
+
+    /// Supplies HOME/TMP-style process state without inheriting the user's
+    /// ambient home directory. The directory must remain inside one declared
+    /// writable root after canonicalization.
+    pub fn with_private_runtime_home(mut self, root: impl Into<PathBuf>) -> Self {
+        self.private_runtime_home = Some(root.into());
+        self
     }
 
     fn normalize(self) -> Result<Self, McpToolsAdapterError> {
         let cwd = canonical_mcp_directory(&self.cwd, "cwd")?;
-        let readable_roots = self
+        let mut readable_roots = self
             .readable_roots
             .iter()
             .map(|root| canonical_mcp_directory(root, "readable root"))
@@ -259,18 +302,36 @@ impl StdioMcpSandboxPolicy {
             .iter()
             .map(|root| canonical_mcp_directory(root, "writable root"))
             .collect::<Result<BTreeSet<_>, _>>()?;
+        let network_targets = normalize_network_targets(&self.network_targets)
+            .map_err(McpToolsAdapterError::InvalidConfig)?;
+        let private_runtime_home = self
+            .private_runtime_home
+            .as_deref()
+            .map(|root| canonical_mcp_directory(root, "private runtime home"))
+            .transpose()?;
+        if let Some(home) = &private_runtime_home {
+            readable_roots.insert(home.clone());
+        }
         if readable_roots.is_empty()
             || writable_roots.is_empty()
-            || !writable_roots.iter().any(|root| cwd.starts_with(root))
+            || !readable_roots.iter().any(|root| cwd.starts_with(root))
+            || private_runtime_home.as_ref().is_some_and(|home| {
+                !writable_roots
+                    .iter()
+                    .any(|writable| home == writable || home.starts_with(writable))
+            })
         {
             return Err(McpToolsAdapterError::InvalidConfig(
-                "MCP stdio sandbox requires readable/writable roots and a writable cwd".to_owned(),
+                "MCP stdio sandbox requires readable/writable roots and a readable cwd".to_owned(),
             ));
         }
         Ok(Self {
             cwd,
             readable_roots,
             writable_roots,
+            network_targets,
+            private_runtime_home,
+            allow_child_processes: self.allow_child_processes,
         })
     }
 }
@@ -334,6 +395,9 @@ impl StdioMcpTransportFactory {
         if !environment.is_empty() {
             effect_scopes.insert(EffectScope::SecretRead);
         }
+        if !sandbox.network_targets.is_empty() {
+            effect_scopes.insert(EffectScope::Network);
+        }
         let binding = json!({
             "transport": "stdio",
             "program": program.to_string_lossy(),
@@ -342,6 +406,9 @@ impl StdioMcpTransportFactory {
             "cwd": sandbox.cwd.to_string_lossy(),
             "readableRoots": sandbox.readable_roots.iter().map(|root| root.to_string_lossy()).collect::<Vec<_>>(),
             "writableRoots": sandbox.writable_roots.iter().map(|root| root.to_string_lossy()).collect::<Vec<_>>(),
+            "networkTargets": &sandbox.network_targets,
+            "privateRuntimeHome": sandbox.private_runtime_home.as_ref().map(|path| path.to_string_lossy()),
+            "allowChildProcesses": sandbox.allow_child_processes,
             "sandboxProfile": MCP_STDIO_SANDBOX_PROFILE,
             "maxFrameBytes": DEFAULT_MCP_MAX_FRAME_BYTES,
         });
@@ -354,6 +421,7 @@ impl StdioMcpTransportFactory {
             binding_digest,
             effect_scopes,
             process_programs: BTreeSet::from([program.to_string_lossy().to_string()]),
+            allow_child_processes: sandbox.allow_child_processes,
             filesystem_read_roots: sandbox
                 .readable_roots
                 .iter()
@@ -365,7 +433,7 @@ impl StdioMcpTransportFactory {
                 .map(|root| root.to_string_lossy().into_owned())
                 .collect(),
             sandbox_profiles: BTreeSet::from([MCP_STDIO_SANDBOX_PROFILE.to_owned()]),
-            network_targets: BTreeSet::new(),
+            network_targets: sandbox.network_targets.clone(),
             environment_variables: environment.keys().cloned().collect(),
             credential_references: BTreeSet::new(),
         };
@@ -397,9 +465,13 @@ impl McpTransportFactory for StdioMcpTransportFactory {
                 readable_roots: self.sandbox.readable_roots.iter().cloned().collect(),
                 readable_files: Vec::new(),
                 writable_roots: self.sandbox.writable_roots.iter().cloned().collect(),
-                allow_child_processes: false,
+                allow_child_processes: self.sandbox.allow_child_processes,
                 launcher_programs: vec![self.program.clone()],
-                network: SandboxNetworkAccess::Disabled,
+                network: if self.sandbox.network_targets.is_empty() {
+                    SandboxNetworkAccess::Disabled
+                } else {
+                    SandboxNetworkAccess::ExactTargets(self.sandbox.network_targets.clone())
+                },
                 linux_bwrap_path: None,
             },
         )
@@ -409,6 +481,16 @@ impl McpTransportFactory for StdioMcpTransportFactory {
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect::<HashMap<_, _>>();
+        if let Some(home) = &self.sandbox.private_runtime_home {
+            let home = home.to_string_lossy().into_owned();
+            environment
+                .entry("HOME".to_owned())
+                .or_insert_with(|| home.clone());
+            environment
+                .entry("USERPROFILE".to_owned())
+                .or_insert_with(|| home.clone());
+            environment.entry("TMPDIR".to_owned()).or_insert(home);
+        }
         environment.extend(command.env);
         StdioMcpTransport::connect(
             &command.program,
@@ -488,6 +570,10 @@ impl GuardedMcpServerConfig {
 
     pub fn allowed_programs(&self) -> BTreeSet<String> {
         self.transport.authority().process_programs.clone()
+    }
+
+    pub fn allows_child_processes(&self) -> bool {
+        self.transport.authority().allow_child_processes
     }
 
     pub fn allowed_network_targets(&self) -> BTreeSet<String> {
@@ -1072,6 +1158,7 @@ impl McpToolsAdapterRegistry {
                 )));
             }
             let programs = config.allowed_programs();
+            let allow_child_processes = config.allows_child_processes();
             let read_roots = config.filesystem_read_roots();
             let write_roots = config.filesystem_write_roots();
             let sandbox_profiles = config.sandbox_profiles();
@@ -1082,6 +1169,8 @@ impl McpToolsAdapterRegistry {
                 .effect_scopes()
                 .is_subset(&restriction.bounds.allowed_effects)
                 || !programs.is_subset(&restriction.bounds.process.transport.allowed_programs)
+                || (allow_child_processes
+                    && !restriction.bounds.process.transport.allow_child_processes)
                 || !read_roots.is_subset(&restriction.bounds.filesystem.readable_roots)
                 || !write_roots.is_subset(&restriction.bounds.filesystem.writable_roots)
                 || !sandbox_profiles.is_subset(&restriction.bounds.sandbox.allowed_profiles)
@@ -1128,6 +1217,7 @@ impl McpToolsAdapterRegistry {
         let mut registrations = Vec::new();
         let mut model_names = BTreeSet::new();
         for manager in managers.values() {
+            let server_restriction = mcp_server_restriction(&restriction, &manager.config);
             let mut sanitized_names = BTreeSet::new();
             for tool in &manager.snapshot.tools {
                 let server = sanitize_mcp_identifier(manager.config.server_id.as_str());
@@ -1173,7 +1263,7 @@ impl McpToolsAdapterRegistry {
                         "additionalProperties": false
                     }),
                     effect_scopes: manager.config.effect_scopes(),
-                    restriction: restriction.clone(),
+                    restriction: server_restriction.clone(),
                     idempotency: ToolIdempotency::NonIdempotent,
                     concurrency: ToolConcurrency::GlobalSerial,
                 };
@@ -1228,6 +1318,31 @@ impl McpToolsAdapterRegistry {
             manager.shutdown().await;
         }
     }
+}
+
+/// Narrows the aggregate Host MCP ceiling to one immutable server binding.
+/// A remote transport therefore cannot inherit a local server's filesystem or
+/// process authority, and local servers cannot inherit each other's roots.
+fn mcp_server_restriction(
+    ceiling: &ToolRestriction,
+    config: &GuardedMcpServerConfig,
+) -> ToolRestriction {
+    let mut bounds = ceiling.bounds.clone();
+    bounds.allowed_effects = config.effect_scopes();
+    bounds.approval = ApprovalPolicy::Required;
+    bounds.sandbox.allowed_profiles = config.sandbox_profiles();
+    bounds.sandbox.required = !bounds.sandbox.allowed_profiles.is_empty();
+    bounds.process.interactive = Default::default();
+    bounds.process.transport.allowed_programs = config.allowed_programs();
+    bounds.process.transport.allow_child_processes = config.allows_child_processes();
+    bounds.filesystem.readable_roots = config.filesystem_read_roots();
+    bounds.filesystem.writable_roots = config.filesystem_write_roots();
+    bounds.network.allowed_targets = config.allowed_network_targets();
+    bounds.network.allow_unrestricted = false;
+    bounds.environment.allowed_variables = config.environment_names();
+    bounds.environment.inherit_host_environment = false;
+    bounds.allowed_credentials = config.credential_references();
+    ToolRestriction { bounds }
 }
 
 async fn shutdown_mcp_managers(managers: &BTreeMap<McpServerId, Arc<McpServerConnectionManager>>) {
@@ -1352,6 +1467,7 @@ impl GuardedToolExecutor for GuardedMcpToolExecutor {
         }
         let bounds = execution.effective_policy.bounds();
         let programs = self.manager.config.allowed_programs();
+        let allow_child_processes = self.manager.config.allows_child_processes();
         let read_roots = self.manager.config.filesystem_read_roots();
         let write_roots = self.manager.config.filesystem_write_roots();
         let sandbox_profiles = self.manager.config.sandbox_profiles();
@@ -1359,6 +1475,7 @@ impl GuardedToolExecutor for GuardedMcpToolExecutor {
         let environment = self.manager.config.environment_names();
         let credentials = self.manager.config.credential_references();
         if !programs.is_subset(&bounds.process.transport.allowed_programs)
+            || (allow_child_processes && !bounds.process.transport.allow_child_processes)
             || !read_roots.is_subset(&bounds.filesystem.readable_roots)
             || !write_roots.is_subset(&bounds.filesystem.writable_roots)
             || !sandbox_profiles.is_subset(&bounds.sandbox.allowed_profiles)
@@ -1709,6 +1826,8 @@ struct StdioMcpTransportState {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    stderr_tail: Arc<StdMutex<VecDeque<u8>>>,
+    stderr_task: tokio::task::JoinHandle<()>,
     process_group_id: Option<u32>,
     max_frame_bytes: usize,
 }
@@ -1731,7 +1850,7 @@ impl StdioMcpTransport {
         cmd.kill_on_drop(true)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::piped());
 
         let mut child = cmd
             .spawn()
@@ -1746,12 +1865,19 @@ impl StdioMcpTransport {
             .stdout
             .take()
             .ok_or_else(|| "mcp stdio missing stdout pipe".to_string())?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "mcp stdio missing stderr pipe".to_string())?;
+        let (stderr_tail, stderr_task) = capture_mcp_stderr(stderr);
 
         Ok(Self {
             state: tokio::sync::Mutex::new(StdioMcpTransportState {
                 child,
                 stdin,
                 stdout: BufReader::new(stdout),
+                stderr_tail,
+                stderr_task,
                 process_group_id,
                 max_frame_bytes: DEFAULT_MCP_MAX_FRAME_BYTES,
             }),
@@ -1885,7 +2011,7 @@ impl StdioMcpTransportState {
                     .map_err(|error| format!("read MCP frame failed: {error}"))?;
                 if available.is_empty() {
                     if bytes.is_empty() {
-                        return Err("mcp process closed stdout".to_owned());
+                        return Err(self.closed_process_error().await);
                     }
                     (Vec::new(), 0, true)
                 } else if let Some(index) = available.iter().position(|byte| *byte == b'\n') {
@@ -1906,6 +2032,31 @@ impl StdioMcpTransportState {
                 return String::from_utf8(bytes)
                     .map_err(|error| format!("MCP response is not UTF-8: {error}"));
             }
+        }
+    }
+
+    async fn closed_process_error(&mut self) -> String {
+        let status = self
+            .child
+            .try_wait()
+            .ok()
+            .flatten()
+            .map(|status| status.to_string())
+            .unwrap_or_else(|| "unknown status".to_owned());
+        tokio::task::yield_now().await;
+        let stderr = self
+            .stderr_tail
+            .lock()
+            .map(|tail| tail.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let stderr = String::from_utf8_lossy(&stderr)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if stderr.is_empty() {
+            format!("mcp process closed stdout ({status})")
+        } else {
+            format!("mcp process closed stdout ({status}): {stderr}")
         }
     }
 }
@@ -1973,8 +2124,38 @@ impl McpTransportConnection for StdioMcpTransport {
         let mut state = self.state.lock().await;
         let process_group_id = state.process_group_id;
         terminate_mcp_process_tree(&mut state.child, process_group_id).await;
+        state.stderr_task.abort();
         Ok(())
     }
+}
+
+fn capture_mcp_stderr(
+    stderr: ChildStderr,
+) -> (Arc<StdMutex<VecDeque<u8>>>, tokio::task::JoinHandle<()>) {
+    let tail = Arc::new(StdMutex::new(VecDeque::with_capacity(
+        MCP_STDERR_CAPTURE_BYTES,
+    )));
+    let captured = tail.clone();
+    let task = tokio::spawn(async move {
+        let mut stderr = BufReader::new(stderr);
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let Ok(count) = stderr.read(&mut buffer).await else {
+                break;
+            };
+            if count == 0 {
+                break;
+            }
+            let Ok(mut tail) = captured.lock() else {
+                break;
+            };
+            tail.extend(&buffer[..count]);
+            while tail.len() > MCP_STDERR_CAPTURE_BYTES {
+                tail.pop_front();
+            }
+        }
+    });
+    (tail, task)
 }
 
 fn attach_stateless_request_metadata(mut params: Value) -> Result<Value, McpRequestError> {
@@ -2258,6 +2439,7 @@ mod mcp_lifecycle_gate_tests {
                     binding_digest: Digest::sha256(format!("fault-stage-{stage:?}")),
                     effect_scopes,
                     process_programs,
+                    allow_child_processes: false,
                     filesystem_read_roots,
                     filesystem_write_roots,
                     sandbox_profiles,
@@ -2497,6 +2679,7 @@ mod mcp_lifecycle_gate_tests {
             ..ToolPolicyBounds::default()
         };
         bounds.process.transport.allowed_programs = authority.process_programs.clone();
+        bounds.process.transport.allow_child_processes = authority.allow_child_processes;
         bounds.filesystem.readable_roots = authority.filesystem_read_roots.clone();
         bounds.filesystem.writable_roots = authority.filesystem_write_roots.clone();
         bounds.sandbox.allowed_profiles = authority.sandbox_profiles.clone();
@@ -2773,6 +2956,7 @@ mod mcp_lifecycle_gate_tests {
                         EffectScope::SecretRead,
                     ]),
                     process_programs: BTreeSet::from(["/fault/mcp".to_owned()]),
+                    allow_child_processes: false,
                     filesystem_read_roots: BTreeSet::from(["/fault/read".to_owned()]),
                     filesystem_write_roots: BTreeSet::from(["/fault/write".to_owned()]),
                     sandbox_profiles: BTreeSet::from([MCP_STDIO_SANDBOX_PROFILE.to_owned()]),
@@ -2790,6 +2974,7 @@ mod mcp_lifecycle_gate_tests {
                         EffectScope::SecretRead,
                     ]),
                     process_programs: BTreeSet::new(),
+                    allow_child_processes: false,
                     filesystem_read_roots: BTreeSet::new(),
                     filesystem_write_roots: BTreeSet::new(),
                     sandbox_profiles: BTreeSet::new(),

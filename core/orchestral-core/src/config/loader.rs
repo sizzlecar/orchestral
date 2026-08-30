@@ -162,6 +162,14 @@ fn validate_providers(config: &OrchestralConfig) -> Result<(), ConfigError> {
 }
 
 fn validate_mcp(config: &OrchestralConfig) -> Result<(), ConfigError> {
+    if config
+        .mcp
+        .import_files
+        .iter()
+        .any(|path| path.trim().is_empty() || path.chars().any(char::is_control))
+    {
+        return invalid("MCP import file paths must not be empty");
+    }
     let mut names = HashSet::new();
     for server in &config.mcp.servers {
         if server.name.trim().is_empty() {
@@ -171,8 +179,26 @@ fn validate_mcp(config: &OrchestralConfig) -> Result<(), ConfigError> {
             return invalid(format!("duplicate MCP server '{}'", server.name));
         }
         match &server.transport {
-            McpTransportSpec::Stdio { command, .. } if command.trim().is_empty() => {
-                return invalid("MCP stdio command must not be empty")
+            McpTransportSpec::Stdio {
+                command,
+                cwd,
+                readable_roots,
+                writable_roots,
+                network_targets,
+                ..
+            } => {
+                if command.trim().is_empty()
+                    || cwd.as_deref().is_some_and(|path| path.trim().is_empty())
+                    || readable_roots
+                        .iter()
+                        .chain(writable_roots.iter())
+                        .any(|path| path.trim().is_empty() || path.chars().any(char::is_control))
+                    || network_targets
+                        .iter()
+                        .any(|target| !valid_network_target(target))
+                {
+                    return invalid("MCP stdio declaration is invalid");
+                }
             }
             McpTransportSpec::StreamableHttp {
                 endpoint,
@@ -188,7 +214,6 @@ fn validate_mcp(config: &OrchestralConfig) -> Result<(), ConfigError> {
                     return invalid("MCP Streamable HTTP declaration is invalid");
                 }
             }
-            _ => {}
         }
     }
     Ok(())
@@ -309,6 +334,10 @@ mcp:
         type: stdio
         command: /bin/echo
         args: [--stdio]
+        cwd: .
+        readable_roots: [/opt/example-mcp]
+        writable_roots: [.orchestral/mcp/local]
+        network_targets: [localhost:4317]
     - name: remote
       transport:
         type: streamable_http
@@ -320,6 +349,27 @@ mcp:
         )
         .unwrap();
         assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn stdio_mcp_rejects_invalid_resource_authority() {
+        let config = serde_yaml::from_str::<OrchestralConfig>(
+            r#"
+mcp:
+  servers:
+    - name: local
+      transport:
+        type: stdio
+        command: /bin/echo
+        readable_roots: [""]
+        network_targets: [missing-port]
+"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_config(&config),
+            Err(ConfigError::Invalid(message)) if message.contains("stdio declaration")
+        ));
     }
 
     #[test]

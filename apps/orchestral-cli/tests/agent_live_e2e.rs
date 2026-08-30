@@ -55,55 +55,88 @@ impl TestWorkspace {
 
     fn configure_compaction(&self, minimum_source_records: usize, keep_recent_records: usize) {
         self.rewrite_config(|config| {
-            config
-                .replace(
-                    "minimum_source_records: 32",
-                    &format!("minimum_source_records: {minimum_source_records}"),
-                )
-                .replace(
-                    "keep_recent_records: 16",
-                    &format!("keep_recent_records: {keep_recent_records}"),
-                )
+            let compaction = config
+                .get_mut("agent")
+                .and_then(|value| value.get_mut("compaction"))
+                .and_then(serde_yaml::Value::as_mapping_mut)
+                .expect("E2E config has agent.compaction");
+            compaction.insert(
+                serde_yaml::Value::String("minimum_source_records".into()),
+                serde_yaml::to_value(minimum_source_records)
+                    .expect("serialize minimum source records"),
+            );
+            compaction.insert(
+                serde_yaml::Value::String("keep_recent_records".into()),
+                serde_yaml::to_value(keep_recent_records).expect("serialize retained records"),
+            );
         });
     }
 
     fn configure_local_openai(&self, endpoint: &str) {
         self.rewrite_config(|config| {
-            config.replace(
-                "kind: openai\n      api_key_env: OPENAI_API_KEY",
-                &format!(
-                    "kind: openai\n      endpoint: {endpoint}\n      api_key_env: OPENAI_API_KEY"
-                ),
-            )
+            let backends = config
+                .get_mut("providers")
+                .and_then(|value| value.get_mut("backends"))
+                .and_then(serde_yaml::Value::as_sequence_mut)
+                .expect("E2E config has providers.backends");
+            let openai = backends
+                .iter_mut()
+                .find(|backend| {
+                    backend.get("name").and_then(|name| name.as_str()) == Some("openai")
+                })
+                .and_then(serde_yaml::Value::as_mapping_mut)
+                .expect("E2E config has OpenAI backend");
+            openai.insert(
+                serde_yaml::Value::String("endpoint".into()),
+                serde_yaml::Value::String(endpoint.into()),
+            );
         });
     }
 
     fn disable_exec(&self) {
         self.rewrite_config(|config| {
-            config.replace(
-                "tools:\n  max_timeout_ms: 30000\n  max_output_bytes: 1048576\n  exec:\n    enabled: true",
-                "tools:\n  max_timeout_ms: 30000\n  max_output_bytes: 1048576\n  exec:\n    enabled: false",
-            )
+            let exec = config
+                .get_mut("tools")
+                .and_then(|value| value.get_mut("exec"))
+                .and_then(serde_yaml::Value::as_mapping_mut)
+                .expect("E2E config has tools.exec");
+            exec.insert(
+                serde_yaml::Value::String("enabled".into()),
+                serde_yaml::Value::Bool(false),
+            );
         });
     }
 
     fn configure_mcp_server(&self, endpoint: &str) {
         self.rewrite_config(|config| {
-            config.replace(
-                "mcp:\n  enabled: true\n  servers: []",
-                &format!(
-                    "mcp:\n  enabled: true\n  servers:\n    - name: fixture\n      required: true\n      transport:\n        type: streamable_http\n        endpoint: {endpoint}\n      startup_timeout_ms: 5000\n      tool_timeout_ms: 5000"
-                ),
-            )
+            let mcp = config
+                .get_mut("mcp")
+                .and_then(serde_yaml::Value::as_mapping_mut)
+                .expect("E2E config has an mcp mapping");
+            let servers: serde_yaml::Value = serde_yaml::from_str(&format!(
+                "- name: fixture\n  required: true\n  transport:\n    type: streamable_http\n    endpoint: {endpoint}\n  startup_timeout_ms: 5000\n  tool_timeout_ms: 5000\n"
+            ))
+            .expect("build E2E MCP server config");
+            mcp.insert(serde_yaml::Value::String("servers".into()), servers);
         });
     }
 
-    fn rewrite_config(&self, update: impl FnOnce(String) -> String) {
+    fn rewrite_config(&self, update: impl FnOnce(&mut serde_yaml::Value)) {
         let path = self.path("orchestral.yaml");
-        let before = fs::read_to_string(&path).expect("read E2E config");
-        let after = update(before.clone());
-        assert_ne!(after, before, "E2E config rewrite did not match its target");
-        fs::write(path, after).expect("write E2E config");
+        let source = fs::read_to_string(&path).expect("read E2E config");
+        let mut config: serde_yaml::Value =
+            serde_yaml::from_str(&source).expect("parse E2E config");
+        let before = config.clone();
+        update(&mut config);
+        assert_ne!(
+            config, before,
+            "E2E config update did not change its target"
+        );
+        fs::write(
+            path,
+            serde_yaml::to_string(&config).expect("serialize E2E config"),
+        )
+        .expect("write E2E config");
     }
 
     fn git(&self, args: &[&str]) -> std::process::Output {
@@ -1214,6 +1247,102 @@ fn local_cli_discovers_calls_and_journals_an_mcp_tool() {
     assert_eq!(tool_result_is_error(exchanges[0]), Some(false));
     assert_eq!(run_payload_count(&workspace, "request_opened"), 1);
     assert_eq!(run_payload_count(&workspace, "request_resolved"), 1);
+}
+
+#[test]
+#[cfg(unix)]
+fn local_cli_manifest_launches_scoped_stdio_mcp_and_calls_its_tool() {
+    let _guard = local_e2e_guard();
+    const MCP_RESULT_MARKER: &str = "LOCAL_MCP_RESULT_海豚_7319🔌";
+
+    let workspace = TestWorkspace::new("local-mcp-manifest");
+    let script = format!(
+        r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"server/discover"'*)
+      printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"supportedVersions":["2026-07-28"],"capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"local-fixture","version":"1"}}}}}}'
+      ;;
+    *'"method":"tools/list"'*)
+      printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"resultType":"complete","ttlMs":1000,"cacheScope":"private","tools":[{{"name":"lookup_marker","description":"Return the local MCP fixture marker","inputSchema":{{"type":"object","required":["key"],"properties":{{"key":{{"type":"string"}}}},"additionalProperties":false}}}}]}}}}'
+      ;;
+    *'"method":"tools/call"'*'"name":"lookup_marker"'*)
+      printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"resultType":"complete","content":[{{"type":"text","text":"{MCP_RESULT_MARKER}"}}],"isError":false}}}}'
+      ;;
+  esac
+done
+"#
+    );
+    let manifest_path = workspace.path("local.mcp.json");
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&json!({
+            "mcpServers": {
+                "localfixture": {
+                    "type": "stdio",
+                    "command": "/bin/sh",
+                    "args": ["-c", script],
+                    "cwd": ".",
+                    "required": true,
+                    "startupTimeoutMs": 5000,
+                    "toolTimeoutMs": 5000
+                }
+            }
+        }))
+        .expect("serialize local MCP manifest"),
+    )
+    .expect("write local MCP manifest");
+
+    let (model_endpoint, model_server) = spawn_fixture_http_server(vec![
+        Box::new(|_| {
+            openai_tool_response(
+                "local-mcp-e2e-call",
+                "mcp__localfixture__lookup_marker",
+                json!({"key": "能力"}),
+            )
+        }),
+        Box::new(|_| openai_text_response("LOCAL_MCP_E2E_OK")),
+    ]);
+    workspace.configure_local_openai(&model_endpoint);
+
+    let mut command = root_command(&workspace);
+    command
+        .env("OPENAI_API_KEY", "fixture-key")
+        .arg("--backend")
+        .arg("openai")
+        .arg("--model")
+        .arg("fixture-model")
+        .arg("--temperature")
+        .arg("0")
+        .arg("--session-id")
+        .arg("local-mcp-manifest-session")
+        .arg("--mcp-config")
+        .arg(&manifest_path)
+        .arg("--no-skills")
+        .arg("Use the local MCP lookup_marker tool with key 能力.");
+    let output = run_with_approval(command, true, LOCAL_PROCESS_TIMEOUT);
+
+    assert!(output.status.success(), "{}", output.stderr_text());
+    assert_eq!(output.stdout_text().trim(), "LOCAL_MCP_E2E_OK");
+    assert!(output.stderr_text().contains(APPROVAL_PROMPT));
+    output.assert_no_ansi();
+
+    let model_requests = model_server.join().expect("join local model server");
+    assert_eq!(model_requests.len(), 2);
+    assert!(model_request_has_tool(
+        &model_requests[0].body,
+        "mcp__localfixture__lookup_marker"
+    ));
+    assert!(model_request_text(&model_requests[1].body).contains(MCP_RESULT_MARKER));
+
+    let records = session_records(&workspace);
+    let exchanges = tool_exchanges(&records);
+    assert_eq!(exchanges.len(), 1);
+    assert_eq!(
+        tool_name(exchanges[0]),
+        Some("mcp__localfixture__lookup_marker")
+    );
+    assert_eq!(tool_result_is_error(exchanges[0]), Some(false));
 }
 
 #[test]

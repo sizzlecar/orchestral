@@ -35,6 +35,9 @@ pub struct Cli {
     system_prompt: Option<String>,
     #[arg(long)]
     no_mcp: bool,
+    /// Explicit local MCP manifest (`.mcp.json`). May be repeated.
+    #[arg(long, value_name = "PATH")]
+    mcp_config: Vec<PathBuf>,
     #[arg(long)]
     no_skills: bool,
     #[arg(long)]
@@ -68,6 +71,7 @@ impl Cli {
             system_prompt: self.system_prompt,
             input: (!self.input.is_empty()).then(|| self.input.join(" ")),
             no_mcp: self.no_mcp,
+            mcp_config: self.mcp_config,
             no_skills: self.no_skills,
         })
         .await
@@ -82,6 +86,8 @@ fn ensure_log_filter(verbose: bool) {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use clap::{CommandFactory, Parser};
 
     use super::Cli;
@@ -92,5 +98,25 @@ mod tests {
             .expect("a positional prompt must start the Agent directly");
         assert_eq!(parsed.input, ["inspect this repository"]);
         assert_eq!(Cli::command().get_subcommands().count(), 0);
+    }
+
+    #[test]
+    fn local_mcp_manifests_are_explicit_repeatable_host_inputs() {
+        let parsed = Cli::try_parse_from([
+            "orchestral",
+            "--mcp-config",
+            "project.mcp.json",
+            "--mcp-config",
+            "/host/user.mcp.json",
+            "inspect tools",
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed.mcp_config,
+            [
+                PathBuf::from("project.mcp.json"),
+                PathBuf::from("/host/user.mcp.json"),
+            ]
+        );
     }
 }

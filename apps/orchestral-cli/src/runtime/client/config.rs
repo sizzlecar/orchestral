@@ -271,6 +271,7 @@ tools:
 
 mcp:
   enabled: true
+  import_files: []
   servers: []
 
 skills:
