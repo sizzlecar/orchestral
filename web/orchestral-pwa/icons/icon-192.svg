@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="192" height="192" viewBox="0 0 192 192" role="img" aria-labelledby="title">
+  <title id="title">Orchestral app icon</title>
+  <defs>
+    <linearGradient id="bg" x1="24" y1="14" x2="166" y2="180" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#292E41" />
+      <stop offset=".54" stop-color="#1D2030" />
+      <stop offset="1" stop-color="#15171F" />
+    </linearGradient>
+    <filter id="shadow" x="36" y="35" width="122" height="125" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse">
+      <feDropShadow dx="0" dy="7" stdDeviation="7" flood-color="#08090D" flood-opacity=".28" />
+    </filter>
+  </defs>
+  <rect x="5" y="5" width="182" height="182" rx="43" fill="url(#bg)" />
+  <rect x="5.75" y="5.75" width="180.5" height="180.5" rx="42.25" fill="none" stroke="#FFFFFF" stroke-opacity=".08" stroke-width="1.5" />
+  <path d="M42 106c17-37 53-55 103-42" fill="none" stroke="#9D96FF" stroke-width="7" stroke-linecap="round" opacity=".76" />
+  <path d="M51 139c33 14 67 4 89-26" fill="none" stroke="#72D2AA" stroke-width="7" stroke-linecap="round" opacity=".72" />
+  <g filter="url(#shadow)">
+    <circle cx="96" cy="96" r="38" fill="#1B1E2B" stroke="#F6F2E8" stroke-width="14" />
+  </g>
+  <circle cx="42" cy="107" r="10" fill="#F09A71" />
+  <circle cx="145" cy="64" r="10" fill="#9D96FF" />
+  <circle cx="140" cy="113" r="10" fill="#72D2AA" />
+</svg>

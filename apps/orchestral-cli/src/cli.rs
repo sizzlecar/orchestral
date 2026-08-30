@@ -15,40 +15,40 @@ use crate::runtime::ModelOverrides;
 pub struct Cli {
     #[command(subcommand)]
     command: Option<CliCommand>,
-    #[arg(long)]
+    #[arg(long, global = true)]
     config: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(long, global = true)]
     env_file: Option<PathBuf>,
     /// Provider credential document. For Google, this accepts a service-account JSON key.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", global = true)]
     credential_file: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(long, global = true)]
     backend: Option<String>,
-    #[arg(long)]
+    #[arg(long, global = true)]
     model_profile: Option<String>,
-    #[arg(long)]
+    #[arg(long, global = true)]
     model: Option<String>,
-    #[arg(long)]
+    #[arg(long, global = true)]
     temperature: Option<f32>,
     /// Reuse this Agent Session identity for all turns in this process
-    #[arg(long)]
+    #[arg(long, global = true)]
     session_id: Option<String>,
-    #[arg(long)]
+    #[arg(long, global = true)]
     system_prompt: Option<String>,
-    #[arg(long)]
+    #[arg(long, global = true)]
     no_mcp: bool,
     /// Explicit local MCP manifest (`.mcp.json`). May be repeated.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", global = true)]
     mcp_config: Vec<PathBuf>,
-    #[arg(long)]
+    #[arg(long, global = true)]
     no_skills: bool,
-    #[arg(long)]
+    #[arg(long, global = true)]
     verbose: bool,
     /// Use DIR as the primary Agent workspace instead of the process directory.
-    #[arg(short = 'C', long = "cwd", value_name = "DIR")]
+    #[arg(short = 'C', long = "cwd", value_name = "DIR", global = true)]
     cwd: Option<PathBuf>,
     /// Add another read-write workspace root. May be repeated.
-    #[arg(long = "add-dir", value_name = "DIR")]
+    #[arg(long = "add-dir", value_name = "DIR", global = true)]
     add_dirs: Vec<PathBuf>,
     /// A single turn. When omitted, starts an interactive conversation.
     #[arg(value_name = "INPUT")]
@@ -59,6 +59,8 @@ pub struct Cli {
 enum CliCommand {
     /// Manage MCP servers registered for this user.
     Mcp(crate::mcp_command::McpCommand),
+    /// Run the local Host gateway and mobile PWA control surface.
+    Serve(crate::remote::ServeCommand),
 }
 
 impl Cli {
@@ -76,13 +78,8 @@ impl Cli {
             load_env_file(env_file)?;
         }
         ensure_log_filter(self.verbose);
-        if let Some(command) = self.command {
-            return match command {
-                CliCommand::Mcp(command) => command.run().await,
-            };
-        }
         let model_overrides = self.model_overrides();
-        crate::agent::run(crate::agent::AgentRunOptions {
+        let options = crate::agent::AgentRunOptions {
             config: self.config,
             credential_file: self.credential_file,
             model_overrides,
@@ -94,8 +91,12 @@ impl Cli {
             no_skills: self.no_skills,
             cwd: self.cwd,
             add_dirs: self.add_dirs,
-        })
-        .await
+        };
+        match self.command {
+            Some(CliCommand::Mcp(command)) => command.run().await,
+            Some(CliCommand::Serve(command)) => crate::remote::serve(command, options).await,
+            None => crate::agent::run(options).await,
+        }
     }
 }
 
@@ -124,7 +125,7 @@ mod tests {
                 .get_subcommands()
                 .map(clap::Command::get_name)
                 .collect::<Vec<_>>(),
-            ["mcp"]
+            ["mcp", "serve"]
         );
     }
 
@@ -181,5 +182,22 @@ mod tests {
             parsed.add_dirs,
             [PathBuf::from("/work/shared"), PathBuf::from("/work/other")]
         );
+    }
+
+    #[test]
+    fn serve_accepts_model_and_workspace_options_after_the_subcommand() {
+        let parsed = Cli::try_parse_from([
+            "orchestral",
+            "serve",
+            "--pair",
+            "--model",
+            "gemini-3.1-pro-preview",
+            "-C",
+            "/work/primary",
+        ])
+        .unwrap();
+        assert_eq!(parsed.model.as_deref(), Some("gemini-3.1-pro-preview"));
+        assert_eq!(parsed.cwd, Some(PathBuf::from("/work/primary")));
+        assert!(matches!(parsed.command, Some(super::CliCommand::Serve(_))));
     }
 }

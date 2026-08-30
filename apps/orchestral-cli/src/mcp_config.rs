@@ -88,20 +88,22 @@ impl JsonMcpServer {
 /// files discovered in a repository. `ORCHESTRAL_HOME` is the explicit escape
 /// hatch; otherwise follow XDG and then the conventional user config path.
 pub(crate) fn user_registry_path() -> anyhow::Result<PathBuf> {
+    Ok(user_config_root()?.join("mcp.json"))
+}
+
+pub(crate) fn user_config_root() -> anyhow::Result<PathBuf> {
     if let Some(root) = std::env::var_os("ORCHESTRAL_HOME") {
-        return absolute_config_root(PathBuf::from(root)).map(|root| root.join("mcp.json"));
+        return absolute_config_root(PathBuf::from(root));
     }
     if let Some(root) = std::env::var_os("XDG_CONFIG_HOME") {
-        return absolute_config_root(PathBuf::from(root))
-            .map(|root| root.join("orchestral/mcp.json"));
+        return absolute_config_root(PathBuf::from(root)).map(|root| root.join("orchestral"));
     }
     if let Some(root) = std::env::var_os("HOME") {
         return absolute_config_root(PathBuf::from(root))
-            .map(|root| root.join(".config/orchestral/mcp.json"));
+            .map(|root| root.join(".config/orchestral"));
     }
     if let Some(root) = std::env::var_os("APPDATA") {
-        return absolute_config_root(PathBuf::from(root))
-            .map(|root| root.join("orchestral/mcp.json"));
+        return absolute_config_root(PathBuf::from(root)).map(|root| root.join("orchestral"));
     }
     bail!("cannot resolve user config directory; set ORCHESTRAL_HOME")
 }

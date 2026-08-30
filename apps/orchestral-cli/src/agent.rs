@@ -43,6 +43,7 @@ use orchestral_model_gemini::{
     GeminiAuthentication, GeminiModelBackend, GeminiModelConfig, GoogleCloudAccessTokenProvider,
 };
 use orchestral_model_openai::{OpenAiCompatibleBackend, OpenAiCompatibleConfig};
+use orchestral_runtime::api::AgentApi;
 use orchestral_runtime::tools::{
     guarded_apply_patch_descriptor, guarded_artifact_read_descriptor, guarded_file_read_descriptor,
     guarded_file_search_descriptor, guarded_file_write_descriptor, guarded_text_search_descriptor,
@@ -69,6 +70,7 @@ use crate::google_auth::{
 use crate::runtime::client::prepare_runtime_config_path;
 use crate::runtime::ModelOverrides;
 
+#[derive(Clone)]
 pub struct AgentRunOptions {
     pub config: Option<PathBuf>,
     pub credential_file: Option<PathBuf>,
@@ -165,10 +167,31 @@ struct CliToolComposition {
     process_supervisor: Arc<ProcessSupervisor>,
 }
 
-pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
+pub struct AgentHost {
+    pub api: AgentApi,
+    pub approvals: Arc<InMemoryHostApprovalBroker>,
+    pub process_supervisor: Arc<ProcessSupervisor>,
+    pub backend_name: String,
+    pub model: String,
+    controller: Arc<AgentController>,
+    resources: Vec<ResourceBinding>,
+    mcp_registry: McpToolsAdapterRegistry,
+}
+
+impl AgentHost {
+    pub fn client(&self, session_id: AgentSessionId) -> AgentClient {
+        AgentClient::new(self.controller.clone(), session_id).with_resources(self.resources.clone())
+    }
+
+    pub async fn shutdown(&self) {
+        self.mcp_registry.shutdown().await;
+    }
+}
+
+pub async fn build_agent_host(options: &AgentRunOptions) -> anyhow::Result<AgentHost> {
     let workspaces = CliWorkspaceSet::resolve(options.cwd.as_deref(), &options.add_dirs)?;
     let config_path = prepare_runtime_config_path(
-        options.config,
+        options.config.clone(),
         &options.model_overrides,
         options.credential_file.as_deref(),
     )?;
@@ -199,6 +222,7 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
     agent_config.reserved_output_tokens = config.agent.reserved_output_tokens;
     if let Some(system_prompt) = options
         .system_prompt
+        .clone()
         .or_else(|| config.agent.system_prompt.clone())
         .or_else(|| {
             profile
@@ -336,15 +360,10 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
     let controller = Arc::new(
         AgentController::with_journal_store(
             provider,
-            ProviderBindingRef::new("cli/generic-agent"),
+            ProviderBindingRef::new("orchestral/generic-agent"),
             run_journal,
         )
         .context("bind Generic Agent controller")?,
-    );
-    let session_id = AgentSessionId::new(
-        options
-            .session_id
-            .unwrap_or_else(|| unique_id("cli-session", 0)),
     );
     let mut resources = Vec::new();
     if let Some(skills) = skills.as_deref() {
@@ -359,7 +378,28 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
             mode: ResourceBindingMode::Snapshot,
         });
     }
-    let client = AgentClient::new(controller, session_id.clone()).with_resources(resources);
+    let api = AgentApi::with_resources(controller.clone(), resources.clone());
+    Ok(AgentHost {
+        api,
+        approvals: approval_broker,
+        process_supervisor,
+        backend_name: backend.name,
+        model,
+        controller,
+        resources,
+        mcp_registry,
+    })
+}
+
+pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
+    let host = build_agent_host(&options).await?;
+    let session_id = AgentSessionId::new(
+        options
+            .session_id
+            .clone()
+            .unwrap_or_else(|| unique_id("cli-session", 0)),
+    );
+    let client = host.client(session_id);
 
     let entry_mode = select_entry_mode(
         options.input,
@@ -369,12 +409,18 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
     let result = async {
         match entry_mode {
             EntryMode::HeadlessPrompt(input) => {
-                eprintln!("Generic Agent: backend={} model={model}", backend.name);
+                eprintln!(
+                    "Generic Agent: backend={} model={}",
+                    host.backend_name, host.model
+                );
                 let mut lines = BufReader::new(tokio::io::stdin()).lines();
-                run_turn(&client, &approval_broker, 1, input, &mut lines, false).await
+                run_turn(&client, &host.approvals, 1, input, &mut lines, false).await
             }
             EntryMode::HeadlessPipe => {
-                eprintln!("Generic Agent: backend={} model={model}", backend.name);
+                eprintln!(
+                    "Generic Agent: backend={} model={}",
+                    host.backend_name, host.model
+                );
                 let mut input = String::new();
                 tokio::io::stdin()
                     .read_to_string(&mut input)
@@ -384,15 +430,21 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
                     bail!("stdin pipe did not contain an Agent prompt")
                 }
                 let mut lines = BufReader::new(tokio::io::stdin()).lines();
-                run_turn(&client, &approval_broker, 1, input, &mut lines, false).await
+                run_turn(&client, &host.approvals, 1, input, &mut lines, false).await
             }
             EntryMode::Tui => {
-                crate::tui::run_tui(client, approval_broker, process_supervisor, model).await
+                crate::tui::run_tui(
+                    client,
+                    host.approvals.clone(),
+                    host.process_supervisor.clone(),
+                    host.model.clone(),
+                )
+                .await
             }
         }
     }
     .await;
-    mcp_registry.shutdown().await;
+    host.shutdown().await;
     result
 }
 

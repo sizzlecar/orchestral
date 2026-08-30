@@ -6,22 +6,35 @@ use std::sync::Arc;
 
 use orchestral_core::agent_protocol::wire::{
     AgentCommandEnvelope, AgentJournalRecord, AgentRunView, AgentSessionId, CommandAck, Content,
-    RunId,
+    ResourceBinding, RunId,
 };
+use tokio::sync::broadcast;
 use tokio::sync::RwLock;
 
-use crate::{AgentClient, AgentController, AgentRunHandle, AgentSdkError};
+use crate::{AgentClient, AgentControlEvent, AgentController, AgentRunHandle, AgentSdkError};
 
 #[derive(Clone)]
 pub struct AgentApi {
     controller: Arc<AgentController>,
+    default_resources: Arc<Vec<ResourceBinding>>,
     sessions: Arc<RwLock<BTreeMap<AgentSessionId, AgentClient>>>,
 }
 
 impl AgentApi {
     pub fn new(controller: Arc<AgentController>) -> Self {
+        Self::with_resources(controller, Vec::new())
+    }
+
+    /// Creates an API whose sessions inherit the same immutable resource
+    /// bindings. Transports can therefore create sessions without knowing how
+    /// a concrete Host discovered Skills or other resources.
+    pub fn with_resources(
+        controller: Arc<AgentController>,
+        default_resources: Vec<ResourceBinding>,
+    ) -> Self {
         Self {
             controller,
+            default_resources: Arc::new(default_resources),
             sessions: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
@@ -42,7 +55,10 @@ impl AgentApi {
             .write()
             .await
             .entry(session_id.clone())
-            .or_insert_with(|| AgentClient::new(self.controller.clone(), session_id.clone()));
+            .or_insert_with(|| {
+                AgentClient::new(self.controller.clone(), session_id.clone())
+                    .with_resources(self.default_resources.as_ref().clone())
+            });
         Ok(session_id)
     }
 
@@ -81,6 +97,15 @@ impl AgentApi {
         Ok(self.controller.events(run_id, after_run_seq).await?)
     }
 
+    /// Subscribes to best-effort live events. Durable consumers must combine
+    /// this with [`Self::events`] before rendering and after broadcast lag.
+    pub async fn subscribe(
+        &self,
+        run_id: &RunId,
+    ) -> Result<broadcast::Receiver<AgentControlEvent>, AgentSdkError> {
+        Ok(self.controller.subscribe(run_id).await?)
+    }
+
     pub async fn command(
         &self,
         command: AgentCommandEnvelope,
@@ -94,6 +119,10 @@ impl AgentApi {
         reason: impl Into<String>,
     ) -> Result<CommandAck, AgentSdkError> {
         Ok(self.controller.cancel(run_id, reason).await?)
+    }
+
+    pub async fn recover(&self, run_id: &RunId) -> Result<AgentRunView, AgentSdkError> {
+        Ok(self.controller.recover(run_id).await?)
     }
 
     async fn session(&self, session_id: &AgentSessionId) -> Result<AgentClient, AgentSdkError> {
