@@ -36,6 +36,12 @@ impl ApiError {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ApiClient;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApiCredential {
+    DeviceToken(String),
+    GatewaySession,
+}
+
 impl ApiClient {
     pub async fn claim_pairing(
         &self,
@@ -49,19 +55,23 @@ impl ApiClient {
         .await
     }
 
-    pub async fn me(&self, token: &str) -> Result<Value, ApiError> {
-        self.get("/me", token).await
+    pub async fn me(&self, credential: &ApiCredential) -> Result<Value, ApiError> {
+        self.get("/me", credential).await
     }
 
-    pub async fn devices(&self, token: &str) -> Result<Vec<DeviceView>, ApiError> {
-        self.get("/devices", token).await
+    pub async fn devices(&self, credential: &ApiCredential) -> Result<Vec<DeviceView>, ApiError> {
+        self.get("/devices", credential).await
     }
 
-    pub async fn revoke_device(&self, token: &str, device_id: &str) -> Result<(), ApiError> {
+    pub async fn revoke_device(
+        &self,
+        credential: &ApiCredential,
+        device_id: &str,
+    ) -> Result<(), ApiError> {
         let response = self
             .authenticated(
                 Request::delete(&format!("{API_BASE}/devices/{}", encode(device_id))),
-                token,
+                credential,
             )
             .send()
             .await
@@ -69,59 +79,81 @@ impl ApiClient {
         expect_empty(response).await
     }
 
-    pub async fn sessions(&self, token: &str) -> Result<Vec<SessionView>, ApiError> {
-        self.get("/sessions", token).await
+    pub async fn sessions(&self, credential: &ApiCredential) -> Result<Vec<SessionView>, ApiError> {
+        self.get("/sessions", credential).await
     }
 
-    pub async fn create_session(&self, token: &str) -> Result<SessionView, ApiError> {
-        self.post("/sessions", token, &json!({ "session_id": new_uuid()? }))
+    pub async fn create_session(
+        &self,
+        credential: &ApiCredential,
+    ) -> Result<SessionView, ApiError> {
+        self.post(
+            "/sessions",
+            credential,
+            &json!({ "session_id": new_uuid()? }),
+        )
+        .await
+    }
+
+    pub async fn get_run(
+        &self,
+        credential: &ApiCredential,
+        run_id: &str,
+    ) -> Result<Value, ApiError> {
+        self.get(&format!("/runs/{}", encode(run_id)), credential)
             .await
-    }
-
-    pub async fn get_run(&self, token: &str, run_id: &str) -> Result<Value, ApiError> {
-        self.get(&format!("/runs/{}", encode(run_id)), token).await
     }
 
     pub async fn events(
         &self,
-        token: &str,
+        credential: &ApiCredential,
         run_id: &str,
         after: u64,
     ) -> Result<EventsResponse, ApiError> {
         self.get(
             &format!("/runs/{}/events?after={after}", encode(run_id)),
-            token,
+            credential,
         )
         .await
     }
 
     pub async fn start_run(
         &self,
-        token: &str,
+        credential: &ApiCredential,
         session_id: &str,
         run_id: &str,
         input: &str,
     ) -> Result<Value, ApiError> {
         self.post(
             &format!("/sessions/{}/runs", encode(session_id)),
-            token,
+            credential,
             &json!({ "run_id": run_id, "input": input }),
         )
         .await
     }
 
-    pub async fn steer(&self, token: &str, run_id: &str, text: &str) -> Result<Value, ApiError> {
+    pub async fn steer(
+        &self,
+        credential: &ApiCredential,
+        run_id: &str,
+        text: &str,
+    ) -> Result<Value, ApiError> {
         self.command(
-            token,
+            credential,
             &format!("/runs/{}/steer", encode(run_id)),
             json!({ "text": text }),
         )
         .await
     }
 
-    pub async fn cancel(&self, token: &str, run_id: &str, reason: &str) -> Result<Value, ApiError> {
+    pub async fn cancel(
+        &self,
+        credential: &ApiCredential,
+        run_id: &str,
+        reason: &str,
+    ) -> Result<Value, ApiError> {
         self.command(
-            token,
+            credential,
             &format!("/runs/{}/cancel", encode(run_id)),
             json!({ "reason": reason }),
         )
@@ -130,13 +162,13 @@ impl ApiClient {
 
     pub async fn resolve_input(
         &self,
-        token: &str,
+        credential: &ApiCredential,
         run_id: &str,
         request_id: &str,
         text: &str,
     ) -> Result<Value, ApiError> {
         self.command(
-            token,
+            credential,
             &format!(
                 "/runs/{}/requests/{}/input",
                 encode(run_id),
@@ -149,13 +181,13 @@ impl ApiClient {
 
     pub async fn resolve_approval(
         &self,
-        token: &str,
+        credential: &ApiCredential,
         run_id: &str,
         request_id: &str,
         decision: &str,
     ) -> Result<Value, ApiError> {
         self.command(
-            token,
+            credential,
             &format!(
                 "/runs/{}/requests/{}/approval",
                 encode(run_id),
@@ -168,7 +200,7 @@ impl ApiClient {
 
     pub async fn stream<F>(
         &self,
-        token: &str,
+        credential: &ApiCredential,
         run_id: &str,
         after: u64,
         signal: &web_sys::AbortSignal,
@@ -185,7 +217,7 @@ impl ApiClient {
             .header("Accept", "text/event-stream")
             .header("Cache-Control", "no-cache")
             .abort_signal(Some(signal)),
-            token,
+            credential,
         );
         if after > 0 {
             request = request.header("Last-Event-ID", &after.to_string());
@@ -217,17 +249,21 @@ impl ApiClient {
 
     async fn command(
         &self,
-        token: &str,
+        credential: &ApiCredential,
         path: &str,
         mut payload: Value,
     ) -> Result<Value, ApiError> {
         payload["command_id"] = Value::String(new_uuid()?);
-        self.post(path, token, &payload).await
+        self.post(path, credential, &payload).await
     }
 
-    async fn get<T: DeserializeOwned>(&self, path: &str, token: &str) -> Result<T, ApiError> {
+    async fn get<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        credential: &ApiCredential,
+    ) -> Result<T, ApiError> {
         let response = self
-            .authenticated(Request::get(&format!("{API_BASE}{path}")), token)
+            .authenticated(Request::get(&format!("{API_BASE}{path}")), credential)
             .send()
             .await
             .map_err(ApiError::transport)?;
@@ -237,11 +273,11 @@ impl ApiClient {
     async fn post<T: DeserializeOwned, B: Serialize + ?Sized>(
         &self,
         path: &str,
-        token: &str,
+        credential: &ApiCredential,
         body: &B,
     ) -> Result<T, ApiError> {
         let request = self
-            .authenticated(Request::post(&format!("{API_BASE}{path}")), token)
+            .authenticated(Request::post(&format!("{API_BASE}{path}")), credential)
             .json(body)
             .map_err(ApiError::transport)?;
         let response = request.send().await.map_err(ApiError::transport)?;
@@ -266,13 +302,18 @@ impl ApiClient {
         decode(response).await
     }
 
-    fn authenticated(&self, request: RequestBuilder, token: &str) -> RequestBuilder {
-        request
+    fn authenticated(&self, request: RequestBuilder, credential: &ApiCredential) -> RequestBuilder {
+        let request = request
             .header("Accept", "application/json")
-            .header("Authorization", &format!("Bearer {token}"))
             .cache(web_sys::RequestCache::NoStore)
             .credentials(web_sys::RequestCredentials::SameOrigin)
-            .referrer_policy(web_sys::ReferrerPolicy::NoReferrer)
+            .referrer_policy(web_sys::ReferrerPolicy::NoReferrer);
+        match credential {
+            ApiCredential::DeviceToken(token) => {
+                request.header("Authorization", &format!("Bearer {token}"))
+            }
+            ApiCredential::GatewaySession => request,
+        }
     }
 }
 

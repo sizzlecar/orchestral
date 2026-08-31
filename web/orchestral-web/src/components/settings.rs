@@ -11,6 +11,18 @@ pub fn SettingsPanel() -> Element {
         return rsx! {};
     }
     let theme = controller.preferences.read().theme.clone();
+    let gateway_identity = state.auth.me.as_ref().is_some_and(|me| {
+        me.get("auth_mode").and_then(|value| value.as_str()) == Some("gateway_jwt")
+    });
+    let gateway_label = state
+        .auth
+        .me
+        .as_ref()
+        .and_then(|me| me.get("attributes"))
+        .and_then(|claims| claims.get("email"))
+        .and_then(|email| email.as_str())
+        .unwrap_or("由访问网关验证")
+        .to_owned();
     rsx! {
         div {
             class: "settings-backdrop",
@@ -44,8 +56,10 @@ pub fn SettingsPanel() -> Element {
                     }
                 }
                 section { class: "settings-section",
-                    h3 { "已配对设备" }
-                    if state.devices.status == LoadStatus::Loading {
+                    h3 { if gateway_identity { "登录身份" } else { "已配对设备" } }
+                    if gateway_identity {
+                        p { "{gateway_label}" }
+                    } else if state.devices.status == LoadStatus::Loading {
                         p { "正在载入设备…" }
                     } else if let Some(error) = state.devices.error.as_ref() {
                         p { class: "settings-error", "{error}" }

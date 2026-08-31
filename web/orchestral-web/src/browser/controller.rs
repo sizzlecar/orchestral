@@ -3,7 +3,7 @@ use gloo_timers::future::TimeoutFuture;
 use serde_json::{json, Value};
 use wasm_bindgen::{closure::Closure, JsValue};
 
-use crate::browser::api::{ApiClient, ApiError};
+use crate::browser::api::{ApiClient, ApiCredential, ApiError};
 use crate::browser::{platform, storage};
 use crate::model::{SessionView, StreamEvent};
 use crate::state::{is_terminal, AppState, AuthStatus, LoadStatus, Notice, SessionsState};
@@ -11,7 +11,7 @@ use crate::state::{is_terminal, AppState, AuthStatus, LoadStatus, Notice, Sessio
 #[derive(Clone, Copy)]
 pub struct AppController {
     pub state: Signal<AppState>,
-    pub token: Signal<Option<String>>,
+    pub token: Signal<Option<ApiCredential>>,
     pub pairing_secret: Signal<Option<String>>,
     pub preferences: Signal<storage::Preferences>,
     pub stream_abort: Signal<Option<web_sys::AbortController>>,
@@ -23,7 +23,7 @@ pub struct AppController {
 impl AppController {
     pub fn new(
         state: Signal<AppState>,
-        token: Signal<Option<String>>,
+        token: Signal<Option<ApiCredential>>,
         pairing_secret: Signal<Option<String>>,
         preferences: Signal<storage::Preferences>,
         stream_abort: Signal<Option<web_sys::AbortController>>,
@@ -50,6 +50,31 @@ impl AppController {
             return;
         }
 
+        let gateway = ApiCredential::GatewaySession;
+        match self.api.me(&gateway).await {
+            Ok(me) if me.get("auth_mode").and_then(Value::as_str) == Some("gateway_jwt") => {
+                self.token.set(Some(gateway));
+                let mut state = self.state.write();
+                state.auth.status = AuthStatus::Authenticated;
+                state.auth.me = Some(me);
+                state.auth.device = None;
+                state.auth.error = None;
+                drop(state);
+                self.load_workspace().await;
+                return;
+            }
+            Ok(_) => {}
+            Err(error) if error.code.starts_with("gateway_authentication_") => {
+                self.set_auth_error(error.message);
+                return;
+            }
+            Err(ApiError { status: 401, .. }) => {}
+            Err(error) => {
+                let mut state = self.state.write();
+                state.connection.error = Some(error.message);
+            }
+        }
+
         let token = match storage::load_token().await {
             Ok(token) => token,
             Err(error) => {
@@ -61,8 +86,9 @@ impl AppController {
             self.clear_auth(None).await;
             return;
         };
-        self.token.set(Some(token.clone()));
-        match self.api.me(&token).await {
+        let credential = ApiCredential::DeviceToken(token);
+        self.token.set(Some(credential.clone()));
+        match self.api.me(&credential).await {
             Ok(me) => {
                 let mut state = self.state.write();
                 state.auth.status = AuthStatus::Authenticated;
@@ -106,7 +132,8 @@ impl AppController {
                     self.set_auth_error(error);
                     return;
                 }
-                self.token.set(Some(claim.token));
+                self.token
+                    .set(Some(ApiCredential::DeviceToken(claim.token)));
                 self.pairing_secret.set(None);
                 {
                     let mut preferences = self.preferences.write();

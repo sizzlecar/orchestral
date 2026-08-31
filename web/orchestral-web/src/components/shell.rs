@@ -23,9 +23,9 @@ pub fn AuthScreen() -> Element {
         ),
         AuthStatus::Error => (
             "无法连接",
-            "配对没有完成",
+            "安全登录没有完成",
             auth.error
-                .unwrap_or_else(|| "请重新生成配对链接。".to_owned()),
+                .unwrap_or_else(|| "请检查登录状态后重试。".to_owned()),
         ),
         _ => (
             "尚未配对",
@@ -54,9 +54,9 @@ pub fn AuthScreen() -> Element {
                     class: "auth-screen__button",
                     r#type: "button",
                     onclick: move |_| {
-                        spawn(async move { controller.claim_pairing().await });
+                        spawn(async move { controller.bootstrap().await });
                     },
-                    "重试配对"
+                    "重试"
                 }
             }
         }

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +22,7 @@ use orchestral_runtime::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
+use super::auth::{GatewayAuthenticator, GatewayPrincipal};
 use super::state::{DevicePrincipal, DeviceView, PairingClaim, RemoteRegistry, SessionView};
 
 const APPROVAL_GRANT_TTL_MS: i64 = 5 * 60 * 1_000;
@@ -30,6 +32,22 @@ pub struct RemoteApiState {
     pub agent: AgentApi,
     pub approvals: Arc<InMemoryHostApprovalBroker>,
     pub registry: RemoteRegistry,
+    pub gateway_authenticator: Option<Arc<dyn GatewayAuthenticator>>,
+}
+
+#[derive(Debug, Clone)]
+enum RemotePrincipal {
+    Device(DevicePrincipal),
+    Gateway(GatewayPrincipal),
+}
+
+impl RemotePrincipal {
+    fn current_device_id(&self) -> Option<&str> {
+        match self {
+            Self::Device(principal) => Some(&principal.device_id),
+            Self::Gateway(_) => None,
+        }
+    }
 }
 
 pub fn router(state: RemoteApiState) -> Router {
@@ -98,20 +116,42 @@ async fn claim_pairing(
 
 #[derive(Debug, Serialize)]
 struct MeResponse {
-    device_id: String,
+    auth_mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subject: Option<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    attributes: BTreeMap<String, String>,
 }
 
-async fn me(Extension(principal): Extension<DevicePrincipal>) -> Json<MeResponse> {
-    Json(MeResponse {
-        device_id: principal.device_id,
+async fn me(Extension(principal): Extension<RemotePrincipal>) -> Json<MeResponse> {
+    Json(match principal {
+        RemotePrincipal::Device(principal) => MeResponse {
+            auth_mode: "device_token",
+            device_id: Some(principal.device_id),
+            subject: None,
+            attributes: BTreeMap::new(),
+        },
+        RemotePrincipal::Gateway(principal) => MeResponse {
+            auth_mode: "gateway_jwt",
+            device_id: None,
+            subject: principal.subject,
+            attributes: principal.attributes,
+        },
     })
 }
 
 async fn list_devices(
     State(state): State<RemoteApiState>,
-    Extension(principal): Extension<DevicePrincipal>,
+    Extension(principal): Extension<RemotePrincipal>,
 ) -> Json<Vec<DeviceView>> {
-    Json(state.registry.devices(&principal.device_id).await)
+    Json(
+        state
+            .registry
+            .devices(principal.current_device_id().unwrap_or_default())
+            .await,
+    )
 }
 
 async fn revoke_device(
@@ -602,6 +642,30 @@ async fn authenticate(
     mut request: Request<axum::body::Body>,
     next: Next,
 ) -> Result<Response, ApiError> {
+    if let Some(authenticator) = &state.gateway_authenticator {
+        let assertion = request
+            .headers()
+            .get(authenticator.header_name())
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                ApiError::unauthorized(
+                    "gateway_authentication_required",
+                    "a signed gateway identity is required",
+                )
+            })?;
+        let principal = authenticator
+            .authenticate(assertion)
+            .await
+            .map_err(|error| {
+                ApiError::unauthorized("gateway_authentication_failed", error.to_string())
+            })?;
+        request
+            .extensions_mut()
+            .insert(RemotePrincipal::Gateway(principal));
+        return Ok(next.run(request).await);
+    }
+
     let token = bearer_token(request.headers()).ok_or_else(|| {
         ApiError::unauthorized(
             "authentication_required",
@@ -614,7 +678,9 @@ async fn authenticate(
             "device authentication is invalid or revoked",
         )
     })?;
-    request.extensions_mut().insert(principal);
+    request
+        .extensions_mut()
+        .insert(RemotePrincipal::Device(principal));
     Ok(next.run(request).await)
 }
 
@@ -741,7 +807,7 @@ mod tests {
 
     use async_trait::async_trait;
     use axum::body::Body;
-    use axum::http::Request;
+    use axum::http::{HeaderName, Request};
     use futures_util::StreamExt;
     use http_body_util::BodyExt;
     use orchestral_agent_protocol_testkit::{
@@ -764,6 +830,31 @@ mod tests {
     use orchestral_runtime::{AgentApprovalBridge, AgentController};
     use tokio::sync::broadcast;
     use tower::ServiceExt;
+
+    use super::super::auth::GatewayAuthError;
+
+    struct StaticGatewayAuthenticator {
+        header_name: HeaderName,
+    }
+
+    #[async_trait]
+    impl GatewayAuthenticator for StaticGatewayAuthenticator {
+        fn header_name(&self) -> &HeaderName {
+            &self.header_name
+        }
+
+        async fn authenticate(&self, token: &str) -> Result<GatewayPrincipal, GatewayAuthError> {
+            if token != "valid-gateway-assertion" {
+                return Err(GatewayAuthError::Invalid(
+                    "test assertion was rejected".to_owned(),
+                ));
+            }
+            Ok(GatewayPrincipal {
+                subject: Some("gateway-user".to_owned()),
+                attributes: BTreeMap::from([("email".to_owned(), "person@example.com".to_owned())]),
+            })
+        }
+    }
 
     struct ApprovalProvider {
         descriptor: AgentDescriptorEnvelope,
@@ -956,6 +1047,12 @@ mod tests {
     }
 
     async fn test_app() -> (Router, String) {
+        test_app_with_gateway(None).await
+    }
+
+    async fn test_app_with_gateway(
+        gateway_authenticator: Option<Arc<dyn GatewayAuthenticator>>,
+    ) -> (Router, String) {
         let factory = ScriptedStatelessFactory::conformant().unwrap();
         let descriptor = factory.descriptor();
         let scenario = ProviderScenario::standard(&descriptor).unwrap();
@@ -974,6 +1071,7 @@ mod tests {
                 agent: AgentApi::new(controller),
                 approvals,
                 registry,
+                gateway_authenticator,
             }),
             claim.token,
         )
@@ -998,6 +1096,7 @@ mod tests {
                 agent: AgentApi::new(controller),
                 approvals,
                 registry,
+                gateway_authenticator: None,
             }),
             claim.token,
         )
@@ -1026,6 +1125,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn gateway_mode_accepts_a_verified_identity_without_a_bearer_token() {
+        let authenticator = Arc::new(StaticGatewayAuthenticator {
+            header_name: HeaderName::from_static("x-gateway-jwt"),
+        });
+        let (app, _) = test_app_with_gateway(Some(authenticator)).await;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/me")
+                    .header("x-gateway-jwt", "valid-gateway-assertion")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let me: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(me["auth_mode"], "gateway_jwt");
+        assert_eq!(me["attributes"]["email"], "person@example.com");
+
+        for assertion in [None, Some("forged-assertion")] {
+            let mut request = Request::builder().uri("/sessions");
+            if let Some(assertion) = assertion {
+                request = request.header("x-gateway-jwt", assertion);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
     }
 
     #[tokio::test]

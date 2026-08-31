@@ -1,5 +1,7 @@
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context};
@@ -11,7 +13,10 @@ use qrcode::QrCode;
 use crate::agent::{build_agent_host, AgentRunOptions};
 use crate::mcp_config::user_config_root;
 
-use super::{asset_router, router, PairingTicket, RemoteApiState, RemoteRegistry};
+use super::{
+    asset_router, router, GatewayAuthenticator, JwtGatewayAuthenticator, JwtGatewayConfig,
+    PairingTicket, RemoteApiState, RemoteRegistry,
+};
 
 const DEFAULT_PAIRING_TTL_SECS: u64 = 5 * 60;
 
@@ -41,10 +46,34 @@ pub struct ServeCommand {
     /// for a trusted LAN; installable PWA features normally require HTTPS.
     #[arg(long)]
     allow_insecure_http: bool,
+
+    /// Expected issuer for JWT assertions injected by an identity-aware reverse proxy.
+    #[arg(long, value_name = "URL")]
+    access_jwt_issuer: Option<String>,
+
+    /// Expected audience for reverse-proxy JWT assertions.
+    #[arg(long, value_name = "AUDIENCE")]
+    access_jwt_audience: Option<String>,
+
+    /// JWKS endpoint used to verify reverse-proxy JWT assertions.
+    #[arg(long, value_name = "URL")]
+    access_jwt_jwks_url: Option<String>,
+
+    /// Request header carrying the reverse-proxy JWT assertion.
+    #[arg(long, value_name = "HEADER")]
+    access_jwt_header: Option<String>,
+
+    /// Required JWT claim. Repeat for multiple NAME=VALUE checks; dotted names address nested claims.
+    #[arg(long = "access-jwt-required-claim", value_name = "NAME=VALUE")]
+    access_jwt_required_claims: Vec<String>,
 }
 
 pub(crate) async fn serve(command: ServeCommand, options: AgentRunOptions) -> anyhow::Result<()> {
     validate_public_surface(&command)?;
+    let gateway_authenticator = build_gateway_authenticator(&command)?;
+    if gateway_authenticator.is_some() && command.pair {
+        bail!("--pair cannot be combined with gateway JWT authentication");
+    }
     let pairing = command
         .pair
         .then(|| {
@@ -59,7 +88,10 @@ pub(crate) async fn serve(command: ServeCommand, options: AgentRunOptions) -> an
         .clone()
         .unwrap_or(user_config_root()?.join("remote-control.json"));
     let registry = RemoteRegistry::open(&state_path, pairing.clone())?;
-    if registry.active_device_count().await == 0 && pairing.is_none() {
+    if registry.active_device_count().await == 0
+        && pairing.is_none()
+        && gateway_authenticator.is_none()
+    {
         bail!("no paired mobile device exists; start with `orchestral serve --pair` to pair one");
     }
 
@@ -71,6 +103,7 @@ pub(crate) async fn serve(command: ServeCommand, options: AgentRunOptions) -> an
                 agent: host.api.clone(),
                 approvals: host.approvals.clone(),
                 registry,
+                gateway_authenticator: gateway_authenticator.clone(),
             }),
         )
         .merge(asset_router());
@@ -88,6 +121,9 @@ pub(crate) async fn serve(command: ServeCommand, options: AgentRunOptions) -> an
         host.backend_name, host.model
     );
     eprintln!("Device registry: {}", state_path.display());
+    if gateway_authenticator.is_some() {
+        eprintln!("Remote authentication: signed reverse-proxy JWT");
+    }
     if let Some(ticket) = pairing {
         let pairing_url = format!(
             "{}/#pair={}",
@@ -132,6 +168,52 @@ fn validate_public_surface(command: &ServeCommand) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn build_gateway_authenticator(
+    command: &ServeCommand,
+) -> anyhow::Result<Option<Arc<dyn GatewayAuthenticator>>> {
+    let configured = command.access_jwt_issuer.is_some()
+        || command.access_jwt_audience.is_some()
+        || command.access_jwt_jwks_url.is_some()
+        || command.access_jwt_header.is_some()
+        || !command.access_jwt_required_claims.is_empty();
+    if !configured {
+        return Ok(None);
+    }
+    let issuer = command
+        .access_jwt_issuer
+        .clone()
+        .context("--access-jwt-issuer is required when gateway JWT authentication is enabled")?;
+    let audience = command
+        .access_jwt_audience
+        .clone()
+        .context("--access-jwt-audience is required when gateway JWT authentication is enabled")?;
+    let jwks_url = command
+        .access_jwt_jwks_url
+        .clone()
+        .context("--access-jwt-jwks-url is required when gateway JWT authentication is enabled")?;
+    let header = command
+        .access_jwt_header
+        .clone()
+        .context("--access-jwt-header is required when gateway JWT authentication is enabled")?;
+    let required_claims = parse_required_claims(&command.access_jwt_required_claims)?;
+    let config = JwtGatewayConfig::new(issuer, audience, jwks_url, header, required_claims)?;
+    Ok(Some(Arc::new(JwtGatewayAuthenticator::new(config)?)))
+}
+
+fn parse_required_claims(entries: &[String]) -> anyhow::Result<BTreeMap<String, String>> {
+    entries
+        .iter()
+        .try_fold(BTreeMap::new(), |mut claims, entry| {
+            let (name, value) = entry.split_once('=').with_context(|| {
+                format!("invalid --access-jwt-required-claim '{entry}'; expected NAME=VALUE")
+            })?;
+            if claims.insert(name.to_owned(), value.to_owned()).is_some() {
+                bail!("duplicate gateway JWT required claim '{name}'");
+            }
+            Ok(claims)
+        })
+}
+
 fn print_pairing(url: &str, expires_at_unix_ms: i64) -> anyhow::Result<()> {
     let code = QrCode::new(url.as_bytes()).context("encode pairing QR")?;
     let image = code
@@ -164,6 +246,11 @@ mod tests {
             pairing_ttl_secs: 300,
             state_file: None,
             allow_insecure_http: false,
+            access_jwt_issuer: None,
+            access_jwt_audience: None,
+            access_jwt_jwks_url: None,
+            access_jwt_header: None,
+            access_jwt_required_claims: Vec::new(),
         }
     }
 
@@ -178,5 +265,18 @@ mod tests {
     #[test]
     fn loopback_development_surface_is_allowed() {
         assert!(validate_public_surface(&command("127.0.0.1:8765", None)).is_ok());
+    }
+
+    #[test]
+    fn gateway_jwt_configuration_is_all_or_nothing() {
+        let mut partial = command("127.0.0.1:8765", None);
+        partial.access_jwt_issuer = Some("https://access.example.com".to_owned());
+        assert!(build_gateway_authenticator(&partial).is_err());
+
+        partial.access_jwt_audience = Some("orchestral".to_owned());
+        partial.access_jwt_jwks_url = Some("https://access.example.com/keys".to_owned());
+        partial.access_jwt_header = Some("x-access-jwt".to_owned());
+        partial.access_jwt_required_claims = vec!["email=person@example.com".to_owned()];
+        assert!(build_gateway_authenticator(&partial).is_ok());
     }
 }
