@@ -666,6 +666,24 @@ svg {
     var(--page-raised);
 }
 
+.conversation-header__controls {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.session-actions-button {
+  min-height: 34px;
+  padding: 0 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--ink-soft);
+  font-size: 11px;
+  font-weight: 680;
+}
+
 .conversation-header {
   position: relative;
   z-index: 5;
@@ -1883,22 +1901,59 @@ svg {
 }
 
 .settings-dialog {
+  position: fixed;
+  z-index: 81;
+  inset: 50% auto auto 50%;
   width: min(calc(100% - 20px), 540px);
   max-width: 540px;
   max-height: min(calc(100dvh - 24px), 720px);
   padding: 0;
+  margin: 0;
   overflow: hidden;
   border: 1px solid var(--line-strong);
   border-radius: 21px;
   background: var(--surface);
   box-shadow: var(--shadow-md);
   color: var(--ink);
+  transform: translate(-50%, -50%);
 }
 
 .settings-dialog::backdrop {
   background: var(--overlay);
   backdrop-filter: blur(4px);
   -webkit-backdrop-filter: blur(4px);
+}
+
+.settings-backdrop {
+  position: fixed;
+  z-index: 80;
+  inset: 0;
+  background: var(--overlay);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+}
+
+.settings-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 68px;
+  padding: 10px 12px 10px 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+.settings-header h2 {
+  margin: 3px 0 0;
+  font-size: 18px;
+  line-height: 1.2;
+}
+
+.settings-content {
+  min-height: 120px;
+  max-height: min(calc(100dvh - 94px), 640px);
+  padding: 16px 18px calc(18px + env(safe-area-inset-bottom));
+  overflow-y: auto;
 }
 
 .settings-dialog__surface {
@@ -1959,6 +2014,121 @@ svg {
   background-color: var(--surface-muted);
   color: var(--ink);
   font-size: 12px;
+}
+
+.session-source-list,
+.session-action-list {
+  display: grid;
+  gap: 10px;
+}
+
+.session-source-card {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  min-height: 68px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 14px;
+  background: var(--surface-muted);
+  color: var(--ink);
+  text-align: left;
+}
+
+.session-source-card__mark {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  border-radius: 12px;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-weight: 760;
+}
+
+.session-source-card__copy {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.session-source-card__copy strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-source-card__copy small,
+.session-source-card__action {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.session-action-card {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: 14px;
+  background: var(--surface-muted);
+}
+
+.session-action-card__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.session-action-card h3,
+.session-action-card p {
+  margin: 0;
+}
+
+.session-action-card h3 {
+  font-size: 13px;
+}
+
+.session-action-card p {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.session-action-fields {
+  display: grid;
+  gap: 9px;
+}
+
+.session-action-field {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.session-action-field input,
+.session-action-field textarea {
+  width: 100%;
+  min-height: 42px;
+  padding: 9px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 9px;
+  outline: 0;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 450;
+}
+
+.session-action-field textarea {
+  min-height: 90px;
+  resize: vertical;
 }
 
 .settings-button,
@@ -2236,6 +2406,19 @@ svg {
 
   .send-button {
     flex: 0 0 44px;
+  }
+
+  .settings-dialog {
+    inset: auto 10px calc(10px + env(safe-area-inset-bottom));
+    width: calc(100% - 20px);
+    max-height: min(82dvh, 720px);
+    margin: 0;
+    border-radius: 20px;
+    transform: none;
+  }
+
+  .settings-content {
+    max-height: calc(82dvh - 68px);
   }
 }
 

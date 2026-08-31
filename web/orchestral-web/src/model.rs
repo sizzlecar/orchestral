@@ -44,11 +44,30 @@ impl SessionView {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentConnectorView {
     pub connector_id: String,
     pub display_name: String,
     pub agent_family: String,
+    pub capabilities: AgentSessionCapabilitiesView,
+    #[serde(default)]
+    pub actions: Vec<AgentSessionActionView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSessionCapabilitiesView {
+    pub list: bool,
+    pub read: bool,
+    pub create: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentSessionActionView {
+    pub action_id: String,
+    pub title: String,
+    pub description: String,
+    #[serde(default)]
+    pub input_schema: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -96,6 +115,16 @@ impl AgentSessionSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentSessionActionOutcome {
+    #[serde(default)]
+    pub session: Option<AgentSessionSummary>,
+    #[serde(default)]
+    pub content: Vec<Value>,
+    #[serde(default)]
+    pub details: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentSessionDetail {
     pub summary: AgentSessionSummary,
     #[serde(default)]
@@ -137,6 +166,40 @@ pub struct EventsResponse {
     pub next: u64,
     #[serde(default)]
     pub records: Vec<Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connector_capabilities_and_action_schema_survive_http_decoding() {
+        let connector: AgentConnectorView = serde_json::from_value(serde_json::json!({
+            "connector_id": "fixture/local",
+            "provider_binding": "fixture/provider",
+            "agent_family": "coding-agent",
+            "display_name": "Fixture",
+            "capabilities": {"list": true, "read": true, "create": true},
+            "actions": [{
+                "action_id": "session.rename",
+                "title": "Rename",
+                "description": "Rename this session",
+                "input_schema": {
+                    "type": "object",
+                    "required": ["name"],
+                    "properties": {"name": {"type": "string"}}
+                }
+            }]
+        }))
+        .unwrap();
+
+        assert!(connector.capabilities.create);
+        assert_eq!(connector.actions[0].action_id, "session.rename");
+        assert_eq!(
+            connector.actions[0].input_schema.as_ref().unwrap()["required"][0],
+            "name"
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

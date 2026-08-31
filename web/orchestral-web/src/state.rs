@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
-use crate::model::{AgentSessionDetail, DeviceView, SessionView};
+use crate::model::{AgentConnectorView, AgentSessionDetail, DeviceView, SessionView};
 
 const MAX_TELEMETRY_IDS: usize = 800;
 const INITIAL_INPUT_ORDER: u64 = 0;
@@ -45,6 +45,13 @@ pub struct SessionsState {
 pub struct DevicesState {
     pub status: LoadStatus,
     pub items: Vec<DeviceView>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ConnectorsState {
+    pub status: LoadStatus,
+    pub items: Vec<AgentConnectorView>,
     pub error: Option<String>,
 }
 
@@ -687,6 +694,8 @@ pub struct ConnectionState {
 pub struct UiState {
     pub drawer_open: bool,
     pub settings_open: bool,
+    pub new_session_open: bool,
+    pub session_actions_open: bool,
     pub composer_busy: bool,
     pub installing: bool,
     pub install_available: bool,
@@ -705,6 +714,7 @@ pub struct AppState {
     pub auth: AuthState,
     pub sessions: SessionsState,
     pub devices: DevicesState,
+    pub connectors: ConnectorsState,
     pub runs: BTreeMap<String, RunState>,
     pub run_order: Vec<String>,
     pub connection: ConnectionState,
@@ -722,6 +732,7 @@ impl AppState {
             },
             sessions: SessionsState::default(),
             devices: DevicesState::default(),
+            connectors: ConnectorsState::default(),
             runs: BTreeMap::new(),
             run_order: Vec::new(),
             connection: ConnectionState {
@@ -766,6 +777,14 @@ impl AppState {
             .items
             .iter()
             .find(|session| session.key() == selected)
+    }
+
+    pub fn selected_connector(&self) -> Option<&AgentConnectorView> {
+        let connector_id = self.selected_session()?.connector_id.as_deref()?;
+        self.connectors
+            .items
+            .iter()
+            .find(|connector| connector.connector_id == connector_id)
     }
 
     pub fn project_agent_session(&mut self, detail: AgentSessionDetail) {

@@ -3,6 +3,7 @@ use gloo_timers::future::TimeoutFuture;
 
 use crate::browser::controller::AppController;
 use crate::components::pending::PendingPanel;
+use crate::components::session_control::{NewSessionPanel, SessionActionsPanel};
 use crate::components::settings::SettingsPanel;
 use crate::components::timeline::ConversationTimeline;
 use crate::state::{AuthStatus, LoadStatus, RunState};
@@ -84,6 +85,9 @@ pub fn Workspace() -> Element {
         .map(connector_label)
         .unwrap_or("Orchestral");
     let run = state.current_run().cloned();
+    let has_session_actions = state
+        .selected_connector()
+        .is_some_and(|connector| !connector.actions.is_empty());
     let install_available = state.ui.install_available;
 
     rsx! {
@@ -112,7 +116,9 @@ pub fn Workspace() -> Element {
                     r#type: "button",
                     aria_label: "新建会话",
                     onclick: move |_| {
-                        spawn(async move { controller.create_session().await; });
+                        let mut state = controller.state.write();
+                        state.ui.drawer_open = false;
+                        state.ui.new_session_open = true;
                     },
                     svg { view_box: "0 0 24 24", width: "21", height: "21",
                         path { d: "M12 5v14M5 12h14" }
@@ -142,7 +148,9 @@ pub fn Workspace() -> Element {
                             class: "new-thread-button",
                             r#type: "button",
                             onclick: move |_| {
-                                spawn(async move { controller.create_session().await; });
+                                let mut state = controller.state.write();
+                                state.ui.drawer_open = false;
+                                state.ui.new_session_open = true;
                             },
                             span { "+" }
                             span { "新建会话" }
@@ -217,7 +225,18 @@ pub fn Workspace() -> Element {
                             p { class: "eyebrow", "{session_source} 会话" }
                             h1 { "{title}" }
                         }
-                        RunStatusBadge { run }
+                        div { class: "conversation-header__controls",
+                            if has_session_actions {
+                                button {
+                                    class: "session-actions-button",
+                                    r#type: "button",
+                                    aria_label: "打开会话操作",
+                                    onclick: move |_| controller.state.write().ui.session_actions_open = true,
+                                    "操作"
+                                }
+                            }
+                            RunStatusBadge { run }
+                        }
                     }
                     ConversationTimeline {}
                     PendingPanel {}
@@ -226,6 +245,8 @@ pub fn Workspace() -> Element {
             }
         }
         SettingsPanel {}
+        NewSessionPanel {}
+        SessionActionsPanel {}
         if let Some(notice) = state.ui.notice {
             div { class: "toast-region", aria_live: "polite",
                 div { class: "toast toast--{notice.tone}", "{notice.message}" }

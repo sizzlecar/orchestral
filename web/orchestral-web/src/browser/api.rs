@@ -9,8 +9,8 @@ use wasm_bindgen::JsValue;
 
 use crate::browser::platform::new_uuid;
 use crate::model::{
-    AgentConnectorView, AgentSessionDetail, AgentSessionPage, DeviceView, EventsResponse,
-    PairingClaim, SessionView, StreamEvent,
+    AgentConnectorView, AgentSessionActionOutcome, AgentSessionDetail, AgentSessionPage,
+    AgentSessionSummary, DeviceView, EventsResponse, PairingClaim, SessionView, StreamEvent,
 };
 use crate::sse::SseParser;
 
@@ -120,6 +120,25 @@ impl ApiClient {
         .await
     }
 
+    pub async fn create_agent_session(
+        &self,
+        credential: &ApiCredential,
+        connector_id: &str,
+        cwd: Option<&str>,
+        title: Option<&str>,
+    ) -> Result<AgentSessionSummary, ApiError> {
+        self.post(
+            "/agent-sessions",
+            credential,
+            &json!({
+                "connector_id": connector_id,
+                "cwd": cwd,
+                "title": title,
+            }),
+        )
+        .await
+    }
+
     pub async fn agent_session(
         &self,
         credential: &ApiCredential,
@@ -133,6 +152,27 @@ impl ApiClient {
                 encode(session_id)
             ),
             credential,
+        )
+        .await
+    }
+
+    pub async fn invoke_agent_session_action(
+        &self,
+        credential: &ApiCredential,
+        connector_id: &str,
+        session_id: &str,
+        action_id: &str,
+        arguments: Value,
+    ) -> Result<AgentSessionActionOutcome, ApiError> {
+        self.post(
+            "/agent-session/actions",
+            credential,
+            &json!({
+                "connector_id": connector_id,
+                "session_id": session_id,
+                "action_id": action_id,
+                "arguments": arguments,
+            }),
         )
         .await
     }

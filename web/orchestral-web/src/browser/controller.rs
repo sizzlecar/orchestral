@@ -5,8 +5,10 @@ use wasm_bindgen::{closure::Closure, JsValue};
 
 use crate::browser::api::{ApiClient, ApiCredential, ApiError};
 use crate::browser::{platform, storage};
-use crate::model::{SessionView, StreamEvent};
-use crate::state::{is_terminal, AppState, AuthStatus, LoadStatus, Notice, SessionsState};
+use crate::model::{AgentConnectorView, SessionView, StreamEvent};
+use crate::state::{
+    is_terminal, AppState, AuthStatus, ConnectorsState, LoadStatus, Notice, SessionsState,
+};
 
 #[derive(Clone, Copy)]
 pub struct AppController {
@@ -204,8 +206,30 @@ impl AppController {
         self.state.write().sessions.status = LoadStatus::Loading;
         match self.api.sessions(&token).await {
             Ok(mut sessions) => {
-                if let Ok(connectors) = self.api.agent_connectors(&token).await {
-                    for connector in connectors {
+                let connectors = match self.api.agent_connectors(&token).await {
+                    Ok(connectors) => {
+                        self.state.write().connectors = ConnectorsState {
+                            status: LoadStatus::Ready,
+                            items: connectors.clone(),
+                            error: None,
+                        };
+                        connectors
+                    }
+                    Err(error) if error.status == 401 => {
+                        self.clear_auth(Some(error.message)).await;
+                        return;
+                    }
+                    Err(error) => {
+                        self.state.write().connectors = ConnectorsState {
+                            status: LoadStatus::Error,
+                            items: Vec::new(),
+                            error: Some(error.message),
+                        };
+                        Vec::new()
+                    }
+                };
+                for connector in connectors {
+                    if connector.capabilities.list {
                         if let Ok(page) = self
                             .api
                             .agent_sessions(&token, &connector.connector_id)
@@ -219,6 +243,7 @@ impl AppController {
                         }
                     }
                 }
+                sessions = merge_sessions(&self.state.read().sessions.items, sessions);
                 sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at_unix_ms));
                 let selected_id = {
                     let state = self.state.read();
@@ -278,6 +303,7 @@ impl AppController {
             let mut state = self.state.write();
             state.sessions.selected_id = Some(session_key);
             state.ui.drawer_open = false;
+            state.ui.session_actions_open = false;
         }
         if let Some(connector_id) = session.connector_id.as_deref() {
             let Some(token) = self.token.read().clone() else {
@@ -414,6 +440,74 @@ impl AppController {
                 self.handle_api_error(error).await;
                 None
             }
+        }
+    }
+
+    pub async fn create_agent_session(
+        mut self,
+        connector: AgentConnectorView,
+    ) -> Option<SessionView> {
+        if !platform::is_online() {
+            self.notice("离线时无法创建会话", "warning");
+            return None;
+        }
+        if !connector.capabilities.create {
+            self.notice("这个 Agent 不支持创建会话", "warning");
+            return None;
+        }
+        let token = self.token.read().clone()?;
+        self.set_busy(true);
+        let result = self
+            .api
+            .create_agent_session(&token, &connector.connector_id, None, None)
+            .await;
+        self.set_busy(false);
+        match result {
+            Ok(summary) => {
+                let session = summary.into_session();
+                self.state.write().ui.new_session_open = false;
+                self.upsert_session(session.clone(), true);
+                self.load_session(session.key()).await;
+                Some(session)
+            }
+            Err(error) => {
+                self.handle_api_error(error).await;
+                None
+            }
+        }
+    }
+
+    pub async fn invoke_session_action(
+        mut self,
+        connector_id: String,
+        session_id: String,
+        action_id: String,
+        arguments: Value,
+    ) {
+        if !platform::is_online() {
+            self.notice("离线时无法执行会话操作", "warning");
+            return;
+        }
+        let Some(token) = self.token.read().clone() else {
+            return;
+        };
+        self.set_busy(true);
+        let result = self
+            .api
+            .invoke_agent_session_action(&token, &connector_id, &session_id, &action_id, arguments)
+            .await;
+        self.set_busy(false);
+        match result {
+            Ok(outcome) => {
+                self.state.write().ui.session_actions_open = false;
+                if let Some(summary) = outcome.session {
+                    let session = summary.into_session();
+                    self.upsert_session(session.clone(), true);
+                    self.load_session(session.key()).await;
+                }
+                self.notice("会话操作已完成", "success");
+            }
+            Err(error) => self.handle_api_error(error).await,
         }
     }
 
@@ -958,6 +1052,14 @@ impl AppController {
     fn upsert_session(mut self, session: SessionView, select: bool) {
         let mut state = self.state.write();
         let session_key = session.key();
+        let session = merge_session(
+            state
+                .sessions
+                .items
+                .iter()
+                .find(|item| item.key() == session_key),
+            session,
+        );
         state
             .sessions
             .items
@@ -981,6 +1083,27 @@ impl AppController {
             self.notice(&error.message, "error");
         }
     }
+}
+
+fn merge_session(existing: Option<&SessionView>, mut incoming: SessionView) -> SessionView {
+    if let Some(existing) = existing {
+        for run_id in &existing.run_ids {
+            if !incoming.run_ids.contains(run_id) {
+                incoming.run_ids.push(run_id.clone());
+            }
+        }
+    }
+    incoming
+}
+
+fn merge_sessions(existing: &[SessionView], incoming: Vec<SessionView>) -> Vec<SessionView> {
+    incoming
+        .into_iter()
+        .map(|session| {
+            let key = session.key();
+            merge_session(existing.iter().find(|item| item.key() == key), session)
+        })
+        .collect()
 }
 
 fn check_ack(ack: &Value, operation: &str) -> Result<String, ApiError> {
@@ -1040,6 +1163,33 @@ fn value_as_id(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refreshing_external_metadata_does_not_drop_controlled_runs() {
+        let existing = SessionView {
+            id: "thread-1".to_owned(),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 2,
+            run_ids: vec![
+                "agent-history:fixture/local:thread-1".to_owned(),
+                "controlled-run".to_owned(),
+            ],
+            connector_id: Some("fixture/local".to_owned()),
+            title: Some("Old".to_owned()),
+            preview: None,
+            cwd: None,
+            state: Some("active".to_owned()),
+        };
+        let incoming = SessionView {
+            title: Some("Renamed".to_owned()),
+            run_ids: vec!["agent-history:fixture/local:thread-1".to_owned()],
+            ..existing.clone()
+        };
+
+        let merged = merge_sessions(&[existing], vec![incoming]).remove(0);
+        assert_eq!(merged.title.as_deref(), Some("Renamed"));
+        assert!(merged.run_ids.iter().any(|run| run == "controlled-run"));
+    }
 
     #[test]
     fn accepted_ack_returns_command_id() {
