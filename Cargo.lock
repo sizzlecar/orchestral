@@ -3129,6 +3129,7 @@ dependencies = [
  "include_dir",
  "insta",
  "jsonwebtoken",
+ "orchestral-agent-codex",
  "orchestral-agent-journal-fs",
  "orchestral-agent-protocol-testkit",
  "orchestral-blob-fs",

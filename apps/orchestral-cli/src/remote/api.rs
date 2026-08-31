@@ -11,13 +11,17 @@ use axum::response::sse::{Event, KeepAlive};
 use axum::response::{IntoResponse, Response, Sse};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use orchestral_core::agent_connector::{
+    AgentConnectorId, AgentSessionDetail, AgentSessionListQuery, AgentSessionPage,
+};
 use orchestral_core::agent_protocol::wire::{
     AgentCommand, AgentCommandEnvelope, AgentRunView, AgentSessionId, ApprovalDecision, CommandAck,
     CommandId, Content, PendingRequest, PendingRequestPayload, RequestId, RequestResolution, RunId,
 };
 use orchestral_runtime::api::AgentApi;
 use orchestral_runtime::{
-    AgentControlEvent, AgentSdkError, ApprovalBridgeError, InMemoryHostApprovalBroker,
+    AgentControlEvent, AgentDirectory, AgentDirectoryError, AgentSdkError, ApprovalBridgeError,
+    InMemoryHostApprovalBroker,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -30,6 +34,7 @@ const APPROVAL_GRANT_TTL_MS: i64 = 5 * 60 * 1_000;
 #[derive(Clone)]
 pub struct RemoteApiState {
     pub agent: AgentApi,
+    pub agent_directory: Arc<AgentDirectory>,
     pub approvals: Arc<InMemoryHostApprovalBroker>,
     pub registry: RemoteRegistry,
     pub gateway_authenticator: Option<Arc<dyn GatewayAuthenticator>>,
@@ -58,6 +63,10 @@ pub fn router(state: RemoteApiState) -> Router {
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{session_id}", get(get_session))
         .route("/sessions/{session_id}/runs", post(start_run))
+        .route("/agent-connectors", get(list_agent_connectors))
+        .route("/agent-sessions", get(list_agent_sessions))
+        .route("/agent-session", get(get_agent_session))
+        .route("/agent-runs", post(start_agent_run))
         .route("/runs/{run_id}", get(inspect_run))
         .route("/runs/{run_id}/events", get(run_events))
         .route("/runs/{run_id}/stream", get(run_stream))
@@ -207,6 +216,73 @@ async fn get_session(
         .ok_or_else(|| ApiError::not_found("session_not_found", "session was not found"))
 }
 
+async fn list_agent_connectors(
+    State(state): State<RemoteApiState>,
+) -> Json<Vec<orchestral_core::agent_connector::AgentConnectorDescriptor>> {
+    Json(state.agent_directory.connectors().await)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentSessionsQuery {
+    connector_id: String,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default = "default_agent_session_limit")]
+    limit: u32,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    search: Option<String>,
+}
+
+const fn default_agent_session_limit() -> u32 {
+    50
+}
+
+async fn list_agent_sessions(
+    State(state): State<RemoteApiState>,
+    Query(query): Query<AgentSessionsQuery>,
+) -> Result<Json<AgentSessionPage>, ApiError> {
+    let connector_id = AgentConnectorId::new(query.connector_id);
+    Ok(Json(
+        state
+            .agent_directory
+            .list_sessions(
+                &connector_id,
+                AgentSessionListQuery {
+                    cursor: query.cursor,
+                    limit: query.limit,
+                    cwd: query.cwd,
+                    search: query.search,
+                },
+            )
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentSessionQuery {
+    connector_id: String,
+    session_id: String,
+}
+
+async fn get_agent_session(
+    State(state): State<RemoteApiState>,
+    Query(query): Query<AgentSessionQuery>,
+) -> Result<Json<AgentSessionDetail>, ApiError> {
+    Ok(Json(
+        state
+            .agent_directory
+            .read_session(
+                &AgentConnectorId::new(query.connector_id),
+                &AgentSessionId::new(query.session_id),
+            )
+            .await?,
+    ))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StartRunRequest {
@@ -218,6 +294,54 @@ struct StartRunRequest {
 struct StartRunResponse {
     run_id: RunId,
     view: RemoteRunView,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StartAgentRunRequest {
+    connector_id: String,
+    session_id: String,
+    run_id: String,
+    input: String,
+}
+
+#[derive(Debug, Serialize)]
+struct StartAgentRunResponse {
+    connector_id: AgentConnectorId,
+    run_id: RunId,
+    view: RemoteRunView,
+}
+
+async fn start_agent_run(
+    State(state): State<RemoteApiState>,
+    Json(request): Json<StartAgentRunRequest>,
+) -> Result<(StatusCode, Json<StartAgentRunResponse>), ApiError> {
+    let connector_id = AgentConnectorId::new(request.connector_id);
+    let session_id = AgentSessionId::new(request.session_id);
+    let run_id = RunId::new(request.run_id);
+    let handle = state
+        .agent_directory
+        .start_text(
+            &connector_id,
+            &session_id,
+            Some(run_id.clone()),
+            request.input,
+        )
+        .await?;
+    let agent = state.agent_directory.agent_api(&connector_id).await?;
+    spawn_approval_driver(state.clone(), agent.clone(), run_id.clone());
+    let view = RemoteRunView {
+        view: handle.inspect().await?,
+        input: agent.initial_input(&run_id).await?,
+    };
+    Ok((
+        StatusCode::CREATED,
+        Json(StartAgentRunResponse {
+            connector_id,
+            run_id,
+            view,
+        }),
+    ))
 }
 
 #[derive(Debug, Serialize)]
@@ -250,12 +374,16 @@ async fn start_run(
 }
 
 pub(super) fn spawn_remembered_approval_driver(state: RemoteApiState, run_id: RunId) {
+    spawn_approval_driver(state.clone(), state.agent.clone(), run_id);
+}
+
+fn spawn_approval_driver(state: RemoteApiState, agent: AgentApi, run_id: RunId) {
     tokio::spawn(async move {
-        let Ok(mut live) = state.agent.subscribe(&run_id).await else {
+        let Ok(mut live) = agent.subscribe(&run_id).await else {
             return;
         };
         loop {
-            let Ok(view) = state.agent.inspect(&run_id).await else {
+            let Ok(view) = agent.inspect(&run_id).await else {
                 return;
             };
             for request in &view.pending_requests {
@@ -284,7 +412,7 @@ pub(super) fn spawn_remembered_approval_driver(state: RemoteApiState, run_id: Ru
                 ) else {
                     continue;
                 };
-                let _ = state.agent.command(command).await;
+                let _ = agent.command(command).await;
             }
             if view.state.is_terminal() {
                 return;
@@ -300,18 +428,29 @@ pub(super) fn spawn_remembered_approval_driver(state: RemoteApiState, run_id: Ru
 async fn inspect_run(
     State(state): State<RemoteApiState>,
     Path(run_id): Path<String>,
+    Query(query): Query<RunTargetQuery>,
 ) -> Result<Json<RemoteRunView>, ApiError> {
-    let run_id = require_run(&state, run_id).await?;
+    let (agent, run_id) = require_run(&state, query.connector_id.as_deref(), run_id).await?;
     Ok(Json(RemoteRunView {
-        view: state.agent.inspect(&run_id).await?,
-        input: state.agent.initial_input(&run_id).await?,
+        view: agent.inspect(&run_id).await?,
+        input: agent.initial_input(&run_id).await?,
     }))
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RunTargetQuery {
+    #[serde(default)]
+    connector_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct EventsQuery {
     #[serde(default)]
     after: u64,
+    #[serde(default)]
+    connector_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -326,8 +465,8 @@ async fn run_events(
     Path(run_id): Path<String>,
     Query(query): Query<EventsQuery>,
 ) -> Result<Json<EventsResponse>, ApiError> {
-    let run_id = require_run(&state, run_id).await?;
-    let records = state.agent.events(&run_id, query.after).await?;
+    let (agent, run_id) = require_run(&state, query.connector_id.as_deref(), run_id).await?;
+    let records = agent.events(&run_id, query.after).await?;
     let next = records
         .last()
         .map_or(query.after, |record| record.event.run_seq);
@@ -344,7 +483,7 @@ async fn run_stream(
     Query(query): Query<EventsQuery>,
     headers: HeaderMap,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    let run_id = require_run(&state, run_id).await?;
+    let (agent, run_id) = require_run(&state, query.connector_id.as_deref(), run_id).await?;
     let header_cursor = headers
         .get("last-event-id")
         .and_then(|value| value.to_str().ok())
@@ -354,8 +493,7 @@ async fn run_stream(
     // Subscribe before replay. Any event committed between these operations is
     // either present in replay or remains queued; sequence filtering removes
     // the harmless overlap.
-    let mut live = state.agent.subscribe(&run_id).await?;
-    let agent = state.agent.clone();
+    let mut live = agent.subscribe(&run_id).await?;
     let stream = async_stream::stream! {
         let mut cursor = initial_cursor;
         match replay_events(&agent, &run_id, &mut cursor).await {
@@ -471,9 +609,10 @@ struct TextCommandRequest {
 async fn steer_run(
     State(state): State<RemoteApiState>,
     Path(run_id): Path<String>,
+    Query(query): Query<RunTargetQuery>,
     Json(request): Json<TextCommandRequest>,
 ) -> Result<Json<CommandAck>, ApiError> {
-    let run_id = require_run(&state, run_id).await?;
+    let (agent, run_id) = require_run(&state, query.connector_id.as_deref(), run_id).await?;
     let command = AgentCommandEnvelope::new(
         CommandId::new(request.command_id),
         run_id,
@@ -482,7 +621,7 @@ async fn steer_run(
             content: vec![Content::text(request.text)],
         },
     )?;
-    Ok(Json(state.agent.command(command).await?))
+    Ok(Json(agent.command(command).await?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -495,9 +634,10 @@ struct CancelRequest {
 async fn cancel_run(
     State(state): State<RemoteApiState>,
     Path(run_id): Path<String>,
+    Query(query): Query<RunTargetQuery>,
     Json(request): Json<CancelRequest>,
 ) -> Result<Json<CommandAck>, ApiError> {
-    let run_id = require_run(&state, run_id).await?;
+    let (agent, run_id) = require_run(&state, query.connector_id.as_deref(), run_id).await?;
     let command = AgentCommandEnvelope::new(
         CommandId::new(request.command_id),
         run_id,
@@ -506,17 +646,18 @@ async fn cancel_run(
             reason: request.reason,
         },
     )?;
-    Ok(Json(state.agent.command(command).await?))
+    Ok(Json(agent.command(command).await?))
 }
 
 async fn resolve_input(
     State(state): State<RemoteApiState>,
     Path((run_id, request_id)): Path<(String, String)>,
+    Query(query): Query<RunTargetQuery>,
     Json(request): Json<TextCommandRequest>,
 ) -> Result<Json<CommandAck>, ApiError> {
-    let run_id = require_run(&state, run_id).await?;
+    let (agent, run_id) = require_run(&state, query.connector_id.as_deref(), run_id).await?;
     let request_id = RequestId::new(request_id);
-    let pending = require_pending(&state, &run_id, &request_id).await?;
+    let pending = require_pending_for(&agent, &run_id, &request_id).await?;
     if !matches!(pending.payload, PendingRequestPayload::Input { .. }) {
         return Err(ApiError::conflict(
             "request_kind_mismatch",
@@ -533,7 +674,7 @@ async fn resolve_input(
             },
         },
     )?;
-    Ok(Json(state.agent.command(command).await?))
+    Ok(Json(agent.command(command).await?))
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -554,11 +695,12 @@ struct ApprovalRequest {
 async fn resolve_approval(
     State(state): State<RemoteApiState>,
     Path((run_id, request_id)): Path<(String, String)>,
+    Query(query): Query<RunTargetQuery>,
     Json(request): Json<ApprovalRequest>,
 ) -> Result<Json<CommandAck>, ApiError> {
-    let run_id = require_run(&state, run_id).await?;
+    let (agent, run_id) = require_run(&state, query.connector_id.as_deref(), run_id).await?;
     let request_id = RequestId::new(request_id);
-    let pending = require_pending(&state, &run_id, &request_id).await?;
+    let pending = require_pending_for(&agent, &run_id, &request_id).await?;
     let PendingRequestPayload::Approval {
         session_approval_scope,
         ..
@@ -603,15 +745,28 @@ async fn resolve_approval(
             },
         },
     )?;
-    Ok(Json(state.agent.command(command).await?))
+    Ok(Json(agent.command(command).await?))
 }
 
-async fn require_run(state: &RemoteApiState, run_id: String) -> Result<RunId, ApiError> {
+async fn require_run(
+    state: &RemoteApiState,
+    connector_id: Option<&str>,
+    run_id: String,
+) -> Result<(AgentApi, RunId), ApiError> {
+    let agent = match connector_id {
+        Some(connector_id) => {
+            state
+                .agent_directory
+                .agent_api(&AgentConnectorId::new(connector_id))
+                .await?
+        }
+        None => state.agent.clone(),
+    };
     let run_id = RunId::new(run_id);
-    if !state.agent.has_run(&run_id).await? {
+    if !agent.has_run(&run_id).await? {
         return Err(ApiError::not_found("run_not_found", "run was not found"));
     }
-    Ok(run_id)
+    Ok((agent, run_id))
 }
 
 /// Projects the remote conversation list directly from durable Run
@@ -655,12 +810,12 @@ async fn session_views(state: &RemoteApiState) -> Result<Vec<SessionView>, Agent
     Ok(sessions)
 }
 
-async fn require_pending(
-    state: &RemoteApiState,
+async fn require_pending_for(
+    agent: &AgentApi,
     run_id: &RunId,
     request_id: &RequestId,
 ) -> Result<PendingRequest, ApiError> {
-    let view = state.agent.inspect(run_id).await?;
+    let view = agent.inspect(run_id).await?;
     view.pending_requests
         .into_iter()
         .find(|request| request.request_id == *request_id)
@@ -812,6 +967,47 @@ impl From<AgentSdkError> for ApiError {
     }
 }
 
+impl From<AgentDirectoryError> for ApiError {
+    fn from(error: AgentDirectoryError) -> Self {
+        match &error {
+            AgentDirectoryError::ConnectorNotFound(_) => {
+                Self::not_found("agent_connector_not_found", error.to_string())
+            }
+            AgentDirectoryError::Connector(connector_error) => {
+                use orchestral_core::agent_connector::AgentConnectorErrorCode;
+                match connector_error.code {
+                    AgentConnectorErrorCode::InvalidRequest => Self::new(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_agent_connector_request",
+                        error.to_string(),
+                    ),
+                    AgentConnectorErrorCode::NotFound => {
+                        Self::not_found("agent_session_not_found", error.to_string())
+                    }
+                    AgentConnectorErrorCode::Busy | AgentConnectorErrorCode::LeaseConflict => {
+                        Self::conflict("agent_connector_busy", error.to_string())
+                    }
+                    AgentConnectorErrorCode::Unsupported => Self::new(
+                        StatusCode::NOT_IMPLEMENTED,
+                        "agent_connector_unsupported",
+                        error.to_string(),
+                    ),
+                    AgentConnectorErrorCode::Unavailable => Self::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "agent_connector_unavailable",
+                        error.to_string(),
+                    ),
+                    AgentConnectorErrorCode::Protocol | AgentConnectorErrorCode::OutcomeUnknown => {
+                        Self::internal("agent_connector_failed", error.to_string())
+                    }
+                    _ => Self::internal("agent_connector_failed", error.to_string()),
+                }
+            }
+            _ => Self::internal("agent_directory_failed", error.to_string()),
+        }
+    }
+}
+
 impl From<orchestral_core::agent_protocol::wire::AgentProtocolError> for ApiError {
     fn from(error: orchestral_core::agent_protocol::wire::AgentProtocolError) -> Self {
         Self::new(
@@ -848,6 +1044,10 @@ mod tests {
     use orchestral_agent_protocol_testkit::{
         ProviderFixtureFactory, ProviderScenario, ScriptedStatelessFactory, TestProbes,
     };
+    use orchestral_core::agent_connector::{
+        AgentConnector, AgentConnectorDescriptor, AgentConnectorError, AgentConnectorHealth,
+        AgentSessionCapabilities, AgentSessionState, AgentSessionSummary,
+    };
     use orchestral_core::agent_protocol::{
         spi::{AgentProvider, AgentRecovery, AgentRecoveryRequest, AgentStart, AgentStartError},
         wire::{
@@ -870,6 +1070,70 @@ mod tests {
 
     struct StaticGatewayAuthenticator {
         header_name: HeaderName,
+    }
+
+    struct StaticAgentConnector;
+
+    impl StaticAgentConnector {
+        fn summary() -> AgentSessionSummary {
+            AgentSessionSummary {
+                connector_id: AgentConnectorId::new("fixture/local"),
+                session_id: AgentSessionId::new("fixture-session"),
+                title: Some("Existing fixture session".to_owned()),
+                preview: Some("resume me".to_owned()),
+                cwd: Some("/fixture/workspace".to_owned()),
+                created_at_unix_ms: Some(1_000),
+                updated_at_unix_ms: Some(2_000),
+                state: AgentSessionState::Idle,
+                extensions: BTreeMap::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AgentConnector for StaticAgentConnector {
+        fn describe(&self) -> AgentConnectorDescriptor {
+            AgentConnectorDescriptor {
+                connector_id: AgentConnectorId::new("fixture/local"),
+                provider_binding: ProviderBindingRef::new("fixture/external"),
+                agent_family: "test-agent".to_owned(),
+                display_name: "Fixture Agent".to_owned(),
+                capabilities: AgentSessionCapabilities::discoverable(),
+                actions: Vec::new(),
+            }
+        }
+
+        async fn health(&self) -> Result<AgentConnectorHealth, AgentConnectorError> {
+            Ok(AgentConnectorHealth::ready(Some("test".to_owned())))
+        }
+
+        async fn list_sessions(
+            &self,
+            _query: AgentSessionListQuery,
+        ) -> Result<AgentSessionPage, AgentConnectorError> {
+            Ok(AgentSessionPage {
+                sessions: vec![Self::summary()],
+                next_cursor: None,
+            })
+        }
+
+        async fn read_session(
+            &self,
+            session_id: &AgentSessionId,
+        ) -> Result<AgentSessionDetail, AgentConnectorError> {
+            if session_id.as_str() != "fixture-session" {
+                return Err(AgentConnectorError::new(
+                    orchestral_core::agent_connector::AgentConnectorErrorCode::NotFound,
+                    "fixture session not found",
+                    false,
+                ));
+            }
+            Ok(AgentSessionDetail {
+                summary: Self::summary(),
+                turns: Vec::new(),
+                pending_requests: Vec::new(),
+            })
+        }
     }
 
     #[async_trait]
@@ -1101,9 +1365,18 @@ mod tests {
         let claim = registry.claim_pairing(&secret, "Test phone").await.unwrap();
         let approvals =
             Arc::new(InMemoryHostApprovalBroker::new(b"0123456789abcdef0123456789abcdef").unwrap());
+        let external_factory = ScriptedStatelessFactory::conformant().unwrap();
+        let external_scenario = ProviderScenario::standard(&external_factory.descriptor()).unwrap();
+        let external_provider = external_factory.create(external_scenario, TestProbes::default());
+        let agent_directory = Arc::new(AgentDirectory::new());
+        agent_directory
+            .register(Arc::new(StaticAgentConnector), external_provider)
+            .await
+            .unwrap();
         (
             router(RemoteApiState {
                 agent: AgentApi::new(controller),
+                agent_directory,
                 approvals,
                 registry,
                 gateway_authenticator,
@@ -1129,6 +1402,7 @@ mod tests {
         (
             router(RemoteApiState {
                 agent: AgentApi::new(controller),
+                agent_directory: Arc::new(AgentDirectory::new()),
                 approvals,
                 registry,
                 gateway_authenticator: None,
@@ -1160,6 +1434,112 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn external_agent_session_can_be_discovered_read_and_started_through_http() {
+        let (app, token) = test_app().await;
+
+        let response = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                "/agent-connectors",
+                &token,
+                serde_json::Value::Null,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let connectors: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(connectors[0]["connector_id"], "fixture/local");
+
+        let response = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                "/agent-sessions?connector_id=fixture%2Flocal&limit=25",
+                &token,
+                serde_json::Value::Null,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let sessions: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(sessions["sessions"][0]["session_id"], "fixture-session");
+
+        let response = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                "/agent-session?connector_id=fixture%2Flocal&session_id=fixture-session",
+                &token,
+                serde_json::Value::Null,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let session: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(session["summary"]["title"], "Existing fixture session");
+
+        let response = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/agent-runs",
+                &token,
+                serde_json::json!({
+                    "connector_id": "fixture/local",
+                    "session_id": "fixture-session",
+                    "run_id": "fixture-external-run",
+                    "input": "continue the existing session"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let started: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(started["connector_id"], "fixture/local");
+        assert_eq!(started["run_id"], "fixture-external-run");
+
+        let response = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                "/runs/fixture-external-run?connector_id=fixture%2Flocal",
+                &token,
+                serde_json::Value::Null,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let run: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            run["input"][0]["body"]["value"],
+            "continue the existing session"
+        );
+
+        let response = app
+            .oneshot(authorized(
+                "GET",
+                "/runs/fixture-external-run/events?connector_id=fixture%2Flocal&after=0",
+                &token,
+                serde_json::Value::Null,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let events: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(events["records"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()));
+        assert!(events["next"].as_u64().is_some_and(|next| next > 0));
     }
 
     #[tokio::test]

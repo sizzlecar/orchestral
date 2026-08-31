@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 orchestral-core = { workspace = true }
 orchestral-runtime = { workspace = true }
+orchestral-agent-codex = { workspace = true }
 orchestral-agent-journal-fs = { path = "../../plugins/orchestral-agent-journal-fs" }
 orchestral-blob-fs = { path = "../../plugins/orchestral-blob-fs" }
 orchestral-model-gemini = { workspace = true }

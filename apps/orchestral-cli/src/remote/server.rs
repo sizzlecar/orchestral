@@ -12,6 +12,7 @@ use qrcode::render::unicode;
 use qrcode::QrCode;
 
 use crate::agent::{build_agent_host, AgentRunOptions};
+use crate::agent_connectors::build_agent_directory;
 use crate::mcp_config::user_config_root;
 
 use super::api::spawn_remembered_approval_driver;
@@ -98,8 +99,10 @@ pub(crate) async fn serve(command: ServeCommand, options: AgentRunOptions) -> an
     }
 
     let host = build_agent_host(&options).await?;
+    let agent_directory = build_agent_directory().await?;
     let remote_state = RemoteApiState {
         agent: host.api.clone(),
+        agent_directory,
         approvals: host.approvals.clone(),
         registry,
         gateway_authenticator: gateway_authenticator.clone(),

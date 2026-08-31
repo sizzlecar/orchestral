@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use thiserror::Error;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{
+    self, AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, oneshot, Mutex};
 use tokio::time::timeout;
@@ -76,11 +78,12 @@ impl CodexRpcClient {
             .map_err(CodexTransportError::Spawn)?;
         let stdin = child.stdin.take().ok_or(CodexTransportError::Closed)?;
         let stdout = child.stdout.take().ok_or(CodexTransportError::Closed)?;
-        if let Some(stderr) = child.stderr.take() {
+        if let Some(mut stderr) = child.stderr.take() {
             tokio::spawn(async move {
-                let mut reader = BufReader::new(stderr);
-                let mut sink = Vec::with_capacity(4096);
-                let _ = reader.read_until(b'\n', &mut sink).await;
+                // app-server owns a long-lived stderr pipe. Draining a single
+                // line can eventually fill the OS pipe and deadlock Codex
+                // while stdout still appears healthy to the Host.
+                let _ = io::copy(&mut stderr, &mut io::sink()).await;
             });
         }
         let client = Self::from_io_with_child(
