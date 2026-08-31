@@ -16,10 +16,12 @@ use std::collections::VecDeque;
 use async_trait::async_trait;
 use orchestral_core::agent_connector::{
     AgentConnector, AgentConnectorDescriptor, AgentConnectorError, AgentConnectorErrorCode,
-    AgentConnectorHealth, AgentConnectorId, AgentSessionActionDescriptor, AgentSessionActionId,
-    AgentSessionActionOutcome, AgentSessionCapabilities, AgentSessionDetail, AgentSessionListQuery,
+    AgentConnectorHealth, AgentConnectorId, AgentSessionActionDescriptor,
+    AgentSessionActionExecution, AgentSessionActionId, AgentSessionActionOutcome,
+    AgentSessionActionStatus, AgentSessionCapabilities, AgentSessionDetail, AgentSessionListQuery,
     AgentSessionPage, AgentSessionSummary, CreateAgentSessionRequest,
-    InvokeAgentSessionActionRequest, SESSION_FORK_ACTION, SESSION_RENAME_ACTION,
+    InvokeAgentSessionActionRequest, SESSION_COMPACT_ACTION, SESSION_FORK_ACTION,
+    SESSION_RENAME_ACTION, SESSION_REVIEW_ACTION,
 };
 use orchestral_core::agent_protocol::wire::{AgentSessionId, ProviderBindingRef};
 use serde_json::{json, Value};
@@ -160,11 +162,42 @@ impl AgentConnector for CodexConnector {
             },
             actions: vec![
                 AgentSessionActionDescriptor {
+                    action_id: AgentSessionActionId::new(SESSION_COMPACT_ACTION),
+                    title: "Compact context".to_owned(),
+                    description:
+                        "Compact this session's native context while preserving its history"
+                            .to_owned(),
+                    input_schema: None,
+                    execution: AgentSessionActionExecution::Run,
+                },
+                AgentSessionActionDescriptor {
+                    action_id: AgentSessionActionId::new(SESSION_REVIEW_ACTION),
+                    title: "Review changes".to_owned(),
+                    description: "Run a native code review in this session".to_owned(),
+                    input_schema: Some(json!({
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["target"],
+                        "properties": {
+                            "target": {
+                                "type": "string",
+                                "title": "Target (uncommitted_changes, base_branch, commit, custom)"
+                            },
+                            "branch": {"type": "string", "title": "Base branch"},
+                            "sha": {"type": "string", "title": "Commit SHA"},
+                            "title": {"type": "string", "title": "Commit title"},
+                            "instructions": {"type": "string", "title": "Custom instructions"}
+                        }
+                    })),
+                    execution: AgentSessionActionExecution::Run,
+                },
+                AgentSessionActionDescriptor {
                     action_id: AgentSessionActionId::new(SESSION_FORK_ACTION),
                     title: "Fork session".to_owned(),
                     description: "Create a new session from this session's persisted history"
                         .to_owned(),
                     input_schema: None,
+                    execution: AgentSessionActionExecution::Immediate,
                 },
                 AgentSessionActionDescriptor {
                     action_id: AgentSessionActionId::new(SESSION_RENAME_ACTION),
@@ -176,6 +209,7 @@ impl AgentConnector for CodexConnector {
                         "required": ["name"],
                         "properties": {"name": {"type": "string", "minLength": 1}}
                     })),
+                    execution: AgentSessionActionExecution::Immediate,
                 },
             ],
         }
@@ -331,6 +365,7 @@ impl AgentConnector for CodexConnector {
             }
         };
         Ok(AgentSessionActionOutcome {
+            status: AgentSessionActionStatus::Completed,
             session,
             content: Vec::new(),
             details: Value::Null,
@@ -558,6 +593,7 @@ mod tests {
                 session_id: created.session_id,
                 action_id: AgentSessionActionId::new(SESSION_FORK_ACTION),
                 arguments: Value::Null,
+                run_id: None,
             })
             .await
             .unwrap()
@@ -570,6 +606,7 @@ mod tests {
                 session_id: forked.session_id,
                 action_id: AgentSessionActionId::new(SESSION_RENAME_ACTION),
                 arguments: json!({"name": "Release review"}),
+                run_id: None,
             })
             .await
             .unwrap()
@@ -597,6 +634,7 @@ mod tests {
                 session_id: AgentSessionId::new("thread-1"),
                 action_id: AgentSessionActionId::new(SESSION_RENAME_ACTION),
                 arguments: json!({"name": "", "unexpected": true}),
+                run_id: None,
             }))
             .unwrap_err();
         assert_eq!(rename_error.code, AgentConnectorErrorCode::InvalidRequest);

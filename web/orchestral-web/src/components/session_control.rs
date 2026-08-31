@@ -4,7 +4,7 @@ use dioxus::prelude::*;
 use serde_json::{Map, Value};
 
 use crate::browser::controller::AppController;
-use crate::model::AgentSessionActionView;
+use crate::model::{AgentSessionActionExecutionView, AgentSessionActionView};
 
 #[component]
 pub fn NewSessionPanel() -> Element {
@@ -158,6 +158,7 @@ fn ActionCard(
     let mut raw_json = use_signal(|| "{}".to_owned());
     let mut error = use_signal(|| None::<String>);
     let action_id = action.action_id.clone();
+    let run_action = action.execution == AgentSessionActionExecutionView::Run;
 
     rsx! {
         form {
@@ -177,7 +178,13 @@ fn ActionCard(
                 let action_id = action_id.clone();
                 spawn(async move {
                     controller
-                        .invoke_session_action(connector_id, session_id, action_id, arguments)
+                        .invoke_session_action(
+                            connector_id,
+                            session_id,
+                            action_id,
+                            arguments,
+                            run_action,
+                        )
                         .await;
                 });
             },

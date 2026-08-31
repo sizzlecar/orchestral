@@ -163,6 +163,7 @@ impl ApiClient {
         session_id: &str,
         action_id: &str,
         arguments: Value,
+        run_id: Option<&str>,
     ) -> Result<AgentSessionActionOutcome, ApiError> {
         self.post(
             "/agent-session/actions",
@@ -172,6 +173,7 @@ impl ApiClient {
                 "session_id": session_id,
                 "action_id": action_id,
                 "arguments": arguments,
+                "run_id": run_id,
             }),
         )
         .await

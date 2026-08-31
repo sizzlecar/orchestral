@@ -12,7 +12,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::agent_protocol::wire::{AgentSessionId, Content, PendingRequest, ProviderBindingRef};
+use crate::agent_protocol::wire::{
+    AgentRunSpec, AgentSessionId, Content, PendingRequest, ProviderBindingRef, RunId,
+};
 
 macro_rules! string_id {
     ($name:ident) => {
@@ -53,6 +55,10 @@ pub const SESSION_FORK_ACTION: &str = "session.fork";
 pub const SESSION_RENAME_ACTION: &str = "session.rename";
 pub const SESSION_SET_MODEL_ACTION: &str = "session.set_model";
 pub const SESSION_SET_REASONING_ACTION: &str = "session.set_reasoning";
+/// Provider-neutral Run extension used when a session action has a lifecycle.
+/// Concrete adapters translate the action id and arguments to their native
+/// protocol; consumers must not place provider wire method names here.
+pub const SESSION_ACTION_RUN_EXTENSION: &str = "orchestral.dev/session-action";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -93,6 +99,20 @@ pub struct AgentSessionActionDescriptor {
     /// arguments; it does not mean arbitrary arguments are accepted.
     #[serde(default)]
     pub input_schema: Option<Value>,
+    /// Immediate actions finish inside the connector call. Run actions use the
+    /// Agent Protocol lifecycle so they can stream, block for approval/input,
+    /// be cancelled, and recover after a disconnect.
+    #[serde(default)]
+    pub execution: AgentSessionActionExecution,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AgentSessionActionExecution {
+    #[default]
+    Immediate,
+    Run,
 }
 
 impl AgentSessionActionDescriptor {
@@ -474,17 +494,79 @@ pub struct InvokeAgentSessionActionRequest {
     pub action_id: AgentSessionActionId,
     #[serde(default)]
     pub arguments: Value,
+    /// Client-selected idempotency identity for Run actions. Immediate actions
+    /// reject this field because they have their own connector semantics.
+    #[serde(default)]
+    pub run_id: Option<RunId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AgentSessionActionStatus {
+    Completed,
+    Running { run_id: RunId },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSessionActionOutcome {
+    pub status: AgentSessionActionStatus,
     #[serde(default)]
     pub session: Option<AgentSessionSummary>,
     #[serde(default)]
     pub content: Vec<Content>,
     #[serde(default)]
     pub details: Value,
+}
+
+impl AgentSessionActionOutcome {
+    pub fn completed() -> Self {
+        Self {
+            status: AgentSessionActionStatus::Completed,
+            session: None,
+            content: Vec::new(),
+            details: Value::Null,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSessionActionInvocation {
+    pub action_id: AgentSessionActionId,
+    #[serde(default)]
+    pub arguments: Value,
+}
+
+impl AgentSessionActionInvocation {
+    pub fn insert_into(&self, spec: &mut AgentRunSpec) -> Result<(), AgentConnectorError> {
+        if self.action_id.is_empty() {
+            return Err(AgentConnectorError::invalid(
+                "session action id must not be empty",
+            ));
+        }
+        let value = serde_json::to_value(self).map_err(|error| {
+            AgentConnectorError::protocol(format!("could not encode session action: {error}"))
+        })?;
+        spec.extensions
+            .insert(SESSION_ACTION_RUN_EXTENSION.to_owned(), value);
+        Ok(())
+    }
+
+    pub fn from_run(spec: &AgentRunSpec) -> Result<Option<Self>, AgentConnectorError> {
+        let Some(value) = spec.extensions.get(SESSION_ACTION_RUN_EXTENSION) else {
+            return Ok(None);
+        };
+        let invocation: Self = serde_json::from_value(value.clone()).map_err(|error| {
+            AgentConnectorError::invalid(format!("invalid session action extension: {error}"))
+        })?;
+        if invocation.action_id.is_empty() {
+            return Err(AgentConnectorError::invalid(
+                "session action extension has an empty action id",
+            ));
+        }
+        Ok(Some(invocation))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -601,6 +683,7 @@ mod tests {
                 title: "Compact".to_owned(),
                 description: "Compact session history".to_owned(),
                 input_schema: None,
+                execution: AgentSessionActionExecution::Run,
             }],
         }
     }
@@ -644,5 +727,38 @@ mod tests {
             .validate_for(&descriptor().connector_id, 50)
             .expect_err("mismatched connector must fail");
         assert_eq!(error.code, AgentConnectorErrorCode::Protocol);
+    }
+
+    #[test]
+    fn session_action_run_extension_round_trips_and_is_digest_bound() {
+        let mut run = crate::agent_protocol::wire::AgentRunEnvelope::new(
+            crate::agent_protocol::AGENT_PROTOCOL_V1,
+            AgentSessionId::new("session-1"),
+            RunId::new("run-1"),
+            vec![Content::text("Review changes")],
+        )
+        .unwrap();
+        let invocation = AgentSessionActionInvocation {
+            action_id: AgentSessionActionId::new(SESSION_REVIEW_ACTION),
+            arguments: serde_json::json!({"target": "uncommitted_changes"}),
+        };
+        invocation.insert_into(&mut run.spec).unwrap();
+        let run = crate::agent_protocol::wire::AgentRunEnvelope::seal(run.spec).unwrap();
+
+        assert_eq!(
+            AgentSessionActionInvocation::from_run(&run.spec).unwrap(),
+            Some(invocation)
+        );
+        run.validate_integrity().unwrap();
+
+        let mut tampered = run;
+        *tampered
+            .spec
+            .extensions
+            .get_mut(SESSION_ACTION_RUN_EXTENSION)
+            .unwrap()
+            .pointer_mut("/arguments/target")
+            .unwrap() = Value::String("commit".to_owned());
+        assert!(tampered.validate_integrity().is_err());
     }
 }

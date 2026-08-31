@@ -4,6 +4,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
 use futures_util::stream::{self, StreamExt};
+use orchestral_core::agent_connector::{
+    AgentSessionActionInvocation, SESSION_COMPACT_ACTION, SESSION_REVIEW_ACTION,
+};
 use orchestral_core::agent_protocol::spi::{
     AgentProvider, AgentProviderStream, AgentRecovery, AgentRecoveryRequest, AgentStart,
     AgentStartError,
@@ -21,6 +24,7 @@ use orchestral_core::agent_protocol::wire::{
 };
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
+use tokio::time::{timeout, Duration};
 
 use crate::transport::{CodexRpcClient, CodexTransportError, CodexTransportEvent};
 use crate::{CodexConnector, ConnectedClient};
@@ -104,6 +108,19 @@ impl CodexConnector {
         notifications: broadcast::Receiver<CodexTransportEvent>,
     ) -> Result<(), AgentStartError> {
         let session_id = run.request.run.spec.session_id.clone();
+        let action =
+            AgentSessionActionInvocation::from_run(&run.request.run.spec).map_err(|error| {
+                self.remove_failed_start(&run);
+                AgentStartError::Rejected(AgentRejection::new(
+                    AgentRejectionCode::InvalidSpec,
+                    error.to_string(),
+                ))
+            })?;
+        if let Some(action) = &action {
+            validate_native_action(action).inspect_err(|_error| {
+                self.remove_failed_start(&run);
+            })?;
+        }
         let needs_resume = self
             .provider_state()
             .loaded_sessions
@@ -123,6 +140,11 @@ impl CodexConnector {
                 self.remove_failed_start(&run);
                 return Err(start_transport_error(error, false));
             }
+        }
+        if let Some(action) = action {
+            return self
+                .start_native_action(connected, run, action, notifications)
+                .await;
         }
         let input = codex_input(&run.request).map_err(|error| {
             self.remove_failed_start(&run);
@@ -163,21 +185,115 @@ impl CodexConnector {
                 ))
             })?
             .to_owned();
-        *lock(&run.turn_id) = Some(turn_id.clone());
-        publish_event(
-            &run,
-            AgentEventDraft {
-                event_id: event_id(&run, "started"),
-                run_id: run.execution.run_id.clone(),
-                causation_id: None,
-                source_fingerprint: None,
-                payload: AgentEvent::RunStarted,
-            },
-        );
+        establish_turn(&run, &turn_id);
         tokio::spawn(async move {
             monitor_native_run(connected.rpc.clone(), run, turn_id, notifications).await;
         });
         Ok(())
+    }
+
+    async fn start_native_action(
+        &self,
+        connected: Arc<ConnectedClient>,
+        run: Arc<CodexRun>,
+        action: AgentSessionActionInvocation,
+        mut notifications: broadcast::Receiver<CodexTransportEvent>,
+    ) -> Result<(), AgentStartError> {
+        let session_id = run.execution.session_id.clone();
+        let turn_id = match action.action_id.as_str() {
+            SESSION_COMPACT_ACTION => {
+                if !action.arguments.is_null() {
+                    self.remove_failed_start(&run);
+                    return Err(invalid_action("session.compact takes no arguments"));
+                }
+                if let Err(error) = connected
+                    .rpc
+                    .request(
+                        "thread/compact/start",
+                        json!({"threadId": session_id.as_str()}),
+                    )
+                    .await
+                {
+                    return self.action_transport_failure(&run, error);
+                }
+                *lock(&run.final_response) = "Session context compacted.".to_owned();
+                match timeout(
+                    Duration::from_secs(30),
+                    wait_for_compaction_turn(&session_id, &mut notifications),
+                )
+                .await
+                {
+                    Ok(Ok(turn_id)) => turn_id,
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => {
+                        run.detached.store(true, Ordering::SeqCst);
+                        return Err(AgentStartError::OutcomeUnknown(protocol_error(
+                            "Codex started compaction but did not identify its turn",
+                            true,
+                        )));
+                    }
+                }
+            }
+            SESSION_REVIEW_ACTION => {
+                let target = review_target(&action.arguments).inspect_err(|_error| {
+                    self.remove_failed_start(&run);
+                })?;
+                let result = match connected
+                    .rpc
+                    .request(
+                        "review/start",
+                        json!({
+                            "threadId": session_id.as_str(),
+                            "target": target,
+                            "delivery": "inline"
+                        }),
+                    )
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(error) => return self.action_transport_failure(&run, error),
+                };
+                result
+                    .pointer("/turn/id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| {
+                        AgentStartError::OutcomeUnknown(protocol_error(
+                            "Codex review/start omitted turn.id",
+                            false,
+                        ))
+                    })?
+                    .to_owned()
+            }
+            other => {
+                self.remove_failed_start(&run);
+                return Err(invalid_action(format!(
+                    "Codex does not support Run session action {other}"
+                )));
+            }
+        };
+
+        establish_turn(&run, &turn_id);
+        tokio::spawn(async move {
+            monitor_native_run(connected.rpc.clone(), run, turn_id, notifications).await;
+        });
+        Ok(())
+    }
+
+    fn action_transport_failure(
+        &self,
+        run: &Arc<CodexRun>,
+        error: CodexTransportError,
+    ) -> Result<(), AgentStartError> {
+        match error {
+            error @ (CodexTransportError::Timeout
+            | CodexTransportError::Closed
+            | CodexTransportError::Disconnected(_)) => Err(start_transport_error(error, true)),
+            error => {
+                self.remove_failed_start(run);
+                Err(start_transport_error(error, false))
+            }
+        }
     }
 
     fn remove_failed_start(&self, run: &CodexRun) {
@@ -625,6 +741,145 @@ async fn monitor_native_run(
     }
 }
 
+fn establish_turn(run: &Arc<CodexRun>, turn_id: &str) {
+    *lock(&run.turn_id) = Some(turn_id.to_owned());
+    publish_event(
+        run,
+        AgentEventDraft {
+            event_id: event_id(run, "started"),
+            run_id: run.execution.run_id.clone(),
+            causation_id: None,
+            source_fingerprint: None,
+            payload: AgentEvent::RunStarted,
+        },
+    );
+}
+
+async fn wait_for_compaction_turn(
+    session_id: &AgentSessionId,
+    notifications: &mut broadcast::Receiver<CodexTransportEvent>,
+) -> Result<String, AgentStartError> {
+    loop {
+        match notifications.recv().await {
+            Ok(CodexTransportEvent::Message(message)) => {
+                if message.get("method").and_then(Value::as_str) != Some("item/started")
+                    || message.pointer("/params/threadId").and_then(Value::as_str)
+                        != Some(session_id.as_str())
+                    || message.pointer("/params/item/type").and_then(Value::as_str)
+                        != Some("contextCompaction")
+                {
+                    continue;
+                }
+                return message
+                    .pointer("/params/turnId")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        AgentStartError::OutcomeUnknown(protocol_error(
+                            "Codex compaction item omitted turnId",
+                            false,
+                        ))
+                    });
+            }
+            Ok(CodexTransportEvent::Disconnected { reason }) => {
+                return Err(AgentStartError::OutcomeUnknown(protocol_error(
+                    format!("Codex disconnected while starting compaction: {reason}"),
+                    true,
+                )));
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                return Err(AgentStartError::OutcomeUnknown(protocol_error(
+                    format!("Codex compaction notifications lagged by {skipped}"),
+                    true,
+                )));
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                return Err(AgentStartError::OutcomeUnknown(protocol_error(
+                    "Codex notification channel closed while starting compaction",
+                    true,
+                )));
+            }
+        }
+    }
+}
+
+fn invalid_action(message: impl Into<String>) -> AgentStartError {
+    AgentStartError::Rejected(AgentRejection::new(
+        AgentRejectionCode::InvalidSpec,
+        message,
+    ))
+}
+
+fn validate_native_action(action: &AgentSessionActionInvocation) -> Result<(), AgentStartError> {
+    match action.action_id.as_str() {
+        SESSION_COMPACT_ACTION if action.arguments.is_null() => Ok(()),
+        SESSION_COMPACT_ACTION => Err(invalid_action("session.compact takes no arguments")),
+        SESSION_REVIEW_ACTION => review_target(&action.arguments).map(|_| ()),
+        other => Err(invalid_action(format!(
+            "Codex does not support Run session action {other}"
+        ))),
+    }
+}
+
+fn review_target(arguments: &Value) -> Result<Value, AgentStartError> {
+    let object = arguments
+        .as_object()
+        .ok_or_else(|| invalid_action("session.review arguments must be an object"))?;
+    let allowed = ["target", "branch", "sha", "title", "instructions"];
+    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(invalid_action(format!(
+            "session.review does not accept argument {key}"
+        )));
+    }
+    let target = action_string(object, "target")?;
+    match target.as_str() {
+        "uncommitted_changes" => Ok(json!({"type": "uncommittedChanges"})),
+        "base_branch" => Ok(json!({
+            "type": "baseBranch",
+            "branch": action_string(object, "branch")?
+        })),
+        "commit" => {
+            let mut target = json!({
+                "type": "commit",
+                "sha": action_string(object, "sha")?
+            });
+            if let Some(title) = optional_action_string(object, "title")? {
+                target["title"] = Value::String(title);
+            }
+            Ok(target)
+        }
+        "custom" => Ok(json!({
+            "type": "custom",
+            "instructions": action_string(object, "instructions")?
+        })),
+        _ => Err(invalid_action(
+            "session.review target must be uncommitted_changes, base_branch, commit, or custom",
+        )),
+    }
+}
+
+fn action_string(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<String, AgentStartError> {
+    optional_action_string(object, field)?
+        .ok_or_else(|| invalid_action(format!("session.review requires {field}")))
+}
+
+fn optional_action_string(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Option<String>, AgentStartError> {
+    match object.get(field) {
+        None => Ok(None),
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value.clone())),
+        Some(_) => Err(invalid_action(format!(
+            "session.review {field} must be a non-empty string"
+        ))),
+    }
+}
+
 fn handle_completed_item(run: &Arc<CodexRun>, item: Option<&Value>) {
     let Some(item) = item else { return };
     match item.get("type").and_then(Value::as_str) {
@@ -657,6 +912,14 @@ fn handle_completed_item(run: &Arc<CodexRun>, item: Option<&Value>) {
         ),
         Some("mcpToolCall") => publish_tool(run, item, "mcp", Vec::new()),
         Some("dynamicToolCall") => publish_tool(run, item, "dynamic_tool", Vec::new()),
+        Some("contextCompaction") => publish_tool(
+            run,
+            item,
+            "session.compact",
+            vec![ToolActivityEvidence::Note {
+                text: "Codex compacted the native session context".to_owned(),
+            }],
+        ),
         _ => {}
     }
 }
@@ -1130,6 +1393,34 @@ mod tests {
         .unwrap()
     }
 
+    fn action_start_request(
+        session_id: &str,
+        run_id: &str,
+        action_id: &str,
+        arguments: Value,
+    ) -> AgentStartRequest {
+        let descriptor = CodexConnector::provider_descriptor();
+        let mut run = AgentRunEnvelope::new(
+            ProtocolVersion::new(1, 0),
+            AgentSessionId::new(session_id),
+            RunId::new(run_id),
+            vec![Content::text("session action")],
+        )
+        .unwrap();
+        AgentSessionActionInvocation {
+            action_id: orchestral_core::agent_connector::AgentSessionActionId::new(action_id),
+            arguments,
+        }
+        .insert_into(&mut run.spec)
+        .unwrap();
+        AgentStartRequest::new(
+            AgentRunEnvelope::seal(run.spec).unwrap(),
+            ProviderBindingRef::new("codex/local"),
+            &descriptor,
+        )
+        .unwrap()
+    }
+
     async fn next_request(
         lines: &mut tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
     ) -> Value {
@@ -1253,6 +1544,159 @@ mod tests {
             .iter()
             .any(|event| event.starts_with("DeliveryCommitted")));
         assert!(saw_tool);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compact_action_uses_native_method_and_run_lifecycle() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let connector = CodexConnector::with_client(rpc, "codex/test");
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            let resume = next_request(&mut lines).await;
+            assert_eq!(resume["method"], "thread/resume");
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"id": resume["id"], "result": {"thread": {"id": "thread-compact"}}})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let compact = next_request(&mut lines).await;
+            assert_eq!(compact["method"], "thread/compact/start");
+            assert_eq!(compact["params"], json!({"threadId": "thread-compact"}));
+            server_write
+                .write_all(format!("{}\n", json!({"id": compact["id"], "result": {}})).as_bytes())
+                .await
+                .unwrap();
+            for notification in [
+                json!({"method": "item/started", "params": {"threadId": "thread-compact", "turnId": "turn-compact", "item": {"type": "contextCompaction", "id": "compact-1"}}}),
+                json!({"method": "item/completed", "params": {"threadId": "thread-compact", "turnId": "turn-compact", "item": {"type": "contextCompaction", "id": "compact-1"}}}),
+                json!({"method": "turn/completed", "params": {"threadId": "thread-compact", "turn": {"id": "turn-compact", "status": "completed", "items": []}}}),
+            ] {
+                server_write
+                    .write_all(format!("{notification}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let mut stream = connector
+            .start(action_start_request(
+                "thread-compact",
+                "run-compact",
+                SESSION_COMPACT_ACTION,
+                Value::Null,
+            ))
+            .await
+            .unwrap()
+            .stream;
+        let mut delivered = None;
+        while let Some(item) = timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+        {
+            if let AgentProviderStreamItem::Event(event) = item.unwrap() {
+                if let AgentEvent::DeliveryCommitted { delivery } = event.payload {
+                    delivered = Some(delivery);
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            delivered.unwrap().final_response,
+            Content::text("Session context compacted.")
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn review_action_maps_typed_target_to_native_review() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let connector = CodexConnector::with_client(rpc, "codex/test");
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            let resume = next_request(&mut lines).await;
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"id": resume["id"], "result": {"thread": {"id": "thread-review"}}})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let review = next_request(&mut lines).await;
+            assert_eq!(review["method"], "review/start");
+            assert_eq!(
+                review["params"],
+                json!({
+                    "threadId": "thread-review",
+                    "target": {"type": "baseBranch", "branch": "main"},
+                    "delivery": "inline"
+                })
+            );
+            server_write
+                .write_all(format!("{}\n", json!({"id": review["id"], "result": {"turn": {"id": "turn-review", "status": "inProgress", "items": []}, "reviewThreadId": "thread-review"}})).as_bytes())
+                .await
+                .unwrap();
+            for notification in [
+                json!({"method": "item/agentMessage/delta", "params": {"threadId": "thread-review", "turnId": "turn-review", "itemId": "review-message", "delta": "No findings."}}),
+                json!({"method": "turn/completed", "params": {"threadId": "thread-review", "turn": {"id": "turn-review", "status": "completed", "items": []}}}),
+            ] {
+                server_write
+                    .write_all(format!("{notification}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let mut stream = connector
+            .start(action_start_request(
+                "thread-review",
+                "run-review",
+                SESSION_REVIEW_ACTION,
+                json!({"target": "base_branch", "branch": "main"}),
+            ))
+            .await
+            .unwrap()
+            .stream;
+        let mut delivered = None;
+        while let Some(item) = timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+        {
+            if let AgentProviderStreamItem::Event(event) = item.unwrap() {
+                if let AgentEvent::DeliveryCommitted { delivery } = event.payload {
+                    delivered = Some(delivery);
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            delivered.unwrap().final_response,
+            Content::text("No findings.")
+        );
         server.await.unwrap();
     }
 

@@ -5,8 +5,8 @@ use std::sync::Arc;
 use anyhow::{bail, Context};
 use clap::{Args, Subcommand};
 use orchestral_core::agent_connector::{
-    AgentConnectorId, AgentSessionActionId, AgentSessionListQuery, CreateAgentSessionRequest,
-    InvokeAgentSessionActionRequest,
+    AgentConnectorId, AgentSessionActionId, AgentSessionActionStatus, AgentSessionListQuery,
+    CreateAgentSessionRequest, InvokeAgentSessionActionRequest,
 };
 use orchestral_core::agent_protocol::wire::{
     AgentCommand, AgentCommandEnvelope, AgentSessionId, CommandId, Content, RunId,
@@ -146,6 +146,9 @@ struct ActionArgs {
     /// JSON object matching the action's declared input schema.
     #[arg(long, default_value = "null")]
     arguments: String,
+    /// Stable Run identity for idempotent Run actions.
+    #[arg(long)]
+    run_id: Option<String>,
     #[arg(long)]
     json: bool,
 }
@@ -355,12 +358,16 @@ impl SessionsCommand {
                             session_id: AgentSessionId::new(args.session_id),
                             action_id: AgentSessionActionId::new(args.action_id),
                             arguments,
+                            run_id: args.run_id.map(RunId::new),
                         },
                     )
                     .await?;
                 if args.json {
                     write_json(output, &outcome)
                 } else {
+                    if let AgentSessionActionStatus::Running { run_id } = &outcome.status {
+                        writeln!(output, "Run: {run_id}")?;
+                    }
                     if let Some(session) = outcome.session {
                         writeln!(output, "Session: {}", session.session_id)?;
                     }
@@ -513,9 +520,9 @@ mod tests {
     };
     use orchestral_core::agent_connector::{
         AgentConnector, AgentConnectorDescriptor, AgentConnectorError, AgentConnectorHealth,
-        AgentSessionActionDescriptor, AgentSessionActionOutcome, AgentSessionCapabilities,
-        AgentSessionDetail, AgentSessionPage, AgentSessionState, AgentSessionSummary,
-        SESSION_RENAME_ACTION,
+        AgentSessionActionDescriptor, AgentSessionActionExecution, AgentSessionActionOutcome,
+        AgentSessionActionStatus, AgentSessionCapabilities, AgentSessionDetail, AgentSessionPage,
+        AgentSessionState, AgentSessionSummary, SESSION_RENAME_ACTION, SESSION_REVIEW_ACTION,
     };
     use orchestral_core::agent_protocol::wire::ProviderBindingRef;
 
@@ -535,12 +542,22 @@ mod tests {
                     create: true,
                     ..AgentSessionCapabilities::discoverable()
                 },
-                actions: vec![AgentSessionActionDescriptor {
-                    action_id: AgentSessionActionId::new(SESSION_RENAME_ACTION),
-                    title: "Rename".to_owned(),
-                    description: "Rename session".to_owned(),
-                    input_schema: Some(json!({"type": "object"})),
-                }],
+                actions: vec![
+                    AgentSessionActionDescriptor {
+                        action_id: AgentSessionActionId::new(SESSION_RENAME_ACTION),
+                        title: "Rename".to_owned(),
+                        description: "Rename session".to_owned(),
+                        input_schema: Some(json!({"type": "object"})),
+                        execution: AgentSessionActionExecution::Immediate,
+                    },
+                    AgentSessionActionDescriptor {
+                        action_id: AgentSessionActionId::new(SESSION_REVIEW_ACTION),
+                        title: "Review".to_owned(),
+                        description: "Review changes".to_owned(),
+                        input_schema: Some(json!({"type": "object"})),
+                        execution: AgentSessionActionExecution::Run,
+                    },
+                ],
             }
         }
 
@@ -581,6 +598,7 @@ mod tests {
             request: InvokeAgentSessionActionRequest,
         ) -> Result<AgentSessionActionOutcome, AgentConnectorError> {
             Ok(AgentSessionActionOutcome {
+                status: AgentSessionActionStatus::Completed,
                 session: Some(summary(request.session_id.as_str())),
                 content: vec![Content::text(request.action_id.as_str())],
                 details: Value::Null,
@@ -672,6 +690,24 @@ mod tests {
                 action_id: SESSION_RENAME_ACTION.to_owned(),
                 connector: ConnectorArgs { connector: None },
                 arguments: r#"{"name":"renamed"}"#.to_owned(),
+                run_id: None,
+                json: true,
+            }),
+        }
+        .run_with_directory(directory.clone(), None, &mut output)
+        .await
+        .unwrap();
+        let action: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(action["content"][0]["body"]["value"], SESSION_RENAME_ACTION);
+
+        output.clear();
+        SessionsCommand {
+            command: SessionsSubcommand::Action(ActionArgs {
+                session_id: "fixture-session".to_owned(),
+                action_id: SESSION_REVIEW_ACTION.to_owned(),
+                connector: ConnectorArgs { connector: None },
+                arguments: r#"{"target":"uncommitted_changes"}"#.to_owned(),
+                run_id: Some("cli-review-run".to_owned()),
                 json: true,
             }),
         }
@@ -679,6 +715,7 @@ mod tests {
         .await
         .unwrap();
         let action: Value = serde_json::from_slice(&output).unwrap();
-        assert_eq!(action["content"][0]["body"]["value"], SESSION_RENAME_ACTION);
+        assert_eq!(action["status"]["state"], "running");
+        assert_eq!(action["status"]["run_id"], "cli-review-run");
     }
 }

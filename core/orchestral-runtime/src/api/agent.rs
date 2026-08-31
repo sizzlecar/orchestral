@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use orchestral_core::agent_connector::AgentSessionActionInvocation;
 use orchestral_core::agent_protocol::spi::AgentRunCatalogEntry;
 use orchestral_core::agent_protocol::wire::{
     AgentCommandEnvelope, AgentJournalRecord, AgentRunView, AgentSessionId, CommandAck, Content,
@@ -84,6 +85,19 @@ impl AgentApi {
             }
             None => client.start_text(input).await,
         }
+    }
+
+    pub async fn start_session_action(
+        &self,
+        session_id: &AgentSessionId,
+        run_id: RunId,
+        title: impl Into<String>,
+        action: AgentSessionActionInvocation,
+    ) -> Result<AgentRunHandle, AgentSdkError> {
+        self.session(session_id)
+            .await?
+            .start_session_action_with_run_id(run_id, title, action)
+            .await
     }
 
     pub async fn inspect(&self, run_id: &RunId) -> Result<AgentRunView, AgentSdkError> {

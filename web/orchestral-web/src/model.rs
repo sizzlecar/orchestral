@@ -68,6 +68,16 @@ pub struct AgentSessionActionView {
     pub description: String,
     #[serde(default)]
     pub input_schema: Option<Value>,
+    #[serde(default)]
+    pub execution: AgentSessionActionExecutionView,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSessionActionExecutionView {
+    #[default]
+    Immediate,
+    Run,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -116,12 +126,20 @@ impl AgentSessionSummary {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentSessionActionOutcome {
+    pub status: AgentSessionActionStatusView,
     #[serde(default)]
     pub session: Option<AgentSessionSummary>,
     #[serde(default)]
     pub content: Vec<Value>,
     #[serde(default)]
     pub details: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum AgentSessionActionStatusView {
+    Completed,
+    Running { run_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -184,6 +202,7 @@ mod tests {
                 "action_id": "session.rename",
                 "title": "Rename",
                 "description": "Rename this session",
+                "execution": "run",
                 "input_schema": {
                     "type": "object",
                     "required": ["name"],
@@ -196,8 +215,29 @@ mod tests {
         assert!(connector.capabilities.create);
         assert_eq!(connector.actions[0].action_id, "session.rename");
         assert_eq!(
+            connector.actions[0].execution,
+            AgentSessionActionExecutionView::Run
+        );
+        assert_eq!(
             connector.actions[0].input_schema.as_ref().unwrap()["required"][0],
             "name"
+        );
+    }
+
+    #[test]
+    fn running_action_outcome_preserves_run_identity() {
+        let outcome: AgentSessionActionOutcome = serde_json::from_value(serde_json::json!({
+            "status": {"state": "running", "run_id": "review-run-1"},
+            "session": null,
+            "content": [],
+            "details": null
+        }))
+        .unwrap();
+        assert_eq!(
+            outcome.status,
+            AgentSessionActionStatusView::Running {
+                run_id: "review-run-1".to_owned()
+            }
         );
     }
 }

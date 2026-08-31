@@ -7,12 +7,13 @@ use orchestral_agent_protocol_testkit::{
 };
 use orchestral_core::agent_connector::{
     AgentConnector, AgentConnectorDescriptor, AgentConnectorError, AgentConnectorHealth,
-    AgentConnectorId, AgentSessionActionDescriptor, AgentSessionActionId,
-    AgentSessionActionOutcome, AgentSessionActivity, AgentSessionActivityId,
-    AgentSessionActivityKind, AgentSessionActivityStatus, AgentSessionCapabilities,
-    AgentSessionDetail, AgentSessionListQuery, AgentSessionPage, AgentSessionState,
-    AgentSessionSummary, AgentSessionTurn, AgentSessionTurnId, AgentSessionTurnStatus,
-    CreateAgentSessionRequest, InvokeAgentSessionActionRequest, SESSION_COMPACT_ACTION,
+    AgentConnectorId, AgentSessionActionDescriptor, AgentSessionActionExecution,
+    AgentSessionActionId, AgentSessionActionOutcome, AgentSessionActionStatus,
+    AgentSessionActivity, AgentSessionActivityId, AgentSessionActivityKind,
+    AgentSessionActivityStatus, AgentSessionCapabilities, AgentSessionDetail,
+    AgentSessionListQuery, AgentSessionPage, AgentSessionState, AgentSessionSummary,
+    AgentSessionTurn, AgentSessionTurnId, AgentSessionTurnStatus, CreateAgentSessionRequest,
+    InvokeAgentSessionActionRequest, SESSION_COMPACT_ACTION, SESSION_REVIEW_ACTION,
 };
 use orchestral_core::agent_protocol::reference::AgentRunStatus;
 use orchestral_core::agent_protocol::wire::{AgentSessionId, Content, ProviderBindingRef, RunId};
@@ -46,12 +47,22 @@ impl FixtureConnector {
                 agent_family: "coding-agent".to_owned(),
                 display_name: "Fixture Agent".to_owned(),
                 capabilities: AgentSessionCapabilities::discoverable(),
-                actions: vec![AgentSessionActionDescriptor {
-                    action_id: AgentSessionActionId::new(SESSION_COMPACT_ACTION),
-                    title: "Compact".to_owned(),
-                    description: "Compact context".to_owned(),
-                    input_schema: None,
-                }],
+                actions: vec![
+                    AgentSessionActionDescriptor {
+                        action_id: AgentSessionActionId::new(SESSION_COMPACT_ACTION),
+                        title: "Compact".to_owned(),
+                        description: "Compact context".to_owned(),
+                        input_schema: None,
+                        execution: AgentSessionActionExecution::Immediate,
+                    },
+                    AgentSessionActionDescriptor {
+                        action_id: AgentSessionActionId::new(SESSION_REVIEW_ACTION),
+                        title: "Review".to_owned(),
+                        description: "Review changes".to_owned(),
+                        input_schema: Some(serde_json::json!({"type": "object"})),
+                        execution: AgentSessionActionExecution::Run,
+                    },
+                ],
             },
             sessions,
         }
@@ -167,7 +178,9 @@ impl AgentConnector for FixtureConnector {
         &self,
         request: InvokeAgentSessionActionRequest,
     ) -> Result<AgentSessionActionOutcome, AgentConnectorError> {
+        assert_ne!(request.action_id.as_str(), SESSION_REVIEW_ACTION);
         Ok(AgentSessionActionOutcome {
+            status: AgentSessionActionStatus::Completed,
             session: None,
             content: vec![Content::text(format!(
                 "invoked {} for {}",
@@ -317,6 +330,7 @@ async fn connector_actions_require_declared_capability() {
                 session_id: AgentSessionId::new("session-000"),
                 action_id: AgentSessionActionId::new(SESSION_COMPACT_ACTION),
                 arguments: serde_json::Value::Null,
+                run_id: None,
             },
         )
         .await
@@ -330,9 +344,56 @@ async fn connector_actions_require_declared_capability() {
                 session_id: AgentSessionId::new("session-000"),
                 action_id: AgentSessionActionId::new("session.unknown"),
                 arguments: serde_json::Value::Null,
+                run_id: None,
             },
         )
         .await
         .expect_err("undeclared action must fail");
     assert!(error.to_string().contains("does not declare action"));
+}
+
+#[tokio::test]
+async fn run_session_action_uses_agent_protocol_lifecycle() {
+    let directory = AgentDirectory::new();
+    directory
+        .register(
+            Arc::new(FixtureConnector::new(
+                "fixture/default",
+                "fixture/provider",
+                1,
+            )),
+            fixture_provider(),
+        )
+        .await
+        .expect("connector registers");
+
+    let outcome = directory
+        .invoke_action(
+            &AgentConnectorId::new("fixture/default"),
+            InvokeAgentSessionActionRequest {
+                session_id: AgentSessionId::new("session-000"),
+                action_id: AgentSessionActionId::new(SESSION_REVIEW_ACTION),
+                arguments: serde_json::json!({"target": "uncommitted_changes"}),
+                run_id: Some(RunId::new("review-run-1")),
+            },
+        )
+        .await
+        .expect("Run action starts");
+    assert_eq!(
+        outcome.status,
+        AgentSessionActionStatus::Running {
+            run_id: RunId::new("review-run-1")
+        }
+    );
+
+    let api = directory
+        .agent_api(&AgentConnectorId::new("fixture/default"))
+        .await
+        .unwrap();
+    assert!(api.has_run(&RunId::new("review-run-1")).await.unwrap());
+    let input = api
+        .initial_input(&RunId::new("review-run-1"))
+        .await
+        .unwrap();
+    assert_eq!(input, vec![Content::text("Review")]);
 }

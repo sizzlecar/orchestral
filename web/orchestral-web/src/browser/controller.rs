@@ -5,7 +5,7 @@ use wasm_bindgen::{closure::Closure, JsValue};
 
 use crate::browser::api::{ApiClient, ApiCredential, ApiError};
 use crate::browser::{platform, storage};
-use crate::model::{AgentConnectorView, SessionView, StreamEvent};
+use crate::model::{AgentConnectorView, AgentSessionActionStatusView, SessionView, StreamEvent};
 use crate::state::{
     is_terminal, AppState, AuthStatus, ConnectorsState, LoadStatus, Notice, SessionsState,
 };
@@ -483,6 +483,7 @@ impl AppController {
         session_id: String,
         action_id: String,
         arguments: Value,
+        run_action: bool,
     ) {
         if !platform::is_online() {
             self.notice("离线时无法执行会话操作", "warning");
@@ -491,10 +492,28 @@ impl AppController {
         let Some(token) = self.token.read().clone() else {
             return;
         };
+        let run_id = if run_action {
+            match platform::new_uuid() {
+                Ok(run_id) => Some(run_id),
+                Err(error) => {
+                    self.notice(&error.message, "error");
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         self.set_busy(true);
         let result = self
             .api
-            .invoke_agent_session_action(&token, &connector_id, &session_id, &action_id, arguments)
+            .invoke_agent_session_action(
+                &token,
+                &connector_id,
+                &session_id,
+                &action_id,
+                arguments,
+                run_id.as_deref(),
+            )
             .await;
         self.set_busy(false);
         match result {
@@ -505,7 +524,53 @@ impl AppController {
                     self.upsert_session(session.clone(), true);
                     self.load_session(session.key()).await;
                 }
-                self.notice("会话操作已完成", "success");
+                match outcome.status {
+                    AgentSessionActionStatusView::Completed => {
+                        self.notice("会话操作已完成", "success");
+                    }
+                    AgentSessionActionStatusView::Running { run_id } => {
+                        let session = self
+                            .state
+                            .read()
+                            .sessions
+                            .items
+                            .iter()
+                            .find(|session| {
+                                session.id == session_id
+                                    && session.connector_id.as_deref()
+                                        == Some(connector_id.as_str())
+                            })
+                            .cloned();
+                        if let Some(mut session) = session {
+                            if !session.run_ids.contains(&run_id) {
+                                session.run_ids.push(run_id.clone());
+                            }
+                            session.updated_at_unix_ms = platform::now() as i64;
+                            self.upsert_session(session, true);
+                        }
+                        {
+                            let mut state = self.state.write();
+                            let run = state.ensure_run_source(
+                                &run_id,
+                                Some(session_id.clone()),
+                                Some(connector_id.clone()),
+                            );
+                            run.status = "accepted".to_owned();
+                            run.started_at = Some(platform::now());
+                        }
+                        self.refresh_run(&run_id).await;
+                        if self
+                            .state
+                            .read()
+                            .runs
+                            .get(&run_id)
+                            .is_some_and(|run| !is_terminal(&run.status))
+                        {
+                            self.start_stream(run_id);
+                        }
+                        self.notice("会话操作已启动", "success");
+                    }
+                }
             }
             Err(error) => self.handle_api_error(error).await,
         }

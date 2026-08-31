@@ -329,6 +329,8 @@ struct InvokeExternalAgentSessionActionRequest {
     action_id: String,
     #[serde(default)]
     arguments: serde_json::Value,
+    #[serde(default)]
+    run_id: Option<String>,
 }
 
 async fn invoke_agent_session_action(
@@ -344,6 +346,7 @@ async fn invoke_agent_session_action(
                     session_id: AgentSessionId::new(request.session_id),
                     action_id: AgentSessionActionId::new(request.action_id),
                     arguments: request.arguments,
+                    run_id: request.run_id.map(RunId::new),
                 },
             )
             .await?,
@@ -1128,9 +1131,10 @@ mod tests {
     };
     use orchestral_core::agent_connector::{
         AgentConnector, AgentConnectorDescriptor, AgentConnectorError, AgentConnectorHealth,
-        AgentSessionActionDescriptor, AgentSessionActionOutcome, AgentSessionCapabilities,
-        AgentSessionState, AgentSessionSummary, CreateAgentSessionRequest,
-        InvokeAgentSessionActionRequest, SESSION_FORK_ACTION, SESSION_RENAME_ACTION,
+        AgentSessionActionDescriptor, AgentSessionActionExecution, AgentSessionActionOutcome,
+        AgentSessionActionStatus, AgentSessionCapabilities, AgentSessionState, AgentSessionSummary,
+        CreateAgentSessionRequest, InvokeAgentSessionActionRequest, SESSION_FORK_ACTION,
+        SESSION_RENAME_ACTION, SESSION_REVIEW_ACTION,
     };
     use orchestral_core::agent_protocol::{
         spi::{AgentProvider, AgentRecovery, AgentRecoveryRequest, AgentStart, AgentStartError},
@@ -1238,12 +1242,21 @@ mod tests {
                         title: "Fork".to_owned(),
                         description: "Fork a fixture session".to_owned(),
                         input_schema: None,
+                        execution: AgentSessionActionExecution::Immediate,
                     },
                     AgentSessionActionDescriptor {
                         action_id: AgentSessionActionId::new(SESSION_RENAME_ACTION),
                         title: "Rename".to_owned(),
                         description: "Rename a fixture session".to_owned(),
                         input_schema: Some(serde_json::json!({"type": "object"})),
+                        execution: AgentSessionActionExecution::Immediate,
+                    },
+                    AgentSessionActionDescriptor {
+                        action_id: AgentSessionActionId::new(SESSION_REVIEW_ACTION),
+                        title: "Review".to_owned(),
+                        description: "Review fixture changes".to_owned(),
+                        input_schema: Some(serde_json::json!({"type": "object"})),
+                        execution: AgentSessionActionExecution::Run,
                     },
                 ],
             }
@@ -1301,6 +1314,7 @@ mod tests {
             let mut summary = Self::summary();
             summary.title = Some("Renamed over HTTP".to_owned());
             Ok(AgentSessionActionOutcome {
+                status: AgentSessionActionStatus::Completed,
                 session: Some(summary),
                 content: Vec::new(),
                 details: serde_json::Value::Null,
@@ -1697,6 +1711,28 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let renamed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(renamed["session"]["title"], "Renamed over HTTP");
+
+        let response = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/agent-session/actions",
+                &token,
+                serde_json::json!({
+                    "connector_id": "fixture/local",
+                    "session_id": "fixture-session",
+                    "action_id": "session.review",
+                    "arguments": {"target": "uncommitted_changes"},
+                    "run_id": "fixture-review-run"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let review: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(review["status"]["state"], "running");
+        assert_eq!(review["status"]["run_id"], "fixture-review-run");
 
         let response = app
             .clone()

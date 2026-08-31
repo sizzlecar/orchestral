@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use orchestral_core::agent_connector::{
     AgentConnector, AgentConnectorDescriptor, AgentConnectorError, AgentConnectorHealth,
-    AgentConnectorId, AgentSessionActionOutcome, AgentSessionDetail, AgentSessionListQuery,
+    AgentConnectorId, AgentSessionActionExecution, AgentSessionActionInvocation,
+    AgentSessionActionOutcome, AgentSessionActionStatus, AgentSessionDetail, AgentSessionListQuery,
     AgentSessionPage, AgentSessionSummary, CreateAgentSessionRequest,
     InvokeAgentSessionActionRequest,
 };
@@ -185,7 +186,49 @@ impl AgentDirectory {
             ))
             .into());
         }
+        if action.execution == AgentSessionActionExecution::Run {
+            // Resolve the session before starting so a forged connector/session
+            // pair cannot allocate a Host-only Run.
+            self.read_session(connector_id, &request.session_id).await?;
+            entry
+                .api
+                .create_session(Some(request.session_id.clone()))
+                .await?;
+            let run_id = request
+                .run_id
+                .unwrap_or_else(|| RunId::new(format!("session-action-{}", uuid::Uuid::new_v4())));
+            entry
+                .api
+                .start_session_action(
+                    &request.session_id,
+                    run_id.clone(),
+                    action.title.clone(),
+                    AgentSessionActionInvocation {
+                        action_id: request.action_id,
+                        arguments: request.arguments,
+                    },
+                )
+                .await?;
+            return Ok(AgentSessionActionOutcome {
+                status: AgentSessionActionStatus::Running { run_id },
+                session: None,
+                content: Vec::new(),
+                details: serde_json::Value::Null,
+            });
+        }
+        if request.run_id.is_some() {
+            return Err(AgentConnectorError::invalid(
+                "run_id is only valid for Run session actions",
+            )
+            .into());
+        }
         let outcome = entry.connector.invoke_action(request).await?;
+        if !matches!(outcome.status, AgentSessionActionStatus::Completed) {
+            return Err(AgentConnectorError::protocol(
+                "an immediate session action returned a running outcome",
+            )
+            .into());
+        }
         if let Some(summary) = &outcome.session {
             summary.validate_for(connector_id)?;
         }

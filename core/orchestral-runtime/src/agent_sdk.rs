@@ -7,6 +7,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use orchestral_core::agent_connector::AgentSessionActionInvocation;
 use orchestral_core::agent_protocol::{
     reference::AgentRunStatus,
     wire::{
@@ -85,6 +86,37 @@ impl AgentClient {
             input,
         )?;
         run.spec.resources = self.resources.as_ref().clone();
+        let run = AgentRunEnvelope::seal(run.spec)?;
+        let execution = self.controller.start(run).await?;
+        Ok(AgentRunHandle {
+            controller: self.controller.clone(),
+            run_id,
+            execution,
+        })
+    }
+
+    pub async fn start_session_action_with_run_id(
+        &self,
+        run_id: RunId,
+        title: impl Into<String>,
+        action: AgentSessionActionInvocation,
+    ) -> Result<AgentRunHandle, AgentSdkError> {
+        let title = title.into();
+        if title.trim().is_empty() {
+            return Err(AgentSdkError::InvalidInput(
+                "Agent session action title must not be empty".to_owned(),
+            ));
+        }
+        let mut run = AgentRunEnvelope::new(
+            AGENT_PROTOCOL_V1,
+            self.session_id.clone(),
+            run_id.clone(),
+            vec![Content::text(title)],
+        )?;
+        run.spec.resources = self.resources.as_ref().clone();
+        action
+            .insert_into(&mut run.spec)
+            .map_err(|error| AgentSdkError::InvalidInput(error.to_string()))?;
         let run = AgentRunEnvelope::seal(run.spec)?;
         let execution = self.controller.start(run).await?;
         Ok(AgentRunHandle {
