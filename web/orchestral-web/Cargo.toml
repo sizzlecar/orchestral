@@ -1,0 +1,87 @@
+[package]
+name = "orchestral-web"
+description = "Dioxus Web client for the Orchestral remote Agent API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[features]
+default = []
+web = [
+    "dioxus/web",
+    "dep:gloo-timers",
+    "dep:gloo-net",
+    "dep:js-sys",
+    "dep:rexie",
+    "dep:serde-wasm-bindgen",
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+    "dep:wasm-streams",
+    "dep:web-sys",
+]
+
+[dependencies]
+dioxus = { version = "=0.7.9", default-features = false, features = ["lib", "launch"] }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+gloo-timers = { version = "0.3", features = ["futures"], optional = true }
+gloo-net = { version = "0.7", default-features = false, features = ["http", "json"], optional = true }
+js-sys = { version = "0.3", optional = true }
+rexie = { version = "0.6", optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+wasm-streams = { version = "0.6", optional = true }
+
+[dependencies.web-sys]
+version = "0.3"
+optional = true
+features = [
+    "AbortController",
+    "AbortSignal",
+    "Clipboard",
+    "Crypto",
+    "Document",
+    "DomException",
+    "Event",
+    "EventTarget",
+    "HtmlElement",
+    "HtmlTextAreaElement",
+    "KeyboardEvent",
+    "Headers",
+    "History",
+    "IdbDatabase",
+    "IdbFactory",
+    "IdbObjectStore",
+    "IdbObjectStoreParameters",
+    "IdbOpenDbRequest",
+    "IdbRequest",
+    "IdbTransaction",
+    "IdbTransactionMode",
+    "Location",
+    "Navigator",
+    "Notification",
+    "NotificationOptions",
+    "ReadableStream",
+    "Request",
+    "RequestCache",
+    "RequestCredentials",
+    "RequestInit",
+    "RequestMode",
+    "Response",
+    "ServiceWorkerContainer",
+    "ServiceWorkerRegistration",
+    "Storage",
+    "VisibilityState",
+    "UrlSearchParams",
+    "Window",
+]
+
+[dev-dependencies]
+pretty_assertions = "1"

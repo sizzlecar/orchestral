@@ -15,6 +15,7 @@ members = [
 
     # Apps
     "apps/orchestral-cli",
+    "web/orchestral-web",
     # Examples
     "examples",
 

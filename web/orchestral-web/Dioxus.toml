@@ -1,0 +1,11 @@
+[application]
+name = "orchestral-web"
+default_platform = "web"
+asset_dir = "public"
+out_dir = "dist"
+
+[web.app]
+title = "Orchestral"
+
+[web.watcher]
+watch_path = ["src", "assets", "public"]

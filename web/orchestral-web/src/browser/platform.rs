@@ -1,0 +1,142 @@
+use js_sys::{Array, Function, Reflect, Uint8Array};
+use wasm_bindgen::{closure::Closure, JsCast, JsValue};
+use wasm_bindgen_futures::JsFuture;
+
+pub fn window() -> Result<web_sys::Window, String> {
+    web_sys::window().ok_or_else(|| "Browser window is unavailable".to_owned())
+}
+
+pub fn now() -> f64 {
+    js_sys::Date::now()
+}
+
+pub fn is_online() -> bool {
+    web_sys::window()
+        .map(|window| window.navigator().on_line())
+        .unwrap_or(false)
+}
+
+pub fn new_uuid() -> Result<String, crate::browser::api::ApiError> {
+    let error = |message: &str| crate::browser::api::ApiError {
+        message: message.to_owned(),
+        status: 0,
+        code: "web_crypto_unavailable".to_owned(),
+        details: None,
+    };
+    let crypto = window()
+        .map_err(|_| error("Web Crypto is required for stable command identity"))?
+        .crypto()
+        .map_err(|_| error("Web Crypto is required for stable command identity"))?;
+    let mut bytes = [0_u8; 16];
+    crypto
+        .get_random_values_with_u8_array(&mut bytes)
+        .map_err(|_| error("Web Crypto could not create a command identity"))?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+    ))
+}
+
+pub fn take_pairing_secret() -> Option<String> {
+    let window = web_sys::window()?;
+    let location = window.location();
+    let hash = location.hash().ok()?;
+    let values = web_sys::UrlSearchParams::new_with_str(hash.strip_prefix('#')?).ok()?;
+    let secret = values.get("pair")?;
+    values.delete("pair");
+    let remainder = values.to_string().as_string().unwrap_or_default();
+    let pathname = location.pathname().unwrap_or_else(|_| "/".to_owned());
+    let search = location.search().unwrap_or_default();
+    let clean = if remainder.is_empty() {
+        format!("{pathname}{search}")
+    } else {
+        format!("{pathname}{search}#{remainder}")
+    };
+    let _ = window
+        .history()
+        .and_then(|history| history.replace_state_with_url(&JsValue::NULL, "", Some(&clean)));
+    Some(secret)
+}
+
+pub fn default_device_name(saved: &str) -> String {
+    if !saved.is_empty() {
+        return saved.to_owned();
+    }
+    let navigator = web_sys::window().map(|window| window.navigator());
+    let user_agent = navigator
+        .as_ref()
+        .and_then(|navigator| navigator.user_agent().ok())
+        .unwrap_or_default();
+    let family = if user_agent.contains("iPad") {
+        "iPad"
+    } else if user_agent.contains("iPhone") {
+        "iPhone"
+    } else if user_agent.contains("Android") {
+        "Android device"
+    } else {
+        "Browser"
+    };
+    format!("{family} · Orchestral")
+}
+
+pub fn apply_theme(theme: &str) {
+    if let Some(root) = web_sys::window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.document_element())
+    {
+        let _ = root.set_attribute("data-theme", theme);
+    }
+}
+
+pub async fn copy_text(text: &str) -> Result<(), String> {
+    let clipboard = window()?.navigator().clipboard();
+    JsFuture::from(clipboard.write_text(text))
+        .await
+        .map(|_| ())
+        .map_err(js_error)
+}
+
+pub async fn register_service_worker() -> Result<(), String> {
+    let navigator = window()?.navigator();
+    let service_workers = navigator.service_worker();
+    JsFuture::from(service_workers.register("./sw.js"))
+        .await
+        .map(|_| ())
+        .map_err(js_error)
+}
+
+pub fn install_event_prompt(event: &JsValue) {
+    if let Ok(prompt) = Reflect::get(event, &JsValue::from_str("prompt"))
+        .and_then(|value| value.dyn_into::<Function>())
+    {
+        let _ = prompt.call0(event);
+    }
+}
+
+pub fn add_window_listener(
+    name: &str,
+    callback: impl FnMut(web_sys::Event) + 'static,
+) -> Result<Closure<dyn FnMut(web_sys::Event)>, String> {
+    let closure = Closure::wrap(Box::new(callback) as Box<dyn FnMut(web_sys::Event)>);
+    window()?
+        .add_event_listener_with_callback(name, closure.as_ref().unchecked_ref())
+        .map_err(js_error)?;
+    Ok(closure)
+}
+
+pub fn js_error(value: JsValue) -> String {
+    value
+        .as_string()
+        .or_else(|| {
+            Reflect::get(&value, &JsValue::from_str("message"))
+                .ok()
+                .and_then(|message| message.as_string())
+        })
+        .unwrap_or_else(|| "Browser operation failed".to_owned())
+}
+
+#[allow(dead_code)]
+fn _keep_imports_typed(_: (Array, Uint8Array)) {}
