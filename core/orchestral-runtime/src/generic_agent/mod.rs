@@ -27,7 +27,8 @@ use orchestral_core::agent_protocol::{
         PendingRequestPayload, Provenance, ProviderCommandDisposition, ProviderCommandOutcome,
         RequestId, RequestResolution, ResourceBindingMode, ResourceBindingSkip,
         ResourceBindingSkipCode, ResourceCapability, ResourceKind, RunId, RunLimitKind,
-        TelemetryId, ToolActivityEvidence, ToolActivityId, ToolActivityState, UsageReport,
+        TelemetryId, ToolActivityErrorDetail, ToolActivityEvidence, ToolActivityId,
+        ToolActivityState, UsageReport,
     },
     AGENT_PROTOCOL_V1,
 };

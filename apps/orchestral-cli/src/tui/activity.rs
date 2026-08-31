@@ -336,7 +336,7 @@ fn project_evidence(
             depth: 0,
             style: ActivityDetailStyle::Primary,
         }],
-        ToolActivityEvidence::Error { code, message } => vec![ActivityDetail {
+        ToolActivityEvidence::Error { code, message, .. } => vec![ActivityDetail {
             text: format!("Error [{code}] {}", compact_error_message(message)),
             depth: 0,
             style: ActivityDetailStyle::Error,
@@ -575,6 +575,7 @@ mod tests {
                 ToolActivityEvidence::Error {
                     code: "patch_invalid".to_owned(),
                     message: "Add File lines must start with '+'".to_owned(),
+                    details: Vec::new(),
                 },
             ],
         );

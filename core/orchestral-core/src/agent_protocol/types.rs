@@ -2453,6 +2453,28 @@ pub struct ToolDiffLine {
     pub text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "agent-protocol-schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ToolActivityErrorDetail {
+    pub label: String,
+    pub value: String,
+}
+
+impl ToolActivityErrorDetail {
+    fn validate_integrity(&self) -> Result<(), AgentProtocolError> {
+        if !is_safe_tool_activity_text(&self.label, 64, false)
+            || !is_safe_tool_activity_text(&self.value, 512, false)
+        {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidSpec,
+                "Tool error detail must contain bounded presentation-safe text",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl ToolDiffLine {
     fn validate_integrity(&self) -> Result<(), AgentProtocolError> {
         if !is_safe_tool_activity_text(&self.text, 512, true) {
@@ -2492,6 +2514,8 @@ pub enum ToolActivityEvidence {
     Error {
         code: String,
         message: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        details: Vec<ToolActivityErrorDetail>,
     },
     Omitted {
         count: u32,
@@ -2508,9 +2532,17 @@ impl ToolActivityEvidence {
                     && diff.iter().all(|line| line.validate_integrity().is_ok())
             }
             Self::Note { text } => is_safe_tool_activity_text(text, 512, false),
-            Self::Error { code, message } => {
+            Self::Error {
+                code,
+                message,
+                details,
+            } => {
                 is_safe_tool_activity_text(code, 128, false)
                     && is_safe_tool_activity_text(message, 512, false)
+                    && details.len() <= 8
+                    && details
+                        .iter()
+                        .all(|detail| detail.validate_integrity().is_ok())
             }
             Self::Omitted { count } => *count > 0,
         };
@@ -3505,5 +3537,27 @@ mod tests {
         }
         .validate_integrity()
         .is_err());
+    }
+
+    #[test]
+    fn tool_error_evidence_carries_bounded_recovery_details() {
+        let evidence = ToolActivityEvidence::Error {
+            code: "mcp_tool_error".to_owned(),
+            message: "repo must be alphanumeric".to_owned(),
+            details: vec![ToolActivityErrorDetail {
+                label: "how_to_get".to_owned(),
+                value: "Call search_capabilities".to_owned(),
+            }],
+        };
+        evidence
+            .validate_integrity()
+            .expect("structured recovery details are valid");
+        let value = serde_json::to_value(&evidence).expect("Tool error serializes");
+        assert_eq!(value["details"][0]["label"], "how_to_get");
+        assert_eq!(value["details"][0]["value"], "Call search_capabilities");
+        assert!(serde_json::from_value::<ToolActivityEvidence>(value)
+            .expect("Tool error deserializes")
+            .validate_integrity()
+            .is_ok());
     }
 }

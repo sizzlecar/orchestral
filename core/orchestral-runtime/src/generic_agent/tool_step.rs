@@ -591,12 +591,67 @@ fn tool_terminal_activity_evidence(
     let Some(code) = bounded_activity_detail(code) else {
         return base.to_vec();
     };
-    let Some(message) = bounded_activity_detail(message) else {
-        return base.to_vec();
-    };
+    let (message, details) = activity_error_presentation(message);
     let mut evidence = base.iter().take(15).cloned().collect::<Vec<_>>();
-    evidence.push(ToolActivityEvidence::Error { code, message });
+    evidence.push(ToolActivityEvidence::Error {
+        code,
+        message,
+        details,
+    });
     evidence
+}
+
+fn activity_error_presentation(message: &str) -> (String, Vec<ToolActivityErrorDetail>) {
+    let fields = message
+        .split("; ")
+        .filter_map(|segment| {
+            let (label, value) = segment.split_once(": ")?;
+            let label = label.trim();
+            let value = value.trim();
+            if label.is_empty()
+                || value.is_empty()
+                || !label
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+            {
+                return None;
+            }
+            Some((label, value))
+        })
+        .take(8)
+        .collect::<Vec<_>>();
+    let recognized = fields.iter().any(|(label, _)| {
+        matches!(
+            *label,
+            "code" | "message" | "reason" | "how_to_get" | "hint"
+        )
+    });
+    if fields.len() < 2 || !recognized {
+        return (
+            bounded_activity_detail(message).unwrap_or_else(|| "Tool operation failed".to_owned()),
+            Vec::new(),
+        );
+    }
+
+    let primary_index = fields
+        .iter()
+        .position(|(label, _)| *label == "message")
+        .or_else(|| fields.iter().position(|(label, _)| *label == "reason"))
+        .unwrap_or(0);
+    let primary = bounded_activity_detail(fields[primary_index].1)
+        .unwrap_or_else(|| "Tool operation failed".to_owned());
+    let details = fields
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| *index != primary_index)
+        .filter_map(|(_, (label, value))| {
+            Some(ToolActivityErrorDetail {
+                label: bounded_activity_detail(label)?,
+                value: bounded_activity_detail(value)?,
+            })
+        })
+        .collect();
+    (primary, details)
 }
 
 fn bounded_activity_detail(value: &str) -> Option<String> {
@@ -680,8 +735,42 @@ mod activity_detail_tests {
                 ToolActivityEvidence::Error {
                     code: "patch_invalid".to_owned(),
                     message: "Add File lines must start with '+'".to_owned(),
+                    details: Vec::new(),
                 }
             ]
+        );
+    }
+
+    #[test]
+    fn terminal_evidence_separates_actionable_error_details() {
+        let evidence = tool_terminal_activity_evidence(
+            &[],
+            &ToolOutcome::Failed {
+                code: "mcp_tool_error".to_owned(),
+                message: "reason: schema omitted; how_to_get: Call search_capabilities; message: repo must be alphanumeric; how_to_get: Rerun with include_schema=true".to_owned(),
+                retryable: false,
+            },
+        );
+        assert_eq!(
+            evidence,
+            vec![ToolActivityEvidence::Error {
+                code: "mcp_tool_error".to_owned(),
+                message: "repo must be alphanumeric".to_owned(),
+                details: vec![
+                    ToolActivityErrorDetail {
+                        label: "reason".to_owned(),
+                        value: "schema omitted".to_owned(),
+                    },
+                    ToolActivityErrorDetail {
+                        label: "how_to_get".to_owned(),
+                        value: "Call search_capabilities".to_owned(),
+                    },
+                    ToolActivityErrorDetail {
+                        label: "how_to_get".to_owned(),
+                        value: "Rerun with include_schema=true".to_owned(),
+                    },
+                ],
+            }]
         );
     }
 }
