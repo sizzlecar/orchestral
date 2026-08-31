@@ -2202,6 +2202,27 @@ svg {
   }
 }
 
+@media (max-width: 859px) {
+  /* iOS Safari zooms the visual viewport when a focused form control uses a
+     font smaller than 16px. Keep mobile controls at 16px so the composer and
+     pending-request forms remain aligned with the visible viewport. */
+  textarea,
+  input,
+  select {
+    font-size: 16px;
+  }
+
+  .composer-dock,
+  .composer-form {
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .send-button {
+    flex: 0 0 44px;
+  }
+}
+
 @media (min-width: 860px) {
   .app-shell {
     grid-template-rows: minmax(0, 1fr);

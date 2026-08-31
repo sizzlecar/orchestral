@@ -306,7 +306,7 @@ fn Composer() -> Element {
                         }
                     }
                 }
-                div { class: "composer-actions",
+                div { class: "composer-form__actions",
                     if active && !stopping {
                         button {
                             class: "cancel-button",
