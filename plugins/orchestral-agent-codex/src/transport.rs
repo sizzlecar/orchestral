@@ -13,7 +13,10 @@ use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, oneshot, Mutex};
 use tokio::time::timeout;
 
-const DEFAULT_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+// `thread/read(includeTurns=true)` is one JSON-RPC frame and Codex currently
+// offers no turn pagination. Long-lived coding sessions can legitimately
+// exceed 64 MiB before Orchestral applies its bounded normalization.
+const DEFAULT_MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct CodexAppServerConfig {
@@ -44,6 +47,8 @@ pub enum CodexTransportError {
     FrameTooLarge { limit: usize },
     #[error("Codex app-server closed the connection")]
     Closed,
+    #[error("Codex app-server disconnected: {0}")]
+    Disconnected(String),
     #[error("Codex app-server request timed out")]
     Timeout,
     #[error("Codex app-server rejected the request: {0}")]
@@ -287,7 +292,9 @@ async fn read_loop<R>(
         guard.drain().map(|(_, sender)| sender).collect::<Vec<_>>()
     };
     for sender in senders {
-        let _ = sender.send(Err(CodexTransportError::Closed));
+        let _ = sender.send(Err(CodexTransportError::Disconnected(
+            disconnect_reason.clone(),
+        )));
     }
     let _ = notifications.send(CodexTransportEvent::Disconnected {
         reason: disconnect_reason,
@@ -412,7 +419,8 @@ mod tests {
 
         assert!(matches!(
             request.await.unwrap(),
-            Err(CodexTransportError::Closed)
+            Err(CodexTransportError::Disconnected(ref reason))
+                if reason.contains("closed stdout")
         ));
         let event = notifications.recv().await.unwrap();
         assert!(matches!(
@@ -449,7 +457,13 @@ mod tests {
             .unwrap();
         assert!(matches!(
             request.await.unwrap(),
-            Err(CodexTransportError::Rpc(_)) | Err(CodexTransportError::Closed)
+            Err(CodexTransportError::Disconnected(ref reason))
+                if reason.contains("frame exceeded 32 bytes")
         ));
+    }
+
+    #[test]
+    fn default_frame_limit_covers_long_lived_codex_sessions() {
+        assert!(CodexAppServerConfig::default().max_frame_bytes >= 256 * 1024 * 1024);
     }
 }

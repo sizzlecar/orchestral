@@ -376,9 +376,10 @@ fn insert_optional(object: &mut Value, key: &str, value: Option<Value>) {
 fn connector_transport_error(error: CodexTransportError) -> AgentConnectorError {
     let (code, retryable) = match error {
         CodexTransportError::Spawn(_) => (AgentConnectorErrorCode::Unavailable, false),
-        CodexTransportError::Timeout | CodexTransportError::Closed | CodexTransportError::Io(_) => {
-            (AgentConnectorErrorCode::Unavailable, true)
-        }
+        CodexTransportError::Timeout
+        | CodexTransportError::Closed
+        | CodexTransportError::Disconnected(_)
+        | CodexTransportError::Io(_) => (AgentConnectorErrorCode::Unavailable, true),
         CodexTransportError::Rpc(_) => (AgentConnectorErrorCode::Protocol, false),
         CodexTransportError::InvalidJson(_)
         | CodexTransportError::FrameTooLarge { .. }

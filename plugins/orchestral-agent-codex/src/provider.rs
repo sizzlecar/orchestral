@@ -140,7 +140,11 @@ impl CodexConnector {
             .await
         {
             Ok(result) => result,
-            Err(error @ (CodexTransportError::Timeout | CodexTransportError::Closed)) => {
+            Err(
+                error @ (CodexTransportError::Timeout
+                | CodexTransportError::Closed
+                | CodexTransportError::Disconnected(_)),
+            ) => {
                 return Err(start_transport_error(error, true));
             }
             Err(error) => {
@@ -1066,7 +1070,10 @@ fn start_transport_error(error: CodexTransportError, outcome_unknown: bool) -> A
 fn transport_to_protocol(error: CodexTransportError) -> AgentProtocolError {
     let retryable = matches!(
         error,
-        CodexTransportError::Io(_) | CodexTransportError::Closed | CodexTransportError::Timeout
+        CodexTransportError::Io(_)
+            | CodexTransportError::Closed
+            | CodexTransportError::Disconnected(_)
+            | CodexTransportError::Timeout
     );
     protocol_error(error.to_string(), retryable)
 }
