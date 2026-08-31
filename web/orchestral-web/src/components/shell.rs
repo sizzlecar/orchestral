@@ -1,4 +1,5 @@
 use dioxus::prelude::*;
+use gloo_timers::future::TimeoutFuture;
 
 use crate::browser::controller::AppController;
 use crate::components::pending::PendingPanel;
@@ -78,7 +79,6 @@ pub fn Workspace() -> Element {
         .map(|session| session_title(&state, session))
         .unwrap_or_else(|| "新会话".to_owned());
     let run = state.current_run().cloned();
-    let status = run_label(run.as_ref());
     let install_available = state.ui.install_available;
 
     rsx! {
@@ -206,10 +206,7 @@ pub fn Workspace() -> Element {
                             p { class: "eyebrow", "当前会话" }
                             h1 { "{title}" }
                         }
-                        output { class: "run-status", "data-state": status.1,
-                            span { class: "run-status__pulse", aria_hidden: "true" }
-                            span { "{status.0}" }
-                        }
+                        RunStatusBadge { run }
                     }
                     ConversationTimeline {}
                     PendingPanel {}
@@ -222,6 +219,25 @@ pub fn Workspace() -> Element {
             div { class: "toast-region", aria_live: "polite",
                 div { class: "toast toast--{notice.tone}", "{notice.message}" }
             }
+        }
+    }
+}
+
+#[component]
+fn RunStatusBadge(run: Option<RunState>) -> Element {
+    let mut now = use_signal(js_sys::Date::now);
+    use_future(move || async move {
+        loop {
+            TimeoutFuture::new(1_000).await;
+            now.set(js_sys::Date::now());
+        }
+    });
+    let status = run_label(run.as_ref(), now());
+
+    rsx! {
+        output { class: "run-status", "data-state": status.1,
+            span { class: "run-status__pulse", aria_hidden: "true" }
+            span { "{status.0}" }
         }
     }
 }
@@ -366,13 +382,13 @@ fn format_date(milliseconds: i64) -> String {
         .unwrap_or_default()
 }
 
-fn run_label(run: Option<&RunState>) -> (String, &'static str) {
+fn run_label(run: Option<&RunState>, now: f64) -> (String, &'static str) {
     let Some(run) = run else {
         return ("就绪".to_owned(), "idle");
     };
     let elapsed = run
         .started_at
-        .map(|started| ((js_sys::Date::now() - started).max(0.0) / 1_000.0) as u64)
+        .map(|started| ((now - started).max(0.0) / 1_000.0) as u64)
         .map(|seconds| format!(" · {}:{:02}", seconds / 60, seconds % 60))
         .unwrap_or_default();
     match run.status.as_str() {
