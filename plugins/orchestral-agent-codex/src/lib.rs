@@ -10,6 +10,9 @@ mod transport;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
+#[cfg(test)]
+use std::collections::VecDeque;
+
 use async_trait::async_trait;
 use orchestral_core::agent_connector::{
     AgentConnector, AgentConnectorDescriptor, AgentConnectorError, AgentConnectorErrorCode,
@@ -42,6 +45,8 @@ pub struct CodexConnector {
     client: AsyncMutex<Option<Arc<ConnectedClient>>>,
     limits: NormalizationLimits,
     provider_state: StdMutex<provider::ProviderState>,
+    #[cfg(test)]
+    reconnect_clients: StdMutex<VecDeque<Arc<ConnectedClient>>>,
 }
 
 impl CodexConnector {
@@ -51,6 +56,8 @@ impl CodexConnector {
             client: AsyncMutex::new(None),
             limits: NormalizationLimits::default(),
             provider_state: StdMutex::new(provider::ProviderState::default()),
+            #[cfg(test)]
+            reconnect_clients: StdMutex::new(VecDeque::new()),
         }
     }
 
@@ -64,6 +71,16 @@ impl CodexConnector {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .reset_connection_state();
+        #[cfg(test)]
+        if let Some(connected) = self
+            .reconnect_clients
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
+        {
+            *client = Some(Arc::clone(&connected));
+            return Ok(connected);
+        }
         let (rpc, user_agent) = CodexRpcClient::spawn(&self.config)
             .await
             .map_err(connector_transport_error)?;
@@ -101,6 +118,24 @@ impl CodexConnector {
             }))),
             limits: NormalizationLimits::default(),
             provider_state: StdMutex::new(provider::ProviderState::default()),
+            reconnect_clients: StdMutex::new(VecDeque::new()),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_reconnect_client(rpc: Arc<CodexRpcClient>, reconnect_rpc: Arc<CodexRpcClient>) -> Self {
+        Self {
+            config: CodexAppServerConfig::default(),
+            client: AsyncMutex::new(Some(Arc::new(ConnectedClient {
+                rpc,
+                user_agent: "codex/test".to_owned(),
+            }))),
+            limits: NormalizationLimits::default(),
+            provider_state: StdMutex::new(provider::ProviderState::default()),
+            reconnect_clients: StdMutex::new(VecDeque::from([Arc::new(ConnectedClient {
+                rpc: reconnect_rpc,
+                user_agent: "codex/test-reconnected".to_owned(),
+            })])),
         }
     }
 }
