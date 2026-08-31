@@ -91,6 +91,19 @@ pub fn apply_theme(theme: &str) {
     }
 }
 
+pub fn scroll_timeline_to_end() {
+    let Some(document) = web_sys::window().and_then(|window| window.document()) else {
+        return;
+    };
+    let Ok(Some(element)) = document.query_selector(".message-list") else {
+        return;
+    };
+    let Ok(element) = element.dyn_into::<web_sys::HtmlElement>() else {
+        return;
+    };
+    element.set_scroll_top(element.scroll_height());
+}
+
 pub async fn copy_text(text: &str) -> Result<(), String> {
     let navigator = window()?.navigator();
     let Some(clipboard) =

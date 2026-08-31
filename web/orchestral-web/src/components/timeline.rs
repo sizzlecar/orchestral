@@ -2,6 +2,7 @@ use dioxus::prelude::*;
 use serde_json::Value;
 
 use crate::browser::{controller::AppController, platform};
+use crate::markdown;
 use crate::state::{
     timeline_blocks_for_run, CommandActivity, TimelineBlock, TimelineItem, ToolActivity,
 };
@@ -202,10 +203,15 @@ fn MessageView(
         if streaming { " is-streaming" } else { "" }
     );
     let copy = text.clone();
+    let rendered = (role == "assistant").then(|| markdown::render(&text));
     rsx! {
         article { class, "data-message-id": id,
             span { class: "message__role", if role == "user" { "你" } else { "Orchestral" } }
-            div { class: "message__content", "{text}" }
+            if let Some(rendered) = rendered {
+                div { class: "message__content", dangerous_inner_html: rendered }
+            } else {
+                div { class: "message__content", "{text}" }
+            }
             if role == "assistant" && !text.is_empty() {
                 button {
                     class: "message__copy",

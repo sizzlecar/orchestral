@@ -274,9 +274,8 @@ fn Composer() -> Element {
     let mut draft = use_signal(String::new);
     let state = controller.state.read();
     let active = state.active_run().is_some();
-    let disabled = state.ui.composer_busy
-        || !state.connection.online
-        || state.auth.status != AuthStatus::Authenticated;
+    let input_disabled = !state.connection.online || state.auth.status != AuthStatus::Authenticated;
+    let action_disabled = state.ui.composer_busy || input_disabled;
     let stopping = state
         .active_run()
         .is_some_and(|run| run.status == "stopping");
@@ -308,9 +307,12 @@ fn Composer() -> Element {
                     rows: "1",
                     maxlength: "20000",
                     value: draft,
-                    disabled,
+                    disabled: input_disabled,
                     placeholder,
                     autocomplete: "off",
+                    autocapitalize: "sentences",
+                    inputmode: "text",
+                    enterkeyhint: "send",
                     oninput: move |event| draft.set(event.value()),
                     onkeydown: move |event| {
                         if event.key() == Key::Enter && !event.modifiers().shift() {
@@ -327,14 +329,14 @@ fn Composer() -> Element {
                         button {
                             class: "cancel-button",
                             r#type: "button",
-                            disabled,
+                            disabled: action_disabled,
                             onclick: move |_| {
                                 spawn(async move { controller.cancel().await });
                             },
                             "停止"
                         }
                     }
-                    button { class: "send-button", r#type: "submit", disabled,
+                    button { class: "send-button", r#type: "submit", disabled: action_disabled,
                         span { "发送" }
                     }
                 }
@@ -392,6 +394,7 @@ fn run_label(run: Option<&RunState>, now: f64) -> (String, &'static str) {
         .map(|seconds| format!(" · {}:{:02}", seconds / 60, seconds % 60))
         .unwrap_or_default();
     match run.status.as_str() {
+        "submitting" => (format!("发送中{elapsed}"), "working"),
         "accepted" => (format!("Starting{elapsed}"), "working"),
         "running" => (format!("Working{elapsed}"), "working"),
         "waiting" => (format!("Waiting{elapsed}"), "waiting"),

@@ -403,6 +403,22 @@ impl AppController {
                 return;
             }
         };
+        let now = platform::now();
+        let mut pending_session = session.clone();
+        pending_session.updated_at_unix_ms = now as i64;
+        if !pending_session.run_ids.iter().any(|id| id == &run_id) {
+            pending_session.run_ids.push(run_id.clone());
+        }
+        self.upsert_session(pending_session, true);
+        self.state
+            .write()
+            .ensure_run(&run_id, Some(session.id.clone()))
+            .optimistic_start_input(input.clone(), now);
+        spawn(async move {
+            TimeoutFuture::new(0).await;
+            platform::scroll_timeline_to_end();
+        });
+
         match self
             .api
             .start_run(&token, &session.id, &run_id, &input)
@@ -413,6 +429,26 @@ impl AppController {
                     .get("run_id")
                     .and_then(value_as_id)
                     .unwrap_or_else(|| run_id.clone());
+                if actual_run_id != run_id {
+                    let mut state = self.state.write();
+                    if let Some(mut provisional) = state.runs.remove(&run_id) {
+                        provisional.id = actual_run_id.clone();
+                        provisional.session_id = Some(session.id.clone());
+                        if let Some(initial) = provisional
+                            .messages
+                            .iter_mut()
+                            .find(|message| message.role == "user" && !message.steering)
+                        {
+                            initial.id = format!("optimistic-input-{actual_run_id}");
+                        }
+                        state.runs.insert(actual_run_id.clone(), provisional);
+                    }
+                    for item in &mut state.run_order {
+                        if item == &run_id {
+                            *item = actual_run_id.clone();
+                        }
+                    }
+                }
                 let mut updated = session.clone();
                 updated.updated_at_unix_ms = platform::now() as i64;
                 if !updated.run_ids.iter().any(|id| id == &actual_run_id) {
@@ -438,7 +474,12 @@ impl AppController {
                     self.start_stream(actual_run_id);
                 }
             }
-            Err(error) => self.handle_api_error(error).await,
+            Err(error) => {
+                if let Some(run) = self.state.write().runs.get_mut(&run_id) {
+                    run.reject_optimistic_start(error.message.clone(), platform::now());
+                }
+                self.handle_api_error(error).await;
+            }
         }
         self.set_busy(false);
     }

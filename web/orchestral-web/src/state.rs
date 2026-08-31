@@ -219,6 +219,36 @@ impl RunState {
         self.confirm_initial_input(input);
     }
 
+    /// Projects a start request before the network round trip completes.
+    ///
+    /// The browser owns this short-lived state. It keeps the user's submitted
+    /// text visible while the Host accepts the immutable Run specification,
+    /// without pretending that the Run is already steerable or cancellable.
+    pub fn optimistic_start_input(&mut self, input: String, now: f64) {
+        self.status = "submitting".to_owned();
+        self.started_at = Some(now);
+        self.messages
+            .retain(|message| !(message.role == "user" && !message.steering && message.optimistic));
+        self.messages.push(Message {
+            id: format!("optimistic-input-{}", self.id),
+            role: "user".to_owned(),
+            text: input,
+            order: INITIAL_INPUT_ORDER,
+            optimistic: true,
+            partial: false,
+            steering: false,
+        });
+    }
+
+    pub fn reject_optimistic_start(&mut self, message: String, now: f64) {
+        self.status = "failed".to_owned();
+        self.completed_at = Some(now);
+        self.error = Some(message);
+        for item in &mut self.messages {
+            item.optimistic = false;
+        }
+    }
+
     fn confirm_initial_input(&mut self, input: String) {
         if let Some(message) = self
             .messages
@@ -1053,6 +1083,11 @@ mod tests {
     #[test]
     fn accepted_start_input_is_not_left_in_sending_state() {
         let mut run = RunState::new("run-1", None);
+        run.optimistic_start_input("inspect the project".to_owned(), 0.5);
+
+        assert_eq!(run.status, "submitting");
+        assert!(run.messages[0].optimistic);
+
         run.record_started_input("inspect the project".to_owned(), 1.0);
 
         assert_eq!(run.messages.len(), 1);

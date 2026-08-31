@@ -4,6 +4,7 @@
 //! covered by ordinary Rust tests. Browser effects and components are only
 //! compiled for the `web` feature.
 
+pub mod markdown;
 pub mod model;
 pub mod sse;
 pub mod state;

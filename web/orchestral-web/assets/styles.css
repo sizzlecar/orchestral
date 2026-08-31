@@ -946,6 +946,10 @@ svg {
   user-select: text;
 }
 
+.message--assistant .message__content {
+  white-space: normal;
+}
+
 .message--user .message__content {
   justify-self: end;
   max-width: min(92%, 660px);
@@ -1807,6 +1811,7 @@ svg {
   line-height: 1.55;
   -webkit-user-select: text;
   user-select: text;
+  touch-action: manipulation;
 }
 
 .composer-form textarea::placeholder {
