@@ -147,11 +147,35 @@ function createEvidence(item) {
             }
             return element("div", { className: "evidence evidence--file" }, children);
         }
-        case "error":
-            return element("div", { className: "evidence evidence--error" }, [
-                element("strong", { text: item.code || "Error" }),
-                element("p", { text: item.message }),
-            ]);
+        case "error": {
+            const details = Array.isArray(item.details) ? item.details : [];
+            const guidance = details.filter(
+                (detail) => detail.label === "how_to_get" || detail.label === "hint",
+            );
+            const metadata = details.filter(
+                (detail) => detail.label !== "how_to_get" && detail.label !== "hint",
+            );
+            const children = [
+                element("strong", { className: "evidence-error__code", text: item.code || "Error" }),
+                element("p", { className: "evidence-error__message", text: item.message }),
+            ];
+            if (guidance.length) {
+                children.push(element("div", { className: "evidence-error__guidance" }, [
+                    element("span", { className: "evidence-error__label", text: "建议" }),
+                    element("ul", {}, guidance.map((detail) => element("li", { text: detail.value }))),
+                ]));
+            }
+            if (metadata.length) {
+                children.push(element("details", { className: "evidence-error__details" }, [
+                    element("summary", { text: "更多错误信息" }),
+                    element("dl", {}, metadata.flatMap((detail) => [
+                        element("dt", { text: detail.label === "reason" ? "原因" : detail.label }),
+                        element("dd", { text: detail.value }),
+                    ])),
+                ]));
+            }
+            return element("div", { className: "evidence evidence--error" }, children);
+        }
         case "omitted":
             return element("p", { className: "evidence", text: `${item.count} 项活动未显示` });
         case "note":
@@ -252,6 +276,59 @@ function requestPrompt(request) {
     return Array.isArray(prompt) ? prompt.map(contentText).filter(Boolean).join("\n") : "";
 }
 
+export function approvalPresentation(reason) {
+    const summary = String(reason ?? "").trim();
+    const marker = "; Reason: ";
+    const markerIndex = summary.lastIndexOf(marker);
+    if (markerIndex > 0) {
+        const operation = summary.slice(0, markerIndex).trim();
+        const rationale = summary.slice(markerIndex + marker.length).trim();
+        if (operation && rationale) return { headline: rationale, operation };
+    }
+    return {
+        headline: "允许 Orchestral 执行此操作？",
+        operation: summary || "主机请求执行一项受保护的操作",
+    };
+}
+
+export function approvalScopeLabel(scope) {
+    const [effect, ...qualifierParts] = String(scope ?? "").split(":");
+    const qualifier = qualifierParts.join(":");
+    const labels = {
+        process: "运行命令",
+        network: "访问网络",
+        filesystem_read: "读取文件",
+        filesystem_write: "修改文件",
+        environment_read: "读取环境",
+        external_side_effect: "外部影响",
+        host_execution: "主机执行",
+    };
+    const label = labels[effect] ?? effect.replaceAll("_", " ");
+    return qualifier && qualifier !== "unrestricted"
+        ? `${label} · ${qualifier}`
+        : label;
+}
+
+function createApprovalScope(scopes) {
+    const labels = [...new Set((scopes ?? []).map(approvalScopeLabel).filter(Boolean))];
+    const visible = labels.slice(0, 4);
+    const row = element("div", {
+        className: "pending-card__scope-row",
+        attrs: { "aria-label": "请求的权限范围" },
+    });
+    for (const label of visible) {
+        row.append(element("span", { className: "pending-card__scope-chip", text: label }));
+    }
+    if (labels.length > visible.length) {
+        row.append(element("span", {
+            className: "pending-card__scope-chip pending-card__scope-chip--more",
+            text: `+${labels.length - visible.length}`,
+            attrs: { title: labels.slice(visible.length).join("、") },
+        }));
+    }
+    return row;
+}
+
 function createPendingCard(run, request) {
     const card = element("article", {
         className: "pending-card",
@@ -289,21 +366,35 @@ function createPendingCard(run, request) {
     }
 
     if (payload.type === "approval") {
+        card.classList.add("pending-card--approval");
+        const presentation = approvalPresentation(payload.reason);
         card.append(
             element("div", { className: "pending-card__heading" }, [
                 element("span", { className: "pending-card__badge pending-card__badge--warning", text: "需要批准" }),
-                element("h2", { text: payload.reason || "是否允许此操作？" }),
+                element("h2", { text: presentation.headline }),
             ]),
         );
         if (payload.requested_scope?.length) {
-            card.append(element("p", {
-                className: "pending-card__scope",
-                text: `范围：${payload.requested_scope.join(" · ")}`,
-            }));
+            card.append(createApprovalScope(payload.requested_scope));
         }
+        card.append(element("details", { className: "pending-card__details" }, [
+            element("summary", { className: "pending-card__details-summary" }, [
+                element("span", { className: "pending-card__details-label", text: "操作详情" }),
+                element("span", { className: "pending-card__details-preview", text: presentation.operation }),
+                element("span", {
+                    className: "pending-card__details-chevron",
+                    attrs: { "aria-hidden": "true" },
+                }),
+            ]),
+            element("pre", {
+                className: "pending-card__operation",
+                text: presentation.operation,
+                attrs: { tabindex: "0" },
+            }),
+        ]));
         const actions = element("div", { className: "pending-card__actions" });
         actions.append(
-            button("仅允许一次", "resolve-approval", {
+            button("允许一次", "resolve-approval", {
                 runId: run.id,
                 requestId: request.request_id,
                 decision: "allow_once",

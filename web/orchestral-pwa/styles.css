@@ -1294,14 +1294,84 @@ svg {
 }
 
 .evidence--error {
-  padding: 9px 10px;
+  padding: 10px 11px;
+  border: 1px solid color-mix(in srgb, var(--danger) 20%, var(--line));
+  border-left: 2px solid color-mix(in srgb, var(--danger) 70%, var(--line));
   border-radius: 8px;
-  background: var(--danger-soft);
-  color: var(--danger);
+  background: color-mix(in srgb, var(--danger-soft) 45%, var(--surface-muted));
+  color: var(--ink-soft);
 }
 
-.evidence--error p {
-  margin: 3px 0 0;
+.evidence-error__code {
+  color: var(--danger);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.evidence-error__message {
+  margin: 4px 0 0;
+  color: var(--ink-soft);
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.evidence-error__guidance {
+  display: grid;
+  gap: 4px;
+  padding-top: 8px;
+  margin-top: 8px;
+  border-top: 1px solid color-mix(in srgb, var(--danger) 14%, var(--line));
+}
+
+.evidence-error__label {
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 720;
+}
+
+.evidence-error__guidance ul {
+  padding: 0 0 0 16px;
+  margin: 0;
+  color: var(--muted);
+}
+
+.evidence-error__guidance li {
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.evidence-error__guidance li + li {
+  margin-top: 3px;
+}
+
+.evidence-error__details {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.evidence-error__details summary {
+  width: fit-content;
+  cursor: pointer;
+}
+
+.evidence-error__details dl {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 4px 8px;
+  padding-top: 7px;
+  margin: 0;
+}
+
+.evidence-error__details dt {
+  color: var(--faint);
+  font-weight: 700;
+}
+
+.evidence-error__details dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
 }
 
 .command-block,
@@ -1356,22 +1426,29 @@ svg {
 .pending-panel {
   position: relative;
   z-index: 6;
-  max-height: min(42vh, 360px);
-  padding: 10px max(12px, env(safe-area-inset-right)) 0 max(12px, env(safe-area-inset-left));
+  max-height: min(46dvh, 390px);
+  padding: 8px max(12px, env(safe-area-inset-right)) 0 max(12px, env(safe-area-inset-left));
+  overflow-x: hidden;
   overflow-y: auto;
   background: linear-gradient(to bottom, transparent, var(--page-raised) 12px);
+  overscroll-behavior: contain;
 }
 
 .pending-card {
   width: min(100%, 820px);
   padding: 13px;
   margin: 0 auto;
-  border: 1px solid color-mix(in srgb, var(--warning) 32%, var(--line));
+  border: 1px solid var(--line-strong);
   border-radius: 14px;
-  background: var(--warning-soft);
+  background: color-mix(in srgb, var(--surface) 96%, var(--page-raised));
   box-shadow: var(--shadow-sm);
   color: var(--ink-soft);
   font-size: 12px;
+}
+
+.pending-card--approval {
+  border-color: color-mix(in srgb, var(--warning) 24%, var(--line-strong));
+  box-shadow: 0 8px 26px rgb(8 10 15 / 14%);
 }
 
 .pending-card__title {
@@ -1387,6 +1464,7 @@ svg {
   font-size: 13px;
   font-weight: 720;
   line-height: 1.4;
+  overflow-wrap: anywhere;
 }
 
 .pending-card__heading {
@@ -1406,16 +1484,119 @@ svg {
 }
 
 .pending-card__badge--warning {
-  background: color-mix(in srgb, var(--warning) 14%, transparent);
+  background: color-mix(in srgb, var(--warning) 11%, transparent);
   color: var(--warning);
 }
 
-.pending-card__scope {
-  margin: 8px 0 0;
+.pending-card__scope-row {
+  display: flex;
+  gap: 5px;
+  margin-top: 9px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.pending-card__scope-row::-webkit-scrollbar {
+  display: none;
+}
+
+.pending-card__scope-chip {
+  flex: 0 0 auto;
+  max-width: 150px;
+  padding: 4px 7px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface-muted);
   color: var(--muted);
+  font-size: 9px;
+  font-weight: 620;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pending-card__scope-chip--more {
+  color: var(--warning);
+}
+
+.pending-card__details {
+  margin-top: 9px;
+  overflow: clip;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-muted);
+}
+
+.pending-card__details-summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 18px;
+  grid-template-rows: auto auto;
+  gap: 2px 8px;
+  min-width: 0;
+  padding: 8px 10px;
+  cursor: pointer;
+  list-style: none;
+  touch-action: manipulation;
+}
+
+.pending-card__details-summary::-webkit-details-marker {
+  display: none;
+}
+
+.pending-card__details-summary::marker {
+  content: "";
+}
+
+.pending-card__details-label {
+  color: var(--faint);
+  font-size: 9px;
+  font-weight: 720;
+}
+
+.pending-card__details-preview {
+  display: -webkit-box;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-soft);
   font-family: var(--font-mono);
   font-size: 10px;
+  line-height: 1.45;
   overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.pending-card__details-chevron {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  align-self: center;
+  justify-self: center;
+  width: 7px;
+  height: 7px;
+  border-right: 1.5px solid var(--muted);
+  border-bottom: 1.5px solid var(--muted);
+  transform: rotate(45deg) translate(-1px, 1px);
+  transition: transform 150ms ease;
+}
+
+.pending-card__details[open] .pending-card__details-chevron {
+  transform: rotate(225deg) translate(-1px, 1px);
+}
+
+.pending-card__operation {
+  max-height: 116px;
+  padding: 9px 10px;
+  margin: 0;
+  overflow: auto;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 .pending-card__form {
@@ -1451,11 +1632,10 @@ svg {
 }
 
 .pending-card__actions {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 7px;
-  margin-top: 12px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(104px, 1fr));
+  gap: 8px;
+  margin-top: 10px;
 }
 
 .pending-card__actions button,
@@ -1482,9 +1662,9 @@ svg {
 }
 
 .pending-card__danger {
-  border-color: color-mix(in srgb, var(--danger) 28%, var(--line));
-  background: var(--danger-soft);
-  color: var(--danger);
+  border-color: var(--line-strong);
+  background: var(--surface-muted);
+  color: var(--muted);
 }
 
 .composer-dock {
