@@ -25,24 +25,24 @@ providers:
       kind: openai
       api_key_env: OPENAI_API_KEY
       config:
-        timeout_secs: 60
+        stream_idle_timeout_secs: 300
     - name: google
       kind: gemini
       api_key_env: GOOGLE_API_KEY
       config:
-        timeout_secs: 60
+        stream_idle_timeout_secs: 300
     - name: openrouter
       kind: openrouter
       endpoint: https://openrouter.ai/api/v1
       api_key_env: OPENROUTER_API_KEY
       config:
-        timeout_secs: 60
+        stream_idle_timeout_secs: 300
     - name: deepseek
       kind: deepseek
       endpoint: https://api.deepseek.com
       api_key_env: DEEPSEEK_API_KEY
       config:
-        timeout_secs: 60
+        stream_idle_timeout_secs: 300
   models:
     - name: gpt-4o-mini
       backend: openai

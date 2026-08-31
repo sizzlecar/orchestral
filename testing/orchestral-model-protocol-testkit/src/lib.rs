@@ -6,11 +6,13 @@
 
 mod fake;
 mod live;
+mod paced;
 mod stress;
 mod suite;
 
 pub use fake::ScriptedModelFixture;
 pub use live::{run_live_text_smoke, LiveModelSmokeReport};
+pub use paced::PacedSseServer;
 pub use stress::{
     ModelStreamStressCase, ModelStreamStressFault, ModelStreamStressReport, ModelStreamStressSuite,
     DEFAULT_MODEL_STREAM_STRESS_CASES,

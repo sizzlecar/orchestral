@@ -1298,7 +1298,12 @@ fn build_model_backend(
     max_buffered_events: usize,
     credential_file: Option<&std::path::Path>,
 ) -> anyhow::Result<(Arc<dyn ModelBackend>, Arc<dyn ModelTokenMeter>)> {
-    let timeout = Duration::from_secs(backend.get_config("timeout_secs").unwrap_or(60));
+    let timeout = Duration::from_secs(
+        backend
+            .get_config("stream_idle_timeout_secs")
+            .or_else(|| backend.get_config("timeout_secs"))
+            .unwrap_or(300),
+    );
     let max_context_tokens = backend.get_config("max_context_tokens");
     match backend.kind.trim().to_ascii_lowercase().as_str() {
         "google" | "gemini" => {

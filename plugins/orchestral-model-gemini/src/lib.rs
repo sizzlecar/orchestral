@@ -172,6 +172,8 @@ pub struct GeminiModelConfig {
     pub thinking_level: Option<GeminiThinkingLevel>,
     pub default_max_output_tokens: u64,
     pub max_context_tokens: Option<u64>,
+    /// Maximum time without response activity. Streaming generations have no
+    /// total deadline and may legitimately run longer than this duration.
     pub timeout: Duration,
     pub max_buffered_events: usize,
 }
@@ -216,7 +218,8 @@ impl GeminiModelBackend {
     pub fn new(config: GeminiModelConfig) -> Result<Self, ModelError> {
         config.validate()?;
         let client = Client::builder()
-            .timeout(config.timeout)
+            .connect_timeout(config.timeout.min(Duration::from_secs(30)))
+            .read_timeout(config.timeout)
             .build()
             .map_err(|error| ModelError::new(ModelErrorCode::Internal, error.to_string()))?;
         Ok(Self { client, config })
@@ -1084,7 +1087,7 @@ mod tests {
     use orchestral_core::model_protocol::{ModelRequestId, ModelToolDefinition};
     use orchestral_model_protocol_testkit::{
         ModelConformanceSuite, ModelFixtureFactory, ModelFixtureResponse, ModelFixtureScenario,
-        ModelStreamStressCase, ModelStreamStressFault, ModelStreamStressSuite,
+        ModelStreamStressCase, ModelStreamStressFault, ModelStreamStressSuite, PacedSseServer,
     };
 
     #[tokio::test]
@@ -1311,6 +1314,50 @@ mod tests {
             .run(&GeminiConformanceFixture)
             .await;
         assert!(report.is_conformant(), "{:#?}", report.results());
+    }
+
+    #[tokio::test]
+    async fn active_stream_may_outlive_its_idle_timeout() {
+        let server = PacedSseServer::start(
+            vec![
+                b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello \"}]}}]}\n\n".to_vec(),
+                b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"world\"}]}}]}\n\n".to_vec(),
+                b"data: {\"candidates\":[{\"content\":{\"parts\":[]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":7,\"candidatesTokenCount\":2}}\n\n".to_vec(),
+            ],
+            Duration::from_millis(550),
+        )
+        .await
+        .unwrap();
+        let backend = GeminiModelBackend::new(GeminiModelConfig {
+            backend_id: "gemini-paced-stream".to_owned(),
+            endpoint: server.endpoint().to_owned(),
+            authentication: GeminiAuthentication::ApiKey("fixture-key".to_owned()),
+            model: "fixture-model".to_owned(),
+            temperature: 0.0,
+            thinking_level: None,
+            default_max_output_tokens: 64,
+            max_context_tokens: Some(8_192),
+            timeout: Duration::from_secs(1),
+            max_buffered_events: 128,
+        })
+        .unwrap();
+        let started = tokio::time::Instant::now();
+        let mut stream = backend
+            .start(request(), CancellationToken::new())
+            .await
+            .unwrap();
+        let mut finished = false;
+        while let Some(event) = stream.next().await {
+            finished |= matches!(
+                event.unwrap().payload,
+                ModelEvent::Finish {
+                    reason: ModelFinishReason::Stop
+                }
+            );
+        }
+        assert!(started.elapsed() > Duration::from_secs(1));
+        assert!(finished);
+        server.finish().await.unwrap();
     }
 
     fn stress_request(case: &ModelStreamStressCase) -> ModelRequest {
