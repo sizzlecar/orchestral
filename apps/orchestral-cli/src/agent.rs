@@ -16,8 +16,8 @@ use orchestral_core::agent_protocol::{
         AgentCommand, AgentCommandEnvelope, AgentRunState, AgentSessionId, AgentTelemetry,
         AgentTerminalState, ApprovalDecision, BindingRequirement, CommandAckState, CommandId,
         Content, ContentBody, Digest, PendingRequest, PendingRequestPayload, ProviderBindingRef,
-        RequestResolution, ResourceBinding, ResourceBindingId, ResourceBindingMode, ResourceId,
-        ResourceKind, ResourceRef, ResourceRevision, RunId,
+        RequestResolution, ResourceBinding, ResourceBindingId, ResourceBindingMode, ResourceKind,
+        ResourceRef, ResourceRevision, RunId,
     },
 };
 use orchestral_core::agent_session::{AgentSessionJournalStore, InMemoryAgentSessionJournalStore};
@@ -27,7 +27,7 @@ use orchestral_core::config::{
 use orchestral_core::io::BlobStore;
 use orchestral_core::mcp_protocol::{McpServerId, McpTransportFactory};
 use orchestral_core::model_protocol::ModelBackend;
-use orchestral_core::skill_protocol::{SkillSourceKind, SKILL_CATALOG_RESOURCE_KIND_V1};
+use orchestral_core::skill_protocol::SKILL_CATALOG_RESOURCE_KIND_V1;
 use orchestral_core::tool_effect::{InMemoryToolEffectJournalStore, ToolEffectJournalStore};
 use orchestral_core::tool_protocol::{
     ApprovalPolicy, EffectScope, EnvironmentPolicy, FilesystemPolicy, HostApprovalVerifier,
@@ -58,8 +58,7 @@ use orchestral_runtime::{
     GuardedMcpServerConfig, GuardedToolRuntime, InMemoryBlobStore,
     InMemoryGenericAgentCheckpointStore, InMemoryHostApprovalBroker, InternalGenericAgentProvider,
     McpToolsAdapterRegistry, ModelTokenMeter, ProcessSupervisor, SessionCompactionPolicy,
-    SkillRoot, SkillRuntime, StdioMcpSandboxPolicy, StdioMcpTransportFactory, ToolArtifactStore,
-    WorkspacePermissionPolicy,
+    StdioMcpSandboxPolicy, StdioMcpTransportFactory, ToolArtifactStore, WorkspacePermissionPolicy,
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
@@ -69,6 +68,7 @@ use crate::google_auth::{
 };
 use crate::runtime::client::prepare_runtime_config_path;
 use crate::runtime::ModelOverrides;
+use crate::skill_command::{build_skill_setup, SkillManager};
 
 #[derive(Clone)]
 pub struct AgentRunOptions {
@@ -173,6 +173,7 @@ pub struct AgentHost {
     pub process_supervisor: Arc<ProcessSupervisor>,
     pub backend_name: String,
     pub model: String,
+    pub(crate) skill_manager: SkillManager,
     controller: Arc<AgentController>,
     resources: Vec<ResourceBinding>,
     mcp_registry: McpToolsAdapterRegistry,
@@ -306,11 +307,8 @@ pub async fn build_agent_host(options: &AgentRunOptions) -> anyhow::Result<Agent
     for (server, error) in mcp_registry.skipped_optional_servers() {
         tracing::warn!(server = %server, %error, "optional MCP server was unavailable");
     }
-    let skills = if options.no_skills {
-        None
-    } else {
-        build_cli_skill_runtime(&config, &workspaces.primary)?
-    };
+    let (skills, skill_manager) =
+        build_skill_setup(&config, &workspaces.primary, options.no_skills)?;
     let provider = match skills.clone() {
         Some(skills) => {
             InternalGenericAgentProvider::new_with_tools_approval_skills_and_session_journal(
@@ -385,6 +383,7 @@ pub async fn build_agent_host(options: &AgentRunOptions) -> anyhow::Result<Agent
         process_supervisor,
         backend_name: backend.name,
         model,
+        skill_manager,
         controller,
         resources,
         mcp_registry,
@@ -438,6 +437,7 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
                     host.approvals.clone(),
                     host.process_supervisor.clone(),
                     host.model.clone(),
+                    host.skill_manager.clone(),
                 )
                 .await
             }
@@ -821,59 +821,6 @@ fn build_cli_blob_store(config: &OrchestralConfig) -> anyhow::Result<Arc<dyn Blo
         )),
         mode => bail!("unsupported BlobStore mode for Generic Agent Artifact results: {mode}"),
     }
-}
-
-fn build_cli_skill_runtime(
-    config: &OrchestralConfig,
-    workspace: &Path,
-) -> anyhow::Result<Option<Arc<SkillRuntime>>> {
-    if !config.skills.enabled {
-        return Ok(None);
-    }
-    let mut roots = Vec::new();
-    for (index, configured) in config.skills.directories.iter().enumerate() {
-        let path = PathBuf::from(configured);
-        roots.push(SkillRoot {
-            path: if path.is_absolute() {
-                path
-            } else {
-                workspace.join(path)
-            },
-            source_kind: SkillSourceKind::UserConfigured,
-            precedence: 10_000_u32.saturating_sub(index as u32),
-            required: true,
-        });
-    }
-    if config.skills.auto_discover {
-        for (index, relative) in [".claude/skills", ".codex/skills", "skills"]
-            .into_iter()
-            .enumerate()
-        {
-            roots.push(SkillRoot {
-                path: workspace.join(relative),
-                source_kind: SkillSourceKind::Workspace,
-                precedence: 1_000_u32.saturating_sub(index as u32),
-                required: false,
-            });
-        }
-    }
-    if roots.is_empty() {
-        return Ok(None);
-    }
-    let runtime = SkillRuntime::discover(ResourceId::new("cli-skills"), &roots)
-        .context("discover Skill catalog")?;
-    if runtime.catalog().skills.is_empty() {
-        return Ok(None);
-    }
-    for conflict in runtime.conflicts() {
-        tracing::warn!(
-            skill = conflict.name,
-            selected = conflict.selected_source,
-            shadowed = conflict.shadowed_source,
-            "Skill name conflict resolved by deterministic precedence"
-        );
-    }
-    Ok(Some(Arc::new(runtime)))
 }
 
 fn configured_exec_host(config: &OrchestralConfig) -> anyhow::Result<Option<CliExecHost>> {

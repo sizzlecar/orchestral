@@ -208,6 +208,29 @@ impl SkillRuntime {
         &self.conflicts
     }
 
+    /// Produces the immutable catalog snapshot visible to a Host after its
+    /// user policy has disabled selected Skill sources. Source locators are
+    /// canonical `SKILL.md` paths emitted by discovery; policy persistence
+    /// remains an application concern rather than part of Skill Protocol.
+    pub fn excluding_sources(
+        &self,
+        disabled_sources: &BTreeSet<String>,
+    ) -> Result<Self, SkillRuntimeError> {
+        let packages = self
+            .packages_by_name
+            .values()
+            .filter(|package| !disabled_sources.contains(&package.descriptor.source.locator))
+            .cloned()
+            .collect();
+        let conflicts = self
+            .conflicts
+            .iter()
+            .filter(|conflict| !disabled_sources.contains(&conflict.selected_source))
+            .cloned()
+            .collect();
+        Self::from_selected(self.catalog.resource_id.clone(), packages, conflicts)
+    }
+
     /// Descriptor-only text. Full instructions are never returned here.
     pub fn descriptor_context(&self) -> String {
         let mut output = String::from(
@@ -466,6 +489,42 @@ mod tests {
             .starts_with(canonical_high.to_string_lossy().as_ref()));
         let _ = fs::remove_dir_all(low);
         let _ = fs::remove_dir_all(high);
+    }
+
+    #[test]
+    fn disabled_source_is_absent_from_catalog_and_context_reads() {
+        let root = temp_dir("disabled-source");
+        write_skill(&root, "demo", "demo", "private demo instructions");
+        write_skill(&root, "other", "other", "other instructions");
+        let discovered = SkillRuntime::discover(
+            ResourceId::new("skills"),
+            &[SkillRoot {
+                path: root.clone(),
+                source_kind: SkillSourceKind::Workspace,
+                precedence: 1,
+                required: true,
+            }],
+        )
+        .unwrap();
+        let disabled_path = root
+            .join("demo/SKILL.md")
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let effective = discovered
+            .excluding_sources(&BTreeSet::from([disabled_path.clone()]))
+            .unwrap();
+
+        assert_eq!(effective.catalog().skills.len(), 1);
+        assert_eq!(effective.catalog().skills[0].name, "other");
+        assert!(!effective.descriptor_context().contains(&disabled_path));
+        assert!(matches!(
+            effective.read_for_context("demo", &LoadedSkillSet::default()),
+            Err(SkillRuntimeError::NotFound(name)) if name == "demo"
+        ));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

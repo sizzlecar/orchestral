@@ -8,6 +8,8 @@ mod mcp_command;
 mod mcp_config;
 pub mod remote;
 mod runtime;
+mod skill_command;
+mod skill_config;
 mod tui;
 
 use clap::Parser;
