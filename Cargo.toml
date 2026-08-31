@@ -8,6 +8,7 @@ members = [
 
     # Concrete infrastructure plugins
     "plugins/orchestral-agent-journal-fs",
+    "plugins/orchestral-agent-codex",
     "plugins/orchestral-blob-fs",
     "plugins/orchestral-model-gemini",
     "plugins/orchestral-model-openai",
@@ -77,6 +78,7 @@ ignore = "0.4"
 orchestral = { path = "core/orchestral" }
 orchestral-core = { path = "core/orchestral-core", version = "0.2.0" }
 orchestral-runtime = { path = "core/orchestral-runtime", version = "0.2.0" }
+orchestral-agent-codex = { path = "plugins/orchestral-agent-codex", version = "0.2.0" }
 orchestral-model-gemini = { path = "plugins/orchestral-model-gemini", version = "0.2.0" }
 orchestral-model-openai = { path = "plugins/orchestral-model-openai", version = "0.2.0" }
 orchestral-model-protocol-testkit = { path = "testing/orchestral-model-protocol-testkit" }

@@ -3057,6 +3057,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "orchestral-agent-codex"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "orchestral-core",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "orchestral-agent-journal-fs"
 version = "0.2.0"
 dependencies = [
