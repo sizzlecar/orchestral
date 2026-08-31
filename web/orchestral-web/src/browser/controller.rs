@@ -395,7 +395,7 @@ impl AppController {
                 {
                     let mut state = self.state.write();
                     let run = state.ensure_run(&actual_run_id, Some(session.id.clone()));
-                    run.optimistic_start(input, platform::now());
+                    run.record_started_input(input, platform::now());
                     if let Some(view) = response.get("view") {
                         run.apply_view(view.clone(), platform::now());
                     }

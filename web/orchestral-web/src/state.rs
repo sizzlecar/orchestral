@@ -203,7 +203,12 @@ impl RunState {
         self.view = Some(view);
     }
 
-    pub fn optimistic_start(&mut self, input: String, now: f64) {
+    /// Records the initial user input after the Host accepted `start_run`.
+    ///
+    /// Unlike a locally queued message this is already confirmed by the HTTP
+    /// response. Initial input is part of the immutable Run spec, so it does
+    /// not produce the steer-only `input_committed` journal event.
+    pub fn record_started_input(&mut self, input: String, now: f64) {
         self.status = "running".to_owned();
         self.started_at = Some(now);
         if self
@@ -219,7 +224,7 @@ impl RunState {
             role: "user".to_owned(),
             text: input,
             order,
-            optimistic: true,
+            optimistic: false,
             partial: false,
             steering: false,
         });
@@ -941,5 +946,15 @@ mod tests {
             timeline_for_run(&run)[1],
             TimelineItem::Activity(_)
         ));
+    }
+
+    #[test]
+    fn accepted_start_input_is_not_left_in_sending_state() {
+        let mut run = RunState::new("run-1", None);
+        run.record_started_input("inspect the project".to_owned(), 1.0);
+
+        assert_eq!(run.messages.len(), 1);
+        assert!(!run.messages[0].optimistic);
+        assert_eq!(run.messages[0].text, "inspect the project");
     }
 }
