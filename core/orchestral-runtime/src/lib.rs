@@ -3,6 +3,7 @@
 //! Agent Protocol control plane, Generic Agent, guarded tools, and context.
 
 pub mod agent_control;
+pub mod agent_directory;
 pub mod agent_sdk;
 pub mod api;
 pub mod approval_bridge;
@@ -18,6 +19,7 @@ pub mod tools;
 pub mod workflow_strategy;
 
 pub use agent_control::{AgentControlError, AgentControlEvent, AgentController};
+pub use agent_directory::{AgentDirectory, AgentDirectoryError};
 pub use agent_sdk::{AgentClient, AgentRunHandle, AgentSdkError, AgentTurn};
 pub use approval_bridge::{AgentApprovalBridge, ApprovalBridgeError, InMemoryHostApprovalBroker};
 pub use exec_process::{

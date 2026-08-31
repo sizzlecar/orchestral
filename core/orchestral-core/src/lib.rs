@@ -9,6 +9,7 @@
 //! - Stable SPI contracts for runtime component and hook extensions
 //! - Unified configuration management
 
+pub mod agent_connector;
 pub mod agent_protocol;
 pub mod agent_session;
 pub mod config;
