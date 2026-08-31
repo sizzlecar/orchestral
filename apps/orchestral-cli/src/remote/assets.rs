@@ -69,10 +69,6 @@ fn asset_response(file: Option<&File<'_>>, path: &str) -> Response {
         HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
     );
     headers.insert(
-        header::HeaderName::from_static("cross-origin-opener-policy"),
-        HeaderValue::from_static("same-origin"),
-    );
-    headers.insert(
         header::HeaderName::from_static("x-frame-options"),
         HeaderValue::from_static("DENY"),
     );
@@ -125,6 +121,14 @@ mod tests {
             .to_str()
             .unwrap()
             .contains("connect-src 'self'"));
+        // COOP is useful only on a potentially trustworthy origin. The Host
+        // deliberately supports explicit trusted-LAN HTTP for diagnostics, so
+        // sending it unconditionally would produce a misleading browser
+        // security warning without protecting any feature used by this UI.
+        assert!(response
+            .headers()
+            .get("cross-origin-opener-policy")
+            .is_none());
     }
 
     #[tokio::test]
