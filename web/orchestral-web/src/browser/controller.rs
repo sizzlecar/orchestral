@@ -426,6 +426,10 @@ impl AppController {
             self.notice("当前离线，恢复连接后再发送", "warning");
             return;
         }
+        if self.state.read().recoverable_run().is_some() {
+            self.notice("运行连接已中断，请先恢复连接", "warning");
+            return;
+        }
         let Some(token) = self.token.read().clone() else {
             return;
         };
@@ -573,6 +577,52 @@ impl AppController {
                 }
                 self.handle_api_error(error).await;
             }
+        }
+        self.set_busy(false);
+    }
+
+    pub async fn recover_current_run(mut self) {
+        if !platform::is_online() {
+            self.notice("当前离线，恢复网络后再重连任务", "warning");
+            return;
+        }
+        let Some(token) = self.token.read().clone() else {
+            return;
+        };
+        let Some((run_id, connector_id)) = self
+            .state
+            .read()
+            .recoverable_run()
+            .map(|run| (run.id.clone(), run.connector_id.clone()))
+        else {
+            return;
+        };
+        self.set_busy(true);
+        match self
+            .api
+            .recover(&token, &run_id, connector_id.as_deref())
+            .await
+        {
+            Ok(view) => {
+                self.state
+                    .write()
+                    .ensure_run_source(&run_id, None, connector_id)
+                    .apply_view(view, platform::now());
+                self.refresh_run(&run_id).await;
+                let status = self
+                    .state
+                    .read()
+                    .runs
+                    .get(&run_id)
+                    .map(|run| run.status.clone());
+                if status
+                    .as_deref()
+                    .is_some_and(|status| !is_terminal(status) && status != "unknown")
+                {
+                    self.start_stream(run_id);
+                }
+            }
+            Err(error) => self.handle_api_error(error).await,
         }
         self.set_busy(false);
     }

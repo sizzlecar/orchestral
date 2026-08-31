@@ -233,6 +233,20 @@ impl ApiClient {
         .await
     }
 
+    pub async fn recover(
+        &self,
+        credential: &ApiCredential,
+        run_id: &str,
+        connector_id: Option<&str>,
+    ) -> Result<Value, ApiError> {
+        self.post(
+            &with_connector(&format!("/runs/{}/recover", encode(run_id)), connector_id),
+            credential,
+            &json!({}),
+        )
+        .await
+    }
+
     pub async fn resolve_input(
         &self,
         credential: &ApiCredential,

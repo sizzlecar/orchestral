@@ -848,9 +848,13 @@ impl AppState {
         self.current_run().filter(|run| {
             matches!(
                 run.status.as_str(),
-                "accepted" | "running" | "waiting" | "stopping" | "unknown"
+                "accepted" | "running" | "waiting" | "stopping"
             )
         })
+    }
+
+    pub fn recoverable_run(&self) -> Option<&RunState> {
+        self.current_run().filter(|run| run.status == "unknown")
     }
 }
 
@@ -1227,6 +1231,36 @@ mod tests {
         .unwrap();
 
         assert_ne!(native.key(), external.key());
+    }
+
+    #[test]
+    fn unknown_run_requires_recovery_instead_of_steer() {
+        let mut state = AppState::new(true);
+        state.sessions.items.push(SessionView {
+            id: "thread-1".to_owned(),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+            run_ids: vec!["run-1".to_owned()],
+            connector_id: Some("agent/local".to_owned()),
+            title: None,
+            preview: None,
+            cwd: None,
+            state: Some("active".to_owned()),
+        });
+        state.sessions.selected_id = Some("agent/local\0thread-1".to_owned());
+        state
+            .ensure_run_source(
+                "run-1",
+                Some("thread-1".to_owned()),
+                Some("agent/local".to_owned()),
+            )
+            .status = "unknown".to_owned();
+
+        assert!(state.active_run().is_none());
+        assert_eq!(
+            state.recoverable_run().map(|run| run.id.as_str()),
+            Some("run-1")
+        );
     }
 
     #[test]

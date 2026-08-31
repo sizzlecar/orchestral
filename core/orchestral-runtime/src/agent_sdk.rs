@@ -195,7 +195,7 @@ impl AgentRunHandle {
         let mut events = self.subscribe().await?;
         loop {
             let view = self.inspect().await?;
-            if view.state.is_terminal() || !view.pending_requests.is_empty() {
+            if is_stable_turn_boundary(&view) {
                 return Ok(AgentTurn {
                     run_id: self.run_id.clone(),
                     view,
@@ -205,7 +205,7 @@ impl AgentRunHandle {
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => {
                     let view = self.inspect().await?;
-                    if view.state.is_terminal() || !view.pending_requests.is_empty() {
+                    if is_stable_turn_boundary(&view) {
                         return Ok(AgentTurn {
                             run_id: self.run_id.clone(),
                             view,
@@ -216,6 +216,12 @@ impl AgentRunHandle {
             }
         }
     }
+}
+
+fn is_stable_turn_boundary(view: &AgentRunView) -> bool {
+    view.state.is_terminal()
+        || view.state.status() == AgentRunStatus::Unknown
+        || !view.pending_requests.is_empty()
 }
 
 #[derive(Debug, Clone)]

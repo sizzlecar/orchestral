@@ -285,18 +285,27 @@ fn Composer() -> Element {
     let mut draft = use_signal(String::new);
     let state = controller.state.read();
     let active = state.active_run().is_some();
-    let input_disabled = !state.connection.online || state.auth.status != AuthStatus::Authenticated;
-    let action_disabled = state.ui.composer_busy || input_disabled;
+    let recoverable = state.recoverable_run().is_some();
+    let input_disabled =
+        !state.connection.online || state.auth.status != AuthStatus::Authenticated || recoverable;
+    let control_disabled = state.ui.composer_busy
+        || !state.connection.online
+        || state.auth.status != AuthStatus::Authenticated;
+    let action_disabled = control_disabled || input_disabled;
     let stopping = state
         .active_run()
         .is_some_and(|run| run.status == "stopping");
     drop(state);
-    let placeholder = if active {
+    let placeholder = if recoverable {
+        "连接中断，恢复后可继续…"
+    } else if active {
         "补充指令（steer）…"
     } else {
         "告诉 Orchestral 你想完成什么…"
     };
-    let hint = if active {
+    let hint = if recoverable {
+        "原生 Agent 状态未知，恢复前不会重复执行"
+    } else if active {
         "当前发送会引导正在运行的任务"
     } else {
         "Enter 发送 · Shift + Enter 换行"
@@ -336,6 +345,17 @@ fn Composer() -> Element {
                     }
                 }
                 div { class: "composer-form__actions",
+                    if recoverable {
+                        button {
+                            class: "send-button recover-button",
+                            r#type: "button",
+                            disabled: control_disabled,
+                            onclick: move |_| {
+                                spawn(async move { controller.recover_current_run().await });
+                            },
+                            "恢复连接"
+                        }
+                    }
                     if active && !stopping {
                         button {
                             class: "cancel-button",
@@ -426,6 +446,7 @@ fn run_label(run: Option<&RunState>, now: f64) -> (String, &'static str) {
         "cancelled" => ("已取消".to_owned(), "idle"),
         "failed" => ("失败".to_owned(), "error"),
         "loading" => ("正在载入".to_owned(), "working"),
+        "unknown" => ("连接待恢复".to_owned(), "warning"),
         _ => ("状态待确认".to_owned(), "warning"),
     }
 }

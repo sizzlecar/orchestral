@@ -76,6 +76,7 @@ pub fn router(state: RemoteApiState) -> Router {
         .route("/runs/{run_id}", get(inspect_run))
         .route("/runs/{run_id}/events", get(run_events))
         .route("/runs/{run_id}/stream", get(run_stream))
+        .route("/runs/{run_id}/recover", post(recover_run))
         .route("/runs/{run_id}/steer", post(steer_run))
         .route("/runs/{run_id}/cancel", post(cancel_run))
         .route(
@@ -499,6 +500,20 @@ async fn inspect_run(
     let (agent, run_id) = require_run(&state, query.connector_id.as_deref(), run_id).await?;
     Ok(Json(RemoteRunView {
         view: agent.inspect(&run_id).await?,
+        input: agent.initial_input(&run_id).await?,
+    }))
+}
+
+async fn recover_run(
+    State(state): State<RemoteApiState>,
+    Path(run_id): Path<String>,
+    Query(query): Query<RunTargetQuery>,
+) -> Result<Json<RemoteRunView>, ApiError> {
+    let (agent, run_id) = require_run(&state, query.connector_id.as_deref(), run_id).await?;
+    let view = agent.recover(&run_id).await?;
+    spawn_approval_driver(state, agent.clone(), run_id.clone());
+    Ok(Json(RemoteRunView {
+        view,
         input: agent.initial_input(&run_id).await?,
     }))
 }
@@ -1108,7 +1123,8 @@ mod tests {
     use futures_util::StreamExt;
     use http_body_util::BodyExt;
     use orchestral_agent_protocol_testkit::{
-        ProviderFixtureFactory, ProviderScenario, ScriptedStatelessFactory, TestProbes,
+        ProviderFixtureFactory, ProviderScenario, ScriptedStatelessFactory,
+        SessionfulRecoverFactory, TestProbes,
     };
     use orchestral_core::agent_connector::{
         AgentConnector, AgentConnectorDescriptor, AgentConnectorError, AgentConnectorHealth,
@@ -1141,6 +1157,44 @@ mod tests {
     }
 
     struct StaticAgentConnector;
+
+    struct DisconnectFirstProvider {
+        inner: Arc<dyn AgentProvider>,
+    }
+
+    #[async_trait]
+    impl AgentProvider for DisconnectFirstProvider {
+        fn describe(&self) -> AgentDescriptorEnvelope {
+            self.inner.describe()
+        }
+
+        async fn start(
+            &self,
+            request: orchestral_core::agent_protocol::wire::AgentStartRequest,
+        ) -> Result<AgentStart, AgentStartError> {
+            let started = self.inner.start(request).await?;
+            Ok(AgentStart {
+                execution: started.execution,
+                admission: started.admission,
+                stream: started.stream.take(1).boxed(),
+            })
+        }
+
+        async fn command(
+            &self,
+            execution: &AgentExecutionRef,
+            command: AgentCommandEnvelope,
+        ) -> Result<ProviderCommandDisposition, AgentProtocolError> {
+            self.inner.command(execution, command).await
+        }
+
+        async fn recover(
+            &self,
+            request: AgentRecoveryRequest,
+        ) -> Result<AgentRecovery, AgentProtocolError> {
+            self.inner.recover(request).await
+        }
+    }
 
     impl StaticAgentConnector {
         fn summary() -> AgentSessionSummary {
@@ -1483,9 +1537,11 @@ mod tests {
         let claim = registry.claim_pairing(&secret, "Test phone").await.unwrap();
         let approvals =
             Arc::new(InMemoryHostApprovalBroker::new(b"0123456789abcdef0123456789abcdef").unwrap());
-        let external_factory = ScriptedStatelessFactory::conformant().unwrap();
+        let external_factory = SessionfulRecoverFactory::new().unwrap();
         let external_scenario = ProviderScenario::standard(&external_factory.descriptor()).unwrap();
-        let external_provider = external_factory.create(external_scenario, TestProbes::default());
+        let external_provider = Arc::new(DisconnectFirstProvider {
+            inner: external_factory.create(external_scenario, TestProbes::default()),
+        });
         let agent_directory = Arc::new(AgentDirectory::new());
         agent_directory
             .register(Arc::new(StaticAgentConnector), external_provider)
@@ -1698,6 +1754,7 @@ mod tests {
         );
 
         let response = app
+            .clone()
             .oneshot(authorized(
                 "GET",
                 "/runs/fixture-external-run/events?connector_id=fixture%2Flocal&after=0",
@@ -1713,6 +1770,78 @@ mod tests {
             .as_array()
             .is_some_and(|items| !items.is_empty()));
         assert!(events["next"].as_u64().is_some_and(|next| next > 0));
+
+        let mut observed_unknown = false;
+        for _ in 0..100 {
+            let response = app
+                .clone()
+                .oneshot(authorized(
+                    "GET",
+                    "/runs/fixture-external-run?connector_id=fixture%2Flocal",
+                    &token,
+                    serde_json::Value::Null,
+                ))
+                .await
+                .unwrap();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let view: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if view["state"]["state"] == "unknown" {
+                observed_unknown = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            observed_unknown,
+            "disconnected provider becomes recoverable"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/runs/fixture-external-run/recover?connector_id=fixture%2Flocal",
+                &token,
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "recovery response: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let recovered: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(recovered["state"]["state"], "running");
+        assert_eq!(
+            recovered["input"][0]["body"]["value"],
+            "continue the existing session"
+        );
+
+        let mut recovered_terminal = false;
+        for _ in 0..100 {
+            let response = app
+                .clone()
+                .oneshot(authorized(
+                    "GET",
+                    "/runs/fixture-external-run?connector_id=fixture%2Flocal",
+                    &token,
+                    serde_json::Value::Null,
+                ))
+                .await
+                .unwrap();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let view: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if view["state"]["state"] == "terminal" {
+                recovered_terminal = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(recovered_terminal, "recovered stream reaches terminal");
     }
 
     #[tokio::test]
