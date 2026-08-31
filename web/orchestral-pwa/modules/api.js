@@ -33,12 +33,12 @@ function encode(value) {
     return encodeURIComponent(String(value));
 }
 
-function newCommandId() {
-    if (typeof globalThis.crypto?.randomUUID === "function") {
-        return globalThis.crypto.randomUUID();
+export function newUuid(cryptoSource = globalThis.crypto) {
+    if (typeof cryptoSource?.randomUUID === "function") {
+        return cryptoSource.randomUUID();
     }
-    if (typeof globalThis.crypto?.getRandomValues === "function") {
-        const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16));
+    if (typeof cryptoSource?.getRandomValues === "function") {
+        const bytes = cryptoSource.getRandomValues(new Uint8Array(16));
         bytes[6] = (bytes[6] & 0x0f) | 0x40;
         bytes[8] = (bytes[8] & 0x3f) | 0x80;
         const hex = [...bytes].map((value) => value.toString(16).padStart(2, "0"));
@@ -194,7 +194,7 @@ export function createApiClient({
     const command = (path, payload, signal) => {
         // Allocate exactly once so an ambiguous transport failure can be
         // retried without applying the command twice on the Host.
-        const body = { command_id: newCommandId(), ...payload };
+        const body = { command_id: newUuid(), ...payload };
         return retryIdempotent(
             () => request(path, { method: "POST", body, signal }),
             signal,
@@ -215,7 +215,7 @@ export function createApiClient({
             signal,
         }),
         listSessions: (signal) => request("/sessions", { signal }),
-        createSession: (sessionId = newCommandId(), signal) => retryIdempotent(
+        createSession: (sessionId = newUuid(), signal) => retryIdempotent(
             () => request("/sessions", {
                 method: "POST",
                 body: { session_id: sessionId },

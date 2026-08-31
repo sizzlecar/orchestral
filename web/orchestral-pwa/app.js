@@ -1,4 +1,4 @@
-import { ApiError, createApiClient } from "./modules/api.js";
+import { ApiError, createApiClient, newUuid } from "./modules/api.js";
 import {
     activeRun,
     createInitialState,
@@ -529,7 +529,7 @@ async function submitComposer(text) {
                 steering: true,
             });
         } else {
-            const requestedRunId = crypto.randomUUID();
+            const requestedRunId = newUuid();
             const response = await api.startRun(session.id, { runId: requestedRunId, input });
             const runId = String(response.run_id ?? requestedRunId);
             const updatedSession = {
