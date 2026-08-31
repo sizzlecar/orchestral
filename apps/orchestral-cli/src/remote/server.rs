@@ -7,12 +7,15 @@ use std::time::Duration;
 use anyhow::{bail, Context};
 use axum::Router;
 use clap::Args;
+use orchestral_core::agent_protocol::reference::AgentRunStatus;
+use orchestral_core::agent_protocol::wire::RunId;
 use qrcode::render::unicode;
 use qrcode::QrCode;
 
 use crate::agent::{build_agent_host, AgentRunOptions};
 use crate::mcp_config::user_config_root;
 
+use super::api::spawn_remembered_approval_driver;
 use super::{
     asset_router, router, GatewayAuthenticator, JwtGatewayAuthenticator, JwtGatewayConfig,
     PairingTicket, RemoteApiState, RemoteRegistry,
@@ -96,16 +99,15 @@ pub(crate) async fn serve(command: ServeCommand, options: AgentRunOptions) -> an
     }
 
     let host = build_agent_host(&options).await?;
+    let remote_state = RemoteApiState {
+        agent: host.api.clone(),
+        approvals: host.approvals.clone(),
+        registry,
+        gateway_authenticator: gateway_authenticator.clone(),
+    };
+    recover_registered_runs(&remote_state).await;
     let app = Router::new()
-        .nest(
-            "/api/v1",
-            router(RemoteApiState {
-                agent: host.api.clone(),
-                approvals: host.approvals.clone(),
-                registry,
-                gateway_authenticator: gateway_authenticator.clone(),
-            }),
-        )
+        .nest("/api/v1", router(remote_state))
         .merge(asset_router());
     let listener = tokio::net::TcpListener::bind(command.listen)
         .await
@@ -141,6 +143,44 @@ pub(crate) async fn serve(command: ServeCommand, options: AgentRunOptions) -> an
         .context("serve Orchestral Host gateway");
     host.shutdown().await;
     result
+}
+
+/// Restores every durable, non-terminal Run owned by the remote registry
+/// before the HTTP surface becomes reachable. Loading a Run into a fresh
+/// controller first records continuity loss; Provider recovery then verifies
+/// and replays its committed prefix, which also re-stages any pending approval
+/// in the replacement Host broker.
+async fn recover_registered_runs(state: &RemoteApiState) {
+    let run_ids = state
+        .registry
+        .sessions()
+        .await
+        .into_iter()
+        .flat_map(|session| session.run_ids)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    for raw_run_id in run_ids {
+        let run_id = RunId::new(raw_run_id);
+        let view = match state.agent.inspect(&run_id).await {
+            Ok(view) => view,
+            Err(error) => {
+                tracing::warn!(run_id = %run_id.as_str(), %error, "could not inspect registered remote Run during Host recovery");
+                continue;
+            }
+        };
+        if view.state.is_terminal() {
+            continue;
+        }
+
+        if view.state.status() == AgentRunStatus::Unknown {
+            if let Err(error) = state.agent.recover(&run_id).await {
+                tracing::warn!(run_id = %run_id.as_str(), %error, "could not recover registered remote Run");
+                continue;
+            }
+        }
+
+        spawn_remembered_approval_driver(state.clone(), run_id);
+    }
 }
 
 fn validate_public_surface(command: &ServeCommand) -> anyhow::Result<()> {

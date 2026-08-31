@@ -246,7 +246,7 @@ async fn start_run(
     Ok((StatusCode::CREATED, Json(StartRunResponse { run_id, view })))
 }
 
-fn spawn_remembered_approval_driver(state: RemoteApiState, run_id: RunId) {
+pub(super) fn spawn_remembered_approval_driver(state: RemoteApiState, run_id: RunId) {
     tokio::spawn(async move {
         let Ok(mut live) = state.agent.subscribe(&run_id).await else {
             return;
