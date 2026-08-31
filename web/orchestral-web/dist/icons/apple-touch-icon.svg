@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="180" height="180" viewBox="0 0 180 180" role="img" aria-labelledby="title">
+  <title id="title">Orchestral app icon</title>
+  <defs>
+    <linearGradient id="bg" x1="20" y1="12" x2="160" y2="170" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#292E41" />
+      <stop offset="1" stop-color="#15171F" />
+    </linearGradient>
+  </defs>
+  <rect width="180" height="180" rx="39" fill="url(#bg)" />
+  <path d="M39 100c16-35 50-52 97-39" fill="none" stroke="#9D96FF" stroke-width="7" stroke-linecap="round" opacity=".76" />
+  <path d="M48 130c31 13 63 4 83-24" fill="none" stroke="#72D2AA" stroke-width="7" stroke-linecap="round" opacity=".72" />
+  <circle cx="90" cy="90" r="36" fill="#1B1E2B" stroke="#F6F2E8" stroke-width="13" />
+  <circle cx="39" cy="100" r="9.5" fill="#F09A71" />
+  <circle cx="136" cy="61" r="9.5" fill="#9D96FF" />
+  <circle cx="131" cy="106" r="9.5" fill="#72D2AA" />
+</svg>
