@@ -167,19 +167,9 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
                 "cmd must be a non-empty string",
             ));
         };
-        let host_execution = requested_host_execution(&invocation.arguments)?;
-        let justification = escalation_justification(&invocation.arguments, host_execution)?;
-        if host_execution
-            && !effective_policy
-                .bounds()
-                .allowed_effects
-                .contains(&EffectScope::HostExecution)
-        {
-            return Err(rejected(
-                "exec_host_execution_denied",
-                "Host configuration does not permit execution outside the default sandbox",
-            ));
-        }
+        let explicitly_requested_host_execution = requested_host_execution(&invocation.arguments)?;
+        let justification =
+            escalation_justification(&invocation.arguments, explicitly_requested_host_execution)?;
         let readable_roots = canonical_roots(&effective_policy.bounds().filesystem.readable_roots)
             .map_err(|message| rejected("exec_read_root_invalid", message))?;
         let writable_roots = canonical_roots(&effective_policy.bounds().filesystem.writable_roots)
@@ -190,18 +180,40 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
                 "exec_command requires readable and writable workspace roots",
             ));
         }
-        let sandboxed_cwd = if host_execution {
-            validate_host_workdir_argument(invocation.arguments.get("workdir"))?;
-            None
-        } else {
-            Some(
-                resolve_workdir(
+        let (host_execution, sandboxed_cwd, implicit_escalation_reason) =
+            if explicitly_requested_host_execution {
+                validate_host_workdir_argument(invocation.arguments.get("workdir"))?;
+                (true, None, None)
+            } else {
+                match resolve_workdir(
                     invocation.arguments.get("workdir"),
                     &readable_roots,
                     &writable_roots,
-                )
-                .map_err(|message| rejected("exec_workdir_invalid", message))?,
-            )
+                ) {
+                    Ok(cwd) => (false, Some(cwd), None),
+                    Err(WorkdirResolutionError::Outside(cwd)) => (
+                        true,
+                        None,
+                        Some(format!(
+                            "Requested workdir is outside the configured workspace roots: {}",
+                            cwd.display()
+                        )),
+                    ),
+                    Err(WorkdirResolutionError::Invalid(message)) => {
+                        return Err(rejected("exec_workdir_invalid", message));
+                    }
+                }
+            };
+        if host_execution
+            && !effective_policy
+                .bounds()
+                .allowed_effects
+                .contains(&EffectScope::HostExecution)
+        {
+            return Err(rejected(
+                "exec_host_execution_denied",
+                "Host configuration does not permit execution outside the default sandbox",
+            ));
         };
         let classification = classify_command(cmd);
         let interactive = invocation
@@ -330,7 +342,9 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
             host_execution_summary(
                 &invocation.arguments,
                 cmd,
-                justification.unwrap_or("Host execution requested"),
+                justification
+                    .or(implicit_escalation_reason.as_deref())
+                    .unwrap_or("Host execution requested"),
             )
         } else {
             format!("Execute in workspace sandbox: {}", display_command(cmd))
@@ -369,14 +383,26 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
         if execution.cancellation.is_cancelled() {
             return ToolOutcome::Cancelled;
         }
-        let host_execution = match requested_host_execution(&execution.invocation.arguments) {
-            Ok(value) => value,
-            Err(outcome) => return outcome,
-        };
-        if let Err(outcome) =
-            escalation_justification(&execution.invocation.arguments, host_execution)
-        {
+        let explicitly_requested_host_execution =
+            match requested_host_execution(&execution.invocation.arguments) {
+                Ok(value) => value,
+                Err(outcome) => return outcome,
+            };
+        if let Err(outcome) = escalation_justification(
+            &execution.invocation.arguments,
+            explicitly_requested_host_execution,
+        ) {
             return outcome;
+        }
+        let host_execution = execution
+            .operation
+            .required_capabilities
+            .requires(EffectScope::HostExecution);
+        if explicitly_requested_host_execution && !host_execution {
+            return rejected(
+                "exec_operation_mismatch",
+                "planned execution no longer matches the invocation's Host execution request",
+            );
         }
         if host_execution
             && (!host_execution_capabilities_are_complete(execution.lease.granted())
@@ -385,17 +411,6 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
             return rejected(
                 "exec_escalation_not_approved",
                 "Host execution requires an exact verified approval capability",
-            );
-        }
-        if !host_execution
-            && execution
-                .lease
-                .granted()
-                .requires(EffectScope::HostExecution)
-        {
-            return rejected(
-                "exec_operation_mismatch",
-                "planned Host execution no longer matches the invocation",
             );
         }
         let bounds = execution.effective_policy.bounds();
@@ -461,6 +476,7 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
                 &readable_roots,
                 &writable_roots,
             )
+            .map_err(WorkdirResolutionError::into_message)
         } {
             Ok(cwd) => cwd,
             Err(message) => return rejected("exec_workdir_invalid", message),
@@ -1233,15 +1249,35 @@ fn validate_host_workdir_argument(value: Option<&Value>) -> Result<(), ToolOutco
     }
 }
 
+#[derive(Debug)]
+enum WorkdirResolutionError {
+    Invalid(String),
+    Outside(PathBuf),
+}
+
+impl WorkdirResolutionError {
+    fn into_message(self) -> String {
+        match self {
+            Self::Invalid(message) => message,
+            Self::Outside(cwd) => format!(
+                "workdir is outside the Host-approved workspace: {}",
+                cwd.display()
+            ),
+        }
+    }
+}
+
 fn resolve_workdir(
     value: Option<&Value>,
     readable_roots: &[PathBuf],
     writable_roots: &[PathBuf],
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, WorkdirResolutionError> {
     let base = writable_roots
         .first()
         .or_else(|| readable_roots.first())
-        .ok_or_else(|| "no workspace root is available".to_owned())?;
+        .ok_or_else(|| {
+            WorkdirResolutionError::Invalid("no workspace root is available".to_owned())
+        })?;
     let requested = match value {
         Some(Value::String(path)) if !path.trim().is_empty() => {
             let path = Path::new(path);
@@ -1251,19 +1287,27 @@ fn resolve_workdir(
                 base.join(path)
             }
         }
-        Some(_) => return Err("workdir must be a non-empty string".to_owned()),
+        Some(_) => {
+            return Err(WorkdirResolutionError::Invalid(
+                "workdir must be a non-empty string".to_owned(),
+            ));
+        }
         None => base.clone(),
     };
-    let cwd = std::fs::canonicalize(&requested)
-        .map_err(|error| format!("resolve workdir '{}': {error}", requested.display()))?;
+    let cwd = std::fs::canonicalize(&requested).map_err(|error| {
+        WorkdirResolutionError::Invalid(format!(
+            "resolve workdir '{}': {error}",
+            requested.display()
+        ))
+    })?;
     if !cwd.is_dir() {
-        return Err(format!("workdir is not a directory: {}", cwd.display()));
+        return Err(WorkdirResolutionError::Invalid(format!(
+            "workdir is not a directory: {}",
+            cwd.display()
+        )));
     }
     if !writable_roots.iter().any(|root| cwd.starts_with(root)) {
-        return Err(format!(
-            "workdir is outside the Host-approved workspace: {}",
-            cwd.display()
-        ));
+        return Err(WorkdirResolutionError::Outside(cwd));
     }
     Ok(cwd)
 }

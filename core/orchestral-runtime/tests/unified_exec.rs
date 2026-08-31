@@ -919,24 +919,45 @@ async fn host_execution_requires_an_exact_approval_and_can_use_an_external_workd
         "host-execution-run",
         "default-outside-workdir",
         "orchestral/exec_command/v1",
-        json!({ "cmd": "pwd", "workdir": external }),
+        json!({ "cmd": "cat evidence.txt", "workdir": external }),
     );
-    assert!(matches!(
+    let implicit_escalation = runtime
+        .invoke(
+            default_request.clone(),
+            RunToolGrant {
+                bounds: bounds.clone(),
+            },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    let GuardedToolResult::ApprovalRequired { binding, summary } = implicit_escalation else {
+        panic!("an external workdir must automatically enter approval: {implicit_escalation:?}")
+    };
+    assert!(binding
+        .requested_capabilities
+        .requires(EffectScope::HostExecution));
+    assert!(summary.contains("outside the configured workspace roots"));
+    assert!(summary.contains(external.to_string_lossy().as_ref()));
+    let approval = HostApprovalIssuer::new(SIGNING_KEY)
+        .unwrap()
+        .issue(binding, i64::MAX)
+        .unwrap();
+    let output = inline_output(
         runtime
             .invoke(
                 default_request,
                 RunToolGrant {
                     bounds: bounds.clone(),
                 },
-                None,
+                Some(approval),
                 CancellationToken::new(),
             )
             .await,
-        GuardedToolResult::Outcome {
-            outcome: ToolOutcome::Rejected { ref code, .. },
-            ..
-        } if code == "exec_workdir_invalid"
-    ));
+    );
+    assert_eq!(output["exit_code"], json!(0));
+    assert_eq!(output["stdout"], json!("approved-host-evidence"));
+    assert_eq!(output["sandbox_backend"], json!("host-approved"));
 
     let missing_justification = invocation(
         "host-execution-run",
