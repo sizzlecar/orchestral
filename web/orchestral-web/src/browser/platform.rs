@@ -92,7 +92,12 @@ pub fn apply_theme(theme: &str) {
 }
 
 pub async fn copy_text(text: &str) -> Result<(), String> {
-    let clipboard = window()?.navigator().clipboard();
+    let navigator = window()?.navigator();
+    let Some(clipboard) =
+        optional_browser_capability::<web_sys::Clipboard>(navigator.as_ref(), "clipboard")?
+    else {
+        return Err("当前地址不支持系统剪贴板，请使用浏览器文本选择复制".to_owned());
+    };
     JsFuture::from(clipboard.write_text(text))
         .await
         .map(|_| ())
@@ -101,11 +106,34 @@ pub async fn copy_text(text: &str) -> Result<(), String> {
 
 pub async fn register_service_worker() -> Result<(), String> {
     let navigator = window()?.navigator();
-    let service_workers = navigator.service_worker();
+    let Some(service_workers) = optional_browser_capability::<web_sys::ServiceWorkerContainer>(
+        navigator.as_ref(),
+        "serviceWorker",
+    )?
+    else {
+        // Service workers are intentionally absent on non-secure origins such
+        // as a LAN HTTP address. The remote control surface must still work;
+        // only offline/install support is unavailable there.
+        return Ok(());
+    };
     JsFuture::from(service_workers.register("./sw.js"))
         .await
         .map(|_| ())
         .map_err(js_error)
+}
+
+fn optional_browser_capability<T>(owner: &JsValue, name: &str) -> Result<Option<T>, String>
+where
+    T: JsCast,
+{
+    let value = Reflect::get(owner, &JsValue::from_str(name)).map_err(js_error)?;
+    if value.is_null() || value.is_undefined() {
+        return Ok(None);
+    }
+    value
+        .dyn_into::<T>()
+        .map(Some)
+        .map_err(|_| format!("Browser capability '{name}' has an unexpected type"))
 }
 
 pub fn install_event_prompt(event: &JsValue) {
