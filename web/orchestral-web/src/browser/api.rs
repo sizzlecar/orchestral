@@ -8,7 +8,10 @@ use thiserror::Error;
 use wasm_bindgen::JsValue;
 
 use crate::browser::platform::new_uuid;
-use crate::model::{DeviceView, EventsResponse, PairingClaim, SessionView, StreamEvent};
+use crate::model::{
+    AgentConnectorView, AgentSessionDetail, AgentSessionPage, DeviceView, EventsResponse,
+    PairingClaim, SessionView, StreamEvent,
+};
 use crate::sse::SseParser;
 
 const API_BASE: &str = "/api/v1";
@@ -95,13 +98,56 @@ impl ApiClient {
         .await
     }
 
+    pub async fn agent_connectors(
+        &self,
+        credential: &ApiCredential,
+    ) -> Result<Vec<AgentConnectorView>, ApiError> {
+        self.get("/agent-connectors", credential).await
+    }
+
+    pub async fn agent_sessions(
+        &self,
+        credential: &ApiCredential,
+        connector_id: &str,
+    ) -> Result<AgentSessionPage, ApiError> {
+        self.get(
+            &format!(
+                "/agent-sessions?connector_id={}&limit=100",
+                encode(connector_id)
+            ),
+            credential,
+        )
+        .await
+    }
+
+    pub async fn agent_session(
+        &self,
+        credential: &ApiCredential,
+        connector_id: &str,
+        session_id: &str,
+    ) -> Result<AgentSessionDetail, ApiError> {
+        self.get(
+            &format!(
+                "/agent-session?connector_id={}&session_id={}",
+                encode(connector_id),
+                encode(session_id)
+            ),
+            credential,
+        )
+        .await
+    }
+
     pub async fn get_run(
         &self,
         credential: &ApiCredential,
         run_id: &str,
+        connector_id: Option<&str>,
     ) -> Result<Value, ApiError> {
-        self.get(&format!("/runs/{}", encode(run_id)), credential)
-            .await
+        self.get(
+            &with_connector(&format!("/runs/{}", encode(run_id)), connector_id),
+            credential,
+        )
+        .await
     }
 
     pub async fn events(
@@ -109,9 +155,13 @@ impl ApiClient {
         credential: &ApiCredential,
         run_id: &str,
         after: u64,
+        connector_id: Option<&str>,
     ) -> Result<EventsResponse, ApiError> {
         self.get(
-            &format!("/runs/{}/events?after={after}", encode(run_id)),
+            &with_connector(
+                &format!("/runs/{}/events?after={after}", encode(run_id)),
+                connector_id,
+            ),
             credential,
         )
         .await
@@ -132,15 +182,37 @@ impl ApiClient {
         .await
     }
 
+    pub async fn start_agent_run(
+        &self,
+        credential: &ApiCredential,
+        connector_id: &str,
+        session_id: &str,
+        run_id: &str,
+        input: &str,
+    ) -> Result<Value, ApiError> {
+        self.post(
+            "/agent-runs",
+            credential,
+            &json!({
+                "connector_id": connector_id,
+                "session_id": session_id,
+                "run_id": run_id,
+                "input": input
+            }),
+        )
+        .await
+    }
+
     pub async fn steer(
         &self,
         credential: &ApiCredential,
         run_id: &str,
         text: &str,
+        connector_id: Option<&str>,
     ) -> Result<Value, ApiError> {
         self.command(
             credential,
-            &format!("/runs/{}/steer", encode(run_id)),
+            &with_connector(&format!("/runs/{}/steer", encode(run_id)), connector_id),
             json!({ "text": text }),
         )
         .await
@@ -151,10 +223,11 @@ impl ApiClient {
         credential: &ApiCredential,
         run_id: &str,
         reason: &str,
+        connector_id: Option<&str>,
     ) -> Result<Value, ApiError> {
         self.command(
             credential,
-            &format!("/runs/{}/cancel", encode(run_id)),
+            &with_connector(&format!("/runs/{}/cancel", encode(run_id)), connector_id),
             json!({ "reason": reason }),
         )
         .await
@@ -166,13 +239,17 @@ impl ApiClient {
         run_id: &str,
         request_id: &str,
         text: &str,
+        connector_id: Option<&str>,
     ) -> Result<Value, ApiError> {
         self.command(
             credential,
-            &format!(
-                "/runs/{}/requests/{}/input",
-                encode(run_id),
-                encode(request_id)
+            &with_connector(
+                &format!(
+                    "/runs/{}/requests/{}/input",
+                    encode(run_id),
+                    encode(request_id)
+                ),
+                connector_id,
             ),
             json!({ "text": text }),
         )
@@ -185,13 +262,17 @@ impl ApiClient {
         run_id: &str,
         request_id: &str,
         decision: &str,
+        connector_id: Option<&str>,
     ) -> Result<Value, ApiError> {
         self.command(
             credential,
-            &format!(
-                "/runs/{}/requests/{}/approval",
-                encode(run_id),
-                encode(request_id)
+            &with_connector(
+                &format!(
+                    "/runs/{}/requests/{}/approval",
+                    encode(run_id),
+                    encode(request_id)
+                ),
+                connector_id,
             ),
             json!({ "decision": decision }),
         )
@@ -203,6 +284,7 @@ impl ApiClient {
         credential: &ApiCredential,
         run_id: &str,
         after: u64,
+        connector_id: Option<&str>,
         signal: &web_sys::AbortSignal,
         mut on_event: F,
     ) -> Result<(), ApiError>
@@ -211,8 +293,11 @@ impl ApiClient {
     {
         let mut request = self.authenticated(
             Request::get(&format!(
-                "{API_BASE}/runs/{}/stream?after={after}",
-                encode(run_id)
+                "{API_BASE}{}",
+                with_connector(
+                    &format!("/runs/{}/stream?after={after}", encode(run_id)),
+                    connector_id
+                )
             ))
             .header("Accept", "text/event-stream")
             .header("Cache-Control", "no-cache")
@@ -355,6 +440,14 @@ fn encode(value: &str) -> String {
     js_sys::encode_uri_component(value)
         .as_string()
         .unwrap_or_default()
+}
+
+fn with_connector(path: &str, connector_id: Option<&str>) -> String {
+    let Some(connector_id) = connector_id else {
+        return path.to_owned();
+    };
+    let separator = if path.contains('?') { '&' } else { '?' };
+    format!("{path}{separator}connector_id={}", encode(connector_id))
 }
 
 fn js_message(value: &JsValue) -> String {

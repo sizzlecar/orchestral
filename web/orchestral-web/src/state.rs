@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
-use crate::model::{DeviceView, SessionView};
+use crate::model::{AgentSessionDetail, DeviceView, SessionView};
 
 const MAX_TELEMETRY_IDS: usize = 800;
 const INITIAL_INPUT_ORDER: u64 = 0;
@@ -97,6 +97,7 @@ pub struct Progress {
 pub struct RunState {
     pub id: String,
     pub session_id: Option<String>,
+    pub connector_id: Option<String>,
     pub status: String,
     pub view: Option<Value>,
     pub cursor: u64,
@@ -125,6 +126,7 @@ impl RunState {
         Self {
             id: id.into(),
             session_id,
+            connector_id: None,
             status: "loading".to_owned(),
             view: None,
             cursor: 0,
@@ -734,6 +736,15 @@ impl AppState {
     }
 
     pub fn ensure_run(&mut self, run_id: &str, session_id: Option<String>) -> &mut RunState {
+        self.ensure_run_source(run_id, session_id, None)
+    }
+
+    pub fn ensure_run_source(
+        &mut self,
+        run_id: &str,
+        session_id: Option<String>,
+        connector_id: Option<String>,
+    ) -> &mut RunState {
         if !self.runs.contains_key(run_id) {
             self.run_order.push(run_id.to_owned());
             self.runs
@@ -743,6 +754,9 @@ impl AppState {
         if session_id.is_some() {
             run.session_id = session_id;
         }
+        if connector_id.is_some() {
+            run.connector_id = connector_id;
+        }
         run
     }
 
@@ -751,7 +765,66 @@ impl AppState {
         self.sessions
             .items
             .iter()
-            .find(|session| session.id == selected)
+            .find(|session| session.key() == selected)
+    }
+
+    pub fn project_agent_session(&mut self, detail: AgentSessionDetail) {
+        let connector_id = detail.summary.connector_id.clone();
+        let session_id = detail.summary.session_id.clone();
+        let run_id = format!("agent-history:{connector_id}:{session_id}");
+        let run = self.ensure_run_source(&run_id, Some(session_id), Some(connector_id));
+        run.status = "delivered".to_owned();
+        run.messages.clear();
+        run.activities.clear();
+        run.commands.clear();
+        run.streamed_outputs.clear();
+        run.presentation_cursor = 0;
+
+        for turn in detail.turns {
+            for activity in turn.activities {
+                let order = run.next_order();
+                let text = contents_text(Some(&Value::Array(activity.content.clone())));
+                match activity.kind.as_str() {
+                    "user_message" | "agent_message" => {
+                        if !text.is_empty() {
+                            run.messages.push(Message {
+                                id: activity.activity_id,
+                                role: if activity.kind == "user_message" {
+                                    "user".to_owned()
+                                } else {
+                                    "assistant".to_owned()
+                                },
+                                text,
+                                order,
+                                optimistic: false,
+                                partial: false,
+                                steering: false,
+                            });
+                        }
+                    }
+                    _ => {
+                        let mut evidence = Vec::new();
+                        if !activity.details.is_null() {
+                            evidence.push(activity.details);
+                        }
+                        if !text.is_empty() {
+                            evidence.push(serde_json::json!({
+                                "type": "note",
+                                "text": text,
+                            }));
+                        }
+                        run.activities.push(ToolActivity {
+                            id: activity.activity_id,
+                            tool_name: activity.title.unwrap_or_else(|| activity.kind.clone()),
+                            state: activity.status,
+                            evidence,
+                            order,
+                        });
+                    }
+                }
+            }
+        }
+        run.pending = detail.pending_requests;
     }
 
     pub fn current_run(&self) -> Option<&RunState> {
@@ -1132,6 +1205,82 @@ mod tests {
         );
         assert!(
             matches!(&timeline[1], TimelineItem::Message(value) if value.role == "assistant" && value.text == "done")
+        );
+    }
+
+    #[test]
+    fn connector_namespace_prevents_same_session_id_from_colliding() {
+        let native: SessionView = serde_json::from_value(serde_json::json!({
+            "id": "same-id",
+            "created_at_unix_ms": 1,
+            "updated_at_unix_ms": 1,
+            "run_ids": []
+        }))
+        .unwrap();
+        let external: SessionView = serde_json::from_value(serde_json::json!({
+            "id": "same-id",
+            "created_at_unix_ms": 1,
+            "updated_at_unix_ms": 1,
+            "run_ids": [],
+            "connector_id": "codex/local"
+        }))
+        .unwrap();
+
+        assert_ne!(native.key(), external.key());
+    }
+
+    #[test]
+    fn external_agent_history_projects_messages_and_operations_in_order() {
+        let detail: AgentSessionDetail = serde_json::from_value(serde_json::json!({
+            "summary": {
+                "connector_id": "codex/local",
+                "session_id": "thread-1",
+                "title": "Existing Codex thread",
+                "state": "idle"
+            },
+            "turns": [{
+                "turn_id": "turn-1",
+                "status": "completed",
+                "activities": [
+                    {
+                        "activity_id": "user-1",
+                        "kind": "user_message",
+                        "status": "completed",
+                        "content": [{"body": {"kind": "inline", "value": "inspect it"}}]
+                    },
+                    {
+                        "activity_id": "command-1",
+                        "kind": "command",
+                        "status": "completed",
+                        "title": "cargo test",
+                        "content": [],
+                        "details": {"type": "command", "command": "cargo test"}
+                    },
+                    {
+                        "activity_id": "agent-1",
+                        "kind": "agent_message",
+                        "status": "completed",
+                        "content": [{"body": {"kind": "inline", "value": "tests pass"}}]
+                    }
+                ]
+            }],
+            "pending_requests": []
+        }))
+        .unwrap();
+        let mut state = AppState::new(true);
+        state.project_agent_session(detail);
+
+        let run = state
+            .runs
+            .get("agent-history:codex/local:thread-1")
+            .unwrap();
+        let timeline = timeline_for_run(run);
+        assert!(matches!(&timeline[0], TimelineItem::Message(message) if message.role == "user"));
+        assert!(
+            matches!(&timeline[1], TimelineItem::Activity(activity) if activity.tool_name == "cargo test")
+        );
+        assert!(
+            matches!(&timeline[2], TimelineItem::Message(message) if message.role == "assistant")
         );
     }
 }

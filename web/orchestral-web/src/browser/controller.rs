@@ -204,6 +204,21 @@ impl AppController {
         self.state.write().sessions.status = LoadStatus::Loading;
         match self.api.sessions(&token).await {
             Ok(mut sessions) => {
+                if let Ok(connectors) = self.api.agent_connectors(&token).await {
+                    for connector in connectors {
+                        if let Ok(page) = self
+                            .api
+                            .agent_sessions(&token, &connector.connector_id)
+                            .await
+                        {
+                            sessions.extend(
+                                page.sessions
+                                    .into_iter()
+                                    .map(|session| session.into_session()),
+                            );
+                        }
+                    }
+                }
                 sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at_unix_ms));
                 let selected_id = {
                     let state = self.state.read();
@@ -211,8 +226,8 @@ impl AppController {
                         .sessions
                         .selected_id
                         .clone()
-                        .filter(|selected| sessions.iter().any(|item| &item.id == selected))
-                        .or_else(|| sessions.first().map(|session| session.id.clone()))
+                        .filter(|selected| sessions.iter().any(|item| &item.key() == selected))
+                        .or_else(|| sessions.first().map(SessionView::key))
                 };
                 {
                     let mut state = self.state.write();
@@ -245,24 +260,48 @@ impl AppController {
         }
     }
 
-    pub async fn load_session(mut self, session_id: String) {
+    pub async fn load_session(mut self, session_key: String) {
         self.stop_stream();
-        {
-            let mut state = self.state.write();
-            state.sessions.selected_id = Some(session_id.clone());
-            state.ui.drawer_open = false;
-        }
-        let run_ids = self
+        let Some(session) = self
             .state
             .read()
             .sessions
             .items
             .iter()
-            .find(|session| session.id == session_id)
-            .map(|session| session.run_ids.clone())
-            .unwrap_or_default();
-        for run_id in run_ids {
-            self.load_run_snapshot(&run_id, &session_id).await;
+            .find(|session| session.key() == session_key)
+            .cloned()
+        else {
+            self.notice("会话已不存在，请刷新列表", "warning");
+            return;
+        };
+        {
+            let mut state = self.state.write();
+            state.sessions.selected_id = Some(session_key);
+            state.ui.drawer_open = false;
+        }
+        if let Some(connector_id) = session.connector_id.as_deref() {
+            let Some(token) = self.token.read().clone() else {
+                return;
+            };
+            match self
+                .api
+                .agent_session(&token, connector_id, &session.id)
+                .await
+            {
+                Ok(detail) => self.state.write().project_agent_session(detail),
+                Err(error) if error.status == 401 => {
+                    self.clear_auth(Some(error.message)).await;
+                    return;
+                }
+                Err(error) => self.notice(&error.message, "error"),
+            }
+        }
+        for run_id in session.run_ids {
+            if run_id.starts_with("agent-history:") {
+                continue;
+            }
+            self.load_run_snapshot(&run_id, &session.id, session.connector_id.as_deref())
+                .await;
         }
         let active = self.state.read().active_run().map(|run| run.id.clone());
         if let Some(run_id) = active {
@@ -279,20 +318,35 @@ impl AppController {
         }
     }
 
-    async fn load_run_snapshot(mut self, run_id: &str, session_id: &str) {
+    async fn load_run_snapshot(
+        mut self,
+        run_id: &str,
+        session_id: &str,
+        connector_id: Option<&str>,
+    ) {
         let Some(token) = self.token.read().clone() else {
             return;
         };
         let cursor = {
             let mut state = self.state.write();
-            state.ensure_run(run_id, Some(session_id.to_owned())).cursor
+            state
+                .ensure_run_source(
+                    run_id,
+                    Some(session_id.to_owned()),
+                    connector_id.map(str::to_owned),
+                )
+                .cursor
         };
-        let events = self.api.events(&token, run_id, cursor).await;
-        let view = self.api.get_run(&token, run_id).await;
+        let events = self.api.events(&token, run_id, cursor, connector_id).await;
+        let view = self.api.get_run(&token, run_id, connector_id).await;
         if let Ok(page) = events {
             let now = platform::now();
             let mut state = self.state.write();
-            let run = state.ensure_run(run_id, Some(session_id.to_owned()));
+            let run = state.ensure_run_source(
+                run_id,
+                Some(session_id.to_owned()),
+                connector_id.map(str::to_owned),
+            );
             for record in page.records {
                 run.project_durable(&record, now);
             }
@@ -301,13 +355,21 @@ impl AppController {
             Ok(view) => {
                 self.state
                     .write()
-                    .ensure_run(run_id, Some(session_id.to_owned()))
+                    .ensure_run_source(
+                        run_id,
+                        Some(session_id.to_owned()),
+                        connector_id.map(str::to_owned),
+                    )
                     .apply_view(view, platform::now());
             }
             Err(error) if error.status == 401 => self.clear_auth(Some(error.message)).await,
             Err(error) => {
                 let mut state = self.state.write();
-                let run = state.ensure_run(run_id, Some(session_id.to_owned()));
+                let run = state.ensure_run_source(
+                    run_id,
+                    Some(session_id.to_owned()),
+                    connector_id.map(str::to_owned),
+                );
                 run.error = Some(error.message);
                 if run.status == "loading" {
                     run.status = "unknown".to_owned();
@@ -317,14 +379,20 @@ impl AppController {
     }
 
     pub async fn refresh_run(self, run_id: &str) {
-        let session_id = self
+        let (session_id, connector_id) = self
             .state
             .read()
             .runs
             .get(run_id)
-            .and_then(|run| run.session_id.clone())
+            .map(|run| {
+                (
+                    run.session_id.clone().unwrap_or_default(),
+                    run.connector_id.clone(),
+                )
+            })
             .unwrap_or_default();
-        self.load_run_snapshot(run_id, &session_id).await;
+        self.load_run_snapshot(run_id, &session_id, connector_id.as_deref())
+            .await;
     }
 
     pub async fn create_session(self) -> Option<SessionView> {
@@ -339,7 +407,7 @@ impl AppController {
         match result {
             Ok(session) => {
                 self.upsert_session(session.clone(), true);
-                self.load_session(session.id.clone()).await;
+                self.load_session(session.key()).await;
                 Some(session)
             }
             Err(error) => {
@@ -379,12 +447,20 @@ impl AppController {
 
         let active_run_id = { self.state.read().active_run().map(|run| run.id.clone()) };
         if let Some(run_id) = active_run_id {
-            match self.api.steer(&token, &run_id, &input).await {
+            match self
+                .api
+                .steer(&token, &run_id, &input, session.connector_id.as_deref())
+                .await
+            {
                 Ok(ack) => match check_ack(&ack, "引导") {
                     Ok(command_id) => {
                         self.state
                             .write()
-                            .ensure_run(&run_id, Some(session.id.clone()))
+                            .ensure_run_source(
+                                &run_id,
+                                Some(session.id.clone()),
+                                session.connector_id.clone(),
+                            )
                             .optimistic_steer(format!("steer-{command_id}"), input);
                     }
                     Err(error) => self.notice(&error.message, "error"),
@@ -412,18 +488,30 @@ impl AppController {
         self.upsert_session(pending_session, true);
         self.state
             .write()
-            .ensure_run(&run_id, Some(session.id.clone()))
+            .ensure_run_source(
+                &run_id,
+                Some(session.id.clone()),
+                session.connector_id.clone(),
+            )
             .optimistic_start_input(input.clone(), now);
         spawn(async move {
             TimeoutFuture::new(0).await;
             platform::scroll_timeline_to_end();
         });
 
-        match self
-            .api
-            .start_run(&token, &session.id, &run_id, &input)
-            .await
-        {
+        let start = match session.connector_id.as_deref() {
+            Some(connector_id) => {
+                self.api
+                    .start_agent_run(&token, connector_id, &session.id, &run_id, &input)
+                    .await
+            }
+            None => {
+                self.api
+                    .start_run(&token, &session.id, &run_id, &input)
+                    .await
+            }
+        };
+        match start {
             Ok(response) => {
                 let actual_run_id = response
                     .get("run_id")
@@ -434,6 +522,7 @@ impl AppController {
                     if let Some(mut provisional) = state.runs.remove(&run_id) {
                         provisional.id = actual_run_id.clone();
                         provisional.session_id = Some(session.id.clone());
+                        provisional.connector_id = session.connector_id.clone();
                         if let Some(initial) = provisional
                             .messages
                             .iter_mut()
@@ -457,7 +546,11 @@ impl AppController {
                 self.upsert_session(updated, true);
                 {
                     let mut state = self.state.write();
-                    let run = state.ensure_run(&actual_run_id, Some(session.id.clone()));
+                    let run = state.ensure_run_source(
+                        &actual_run_id,
+                        Some(session.id.clone()),
+                        session.connector_id.clone(),
+                    );
                     run.record_started_input(input, platform::now());
                     if let Some(view) = response.get("view") {
                         run.apply_view(view.clone(), platform::now());
@@ -488,13 +581,23 @@ impl AppController {
         let Some(token) = self.token.read().clone() else {
             return;
         };
-        let Some(run_id) = self.state.read().active_run().map(|run| run.id.clone()) else {
+        let Some((run_id, connector_id)) = self
+            .state
+            .read()
+            .active_run()
+            .map(|run| (run.id.clone(), run.connector_id.clone()))
+        else {
             return;
         };
         self.set_busy(true);
         match self
             .api
-            .cancel(&token, &run_id, "Cancelled from paired device")
+            .cancel(
+                &token,
+                &run_id,
+                "Cancelled from paired device",
+                connector_id.as_deref(),
+            )
             .await
         {
             Ok(ack) => match check_ack(&ack, "取消") {
@@ -510,10 +613,22 @@ impl AppController {
         let Some(token) = self.token.read().clone() else {
             return;
         };
+        let connector_id = self
+            .state
+            .read()
+            .runs
+            .get(&run_id)
+            .and_then(|run| run.connector_id.clone());
         self.set_busy(true);
         match self
             .api
-            .resolve_input(&token, &run_id, &request_id, text.trim())
+            .resolve_input(
+                &token,
+                &run_id,
+                &request_id,
+                text.trim(),
+                connector_id.as_deref(),
+            )
             .await
         {
             Ok(ack) => {
@@ -532,10 +647,22 @@ impl AppController {
         let Some(token) = self.token.read().clone() else {
             return;
         };
+        let connector_id = self
+            .state
+            .read()
+            .runs
+            .get(&run_id)
+            .and_then(|run| run.connector_id.clone());
         self.set_busy(true);
         match self
             .api
-            .resolve_approval(&token, &run_id, &request_id, &decision)
+            .resolve_approval(
+                &token,
+                &run_id,
+                &request_id,
+                &decision,
+                connector_id.as_deref(),
+            )
             .await
         {
             Ok(ack) => {
@@ -612,6 +739,12 @@ impl AppController {
                 .get(&run_id)
                 .map(|run| run.cursor)
                 .unwrap_or_default();
+            let connector_id = self
+                .state
+                .read()
+                .runs
+                .get(&run_id)
+                .and_then(|run| run.connector_id.clone());
             {
                 let mut state = self.state.write();
                 state.connection.stream = if attempt == 0 {
@@ -631,6 +764,7 @@ impl AppController {
                     &token,
                     &run_id,
                     cursor,
+                    connector_id.as_deref(),
                     &controller.signal(),
                     move |event| event_controller.handle_stream_event(&event_run_id, event),
                 )
@@ -773,7 +907,11 @@ impl AppController {
 
     fn upsert_session(mut self, session: SessionView, select: bool) {
         let mut state = self.state.write();
-        state.sessions.items.retain(|item| item.id != session.id);
+        let session_key = session.key();
+        state
+            .sessions
+            .items
+            .retain(|item| item.key() != session_key);
         state.sessions.items.push(session.clone());
         state
             .sessions
@@ -782,7 +920,7 @@ impl AppController {
         state.sessions.status = LoadStatus::Ready;
         state.sessions.error = None;
         if select {
-            state.sessions.selected_id = Some(session.id);
+            state.sessions.selected_id = Some(session_key);
         }
     }
 

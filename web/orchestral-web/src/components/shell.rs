@@ -78,6 +78,11 @@ pub fn Workspace() -> Element {
         .as_ref()
         .map(|session| session_title(&state, session))
         .unwrap_or_else(|| "新会话".to_owned());
+    let session_source = selected
+        .as_ref()
+        .and_then(|session| session.connector_id.as_deref())
+        .map(connector_label)
+        .unwrap_or("Orchestral");
     let run = state.current_run().cloned();
     let install_available = state.ui.install_available;
 
@@ -152,8 +157,8 @@ pub fn Workspace() -> Element {
                         ul { class: "thread-list",
                             for session in state.sessions.items.iter() {
                                 {
-                                    let session_id = session.id.clone();
-                                    let selected = state.sessions.selected_id.as_deref() == Some(&session.id);
+                                    let session_key = session.key();
+                                    let selected = state.sessions.selected_id.as_deref() == Some(session_key.as_str());
                                     let title = session_title(&state, session);
                                     let updated = format_date(session.updated_at_unix_ms);
                                     rsx! {
@@ -163,11 +168,17 @@ pub fn Workspace() -> Element {
                                                 r#type: "button",
                                                 aria_current: if selected { "page" } else { "false" },
                                                 onclick: move |_| {
-                                                    let selected = session_id.clone();
+                                                    let selected = session_key.clone();
                                                     spawn(async move { controller.load_session(selected).await });
                                                 },
                                                 span { class: "thread-button__title", "{title}" }
-                                                span { class: "thread-button__meta", "{updated}" }
+                                                span { class: "thread-button__meta",
+                                                    if let Some(connector_id) = session.connector_id.as_deref() {
+                                                        "{connector_label(connector_id)} · {updated}"
+                                                    } else {
+                                                        "{updated}"
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -203,7 +214,7 @@ pub fn Workspace() -> Element {
                 main { class: "conversation", id: "main-content", tabindex: "-1",
                     header { class: "conversation-header",
                         div { class: "conversation-header__title",
-                            p { class: "eyebrow", "当前会话" }
+                            p { class: "eyebrow", "{session_source} 会话" }
                             h1 { "{title}" }
                         }
                         RunStatusBadge { run }
@@ -347,6 +358,13 @@ fn Composer() -> Element {
 }
 
 fn session_title(state: &crate::state::AppState, session: &crate::model::SessionView) -> String {
+    if let Some(title) = session
+        .title
+        .as_ref()
+        .filter(|title| !title.trim().is_empty())
+    {
+        return title.clone();
+    }
     for run_id in &session.run_ids {
         if let Some(text) = state
             .runs
@@ -375,6 +393,10 @@ fn session_title(state: &crate::state::AppState, session: &crate::model::Session
 
 fn short_id(value: &str) -> String {
     value.chars().take(8).collect()
+}
+
+fn connector_label(connector_id: &str) -> &str {
+    connector_id.split('/').next().unwrap_or(connector_id)
 }
 
 fn format_date(milliseconds: i64) -> String {
