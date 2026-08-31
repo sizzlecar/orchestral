@@ -2,7 +2,9 @@ use dioxus::prelude::*;
 use serde_json::Value;
 
 use crate::browser::{controller::AppController, platform};
-use crate::state::{timeline_for_run, TimelineItem, ToolActivity};
+use crate::state::{
+    timeline_blocks_for_run, CommandActivity, TimelineBlock, TimelineItem, ToolActivity,
+};
 
 #[component]
 pub fn ConversationTimeline() -> Element {
@@ -18,7 +20,9 @@ pub fn ConversationTimeline() -> Element {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let empty = runs.iter().all(|run| timeline_for_run(run).is_empty());
+    let empty = runs
+        .iter()
+        .all(|run| timeline_blocks_for_run(run).is_empty());
     drop(state);
 
     rsx! {
@@ -38,8 +42,8 @@ pub fn ConversationTimeline() -> Element {
                 }
             } else {
                 for run in runs {
-                    for (index, item) in timeline_for_run(&run).into_iter().enumerate() {
-                        TimelineEntry { key: "{run.id}-{index}", run_id: run.id.clone(), item }
+                    for (index, block) in timeline_blocks_for_run(&run).into_iter().enumerate() {
+                        TimelineBlockView { key: "{run.id}-{index}", run_id: run.id.clone(), block }
                     }
                     if let Some(failure) = run.failure.as_ref() {
                         RunFailure { value: failure.clone() }
@@ -49,6 +53,14 @@ pub fn ConversationTimeline() -> Element {
                 }
             }
         }
+    }
+}
+
+#[component]
+fn TimelineBlockView(run_id: String, block: TimelineBlock) -> Element {
+    match block {
+        TimelineBlock::Entry(item) => rsx! { TimelineEntry { run_id, item } },
+        TimelineBlock::ActivityGroup(items) => rsx! { ActivityGroupView { items } },
     }
 }
 
@@ -75,28 +87,8 @@ fn TimelineEntry(run_id: String, item: TimelineItem) -> Element {
                 streaming: true
             }
         },
-        TimelineItem::Activity(activity) => rsx! {
-            section { class: "run-activity", aria_label: "运行活动",
-                ToolActivityView { activity }
-            }
-        },
-        TimelineItem::Command(command) => rsx! {
-            section { class: "run-activity", aria_label: "运行活动",
-                details { class: "activity-item activity-item--command",
-                    summary { class: "activity-item__summary",
-                        span { class: "activity-state activity-state--{command.state}", aria_hidden: "true" }
-                        span { class: "activity-item__name", {command.kind.replace('_', " ")} }
-                        span { class: "activity-item__status", "{command.state}" }
-                    }
-                    div { class: "activity-item__body",
-                        if !command.summary.is_empty() {
-                            pre { class: "command-block", tabindex: "0", "{command.summary}" }
-                        }
-                        small { "command_id: {command.id}" }
-                    }
-                }
-            }
-        },
+        TimelineItem::Activity(activity) => rsx! { ToolActivityView { activity } },
+        TimelineItem::Command(command) => rsx! { CommandActivityView { command } },
         TimelineItem::Progress(progress) => {
             let label = progress
                 .fraction
@@ -113,6 +105,84 @@ fn TimelineEntry(run_id: String, item: TimelineItem) -> Element {
                 }
             }
         }
+    }
+}
+
+#[component]
+fn ActivityGroupView(items: Vec<TimelineItem>) -> Element {
+    let failures = items
+        .iter()
+        .filter(|item| operation_state(item).is_some_and(is_failure_state))
+        .count();
+    let running = items
+        .iter()
+        .filter(|item| operation_state(item).is_some_and(is_running_state))
+        .count();
+    let state = if failures > 0 {
+        "failed"
+    } else if running > 0 {
+        "running"
+    } else {
+        "succeeded"
+    };
+    let status = if failures > 0 {
+        format!("{failures} 项失败")
+    } else if running > 0 {
+        format!("{running} 项进行中")
+    } else {
+        "已完成".to_owned()
+    };
+    let latest = items
+        .last()
+        .map(operation_name)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "Agent 操作".to_owned());
+    let count = items.len();
+    let mut expanded = use_signal(|| failures > 0);
+
+    use_effect(use_reactive((&failures,), move |(failures,)| {
+        if failures > 0 {
+            expanded.set(true);
+        }
+    }));
+
+    rsx! {
+        section { class: "run-activity", aria_label: "运行活动",
+            div { class: "activity-group", "data-state": state,
+                button {
+                    class: "activity-group__summary",
+                    r#type: "button",
+                    aria_expanded: expanded(),
+                    onclick: move |_| expanded.toggle(),
+                    span { class: "activity-state activity-state--{state}", aria_hidden: "true" }
+                    span { class: "activity-group__copy",
+                        strong { "{count} 项操作" }
+                        span { "最近：{latest}" }
+                    }
+                    span { class: "activity-group__status", "{status}" }
+                    span {
+                        class: if expanded() { "activity-group__chevron is-open" } else { "activity-group__chevron" },
+                        aria_hidden: "true"
+                    }
+                }
+                if expanded() {
+                    div { class: "activity-group__body",
+                        for (index, item) in items.into_iter().enumerate() {
+                            ActivityGroupEntry { key: "{index}", item }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn ActivityGroupEntry(item: TimelineItem) -> Element {
+    match item {
+        TimelineItem::Activity(activity) => rsx! { ToolActivityView { activity } },
+        TimelineItem::Command(command) => rsx! { CommandActivityView { command } },
+        _ => rsx! {},
     }
 }
 
@@ -159,7 +229,7 @@ fn MessageView(
 
 #[component]
 fn ToolActivityView(activity: ToolActivity) -> Element {
-    let open = activity.state == "running";
+    let open = is_running_state(&activity.state) || is_failure_state(&activity.state);
     rsx! {
         details { class: "activity-item", open,
             summary { class: "activity-item__summary",
@@ -178,6 +248,50 @@ fn ToolActivityView(activity: ToolActivity) -> Element {
             }
         }
     }
+}
+
+#[component]
+fn CommandActivityView(command: CommandActivity) -> Element {
+    let open = is_failure_state(&command.state);
+    rsx! {
+        details { class: "activity-item activity-item--command", open,
+            summary { class: "activity-item__summary",
+                span { class: "activity-state activity-state--{command.state}", aria_hidden: "true" }
+                span { class: "activity-item__name", {command.kind.replace('_', " ")} }
+                span { class: "activity-item__status", "{command.state}" }
+            }
+            div { class: "activity-item__body",
+                if !command.summary.is_empty() {
+                    pre { class: "command-block", tabindex: "0", "{command.summary}" }
+                }
+                small { "command_id: {command.id}" }
+            }
+        }
+    }
+}
+
+fn operation_state(item: &TimelineItem) -> Option<&str> {
+    match item {
+        TimelineItem::Activity(activity) => Some(&activity.state),
+        TimelineItem::Command(command) => Some(&command.state),
+        _ => None,
+    }
+}
+
+fn operation_name(item: &TimelineItem) -> String {
+    match item {
+        TimelineItem::Activity(activity) => activity.tool_name.replace('_', " "),
+        TimelineItem::Command(command) => command.kind.replace('_', " "),
+        _ => String::new(),
+    }
+}
+
+fn is_failure_state(state: &str) -> bool {
+    matches!(state, "failed" | "error" | "rejected")
+}
+
+fn is_running_state(state: &str) -> bool {
+    matches!(state, "running" | "pending" | "received")
 }
 
 #[component]

@@ -760,6 +760,12 @@ pub enum TimelineItem {
     Progress(Progress),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum TimelineBlock {
+    Entry(TimelineItem),
+    ActivityGroup(Vec<TimelineItem>),
+}
+
 impl TimelineItem {
     pub fn order(&self) -> u64 {
         match self {
@@ -786,6 +792,35 @@ pub fn timeline_for_run(run: &RunState) -> Vec<TimelineItem> {
     items.extend(run.progress.iter().cloned().map(TimelineItem::Progress));
     items.sort_by_key(TimelineItem::order);
     items
+}
+
+/// Folds consecutive tool and command events into one disclosure block.
+///
+/// Message and progress boundaries remain visible in chronological order, but
+/// long agent loops no longer consume one full card per operation. The full
+/// evidence stays available inside the group when the user expands it.
+pub fn timeline_blocks_for_run(run: &RunState) -> Vec<TimelineBlock> {
+    let mut blocks = Vec::new();
+    let mut activities = Vec::new();
+
+    for item in timeline_for_run(run) {
+        if matches!(item, TimelineItem::Activity(_) | TimelineItem::Command(_)) {
+            activities.push(item);
+            continue;
+        }
+
+        if !activities.is_empty() {
+            blocks.push(TimelineBlock::ActivityGroup(std::mem::take(
+                &mut activities,
+            )));
+        }
+        blocks.push(TimelineBlock::Entry(item));
+    }
+
+    if !activities.is_empty() {
+        blocks.push(TimelineBlock::ActivityGroup(activities));
+    }
+    blocks
 }
 
 pub fn content_text(content: &Value) -> String {
@@ -924,6 +959,60 @@ mod tests {
         assert!(
             matches!(timeline_for_run(&run)[2], TimelineItem::Message(ref value) if value.role == "assistant")
         );
+    }
+
+    #[test]
+    fn consecutive_operations_fold_into_one_timeline_block() {
+        let mut run = RunState::new("run-1", None);
+        run.record_started_input("inspect".to_owned(), 1.0);
+        run.project_telemetry(&serde_json::json!({
+            "telemetry_id": "tool-1",
+            "payload": {
+                "type": "tool_activity",
+                "activity_id": "activity-1",
+                "tool_name": "file_read",
+                "state": "succeeded",
+                "evidence": [],
+            }
+        }));
+        run.project_durable(
+            &record(
+                1,
+                "command-1",
+                serde_json::json!({
+                    "type": "command_received",
+                    "command": {
+                        "command_id": "resolve-1",
+                        "payload": {"type": "resolve_request", "request_id": "approval-1"},
+                    },
+                }),
+            ),
+            1.0,
+        );
+        run.project_durable(
+            &record(
+                2,
+                "output",
+                serde_json::json!({
+                    "type": "output_committed",
+                    "output_id": "out-1",
+                    "content": content("done"),
+                }),
+            ),
+            2.0,
+        );
+
+        let blocks = timeline_blocks_for_run(&run);
+        assert_eq!(blocks.len(), 3);
+        assert!(matches!(
+            blocks[0],
+            TimelineBlock::Entry(TimelineItem::Message(_))
+        ));
+        assert!(matches!(&blocks[1], TimelineBlock::ActivityGroup(items) if items.len() == 2));
+        assert!(matches!(
+            blocks[2],
+            TimelineBlock::Entry(TimelineItem::Message(_))
+        ));
     }
 
     #[test]
