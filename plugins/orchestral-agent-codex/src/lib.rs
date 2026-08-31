@@ -4,9 +4,11 @@
 //! names and compatibility handling stay inside this concrete plugin.
 
 mod normalize;
+mod provider;
 mod transport;
 
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
 use async_trait::async_trait;
 use orchestral_core::agent_connector::{
@@ -16,7 +18,7 @@ use orchestral_core::agent_connector::{
 };
 use orchestral_core::agent_protocol::wire::{AgentSessionId, ProviderBindingRef};
 use serde_json::{json, Value};
-use tokio::sync::Mutex;
+use tokio::sync::Mutex as AsyncMutex;
 
 pub use transport::{CodexAppServerConfig, CodexTransportError};
 
@@ -35,16 +37,18 @@ struct ConnectedClient {
 /// process; UI subscribers never own Codex subscriptions directly.
 pub struct CodexConnector {
     config: CodexAppServerConfig,
-    client: Mutex<Option<Arc<ConnectedClient>>>,
+    client: AsyncMutex<Option<Arc<ConnectedClient>>>,
     limits: NormalizationLimits,
+    provider_state: StdMutex<provider::ProviderState>,
 }
 
 impl CodexConnector {
     pub fn new(config: CodexAppServerConfig) -> Self {
         Self {
             config,
-            client: Mutex::new(None),
+            client: AsyncMutex::new(None),
             limits: NormalizationLimits::default(),
+            provider_state: StdMutex::new(provider::ProviderState::default()),
         }
     }
 
@@ -65,11 +69,12 @@ impl CodexConnector {
     fn with_client(rpc: Arc<CodexRpcClient>, user_agent: impl Into<String>) -> Self {
         Self {
             config: CodexAppServerConfig::default(),
-            client: Mutex::new(Some(Arc::new(ConnectedClient {
+            client: AsyncMutex::new(Some(Arc::new(ConnectedClient {
                 rpc,
                 user_agent: user_agent.into(),
             }))),
             limits: NormalizationLimits::default(),
+            provider_state: StdMutex::new(provider::ProviderState::default()),
         }
     }
 }

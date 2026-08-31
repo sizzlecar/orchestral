@@ -3061,7 +3061,9 @@ name = "orchestral-agent-codex"
 version = "0.2.0"
 dependencies = [
  "async-trait",
+ "futures-util",
  "orchestral-core",
+ "orchestral-runtime",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",

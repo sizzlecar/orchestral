@@ -155,9 +155,16 @@ impl CodexRpcClient {
         client
     }
 
-    #[cfg(test)]
     pub(crate) fn subscribe(&self) -> broadcast::Receiver<Value> {
         self._notifications.subscribe()
+    }
+
+    pub(crate) async fn respond(
+        &self,
+        id: Value,
+        result: Value,
+    ) -> Result<(), CodexTransportError> {
+        self.write(&json!({"id": id, "result": result})).await
     }
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, CodexTransportError> {

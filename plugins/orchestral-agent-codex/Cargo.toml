@@ -10,9 +10,11 @@ homepage.workspace = true
 [dependencies]
 orchestral-core = { workspace = true }
 async-trait = { workspace = true }
+futures-util = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
+orchestral-runtime = { workspace = true }
 tokio = { workspace = true }
