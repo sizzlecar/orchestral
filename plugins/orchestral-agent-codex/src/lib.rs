@@ -56,9 +56,14 @@ impl CodexConnector {
 
     async fn client(&self) -> Result<Arc<ConnectedClient>, AgentConnectorError> {
         let mut client = self.client.lock().await;
-        if let Some(client) = client.as_ref() {
+        if let Some(client) = client.as_ref().filter(|client| client.rpc.is_connected()) {
             return Ok(Arc::clone(client));
         }
+        *client = None;
+        self.provider_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reset_connection_state();
         let (rpc, user_agent) = CodexRpcClient::spawn(&self.config)
             .await
             .map_err(connector_transport_error)?;

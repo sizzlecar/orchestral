@@ -22,7 +22,7 @@ use orchestral_core::agent_protocol::wire::{
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
-use crate::transport::{CodexRpcClient, CodexTransportError};
+use crate::transport::{CodexRpcClient, CodexTransportError, CodexTransportEvent};
 use crate::{CodexConnector, ConnectedClient};
 
 const PROVIDER_ID: &str = "codex/app-server";
@@ -33,6 +33,12 @@ pub(crate) struct ProviderState {
     runs: BTreeMap<RunId, Arc<CodexRun>>,
     sessions: BTreeMap<AgentSessionId, RunId>,
     loaded_sessions: BTreeSet<AgentSessionId>,
+}
+
+impl ProviderState {
+    pub(crate) fn reset_connection_state(&mut self) {
+        self.loaded_sessions.clear();
+    }
 }
 
 struct CodexRun {
@@ -94,7 +100,7 @@ impl CodexConnector {
         &self,
         connected: Arc<ConnectedClient>,
         run: Arc<CodexRun>,
-        notifications: broadcast::Receiver<Value>,
+        notifications: broadcast::Receiver<CodexTransportEvent>,
     ) -> Result<(), AgentStartError> {
         let session_id = run.request.run.spec.session_id.clone();
         let needs_resume = self
@@ -173,6 +179,7 @@ impl CodexConnector {
         let mut state = self.provider_state();
         state.runs.remove(&run.execution.run_id);
         state.sessions.remove(&run.execution.session_id);
+        state.loaded_sessions.remove(&run.execution.session_id);
     }
 }
 
@@ -435,11 +442,19 @@ async fn monitor_native_run(
     rpc: Arc<CodexRpcClient>,
     run: Arc<CodexRun>,
     turn_id: String,
-    mut notifications: broadcast::Receiver<Value>,
+    mut notifications: broadcast::Receiver<CodexTransportEvent>,
 ) {
     loop {
         let message = match notifications.recv().await {
-            Ok(message) => message,
+            Ok(CodexTransportEvent::Message(message)) => message,
+            Ok(CodexTransportEvent::Disconnected { reason }) => {
+                run.terminal.store(true, Ordering::SeqCst);
+                let _ = run.sender.send(Err(protocol_error(
+                    format!("Codex app-server disconnected: {reason}"),
+                    true,
+                )));
+                return;
+            }
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                 let _ = run.sender.send(Err(AgentProtocolError::new(
                     AgentProtocolErrorCode::SequenceGap,
@@ -448,12 +463,11 @@ async fn monitor_native_run(
                 continue;
             }
             Err(broadcast::error::RecvError::Closed) => {
-                publish_failure(
-                    &run,
-                    "codex_disconnected",
-                    "Codex app-server disconnected",
+                run.terminal.store(true, Ordering::SeqCst);
+                let _ = run.sender.send(Err(protocol_error(
+                    "Codex app-server notification channel closed",
                     true,
-                );
+                )));
                 return;
             }
         };
@@ -1350,6 +1364,153 @@ mod tests {
             view.delivery.unwrap().final_response,
             Content::text("verified")
         );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn app_server_disconnect_becomes_unknown_continuity_not_a_false_failure() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let connector = Arc::new(CodexConnector::with_client(rpc, "codex/test"));
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            let resume = next_request(&mut lines).await;
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"id": resume["id"], "result": {"thread": {"id": "thread-disconnect"}}})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let start = next_request(&mut lines).await;
+            server_write
+                .write_all(format!("{}\n", json!({"id": start["id"], "result": {"turn": {"id": "turn-disconnect", "status": "inProgress", "items": []}}})).as_bytes())
+                .await
+                .unwrap();
+            // EOF is deliberately ambiguous: the native turn may still have
+            // reached Codex even though this app-server process disappeared.
+        });
+        let provider: Arc<dyn AgentProvider> = connector;
+        let controller = Arc::new(
+            AgentController::new(provider, ProviderBindingRef::new("codex/local")).unwrap(),
+        );
+        let run = AgentRunEnvelope::new(
+            ProtocolVersion::new(1, 0),
+            AgentSessionId::new("thread-disconnect"),
+            RunId::new("run-disconnect"),
+            vec![Content::text("keep working")],
+        )
+        .unwrap();
+        let execution = controller.start(run).await.unwrap();
+        server.await.unwrap();
+
+        let view = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let view = controller.inspect(&execution.run_id).await.unwrap();
+                if view.state.status() == AgentRunStatus::Unknown {
+                    break view;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(view.state.status(), AgentRunStatus::Unknown);
+        assert!(view.delivery.is_none());
+        assert!(matches!(
+            view.state,
+            orchestral_core::agent_protocol::wire::AgentRunState::Unknown { ref reason, .. }
+                if reason.contains("disconnected")
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_resume_does_not_poison_the_next_attempt_for_that_session() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let connector = CodexConnector::with_client(rpc, "codex/test");
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            let first_resume = next_request(&mut lines).await;
+            assert_eq!(first_resume["method"], "thread/resume");
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"id": first_resume["id"], "error": {"code": -32000, "message": "temporary load failure"}})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let second_resume = next_request(&mut lines).await;
+            assert_eq!(second_resume["method"], "thread/resume");
+            assert_eq!(second_resume["params"]["threadId"], "thread-retry");
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"id": second_resume["id"], "result": {"thread": {"id": "thread-retry"}}})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let start = next_request(&mut lines).await;
+            assert_eq!(start["method"], "turn/start");
+            server_write
+                .write_all(format!("{}\n", json!({"id": start["id"], "result": {"turn": {"id": "turn-retry", "status": "inProgress", "items": []}}})).as_bytes())
+                .await
+                .unwrap();
+            server_write
+                .write_all(format!("{}\n", json!({"method": "turn/completed", "params": {"threadId": "thread-retry", "turn": {"id": "turn-retry", "status": "completed", "items": []}}})).as_bytes())
+                .await
+                .unwrap();
+        });
+
+        assert!(matches!(
+            connector
+                .start(start_request("thread-retry", "run-retry-1"))
+                .await,
+            Err(AgentStartError::Rejected(_))
+        ));
+        let mut stream = connector
+            .start(start_request("thread-retry", "run-retry-2"))
+            .await
+            .unwrap()
+            .stream;
+        loop {
+            let item = tokio::time::timeout(Duration::from_secs(1), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if matches!(
+                item,
+                AgentProviderStreamItem::Event(event)
+                    if matches!(event.payload, AgentEvent::DeliveryCommitted { .. })
+            ) {
+                break;
+            }
+        }
         server.await.unwrap();
     }
 }

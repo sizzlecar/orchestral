@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -51,14 +52,21 @@ pub enum CodexTransportError {
     MissingResult,
 }
 
-type RpcReply = Result<Value, String>;
+type RpcReply = Result<Value, CodexTransportError>;
 type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<RpcReply>>>>;
 type DynWriter = Box<dyn AsyncWrite + Send + Unpin>;
+
+#[derive(Debug, Clone)]
+pub(crate) enum CodexTransportEvent {
+    Message(Value),
+    Disconnected { reason: String },
+}
 
 pub struct CodexRpcClient {
     writer: Arc<Mutex<DynWriter>>,
     pending: Pending,
-    _notifications: broadcast::Sender<Value>,
+    notifications: broadcast::Sender<CodexTransportEvent>,
+    connected: Arc<AtomicBool>,
     next_id: Mutex<u64>,
     request_timeout: Duration,
     _child: Option<Arc<Mutex<Child>>>,
@@ -141,10 +149,12 @@ impl CodexRpcClient {
     {
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let (notifications, _) = broadcast::channel(256);
+        let connected = Arc::new(AtomicBool::new(true));
         let client = Arc::new(Self {
             writer: Arc::new(Mutex::new(Box::new(writer))),
             pending: Arc::clone(&pending),
-            _notifications: notifications.clone(),
+            notifications: notifications.clone(),
+            connected: Arc::clone(&connected),
             next_id: Mutex::new(1),
             request_timeout,
             _child: child.map(|child| Arc::new(Mutex::new(child))),
@@ -153,13 +163,18 @@ impl CodexRpcClient {
             BufReader::new(reader),
             pending,
             notifications,
+            connected,
             max_frame_bytes,
         ));
         client
     }
 
-    pub(crate) fn subscribe(&self) -> broadcast::Receiver<Value> {
-        self._notifications.subscribe()
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<CodexTransportEvent> {
+        self.notifications.subscribe()
+    }
+
+    pub(crate) fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
     }
 
     pub(crate) async fn respond(
@@ -189,7 +204,7 @@ impl CodexRpcClient {
         }
         match timeout(self.request_timeout, receiver).await {
             Ok(Ok(Ok(result))) => Ok(result),
-            Ok(Ok(Err(message))) => Err(CodexTransportError::Rpc(message)),
+            Ok(Ok(Err(error))) => Err(error),
             Ok(Err(_)) => Err(CodexTransportError::Closed),
             Err(_) => {
                 self.pending.lock().await.remove(&key);
@@ -204,63 +219,79 @@ impl CodexRpcClient {
     }
 
     async fn write(&self, message: &Value) -> Result<(), CodexTransportError> {
+        if !self.is_connected() {
+            return Err(CodexTransportError::Closed);
+        }
         let mut bytes = serde_json::to_vec(message).map_err(CodexTransportError::InvalidJson)?;
         bytes.push(b'\n');
         let mut writer = self.writer.lock().await;
-        writer
-            .write_all(&bytes)
-            .await
-            .map_err(CodexTransportError::Io)?;
-        writer.flush().await.map_err(CodexTransportError::Io)
+        if let Err(error) = writer.write_all(&bytes).await {
+            self.connected.store(false, Ordering::Release);
+            return Err(CodexTransportError::Io(error));
+        }
+        if let Err(error) = writer.flush().await {
+            self.connected.store(false, Ordering::Release);
+            return Err(CodexTransportError::Io(error));
+        }
+        Ok(())
     }
 }
 
 async fn read_loop<R>(
     mut reader: R,
     pending: Pending,
-    notifications: broadcast::Sender<Value>,
+    notifications: broadcast::Sender<CodexTransportEvent>,
+    connected: Arc<AtomicBool>,
     max_frame_bytes: usize,
 ) where
     R: AsyncBufRead + Send + Unpin + 'static,
 {
-    loop {
+    let disconnect_reason = loop {
         let frame = match read_frame(&mut reader, max_frame_bytes).await {
             Ok(Some(frame)) => frame,
-            Ok(None) | Err(_) => break,
+            Ok(None) => break "Codex app-server closed stdout".to_owned(),
+            Err(error) => break error.to_string(),
         };
-        let Ok(message) = serde_json::from_slice::<Value>(&frame) else {
-            continue;
+        let message = match serde_json::from_slice::<Value>(&frame) {
+            Ok(message) => message,
+            Err(error) => break CodexTransportError::InvalidJson(error).to_string(),
         };
         if let Some(id) = message.get("id") {
             if message.get("method").is_none() {
                 let key = id_key(id);
                 if let Some(sender) = pending.lock().await.remove(&key) {
                     let reply = if let Some(error) = message.get("error") {
-                        Err(error
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown JSON-RPC error")
-                            .to_owned())
+                        Err(CodexTransportError::Rpc(
+                            error
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown JSON-RPC error")
+                                .to_owned(),
+                        ))
                     } else {
                         message
                             .get("result")
                             .cloned()
-                            .ok_or_else(|| "response omitted result".to_owned())
+                            .ok_or(CodexTransportError::MissingResult)
                     };
                     let _ = sender.send(reply);
                     continue;
                 }
             }
         }
-        let _ = notifications.send(message);
-    }
+        let _ = notifications.send(CodexTransportEvent::Message(message));
+    };
+    connected.store(false, Ordering::Release);
     let senders = {
         let mut guard = pending.lock().await;
         guard.drain().map(|(_, sender)| sender).collect::<Vec<_>>()
     };
     for sender in senders {
-        let _ = sender.send(Err("connection closed".to_owned()));
+        let _ = sender.send(Err(CodexTransportError::Closed));
     }
+    let _ = notifications.send(CodexTransportEvent::Disconnected {
+        reason: disconnect_reason,
+    });
 }
 
 async fn read_frame<R>(
@@ -346,10 +377,54 @@ mod tests {
         assert_eq!(first.unwrap()["value"], 1);
         assert_eq!(second.unwrap()["value"], 2);
         assert_eq!(
-            notifications.recv().await.unwrap()["method"],
-            "turn/started"
+            match notifications.recv().await.unwrap() {
+                CodexTransportEvent::Message(message) => message["method"].clone(),
+                CodexTransportEvent::Disconnected { reason } => {
+                    panic!("unexpected disconnect: {reason}")
+                }
+            },
+            json!("turn/started")
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reports_connection_close_to_requests_and_subscribers() {
+        let (client_io, server_io) = duplex(16 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let client = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let mut notifications = client.subscribe();
+        let request = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.request("pending", json!({})).await }
+        });
+        let mut reader = BufReader::new(server_read);
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).await.unwrap();
+        drop(reader);
+        drop(server_write);
+
+        assert!(matches!(
+            request.await.unwrap(),
+            Err(CodexTransportError::Closed)
+        ));
+        let event = notifications.recv().await.unwrap();
+        assert!(matches!(
+            event,
+            CodexTransportEvent::Disconnected { ref reason }
+                if reason.contains("closed stdout")
+        ));
+        assert!(!client.is_connected());
+        assert!(matches!(
+            client.request("after-close", json!({})).await,
+            Err(CodexTransportError::Closed)
+        ));
     }
 
     #[tokio::test]
