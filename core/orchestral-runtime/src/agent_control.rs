@@ -23,8 +23,8 @@ use orchestral_core::agent_protocol::{
         AgentCommand, AgentCommandEnvelope, AgentEvent, AgentEventAuthority, AgentEventDraft,
         AgentEventId, AgentExecutionRef, AgentJournalRecord, AgentProtocolError,
         AgentProtocolErrorCode, AgentProviderStreamItem, AgentRunEnvelope, AgentRunState,
-        AgentRunView, AgentStartRequest, AgentTelemetryEnvelope, CommandAck, CommandId, Digest,
-        ProviderBindingRef, ReconciliationProof, ReconciliationProofRef, RunId,
+        AgentRunView, AgentStartRequest, AgentTelemetryEnvelope, CommandAck, CommandId, Content,
+        Digest, ProviderBindingRef, ReconciliationProof, ReconciliationProofRef, RunId,
     },
 };
 use thiserror::Error;
@@ -295,6 +295,18 @@ impl AgentController {
         let slot = self.run_slot(run_id).await?;
         let view = slot.entry.lock().await.reducer.view();
         Ok(view)
+    }
+
+    /// Returns the immutable initial input from the registered Run spec.
+    ///
+    /// This is separate from the bounded public Run projection because it is
+    /// conversation content, not reducible execution state. Authenticated Host
+    /// surfaces can use it to reconstruct a transcript without duplicating the
+    /// input in a transport-specific registry.
+    pub async fn initial_input(&self, run_id: &RunId) -> Result<Vec<Content>, AgentControlError> {
+        let slot = self.run_slot(run_id).await?;
+        let input = slot.entry.lock().await.request.run.spec.input.clone();
+        Ok(input)
     }
 
     /// Replays normalized durable facts after the supplied Run sequence.

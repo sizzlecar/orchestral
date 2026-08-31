@@ -169,7 +169,16 @@ struct StartRunRequest {
 #[derive(Debug, Serialize)]
 struct StartRunResponse {
     run_id: RunId,
+    view: RemoteRunView,
+}
+
+#[derive(Debug, Serialize)]
+struct RemoteRunView {
+    #[serde(flatten)]
     view: AgentRunView,
+    /// Immutable initial Run input. This is read from the controller-owned
+    /// RunSpec rather than copied into the mobile session registry.
+    input: Vec<Content>,
 }
 
 async fn start_run(
@@ -190,7 +199,10 @@ async fn start_run(
         .record_run(session_id.as_str(), run_id.as_str())
         .await?;
     spawn_remembered_approval_driver(state.clone(), run_id.clone());
-    let view = handle.inspect().await?;
+    let view = RemoteRunView {
+        view: handle.inspect().await?,
+        input: state.agent.initial_input(&run_id).await?,
+    };
     Ok((StatusCode::CREATED, Json(StartRunResponse { run_id, view })))
 }
 
@@ -245,9 +257,12 @@ fn spawn_remembered_approval_driver(state: RemoteApiState, run_id: RunId) {
 async fn inspect_run(
     State(state): State<RemoteApiState>,
     Path(run_id): Path<String>,
-) -> Result<Json<AgentRunView>, ApiError> {
+) -> Result<Json<RemoteRunView>, ApiError> {
     let run_id = require_run(&state, run_id).await?;
-    Ok(Json(state.agent.inspect(&run_id).await?))
+    Ok(Json(RemoteRunView {
+        view: state.agent.inspect(&run_id).await?,
+        input: state.agent.initial_input(&run_id).await?,
+    }))
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1190,8 +1205,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let started: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            started["view"]["input"][0]["body"]["value"],
+            "complete the deterministic fixture"
+        );
 
         tokio::time::sleep(Duration::from_millis(20)).await;
+        let response = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                "/runs/mobile-run",
+                &token,
+                serde_json::Value::Null,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let inspected: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            inspected["input"][0]["body"]["value"],
+            "complete the deterministic fixture"
+        );
+
         let response = app
             .clone()
             .oneshot(authorized(

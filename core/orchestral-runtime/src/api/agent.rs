@@ -89,6 +89,10 @@ impl AgentApi {
         Ok(self.controller.inspect(run_id).await?)
     }
 
+    pub async fn initial_input(&self, run_id: &RunId) -> Result<Vec<Content>, AgentSdkError> {
+        Ok(self.controller.initial_input(run_id).await?)
+    }
+
     pub async fn events(
         &self,
         run_id: &RunId,

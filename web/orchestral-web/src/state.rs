@@ -5,6 +5,7 @@ use serde_json::Value;
 use crate::model::{DeviceView, SessionView};
 
 const MAX_TELEMETRY_IDS: usize = 800;
+const INITIAL_INPUT_ORDER: u64 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LoadStatus {
@@ -154,6 +155,10 @@ impl RunState {
     }
 
     pub fn apply_view(&mut self, view: Value, now: f64) {
+        let initial_input = contents_text(view.get("input"));
+        if !initial_input.is_empty() {
+            self.confirm_initial_input(initial_input);
+        }
         let view_cursor = view
             .get("last_run_seq")
             .and_then(Value::as_u64)
@@ -211,19 +216,27 @@ impl RunState {
     pub fn record_started_input(&mut self, input: String, now: f64) {
         self.status = "running".to_owned();
         self.started_at = Some(now);
-        if self
+        self.confirm_initial_input(input);
+    }
+
+    fn confirm_initial_input(&mut self, input: String) {
+        if let Some(message) = self
             .messages
-            .iter()
-            .any(|message| message.role == "user" && message.text == input)
+            .iter_mut()
+            .find(|message| message.role == "user" && !message.steering)
         {
-            return;
+            if message.optimistic || message.text == input {
+                message.text = input;
+                message.order = INITIAL_INPUT_ORDER;
+                message.optimistic = false;
+                return;
+            }
         }
-        let order = self.next_order();
         self.messages.push(Message {
-            id: format!("optimistic-{}", self.id),
+            id: format!("initial-input-{}", self.id),
             role: "user".to_owned(),
             text: input,
-            order,
+            order: INITIAL_INPUT_ORDER,
             optimistic: false,
             partial: false,
             steering: false,
@@ -956,5 +969,45 @@ mod tests {
         assert_eq!(run.messages.len(), 1);
         assert!(!run.messages[0].optimistic);
         assert_eq!(run.messages[0].text, "inspect the project");
+    }
+
+    #[test]
+    fn run_view_restores_initial_input_for_a_fresh_client() {
+        let mut run = RunState::new("run-1", None);
+        run.project_durable(
+            &record(1, "accepted", serde_json::json!({"type": "run_accepted"})),
+            1.0,
+        );
+        run.project_durable(
+            &record(
+                2,
+                "output",
+                serde_json::json!({
+                    "type": "output_committed",
+                    "output_id": "out-1",
+                    "content": content("done"),
+                }),
+            ),
+            2.0,
+        );
+        run.apply_view(
+            serde_json::json!({
+                "execution": {"session_id": "session-1"},
+                "state": {"state": "terminal", "terminal": {"type": "delivered", "delivery_id": "delivery-1"}},
+                "last_run_seq": 2,
+                "pending_requests": [],
+                "input": content("inspect the project"),
+            }),
+            2.0,
+        );
+
+        let timeline = timeline_for_run(&run);
+        assert_eq!(timeline.len(), 2);
+        assert!(
+            matches!(&timeline[0], TimelineItem::Message(value) if value.role == "user" && value.text == "inspect the project" && !value.optimistic)
+        );
+        assert!(
+            matches!(&timeline[1], TimelineItem::Message(value) if value.role == "assistant" && value.text == "done")
+        );
     }
 }
