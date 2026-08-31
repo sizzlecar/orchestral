@@ -3064,6 +3064,8 @@ dependencies = [
  "orchestral-agent-protocol-testkit",
  "orchestral-core",
  "orchestral-runtime",
+ "serde",
+ "serde_jcs",
  "serde_json",
  "tokio",
  "uuid",
