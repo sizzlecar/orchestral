@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use orchestral_core::agent_protocol::{
     spi::{
-        AgentJournalStore, AgentJournalStoreError, AppendAgentRecordOutcome, CreateAgentRunOutcome,
-        StoredAgentRun,
+        AgentJournalStore, AgentJournalStoreError, AgentRunCatalogEntry, AppendAgentRecordOutcome,
+        CreateAgentRunOutcome, StoredAgentRun,
     },
     wire::{AgentJournalRecord, AgentSessionId, Digest, RunId},
 };
@@ -102,6 +102,49 @@ impl FileAgentJournalStore {
             )));
         }
         Ok(Some(run))
+    }
+
+    fn catalog_runs_sync(&self) -> Result<Vec<AgentRunCatalogEntry>, AgentJournalStoreError> {
+        let mut entries = Vec::new();
+        for directory_entry in fs::read_dir(self.root.as_path()).map_err(unavailable)? {
+            let directory_entry = directory_entry.map_err(unavailable)?;
+            let file_name = directory_entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            if !file_name.starts_with("run-") || !file_name.ends_with(".json") {
+                continue;
+            }
+
+            let path = directory_entry.path();
+            let bytes = fs::read(&path).map_err(unavailable)?;
+            let run = serde_json::from_slice::<StoredAgentRun>(&bytes).map_err(|error| {
+                AgentJournalStoreError::InvalidData(format!(
+                    "could not decode {}: {error}",
+                    path.display()
+                ))
+            })?;
+            run.validate_shape()?;
+            let metadata = directory_entry.metadata().map_err(unavailable)?;
+            let updated_at_unix_ms = metadata
+                .modified()
+                .ok()
+                .and_then(system_time_unix_ms)
+                .unwrap_or_default();
+            let created_at_unix_ms = metadata
+                .created()
+                .ok()
+                .and_then(system_time_unix_ms)
+                .unwrap_or(updated_at_unix_ms);
+            entries.push(AgentRunCatalogEntry {
+                run_id: run.registration.run_id().clone(),
+                session_id: run.registration.request.run.spec.session_id.clone(),
+                created_at_unix_ms,
+                updated_at_unix_ms,
+            });
+        }
+        entries.sort_by(|left, right| left.run_id.cmp(&right.run_id));
+        Ok(entries)
     }
 
     fn write_sync(&self, run: &StoredAgentRun) -> Result<(), AgentJournalStoreError> {
@@ -447,6 +490,18 @@ impl AgentJournalStore for FileAgentJournalStore {
         })
         .await
     }
+
+    async fn catalog_runs(&self) -> Result<Vec<AgentRunCatalogEntry>, AgentJournalStoreError> {
+        self.blocking(|store| store.catalog_runs_sync()).await
+    }
+}
+
+fn system_time_unix_ms(value: std::time::SystemTime) -> Option<i64> {
+    let milliseconds = value
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    i64::try_from(milliseconds).ok()
 }
 
 #[async_trait]

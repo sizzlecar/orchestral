@@ -166,8 +166,10 @@ async fn revoke_device(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn list_sessions(State(state): State<RemoteApiState>) -> Json<Vec<SessionView>> {
-    Json(state.registry.sessions().await)
+async fn list_sessions(
+    State(state): State<RemoteApiState>,
+) -> Result<Json<Vec<SessionView>>, ApiError> {
+    Ok(Json(session_views(&state).await?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -183,7 +185,13 @@ async fn create_session(
 ) -> Result<(StatusCode, Json<SessionView>), ApiError> {
     let preferred = request.session_id.map(AgentSessionId::new);
     let session_id = state.agent.create_session(preferred).await?;
-    let session = state.registry.register_session(session_id.as_str()).await?;
+    let timestamp = chrono::Utc::now().timestamp_millis();
+    let session = SessionView {
+        id: session_id.as_str().to_owned(),
+        created_at_unix_ms: timestamp,
+        updated_at_unix_ms: timestamp,
+        run_ids: Vec::new(),
+    };
     Ok((StatusCode::CREATED, Json(session)))
 }
 
@@ -191,10 +199,10 @@ async fn get_session(
     State(state): State<RemoteApiState>,
     Path(session_id): Path<String>,
 ) -> Result<Json<SessionView>, ApiError> {
-    state
-        .registry
-        .session(&session_id)
-        .await
+    session_views(&state)
+        .await?
+        .into_iter()
+        .find(|session| session.id == session_id)
         .map(Json)
         .ok_or_else(|| ApiError::not_found("session_not_found", "session was not found"))
 }
@@ -226,17 +234,12 @@ async fn start_run(
     Path(session_id): Path<String>,
     Json(request): Json<StartRunRequest>,
 ) -> Result<(StatusCode, Json<StartRunResponse>), ApiError> {
-    require_session(&state, &session_id).await?;
     let session_id = AgentSessionId::new(session_id);
     state.agent.create_session(Some(session_id.clone())).await?;
     let run_id = RunId::new(request.run_id);
     let handle = state
         .agent
         .start_text(&session_id, Some(run_id.clone()), request.input)
-        .await?;
-    state
-        .registry
-        .record_run(session_id.as_str(), run_id.as_str())
         .await?;
     spawn_remembered_approval_driver(state.clone(), run_id.clone());
     let view = RemoteRunView {
@@ -603,21 +606,53 @@ async fn resolve_approval(
     Ok(Json(state.agent.command(command).await?))
 }
 
-async fn require_session(state: &RemoteApiState, session_id: &str) -> Result<(), ApiError> {
-    if state.registry.session(session_id).await.is_none() {
-        return Err(ApiError::not_found(
-            "session_not_found",
-            "session was not found",
-        ));
-    }
-    Ok(())
-}
-
 async fn require_run(state: &RemoteApiState, run_id: String) -> Result<RunId, ApiError> {
-    if !state.registry.owns_run(&run_id).await {
+    let run_id = RunId::new(run_id);
+    if !state.agent.has_run(&run_id).await? {
         return Err(ApiError::not_found("run_not_found", "run was not found"));
     }
-    Ok(RunId::new(run_id))
+    Ok(run_id)
+}
+
+/// Projects the remote conversation list directly from durable Run
+/// registrations. The Agent journal is the only Session-to-Run source of
+/// truth; empty Sessions remain process-local until their first Run starts.
+async fn session_views(state: &RemoteApiState) -> Result<Vec<SessionView>, AgentSdkError> {
+    let fallback = chrono::Utc::now().timestamp_millis();
+    let mut catalog = state.agent.catalog_runs().await?;
+    catalog.sort_by(|left, right| {
+        left.created_at_unix_ms
+            .cmp(&right.created_at_unix_ms)
+            .then_with(|| left.run_id.cmp(&right.run_id))
+    });
+
+    let mut sessions = BTreeMap::<String, SessionView>::new();
+    for run in catalog {
+        let created = if run.created_at_unix_ms > 0 {
+            run.created_at_unix_ms
+        } else {
+            fallback
+        };
+        let updated = if run.updated_at_unix_ms > 0 {
+            run.updated_at_unix_ms
+        } else {
+            created
+        };
+        let session = sessions
+            .entry(run.session_id.as_str().to_owned())
+            .or_insert_with(|| SessionView {
+                id: run.session_id.as_str().to_owned(),
+                created_at_unix_ms: created,
+                updated_at_unix_ms: updated,
+                run_ids: Vec::new(),
+            });
+        session.created_at_unix_ms = session.created_at_unix_ms.min(created);
+        session.updated_at_unix_ms = session.updated_at_unix_ms.max(updated);
+        session.run_ids.push(run.run_id.as_str().to_owned());
+    }
+    let mut sessions = sessions.into_values().collect::<Vec<_>>();
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at_unix_ms));
+    Ok(sessions)
 }
 
 async fn require_pending(
@@ -1367,6 +1402,22 @@ mod tests {
             inspected["input"][0]["body"]["value"],
             "complete the deterministic fixture"
         );
+
+        let response = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                "/sessions",
+                &token,
+                serde_json::Value::Null,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let sessions: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(sessions[0]["id"], "mobile-session");
+        assert_eq!(sessions[0]["run_ids"], serde_json::json!(["mobile-run"]));
 
         let response = app
             .clone()

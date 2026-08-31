@@ -8,7 +8,6 @@ use anyhow::{bail, Context};
 use axum::Router;
 use clap::Args;
 use orchestral_core::agent_protocol::reference::AgentRunStatus;
-use orchestral_core::agent_protocol::wire::RunId;
 use qrcode::render::unicode;
 use qrcode::QrCode;
 
@@ -151,16 +150,18 @@ pub(crate) async fn serve(command: ServeCommand, options: AgentRunOptions) -> an
 /// and replays its committed prefix, which also re-stages any pending approval
 /// in the replacement Host broker.
 async fn recover_registered_runs(state: &RemoteApiState) {
-    let run_ids = state
-        .registry
-        .sessions()
-        .await
-        .into_iter()
-        .flat_map(|session| session.run_ids)
-        .collect::<std::collections::BTreeSet<_>>();
+    let run_ids = match state.agent.catalog_runs().await {
+        Ok(entries) => entries
+            .into_iter()
+            .map(|entry| entry.run_id)
+            .collect::<std::collections::BTreeSet<_>>(),
+        Err(error) => {
+            tracing::warn!(%error, "could not enumerate durable Runs during Host recovery");
+            return;
+        }
+    };
 
-    for raw_run_id in run_ids {
-        let run_id = RunId::new(raw_run_id);
+    for run_id in run_ids {
         let view = match state.agent.inspect(&run_id).await {
             Ok(view) => view,
             Err(error) => {

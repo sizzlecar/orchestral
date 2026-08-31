@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use super::types::{
-    AgentAdmission, AgentExecutionRef, AgentJournalRecord, AgentRunEnvelope, AgentStartRequest,
-    RunId,
+    AgentAdmission, AgentExecutionRef, AgentJournalRecord, AgentRunEnvelope, AgentSessionId,
+    AgentStartRequest, RunId,
 };
 
 /// Immutable data needed to reconstruct an Agent Run reducer after restart.
@@ -59,6 +59,19 @@ impl AgentRunRegistration {
 pub struct StoredAgentRun {
     pub registration: AgentRunRegistration,
     pub records: Vec<AgentJournalRecord>,
+}
+
+/// Bounded discovery metadata derived from the authoritative Run journal.
+///
+/// Session browsers use this projection instead of maintaining a second
+/// session-to-Run index. Timestamps describe storage activity and are not part
+/// of Agent Protocol event ordering or integrity digests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRunCatalogEntry {
+    pub run_id: RunId,
+    pub session_id: AgentSessionId,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
 }
 
 impl StoredAgentRun {
@@ -140,6 +153,11 @@ pub trait AgentJournalStore: Send + Sync {
         run_id: &RunId,
         after_run_seq: u64,
     ) -> Result<Vec<AgentJournalRecord>, AgentJournalStoreError>;
+
+    /// Enumerates the Runs owned by this journal without inventing a second
+    /// durable catalog. Implementations must derive every entry from a valid
+    /// Run registration and must not return dangling Run identities.
+    async fn catalog_runs(&self) -> Result<Vec<AgentRunCatalogEntry>, AgentJournalStoreError>;
 }
 
 /// Minimal deterministic store used by tests and process-lifetime defaults.
@@ -235,6 +253,21 @@ impl AgentJournalStore for InMemoryAgentJournalStore {
             .iter()
             .filter(|record| record.event.run_seq > after_run_seq)
             .cloned()
+            .collect())
+    }
+
+    async fn catalog_runs(&self) -> Result<Vec<AgentRunCatalogEntry>, AgentJournalStoreError> {
+        Ok(self
+            .runs
+            .read()
+            .await
+            .values()
+            .map(|run| AgentRunCatalogEntry {
+                run_id: run.registration.run_id().clone(),
+                session_id: run.registration.request.run.spec.session_id.clone(),
+                created_at_unix_ms: 0,
+                updated_at_unix_ms: 0,
+            })
             .collect())
     }
 }

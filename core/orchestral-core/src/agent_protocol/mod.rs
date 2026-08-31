@@ -41,8 +41,8 @@ pub mod wire {
 /// snapshots themselves.
 pub mod spi {
     pub use super::journal::{
-        AgentJournalStore, AgentJournalStoreError, AgentRunRegistration, AppendAgentRecordOutcome,
-        CreateAgentRunOutcome, InMemoryAgentJournalStore, StoredAgentRun,
+        AgentJournalStore, AgentJournalStoreError, AgentRunCatalogEntry, AgentRunRegistration,
+        AppendAgentRecordOutcome, CreateAgentRunOutcome, InMemoryAgentJournalStore, StoredAgentRun,
     };
     pub use super::provider::{
         AgentProvider, AgentProviderStream, AgentRecovery, AgentRecoveryConfirmation,

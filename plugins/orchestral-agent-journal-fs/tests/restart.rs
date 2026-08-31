@@ -177,9 +177,16 @@ async fn terminal_run_rehydrates_from_a_new_store_and_controller_instance() {
         .inspect(&execution.run_id)
         .await
         .expect("durable run rehydrates");
+    let catalog = second
+        .catalog_runs()
+        .await
+        .expect("durable Run catalog remains discoverable");
 
     assert_eq!(after.state.status(), AgentRunStatus::Delivered);
     assert_eq!(after, before);
+    assert_eq!(catalog.len(), 1);
+    assert_eq!(catalog[0].run_id, execution.run_id);
+    assert_eq!(catalog[0].session_id, execution.session_id);
     std::fs::remove_dir_all(root).expect("temporary journal cleans up");
 }
 

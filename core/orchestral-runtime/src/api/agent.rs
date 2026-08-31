@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use orchestral_core::agent_protocol::spi::AgentRunCatalogEntry;
 use orchestral_core::agent_protocol::wire::{
     AgentCommandEnvelope, AgentJournalRecord, AgentRunView, AgentSessionId, CommandAck, Content,
     ResourceBinding, RunId,
@@ -91,6 +92,14 @@ impl AgentApi {
 
     pub async fn initial_input(&self, run_id: &RunId) -> Result<Vec<Content>, AgentSdkError> {
         Ok(self.controller.initial_input(run_id).await?)
+    }
+
+    pub async fn catalog_runs(&self) -> Result<Vec<AgentRunCatalogEntry>, AgentSdkError> {
+        Ok(self.controller.catalog_runs().await?)
+    }
+
+    pub async fn has_run(&self, run_id: &RunId) -> Result<bool, AgentSdkError> {
+        Ok(self.controller.has_run(run_id).await?)
     }
 
     pub async fn events(
