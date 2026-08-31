@@ -13,8 +13,10 @@ use std::sync::Mutex as StdMutex;
 use async_trait::async_trait;
 use orchestral_core::agent_connector::{
     AgentConnector, AgentConnectorDescriptor, AgentConnectorError, AgentConnectorErrorCode,
-    AgentConnectorHealth, AgentConnectorId, AgentSessionCapabilities, AgentSessionDetail,
-    AgentSessionListQuery, AgentSessionPage,
+    AgentConnectorHealth, AgentConnectorId, AgentSessionActionDescriptor, AgentSessionActionId,
+    AgentSessionActionOutcome, AgentSessionCapabilities, AgentSessionDetail, AgentSessionListQuery,
+    AgentSessionPage, AgentSessionSummary, CreateAgentSessionRequest,
+    InvokeAgentSessionActionRequest, SESSION_FORK_ACTION, SESSION_RENAME_ACTION,
 };
 use orchestral_core::agent_protocol::wire::{AgentSessionId, ProviderBindingRef};
 use serde_json::{json, Value};
@@ -65,6 +67,25 @@ impl CodexConnector {
         Ok(connected)
     }
 
+    async fn read_summary(
+        &self,
+        client: &ConnectedClient,
+        session_id: &AgentSessionId,
+    ) -> Result<AgentSessionSummary, AgentConnectorError> {
+        let result = client
+            .rpc
+            .request(
+                "thread/read",
+                json!({"threadId": session_id.as_str(), "includeTurns": false}),
+            )
+            .await
+            .map_err(connector_transport_error)?;
+        let thread = result
+            .get("thread")
+            .ok_or_else(|| AgentConnectorError::protocol("thread/read omitted thread"))?;
+        normalize::session_summary(&self.describe().connector_id, thread)
+    }
+
     #[cfg(test)]
     fn with_client(rpc: Arc<CodexRpcClient>, user_agent: impl Into<String>) -> Self {
         Self {
@@ -93,8 +114,30 @@ impl AgentConnector for CodexConnector {
             provider_binding: ProviderBindingRef::new(PROVIDER_BINDING),
             agent_family: "coding-agent".to_owned(),
             display_name: "Codex".to_owned(),
-            capabilities: AgentSessionCapabilities::discoverable(),
-            actions: Vec::new(),
+            capabilities: AgentSessionCapabilities {
+                create: true,
+                ..AgentSessionCapabilities::discoverable()
+            },
+            actions: vec![
+                AgentSessionActionDescriptor {
+                    action_id: AgentSessionActionId::new(SESSION_FORK_ACTION),
+                    title: "Fork session".to_owned(),
+                    description: "Create a new session from this session's persisted history"
+                        .to_owned(),
+                    input_schema: None,
+                },
+                AgentSessionActionDescriptor {
+                    action_id: AgentSessionActionId::new(SESSION_RENAME_ACTION),
+                    title: "Rename session".to_owned(),
+                    description: "Set the session's display name".to_owned(),
+                    input_schema: Some(json!({
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["name"],
+                        "properties": {"name": {"type": "string", "minLength": 1}}
+                    })),
+                },
+            ],
         }
     }
 
@@ -147,6 +190,141 @@ impl AgentConnector for CodexConnector {
         detail.validate_for(&self.describe().connector_id)?;
         Ok(detail)
     }
+
+    async fn create_session(
+        &self,
+        request: CreateAgentSessionRequest,
+    ) -> Result<AgentSessionSummary, AgentConnectorError> {
+        let cwd = non_empty_optional(request.cwd, "cwd")?;
+        let title = non_empty_optional(request.title, "title")?;
+        if !request.extensions.is_empty() {
+            return Err(AgentConnectorError::invalid(
+                "Codex session creation does not accept connector extensions",
+            ));
+        }
+        let client = self.client().await?;
+        let mut params = json!({
+            "experimentalRawEvents": false,
+            "persistExtendedHistory": true
+        });
+        insert_optional(&mut params, "cwd", cwd.map(Value::String));
+        let result = client
+            .rpc
+            .request("thread/start", params)
+            .await
+            .map_err(connector_transport_error)?;
+        let thread = result
+            .get("thread")
+            .ok_or_else(|| AgentConnectorError::protocol("thread/start omitted thread"))?;
+        let mut summary = normalize::session_summary(&self.describe().connector_id, thread)?;
+        if let Some(title) = title {
+            client
+                .rpc
+                .request(
+                    "thread/name/set",
+                    json!({"threadId": summary.session_id.as_str(), "name": title}),
+                )
+                .await
+                .map_err(|error| {
+                    connector_transport_error(error).with_details(json!({
+                        "createdSessionId": summary.session_id.as_str()
+                    }))
+                })?;
+            summary.title = Some(title);
+        }
+        summary.validate_for(&self.describe().connector_id)?;
+        Ok(summary)
+    }
+
+    async fn invoke_action(
+        &self,
+        request: InvokeAgentSessionActionRequest,
+    ) -> Result<AgentSessionActionOutcome, AgentConnectorError> {
+        if request.session_id.is_empty() {
+            return Err(AgentConnectorError::invalid("session id must not be empty"));
+        }
+        let session = match request.action_id.as_str() {
+            SESSION_FORK_ACTION => {
+                if !request.arguments.is_null() {
+                    return Err(AgentConnectorError::invalid(
+                        "session.fork takes no arguments",
+                    ));
+                }
+                let client = self.client().await?;
+                let result = client
+                    .rpc
+                    .request(
+                        "thread/fork",
+                        json!({
+                            "threadId": request.session_id.as_str(),
+                            "persistExtendedHistory": true
+                        }),
+                    )
+                    .await
+                    .map_err(connector_transport_error)?;
+                let thread = result
+                    .get("thread")
+                    .ok_or_else(|| AgentConnectorError::protocol("thread/fork omitted thread"))?;
+                Some(normalize::session_summary(
+                    &self.describe().connector_id,
+                    thread,
+                )?)
+            }
+            SESSION_RENAME_ACTION => {
+                let name = required_action_string(&request.arguments, "name")?;
+                let client = self.client().await?;
+                client
+                    .rpc
+                    .request(
+                        "thread/name/set",
+                        json!({"threadId": request.session_id.as_str(), "name": name}),
+                    )
+                    .await
+                    .map_err(connector_transport_error)?;
+                Some(self.read_summary(&client, &request.session_id).await?)
+            }
+            _ => {
+                return Err(AgentConnectorError::unsupported(format!(
+                    "Codex does not declare action {}",
+                    request.action_id
+                )))
+            }
+        };
+        Ok(AgentSessionActionOutcome {
+            session,
+            content: Vec::new(),
+            details: Value::Null,
+        })
+    }
+}
+
+fn non_empty_optional(
+    value: Option<String>,
+    field: &str,
+) -> Result<Option<String>, AgentConnectorError> {
+    match value {
+        Some(value) if value.trim().is_empty() => Err(AgentConnectorError::invalid(format!(
+            "{field} must not be empty"
+        ))),
+        value => Ok(value),
+    }
+}
+
+fn required_action_string(arguments: &Value, field: &str) -> Result<String, AgentConnectorError> {
+    let object = arguments
+        .as_object()
+        .ok_or_else(|| AgentConnectorError::invalid("action arguments must be an object"))?;
+    if object.len() != 1 {
+        return Err(AgentConnectorError::invalid(
+            "rename action accepts only the name argument",
+        ));
+    }
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| AgentConnectorError::invalid("rename action requires a non-empty name"))
 }
 
 fn insert_optional(object: &mut Value, key: &str, value: Option<Value>) {
@@ -171,9 +349,12 @@ fn connector_transport_error(error: CodexTransportError) -> AgentConnectorError 
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::time::Duration;
 
-    use orchestral_core::agent_connector::AgentSessionState;
+    use orchestral_core::agent_connector::{
+        AgentSessionState, CreateAgentSessionRequest, InvokeAgentSessionActionRequest,
+    };
     use tokio::io::{duplex, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     use super::*;
@@ -248,5 +429,164 @@ mod tests {
         assert_eq!(detail.turns.len(), 1);
         assert_eq!(detail.turns[0].activities.len(), 2);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn connector_creates_forks_and_renames_sessions_with_declared_rpc_methods() {
+        let (client_io, server_io) = duplex(128 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let connector = CodexConnector::with_client(rpc, "codex/0.149.1");
+        let server = tokio::spawn(async move {
+            let mut requests = BufReader::new(server_read).lines();
+
+            let start = read_request(&mut requests).await;
+            assert_eq!(start["method"], "thread/start");
+            assert_eq!(start["params"]["cwd"], "/repo");
+            assert_eq!(start["params"]["experimentalRawEvents"], false);
+            assert_eq!(start["params"]["persistExtendedHistory"], true);
+            write_result(
+                &mut server_write,
+                &start,
+                json!({"thread": thread("thread-new", Value::Null)}),
+            )
+            .await;
+
+            let initial_name = read_request(&mut requests).await;
+            assert_eq!(initial_name["method"], "thread/name/set");
+            assert_eq!(initial_name["params"]["threadId"], "thread-new");
+            assert_eq!(initial_name["params"]["name"], "Compiler work");
+            write_result(&mut server_write, &initial_name, json!({})).await;
+
+            let fork = read_request(&mut requests).await;
+            assert_eq!(fork["method"], "thread/fork");
+            assert_eq!(fork["params"]["threadId"], "thread-new");
+            assert_eq!(fork["params"]["persistExtendedHistory"], true);
+            write_result(
+                &mut server_write,
+                &fork,
+                json!({"thread": thread("thread-fork", "Compiler work fork")}),
+            )
+            .await;
+
+            let rename = read_request(&mut requests).await;
+            assert_eq!(rename["method"], "thread/name/set");
+            assert_eq!(rename["params"]["threadId"], "thread-fork");
+            assert_eq!(rename["params"]["name"], "Release review");
+            write_result(&mut server_write, &rename, json!({})).await;
+
+            let read = read_request(&mut requests).await;
+            assert_eq!(read["method"], "thread/read");
+            assert_eq!(read["params"]["includeTurns"], false);
+            write_result(
+                &mut server_write,
+                &read,
+                json!({"thread": thread("thread-fork", "Release review")}),
+            )
+            .await;
+        });
+
+        let descriptor = connector.describe();
+        assert!(descriptor.capabilities.create);
+        assert!(descriptor
+            .action(&AgentSessionActionId::new(SESSION_FORK_ACTION))
+            .is_some());
+        assert!(descriptor
+            .action(&AgentSessionActionId::new(SESSION_RENAME_ACTION))
+            .is_some());
+
+        let created = connector
+            .create_session(CreateAgentSessionRequest {
+                cwd: Some("/repo".to_owned()),
+                title: Some("Compiler work".to_owned()),
+                extensions: BTreeMap::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(created.session_id.as_str(), "thread-new");
+        assert_eq!(created.title.as_deref(), Some("Compiler work"));
+
+        let forked = connector
+            .invoke_action(InvokeAgentSessionActionRequest {
+                session_id: created.session_id,
+                action_id: AgentSessionActionId::new(SESSION_FORK_ACTION),
+                arguments: Value::Null,
+            })
+            .await
+            .unwrap()
+            .session
+            .unwrap();
+        assert_eq!(forked.session_id.as_str(), "thread-fork");
+
+        let renamed = connector
+            .invoke_action(InvokeAgentSessionActionRequest {
+                session_id: forked.session_id,
+                action_id: AgentSessionActionId::new(SESSION_RENAME_ACTION),
+                arguments: json!({"name": "Release review"}),
+            })
+            .await
+            .unwrap()
+            .session
+            .unwrap();
+        assert_eq!(renamed.title.as_deref(), Some("Release review"));
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn connector_rejects_invalid_create_and_action_arguments_before_side_effects() {
+        let connector = CodexConnector::default();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let create_error = runtime
+            .block_on(connector.create_session(CreateAgentSessionRequest {
+                cwd: Some("  ".to_owned()),
+                title: None,
+                extensions: BTreeMap::new(),
+            }))
+            .unwrap_err();
+        assert_eq!(create_error.code, AgentConnectorErrorCode::InvalidRequest);
+
+        let rename_error = runtime
+            .block_on(connector.invoke_action(InvokeAgentSessionActionRequest {
+                session_id: AgentSessionId::new("thread-1"),
+                action_id: AgentSessionActionId::new(SESSION_RENAME_ACTION),
+                arguments: json!({"name": "", "unexpected": true}),
+            }))
+            .unwrap_err();
+        assert_eq!(rename_error.code, AgentConnectorErrorCode::InvalidRequest);
+    }
+
+    fn thread(id: &str, name: impl Into<Value>) -> Value {
+        json!({
+            "id": id,
+            "name": name.into(),
+            "preview": "session preview",
+            "cwd": "/repo",
+            "createdAt": 10,
+            "updatedAt": 20,
+            "status": {"type": "idle"}
+        })
+    }
+
+    async fn read_request<R>(requests: &mut tokio::io::Lines<BufReader<R>>) -> Value
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        serde_json::from_str(&requests.next_line().await.unwrap().unwrap()).unwrap()
+    }
+
+    async fn write_result<W>(writer: &mut W, request: &Value, result: Value)
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        writer
+            .write_all(format!("{}\n", json!({"id": request["id"], "result": result})).as_bytes())
+            .await
+            .unwrap();
     }
 }

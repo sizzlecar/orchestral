@@ -12,7 +12,9 @@ use axum::response::{IntoResponse, Response, Sse};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use orchestral_core::agent_connector::{
-    AgentConnectorId, AgentSessionDetail, AgentSessionListQuery, AgentSessionPage,
+    AgentConnectorId, AgentSessionActionId, AgentSessionActionOutcome, AgentSessionDetail,
+    AgentSessionListQuery, AgentSessionPage, AgentSessionSummary, CreateAgentSessionRequest,
+    InvokeAgentSessionActionRequest,
 };
 use orchestral_core::agent_protocol::wire::{
     AgentCommand, AgentCommandEnvelope, AgentRunView, AgentSessionId, ApprovalDecision, CommandAck,
@@ -64,8 +66,12 @@ pub fn router(state: RemoteApiState) -> Router {
         .route("/sessions/{session_id}", get(get_session))
         .route("/sessions/{session_id}/runs", post(start_run))
         .route("/agent-connectors", get(list_agent_connectors))
-        .route("/agent-sessions", get(list_agent_sessions))
+        .route(
+            "/agent-sessions",
+            get(list_agent_sessions).post(create_agent_session),
+        )
         .route("/agent-session", get(get_agent_session))
+        .route("/agent-session/actions", post(invoke_agent_session_action))
         .route("/agent-runs", post(start_agent_run))
         .route("/runs/{run_id}", get(inspect_run))
         .route("/runs/{run_id}/events", get(run_events))
@@ -263,6 +269,37 @@ async fn list_agent_sessions(
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct CreateExternalAgentSessionRequest {
+    connector_id: String,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    extensions: BTreeMap<String, serde_json::Value>,
+}
+
+async fn create_agent_session(
+    State(state): State<RemoteApiState>,
+    Json(request): Json<CreateExternalAgentSessionRequest>,
+) -> Result<(StatusCode, Json<AgentSessionSummary>), ApiError> {
+    let connector_id = AgentConnectorId::new(request.connector_id);
+    let summary = state
+        .agent_directory
+        .create_session(
+            &connector_id,
+            CreateAgentSessionRequest {
+                cwd: request.cwd,
+                title: request.title,
+                extensions: request.extensions,
+            },
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(summary)))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AgentSessionQuery {
     connector_id: String,
     session_id: String,
@@ -278,6 +315,35 @@ async fn get_agent_session(
             .read_session(
                 &AgentConnectorId::new(query.connector_id),
                 &AgentSessionId::new(query.session_id),
+            )
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InvokeExternalAgentSessionActionRequest {
+    connector_id: String,
+    session_id: String,
+    action_id: String,
+    #[serde(default)]
+    arguments: serde_json::Value,
+}
+
+async fn invoke_agent_session_action(
+    State(state): State<RemoteApiState>,
+    Json(request): Json<InvokeExternalAgentSessionActionRequest>,
+) -> Result<Json<AgentSessionActionOutcome>, ApiError> {
+    Ok(Json(
+        state
+            .agent_directory
+            .invoke_action(
+                &AgentConnectorId::new(request.connector_id),
+                InvokeAgentSessionActionRequest {
+                    session_id: AgentSessionId::new(request.session_id),
+                    action_id: AgentSessionActionId::new(request.action_id),
+                    arguments: request.arguments,
+                },
             )
             .await?,
     ))
@@ -1046,7 +1112,9 @@ mod tests {
     };
     use orchestral_core::agent_connector::{
         AgentConnector, AgentConnectorDescriptor, AgentConnectorError, AgentConnectorHealth,
-        AgentSessionCapabilities, AgentSessionState, AgentSessionSummary,
+        AgentSessionActionDescriptor, AgentSessionActionOutcome, AgentSessionCapabilities,
+        AgentSessionState, AgentSessionSummary, CreateAgentSessionRequest,
+        InvokeAgentSessionActionRequest, SESSION_FORK_ACTION, SESSION_RENAME_ACTION,
     };
     use orchestral_core::agent_protocol::{
         spi::{AgentProvider, AgentRecovery, AgentRecoveryRequest, AgentStart, AgentStartError},
@@ -1088,6 +1156,14 @@ mod tests {
                 extensions: BTreeMap::new(),
             }
         }
+
+        fn created_summary() -> AgentSessionSummary {
+            AgentSessionSummary {
+                session_id: AgentSessionId::new("fixture-created"),
+                title: Some("Created from HTTP".to_owned()),
+                ..Self::summary()
+            }
+        }
     }
 
     #[async_trait]
@@ -1098,8 +1174,24 @@ mod tests {
                 provider_binding: ProviderBindingRef::new("fixture/external"),
                 agent_family: "test-agent".to_owned(),
                 display_name: "Fixture Agent".to_owned(),
-                capabilities: AgentSessionCapabilities::discoverable(),
-                actions: Vec::new(),
+                capabilities: AgentSessionCapabilities {
+                    create: true,
+                    ..AgentSessionCapabilities::discoverable()
+                },
+                actions: vec![
+                    AgentSessionActionDescriptor {
+                        action_id: AgentSessionActionId::new(SESSION_FORK_ACTION),
+                        title: "Fork".to_owned(),
+                        description: "Fork a fixture session".to_owned(),
+                        input_schema: None,
+                    },
+                    AgentSessionActionDescriptor {
+                        action_id: AgentSessionActionId::new(SESSION_RENAME_ACTION),
+                        title: "Rename".to_owned(),
+                        description: "Rename a fixture session".to_owned(),
+                        input_schema: Some(serde_json::json!({"type": "object"})),
+                    },
+                ],
             }
         }
 
@@ -1132,6 +1224,32 @@ mod tests {
                 summary: Self::summary(),
                 turns: Vec::new(),
                 pending_requests: Vec::new(),
+            })
+        }
+
+        async fn create_session(
+            &self,
+            request: CreateAgentSessionRequest,
+        ) -> Result<AgentSessionSummary, AgentConnectorError> {
+            assert_eq!(request.cwd.as_deref(), Some("/fixture/new"));
+            assert_eq!(request.title.as_deref(), Some("Created from HTTP"));
+            assert!(request.extensions.is_empty());
+            Ok(Self::created_summary())
+        }
+
+        async fn invoke_action(
+            &self,
+            request: InvokeAgentSessionActionRequest,
+        ) -> Result<AgentSessionActionOutcome, AgentConnectorError> {
+            assert_eq!(request.session_id.as_str(), "fixture-session");
+            assert_eq!(request.action_id.as_str(), SESSION_RENAME_ACTION);
+            assert_eq!(request.arguments["name"], "Renamed over HTTP");
+            let mut summary = Self::summary();
+            summary.title = Some("Renamed over HTTP".to_owned());
+            Ok(AgentSessionActionOutcome {
+                session: Some(summary),
+                content: Vec::new(),
+                details: serde_json::Value::Null,
             })
         }
     }
@@ -1484,6 +1602,61 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let session: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(session["summary"]["title"], "Existing fixture session");
+
+        let response = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/agent-sessions",
+                &token,
+                serde_json::json!({
+                    "connector_id": "fixture/local",
+                    "cwd": "/fixture/new",
+                    "title": "Created from HTTP"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(created["session_id"], "fixture-created");
+
+        let response = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/agent-session/actions",
+                &token,
+                serde_json::json!({
+                    "connector_id": "fixture/local",
+                    "session_id": "fixture-session",
+                    "action_id": "session.rename",
+                    "arguments": {"name": "Renamed over HTTP"}
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let renamed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(renamed["session"]["title"], "Renamed over HTTP");
+
+        let response = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/agent-session/actions",
+                &token,
+                serde_json::json!({
+                    "connector_id": "fixture/local",
+                    "session_id": "fixture-session",
+                    "action_id": "session.undeclared"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
 
         let response = app
             .clone()
