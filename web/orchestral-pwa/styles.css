@@ -1174,7 +1174,7 @@ svg {
 
 .activity-item__summary {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) auto 18px;
   align-items: center;
   gap: 9px;
   min-height: 44px;
@@ -1192,12 +1192,16 @@ svg {
   display: none;
 }
 
+.activity-item__summary::marker {
+  content: "";
+}
+
 .activity-item__summary::after {
-  grid-column: 3;
+  grid-column: 4;
   grid-row: 1;
+  justify-self: center;
   width: 7px;
   height: 7px;
-  margin-left: 5px;
   border-right: 1.5px solid currentColor;
   border-bottom: 1.5px solid currentColor;
   content: "";
@@ -1223,7 +1227,6 @@ svg {
 .activity-item__status {
   grid-column: 3;
   grid-row: 1;
-  padding-right: 17px;
   color: var(--muted);
   font-size: 9px;
   text-transform: lowercase;

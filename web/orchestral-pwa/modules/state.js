@@ -101,6 +101,7 @@ function emptyRun(id, sessionId = null) {
         streamedOutputs: {},
         committedOutputIds: [],
         telemetryIds: [],
+        presentationCursor: 0,
         activities: [],
         commands: [],
         pending: [],
@@ -142,7 +143,10 @@ function replaceOrAppendOptimistic(messages, message) {
         return [...messages, message];
     }
     const next = [...messages];
-    next[optimisticIndex] = message;
+    next[optimisticIndex] = {
+        ...message,
+        order: messages[optimisticIndex].order ?? message.order,
+    };
     return next;
 }
 
@@ -158,6 +162,11 @@ function appendIfNewText(messages, message) {
 
 function terminalTime(status, previous, now) {
     return isTerminalStatus(status) ? (previous ?? now) : null;
+}
+
+function takePresentationOrder(run) {
+    run.presentationCursor = (run.presentationCursor ?? 0) + 1;
+    return run.presentationCursor;
 }
 
 function commandSummary(command) {
@@ -224,25 +233,36 @@ export function projectDurableRecord(run, record, now = Date.now()) {
             break;
         case "input_committed": {
             const text = contentsText(payload.content);
+            const optimistic = next.messages.find(
+                (item) => item.role === "user" && item.optimistic,
+            );
             next.messages = replaceOrAppendOptimistic(next.messages, {
                 id: eventId,
                 role: "user",
                 text,
                 seq: sequence,
+                order: optimistic?.order ?? takePresentationOrder(next),
                 optimistic: false,
             });
             break;
         }
         case "output_committed": {
             const text = contentsText(payload.content);
-            next.messages = appendIfNewText(next.messages, {
-                id: eventId,
-                role: "assistant",
-                text,
-                seq: sequence,
-                outputId: payload.output_id,
-                optimistic: false,
-            });
+            const duplicate = next.messages.some(
+                (item) => item.role === "assistant" && item.text === text && !item.optimistic,
+            );
+            if (text && !duplicate) {
+                next.messages = [...next.messages, {
+                    id: eventId,
+                    role: "assistant",
+                    text,
+                    seq: sequence,
+                    order: next.streamedOutputs[payload.output_id]?.order
+                        ?? takePresentationOrder(next),
+                    outputId: payload.output_id,
+                    optimistic: false,
+                }];
+            }
             next.committedOutputIds = next.committedOutputIds.includes(payload.output_id)
                 ? next.committedOutputIds
                 : [...next.committedOutputIds, payload.output_id];
@@ -272,6 +292,7 @@ export function projectDurableRecord(run, record, now = Date.now()) {
             break;
         case "command_received": {
             const command = payload.command;
+            const existing = next.commands.find((item) => item.id === command.command_id);
             next.commands = [
                 ...next.commands.filter((item) => item.id !== command.command_id),
                 {
@@ -281,6 +302,7 @@ export function projectDurableRecord(run, record, now = Date.now()) {
                     requestId: command.request_id ?? null,
                     state: "received",
                     seq: sequence,
+                    order: existing?.order ?? takePresentationOrder(next),
                 },
             ];
             break;
@@ -297,6 +319,7 @@ export function projectDurableRecord(run, record, now = Date.now()) {
                 state: payload.outcome?.outcome ?? "recorded",
                 outcome: payload.outcome,
                 dispositionSeq: sequence,
+                order: existing?.order ?? takePresentationOrder(next),
             };
             next.commands = [
                 ...next.commands.filter((command) => command.id !== payload.command_id),
@@ -313,13 +336,19 @@ export function projectDurableRecord(run, record, now = Date.now()) {
             next.completedAt = terminalTime(next.status, next.completedAt, now);
             next.pending = [];
             const text = contentText(payload.delivery?.final_response);
-            next.messages = appendIfNewText(next.messages, {
-                id: `${eventId}-delivery`,
-                role: "assistant",
-                text,
-                seq: sequence,
-                optimistic: false,
-            });
+            const duplicate = next.messages.some(
+                (item) => item.role === "assistant" && item.text === text && !item.optimistic,
+            );
+            if (text && !duplicate) {
+                next.messages = [...next.messages, {
+                    id: `${eventId}-delivery`,
+                    role: "assistant",
+                    text,
+                    seq: sequence,
+                    order: takePresentationOrder(next),
+                    optimistic: false,
+                }];
+            }
             break;
         }
         case "run_incomplete": {
@@ -328,14 +357,20 @@ export function projectDurableRecord(run, record, now = Date.now()) {
             next.completedAt = terminalTime(next.status, next.completedAt, now);
             next.pending = [];
             const text = contentText(payload.partial_delivery?.response);
-            next.messages = appendIfNewText(next.messages, {
-                id: `${eventId}-partial`,
-                role: "assistant",
-                text,
-                seq: sequence,
-                partial: true,
-                optimistic: false,
-            });
+            const duplicate = next.messages.some(
+                (item) => item.role === "assistant" && item.text === text && !item.optimistic,
+            );
+            if (text && !duplicate) {
+                next.messages = [...next.messages, {
+                    id: `${eventId}-partial`,
+                    role: "assistant",
+                    text,
+                    seq: sequence,
+                    order: takePresentationOrder(next),
+                    partial: true,
+                    optimistic: false,
+                }];
+            }
             break;
         }
         case "run_failed":
@@ -390,6 +425,7 @@ export function projectTelemetry(run, telemetry) {
                     outputId: payload.output_id,
                     text: `${previous?.text ?? ""}${text}`,
                     telemetryId,
+                    order: previous?.order ?? takePresentationOrder(next),
                 },
             };
             break;
@@ -399,6 +435,7 @@ export function projectTelemetry(run, telemetry) {
                 message: payload.message,
                 fraction: payload.fraction ?? null,
                 telemetryId,
+                order: run.progress?.order ?? takePresentationOrder(next),
             };
             break;
         case "tool_activity": {
@@ -408,6 +445,8 @@ export function projectTelemetry(run, telemetry) {
                 state: payload.state,
                 evidence: Array.isArray(payload.evidence) ? payload.evidence : [],
                 telemetryId,
+                order: run.activities.find((item) => item.id === payload.activity_id)?.order
+                    ?? takePresentationOrder(next),
             };
             const existingIndex = run.activities.findIndex((item) => item.id === activity.id);
             if (existingIndex < 0) {
@@ -561,29 +600,35 @@ export function reducer(state, action) {
                 };
             });
         case "RUN_OPTIMISTIC_START":
-            return withRun(state, action.runId, action.sessionId, (run) => ({
-                ...run,
-                sessionId: action.sessionId,
-                status: "running",
-                startedAt: action.now ?? Date.now(),
-                messages: appendIfNewText(run.messages, {
+            return withRun(state, action.runId, action.sessionId, (run) => {
+                const next = {
+                    ...run,
+                    sessionId: action.sessionId,
+                    status: "running",
+                    startedAt: action.now ?? Date.now(),
+                };
+                next.messages = appendIfNewText(run.messages, {
                     id: `optimistic-${action.runId}`,
                     role: "user",
                     text: action.input,
+                    order: takePresentationOrder(next),
                     optimistic: true,
-                }),
-            }));
+                });
+                return next;
+            });
         case "RUN_OPTIMISTIC_MESSAGE":
-            return withRun(state, action.runId, action.sessionId, (run) => ({
-                ...run,
-                messages: [...run.messages, {
+            return withRun(state, action.runId, action.sessionId, (run) => {
+                const next = { ...run };
+                next.messages = [...run.messages, {
                     id: action.id,
                     role: action.role ?? "user",
                     text: action.text,
+                    order: takePresentationOrder(next),
                     optimistic: false,
                     steering: Boolean(action.steering),
-                }],
-            }));
+                }];
+                return next;
+            });
         case "RUN_DURABLE":
             return withRun(state, action.runId, action.sessionId, (run) => (
                 projectDurableRecord(run, action.record, action.now)
@@ -615,6 +660,32 @@ export function reducer(state, action) {
         default:
             return state;
     }
+}
+
+export function timelineForRun(run) {
+    const items = [];
+    let fallback = 0;
+    const append = (kind, value) => {
+        fallback += 1;
+        items.push({
+            kind,
+            value,
+            order: Number.isSafeInteger(value?.order)
+                ? value.order
+                : Number.MAX_SAFE_INTEGER,
+            fallback,
+        });
+    };
+
+    for (const message of run.messages) append("message", message);
+    for (const output of Object.values(run.streamedOutputs)) append("stream", output);
+    for (const activity of run.activities) append("activity", activity);
+    for (const command of run.commands) append("command", command);
+    if (run.progress) append("progress", run.progress);
+
+    return items
+        .sort((left, right) => left.order - right.order || left.fallback - right.fallback)
+        .map(({ kind, value }) => ({ kind, value }));
 }
 
 export function selectedSession(state) {

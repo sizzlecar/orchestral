@@ -7,6 +7,7 @@ import {
     createInitialState,
     currentRun,
     reducer,
+    timelineForRun,
 } from "../modules/state.js";
 
 const inline = (value) => ({
@@ -109,6 +110,78 @@ test("telemetry deduplicates deltas but never advances the durable cursor", () =
     const run = state.runs.byId["run-1"];
     assert.equal(run.cursor, 0);
     assert.equal(run.streamedOutputs.answer.text, "Hello");
+});
+
+test("the presentation timeline preserves live tool order through terminal updates", () => {
+    let state = withRun();
+    for (const item of [
+        record(1, "run_accepted"),
+        record(2, "input_committed", { content: [inline("Inspect the repository")] }),
+    ]) {
+        state = reducer(state, { type: "RUN_DURABLE", runId: "run-1", record: item });
+    }
+    state = reducer(state, {
+        type: "RUN_TELEMETRY",
+        runId: "run-1",
+        telemetry: {
+            telemetry_id: "tool-running",
+            run_id: "run-1",
+            payload: {
+                type: "tool_activity",
+                activity_id: "tool-1",
+                tool_name: "exec_command",
+                state: "running",
+                evidence: [],
+            },
+        },
+    });
+    const originalToolOrder = state.runs.byId["run-1"].activities[0].order;
+    state = reducer(state, {
+        type: "RUN_TELEMETRY",
+        runId: "run-1",
+        telemetry: {
+            telemetry_id: "tool-succeeded",
+            run_id: "run-1",
+            payload: {
+                type: "tool_activity",
+                activity_id: "tool-1",
+                tool_name: "exec_command",
+                state: "succeeded",
+                evidence: [{ type: "command", command: "git log -n 5" }],
+            },
+        },
+    });
+    state = reducer(state, {
+        type: "RUN_TELEMETRY",
+        runId: "run-1",
+        telemetry: {
+            telemetry_id: "answer-delta",
+            run_id: "run-1",
+            payload: { type: "output_delta", output_id: "answer", delta: inline("Finished") },
+        },
+    });
+    state = reducer(state, {
+        type: "RUN_DURABLE",
+        runId: "run-1",
+        record: record(3, "output_committed", {
+            output_id: "answer",
+            content: [inline("Finished")],
+        }),
+    });
+
+    const run = state.runs.byId["run-1"];
+    assert.equal(run.activities[0].order, originalToolOrder);
+    assert.deepEqual(
+        timelineForRun(run).map(({ kind, value }) => [
+            kind,
+            value.text ?? value.toolName,
+        ]),
+        [
+            ["message", "Inspect the repository"],
+            ["activity", "exec_command"],
+            ["message", "Finished"],
+        ],
+    );
 });
 
 test("committed output replaces its lossy stream and terminal delivery closes the run", () => {

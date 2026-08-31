@@ -5,6 +5,7 @@ import {
     isTerminalStatus,
     runsForSelectedSession,
     selectedSession,
+    timelineForRun,
 } from "./state.js";
 
 function element(tag, { className, text, attrs, dataset } = {}, children = []) {
@@ -202,27 +203,48 @@ function createCommand(command) {
     return details;
 }
 
-function createRunActivity(run) {
-    if (!run.activities.length && !run.commands.length && !run.progress) return null;
+function wrapRunActivity(child) {
     const section = element("section", { className: "run-activity", attrs: { "aria-label": "运行活动" } });
-    if (run.progress) {
-        const fraction = run.progress.fraction;
-        const text = fraction === null
-            ? run.progress.message
-            : `${Math.round(fraction * 100)}% · ${run.progress.message}`;
-        const progress = element("div", { className: "progress-card" }, [
-            element("span", { className: "progress-card__label", text }),
-        ]);
-        if (fraction !== null) {
-            progress.append(element("progress", {
-                attrs: { max: "1", value: String(fraction), "aria-label": text },
-            }));
-        }
-        section.append(progress);
-    }
-    for (const activity of run.activities) section.append(createActivity(activity));
-    for (const command of run.commands) section.append(createCommand(command));
+    section.append(child);
     return section;
+}
+
+function createProgress(progressState) {
+    const fraction = progressState.fraction;
+    const text = fraction === null
+        ? progressState.message
+        : `${Math.round(fraction * 100)}% · ${progressState.message}`;
+    const progress = element("div", { className: "progress-card" }, [
+        element("span", { className: "progress-card__label", text }),
+    ]);
+    if (fraction !== null) {
+        progress.append(element("progress", {
+            attrs: { max: "1", value: String(fraction), "aria-label": text },
+        }));
+    }
+    return progress;
+}
+
+function createTimelineNode(run, entry) {
+    switch (entry.kind) {
+        case "message":
+            return createMessage(entry.value);
+        case "stream":
+            return createMessage({
+                id: `stream-${run.id}-${entry.value.outputId}`,
+                role: "assistant",
+                text: entry.value.text,
+                streaming: true,
+            });
+        case "activity":
+            return wrapRunActivity(createActivity(entry.value));
+        case "command":
+            return wrapRunActivity(createCommand(entry.value));
+        case "progress":
+            return wrapRunActivity(createProgress(entry.value));
+        default:
+            return null;
+    }
 }
 
 function requestPrompt(request) {
@@ -438,7 +460,8 @@ export function createView() {
         const hasContent = runs.some((run) => run.messages.length
             || Object.keys(run.streamedOutputs).length
             || run.activities.length
-            || run.commands.length);
+            || run.commands.length
+            || run.progress);
         if (!hasContent) {
             refs.messageList.append(emptyTemplate.cloneNode(true));
             return;
@@ -446,16 +469,9 @@ export function createView() {
 
         for (const run of runs) {
             const group = element("div", { className: "run-group", dataset: { runId: run.id } });
-            for (const message of run.messages) group.append(createMessage(message));
-            const activity = createRunActivity(run);
-            if (activity) group.append(activity);
-            for (const output of Object.values(run.streamedOutputs)) {
-                group.append(createMessage({
-                    id: `stream-${run.id}-${output.outputId}`,
-                    role: "assistant",
-                    text: output.text,
-                    streaming: true,
-                }));
+            for (const entry of timelineForRun(run)) {
+                const node = createTimelineNode(run, entry);
+                if (node) group.append(node);
             }
             if (run.failure?.message) {
                 group.append(element("div", {
