@@ -12,8 +12,8 @@ use axum::response::{IntoResponse, Response, Sse};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use orchestral_core::agent_connector::{
-    AgentConnectorId, AgentSessionActionId, AgentSessionActionOutcome, AgentSessionDetail,
-    AgentSessionListQuery, AgentSessionPage, AgentSessionReadQuery, AgentSessionSummary,
+    AgentConnectorId, AgentSessionActionId, AgentSessionActionOutcome, AgentSessionListQuery,
+    AgentSessionPage, AgentSessionReadQuery, AgentSessionSummary,
     CreateAgentSessionRequest, InvokeAgentSessionActionRequest,
 };
 use orchestral_core::agent_protocol::spi::AgentStartError;
