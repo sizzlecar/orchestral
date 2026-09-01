@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use dioxus::prelude::*;
 use gloo_timers::future::TimeoutFuture;
 
@@ -6,7 +8,8 @@ use crate::components::pending::PendingPanel;
 use crate::components::session_control::{NewSessionPanel, SessionActionsPanel};
 use crate::components::settings::SettingsPanel;
 use crate::components::timeline::ConversationTimeline;
-use crate::state::{AuthStatus, LoadStatus, RunState};
+use crate::model::SessionView;
+use crate::state::{AppState, AuthStatus, LoadStatus, RunState};
 
 #[component]
 pub fn AuthScreen() -> Element {
@@ -82,13 +85,14 @@ pub fn Workspace() -> Element {
     let session_source = selected
         .as_ref()
         .and_then(|session| session.connector_id.as_deref())
-        .map(connector_label)
-        .unwrap_or("Orchestral");
+        .map(|connector_id| connector_display_name(&state, connector_id))
+        .unwrap_or_else(|| "Orchestral".to_owned());
     let run = state.current_run().cloned();
     let has_session_actions = state
         .selected_connector()
         .is_some_and(|connector| !connector.actions.is_empty());
     let install_available = state.ui.install_available;
+    let session_groups = group_sessions(&state);
 
     rsx! {
         a { class: "skip-link", href: "#main-content", "跳到对话" }
@@ -159,32 +163,39 @@ pub fn Workspace() -> Element {
                     }
                     nav { class: "thread-nav", aria_label: "最近会话",
                         div { class: "section-label",
-                            span { "最近" }
+                            span { "会话" }
                             span { class: "section-label__count", "{state.sessions.items.len()}" }
                         }
-                        ul { class: "thread-list",
-                            for session in state.sessions.items.iter() {
-                                {
-                                    let session_key = session.key();
-                                    let selected = state.sessions.selected_id.as_deref() == Some(session_key.as_str());
-                                    let title = session_title(&state, session);
-                                    let updated = format_date(session.updated_at_unix_ms);
-                                    rsx! {
-                                        li { class: "thread-item", key: "{session.id}",
-                                            button {
-                                                class: "thread-button",
-                                                r#type: "button",
-                                                aria_current: if selected { "page" } else { "false" },
-                                                onclick: move |_| {
-                                                    let selected = session_key.clone();
-                                                    spawn(async move { controller.load_session(selected).await });
-                                                },
-                                                span { class: "thread-button__title", "{title}" }
-                                                span { class: "thread-button__meta",
-                                                    if let Some(connector_id) = session.connector_id.as_deref() {
-                                                        "{connector_label(connector_id)} · {updated}"
-                                                    } else {
-                                                        "{updated}"
+                        div { class: "thread-groups",
+                            for group in session_groups {
+                                section {
+                                    class: "thread-group",
+                                    key: "{group.key}",
+                                    aria_label: "{group.label} 会话",
+                                    div { class: "thread-group__label",
+                                        span { "{group.label}" }
+                                        span { "{group.sessions.len()}" }
+                                    }
+                                    ul { class: "thread-list",
+                                        for session in group.sessions {
+                                            {
+                                                let session_key = session.key();
+                                                let selected = state.sessions.selected_id.as_deref() == Some(session_key.as_str());
+                                                let title = session_title(&state, &session);
+                                                let updated = format_date(session.updated_at_unix_ms);
+                                                rsx! {
+                                                    li { class: "thread-item", key: "{session_key}",
+                                                        button {
+                                                            class: "thread-button",
+                                                            r#type: "button",
+                                                            aria_current: if selected { "page" } else { "false" },
+                                                            onclick: move |_| {
+                                                                let selected = session_key.clone();
+                                                                spawn(async move { controller.load_session(selected).await });
+                                                            },
+                                                            span { class: "thread-button__title", "{title}" }
+                                                            span { class: "thread-button__meta", "{updated}" }
+                                                        }
                                                     }
                                                 }
                                             }
@@ -409,7 +420,57 @@ fn Composer() -> Element {
     }
 }
 
-fn session_title(state: &crate::state::AppState, session: &crate::model::SessionView) -> String {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionGroup {
+    key: String,
+    label: String,
+    sessions: Vec<SessionView>,
+}
+
+fn group_sessions(state: &AppState) -> Vec<SessionGroup> {
+    let mut grouped = BTreeMap::<Option<String>, Vec<SessionView>>::new();
+    for session in &state.sessions.items {
+        grouped
+            .entry(session.connector_id.clone())
+            .or_default()
+            .push(session.clone());
+    }
+
+    let mut groups = grouped
+        .into_iter()
+        .map(|(connector_id, mut sessions)| {
+            sessions.sort_by(|left, right| {
+                right
+                    .updated_at_unix_ms
+                    .cmp(&left.updated_at_unix_ms)
+                    .then_with(|| left.key().cmp(&right.key()))
+            });
+            let (key, label) = match connector_id {
+                Some(connector_id) => (
+                    connector_id.clone(),
+                    connector_display_name(state, &connector_id),
+                ),
+                None => ("orchestral".to_owned(), "Orchestral".to_owned()),
+            };
+            SessionGroup {
+                key,
+                label,
+                sessions,
+            }
+        })
+        .collect::<Vec<_>>();
+    groups.sort_by(|left, right| {
+        let left_native = left.key == "orchestral";
+        let right_native = right.key == "orchestral";
+        right_native
+            .cmp(&left_native)
+            .then_with(|| left.label.to_lowercase().cmp(&right.label.to_lowercase()))
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    groups
+}
+
+fn session_title(state: &AppState, session: &SessionView) -> String {
     if let Some(title) = session
         .title
         .as_ref()
@@ -447,8 +508,23 @@ fn short_id(value: &str) -> String {
     value.chars().take(8).collect()
 }
 
-fn connector_label(connector_id: &str) -> &str {
-    connector_id.split('/').next().unwrap_or(connector_id)
+fn connector_display_name(state: &AppState, connector_id: &str) -> String {
+    state
+        .connectors
+        .items
+        .iter()
+        .find(|connector| connector.connector_id == connector_id)
+        .map(|connector| connector.display_name.trim())
+        .filter(|label| !label.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            let fallback = connector_id.split('/').next().unwrap_or(connector_id);
+            let mut chars = fallback.chars();
+            chars
+                .next()
+                .map(|first| first.to_uppercase().chain(chars).collect())
+                .unwrap_or_else(|| "Agent".to_owned())
+        })
 }
 
 fn format_date(milliseconds: i64) -> String {
@@ -480,5 +556,82 @@ fn run_label(run: Option<&RunState>, now: f64) -> (String, &'static str) {
         "loading" => ("正在载入".to_owned(), "working"),
         "unknown" => ("连接待恢复".to_owned(), "warning"),
         _ => ("状态待确认".to_owned(), "warning"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{AgentConnectorView, AgentSessionCapabilitiesView};
+
+    fn session(id: &str, connector_id: Option<&str>, updated_at_unix_ms: i64) -> SessionView {
+        SessionView {
+            id: id.to_owned(),
+            created_at_unix_ms: updated_at_unix_ms,
+            updated_at_unix_ms,
+            run_ids: Vec::new(),
+            connector_id: connector_id.map(str::to_owned),
+            title: None,
+            preview: None,
+            cwd: None,
+            state: None,
+        }
+    }
+
+    fn connector(connector_id: &str, display_name: &str) -> AgentConnectorView {
+        AgentConnectorView {
+            connector_id: connector_id.to_owned(),
+            display_name: display_name.to_owned(),
+            agent_family: "coding-agent".to_owned(),
+            capabilities: AgentSessionCapabilitiesView {
+                list: true,
+                read: true,
+                create: true,
+            },
+            actions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn sidebar_groups_native_and_agent_sessions_and_sorts_each_group_by_recency() {
+        let mut state = AppState::new(true);
+        state.connectors.items = vec![
+            connector("codex/local", "Codex"),
+            connector("claude/local", "Claude"),
+        ];
+        state.sessions.items = vec![
+            session("native-old", None, 10),
+            session("same-id", Some("codex/local"), 20),
+            session("same-id", Some("claude/local"), 50),
+            session("codex-new", Some("codex/local"), 40),
+            session("native-new", None, 30),
+        ];
+
+        let groups = group_sessions(&state);
+
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Orchestral", "Claude", "Codex"]
+        );
+        assert_eq!(
+            groups[0]
+                .sessions
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["native-new", "native-old"]
+        );
+        assert_eq!(
+            groups[2]
+                .sessions
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["codex-new", "same-id"]
+        );
+        assert_ne!(groups[1].sessions[0].key(), groups[2].sessions[1].key());
     }
 }

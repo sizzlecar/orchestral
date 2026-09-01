@@ -495,6 +495,37 @@ svg {
   margin-top: 20px;
 }
 
+.thread-groups {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-color: var(--line-strong) transparent;
+}
+
+.thread-group + .thread-group {
+  margin-top: 13px;
+}
+
+.thread-group__label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 28px;
+  padding: 0 9px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 720;
+  letter-spacing: 0.055em;
+}
+
+.thread-group__label span:last-child {
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
 .section-label {
   display: flex;
   align-items: center;
@@ -518,9 +549,6 @@ svg {
   min-height: 0;
   padding: 0;
   margin: 2px 0 0;
-  overflow: auto;
-  overscroll-behavior: contain;
-  scrollbar-color: var(--line-strong) transparent;
   list-style: none;
 }
 
@@ -814,6 +842,25 @@ svg {
   scrollbar-color: var(--line-strong) transparent;
   -webkit-user-select: text;
   user-select: text;
+}
+
+.history-pagination {
+  display: flex;
+  justify-content: center;
+  width: min(100%, 820px);
+  margin: 0 auto 18px;
+}
+
+.history-pagination__button {
+  min-height: 40px;
+  padding: 0 15px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 680;
 }
 
 .run-group {

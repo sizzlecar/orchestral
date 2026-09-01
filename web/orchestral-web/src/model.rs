@@ -149,6 +149,9 @@ pub struct AgentSessionDetail {
     pub turns: Vec<AgentSessionTurn>,
     #[serde(default)]
     pub pending_requests: Vec<Value>,
+    /// Opaque cursor for the next, older page of session history.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -239,6 +242,23 @@ mod tests {
                 run_id: "review-run-1".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn session_detail_preserves_the_older_history_cursor() {
+        let detail: AgentSessionDetail = serde_json::from_value(serde_json::json!({
+            "summary": {
+                "connector_id": "codex/local",
+                "session_id": "thread-1",
+                "state": "idle"
+            },
+            "turns": [],
+            "pending_requests": [],
+            "next_cursor": "activity-offset-v1:40"
+        }))
+        .unwrap();
+
+        assert_eq!(detail.next_cursor.as_deref(), Some("activity-offset-v1:40"));
     }
 }
 

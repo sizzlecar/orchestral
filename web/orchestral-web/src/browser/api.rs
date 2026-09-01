@@ -144,16 +144,19 @@ impl ApiClient {
         credential: &ApiCredential,
         connector_id: &str,
         session_id: &str,
+        cursor: Option<&str>,
+        limit: u32,
     ) -> Result<AgentSessionDetail, ApiError> {
-        self.get(
-            &format!(
-                "/agent-session?connector_id={}&session_id={}",
-                encode(connector_id),
-                encode(session_id)
-            ),
-            credential,
-        )
-        .await
+        let mut path = format!(
+            "/agent-session?connector_id={}&session_id={}&limit={limit}",
+            encode(connector_id),
+            encode(session_id)
+        );
+        if let Some(cursor) = cursor {
+            path.push_str("&cursor=");
+            path.push_str(&encode(cursor));
+        }
+        self.get(&path, credential).await
     }
 
     pub async fn invoke_agent_session_action(

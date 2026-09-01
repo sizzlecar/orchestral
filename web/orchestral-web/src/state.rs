@@ -119,6 +119,9 @@ pub struct RunState {
     pub activities: Vec<ToolActivity>,
     pub commands: Vec<CommandActivity>,
     pub pending: Vec<Value>,
+    /// Opaque cursor for the next, older page of an external Agent transcript.
+    pub history_next_cursor: Option<String>,
+    pub history_loading_earlier: bool,
     pub progress: Option<Progress>,
     pub delivery: Option<Value>,
     pub partial_delivery: Option<Value>,
@@ -148,6 +151,8 @@ impl RunState {
             activities: Vec::new(),
             commands: Vec::new(),
             pending: Vec::new(),
+            history_next_cursor: None,
+            history_loading_earlier: false,
             progress: None,
             delivery: None,
             partial_delivery: None,
@@ -813,52 +818,23 @@ impl AppState {
         run.commands.clear();
         run.streamed_outputs.clear();
         run.presentation_cursor = 0;
-
-        for turn in detail.turns {
-            for activity in turn.activities {
-                let order = run.next_order();
-                let text = contents_text(Some(&Value::Array(activity.content.clone())));
-                match activity.kind.as_str() {
-                    "user_message" | "agent_message" => {
-                        if !text.is_empty() {
-                            run.messages.push(Message {
-                                id: activity.activity_id,
-                                role: if activity.kind == "user_message" {
-                                    "user".to_owned()
-                                } else {
-                                    "assistant".to_owned()
-                                },
-                                text,
-                                order,
-                                optimistic: false,
-                                partial: false,
-                                steering: false,
-                            });
-                        }
-                    }
-                    _ => {
-                        let mut evidence = Vec::new();
-                        if !activity.details.is_null() {
-                            evidence.push(activity.details);
-                        }
-                        if !text.is_empty() {
-                            evidence.push(serde_json::json!({
-                                "type": "note",
-                                "text": text,
-                            }));
-                        }
-                        run.activities.push(ToolActivity {
-                            id: activity.activity_id,
-                            tool_name: activity.title.unwrap_or_else(|| activity.kind.clone()),
-                            state: activity.status,
-                            evidence,
-                            order,
-                        });
-                    }
-                }
-            }
-        }
+        append_agent_history(run, detail.turns, false);
         run.pending = detail.pending_requests;
+        run.history_next_cursor = detail.next_cursor;
+        run.history_loading_earlier = false;
+    }
+
+    /// Prepends one older Agent transcript page without replacing the latest
+    /// page that is already visible. Boundary overlap is deduplicated by the
+    /// connector-provided activity id.
+    pub fn prepend_agent_session_history(&mut self, detail: AgentSessionDetail) {
+        let connector_id = detail.summary.connector_id.clone();
+        let session_id = detail.summary.session_id.clone();
+        let run_id = format!("agent-history:{connector_id}:{session_id}");
+        let run = self.ensure_run_source(&run_id, Some(session_id), Some(connector_id));
+        append_agent_history(run, detail.turns, true);
+        run.history_next_cursor = detail.next_cursor;
+        run.history_loading_earlier = false;
     }
 
     pub fn current_run(&self) -> Option<&RunState> {
@@ -889,6 +865,129 @@ impl AppState {
 
     pub fn recoverable_run(&self) -> Option<&RunState> {
         self.current_run().filter(|run| run.status == "unknown")
+    }
+}
+
+#[derive(Debug)]
+enum AgentHistoryItem {
+    Message(Message),
+    Activity(ToolActivity),
+}
+
+impl AgentHistoryItem {
+    fn id(&self) -> &str {
+        match self {
+            Self::Message(message) => &message.id,
+            Self::Activity(activity) => &activity.id,
+        }
+    }
+
+    fn set_order(&mut self, order: u64) {
+        match self {
+            Self::Message(message) => message.order = order,
+            Self::Activity(activity) => activity.order = order,
+        }
+    }
+}
+
+fn append_agent_history(
+    run: &mut RunState,
+    turns: Vec<crate::model::AgentSessionTurn>,
+    prepend: bool,
+) {
+    let mut seen_ids = run
+        .messages
+        .iter()
+        .map(|message| message.id.clone())
+        .chain(run.activities.iter().map(|activity| activity.id.clone()))
+        .collect::<BTreeSet<_>>();
+    let mut items = turns
+        .into_iter()
+        .flat_map(|turn| turn.activities)
+        .filter_map(agent_history_item)
+        .filter(|item| seen_ids.insert(item.id().to_owned()))
+        .collect::<Vec<_>>();
+
+    if prepend {
+        let offset = items.len() as u64;
+        if offset == 0 {
+            return;
+        }
+        shift_timeline_orders(run, offset);
+        for (index, item) in items.iter_mut().enumerate() {
+            item.set_order(index as u64 + 1);
+        }
+        run.presentation_cursor = run.presentation_cursor.saturating_add(offset);
+    } else {
+        for item in &mut items {
+            item.set_order(run.next_order());
+        }
+    }
+
+    for item in items {
+        match item {
+            AgentHistoryItem::Message(message) => run.messages.push(message),
+            AgentHistoryItem::Activity(activity) => run.activities.push(activity),
+        }
+    }
+}
+
+fn agent_history_item(activity: crate::model::AgentSessionActivity) -> Option<AgentHistoryItem> {
+    let text = contents_text(Some(&Value::Array(activity.content.clone())));
+    match activity.kind.as_str() {
+        "user_message" | "agent_message" if !text.is_empty() => {
+            Some(AgentHistoryItem::Message(Message {
+                id: activity.activity_id,
+                role: if activity.kind == "user_message" {
+                    "user".to_owned()
+                } else {
+                    "assistant".to_owned()
+                },
+                text,
+                order: 0,
+                optimistic: false,
+                partial: false,
+                steering: false,
+            }))
+        }
+        "user_message" | "agent_message" => None,
+        _ => {
+            let mut evidence = Vec::new();
+            if !activity.details.is_null() {
+                evidence.push(activity.details);
+            }
+            if !text.is_empty() {
+                evidence.push(serde_json::json!({
+                    "type": "note",
+                    "text": text,
+                }));
+            }
+            Some(AgentHistoryItem::Activity(ToolActivity {
+                id: activity.activity_id,
+                tool_name: activity.title.unwrap_or_else(|| activity.kind.clone()),
+                state: activity.status,
+                evidence,
+                order: 0,
+            }))
+        }
+    }
+}
+
+fn shift_timeline_orders(run: &mut RunState, offset: u64) {
+    for message in &mut run.messages {
+        message.order = message.order.saturating_add(offset);
+    }
+    for output in run.streamed_outputs.values_mut() {
+        output.order = output.order.saturating_add(offset);
+    }
+    for activity in &mut run.activities {
+        activity.order = activity.order.saturating_add(offset);
+    }
+    for command in &mut run.commands {
+        command.order = command.order.saturating_add(offset);
+    }
+    if let Some(progress) = &mut run.progress {
+        progress.order = progress.order.saturating_add(offset);
     }
 }
 
@@ -1332,7 +1431,8 @@ mod tests {
                     }
                 ]
             }],
-            "pending_requests": []
+            "pending_requests": [],
+            "next_cursor": "activity-offset-v1:3"
         }))
         .unwrap();
         let mut state = AppState::new(true);
@@ -1350,6 +1450,115 @@ mod tests {
         assert!(
             matches!(&timeline[2], TimelineItem::Message(message) if message.role == "assistant")
         );
+        assert_eq!(
+            run.history_next_cursor.as_deref(),
+            Some("activity-offset-v1:3")
+        );
+    }
+
+    #[test]
+    fn older_agent_history_is_deduplicated_and_prepended_without_clearing_latest() {
+        let latest: AgentSessionDetail = serde_json::from_value(serde_json::json!({
+            "summary": {
+                "connector_id": "codex/local",
+                "session_id": "thread-1",
+                "state": "idle"
+            },
+            "turns": [{
+                "turn_id": "turn-new",
+                "status": "completed",
+                "activities": [
+                    {
+                        "activity_id": "user-new",
+                        "kind": "user_message",
+                        "status": "completed",
+                        "content": [{"body": {"kind": "inline", "value": "new question"}}]
+                    },
+                    {
+                        "activity_id": "agent-new",
+                        "kind": "agent_message",
+                        "status": "completed",
+                        "content": [{"body": {"kind": "inline", "value": "new answer"}}]
+                    }
+                ]
+            }],
+            "pending_requests": [{"request_id": "latest-request"}],
+            "next_cursor": "activity-offset-v1:2"
+        }))
+        .unwrap();
+        let older: AgentSessionDetail = serde_json::from_value(serde_json::json!({
+            "summary": {
+                "connector_id": "codex/local",
+                "session_id": "thread-1",
+                "state": "idle"
+            },
+            "turns": [{
+                "turn_id": "turn-old",
+                "status": "completed",
+                "activities": [
+                    {
+                        "activity_id": "user-old",
+                        "kind": "user_message",
+                        "status": "completed",
+                        "content": [{"body": {"kind": "inline", "value": "old question"}}]
+                    },
+                    {
+                        "activity_id": "tool-old",
+                        "kind": "command",
+                        "status": "completed",
+                        "title": "old command",
+                        "details": {"type": "command", "command": "pwd"}
+                    },
+                    {
+                        "activity_id": "user-new",
+                        "kind": "user_message",
+                        "status": "completed",
+                        "content": [{"body": {"kind": "inline", "value": "overlap"}}]
+                    }
+                ]
+            }],
+            "pending_requests": [{"request_id": "stale-request"}],
+            "next_cursor": null
+        }))
+        .unwrap();
+        let mut state = AppState::new(true);
+        state.project_agent_session(latest);
+        state
+            .runs
+            .get_mut("agent-history:codex/local:thread-1")
+            .unwrap()
+            .history_loading_earlier = true;
+
+        state.prepend_agent_session_history(older);
+
+        let run = state
+            .runs
+            .get("agent-history:codex/local:thread-1")
+            .unwrap();
+        let timeline = timeline_for_run(run);
+        assert_eq!(timeline.len(), 4);
+        assert!(
+            matches!(&timeline[0], TimelineItem::Message(message) if message.text == "old question")
+        );
+        assert!(
+            matches!(&timeline[1], TimelineItem::Activity(activity) if activity.id == "tool-old")
+        );
+        assert!(
+            matches!(&timeline[2], TimelineItem::Message(message) if message.text == "new question")
+        );
+        assert!(
+            matches!(&timeline[3], TimelineItem::Message(message) if message.text == "new answer")
+        );
+        assert_eq!(
+            run.messages
+                .iter()
+                .filter(|message| message.id == "user-new")
+                .count(),
+            1
+        );
+        assert_eq!(run.pending[0]["request_id"], "latest-request");
+        assert!(run.history_next_cursor.is_none());
+        assert!(!run.history_loading_earlier);
     }
 
     #[test]

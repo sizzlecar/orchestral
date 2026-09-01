@@ -10,6 +10,8 @@ use crate::state::{
     is_terminal, AppState, AuthStatus, ConnectorsState, LoadStatus, Notice, SessionsState,
 };
 
+const AGENT_HISTORY_PAGE_LIMIT: u32 = 100;
+
 #[derive(Clone, Copy)]
 pub struct AppController {
     pub state: Signal<AppState>,
@@ -311,7 +313,13 @@ impl AppController {
             };
             match self
                 .api
-                .agent_session(&token, connector_id, &session.id)
+                .agent_session(
+                    &token,
+                    connector_id,
+                    &session.id,
+                    None,
+                    AGENT_HISTORY_PAGE_LIMIT,
+                )
                 .await
             {
                 Ok(detail) => self.state.write().project_agent_session(detail),
@@ -341,6 +349,73 @@ impl AppController {
             }
             .to_owned();
             state.connection.attempt = 0;
+        }
+    }
+
+    pub async fn load_earlier_agent_history(mut self) {
+        if !platform::is_online() {
+            self.notice("当前离线，恢复连接后再加载记录", "warning");
+            return;
+        }
+        let Some(token) = self.token.read().clone() else {
+            return;
+        };
+        let Some((session_key, connector_id, session_id, run_id, cursor)) = ({
+            let state = self.state.read();
+            state.selected_session().and_then(|session| {
+                let connector_id = session.connector_id.clone()?;
+                let run_id = session.history_run_id()?;
+                let run = state.runs.get(&run_id)?;
+                if run.history_loading_earlier {
+                    return None;
+                }
+                Some((
+                    session.key(),
+                    connector_id,
+                    session.id.clone(),
+                    run_id,
+                    run.history_next_cursor.clone()?,
+                ))
+            })
+        }) else {
+            return;
+        };
+
+        if let Some(run) = self.state.write().runs.get_mut(&run_id) {
+            run.history_loading_earlier = true;
+        }
+        match self
+            .api
+            .agent_session(
+                &token,
+                &connector_id,
+                &session_id,
+                Some(&cursor),
+                AGENT_HISTORY_PAGE_LIMIT,
+            )
+            .await
+        {
+            Ok(detail) => {
+                let still_selected =
+                    self.state.read().sessions.selected_id.as_deref() == Some(session_key.as_str());
+                let anchor = still_selected
+                    .then(platform::timeline_scroll_anchor)
+                    .flatten();
+                self.state.write().prepend_agent_session_history(detail);
+                if let Some(anchor) = anchor {
+                    spawn(async move {
+                        TimeoutFuture::new(0).await;
+                        platform::restore_timeline_scroll_anchor(anchor);
+                    });
+                }
+            }
+            Err(error) if error.status == 401 => self.clear_auth(Some(error.message)).await,
+            Err(error) => {
+                if let Some(run) = self.state.write().runs.get_mut(&run_id) {
+                    run.history_loading_earlier = false;
+                }
+                self.notice(&error.message, "error");
+            }
         }
     }
 
