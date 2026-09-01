@@ -62,6 +62,7 @@ google-cloud-auth = "1.16.0"
 # Utilities
 uuid = { version = "1", features = ["v4", "serde"] }
 futures-util = "0.3"
+tokio-tungstenite = "0.28"
 bytes = "1"
 sha2 = "0.10"
 hex = "0.4"

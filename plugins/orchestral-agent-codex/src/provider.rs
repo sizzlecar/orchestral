@@ -142,8 +142,12 @@ impl CodexConnector {
                 )
                 .await
             {
-                self.remove_failed_start(&run);
-                return Err(start_transport_error(error, false));
+                let loaded_without_rollout = unmaterialized_resume_without_rollout(&error)
+                    && client_has_loaded_session(&connected.rpc, &session_id).await;
+                if !loaded_without_rollout {
+                    self.remove_failed_start(&run);
+                    return Err(start_transport_error(error, false));
+                }
             }
         }
         if let Some(action) = action {
@@ -306,6 +310,47 @@ impl CodexConnector {
         state.runs.remove(&run.execution.run_id);
         state.sessions.remove(&run.execution.session_id);
         state.loaded_sessions.remove(&run.execution.session_id);
+    }
+}
+
+fn unmaterialized_resume_without_rollout(error: &CodexTransportError) -> bool {
+    matches!(
+        error,
+        CodexTransportError::Rpc(message)
+            if message.contains("no rollout found for thread id")
+    )
+}
+
+async fn client_has_loaded_session(rpc: &CodexRpcClient, session_id: &AgentSessionId) -> bool {
+    let mut cursor = None;
+    loop {
+        let result = match rpc
+            .request(
+                "thread/loaded/list",
+                json!({"cursor": cursor, "limit": 200}),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => return false,
+        };
+        if result
+            .get("data")
+            .and_then(Value::as_array)
+            .is_some_and(|ids| {
+                ids.iter()
+                    .any(|id| id.as_str() == Some(session_id.as_str()))
+            })
+        {
+            return true;
+        }
+        cursor = result
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if cursor.is_none() {
+            return false;
+        }
     }
 }
 
@@ -1324,12 +1369,18 @@ fn event_id(run: &CodexRun, suffix: &str) -> AgentEventId {
 }
 
 fn start_transport_error(error: CodexTransportError, outcome_unknown: bool) -> AgentStartError {
+    let rejection_code = match &error {
+        CodexTransportError::Rpc(message) if message.contains("already has an active writer") => {
+            AgentRejectionCode::SessionConflict
+        }
+        _ => AgentRejectionCode::ProviderUnavailable,
+    };
     let protocol = transport_to_protocol(error);
     if outcome_unknown {
         AgentStartError::OutcomeUnknown(protocol)
     } else {
         AgentStartError::Rejected(
-            AgentRejection::new(AgentRejectionCode::ProviderUnavailable, protocol.message)
+            AgentRejection::new(rejection_code, protocol.message)
                 .with_retryable(protocol.retryable),
         )
     }
@@ -1381,6 +1432,21 @@ mod tests {
     use tokio::io::{duplex, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     use super::*;
+
+    #[test]
+    fn active_writer_is_a_typed_session_conflict() {
+        let error = start_transport_error(
+            CodexTransportError::Rpc("thread fixture already has an active writer".to_owned()),
+            false,
+        );
+        assert!(matches!(
+            error,
+            AgentStartError::Rejected(AgentRejection {
+                code: AgentRejectionCode::SessionConflict,
+                ..
+            })
+        ));
+    }
 
     fn start_request(session_id: &str, run_id: &str) -> AgentStartRequest {
         let descriptor = CodexConnector::provider_descriptor();
@@ -2064,6 +2130,111 @@ mod tests {
         ));
         let mut stream = connector
             .start(start_request("thread-retry", "run-retry-2"))
+            .await
+            .unwrap()
+            .stream;
+        loop {
+            let item = tokio::time::timeout(Duration::from_secs(1), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if matches!(
+                item,
+                AgentProviderStreamItem::Event(event)
+                    if matches!(event.payload, AgentEvent::DeliveryCommitted { .. })
+            ) {
+                break;
+            }
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn loaded_unmaterialized_thread_can_receive_its_first_turn_after_reconnect() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let connector = CodexConnector::with_client(rpc, "codex/test");
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            let resume = next_request(&mut lines).await;
+            assert_eq!(resume["method"], "thread/resume");
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({
+                            "id": resume["id"],
+                            "error": {
+                                "code": -32000,
+                                "message": "no rollout found for thread id thread-empty-loaded"
+                            }
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let loaded = next_request(&mut lines).await;
+            assert_eq!(loaded["method"], "thread/loaded/list");
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({
+                            "id": loaded["id"],
+                            "result": {"data": ["thread-empty-loaded"], "nextCursor": null}
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let start = next_request(&mut lines).await;
+            assert_eq!(start["method"], "turn/start");
+            assert_eq!(start["params"]["threadId"], "thread-empty-loaded");
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({
+                            "id": start["id"],
+                            "result": {"turn": {"id": "turn-first", "status": "inProgress", "items": []}}
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({
+                            "method": "turn/completed",
+                            "params": {
+                                "threadId": "thread-empty-loaded",
+                                "turn": {"id": "turn-first", "status": "completed", "items": []}
+                            }
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+
+        let mut stream = connector
+            .start(start_request("thread-empty-loaded", "run-first"))
             .await
             .unwrap()
             .stream;

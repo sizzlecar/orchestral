@@ -11,6 +11,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use orchestral_agent_codex::{CodexAppServerConfig, CodexConnector};
 use orchestral_agent_journal_fs::FileAgentJournalStore;
+use orchestral_core::agent_connector::{AgentConnector, AgentSessionListQuery};
 use orchestral_runtime::AgentDirectory;
 
 use crate::mcp_config::user_config_root;
@@ -36,9 +37,17 @@ pub(crate) async fn build_agent_directory() -> anyhow::Result<Arc<AgentDirectory
         .context("open Codex control journal")?,
     );
     directory
-        .register_with_journal(codex.clone(), codex, journal)
+        .register_with_journal(codex.clone(), codex.clone(), journal)
         .await
         .context("register Codex Agent connector")?;
+    tokio::spawn(async move {
+        let _ = codex
+            .list_sessions(AgentSessionListQuery {
+                limit: 25,
+                ..AgentSessionListQuery::default()
+            })
+            .await;
+    });
     Ok(directory)
 }
 

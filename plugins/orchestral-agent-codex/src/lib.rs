@@ -10,6 +10,7 @@ mod transport;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use orchestral_core::agent_connector::{
@@ -25,7 +26,7 @@ use orchestral_core::agent_protocol::wire::{AgentSessionId, ProviderBindingRef};
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
-pub use transport::{CodexAppServerConfig, CodexTransportError};
+pub use transport::{CodexAppServerConfig, CodexAppServerEndpoint, CodexTransportError};
 
 use crate::normalize::NormalizationLimits;
 use crate::transport::CodexRpcClient;
@@ -33,6 +34,32 @@ use crate::transport::CodexRpcClient;
 const CONNECTOR_ID: &str = "codex/local";
 const PROVIDER_BINDING: &str = "codex/local";
 const SESSION_DETAIL_CACHE_ENTRIES: usize = 2;
+const SESSION_LIST_CACHE_ENTRIES: usize = 8;
+const SESSION_LIST_CACHE_TTL: Duration = Duration::from_secs(15);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SessionListCacheKey {
+    cursor: Option<String>,
+    limit: u32,
+    cwd: Option<String>,
+    search: Option<String>,
+}
+
+impl From<&AgentSessionListQuery> for SessionListCacheKey {
+    fn from(query: &AgentSessionListQuery) -> Self {
+        Self {
+            cursor: query.cursor.clone(),
+            limit: query.limit,
+            cwd: query.cwd.clone(),
+            search: query.search.clone(),
+        }
+    }
+}
+
+struct SessionListCacheEntry {
+    inserted_at: Instant,
+    page: AgentSessionPage,
+}
 
 #[derive(Default)]
 struct SessionDetailCache {
@@ -84,14 +111,16 @@ struct ConnectedClient {
     user_agent: String,
 }
 
-/// Long-lived local Codex connector. The connector owns the app-server
-/// process; UI subscribers never own Codex subscriptions directly.
+/// Long-lived local Codex connector. By default it attaches to Codex's shared
+/// app-server daemon; UI subscribers never own native Codex connections.
 pub struct CodexConnector {
     config: CodexAppServerConfig,
     client: AsyncMutex<Option<Arc<ConnectedClient>>>,
     limits: NormalizationLimits,
     provider_state: StdMutex<provider::ProviderState>,
     session_cache: StdMutex<SessionDetailCache>,
+    session_list_cache: StdMutex<BTreeMap<SessionListCacheKey, SessionListCacheEntry>>,
+    session_list_gate: AsyncMutex<()>,
     #[cfg(test)]
     reconnect_clients: StdMutex<VecDeque<Arc<ConnectedClient>>>,
 }
@@ -104,6 +133,8 @@ impl CodexConnector {
             limits: NormalizationLimits::default(),
             provider_state: StdMutex::new(provider::ProviderState::default()),
             session_cache: StdMutex::new(SessionDetailCache::default()),
+            session_list_cache: StdMutex::new(BTreeMap::new()),
+            session_list_gate: AsyncMutex::new(()),
             #[cfg(test)]
             reconnect_clients: StdMutex::new(VecDeque::new()),
         }
@@ -115,6 +146,7 @@ impl CodexConnector {
             return Ok(Arc::clone(client));
         }
         *client = None;
+        self.invalidate_session_list_cache();
         self.provider_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -129,7 +161,7 @@ impl CodexConnector {
             *client = Some(Arc::clone(&connected));
             return Ok(connected);
         }
-        let (rpc, user_agent) = CodexRpcClient::spawn(&self.config)
+        let (rpc, user_agent) = CodexRpcClient::connect(&self.config)
             .await
             .map_err(connector_transport_error)?;
         let connected = Arc::new(ConnectedClient { rpc, user_agent });
@@ -180,6 +212,40 @@ impl CodexConnector {
             .remove(session_id);
     }
 
+    fn cached_session_page(&self, query: &AgentSessionListQuery) -> Option<AgentSessionPage> {
+        let key = SessionListCacheKey::from(query);
+        self.session_list_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .filter(|entry| entry.inserted_at.elapsed() <= SESSION_LIST_CACHE_TTL)
+            .map(|entry| entry.page.clone())
+    }
+
+    fn cache_session_page(&self, query: &AgentSessionListQuery, page: AgentSessionPage) {
+        let mut cache = self
+            .session_list_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.len() >= SESSION_LIST_CACHE_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(
+            SessionListCacheKey::from(query),
+            SessionListCacheEntry {
+                inserted_at: Instant::now(),
+                page,
+            },
+        );
+    }
+
+    fn invalidate_session_list_cache(&self) {
+        self.session_list_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
     #[cfg(test)]
     fn with_client(rpc: Arc<CodexRpcClient>, user_agent: impl Into<String>) -> Self {
         Self {
@@ -191,6 +257,8 @@ impl CodexConnector {
             limits: NormalizationLimits::default(),
             provider_state: StdMutex::new(provider::ProviderState::default()),
             session_cache: StdMutex::new(SessionDetailCache::default()),
+            session_list_cache: StdMutex::new(BTreeMap::new()),
+            session_list_gate: AsyncMutex::new(()),
             reconnect_clients: StdMutex::new(VecDeque::new()),
         }
     }
@@ -206,6 +274,8 @@ impl CodexConnector {
             limits: NormalizationLimits::default(),
             provider_state: StdMutex::new(provider::ProviderState::default()),
             session_cache: StdMutex::new(SessionDetailCache::default()),
+            session_list_cache: StdMutex::new(BTreeMap::new()),
+            session_list_gate: AsyncMutex::new(()),
             reconnect_clients: StdMutex::new(VecDeque::from([Arc::new(ConnectedClient {
                 rpc: reconnect_rpc,
                 user_agent: "codex/test-reconnected".to_owned(),
@@ -297,14 +367,29 @@ impl AgentConnector for CodexConnector {
         query: AgentSessionListQuery,
     ) -> Result<AgentSessionPage, AgentConnectorError> {
         query.validate()?;
+        if let Some(page) = self.cached_session_page(&query) {
+            return Ok(page);
+        }
+        let _gate = self.session_list_gate.lock().await;
+        if let Some(page) = self.cached_session_page(&query) {
+            return Ok(page);
+        }
         let client = self.client().await?;
         let mut params = json!({
             "limit": query.limit,
             "sortKey": "updated_at"
         });
-        insert_optional(&mut params, "cursor", query.cursor.map(Value::String));
-        insert_optional(&mut params, "cwd", query.cwd.map(Value::String));
-        insert_optional(&mut params, "searchTerm", query.search.map(Value::String));
+        insert_optional(
+            &mut params,
+            "cursor",
+            query.cursor.clone().map(Value::String),
+        );
+        insert_optional(&mut params, "cwd", query.cwd.clone().map(Value::String));
+        insert_optional(
+            &mut params,
+            "searchTerm",
+            query.search.clone().map(Value::String),
+        );
         let result = client
             .rpc
             .request("thread/list", params)
@@ -312,6 +397,7 @@ impl AgentConnector for CodexConnector {
             .map_err(connector_transport_error)?;
         let page = normalize::session_page(&self.describe().connector_id, &result)?;
         page.validate_for(&self.describe().connector_id, query.limit)?;
+        self.cache_session_page(&query, page.clone());
         Ok(page)
     }
 
@@ -422,6 +508,7 @@ impl AgentConnector for CodexConnector {
             pending_requests: Vec::new(),
             next_cursor: None,
         });
+        self.invalidate_session_list_cache();
         Ok(summary)
     }
 
@@ -481,6 +568,7 @@ impl AgentConnector for CodexConnector {
                 )))
             }
         };
+        self.invalidate_session_list_cache();
         Ok(AgentSessionActionOutcome {
             status: AgentSessionActionStatus::Completed,
             session,
@@ -527,11 +615,15 @@ fn insert_optional(object: &mut Value, key: &str, value: Option<Value>) {
 
 fn connector_transport_error(error: CodexTransportError) -> AgentConnectorError {
     let (code, retryable) = match error {
-        CodexTransportError::Spawn(_) => (AgentConnectorErrorCode::Unavailable, false),
+        CodexTransportError::Spawn(_) | CodexTransportError::DaemonStart(_) => {
+            (AgentConnectorErrorCode::Unavailable, false)
+        }
         CodexTransportError::Timeout
         | CodexTransportError::Closed
         | CodexTransportError::Disconnected(_)
-        | CodexTransportError::Io(_) => (AgentConnectorErrorCode::Unavailable, true),
+        | CodexTransportError::Io(_)
+        | CodexTransportError::SharedDaemonConnect { .. }
+        | CodexTransportError::WebSocket(_) => (AgentConnectorErrorCode::Unavailable, true),
         CodexTransportError::Rpc(_) => (AgentConnectorErrorCode::Protocol, false),
         CodexTransportError::InvalidJson(_)
         | CodexTransportError::FrameTooLarge { .. }
@@ -623,17 +715,16 @@ mod tests {
             connector.health().await.unwrap().version.as_deref(),
             Some("codex/0.149.1")
         );
-        let page = connector
-            .list_sessions(AgentSessionListQuery {
-                limit: 50,
-                search: Some("compiler".to_owned()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
+        let query = AgentSessionListQuery {
+            limit: 50,
+            search: Some("compiler".to_owned()),
+            ..Default::default()
+        };
+        let page = connector.list_sessions(query.clone()).await.unwrap();
         assert_eq!(page.sessions.len(), 1);
         assert_eq!(page.sessions[0].state, AgentSessionState::Idle);
         assert_eq!(page.next_cursor.as_deref(), Some("next-page"));
+        assert_eq!(connector.list_sessions(query).await.unwrap(), page);
         let detail = connector
             .read_session(&AgentSessionId::new("thread-1"))
             .await

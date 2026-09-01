@@ -16,14 +16,16 @@ use orchestral_core::agent_connector::{
     AgentSessionListQuery, AgentSessionPage, AgentSessionReadQuery, AgentSessionSummary,
     CreateAgentSessionRequest, InvokeAgentSessionActionRequest,
 };
+use orchestral_core::agent_protocol::spi::AgentStartError;
 use orchestral_core::agent_protocol::wire::{
-    AgentCommand, AgentCommandEnvelope, AgentRunView, AgentSessionId, ApprovalDecision, CommandAck,
-    CommandId, Content, PendingRequest, PendingRequestPayload, RequestId, RequestResolution, RunId,
+    AgentCommand, AgentCommandEnvelope, AgentRejectionCode, AgentRunView, AgentSessionId,
+    ApprovalDecision, CommandAck, CommandId, Content, PendingRequest, PendingRequestPayload,
+    RequestId, RequestResolution, RunId,
 };
 use orchestral_runtime::api::AgentApi;
 use orchestral_runtime::{
-    AgentControlEvent, AgentDirectory, AgentDirectoryError, AgentSdkError, ApprovalBridgeError,
-    InMemoryHostApprovalBroker,
+    AgentControlError, AgentControlEvent, AgentDirectory, AgentDirectoryError, AgentSdkError,
+    ApprovalBridgeError, InMemoryHostApprovalBroker,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -1095,6 +1097,35 @@ impl From<AgentDirectoryError> for ApiError {
                     _ => Self::internal("agent_connector_failed", error.to_string()),
                 }
             }
+            AgentDirectoryError::Agent(AgentSdkError::Control(AgentControlError::Start(
+                AgentStartError::Rejected(rejection),
+            ))) => match rejection.code {
+                AgentRejectionCode::SessionConflict | AgentRejectionCode::RunIdConflict => {
+                    Self::conflict("agent_session_conflict", rejection.message.clone())
+                }
+                AgentRejectionCode::InvalidSpec => Self::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_agent_input",
+                    rejection.message.clone(),
+                ),
+                AgentRejectionCode::UnsupportedProtocol
+                | AgentRejectionCode::UnsupportedCapability
+                | AgentRejectionCode::UnsupportedResource => Self::new(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "agent_capability_unsupported",
+                    rejection.message.clone(),
+                ),
+                AgentRejectionCode::ProviderUnavailable => Self::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "agent_provider_unavailable",
+                    rejection.message.clone(),
+                ),
+                _ => Self::new(
+                    StatusCode::BAD_REQUEST,
+                    "agent_rejected",
+                    rejection.message.clone(),
+                ),
+            },
             _ => Self::internal("agent_directory_failed", error.to_string()),
         }
     }
@@ -1174,6 +1205,21 @@ mod tests {
 
     struct DisconnectFirstProvider {
         inner: Arc<dyn AgentProvider>,
+    }
+
+    #[test]
+    fn active_external_agent_writer_is_reported_as_a_conflict() {
+        let rejection = orchestral_core::agent_protocol::wire::AgentRejection::new(
+            AgentRejectionCode::SessionConflict,
+            "thread already has an active writer",
+        );
+        let error = AgentDirectoryError::Agent(AgentSdkError::Control(AgentControlError::Start(
+            AgentStartError::Rejected(rejection),
+        )));
+
+        let response = ApiError::from(error);
+        assert_eq!(response.status, StatusCode::CONFLICT);
+        assert_eq!(response.body.code, "agent_session_conflict");
     }
 
     #[async_trait]
