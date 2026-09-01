@@ -162,6 +162,7 @@ impl AgentConnector for FixtureConnector {
                 },
             ],
             pending_requests: Vec::new(),
+            next_cursor: None,
         })
     }
 

@@ -362,6 +362,9 @@ pub struct AgentSessionDetail {
     pub turns: Vec<AgentSessionTurn>,
     #[serde(default)]
     pub pending_requests: Vec<PendingRequest>,
+    /// Opaque cursor for the next, older page of session history.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
 }
 
 impl AgentSessionDetail {
@@ -386,6 +389,56 @@ impl AgentSessionDetail {
                     "pending request ids must be unique within a session",
                 ));
             }
+        }
+        if self
+            .next_cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.trim().is_empty())
+        {
+            return Err(AgentConnectorError::protocol(
+                "session history cursor must not be empty",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSessionReadQuery {
+    #[serde(default)]
+    pub cursor: Option<String>,
+    pub limit: u32,
+}
+
+/// Upper bound reserved for serialized activities in one session-history
+/// page. Connectors may return fewer than `limit` activities to honor it.
+pub const AGENT_SESSION_HISTORY_ACTIVITY_BUDGET_BYTES: usize = 448 * 1_024;
+
+impl Default for AgentSessionReadQuery {
+    fn default() -> Self {
+        Self {
+            cursor: None,
+            limit: 100,
+        }
+    }
+}
+
+impl AgentSessionReadQuery {
+    pub fn validate(&self) -> Result<(), AgentConnectorError> {
+        if self.limit == 0 || self.limit > 500 {
+            return Err(AgentConnectorError::invalid(
+                "session history limit must be between 1 and 500",
+            ));
+        }
+        if self
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.trim().is_empty())
+        {
+            return Err(AgentConnectorError::invalid(
+                "session history cursor must not be empty",
+            ));
         }
         Ok(())
     }
@@ -648,6 +701,20 @@ pub trait AgentConnector: Send + Sync {
         session_id: &AgentSessionId,
     ) -> Result<AgentSessionDetail, AgentConnectorError>;
 
+    /// Returns one bounded page of session history. Connectors with native or
+    /// efficient history pagination should override this method. The default
+    /// exists for integrations whose upstream protocol only exposes a complete
+    /// transcript.
+    async fn read_session_page(
+        &self,
+        session_id: &AgentSessionId,
+        query: AgentSessionReadQuery,
+    ) -> Result<AgentSessionDetail, AgentConnectorError> {
+        query.validate()?;
+        let detail = self.read_session(session_id).await?;
+        paginate_session_detail(&detail, query)
+    }
+
     async fn create_session(
         &self,
         _request: CreateAgentSessionRequest,
@@ -665,6 +732,77 @@ pub trait AgentConnector: Send + Sync {
             "connector does not support session actions",
         ))
     }
+}
+
+pub fn paginate_session_detail(
+    detail: &AgentSessionDetail,
+    query: AgentSessionReadQuery,
+) -> Result<AgentSessionDetail, AgentConnectorError> {
+    const CURSOR_PREFIX: &str = "activity-offset-v1:";
+    let activity_count = detail
+        .turns
+        .iter()
+        .map(|turn| turn.activities.len())
+        .sum::<usize>();
+    let end = match query.cursor.as_deref() {
+        Some(cursor) => cursor
+            .strip_prefix(CURSOR_PREFIX)
+            .and_then(|offset| offset.parse::<usize>().ok())
+            .filter(|offset| *offset <= activity_count)
+            .ok_or_else(|| AgentConnectorError::invalid("invalid session history cursor"))?,
+        None => activity_count,
+    };
+    let count_start = end.saturating_sub(query.limit as usize);
+    let activities = detail
+        .turns
+        .iter()
+        .flat_map(|turn| turn.activities.iter())
+        .collect::<Vec<_>>();
+    let mut start = end;
+    let mut bytes = 0usize;
+    while start > count_start {
+        let candidate = activities[start - 1];
+        let candidate_bytes = serde_json::to_vec(candidate)
+            .map_err(|error| {
+                AgentConnectorError::protocol(format!(
+                    "could not size session history activity: {error}"
+                ))
+            })?
+            .len();
+        if start < end
+            && bytes.saturating_add(candidate_bytes) > AGENT_SESSION_HISTORY_ACTIVITY_BUDGET_BYTES
+        {
+            break;
+        }
+        start -= 1;
+        bytes = bytes.saturating_add(candidate_bytes);
+    }
+    let mut offset = 0usize;
+    let turns = detail
+        .turns
+        .iter()
+        .filter_map(|turn| {
+            let turn_start = offset;
+            let turn_end = turn_start.saturating_add(turn.activities.len());
+            offset = turn_end;
+            let selected_start = start.saturating_sub(turn_start).min(turn.activities.len());
+            let selected_end = end.saturating_sub(turn_start).min(turn.activities.len());
+            if selected_start >= selected_end {
+                return None;
+            }
+            Some(AgentSessionTurn {
+                turn_id: turn.turn_id.clone(),
+                status: turn.status,
+                activities: turn.activities[selected_start..selected_end].to_vec(),
+            })
+        })
+        .collect();
+    Ok(AgentSessionDetail {
+        summary: detail.summary.clone(),
+        turns,
+        pending_requests: detail.pending_requests.clone(),
+        next_cursor: (start > 0).then(|| format!("{CURSOR_PREFIX}{start}")),
+    })
 }
 
 #[cfg(test)]
@@ -727,6 +865,59 @@ mod tests {
             .validate_for(&descriptor().connector_id, 50)
             .expect_err("mismatched connector must fail");
         assert_eq!(error.code, AgentConnectorErrorCode::Protocol);
+    }
+
+    #[test]
+    fn session_history_page_starts_with_latest_bounded_activities() {
+        let connector_id = AgentConnectorId::new("fixture/default");
+        let activities = (0..40)
+            .map(|index| AgentSessionActivity {
+                activity_id: AgentSessionActivityId::new(format!("activity-{index}")),
+                kind: AgentSessionActivityKind::Command,
+                status: AgentSessionActivityStatus::Completed,
+                title: Some(format!("command-{index}")),
+                content: vec![Content::text("x".repeat(32_000))],
+                details: Value::Null,
+            })
+            .collect();
+        let detail = AgentSessionDetail {
+            summary: AgentSessionSummary {
+                connector_id: connector_id.clone(),
+                session_id: AgentSessionId::new("session-1"),
+                title: None,
+                preview: None,
+                cwd: None,
+                created_at_unix_ms: None,
+                updated_at_unix_ms: None,
+                state: AgentSessionState::Idle,
+                extensions: BTreeMap::new(),
+            },
+            turns: vec![AgentSessionTurn {
+                turn_id: AgentSessionTurnId::new("turn-1"),
+                status: AgentSessionTurnStatus::Completed,
+                activities,
+            }],
+            pending_requests: Vec::new(),
+            next_cursor: None,
+        };
+
+        let page = paginate_session_detail(
+            &detail,
+            AgentSessionReadQuery {
+                cursor: None,
+                limit: 100,
+            },
+        )
+        .unwrap();
+
+        let page_activities = &page.turns[0].activities;
+        assert!(page_activities.len() < 40);
+        assert_eq!(
+            page_activities.last().unwrap().activity_id.as_str(),
+            "activity-39"
+        );
+        assert!(page.next_cursor.is_some());
+        assert!(serde_json::to_vec(&page).unwrap().len() < 512 * 1_024);
     }
 
     #[test]

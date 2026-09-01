@@ -11,7 +11,7 @@ use orchestral_core::agent_connector::{
     AgentConnector, AgentConnectorDescriptor, AgentConnectorError, AgentConnectorHealth,
     AgentConnectorId, AgentSessionActionExecution, AgentSessionActionInvocation,
     AgentSessionActionOutcome, AgentSessionActionStatus, AgentSessionDetail, AgentSessionListQuery,
-    AgentSessionPage, AgentSessionSummary, CreateAgentSessionRequest,
+    AgentSessionPage, AgentSessionReadQuery, AgentSessionSummary, CreateAgentSessionRequest,
     InvokeAgentSessionActionRequest,
 };
 use orchestral_core::agent_protocol::spi::{
@@ -138,6 +138,29 @@ impl AgentDirectory {
         Ok(detail)
     }
 
+    pub async fn read_session_page(
+        &self,
+        connector_id: &AgentConnectorId,
+        session_id: &AgentSessionId,
+        query: AgentSessionReadQuery,
+    ) -> Result<AgentSessionDetail, AgentDirectoryError> {
+        if session_id.is_empty() {
+            return Err(AgentConnectorError::invalid("session id must not be empty").into());
+        }
+        query.validate()?;
+        let entry = self.entry(connector_id).await?;
+        self.verify_descriptor(&entry)?;
+        let detail = entry.connector.read_session_page(session_id, query).await?;
+        detail.validate_for(connector_id)?;
+        if detail.summary.session_id != *session_id {
+            return Err(AgentConnectorError::protocol(
+                "connector returned a different session than requested",
+            )
+            .into());
+        }
+        Ok(detail)
+    }
+
     pub async fn create_session(
         &self,
         connector_id: &AgentConnectorId,
@@ -189,7 +212,15 @@ impl AgentDirectory {
         if action.execution == AgentSessionActionExecution::Run {
             // Resolve the session before starting so a forged connector/session
             // pair cannot allocate a Host-only Run.
-            self.read_session(connector_id, &request.session_id).await?;
+            self.read_session_page(
+                connector_id,
+                &request.session_id,
+                AgentSessionReadQuery {
+                    cursor: None,
+                    limit: 1,
+                },
+            )
+            .await?;
             entry
                 .api
                 .create_session(Some(request.session_id.clone()))
@@ -250,7 +281,15 @@ impl AgentDirectory {
     ) -> Result<AgentRunHandle, AgentDirectoryError> {
         // Read first so a stale or forged connector/session pair cannot create
         // a Host-only session that the external Provider cannot resolve.
-        self.read_session(connector_id, session_id).await?;
+        self.read_session_page(
+            connector_id,
+            session_id,
+            AgentSessionReadQuery {
+                cursor: None,
+                limit: 1,
+            },
+        )
+        .await?;
         let entry = self.entry(connector_id).await?;
         entry.api.create_session(Some(session_id.clone())).await?;
         Ok(entry.api.start_text(session_id, run_id, input).await?)

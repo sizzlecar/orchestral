@@ -43,6 +43,10 @@ impl ProviderState {
     pub(crate) fn reset_connection_state(&mut self) {
         self.loaded_sessions.clear();
     }
+
+    pub(crate) fn mark_loaded(&mut self, session_id: AgentSessionId) {
+        self.loaded_sessions.insert(session_id);
+    }
 }
 
 struct CodexRun {
@@ -121,6 +125,7 @@ impl CodexConnector {
                 self.remove_failed_start(&run);
             })?;
         }
+        self.invalidate_session_cache(&session_id);
         let needs_resume = self
             .provider_state()
             .loaded_sessions

@@ -70,6 +70,7 @@ pub(crate) fn session_detail(
         summary: session_summary(connector_id, thread)?,
         turns,
         pending_requests: Vec::new(),
+        next_cursor: None,
     })
 }
 

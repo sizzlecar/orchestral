@@ -7,21 +7,19 @@ mod normalize;
 mod provider;
 mod transport;
 
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
-#[cfg(test)]
-use std::collections::VecDeque;
-
 use async_trait::async_trait;
 use orchestral_core::agent_connector::{
-    AgentConnector, AgentConnectorDescriptor, AgentConnectorError, AgentConnectorErrorCode,
-    AgentConnectorHealth, AgentConnectorId, AgentSessionActionDescriptor,
+    paginate_session_detail, AgentConnector, AgentConnectorDescriptor, AgentConnectorError,
+    AgentConnectorErrorCode, AgentConnectorHealth, AgentConnectorId, AgentSessionActionDescriptor,
     AgentSessionActionExecution, AgentSessionActionId, AgentSessionActionOutcome,
     AgentSessionActionStatus, AgentSessionCapabilities, AgentSessionDetail, AgentSessionListQuery,
-    AgentSessionPage, AgentSessionSummary, CreateAgentSessionRequest,
-    InvokeAgentSessionActionRequest, SESSION_COMPACT_ACTION, SESSION_FORK_ACTION,
-    SESSION_RENAME_ACTION, SESSION_REVIEW_ACTION,
+    AgentSessionPage, AgentSessionReadQuery, AgentSessionState, AgentSessionSummary,
+    CreateAgentSessionRequest, InvokeAgentSessionActionRequest, SESSION_COMPACT_ACTION,
+    SESSION_FORK_ACTION, SESSION_RENAME_ACTION, SESSION_REVIEW_ACTION,
 };
 use orchestral_core::agent_protocol::wire::{AgentSessionId, ProviderBindingRef};
 use serde_json::{json, Value};
@@ -34,6 +32,52 @@ use crate::transport::CodexRpcClient;
 
 const CONNECTOR_ID: &str = "codex/local";
 const PROVIDER_BINDING: &str = "codex/local";
+const SESSION_DETAIL_CACHE_ENTRIES: usize = 2;
+
+#[derive(Default)]
+struct SessionDetailCache {
+    entries: BTreeMap<AgentSessionId, Arc<AgentSessionDetail>>,
+    lru: VecDeque<AgentSessionId>,
+}
+
+impl SessionDetailCache {
+    fn get_current(&mut self, summary: &AgentSessionSummary) -> Option<Arc<AgentSessionDetail>> {
+        if !matches!(
+            summary.state,
+            AgentSessionState::Idle | AgentSessionState::Detached
+        ) {
+            return None;
+        }
+        let detail = self
+            .entries
+            .get(&summary.session_id)
+            .filter(|detail| detail.summary == *summary)
+            .cloned()?;
+        self.touch(&summary.session_id);
+        Some(detail)
+    }
+
+    fn insert(&mut self, detail: AgentSessionDetail) {
+        let session_id = detail.summary.session_id.clone();
+        self.entries.insert(session_id.clone(), Arc::new(detail));
+        self.touch(&session_id);
+        while self.entries.len() > SESSION_DETAIL_CACHE_ENTRIES {
+            if let Some(evicted) = self.lru.pop_front() {
+                self.entries.remove(&evicted);
+            }
+        }
+    }
+
+    fn remove(&mut self, session_id: &AgentSessionId) {
+        self.entries.remove(session_id);
+        self.lru.retain(|candidate| candidate != session_id);
+    }
+
+    fn touch(&mut self, session_id: &AgentSessionId) {
+        self.lru.retain(|candidate| candidate != session_id);
+        self.lru.push_back(session_id.clone());
+    }
+}
 
 struct ConnectedClient {
     rpc: Arc<CodexRpcClient>,
@@ -47,6 +91,7 @@ pub struct CodexConnector {
     client: AsyncMutex<Option<Arc<ConnectedClient>>>,
     limits: NormalizationLimits,
     provider_state: StdMutex<provider::ProviderState>,
+    session_cache: StdMutex<SessionDetailCache>,
     #[cfg(test)]
     reconnect_clients: StdMutex<VecDeque<Arc<ConnectedClient>>>,
 }
@@ -58,6 +103,7 @@ impl CodexConnector {
             client: AsyncMutex::new(None),
             limits: NormalizationLimits::default(),
             provider_state: StdMutex::new(provider::ProviderState::default()),
+            session_cache: StdMutex::new(SessionDetailCache::default()),
             #[cfg(test)]
             reconnect_clients: StdMutex::new(VecDeque::new()),
         }
@@ -110,6 +156,30 @@ impl CodexConnector {
         normalize::session_summary(&self.describe().connector_id, thread)
     }
 
+    fn cache_session_detail(&self, detail: AgentSessionDetail) {
+        self.session_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(detail);
+    }
+
+    fn cached_session_detail(
+        &self,
+        summary: &AgentSessionSummary,
+    ) -> Option<Arc<AgentSessionDetail>> {
+        self.session_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_current(summary)
+    }
+
+    fn invalidate_session_cache(&self, session_id: &AgentSessionId) {
+        self.session_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+    }
+
     #[cfg(test)]
     fn with_client(rpc: Arc<CodexRpcClient>, user_agent: impl Into<String>) -> Self {
         Self {
@@ -120,6 +190,7 @@ impl CodexConnector {
             }))),
             limits: NormalizationLimits::default(),
             provider_state: StdMutex::new(provider::ProviderState::default()),
+            session_cache: StdMutex::new(SessionDetailCache::default()),
             reconnect_clients: StdMutex::new(VecDeque::new()),
         }
     }
@@ -134,6 +205,7 @@ impl CodexConnector {
             }))),
             limits: NormalizationLimits::default(),
             provider_state: StdMutex::new(provider::ProviderState::default()),
+            session_cache: StdMutex::new(SessionDetailCache::default()),
             reconnect_clients: StdMutex::new(VecDeque::from([Arc::new(ConnectedClient {
                 rpc: reconnect_rpc,
                 user_agent: "codex/test-reconnected".to_owned(),
@@ -273,7 +345,29 @@ impl AgentConnector for CodexConnector {
         let detail =
             normalize::session_detail(&self.describe().connector_id, &result, &self.limits)?;
         detail.validate_for(&self.describe().connector_id)?;
+        self.cache_session_detail(detail.clone());
         Ok(detail)
+    }
+
+    async fn read_session_page(
+        &self,
+        session_id: &AgentSessionId,
+        query: AgentSessionReadQuery,
+    ) -> Result<AgentSessionDetail, AgentConnectorError> {
+        query.validate()?;
+        if session_id.is_empty() {
+            return Err(AgentConnectorError::invalid("session id must not be empty"));
+        }
+        let client = self.client().await?;
+        let summary = self.read_summary(&client, session_id).await?;
+        let detail = match self.cached_session_detail(&summary) {
+            Some(detail) => detail,
+            None => {
+                let detail = self.read_session(session_id).await?;
+                Arc::new(detail)
+            }
+        };
+        paginate_session_detail(&detail, query)
     }
 
     async fn create_session(
@@ -318,6 +412,16 @@ impl AgentConnector for CodexConnector {
             summary.title = Some(title);
         }
         summary.validate_for(&self.describe().connector_id)?;
+        self.provider_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .mark_loaded(summary.session_id.clone());
+        self.cache_session_detail(AgentSessionDetail {
+            summary: summary.clone(),
+            turns: Vec::new(),
+            pending_requests: Vec::new(),
+            next_cursor: None,
+        });
         Ok(summary)
     }
 
@@ -350,10 +454,12 @@ impl AgentConnector for CodexConnector {
                 let thread = result
                     .get("thread")
                     .ok_or_else(|| AgentConnectorError::protocol("thread/fork omitted thread"))?;
-                Some(normalize::session_summary(
-                    &self.describe().connector_id,
-                    thread,
-                )?)
+                let summary = normalize::session_summary(&self.describe().connector_id, thread)?;
+                self.provider_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .mark_loaded(summary.session_id.clone());
+                Some(summary)
             }
             SESSION_RENAME_ACTION => {
                 let name = required_action_string(&request.arguments, "name")?;
@@ -452,8 +558,14 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
+    use futures_util::StreamExt;
     use orchestral_core::agent_connector::{
-        AgentSessionState, CreateAgentSessionRequest, InvokeAgentSessionActionRequest,
+        AgentSessionReadQuery, AgentSessionState, CreateAgentSessionRequest,
+        InvokeAgentSessionActionRequest,
+    };
+    use orchestral_core::agent_protocol::wire::{
+        AgentEvent, AgentProviderStreamItem, AgentRunEnvelope, AgentStartRequest, Content,
+        ProtocolVersion, RunId,
     };
     use tokio::io::{duplex, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -707,6 +819,168 @@ mod tests {
 
         assert_eq!(detail.summary.session_id, created.session_id);
         assert!(detail.turns.is_empty());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn newly_created_session_starts_first_turn_without_resume() {
+        let (client_io, server_io) = duplex(128 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let connector = CodexConnector::with_client(rpc, "codex/0.149.1");
+        let server = tokio::spawn(async move {
+            let mut requests = BufReader::new(server_read).lines();
+
+            let thread_start = read_request(&mut requests).await;
+            assert_eq!(thread_start["method"], "thread/start");
+            write_result(
+                &mut server_write,
+                &thread_start,
+                json!({"thread": thread("thread-new", Value::Null)}),
+            )
+            .await;
+
+            let turn_start = read_request(&mut requests).await;
+            assert_eq!(turn_start["method"], "turn/start");
+            assert_eq!(turn_start["params"]["threadId"], "thread-new");
+            write_result(
+                &mut server_write,
+                &turn_start,
+                json!({"turn": {"id": "turn-first", "status": "inProgress", "items": []}}),
+            )
+            .await;
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"method": "turn/completed", "params": {"threadId": "thread-new", "turn": {"id": "turn-first", "status": "completed", "items": []}}})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+
+        let created = connector
+            .create_session(CreateAgentSessionRequest {
+                cwd: None,
+                title: None,
+                extensions: BTreeMap::new(),
+            })
+            .await
+            .unwrap();
+        let descriptor =
+            <CodexConnector as orchestral_core::agent_protocol::spi::AgentProvider>::describe(
+                &connector,
+            );
+        let run = AgentRunEnvelope::new(
+            ProtocolVersion::new(1, 0),
+            created.session_id,
+            RunId::new("run-first"),
+            vec![Content::text("hello")],
+        )
+        .unwrap();
+        let request = AgentStartRequest::new(
+            AgentRunEnvelope::seal(run.spec).unwrap(),
+            ProviderBindingRef::new("codex/local"),
+            &descriptor,
+        )
+        .unwrap();
+        let mut stream =
+            <CodexConnector as orchestral_core::agent_protocol::spi::AgentProvider>::start(
+                &connector, request,
+            )
+            .await
+            .unwrap()
+            .stream;
+        while let Some(item) = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+        {
+            if matches!(
+                item.unwrap(),
+                AgentProviderStreamItem::Event(event)
+                    if matches!(event.payload, AgentEvent::DeliveryCommitted { .. })
+            ) {
+                break;
+            }
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_pages_are_bounded_and_reuse_revision_validated_cache() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let connector = CodexConnector::with_client(rpc, "codex/0.149.1");
+        let server = tokio::spawn(async move {
+            let mut requests = BufReader::new(server_read).lines();
+            let items = (0..60)
+                .map(|index| {
+                    json!({
+                        "type": "commandExecution",
+                        "id": format!("command-{index}"),
+                        "command": format!("command {index}"),
+                        "status": "completed",
+                        "aggregatedOutput": "x".repeat(10_000)
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            for include_turns in [false, true, false] {
+                let read = read_request(&mut requests).await;
+                assert_eq!(read["method"], "thread/read");
+                assert_eq!(read["params"]["includeTurns"], include_turns);
+                let mut value = thread("thread-large", Value::Null);
+                if include_turns {
+                    value["turns"] = json!([{
+                        "id": "turn-1",
+                        "status": "completed",
+                        "items": items
+                    }]);
+                }
+                write_result(&mut server_write, &read, json!({"thread": value})).await;
+            }
+        });
+
+        let query = AgentSessionReadQuery {
+            cursor: None,
+            limit: 100,
+        };
+        let first = connector
+            .read_session_page(&AgentSessionId::new("thread-large"), query.clone())
+            .await
+            .unwrap();
+        let second = connector
+            .read_session_page(&AgentSessionId::new("thread-large"), query)
+            .await
+            .unwrap();
+
+        assert!(first.next_cursor.is_some());
+        assert_eq!(first, second);
+        assert_eq!(
+            first.turns[0]
+                .activities
+                .last()
+                .unwrap()
+                .activity_id
+                .as_str(),
+            "command-59"
+        );
+        assert!(serde_json::to_vec(&first).unwrap().len() < 512 * 1_024);
         server.await.unwrap();
     }
 

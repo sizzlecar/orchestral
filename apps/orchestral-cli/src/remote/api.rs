@@ -13,8 +13,8 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use orchestral_core::agent_connector::{
     AgentConnectorId, AgentSessionActionId, AgentSessionActionOutcome, AgentSessionDetail,
-    AgentSessionListQuery, AgentSessionPage, AgentSessionSummary, CreateAgentSessionRequest,
-    InvokeAgentSessionActionRequest,
+    AgentSessionListQuery, AgentSessionPage, AgentSessionReadQuery, AgentSessionSummary,
+    CreateAgentSessionRequest, InvokeAgentSessionActionRequest,
 };
 use orchestral_core::agent_protocol::wire::{
     AgentCommand, AgentCommandEnvelope, AgentRunView, AgentSessionId, ApprovalDecision, CommandAck,
@@ -304,6 +304,10 @@ async fn create_agent_session(
 struct AgentSessionQuery {
     connector_id: String,
     session_id: String,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
 }
 
 async fn get_agent_session(
@@ -313,9 +317,13 @@ async fn get_agent_session(
     Ok(Json(
         state
             .agent_directory
-            .read_session(
+            .read_session_page(
                 &AgentConnectorId::new(query.connector_id),
                 &AgentSessionId::new(query.session_id),
+                AgentSessionReadQuery {
+                    cursor: query.cursor,
+                    limit: query.limit.unwrap_or(100),
+                },
             )
             .await?,
     ))
@@ -1132,9 +1140,11 @@ mod tests {
     use orchestral_core::agent_connector::{
         AgentConnector, AgentConnectorDescriptor, AgentConnectorError, AgentConnectorHealth,
         AgentSessionActionDescriptor, AgentSessionActionExecution, AgentSessionActionOutcome,
-        AgentSessionActionStatus, AgentSessionCapabilities, AgentSessionState, AgentSessionSummary,
-        CreateAgentSessionRequest, InvokeAgentSessionActionRequest, SESSION_FORK_ACTION,
-        SESSION_RENAME_ACTION, SESSION_REVIEW_ACTION,
+        AgentSessionActionStatus, AgentSessionActivity, AgentSessionActivityId,
+        AgentSessionActivityKind, AgentSessionActivityStatus, AgentSessionCapabilities,
+        AgentSessionState, AgentSessionSummary, AgentSessionTurn, AgentSessionTurnId,
+        AgentSessionTurnStatus, CreateAgentSessionRequest, InvokeAgentSessionActionRequest,
+        SESSION_FORK_ACTION, SESSION_RENAME_ACTION, SESSION_REVIEW_ACTION,
     };
     use orchestral_core::agent_protocol::{
         spi::{AgentProvider, AgentRecovery, AgentRecoveryRequest, AgentStart, AgentStartError},
@@ -1289,8 +1299,22 @@ mod tests {
             }
             Ok(AgentSessionDetail {
                 summary: Self::summary(),
-                turns: Vec::new(),
+                turns: vec![AgentSessionTurn {
+                    turn_id: AgentSessionTurnId::new("turn-large"),
+                    status: AgentSessionTurnStatus::Completed,
+                    activities: (0..60)
+                        .map(|index| AgentSessionActivity {
+                            activity_id: AgentSessionActivityId::new(format!("activity-{index}")),
+                            kind: AgentSessionActivityKind::Command,
+                            status: AgentSessionActivityStatus::Completed,
+                            title: Some(format!("command-{index}")),
+                            content: vec![Content::text("x".repeat(10_000))],
+                            details: serde_json::Value::Null,
+                        })
+                        .collect(),
+                }],
                 pending_requests: Vec::new(),
+                next_cursor: None,
             })
         }
 
@@ -1662,7 +1686,7 @@ mod tests {
             .clone()
             .oneshot(authorized(
                 "GET",
-                "/agent-session?connector_id=fixture%2Flocal&session_id=fixture-session",
+                "/agent-session?connector_id=fixture%2Flocal&session_id=fixture-session&limit=100",
                 &token,
                 serde_json::Value::Null,
             ))
@@ -1670,8 +1694,18 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.len() < 512 * 1_024);
         let session: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(session["summary"]["title"], "Existing fixture session");
+        assert!(session["next_cursor"].is_string());
+        assert_eq!(
+            session["turns"][0]["activities"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["activity_id"],
+            "activity-59"
+        );
 
         let response = app
             .clone()

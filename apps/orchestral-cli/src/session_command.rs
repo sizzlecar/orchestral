@@ -583,6 +583,7 @@ mod tests {
                 summary: summary(session_id.as_str()),
                 turns: Vec::new(),
                 pending_requests: Vec::new(),
+                next_cursor: None,
             })
         }
 

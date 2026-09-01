@@ -373,6 +373,7 @@ impl AgentConnector for AcpConnector {
             summary,
             turns,
             pending_requests: Vec::new(),
+            next_cursor: None,
         };
         detail.validate_for(&self.connector_id())?;
         Ok(detail)
