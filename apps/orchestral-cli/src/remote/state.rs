@@ -83,8 +83,6 @@ struct RemoteStateFile {
     owner_id: String,
     #[serde(default)]
     devices: Vec<DeviceRecord>,
-    #[serde(default)]
-    sessions: Vec<SessionView>,
 }
 
 impl RemoteStateFile {
@@ -93,7 +91,6 @@ impl RemoteStateFile {
             version: STATE_VERSION,
             owner_id: format!("owner-{}", uuid::Uuid::new_v4()),
             devices: Vec::new(),
-            sessions: Vec::new(),
         }
     }
 
@@ -113,11 +110,6 @@ impl RemoteStateFile {
                 || device.token_digest.len() != 64
             {
                 bail!("remote-control state contains an invalid device");
-            }
-        }
-        for session in &self.sessions {
-            if session.id.trim().is_empty() {
-                bail!("remote-control state contains an invalid session");
             }
         }
         Ok(())
@@ -148,7 +140,8 @@ impl RemoteRegistry {
 
     pub fn open(path: impl Into<PathBuf>, pairing: Option<PairingTicket>) -> anyhow::Result<Self> {
         let path = path.into();
-        let durable = if path.exists() {
+        let existed = path.exists();
+        let durable = if existed {
             let bytes = std::fs::read(&path)
                 .with_context(|| format!("read remote-control state '{}'", path.display()))?;
             let state: RemoteStateFile = serde_json::from_slice(&bytes)
@@ -158,6 +151,12 @@ impl RemoteRegistry {
         } else {
             RemoteStateFile::fresh()
         };
+        // Version 1 previously mixed Session/Run indexes into the device
+        // credential file. Unknown legacy fields are intentionally discarded
+        // and the sanitized authentication-only state is persisted here.
+        if existed {
+            persist_state(&path, &durable)?;
+        }
         Ok(Self {
             path: Some(path),
             state: Arc::new(Mutex::new(RegistryState { durable, pairing })),
@@ -263,79 +262,6 @@ impl RemoteRegistry {
             .context("device was not found")?;
         record.revoked_at_unix_ms = Some(now_unix_ms());
         self.persist_locked(&state.durable)
-    }
-
-    pub async fn register_session(&self, session_id: &str) -> anyhow::Result<SessionView> {
-        if session_id.trim().is_empty() {
-            bail!("session id must not be empty");
-        }
-        let mut state = self.state.lock().await;
-        if let Some(existing) = state
-            .durable
-            .sessions
-            .iter()
-            .find(|session| session.id == session_id)
-        {
-            return Ok(existing.clone());
-        }
-        let timestamp = now_unix_ms();
-        let session = SessionView {
-            id: session_id.to_owned(),
-            created_at_unix_ms: timestamp,
-            updated_at_unix_ms: timestamp,
-            run_ids: Vec::new(),
-        };
-        state.durable.sessions.push(session.clone());
-        self.persist_locked(&state.durable)?;
-        Ok(session)
-    }
-
-    pub async fn record_run(&self, session_id: &str, run_id: &str) -> anyhow::Result<SessionView> {
-        if run_id.trim().is_empty() {
-            bail!("run id must not be empty");
-        }
-        let mut state = self.state.lock().await;
-        let session = state
-            .durable
-            .sessions
-            .iter_mut()
-            .find(|session| session.id == session_id)
-            .context("session was not registered")?;
-        if !session.run_ids.iter().any(|existing| existing == run_id) {
-            session.run_ids.push(run_id.to_owned());
-        }
-        session.updated_at_unix_ms = now_unix_ms();
-        let view = session.clone();
-        self.persist_locked(&state.durable)?;
-        Ok(view)
-    }
-
-    pub async fn sessions(&self) -> Vec<SessionView> {
-        let state = self.state.lock().await;
-        let mut sessions = state.durable.sessions.clone();
-        sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at_unix_ms));
-        sessions
-    }
-
-    pub async fn session(&self, session_id: &str) -> Option<SessionView> {
-        self.state
-            .lock()
-            .await
-            .durable
-            .sessions
-            .iter()
-            .find(|session| session.id == session_id)
-            .cloned()
-    }
-
-    pub async fn owns_run(&self, run_id: &str) -> bool {
-        self.state
-            .lock()
-            .await
-            .durable
-            .sessions
-            .iter()
-            .any(|session| session.run_ids.iter().any(|existing| existing == run_id))
     }
 
     fn persist_locked(&self, state: &RemoteStateFile) -> anyhow::Result<()> {
@@ -473,18 +399,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sessions_and_runs_are_idempotently_registered() {
-        let registry = RemoteRegistry::in_memory(None);
-        registry.register_session("session-1").await.unwrap();
-        registry.register_session("session-1").await.unwrap();
-        registry.record_run("session-1", "run-1").await.unwrap();
-        registry.record_run("session-1", "run-1").await.unwrap();
+    async fn persisted_remote_state_contains_only_authentication_data() {
+        let root = std::env::temp_dir().join(format!(
+            "orchestral-remote-auth-state-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = root.join("state.json");
+        let ticket = PairingTicket::issue(60_000).unwrap();
+        let secret = ticket.secret().to_owned();
+        let registry = RemoteRegistry::open(&path, Some(ticket)).unwrap();
+        registry.claim_pairing(&secret, "Phone").await.unwrap();
 
-        let sessions = registry.sessions().await;
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].run_ids, ["run-1"]);
-        assert!(registry.owns_run("run-1").await);
-        assert!(!registry.owns_run("other-run").await);
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(persisted.get("devices").is_some());
+        assert!(persisted.get("sessions").is_none());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_session_index_is_discarded_when_auth_state_opens() {
+        let root = std::env::temp_dir().join(format!(
+            "orchestral-remote-legacy-state-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("state.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "version": 1,
+                "owner_id": "owner-legacy",
+                "devices": [],
+                "sessions": [{
+                    "id": "dangling-session",
+                    "created_at_unix_ms": 1,
+                    "updated_at_unix_ms": 1,
+                    "run_ids": ["missing-run"]
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        RemoteRegistry::open(&path, None).unwrap();
+        let sanitized: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(sanitized.get("sessions").is_none());
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

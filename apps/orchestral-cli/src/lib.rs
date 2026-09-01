@@ -1,6 +1,7 @@
 //! Orchestral application composition and transport surfaces.
 
 pub mod agent;
+mod agent_connectors;
 mod cli;
 mod envfile;
 mod google_auth;
@@ -8,6 +9,9 @@ mod mcp_command;
 mod mcp_config;
 pub mod remote;
 mod runtime;
+mod session_command;
+mod skill_command;
+mod skill_config;
 mod tui;
 
 use clap::Parser;

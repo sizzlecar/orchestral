@@ -2017,6 +2017,18 @@
                 "type": "string"
               }
             },
+            "session_approval_scope": {
+              "description": "Opaque Host review class that may be remembered for this\ninteractive session. It never replaces the exact operation digest\nor the single-use approval grant.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Digest"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
             "type": {
               "type": "string",
               "const": "approval"
@@ -2522,6 +2534,22 @@
       "description": "Stable telemetry item identifier.",
       "type": "string"
     },
+    "ToolActivityErrorDetail": {
+      "type": "object",
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "label",
+        "value"
+      ]
+    },
     "ToolActivityEvidence": {
       "description": "Bounded, Host-selected evidence about one Tool operation.\n\nThis is deliberately semantic rather than a copy of arbitrary Tool JSON:\nadapters describe their own operations, while Agent clients only aggregate\nand render the stable evidence vocabulary.",
       "oneOf": [
@@ -2596,6 +2624,12 @@
           "properties": {
             "code": {
               "type": "string"
+            },
+            "details": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/ToolActivityErrorDetail"
+              }
             },
             "message": {
               "type": "string"

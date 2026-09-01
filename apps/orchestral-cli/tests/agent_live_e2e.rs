@@ -3038,7 +3038,13 @@ fn run_payload_count(workspace: &TestWorkspace, kind: &str) -> usize {
             serde_json::from_slice::<Value>(&fs::read(path).expect("read Run journal"))
                 .expect("parse Run journal")
         })
-        .flat_map(|value| value["records"].as_array().cloned().unwrap_or_default())
+        .flat_map(|value| {
+            value["run"]["records"]
+                .as_array()
+                .or_else(|| value["records"].as_array())
+                .cloned()
+                .unwrap_or_default()
+        })
         .filter(|record| record["event"]["payload"]["type"].as_str() == Some(kind))
         .count()
 }

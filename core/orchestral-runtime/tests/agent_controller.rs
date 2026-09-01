@@ -19,7 +19,7 @@ use orchestral_core::agent_protocol::{
         ProviderCommandDisposition,
     },
 };
-use orchestral_runtime::AgentController;
+use orchestral_runtime::{AgentClient, AgentController};
 
 struct RecoveryOrderProvider {
     inner: Arc<dyn AgentProvider>,
@@ -310,4 +310,39 @@ async fn failed_recovery_confirmation_returns_the_run_to_unknown() {
         .await
         .expect("Run remains inspectable after failed continuation");
     assert_eq!(view.state.status(), AgentRunStatus::Unknown);
+}
+
+#[tokio::test]
+async fn sdk_returns_unknown_as_a_recoverable_turn_boundary() {
+    let factory = SessionfulRecoverFactory::new().expect("fixture descriptor");
+    let mut scenario = ProviderScenario::standard(&factory.descriptor()).expect("fixture scenario");
+    scenario.immediate_events.truncate(1);
+    let controller = Arc::new(
+        AgentController::new(
+            factory.create(scenario, TestProbes::default()),
+            ProviderBindingRef::new("conformance-binding"),
+        )
+        .expect("controller binds provider"),
+    );
+    let client = AgentClient::new(
+        controller,
+        orchestral_core::agent_protocol::wire::AgentSessionId::new("conformance-session"),
+    );
+    let handle = client
+        .start_with_run_id(
+            orchestral_core::agent_protocol::wire::RunId::new("conformance-run"),
+            vec![orchestral_core::agent_protocol::wire::Content::text(
+                "complete the deterministic fixture",
+            )],
+        )
+        .await
+        .expect("non-terminal fixture starts");
+
+    let turn = tokio::time::timeout(Duration::from_secs(1), handle.wait_until_blocked())
+        .await
+        .expect("SDK does not hang after Provider continuity is lost")
+        .expect("Unknown is returned as an inspectable boundary");
+
+    assert_eq!(turn.status(), AgentRunStatus::Unknown);
+    assert!(!turn.is_waiting());
 }

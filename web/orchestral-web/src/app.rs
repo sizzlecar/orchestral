@@ -2,6 +2,7 @@ use std::rc::Rc;
 
 use dioxus::prelude::*;
 
+use crate::browser::api::ApiCredential;
 use crate::browser::controller::AppController;
 use crate::browser::{platform, storage};
 use crate::components::{AuthScreen, Workspace};
@@ -12,7 +13,7 @@ const CSS: Asset = asset!("/assets/styles.css");
 #[component]
 pub fn App() -> Element {
     let state = use_signal(|| AppState::new(platform::is_online()));
-    let token = use_signal(|| None::<String>);
+    let token = use_signal(|| None::<ApiCredential>);
     let pairing_secret = use_signal(platform::take_pairing_secret);
     let preferences = use_signal(storage::load_preferences);
     let stream_abort = use_signal(|| None::<web_sys::AbortController>);

@@ -130,6 +130,30 @@ Tool/file evidence and progress, resolve input and approval requests, steer or c
 revoke paired devices. API responses, credentials, and transcripts are excluded from the service
 worker cache.
 
+For an identity-aware reverse proxy, the Host can instead require and verify a signed RS256 JWT.
+This mode does not use browser device pairing: the PWA restores the proxy session from its secure
+cookie, while the Host independently verifies the assertion signature, issuer, audience, expiry,
+and configured identity claims on every API request.
+
+```bash
+orchestral serve \
+  --public-url https://agent.example.com \
+  --access-jwt-issuer https://access.example.com \
+  --access-jwt-jwks-url https://access.example.com/.well-known/jwks.json \
+  --access-jwt-audience orchestral \
+  --access-jwt-header X-Access-JWT \
+  --access-jwt-required-claim email=owner@example.com \
+  --backend google --model gemini-3.1-pro-preview \
+  -C /path/to/workspace
+```
+
+The contract is proxy-neutral: header name, issuer, JWKS endpoint, audience, and repeatable
+`NAME=VALUE` claim constraints are deployment configuration. Cloudflare Access, oauth2-proxy, or
+another gateway can provide the assertion. Once JWT mode is enabled, protected Host routes accept
+only a valid gateway assertion; a stale device token cannot bypass the proxy identity policy.
+The proxy must strip or overwrite the configured identity header, and the Host origin should stay
+private or loopback-only so clients cannot bypass the proxy and inject their own assertion header.
+
 The default listener is loopback-only. A direct trusted-LAN test can opt into cleartext explicitly
 with `--listen 0.0.0.0:8765 --public-url http://HOST:8765 --allow-insecure-http`, but browsers
 normally require trusted HTTPS for installation, service workers, notifications, and other PWA

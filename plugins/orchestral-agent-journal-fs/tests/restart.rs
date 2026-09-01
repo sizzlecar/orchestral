@@ -5,14 +5,153 @@ use orchestral_agent_protocol_testkit::{
     ProviderFixtureFactory, ProviderScenario, ScriptedStatelessFactory, TestProbes,
 };
 use orchestral_core::agent_protocol::{
-    reference::AgentRunStatus,
+    reference::{AgentRunReducer, AgentRunStatus},
+    spi::{AgentJournalStore, AgentRunRegistration, StoredAgentRun},
     wire::{
-        AgentAdmission, AgentDescriptor, AgentDescriptorEnvelope, AgentExecutionRef, AgentId,
-        AgentProviderId, AgentRunEnvelope, AgentSessionId, AgentStartRequest, Content, Digest,
-        ProviderBindingRef, RunId,
+        AgentAdmission, AgentCapabilities, AgentDescriptor, AgentDescriptorEnvelope, AgentEvent,
+        AgentEventDraft, AgentEventId, AgentExecutionRef, AgentId, AgentProviderId,
+        AgentRunEnvelope, AgentSessionId, AgentStartRequest, Content, Digest, PendingRequest,
+        PendingRequestKind, PendingRequestPayload, ProviderBindingRef, RequestId, RunId,
     },
     AGENT_PROTOCOL_V1,
 };
+
+#[tokio::test]
+async fn legacy_approval_digest_is_verified_and_upgraded_without_hiding_the_run() {
+    let root = std::env::temp_dir().join(format!(
+        "orchestral-agent-journal-legacy-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let mut capabilities = AgentCapabilities::default();
+    capabilities
+        .pending_request_kinds
+        .insert(PendingRequestKind::Approval);
+    let descriptor = AgentDescriptorEnvelope::seal(AgentDescriptor {
+        provider_id: AgentProviderId::new("test/legacy-journal"),
+        agent_id: AgentId::new("legacy-journal-v1"),
+        supported_protocol_versions: vec![AGENT_PROTOCOL_V1],
+        accepted_content_types: std::collections::BTreeSet::from(["text/plain".to_owned()]),
+        capabilities,
+        extensions: Default::default(),
+    })
+    .expect("descriptor seals");
+    let run = AgentRunEnvelope::new(
+        AGENT_PROTOCOL_V1,
+        AgentSessionId::new("legacy-session"),
+        RunId::new("legacy-run"),
+        vec![Content::text("exercise durable compatibility")],
+    )
+    .expect("Run seals");
+    let request =
+        AgentStartRequest::new(run, ProviderBindingRef::new("legacy-binding"), &descriptor)
+            .expect("start request is valid");
+    let execution =
+        AgentExecutionRef::for_start(&request, &descriptor).expect("execution reference is valid");
+    let admission = AgentAdmission::default();
+    let mut reducer =
+        AgentRunReducer::new(execution.clone(), &request, &descriptor, admission.clone())
+            .expect("reducer starts");
+    let opened = reducer
+        .apply_provider_draft(AgentEventDraft {
+            event_id: AgentEventId::new("legacy-approval-opened"),
+            run_id: execution.run_id.clone(),
+            causation_id: None,
+            source_fingerprint: None,
+            payload: AgentEvent::RequestOpened {
+                request: PendingRequest {
+                    request_id: RequestId::new("legacy-approval"),
+                    blocking: true,
+                    payload: PendingRequestPayload::Approval {
+                        operation_digest: Digest::sha256("legacy-operation"),
+                        requested_scope: vec!["filesystem_read".to_owned()],
+                        session_approval_scope: None,
+                        reason: "verify a legacy approval record".to_owned(),
+                    },
+                },
+            },
+        })
+        .expect("approval event is sequenced");
+    let stored = StoredAgentRun {
+        registration: AgentRunRegistration {
+            request,
+            execution: execution.clone(),
+            admission,
+        },
+        records: vec![opened.record],
+    };
+    stored.validate_shape().expect("current Run is valid");
+
+    let store = FileAgentJournalStore::open(&root).expect("journal opens");
+    AgentJournalStore::create_run(&store, stored.clone())
+        .await
+        .expect("current Run persists");
+    let run_path = root.join(format!(
+        "run-{}.json",
+        Digest::sha256(execution.run_id.as_str()).as_str()
+    ));
+    let current = serde_json::from_slice::<serde_json::Value>(
+        &std::fs::read(&run_path).expect("versioned Run reads"),
+    )
+    .expect("versioned Run is JSON");
+    assert_eq!(current["schema_version"], 1);
+
+    let mut legacy = serde_json::to_value(stored).expect("legacy Run serializes");
+    let record = &mut legacy["records"][0];
+    record["event"]["payload"]["request"]["payload"]
+        .as_object_mut()
+        .expect("approval payload is an object")
+        .remove("session_approval_scope");
+    let mut event_view = record["event"].clone();
+    event_view
+        .as_object_mut()
+        .expect("event is an object")
+        .remove("event_digest");
+    let legacy_event_digest =
+        Digest::sha256(serde_jcs::to_vec(&event_view).expect("legacy event canonicalizes"));
+    record["event"]["event_digest"] =
+        serde_json::Value::String(legacy_event_digest.as_str().to_owned());
+    event_view
+        .as_object_mut()
+        .expect("event is an object")
+        .remove("run_seq");
+    let legacy_draft_digest =
+        Digest::sha256(serde_jcs::to_vec(&event_view).expect("legacy draft canonicalizes"));
+    record["draft_digest"] = serde_json::Value::String(legacy_draft_digest.as_str().to_owned());
+    std::fs::write(
+        &run_path,
+        serde_json::to_vec(&legacy).expect("legacy Run encodes"),
+    )
+    .expect("legacy Run replaces current fixture");
+
+    let reopened = FileAgentJournalStore::open(&root).expect("journal reopens");
+    let loaded = AgentJournalStore::load_run(&reopened, &execution.run_id)
+        .await
+        .expect("legacy Run loads")
+        .expect("legacy Run exists");
+    loaded.validate_shape().expect("upgraded Run is valid");
+    assert_eq!(
+        reopened
+            .catalog_runs()
+            .await
+            .expect("legacy Run remains discoverable")
+            .len(),
+        1
+    );
+
+    legacy["records"][0]["event"]["payload"]["request"]["payload"]["reason"] =
+        serde_json::Value::String("tampered after sealing".to_owned());
+    std::fs::write(
+        &run_path,
+        serde_json::to_vec(&legacy).expect("tampered Run encodes"),
+    )
+    .expect("tampered Run replaces legacy fixture");
+    let error = AgentJournalStore::load_run(&reopened, &execution.run_id)
+        .await
+        .expect_err("tampered legacy semantics are rejected");
+    assert!(error.to_string().contains("legacy event digest mismatch"));
+
+    std::fs::remove_dir_all(root).expect("temporary journal cleans up");
+}
 use orchestral_core::agent_session::{
     AgentSessionEvent, AgentSessionEventDraft, AgentSessionEventId, AgentSessionJournalStore,
     SessionSourceRange,
@@ -177,9 +316,16 @@ async fn terminal_run_rehydrates_from_a_new_store_and_controller_instance() {
         .inspect(&execution.run_id)
         .await
         .expect("durable run rehydrates");
+    let catalog = second
+        .catalog_runs()
+        .await
+        .expect("durable Run catalog remains discoverable");
 
     assert_eq!(after.state.status(), AgentRunStatus::Delivered);
     assert_eq!(after, before);
+    assert_eq!(catalog.len(), 1);
+    assert_eq!(catalog[0].run_id, execution.run_id);
+    assert_eq!(catalog[0].session_id, execution.session_id);
     std::fs::remove_dir_all(root).expect("temporary journal cleans up");
 }
 

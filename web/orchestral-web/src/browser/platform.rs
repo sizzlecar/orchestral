@@ -91,6 +91,45 @@ pub fn apply_theme(theme: &str) {
     }
 }
 
+pub fn scroll_timeline_to_end() {
+    let Some(document) = web_sys::window().and_then(|window| window.document()) else {
+        return;
+    };
+    let Ok(Some(element)) = document.query_selector(".message-list") else {
+        return;
+    };
+    let Ok(element) = element.dyn_into::<web_sys::HtmlElement>() else {
+        return;
+    };
+    element.set_scroll_top(element.scroll_height());
+}
+
+pub fn timeline_scroll_anchor() -> Option<(i32, i32)> {
+    let document = web_sys::window()?.document()?;
+    let element = document
+        .query_selector(".message-list")
+        .ok()??
+        .dyn_into::<web_sys::HtmlElement>()
+        .ok()?;
+    Some((element.scroll_top(), element.scroll_height()))
+}
+
+/// Keeps the same content under the viewport after older transcript entries
+/// are inserted above it.
+pub fn restore_timeline_scroll_anchor((scroll_top, scroll_height): (i32, i32)) {
+    let Some(document) = web_sys::window().and_then(|window| window.document()) else {
+        return;
+    };
+    let Ok(Some(element)) = document.query_selector(".message-list") else {
+        return;
+    };
+    let Ok(element) = element.dyn_into::<web_sys::HtmlElement>() else {
+        return;
+    };
+    let added_height = element.scroll_height().saturating_sub(scroll_height);
+    element.set_scroll_top(scroll_top.saturating_add(added_height));
+}
+
 pub async fn copy_text(text: &str) -> Result<(), String> {
     let navigator = window()?.navigator();
     let Some(clipboard) =

@@ -116,6 +116,7 @@
 html {
   min-width: 300px;
   height: 100%;
+  overscroll-behavior: none;
   background: var(--page);
   text-size-adjust: 100%;
   -webkit-text-size-adjust: 100%;
@@ -123,10 +124,14 @@ html {
 }
 
 body {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
   min-width: 300px;
-  min-height: 100%;
   margin: 0;
   overflow: hidden;
+  overscroll-behavior: none;
   background: var(--page);
   color: var(--ink);
   font-family: var(--font-sans);
@@ -136,6 +141,12 @@ body {
   -webkit-font-smoothing: antialiased;
   -webkit-user-select: text;
   user-select: text;
+}
+
+#main {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
 }
 
 ::selection {
@@ -484,6 +495,56 @@ svg {
   margin-top: 20px;
 }
 
+.thread-groups {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-color: var(--line-strong) transparent;
+}
+
+.thread-group + .thread-group {
+  margin-top: 13px;
+}
+
+.thread-group__label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 28px;
+  padding: 0 9px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 720;
+  letter-spacing: 0.055em;
+}
+
+.thread-group__label span:last-child {
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.thread-group__more {
+  width: calc(100% - 18px);
+  min-height: 36px;
+  margin: 5px 9px 0;
+  border: 1px dashed var(--line-strong);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 680;
+}
+
+.thread-group__error {
+  margin: 5px 9px 0;
+  color: var(--danger);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
 .section-label {
   display: flex;
   align-items: center;
@@ -507,9 +568,6 @@ svg {
   min-height: 0;
   padding: 0;
   margin: 2px 0 0;
-  overflow: auto;
-  overscroll-behavior: contain;
-  scrollbar-color: var(--line-strong) transparent;
   list-style: none;
 }
 
@@ -627,6 +685,7 @@ svg {
 
 .connection-status[data-state="online"] .connection-status__dot,
 .connection-status[data-state="live"] .connection-status__dot,
+.connection-status[data-state="observing"] .connection-status__dot,
 .connection-status[data-state="idle"] .connection-status__dot,
 .connection-status.is-online .connection-status__dot {
   background: var(--success);
@@ -653,6 +712,24 @@ svg {
   background:
     radial-gradient(circle at 20% 0%, color-mix(in srgb, var(--accent-soft) 38%, transparent), transparent 28rem),
     var(--page-raised);
+}
+
+.conversation-header__controls {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.session-actions-button {
+  min-height: 34px;
+  padding: 0 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--ink-soft);
+  font-size: 11px;
+  font-weight: 680;
 }
 
 .conversation-header {
@@ -785,6 +862,25 @@ svg {
   scrollbar-color: var(--line-strong) transparent;
   -webkit-user-select: text;
   user-select: text;
+}
+
+.history-pagination {
+  display: flex;
+  justify-content: center;
+  width: min(100%, 820px);
+  margin: 0 auto 18px;
+}
+
+.history-pagination__button {
+  min-height: 40px;
+  padding: 0 15px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 680;
 }
 
 .run-group {
@@ -944,6 +1040,10 @@ svg {
   white-space: pre-wrap;
   -webkit-user-select: text;
   user-select: text;
+}
+
+.message--assistant .message__content {
+  white-space: normal;
 }
 
 .message--user .message__content {
@@ -1807,6 +1907,7 @@ svg {
   line-height: 1.55;
   -webkit-user-select: text;
   user-select: text;
+  touch-action: manipulation;
 }
 
 .composer-form textarea::placeholder {
@@ -1867,22 +1968,59 @@ svg {
 }
 
 .settings-dialog {
+  position: fixed;
+  z-index: 81;
+  inset: 50% auto auto 50%;
   width: min(calc(100% - 20px), 540px);
   max-width: 540px;
   max-height: min(calc(100dvh - 24px), 720px);
   padding: 0;
+  margin: 0;
   overflow: hidden;
   border: 1px solid var(--line-strong);
   border-radius: 21px;
   background: var(--surface);
   box-shadow: var(--shadow-md);
   color: var(--ink);
+  transform: translate(-50%, -50%);
 }
 
 .settings-dialog::backdrop {
   background: var(--overlay);
   backdrop-filter: blur(4px);
   -webkit-backdrop-filter: blur(4px);
+}
+
+.settings-backdrop {
+  position: fixed;
+  z-index: 80;
+  inset: 0;
+  background: var(--overlay);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+}
+
+.settings-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 68px;
+  padding: 10px 12px 10px 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+.settings-header h2 {
+  margin: 3px 0 0;
+  font-size: 18px;
+  line-height: 1.2;
+}
+
+.settings-content {
+  min-height: 120px;
+  max-height: min(calc(100dvh - 94px), 640px);
+  padding: 16px 18px calc(18px + env(safe-area-inset-bottom));
+  overflow-y: auto;
 }
 
 .settings-dialog__surface {
@@ -1943,6 +2081,121 @@ svg {
   background-color: var(--surface-muted);
   color: var(--ink);
   font-size: 12px;
+}
+
+.session-source-list,
+.session-action-list {
+  display: grid;
+  gap: 10px;
+}
+
+.session-source-card {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  min-height: 68px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 14px;
+  background: var(--surface-muted);
+  color: var(--ink);
+  text-align: left;
+}
+
+.session-source-card__mark {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  border-radius: 12px;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-weight: 760;
+}
+
+.session-source-card__copy {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.session-source-card__copy strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-source-card__copy small,
+.session-source-card__action {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.session-action-card {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: 14px;
+  background: var(--surface-muted);
+}
+
+.session-action-card__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.session-action-card h3,
+.session-action-card p {
+  margin: 0;
+}
+
+.session-action-card h3 {
+  font-size: 13px;
+}
+
+.session-action-card p {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.session-action-fields {
+  display: grid;
+  gap: 9px;
+}
+
+.session-action-field {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.session-action-field input,
+.session-action-field textarea {
+  width: 100%;
+  min-height: 42px;
+  padding: 9px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 9px;
+  outline: 0;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 450;
+}
+
+.session-action-field textarea {
+  min-height: 90px;
+  resize: vertical;
 }
 
 .settings-button,
@@ -2049,8 +2302,9 @@ svg {
 .toast-region {
   position: fixed;
   z-index: 120;
+  top: calc(var(--topbar-height) + 10px + env(safe-area-inset-top));
   right: max(12px, env(safe-area-inset-right));
-  bottom: calc(12px + env(safe-area-inset-bottom));
+  bottom: auto;
   left: max(12px, env(safe-area-inset-left));
   display: grid;
   justify-items: center;
@@ -2059,9 +2313,14 @@ svg {
 }
 
 .toast {
-  width: fit-content;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px;
+  align-items: start;
+  gap: 8px;
+  width: min(100%, 460px);
   max-width: min(100%, 460px);
-  padding: 10px 13px;
+  max-height: min(30dvh, 180px);
+  padding: 10px 9px 10px 13px;
   border: 1px solid var(--line-strong);
   border-radius: 11px;
   background: var(--surface);
@@ -2071,6 +2330,26 @@ svg {
   line-height: 1.45;
   pointer-events: auto;
   animation: toast-in 180ms ease-out both;
+}
+
+.toast__message {
+  min-width: 0;
+  max-height: min(24dvh, 138px);
+  overflow: auto;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.toast__dismiss {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: 8px;
+  color: currentColor;
+  font-size: 18px;
+  line-height: 1;
 }
 
 .toast.is-error {
@@ -2202,6 +2481,40 @@ svg {
   }
 }
 
+@media (max-width: 859px) {
+  /* iOS Safari zooms the visual viewport when a focused form control uses a
+     font smaller than 16px. Keep mobile controls at 16px so the composer and
+     pending-request forms remain aligned with the visible viewport. */
+  textarea,
+  input,
+  select {
+    font-size: 16px;
+  }
+
+  .composer-dock,
+  .composer-form {
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .send-button {
+    flex: 0 0 44px;
+  }
+
+  .settings-dialog {
+    inset: auto 10px calc(10px + env(safe-area-inset-bottom));
+    width: calc(100% - 20px);
+    max-height: min(82dvh, 720px);
+    margin: 0;
+    border-radius: 20px;
+    transform: none;
+  }
+
+  .settings-content {
+    max-height: calc(82dvh - 68px);
+  }
+}
+
 @media (min-width: 860px) {
   .app-shell {
     grid-template-rows: minmax(0, 1fr);
@@ -2266,6 +2579,7 @@ svg {
   }
 
   .toast-region {
+    top: 14px;
     left: calc(var(--sidebar-width) + 12px);
   }
 }

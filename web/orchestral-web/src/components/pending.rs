@@ -7,7 +7,7 @@ use crate::state::{content_text, RunState};
 #[component]
 pub fn PendingPanel() -> Element {
     let controller = consume_context::<AppController>();
-    let run = controller.state.read().current_run().cloned();
+    let run = controller.state.read().pending_run().cloned();
     let Some(run) = run.filter(|run| !run.pending.is_empty()) else {
         return rsx! {};
     };

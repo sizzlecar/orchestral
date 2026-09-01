@@ -16,8 +16,8 @@ use orchestral_core::agent_protocol::{
     },
     spi::{
         AgentJournalStore, AgentJournalStoreError, AgentProvider, AgentProviderStream,
-        AgentRecoveryRequest, AgentRunRegistration, AgentStartError, InMemoryAgentJournalStore,
-        StoredAgentRun,
+        AgentRecoveryRequest, AgentRunCatalogEntry, AgentRunRegistration, AgentStartError,
+        InMemoryAgentJournalStore, StoredAgentRun,
     },
     wire::{
         AgentCommand, AgentCommandEnvelope, AgentEvent, AgentEventAuthority, AgentEventDraft,
@@ -307,6 +307,19 @@ impl AgentController {
         let slot = self.run_slot(run_id).await?;
         let input = slot.entry.lock().await.request.run.spec.input.clone();
         Ok(input)
+    }
+
+    /// Lists durable Runs directly from the Host journal. Transport-specific
+    /// session registries must not maintain a second Run ownership index.
+    pub async fn catalog_runs(&self) -> Result<Vec<AgentRunCatalogEntry>, AgentControlError> {
+        Ok(self.journal_store.catalog_runs().await?)
+    }
+
+    pub async fn has_run(&self, run_id: &RunId) -> Result<bool, AgentControlError> {
+        if self.runs.read().await.contains_key(run_id) {
+            return Ok(true);
+        }
+        Ok(self.journal_store.load_run(run_id).await?.is_some())
     }
 
     /// Replays normalized durable facts after the supplied Run sequence.

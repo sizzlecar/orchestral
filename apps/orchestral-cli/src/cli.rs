@@ -59,6 +59,10 @@ pub struct Cli {
 enum CliCommand {
     /// Manage MCP servers registered for this user.
     Mcp(crate::mcp_command::McpCommand),
+    /// List, enable, or disable Skills for the current workspace.
+    Skills(crate::skill_command::SkillsCommand),
+    /// Discover and control sessions owned by installed Agents.
+    Sessions(crate::session_command::SessionsCommand),
     /// Run the local Host gateway and mobile PWA control surface.
     Serve(crate::remote::ServeCommand),
 }
@@ -94,6 +98,8 @@ impl Cli {
         };
         match self.command {
             Some(CliCommand::Mcp(command)) => command.run().await,
+            Some(CliCommand::Skills(command)) => command.run(options.config, options.cwd),
+            Some(CliCommand::Sessions(command)) => command.run(options.cwd).await,
             Some(CliCommand::Serve(command)) => crate::remote::serve(command, options).await,
             None => crate::agent::run(options).await,
         }
@@ -125,7 +131,7 @@ mod tests {
                 .get_subcommands()
                 .map(clap::Command::get_name)
                 .collect::<Vec<_>>(),
-            ["mcp", "serve"]
+            ["mcp", "skills", "sessions", "serve"]
         );
     }
 
@@ -141,6 +147,14 @@ mod tests {
         ])
         .expect("MCP registration must be a management subcommand");
         assert!(matches!(parsed.command, Some(super::CliCommand::Mcp(_))));
+        assert!(parsed.input.is_empty());
+    }
+
+    #[test]
+    fn skill_management_is_a_first_class_root_command() {
+        let parsed = Cli::try_parse_from(["orchestral", "skills", "disable", "xlsx"])
+            .expect("Skill management command must parse");
+        assert!(matches!(parsed.command, Some(super::CliCommand::Skills(_))));
         assert!(parsed.input.is_empty());
     }
 

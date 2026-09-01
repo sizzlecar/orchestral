@@ -4,6 +4,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use orchestral_core::agent_connector::AgentSessionActionInvocation;
+use orchestral_core::agent_protocol::spi::AgentRunCatalogEntry;
 use orchestral_core::agent_protocol::wire::{
     AgentCommandEnvelope, AgentJournalRecord, AgentRunView, AgentSessionId, CommandAck, Content,
     ResourceBinding, RunId,
@@ -85,12 +87,33 @@ impl AgentApi {
         }
     }
 
+    pub async fn start_session_action(
+        &self,
+        session_id: &AgentSessionId,
+        run_id: RunId,
+        title: impl Into<String>,
+        action: AgentSessionActionInvocation,
+    ) -> Result<AgentRunHandle, AgentSdkError> {
+        self.session(session_id)
+            .await?
+            .start_session_action_with_run_id(run_id, title, action)
+            .await
+    }
+
     pub async fn inspect(&self, run_id: &RunId) -> Result<AgentRunView, AgentSdkError> {
         Ok(self.controller.inspect(run_id).await?)
     }
 
     pub async fn initial_input(&self, run_id: &RunId) -> Result<Vec<Content>, AgentSdkError> {
         Ok(self.controller.initial_input(run_id).await?)
+    }
+
+    pub async fn catalog_runs(&self) -> Result<Vec<AgentRunCatalogEntry>, AgentSdkError> {
+        Ok(self.controller.catalog_runs().await?)
+    }
+
+    pub async fn has_run(&self, run_id: &RunId) -> Result<bool, AgentSdkError> {
+        Ok(self.controller.has_run(run_id).await?)
     }
 
     pub async fn events(

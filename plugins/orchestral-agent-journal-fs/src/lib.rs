@@ -14,10 +14,10 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use orchestral_core::agent_protocol::{
     spi::{
-        AgentJournalStore, AgentJournalStoreError, AppendAgentRecordOutcome, CreateAgentRunOutcome,
-        StoredAgentRun,
+        AgentJournalStore, AgentJournalStoreError, AgentRunCatalogEntry, AppendAgentRecordOutcome,
+        CreateAgentRunOutcome, StoredAgentRun,
     },
-    wire::{AgentJournalRecord, AgentSessionId, Digest, RunId},
+    wire::{AgentEvent, AgentJournalRecord, AgentSessionId, Digest, PendingRequestPayload, RunId},
 };
 use orchestral_core::agent_session::{
     validate_session_trace, AgentSessionAppend, AgentSessionError, AgentSessionEventDraft,
@@ -32,6 +32,17 @@ use orchestral_runtime::{
     GenericAgentRunRegistration, GenericCheckpointDraft, GenericCheckpointError,
     GenericCheckpointRecord, StoredGenericAgentRun,
 };
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+const AGENT_RUN_FILE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedAgentRun {
+    schema_version: u32,
+    run: StoredAgentRun,
+}
 
 #[derive(Clone)]
 pub struct FileAgentJournalStore {
@@ -88,13 +99,7 @@ impl FileAgentJournalStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(unavailable(error)),
         };
-        let run = serde_json::from_slice::<StoredAgentRun>(&bytes).map_err(|error| {
-            AgentJournalStoreError::InvalidData(format!(
-                "could not decode {}: {error}",
-                path.display()
-            ))
-        })?;
-        run.validate_shape()?;
+        let run = decode_agent_run(&bytes, &path)?;
         if run.registration.run_id() != run_id {
             return Err(AgentJournalStoreError::InvalidData(format!(
                 "journal filename identity does not match stored run_id: {}",
@@ -102,6 +107,43 @@ impl FileAgentJournalStore {
             )));
         }
         Ok(Some(run))
+    }
+
+    fn catalog_runs_sync(&self) -> Result<Vec<AgentRunCatalogEntry>, AgentJournalStoreError> {
+        let mut entries = Vec::new();
+        for directory_entry in fs::read_dir(self.root.as_path()).map_err(unavailable)? {
+            let directory_entry = directory_entry.map_err(unavailable)?;
+            let file_name = directory_entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            if !file_name.starts_with("run-") || !file_name.ends_with(".json") {
+                continue;
+            }
+
+            let path = directory_entry.path();
+            let bytes = fs::read(&path).map_err(unavailable)?;
+            let run = decode_agent_run(&bytes, &path)?;
+            let metadata = directory_entry.metadata().map_err(unavailable)?;
+            let updated_at_unix_ms = metadata
+                .modified()
+                .ok()
+                .and_then(system_time_unix_ms)
+                .unwrap_or_default();
+            let created_at_unix_ms = metadata
+                .created()
+                .ok()
+                .and_then(system_time_unix_ms)
+                .unwrap_or(updated_at_unix_ms);
+            entries.push(AgentRunCatalogEntry {
+                run_id: run.registration.run_id().clone(),
+                session_id: run.registration.request.run.spec.session_id.clone(),
+                created_at_unix_ms,
+                updated_at_unix_ms,
+            });
+        }
+        entries.sort_by(|left, right| left.run_id.cmp(&right.run_id));
+        Ok(entries)
     }
 
     fn write_sync(&self, run: &StoredAgentRun) -> Result<(), AgentJournalStoreError> {
@@ -112,7 +154,11 @@ impl FileAgentJournalStore {
             Digest::sha256(run.registration.run_id().as_str()).as_str(),
             uuid::Uuid::new_v4()
         ));
-        let bytes = serde_json::to_vec(run).map_err(|error| {
+        let bytes = serde_json::to_vec(&PersistedAgentRun {
+            schema_version: AGENT_RUN_FILE_SCHEMA_VERSION,
+            run: run.clone(),
+        })
+        .map_err(|error| {
             AgentJournalStoreError::InvalidData(format!("could not encode Agent journal: {error}"))
         })?;
         let write_result = (|| {
@@ -447,6 +493,178 @@ impl AgentJournalStore for FileAgentJournalStore {
         })
         .await
     }
+
+    async fn catalog_runs(&self) -> Result<Vec<AgentRunCatalogEntry>, AgentJournalStoreError> {
+        self.blocking(|store| store.catalog_runs_sync()).await
+    }
+}
+
+fn decode_agent_run(bytes: &[u8], path: &Path) -> Result<StoredAgentRun, AgentJournalStoreError> {
+    let value = serde_json::from_slice::<Value>(bytes)
+        .map_err(|error| invalid_journal(path, format!("could not decode JSON: {error}")))?;
+    if value.get("schema_version").is_some() {
+        let persisted = serde_json::from_value::<PersistedAgentRun>(value).map_err(|error| {
+            invalid_journal(
+                path,
+                format!("could not decode versioned Agent Run: {error}"),
+            )
+        })?;
+        if persisted.schema_version != AGENT_RUN_FILE_SCHEMA_VERSION {
+            return Err(invalid_journal(
+                path,
+                format!(
+                    "unsupported Agent Run file schema version {}",
+                    persisted.schema_version
+                ),
+            ));
+        }
+        persisted
+            .run
+            .validate_shape()
+            .map_err(|error| invalid_journal(path, error))?;
+        return Ok(persisted.run);
+    }
+
+    decode_legacy_agent_run(value, path)
+}
+
+/// Decodes the unversioned file format used before the filesystem journal
+/// gained an explicit schema envelope. The only accepted semantic migration
+/// is the addition of an absent `session_approval_scope` field. Both legacy
+/// digests are verified against the original JSON before the record is
+/// resealed in memory under the current schema.
+fn decode_legacy_agent_run(
+    value: Value,
+    path: &Path,
+) -> Result<StoredAgentRun, AgentJournalStoreError> {
+    let raw_records = value
+        .get("records")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| invalid_journal(path, "legacy Agent Run has no records array"))?;
+    let mut run = serde_json::from_value::<StoredAgentRun>(value).map_err(|error| {
+        invalid_journal(path, format!("could not decode legacy Agent Run: {error}"))
+    })?;
+    if raw_records.len() != run.records.len() {
+        return Err(invalid_journal(
+            path,
+            "legacy Agent Run record count changed during decoding",
+        ));
+    }
+
+    for (raw, record) in raw_records.iter().zip(&mut run.records) {
+        if record.validate_integrity().is_ok() {
+            continue;
+        }
+        if !is_legacy_approval_without_session_scope(raw, record) {
+            return Err(invalid_journal(
+                path,
+                format!(
+                    "record {} does not match a supported legacy schema",
+                    record.event.run_seq
+                ),
+            ));
+        }
+        verify_legacy_record_digests(raw, record, path)?;
+        record.event.event_digest = record
+            .event
+            .computed_digest()
+            .map_err(|error| invalid_journal(path, error))?;
+        record.draft_digest = record
+            .event
+            .computed_draft_digest()
+            .map_err(|error| invalid_journal(path, error))?;
+        record
+            .validate_integrity()
+            .map_err(|error| invalid_journal(path, error))?;
+    }
+    run.validate_shape()
+        .map_err(|error| invalid_journal(path, error))?;
+    Ok(run)
+}
+
+fn is_legacy_approval_without_session_scope(raw: &Value, record: &AgentJournalRecord) -> bool {
+    let AgentEvent::RequestOpened { request } = &record.event.payload else {
+        return false;
+    };
+    let PendingRequestPayload::Approval {
+        session_approval_scope,
+        ..
+    } = &request.payload
+    else {
+        return false;
+    };
+    if session_approval_scope.is_some() {
+        return false;
+    }
+    let Some(payload) = raw
+        .pointer("/event/payload/request/payload")
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    payload.get("type").and_then(Value::as_str) == Some("approval")
+        && !payload.contains_key("session_approval_scope")
+}
+
+fn verify_legacy_record_digests(
+    raw: &Value,
+    record: &AgentJournalRecord,
+    path: &Path,
+) -> Result<(), AgentJournalStoreError> {
+    let mut event_view = raw
+        .get("event")
+        .cloned()
+        .ok_or_else(|| invalid_journal(path, "legacy record has no event"))?;
+    let event_fields = event_view
+        .as_object_mut()
+        .ok_or_else(|| invalid_journal(path, "legacy event is not an object"))?;
+    event_fields
+        .remove("event_digest")
+        .ok_or_else(|| invalid_journal(path, "legacy event has no event_digest"))?;
+    if digest_json(&event_view, path)? != record.event.event_digest {
+        return Err(invalid_journal(
+            path,
+            format!(
+                "legacy event digest mismatch at run_seq {}",
+                record.event.run_seq
+            ),
+        ));
+    }
+
+    event_view
+        .as_object_mut()
+        .expect("event object was checked above")
+        .remove("run_seq")
+        .ok_or_else(|| invalid_journal(path, "legacy event has no run_seq"))?;
+    if digest_json(&event_view, path)? != record.draft_digest {
+        return Err(invalid_journal(
+            path,
+            format!(
+                "legacy draft digest mismatch at run_seq {}",
+                record.event.run_seq
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn digest_json(value: &Value, path: &Path) -> Result<Digest, AgentJournalStoreError> {
+    let bytes = serde_jcs::to_vec(value)
+        .map_err(|error| invalid_journal(path, format!("could not canonicalize JSON: {error}")))?;
+    Ok(Digest::sha256(bytes))
+}
+
+fn invalid_journal(path: &Path, message: impl std::fmt::Display) -> AgentJournalStoreError {
+    AgentJournalStoreError::InvalidData(format!("{}: {message}", path.display()))
+}
+
+fn system_time_unix_ms(value: std::time::SystemTime) -> Option<i64> {
+    let milliseconds = value
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    i64::try_from(milliseconds).ok()
 }
 
 #[async_trait]

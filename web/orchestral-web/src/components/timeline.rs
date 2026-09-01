@@ -2,6 +2,7 @@ use dioxus::prelude::*;
 use serde_json::Value;
 
 use crate::browser::{controller::AppController, platform};
+use crate::markdown;
 use crate::state::{
     timeline_blocks_for_run, CommandActivity, TimelineBlock, TimelineItem, ToolActivity,
 };
@@ -23,6 +24,13 @@ pub fn ConversationTimeline() -> Element {
     let empty = runs
         .iter()
         .all(|run| timeline_blocks_for_run(run).is_empty());
+    let history_pagination = state.selected_session().and_then(|session| {
+        let run_id = session.history_run_id()?;
+        let run = state.runs.get(&run_id)?;
+        run.history_next_cursor
+            .as_ref()
+            .map(|_| (run.history_loading_earlier, state.connection.online))
+    });
     drop(state);
 
     rsx! {
@@ -31,6 +39,20 @@ pub fn ConversationTimeline() -> Element {
             role: "log",
             aria_label: "对话内容",
             aria_live: "polite",
+            if let Some((loading, online)) = history_pagination {
+                div { class: "history-pagination",
+                    button {
+                        class: "history-pagination__button",
+                        r#type: "button",
+                        disabled: loading || !online,
+                        aria_label: "加载更早的会话记录",
+                        onclick: move |_| {
+                            spawn(async move { controller.load_earlier_agent_history().await });
+                        },
+                        if loading { "正在加载更早记录…" } else { "加载更早记录" }
+                    }
+                }
+            }
             if empty {
                 div { class: "empty-state",
                     div { class: "empty-state__mark", aria_hidden: "true", "✦" }
@@ -202,10 +224,15 @@ fn MessageView(
         if streaming { " is-streaming" } else { "" }
     );
     let copy = text.clone();
+    let rendered = (role == "assistant").then(|| markdown::render(&text));
     rsx! {
         article { class, "data-message-id": id,
             span { class: "message__role", if role == "user" { "你" } else { "Orchestral" } }
-            div { class: "message__content", "{text}" }
+            if let Some(rendered) = rendered {
+                div { class: "message__content", dangerous_inner_html: rendered }
+            } else {
+                div { class: "message__content", "{text}" }
+            }
             if role == "assistant" && !text.is_empty() {
                 button {
                     class: "message__copy",

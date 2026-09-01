@@ -116,6 +116,9 @@ pub(crate) enum ApprovalChoice {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UiEffect {
+    ManageSkills {
+        arguments: String,
+    },
     StartRun {
         input: String,
     },
@@ -626,6 +629,18 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
 }
 
 fn submit(state: &mut UiState) -> Vec<UiEffect> {
+    let command = state.composer.trim();
+    if command == "/skills" || command.starts_with("/skills ") {
+        let arguments = command
+            .strip_prefix("/skills")
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        let input = state.take_composer().expect("non-empty command checked");
+        state.transcript.push(TranscriptEntry::user(input));
+        state.scroll_back = 0;
+        return vec![UiEffect::ManageSkills { arguments }];
+    }
     if state.phase.accepts_new_run() {
         let Some(input) = state.take_composer() else {
             return Vec::new();
@@ -868,6 +883,34 @@ mod tests {
             },
         );
         assert_eq!(state.phase, UiPhase::Failed);
+    }
+
+    #[test]
+    fn skills_slash_command_never_becomes_model_input() {
+        let mut state = UiState::new("session-a", "model-a");
+
+        assert_eq!(
+            type_and_submit(&mut state, "/skills disable xlsx"),
+            vec![UiEffect::ManageSkills {
+                arguments: "disable xlsx".to_owned()
+            }]
+        );
+        assert_eq!(state.phase, UiPhase::Idle);
+        assert_eq!(state.transcript.len(), 1);
+
+        update(
+            &mut state,
+            UiMsg::RunStarted {
+                run_id: "run-a".to_owned(),
+            },
+        );
+        assert_eq!(
+            type_and_submit(&mut state, "/skills list"),
+            vec![UiEffect::ManageSkills {
+                arguments: "list".to_owned()
+            }]
+        );
+        assert_eq!(state.phase, UiPhase::Running);
     }
 
     #[test]

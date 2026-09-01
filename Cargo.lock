@@ -3057,6 +3057,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "orchestral-agent-acp"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "orchestral-core",
+ "orchestral-runtime",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "orchestral-agent-codex"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "orchestral-core",
+ "orchestral-runtime",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-tungstenite",
+]
+
+[[package]]
 name = "orchestral-agent-journal-fs"
 version = "0.2.0"
 dependencies = [
@@ -3064,6 +3093,8 @@ dependencies = [
  "orchestral-agent-protocol-testkit",
  "orchestral-core",
  "orchestral-runtime",
+ "serde",
+ "serde_jcs",
  "serde_json",
  "tokio",
  "uuid",
@@ -3113,6 +3144,8 @@ dependencies = [
  "http-body-util",
  "include_dir",
  "insta",
+ "jsonwebtoken",
+ "orchestral-agent-codex",
  "orchestral-agent-journal-fs",
  "orchestral-agent-protocol-testkit",
  "orchestral-blob-fs",
@@ -3124,6 +3157,7 @@ dependencies = [
  "portable-pty",
  "qrcode",
  "ratatui",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -3278,6 +3312,7 @@ dependencies = [
  "gloo-timers",
  "js-sys",
  "pretty_assertions",
+ "pulldown-cmark",
  "rexie",
  "serde",
  "serde-wasm-bindgen",
@@ -3504,6 +3539,24 @@ dependencies = [
  "idna",
  "psl-types",
 ]
+
+[[package]]
+name = "pulldown-cmark"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9f068eba8e7071c5f9511831b44f32c740d5adf574e990f946ddb53db2f314e"
+dependencies = [
+ "bitflags 2.13.1",
+ "memchr",
+ "pulldown-cmark-escape",
+ "unicase",
+]
+
+[[package]]
+name = "pulldown-cmark-escape"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "007d8adb5ddab6f8e3f491ac63566a7d5002cc7ed73901f72057943fa71ae1ae"
 
 [[package]]
 name = "qrcode"
@@ -4777,6 +4830,18 @@ dependencies = [
  "futures-core",
  "tokio",
  "tokio-stream",
+]
+
+[[package]]
+name = "tokio-tungstenite"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d25a406cddcc431a75d3d9afc6a7c0f7428d4891dd973e4d54c56b46127bf857"
+dependencies = [
+ "futures-util",
+ "log",
+ "tokio",
+ "tungstenite 0.28.0",
 ]
 
 [[package]]

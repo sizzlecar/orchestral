@@ -22,6 +22,7 @@ use tokio::time::MissedTickBehavior;
 
 use super::terminal::TerminalSession;
 use super::{render, update, ApprovalChoice, UiEffect, UiMsg, UiPhase, UiState};
+use crate::skill_command::SkillManager;
 
 const RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
 const ANIMATION_INTERVAL: Duration = Duration::from_millis(200);
@@ -32,6 +33,7 @@ pub(crate) async fn run_tui(
     approval_broker: Arc<InMemoryHostApprovalBroker>,
     process_supervisor: Arc<ProcessSupervisor>,
     model: String,
+    skill_manager: SkillManager,
 ) -> Result<()> {
     let mut terminal = TerminalSession::enter().context("enter TUI terminal mode")?;
     let mut input = EventStream::new();
@@ -70,6 +72,7 @@ pub(crate) async fn run_tui(
                         &agent_tx,
                         &mut active,
                         &mut state,
+                        &skill_manager,
                     ).await?;
                 }
                 needs_redraw = true;
@@ -261,9 +264,20 @@ async fn execute_effects(
     agent_tx: &mpsc::UnboundedSender<ForwardedAgentEvent>,
     active: &mut Option<ActiveRun>,
     state: &mut UiState,
+    skill_manager: &SkillManager,
 ) -> Result<bool> {
     for effect in effects {
         match effect {
+            UiEffect::ManageSkills { arguments } => {
+                let id = format!(
+                    "skill-command-{}",
+                    COMMAND_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+                );
+                match skill_manager.execute_tui(&arguments) {
+                    Ok(message) => notice(state, id, message, false),
+                    Err(error) => notice(state, id, error.to_string(), true),
+                }
+            }
             UiEffect::StartRun { input } => {
                 if active.is_some() {
                     notice(state, "start-active", "A Run is already active", true);
