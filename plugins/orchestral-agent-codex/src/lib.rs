@@ -251,14 +251,25 @@ impl AgentConnector for CodexConnector {
             return Err(AgentConnectorError::invalid("session id must not be empty"));
         }
         let client = self.client().await?;
-        let result = client
+        let result = match client
             .rpc
             .request(
                 "thread/read",
                 json!({"threadId": session_id.as_str(), "includeTurns": true}),
             )
             .await
-            .map_err(connector_transport_error)?;
+        {
+            Ok(result) => result,
+            Err(error) if unmaterialized_thread_read(&error) => client
+                .rpc
+                .request(
+                    "thread/read",
+                    json!({"threadId": session_id.as_str(), "includeTurns": false}),
+                )
+                .await
+                .map_err(connector_transport_error)?,
+            Err(error) => return Err(connector_transport_error(error)),
+        };
         let detail =
             normalize::session_detail(&self.describe().connector_id, &result, &self.limits)?;
         detail.validate_for(&self.describe().connector_id)?;
@@ -421,6 +432,19 @@ fn connector_transport_error(error: CodexTransportError) -> AgentConnectorError 
         | CodexTransportError::MissingResult => (AgentConnectorErrorCode::Protocol, false),
     };
     AgentConnectorError::new(code, error.to_string(), retryable)
+}
+
+/// Codex deliberately has no rollout to return between `thread/start` and the
+/// first user message. Metadata is still readable, so adapt that provider
+/// lifecycle state to an empty Orchestral session instead of surfacing it as a
+/// failed request. Keep the match narrow so unrelated protocol failures remain
+/// visible.
+fn unmaterialized_thread_read(error: &CodexTransportError) -> bool {
+    matches!(
+        error,
+        CodexTransportError::Rpc(message)
+            if message.contains("includeTurns is unavailable before first user message")
+    )
 }
 
 #[cfg(test)]
@@ -613,6 +637,76 @@ mod tests {
             .session
             .unwrap();
         assert_eq!(renamed.title.as_deref(), Some("Release review"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn newly_created_session_reads_as_empty_before_its_first_user_message() {
+        let (client_io, server_io) = duplex(128 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let connector = CodexConnector::with_client(rpc, "codex/0.149.1");
+        let server = tokio::spawn(async move {
+            let mut requests = BufReader::new(server_read).lines();
+
+            let start = read_request(&mut requests).await;
+            assert_eq!(start["method"], "thread/start");
+            write_result(
+                &mut server_write,
+                &start,
+                json!({"thread": thread("thread-new", Value::Null)}),
+            )
+            .await;
+
+            let read_with_turns = read_request(&mut requests).await;
+            assert_eq!(read_with_turns["method"], "thread/read");
+            assert_eq!(read_with_turns["params"]["includeTurns"], true);
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({
+                            "id": read_with_turns["id"],
+                            "error": {
+                                "code": -32602,
+                                "message": "thread thread-new is not materialized yet; includeTurns is unavailable before first user message"
+                            }
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let metadata_read = read_request(&mut requests).await;
+            assert_eq!(metadata_read["method"], "thread/read");
+            assert_eq!(metadata_read["params"]["includeTurns"], false);
+            write_result(
+                &mut server_write,
+                &metadata_read,
+                json!({"thread": thread("thread-new", Value::Null)}),
+            )
+            .await;
+        });
+
+        let created = connector
+            .create_session(CreateAgentSessionRequest {
+                cwd: None,
+                title: None,
+                extensions: BTreeMap::new(),
+            })
+            .await
+            .unwrap();
+        let detail = connector.read_session(&created.session_id).await.unwrap();
+
+        assert_eq!(detail.summary.session_id, created.session_id);
+        assert!(detail.turns.is_empty());
         server.await.unwrap();
     }
 
