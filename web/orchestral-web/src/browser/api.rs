@@ -45,6 +45,17 @@ pub enum ApiCredential {
     GatewaySession,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum AgentSessionObservation {
+    NotModified {
+        etag: Option<String>,
+    },
+    Modified {
+        detail: AgentSessionDetail,
+        etag: Option<String>,
+    },
+}
+
 impl ApiClient {
     pub async fn claim_pairing(
         &self,
@@ -109,15 +120,18 @@ impl ApiClient {
         &self,
         credential: &ApiCredential,
         connector_id: &str,
+        cursor: Option<&str>,
+        limit: u32,
     ) -> Result<AgentSessionPage, ApiError> {
-        self.get(
-            &format!(
-                "/agent-sessions?connector_id={}&limit=100",
-                encode(connector_id)
-            ),
-            credential,
-        )
-        .await
+        let mut path = format!(
+            "/agent-sessions?connector_id={}&limit={limit}",
+            encode(connector_id)
+        );
+        if let Some(cursor) = cursor {
+            path.push_str("&cursor=");
+            path.push_str(&encode(cursor));
+        }
+        self.get(&path, credential).await
     }
 
     pub async fn create_agent_session(
@@ -147,16 +161,45 @@ impl ApiClient {
         cursor: Option<&str>,
         limit: u32,
     ) -> Result<AgentSessionDetail, ApiError> {
-        let mut path = format!(
-            "/agent-session?connector_id={}&session_id={}&limit={limit}",
-            encode(connector_id),
-            encode(session_id)
-        );
-        if let Some(cursor) = cursor {
-            path.push_str("&cursor=");
-            path.push_str(&encode(cursor));
-        }
+        let path = agent_session_path(connector_id, session_id, cursor, limit);
         self.get(&path, credential).await
+    }
+
+    /// Fetches an Agent session snapshot that can be interrupted when the
+    /// selected session or connection mode changes.
+    pub async fn observe_agent_session(
+        &self,
+        credential: &ApiCredential,
+        connector_id: &str,
+        session_id: &str,
+        limit: u32,
+        signal: &web_sys::AbortSignal,
+        etag: Option<&str>,
+    ) -> Result<AgentSessionObservation, ApiError> {
+        let path = agent_session_path(connector_id, session_id, None, limit);
+        let mut request = Request::get(&format!("{API_BASE}{path}")).abort_signal(Some(signal));
+        if let Some(etag) = etag {
+            request = request.header("If-None-Match", etag);
+        }
+        let response = self
+            .authenticated(request, credential)
+            .send()
+            .await
+            .map_err(ApiError::transport)?;
+        let response_etag = response.headers().get("ETag");
+        if response.status() == 304 {
+            return Ok(AgentSessionObservation::NotModified {
+                etag: response_etag.or_else(|| etag.map(str::to_owned)),
+            });
+        }
+        if !response.ok() {
+            return Err(error_response(response).await);
+        }
+        let detail = response.json().await.map_err(ApiError::transport)?;
+        Ok(AgentSessionObservation::Modified {
+            detail,
+            etag: response_etag,
+        })
     }
 
     pub async fn invoke_agent_session_action(
@@ -406,8 +449,18 @@ impl ApiClient {
         path: &str,
         credential: &ApiCredential,
     ) -> Result<T, ApiError> {
+        self.get_with_abort(path, credential, None).await
+    }
+
+    async fn get_with_abort<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        credential: &ApiCredential,
+        signal: Option<&web_sys::AbortSignal>,
+    ) -> Result<T, ApiError> {
+        let request = Request::get(&format!("{API_BASE}{path}")).abort_signal(signal);
         let response = self
-            .authenticated(Request::get(&format!("{API_BASE}{path}")), credential)
+            .authenticated(request, credential)
             .send()
             .await
             .map_err(ApiError::transport)?;
@@ -499,6 +552,24 @@ fn encode(value: &str) -> String {
     js_sys::encode_uri_component(value)
         .as_string()
         .unwrap_or_default()
+}
+
+fn agent_session_path(
+    connector_id: &str,
+    session_id: &str,
+    cursor: Option<&str>,
+    limit: u32,
+) -> String {
+    let mut path = format!(
+        "/agent-session?connector_id={}&session_id={}&limit={limit}",
+        encode(connector_id),
+        encode(session_id)
+    );
+    if let Some(cursor) = cursor {
+        path.push_str("&cursor=");
+        path.push_str(&encode(cursor));
+    }
+    path
 }
 
 fn with_connector(path: &str, connector_id: Option<&str>) -> String {

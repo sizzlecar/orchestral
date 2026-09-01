@@ -1,16 +1,75 @@
+use std::collections::BTreeMap;
+
 use dioxus::prelude::{spawn, ReadableExt, Signal, WritableExt};
 use gloo_timers::future::TimeoutFuture;
 use serde_json::{json, Value};
 use wasm_bindgen::{closure::Closure, JsValue};
 
-use crate::browser::api::{ApiClient, ApiCredential, ApiError};
+use crate::browser::api::{AgentSessionObservation, ApiClient, ApiCredential, ApiError};
 use crate::browser::{platform, storage};
 use crate::model::{AgentConnectorView, AgentSessionActionStatusView, SessionView, StreamEvent};
 use crate::state::{
-    is_terminal, AppState, AuthStatus, ConnectorsState, LoadStatus, Notice, SessionsState,
+    is_terminal, AgentSessionListState, AppState, AuthStatus, ConnectorsState, LoadStatus, Notice,
+    SessionsState,
 };
 
 const AGENT_HISTORY_PAGE_LIMIT: u32 = 100;
+const AGENT_SESSION_LIST_PAGE_LIMIT: u32 = 25;
+const AGENT_OBSERVER_ACTIVE_INTERVAL_MS: u32 = 1_500;
+const AGENT_OBSERVER_IDLE_INTERVAL_MS: u32 = 12_000;
+const AGENT_OBSERVER_MAX_BACKOFF_MS: u32 = 30_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentSessionObservationTarget {
+    session_key: String,
+    connector_id: String,
+    session_id: String,
+}
+
+fn selected_agent_observation_target(state: &AppState) -> Option<AgentSessionObservationTarget> {
+    if !state.connection.online || orchestral_run_blocks_agent_observation(state) {
+        return None;
+    }
+    let session = state.selected_session()?;
+    Some(AgentSessionObservationTarget {
+        session_key: session.key(),
+        connector_id: session.connector_id.clone()?,
+        session_id: session.id.clone(),
+    })
+}
+
+fn orchestral_run_blocks_agent_observation(state: &AppState) -> bool {
+    state.selected_session().is_some_and(|session| {
+        session
+            .run_ids
+            .iter()
+            .filter(|run_id| !run_id.starts_with("agent-history:"))
+            .filter_map(|run_id| state.runs.get(run_id))
+            .any(|run| {
+                matches!(
+                    run.status.as_str(),
+                    "loading" | "submitting" | "accepted" | "running" | "waiting" | "stopping"
+                )
+            })
+    })
+}
+
+fn agent_observation_is_current(state: &AppState, target: &AgentSessionObservationTarget) -> bool {
+    selected_agent_observation_target(state).as_ref() == Some(target)
+}
+
+fn agent_observation_interval_ms(session_state: &str) -> u32 {
+    match session_state {
+        "active" | "running" | "waiting" | "waiting_input" | "waiting_approval"
+        | "busy_elsewhere" => AGENT_OBSERVER_ACTIVE_INTERVAL_MS,
+        _ => AGENT_OBSERVER_IDLE_INTERVAL_MS,
+    }
+}
+
+fn agent_observation_backoff_ms(consecutive_errors: u32) -> u32 {
+    let exponent = consecutive_errors.saturating_sub(1).min(5);
+    (1_000_u32.saturating_mul(2_u32.saturating_pow(exponent))).min(AGENT_OBSERVER_MAX_BACKOFF_MS)
+}
 
 #[derive(Clone, Copy)]
 pub struct AppController {
@@ -205,6 +264,13 @@ impl AppController {
         let Some(token) = self.token.read().clone() else {
             return;
         };
+        let (cached_sessions, previous_selected_id) = {
+            let state = self.state.read();
+            (
+                state.sessions.items.clone(),
+                state.sessions.selected_id.clone(),
+            )
+        };
         self.state.write().sessions.status = LoadStatus::Loading;
         match self.api.sessions(&token).await {
             Ok(mut sessions) => {
@@ -230,45 +296,101 @@ impl AppController {
                         Vec::new()
                     }
                 };
+                let mut connector_pages = BTreeMap::new();
                 for connector in connectors {
                     if connector.capabilities.list {
-                        if let Ok(page) = self
+                        match self
                             .api
-                            .agent_sessions(&token, &connector.connector_id)
+                            .agent_sessions(
+                                &token,
+                                &connector.connector_id,
+                                None,
+                                AGENT_SESSION_LIST_PAGE_LIMIT,
+                            )
                             .await
                         {
-                            sessions.extend(
-                                page.sessions
-                                    .into_iter()
-                                    .map(|session| session.into_session()),
-                            );
+                            Ok(page) => {
+                                let next_cursor = page.next_cursor;
+                                sessions.extend(
+                                    page.sessions
+                                        .into_iter()
+                                        .map(|session| session.into_session()),
+                                );
+                                connector_pages.insert(
+                                    connector.connector_id,
+                                    AgentSessionListState {
+                                        next_cursor,
+                                        loading_more: false,
+                                        error: None,
+                                    },
+                                );
+                            }
+                            Err(error) if error.status == 401 => {
+                                self.clear_auth(Some(error.message)).await;
+                                return;
+                            }
+                            Err(error) => {
+                                sessions.extend(
+                                    cached_sessions
+                                        .iter()
+                                        .filter(|session| {
+                                            session.connector_id.as_deref()
+                                                == Some(connector.connector_id.as_str())
+                                        })
+                                        .cloned(),
+                                );
+                                connector_pages.insert(
+                                    connector.connector_id,
+                                    AgentSessionListState {
+                                        next_cursor: None,
+                                        loading_more: false,
+                                        error: Some(error.message),
+                                    },
+                                );
+                            }
                         }
                     }
                 }
-                sessions = merge_sessions(&self.state.read().sessions.items, sessions);
-                sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at_unix_ms));
-                let selected_id = {
+                let (latest_sessions, current_selected_id) = {
                     let state = self.state.read();
-                    state
-                        .sessions
-                        .selected_id
-                        .clone()
-                        .filter(|selected| sessions.iter().any(|item| &item.key() == selected))
-                        .or_else(|| sessions.first().map(SessionView::key))
+                    (
+                        state.sessions.items.clone(),
+                        state.sessions.selected_id.clone(),
+                    )
                 };
+                let selection_changed_during_refresh = current_selected_id != previous_selected_id;
+                sessions = merge_sessions(&latest_sessions, sessions);
+                if let Some(selected) = current_selected_id.as_deref().and_then(|selected_id| {
+                    latest_sessions
+                        .iter()
+                        .find(|session| session.key() == selected_id)
+                }) {
+                    let selected_key = selected.key();
+                    if !sessions.iter().any(|session| session.key() == selected_key)
+                        && selected_session_may_be_on_later_page(selected, &connector_pages)
+                    {
+                        sessions.push(selected.clone());
+                    }
+                }
+                sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at_unix_ms));
+                let selected_id = retained_selection(current_selected_id.as_deref(), &sessions);
                 {
                     let mut state = self.state.write();
                     state.sessions = SessionsState {
                         status: LoadStatus::Ready,
                         items: sessions,
                         selected_id: selected_id.clone(),
+                        connector_pages,
                         error: None,
                     };
                 }
-                if load_selection {
-                    if let Some(selected_id) = selected_id {
+                if load_selection && !selection_changed_during_refresh {
+                    if let Some(selected_id) = selected_id.clone() {
                         self.load_session(selected_id).await;
                     }
+                }
+                if selected_id.is_none() && current_selected_id.is_some() {
+                    self.stop_stream_and_set_idle();
                 }
             }
             Err(error) if error.status == 401 => self.clear_auth(Some(error.message)).await,
@@ -283,6 +405,88 @@ impl AppController {
                     "offline"
                 }
                 .to_owned();
+            }
+        }
+    }
+
+    pub async fn load_more_agent_sessions(mut self, connector_id: String) {
+        if !platform::is_online() {
+            self.notice("当前离线，恢复连接后再加载会话", "warning");
+            return;
+        }
+        let Some(token) = self.token.read().clone() else {
+            return;
+        };
+        let Some(cursor) = ({
+            let state = self.state.read();
+            state
+                .sessions
+                .connector_pages
+                .get(&connector_id)
+                .and_then(|page| {
+                    if page.loading_more || (page.next_cursor.is_none() && page.error.is_none()) {
+                        None
+                    } else {
+                        Some(page.next_cursor.clone())
+                    }
+                })
+        }) else {
+            return;
+        };
+        {
+            let mut state = self.state.write();
+            let Some(page) = state.sessions.connector_pages.get_mut(&connector_id) else {
+                return;
+            };
+            page.loading_more = true;
+            page.error = None;
+        }
+
+        match self
+            .api
+            .agent_sessions(
+                &token,
+                &connector_id,
+                cursor.as_deref(),
+                AGENT_SESSION_LIST_PAGE_LIMIT,
+            )
+            .await
+        {
+            Ok(page) => {
+                let next_cursor = advancing_cursor(cursor.as_deref(), page.next_cursor);
+                let incoming = page
+                    .sessions
+                    .into_iter()
+                    .map(|session| session.into_session())
+                    .collect();
+                let mut state = self.state.write();
+                let response_is_current = state
+                    .sessions
+                    .connector_pages
+                    .get(&connector_id)
+                    .is_some_and(|page| page_request_is_current(page, cursor.as_deref()));
+                if !response_is_current {
+                    return;
+                }
+                merge_session_page(&mut state.sessions.items, incoming);
+                if let Some(page) = state.sessions.connector_pages.get_mut(&connector_id) {
+                    page.next_cursor = next_cursor;
+                    page.loading_more = false;
+                    page.error = None;
+                }
+            }
+            Err(error) if error.status == 401 => self.clear_auth(Some(error.message)).await,
+            Err(error) => {
+                {
+                    let mut state = self.state.write();
+                    if let Some(page) = state.sessions.connector_pages.get_mut(&connector_id) {
+                        if page_request_is_current(page, cursor.as_deref()) {
+                            page.loading_more = false;
+                            page.error = Some(error.message.clone());
+                        }
+                    }
+                }
+                self.notice(&error.message, "error");
             }
         }
     }
@@ -303,15 +507,16 @@ impl AppController {
         };
         {
             let mut state = self.state.write();
-            state.sessions.selected_id = Some(session_key);
+            state.sessions.selected_id = Some(session_key.clone());
             state.ui.drawer_open = false;
             state.ui.session_actions_open = false;
         }
+        let mut initial_observer_errors = 0;
         if let Some(connector_id) = session.connector_id.as_deref() {
             let Some(token) = self.token.read().clone() else {
                 return;
             };
-            match self
+            let result = self
                 .api
                 .agent_session(
                     &token,
@@ -320,36 +525,65 @@ impl AppController {
                     None,
                     AGENT_HISTORY_PAGE_LIMIT,
                 )
-                .await
-            {
-                Ok(detail) => self.state.write().project_agent_session(detail),
+                .await;
+            if self.state.read().sessions.selected_id.as_deref() != Some(session_key.as_str()) {
+                if let Err(error) = result {
+                    if error.status == 401 {
+                        self.clear_auth(Some(error.message)).await;
+                    }
+                }
+                return;
+            }
+            match result {
+                Ok(detail) => {
+                    self.state.write().project_agent_session(detail);
+                }
                 Err(error) if error.status == 401 => {
                     self.clear_auth(Some(error.message)).await;
                     return;
                 }
-                Err(error) => self.notice(&error.message, "error"),
+                Err(error) if error.status == 404 => {
+                    let removed_selected = {
+                        let selected_key = session.key();
+                        let mut state = self.state.write();
+                        state
+                            .sessions
+                            .items
+                            .retain(|item| item.key() != selected_key);
+                        let was_selected =
+                            state.sessions.selected_id.as_deref() == Some(selected_key.as_str());
+                        if was_selected {
+                            state.sessions.selected_id = None;
+                        }
+                        was_selected
+                    };
+                    if removed_selected {
+                        self.stop_stream_and_set_idle();
+                        self.notice("会话已不存在，已从列表移除", "warning");
+                    }
+                    return;
+                }
+                Err(error) => {
+                    initial_observer_errors = 1;
+                    self.state.write().connection.error = Some(error.message.clone());
+                    self.notice(&error.message, "error");
+                }
             }
         }
-        for run_id in session.run_ids {
+        for run_id in &session.run_ids {
+            if self.state.read().sessions.selected_id.as_deref() != Some(session_key.as_str()) {
+                return;
+            }
             if run_id.starts_with("agent-history:") {
                 continue;
             }
-            self.load_run_snapshot(&run_id, &session.id, session.connector_id.as_deref())
+            self.load_run_snapshot(run_id, &session.id, session.connector_id.as_deref())
                 .await;
         }
-        let active = self.state.read().active_run().map(|run| run.id.clone());
-        if let Some(run_id) = active {
-            self.start_stream(run_id);
-        } else {
-            let mut state = self.state.write();
-            state.connection.stream = if platform::is_online() {
-                "idle"
-            } else {
-                "offline"
-            }
-            .to_owned();
-            state.connection.attempt = 0;
+        if self.state.read().sessions.selected_id.as_deref() != Some(session_key.as_str()) {
+            return;
         }
+        self.resume_live_transport_for_selection(initial_observer_errors);
     }
 
     pub async fn load_earlier_agent_history(mut self) {
@@ -383,6 +617,7 @@ impl AppController {
 
         if let Some(run) = self.state.write().runs.get_mut(&run_id) {
             run.history_loading_earlier = true;
+            run.history_pagination_started = true;
         }
         match self
             .api
@@ -567,6 +802,7 @@ impl AppController {
         let Some(token) = self.token.read().clone() else {
             return;
         };
+        let operation_session_key = format!("{connector_id}\0{session_id}");
         let run_id = if run_action {
             match platform::new_uuid() {
                 Ok(run_id) => Some(run_id),
@@ -578,6 +814,12 @@ impl AppController {
         } else {
             None
         };
+        if run_action
+            && self.state.read().sessions.selected_id.as_deref()
+                == Some(operation_session_key.as_str())
+        {
+            self.stop_stream();
+        }
         self.set_busy(true);
         let result = self
             .api
@@ -596,11 +838,21 @@ impl AppController {
                 self.state.write().ui.session_actions_open = false;
                 if let Some(summary) = outcome.session {
                     let session = summary.into_session();
-                    self.upsert_session(session.clone(), true);
-                    self.load_session(session.key()).await;
+                    let still_selected = self.state.read().sessions.selected_id.as_deref()
+                        == Some(operation_session_key.as_str());
+                    self.upsert_session(session.clone(), still_selected);
+                    if still_selected {
+                        self.load_session(session.key()).await;
+                    }
                 }
                 match outcome.status {
                     AgentSessionActionStatusView::Completed => {
+                        if run_action
+                            && self.state.read().sessions.selected_id.as_deref()
+                                == Some(operation_session_key.as_str())
+                        {
+                            self.resume_live_transport_for_selection(0);
+                        }
                         self.notice("会话操作已完成", "success");
                     }
                     AgentSessionActionStatusView::Running { run_id } => {
@@ -621,7 +873,9 @@ impl AppController {
                                 session.run_ids.push(run_id.clone());
                             }
                             session.updated_at_unix_ms = platform::now() as i64;
-                            self.upsert_session(session, true);
+                            let still_selected = self.state.read().sessions.selected_id.as_deref()
+                                == Some(operation_session_key.as_str());
+                            self.upsert_session(session, still_selected);
                         }
                         {
                             let mut state = self.state.write();
@@ -633,21 +887,30 @@ impl AppController {
                             run.status = "accepted".to_owned();
                             run.started_at = Some(platform::now());
                         }
+                        let still_selected = self.state.read().sessions.selected_id.as_deref()
+                            == Some(operation_session_key.as_str());
+                        if still_selected {
+                            self.stop_stream();
+                        }
                         self.refresh_run(&run_id).await;
-                        if self
-                            .state
-                            .read()
-                            .runs
-                            .get(&run_id)
-                            .is_some_and(|run| !is_terminal(&run.status))
+                        if self.state.read().sessions.selected_id.as_deref()
+                            == Some(operation_session_key.as_str())
                         {
-                            self.start_stream(run_id);
+                            self.resume_live_transport_for_selection(0);
                         }
                         self.notice("会话操作已启动", "success");
                     }
                 }
             }
-            Err(error) => self.handle_api_error(error).await,
+            Err(error) => {
+                self.handle_api_error(error).await;
+                if run_action
+                    && self.state.read().sessions.selected_id.as_deref()
+                        == Some(operation_session_key.as_str())
+                {
+                    self.resume_live_transport_for_selection(0);
+                }
+            }
         }
     }
 
@@ -682,6 +945,7 @@ impl AppController {
                 }
             },
         };
+        let operation_session_key = session.key();
 
         let active_run_id = { self.state.read().active_run().map(|run| run.id.clone()) };
         if let Some(run_id) = active_run_id {
@@ -732,6 +996,7 @@ impl AppController {
                 session.connector_id.clone(),
             )
             .optimistic_start_input(input.clone(), now);
+        self.stop_stream();
         spawn(async move {
             TimeoutFuture::new(0).await;
             platform::scroll_timeline_to_end();
@@ -781,7 +1046,9 @@ impl AppController {
                 if !updated.run_ids.iter().any(|id| id == &actual_run_id) {
                     updated.run_ids.push(actual_run_id.clone());
                 }
-                self.upsert_session(updated, true);
+                let still_selected = self.state.read().sessions.selected_id.as_deref()
+                    == Some(operation_session_key.as_str());
+                self.upsert_session(updated, still_selected);
                 {
                     let mut state = self.state.write();
                     let run = state.ensure_run_source(
@@ -795,14 +1062,10 @@ impl AppController {
                     }
                 }
                 self.refresh_run(&actual_run_id).await;
-                if self
-                    .state
-                    .read()
-                    .runs
-                    .get(&actual_run_id)
-                    .is_some_and(|run| !is_terminal(&run.status))
+                if self.state.read().sessions.selected_id.as_deref()
+                    == Some(operation_session_key.as_str())
                 {
-                    self.start_stream(actual_run_id);
+                    self.resume_live_transport_for_selection(0);
                 }
             }
             Err(error) => {
@@ -810,6 +1073,11 @@ impl AppController {
                     run.reject_optimistic_start(error.message.clone(), platform::now());
                 }
                 self.handle_api_error(error).await;
+                if self.state.read().sessions.selected_id.as_deref()
+                    == Some(operation_session_key.as_str())
+                {
+                    self.resume_live_transport_for_selection(0);
+                }
             }
         }
         self.set_busy(false);
@@ -823,15 +1091,20 @@ impl AppController {
         let Some(token) = self.token.read().clone() else {
             return;
         };
-        let Some((run_id, connector_id)) = self
-            .state
-            .read()
-            .recoverable_run()
-            .map(|run| (run.id.clone(), run.connector_id.clone()))
-        else {
+        let Some((run_id, connector_id, operation_session_key)) = ({
+            let state = self.state.read();
+            state.recoverable_run().map(|run| {
+                (
+                    run.id.clone(),
+                    run.connector_id.clone(),
+                    state.sessions.selected_id.clone().unwrap_or_default(),
+                )
+            })
+        }) else {
             return;
         };
         self.set_busy(true);
+        self.stop_stream();
         match self
             .api
             .recover(&token, &run_id, connector_id.as_deref())
@@ -843,20 +1116,20 @@ impl AppController {
                     .ensure_run_source(&run_id, None, connector_id)
                     .apply_view(view, platform::now());
                 self.refresh_run(&run_id).await;
-                let status = self
-                    .state
-                    .read()
-                    .runs
-                    .get(&run_id)
-                    .map(|run| run.status.clone());
-                if status
-                    .as_deref()
-                    .is_some_and(|status| !is_terminal(status) && status != "unknown")
+                if self.state.read().sessions.selected_id.as_deref()
+                    == Some(operation_session_key.as_str())
                 {
-                    self.start_stream(run_id);
+                    self.resume_live_transport_for_selection(0);
                 }
             }
-            Err(error) => self.handle_api_error(error).await,
+            Err(error) => {
+                self.handle_api_error(error).await;
+                if self.state.read().sessions.selected_id.as_deref()
+                    == Some(operation_session_key.as_str())
+                {
+                    self.resume_live_transport_for_selection(0);
+                }
+            }
         }
         self.set_busy(false);
     }
@@ -982,6 +1255,190 @@ impl AppController {
         }
     }
 
+    fn resume_live_transport_for_selection(self, initial_observer_errors: u32) {
+        let active = self.state.read().active_run().map(|run| run.id.clone());
+        if let Some(run_id) = active {
+            self.start_stream(run_id);
+        } else if selected_agent_observation_target(&self.state.read()).is_some() {
+            self.start_selected_agent_observer(initial_observer_errors);
+        } else {
+            self.stop_stream_and_set_idle();
+        }
+    }
+
+    fn start_selected_agent_observer(self, initial_errors: u32) {
+        let selected = {
+            let state = self.state.read();
+            selected_agent_observation_target(&state).map(|target| {
+                let session_state = state
+                    .selected_session()
+                    .and_then(|session| session.state.clone())
+                    .unwrap_or_else(|| "idle".to_owned());
+                (target, session_state)
+            })
+        };
+        if let Some((target, session_state)) = selected {
+            self.start_agent_session_observer(target, session_state, initial_errors);
+        }
+    }
+
+    fn start_agent_session_observer(
+        mut self,
+        target: AgentSessionObservationTarget,
+        session_state: String,
+        initial_errors: u32,
+    ) {
+        self.stop_stream();
+        if !agent_observation_is_current(&self.state.read(), &target) {
+            return;
+        }
+        let Ok(controller) = web_sys::AbortController::new() else {
+            self.notice("浏览器无法启动 Agent 会话自动刷新", "error");
+            return;
+        };
+        self.stream_abort.set(Some(controller.clone()));
+        let generation = self.stream_generation.read().saturating_add(1);
+        self.stream_generation.set(generation);
+        {
+            let mut state = self.state.write();
+            state.connection.stream = if initial_errors == 0 {
+                "observing"
+            } else {
+                "reconnecting"
+            }
+            .to_owned();
+            state.connection.attempt = initial_errors;
+            if initial_errors == 0 {
+                state.connection.error = None;
+            }
+        }
+        spawn(async move {
+            self.follow_agent_session_observer(
+                target,
+                session_state,
+                controller,
+                generation,
+                initial_errors,
+            )
+            .await;
+        });
+    }
+
+    async fn follow_agent_session_observer(
+        mut self,
+        target: AgentSessionObservationTarget,
+        mut session_state: String,
+        controller: web_sys::AbortController,
+        generation: u64,
+        initial_errors: u32,
+    ) {
+        let mut consecutive_errors = initial_errors;
+        let mut etag = None;
+        loop {
+            if controller.signal().aborted()
+                || *self.stream_generation.read() != generation
+                || !agent_observation_is_current(&self.state.read(), &target)
+            {
+                return;
+            }
+            let delay = if consecutive_errors == 0 {
+                agent_observation_interval_ms(&session_state)
+            } else {
+                agent_observation_backoff_ms(consecutive_errors)
+            };
+            TimeoutFuture::new(delay).await;
+            if controller.signal().aborted()
+                || *self.stream_generation.read() != generation
+                || !agent_observation_is_current(&self.state.read(), &target)
+            {
+                return;
+            }
+            let Some(token) = self.token.read().clone() else {
+                return;
+            };
+            let result = self
+                .api
+                .observe_agent_session(
+                    &token,
+                    &target.connector_id,
+                    &target.session_id,
+                    AGENT_HISTORY_PAGE_LIMIT,
+                    &controller.signal(),
+                    etag.as_deref(),
+                )
+                .await;
+            if controller.signal().aborted() || *self.stream_generation.read() != generation {
+                return;
+            }
+
+            match result {
+                Ok(AgentSessionObservation::NotModified { etag: next_etag }) => {
+                    etag = next_etag;
+                    let mut state = self.state.write();
+                    if !agent_observation_is_current(&state, &target) {
+                        return;
+                    }
+                    state.connection.stream = "observing".to_owned();
+                    state.connection.attempt = 0;
+                    state.connection.error = None;
+                    state.connection.last_connected_at = Some(platform::now());
+                    consecutive_errors = 0;
+                }
+                Ok(AgentSessionObservation::Modified {
+                    detail,
+                    etag: next_etag,
+                }) => {
+                    etag = next_etag;
+                    let next_session_state = detail.summary.state.clone();
+                    let mut state = self.state.write();
+                    if !agent_observation_is_current(&state, &target) {
+                        return;
+                    }
+                    state.project_agent_session(detail);
+                    state.connection.stream = "observing".to_owned();
+                    state.connection.attempt = 0;
+                    state.connection.error = None;
+                    state.connection.last_connected_at = Some(platform::now());
+                    drop(state);
+                    session_state = next_session_state;
+                    consecutive_errors = 0;
+                }
+                Err(error) if error.status == 401 => {
+                    if agent_observation_is_current(&self.state.read(), &target) {
+                        self.clear_auth(Some(error.message)).await;
+                    }
+                    return;
+                }
+                Err(error) if error.status == 404 => {
+                    {
+                        let mut state = self.state.write();
+                        if !agent_observation_is_current(&state, &target) {
+                            return;
+                        }
+                        state
+                            .sessions
+                            .items
+                            .retain(|session| session.key() != target.session_key);
+                        state.sessions.selected_id = None;
+                    }
+                    self.stop_stream_and_set_idle();
+                    self.notice("会话已不存在，已从列表移除", "warning");
+                    return;
+                }
+                Err(error) => {
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    let mut state = self.state.write();
+                    if !agent_observation_is_current(&state, &target) {
+                        return;
+                    }
+                    state.connection.stream = "reconnecting".to_owned();
+                    state.connection.attempt = consecutive_errors;
+                    state.connection.error = Some(error.message);
+                }
+            }
+        }
+    }
+
     pub fn start_stream(mut self, run_id: String) {
         self.stop_stream();
         let Ok(controller) = web_sys::AbortController::new() else {
@@ -1000,6 +1457,21 @@ impl AppController {
         if let Some(controller) = self.stream_abort.take() {
             controller.abort();
         }
+        let generation = self.stream_generation.read().saturating_add(1);
+        self.stream_generation.set(generation);
+    }
+
+    fn stop_stream_and_set_idle(mut self) {
+        self.stop_stream();
+        let mut state = self.state.write();
+        state.connection.stream = if platform::is_online() {
+            "idle"
+        } else {
+            "offline"
+        }
+        .to_owned();
+        state.connection.attempt = 0;
+        state.connection.error = None;
     }
 
     async fn follow_stream(
@@ -1050,7 +1522,9 @@ impl AppController {
                     cursor,
                     connector_id.as_deref(),
                     &controller.signal(),
-                    move |event| event_controller.handle_stream_event(&event_run_id, event),
+                    move |event| {
+                        event_controller.handle_stream_event(&event_run_id, generation, event)
+                    },
                 )
                 .await;
             if controller.signal().aborted() || *self.stream_generation.read() != generation {
@@ -1063,9 +1537,7 @@ impl AppController {
                 .get(&run_id)
                 .is_some_and(|run| is_terminal(&run.status))
             {
-                let mut state = self.state.write();
-                state.connection.stream = "idle".to_owned();
-                state.connection.attempt = 0;
+                self.finish_terminal_stream(generation);
                 return;
             }
             if let Err(error) = result {
@@ -1083,17 +1555,25 @@ impl AppController {
         }
     }
 
-    fn handle_stream_event(mut self, run_id: &str, event: StreamEvent) {
+    fn handle_stream_event(mut self, run_id: &str, generation: u64, event: StreamEvent) {
+        if *self.stream_generation.read() != generation {
+            return;
+        }
         match event {
             StreamEvent::Durable { data, .. } => {
                 if let Ok(record) = serde_json::from_str::<Value>(&data) {
-                    let mut state = self.state.write();
-                    state.connection.stream = "live".to_owned();
-                    state.connection.attempt = 0;
-                    state.connection.last_connected_at = Some(platform::now());
-                    state
-                        .ensure_run(run_id, None)
-                        .project_durable(&record, platform::now());
+                    let terminal = {
+                        let mut state = self.state.write();
+                        state.connection.stream = "live".to_owned();
+                        state.connection.attempt = 0;
+                        state.connection.last_connected_at = Some(platform::now());
+                        let run = state.ensure_run(run_id, None);
+                        run.project_durable(&record, platform::now());
+                        is_terminal(&run.status)
+                    };
+                    if terminal {
+                        self.finish_terminal_stream(generation);
+                    }
                 }
             }
             StreamEvent::Telemetry { data } => {
@@ -1123,6 +1603,13 @@ impl AppController {
         }
     }
 
+    fn finish_terminal_stream(self, generation: u64) {
+        if *self.stream_generation.read() != generation {
+            return;
+        }
+        self.resume_live_transport_for_selection(0);
+    }
+
     pub fn window_listeners(self) -> Vec<Closure<dyn FnMut(web_sys::Event)>> {
         let mut listeners = Vec::new();
         if let Ok(listener) = platform::add_window_listener("online", move |_| {
@@ -1135,9 +1622,11 @@ impl AppController {
         }
         if let Ok(listener) = platform::add_window_listener("offline", move |_| {
             let mut controller = self;
+            controller.stop_stream();
             let mut state = controller.state.write();
             state.connection.online = false;
             state.connection.stream = "offline".to_owned();
+            state.connection.attempt = 0;
             state.connection.error = None;
         }) {
             listeners.push(listener);
@@ -1252,6 +1741,42 @@ fn merge_sessions(existing: &[SessionView], incoming: Vec<SessionView>) -> Vec<S
         .collect()
 }
 
+fn merge_session_page(existing: &mut Vec<SessionView>, incoming: Vec<SessionView>) {
+    for session in incoming {
+        let key = session.key();
+        let merged = merge_session(existing.iter().find(|item| item.key() == key), session);
+        existing.retain(|item| item.key() != key);
+        existing.push(merged);
+    }
+    existing.sort_by_key(|session| std::cmp::Reverse(session.updated_at_unix_ms));
+}
+
+fn retained_selection(selected_id: Option<&str>, sessions: &[SessionView]) -> Option<String> {
+    selected_id
+        .filter(|selected| sessions.iter().any(|session| session.key() == *selected))
+        .map(str::to_owned)
+}
+
+fn selected_session_may_be_on_later_page(
+    selected: &SessionView,
+    connector_pages: &BTreeMap<String, AgentSessionListState>,
+) -> bool {
+    let Some(connector_id) = selected.connector_id.as_deref() else {
+        return false;
+    };
+    connector_pages
+        .get(connector_id)
+        .is_some_and(|page| page.next_cursor.is_some() || page.error.is_some() || page.loading_more)
+}
+
+fn page_request_is_current(page: &AgentSessionListState, requested_cursor: Option<&str>) -> bool {
+    page.loading_more && page.next_cursor.as_deref() == requested_cursor
+}
+
+fn advancing_cursor(requested_cursor: Option<&str>, next_cursor: Option<String>) -> Option<String> {
+    next_cursor.filter(|next| requested_cursor != Some(next.as_str()))
+}
+
 fn check_ack(ack: &Value, operation: &str) -> Result<String, ApiError> {
     let state = ack
         .get("state")
@@ -1310,6 +1835,172 @@ fn value_as_id(value: &Value) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn native_session(id: &str, updated_at_unix_ms: i64) -> SessionView {
+        SessionView {
+            id: id.to_owned(),
+            created_at_unix_ms: updated_at_unix_ms,
+            updated_at_unix_ms,
+            run_ids: Vec::new(),
+            connector_id: None,
+            title: None,
+            preview: None,
+            cwd: None,
+            state: None,
+        }
+    }
+
+    fn selected_external_state() -> AppState {
+        let mut state = AppState::new(true);
+        state.sessions.items.push(SessionView {
+            id: "thread-1".to_owned(),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+            run_ids: vec!["agent-history:codex/local:thread-1".to_owned()],
+            connector_id: Some("codex/local".to_owned()),
+            title: None,
+            preview: None,
+            cwd: None,
+            state: Some("active".to_owned()),
+        });
+        state.sessions.selected_id = Some("codex/local\0thread-1".to_owned());
+        state
+            .ensure_run_source(
+                "agent-history:codex/local:thread-1",
+                Some("thread-1".to_owned()),
+                Some("codex/local".to_owned()),
+            )
+            .status = "delivered".to_owned();
+        state
+    }
+
+    #[test]
+    fn agent_observation_uses_fast_active_polling_and_capped_error_backoff() {
+        for status in [
+            "active",
+            "running",
+            "waiting",
+            "waiting_input",
+            "waiting_approval",
+            "busy_elsewhere",
+        ] {
+            assert_eq!(
+                agent_observation_interval_ms(status),
+                AGENT_OBSERVER_ACTIVE_INTERVAL_MS
+            );
+        }
+        for status in ["idle", "detached", "unavailable", "unknown"] {
+            assert_eq!(
+                agent_observation_interval_ms(status),
+                AGENT_OBSERVER_IDLE_INTERVAL_MS
+            );
+        }
+        assert_eq!(
+            (1..=7)
+                .map(agent_observation_backoff_ms)
+                .collect::<Vec<_>>(),
+            vec![1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000]
+        );
+    }
+
+    #[test]
+    fn agent_observation_guard_tracks_selection_connectivity_and_controlled_runs() {
+        let mut state = selected_external_state();
+        let target = selected_agent_observation_target(&state).unwrap();
+        assert!(agent_observation_is_current(&state, &target));
+
+        state.connection.online = false;
+        assert!(!agent_observation_is_current(&state, &target));
+        state.connection.online = true;
+
+        state.sessions.items[0]
+            .run_ids
+            .push("controlled-run".to_owned());
+        state
+            .ensure_run_source(
+                "controlled-run",
+                Some("thread-1".to_owned()),
+                Some("codex/local".to_owned()),
+            )
+            .status = "submitting".to_owned();
+        assert!(selected_agent_observation_target(&state).is_none());
+
+        state.runs.get_mut("controlled-run").unwrap().status = "delivered".to_owned();
+        assert_eq!(
+            selected_agent_observation_target(&state),
+            Some(target.clone())
+        );
+
+        state.sessions.selected_id = None;
+        assert!(!agent_observation_is_current(&state, &target));
+    }
+
+    #[test]
+    fn refresh_does_not_select_the_first_session_without_an_explicit_selection() {
+        let sessions = vec![native_session("newest", 20), native_session("older", 10)];
+
+        assert_eq!(retained_selection(None, &sessions), None);
+        assert_eq!(
+            retained_selection(Some("older"), &sessions).as_deref(),
+            Some("older")
+        );
+        assert_eq!(retained_selection(Some("deleted"), &sessions), None);
+    }
+
+    #[test]
+    fn selected_external_session_is_pinned_only_while_more_pages_may_contain_it() {
+        let selected = SessionView {
+            id: "older-thread".to_owned(),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+            run_ids: vec!["agent-history:codex/local:older-thread".to_owned()],
+            connector_id: Some("codex/local".to_owned()),
+            title: None,
+            preview: None,
+            cwd: None,
+            state: None,
+        };
+        let mut pages = BTreeMap::from([(
+            "codex/local".to_owned(),
+            AgentSessionListState {
+                next_cursor: Some("page-2".to_owned()),
+                loading_more: false,
+                error: None,
+            },
+        )]);
+
+        assert!(selected_session_may_be_on_later_page(&selected, &pages));
+
+        pages.get_mut("codex/local").unwrap().next_cursor = None;
+        assert!(!selected_session_may_be_on_later_page(&selected, &pages));
+
+        pages.get_mut("codex/local").unwrap().error = Some("offline".to_owned());
+        assert!(selected_session_may_be_on_later_page(&selected, &pages));
+        assert!(!selected_session_may_be_on_later_page(
+            &native_session("native", 1),
+            &pages
+        ));
+    }
+
+    #[test]
+    fn connector_pagination_rejects_stale_and_non_advancing_cursors() {
+        let page = AgentSessionListState {
+            next_cursor: Some("page-2".to_owned()),
+            loading_more: true,
+            error: None,
+        };
+
+        assert!(page_request_is_current(&page, Some("page-2")));
+        assert!(!page_request_is_current(&page, Some("stale-page")));
+        assert_eq!(
+            advancing_cursor(Some("page-2"), Some("page-3".to_owned())).as_deref(),
+            Some("page-3")
+        );
+        assert_eq!(
+            advancing_cursor(Some("page-2"), Some("page-2".to_owned())),
+            None
+        );
+    }
+
     #[test]
     fn refreshing_external_metadata_does_not_drop_controlled_runs() {
         let existing = SessionView {
@@ -1335,6 +2026,51 @@ mod tests {
         let merged = merge_sessions(&[existing], vec![incoming]).remove(0);
         assert_eq!(merged.title.as_deref(), Some("Renamed"));
         assert!(merged.run_ids.iter().any(|run| run == "controlled-run"));
+    }
+
+    #[test]
+    fn loading_another_connector_page_deduplicates_sessions_and_preserves_run_state() {
+        let existing_external = SessionView {
+            id: "thread-1".to_owned(),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 2,
+            run_ids: vec![
+                "agent-history:fixture/local:thread-1".to_owned(),
+                "controlled-run".to_owned(),
+            ],
+            connector_id: Some("fixture/local".to_owned()),
+            title: Some("Old title".to_owned()),
+            preview: None,
+            cwd: None,
+            state: Some("active".to_owned()),
+        };
+        let incoming_external = SessionView {
+            title: Some("New title".to_owned()),
+            updated_at_unix_ms: 30,
+            run_ids: vec!["agent-history:fixture/local:thread-1".to_owned()],
+            ..existing_external.clone()
+        };
+        let mut sessions = vec![native_session("native", 10), existing_external];
+
+        merge_session_page(
+            &mut sessions,
+            vec![incoming_external, native_session("native-2", 20)],
+        );
+
+        assert_eq!(sessions.len(), 3);
+        assert_eq!(sessions[0].id, "thread-1");
+        assert_eq!(sessions[0].title.as_deref(), Some("New title"));
+        assert!(sessions[0]
+            .run_ids
+            .iter()
+            .any(|run_id| run_id == "controlled-run"));
+        assert_eq!(
+            sessions
+                .iter()
+                .filter(|session| session.id == "thread-1")
+                .count(),
+            1
+        );
     }
 
     #[test]

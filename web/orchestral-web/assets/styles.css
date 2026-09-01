@@ -526,6 +526,25 @@ svg {
   font-variant-numeric: tabular-nums;
 }
 
+.thread-group__more {
+  width: calc(100% - 18px);
+  min-height: 36px;
+  margin: 5px 9px 0;
+  border: 1px dashed var(--line-strong);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 680;
+}
+
+.thread-group__error {
+  margin: 5px 9px 0;
+  color: var(--danger);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
 .section-label {
   display: flex;
   align-items: center;
@@ -666,6 +685,7 @@ svg {
 
 .connection-status[data-state="online"] .connection-status__dot,
 .connection-status[data-state="live"] .connection-status__dot,
+.connection-status[data-state="observing"] .connection-status__dot,
 .connection-status[data-state="idle"] .connection-status__dot,
 .connection-status.is-online .connection-status__dot {
   background: var(--success);

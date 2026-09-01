@@ -201,6 +201,31 @@ pub fn Workspace() -> Element {
                                             }
                                         }
                                     }
+                                    if group.has_more || group.load_error.is_some() {
+                                        if let Some(connector_id) = group.connector_id.clone() {
+                                            button {
+                                                class: "thread-group__more",
+                                                r#type: "button",
+                                                disabled: group.loading_more || !state.connection.online,
+                                                onclick: move |_| {
+                                                    let connector_id = connector_id.clone();
+                                                    spawn(async move {
+                                                        controller.load_more_agent_sessions(connector_id).await;
+                                                    });
+                                                },
+                                                if group.loading_more {
+                                                    "正在加载…"
+                                                } else if group.load_error.is_some() {
+                                                    "重试加载"
+                                                } else {
+                                                    "加载更多"
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if let Some(error) = group.load_error.as_ref() {
+                                        p { class: "thread-group__error", "{error}" }
+                                    }
                                 }
                             }
                         }
@@ -310,6 +335,7 @@ fn ConnectionStatus() -> Element {
         "connecting" => "正在连接".to_owned(),
         "reconnecting" => format!("正在重连 · {}", connection.attempt),
         "live" => "实时连接".to_owned(),
+        "observing" => "正在自动刷新 Agent".to_owned(),
         "idle" => "已连接".to_owned(),
         "error" => "连接中断".to_owned(),
         value => value.to_owned(),
@@ -424,11 +450,23 @@ fn Composer() -> Element {
 struct SessionGroup {
     key: String,
     label: String,
+    connector_id: Option<String>,
     sessions: Vec<SessionView>,
+    has_more: bool,
+    loading_more: bool,
+    load_error: Option<String>,
 }
 
 fn group_sessions(state: &AppState) -> Vec<SessionGroup> {
     let mut grouped = BTreeMap::<Option<String>, Vec<SessionView>>::new();
+    grouped.entry(None).or_default();
+    for connector in &state.connectors.items {
+        if connector.capabilities.list {
+            grouped
+                .entry(Some(connector.connector_id.clone()))
+                .or_default();
+        }
+    }
     for session in &state.sessions.items {
         grouped
             .entry(session.connector_id.clone())
@@ -445,17 +483,22 @@ fn group_sessions(state: &AppState) -> Vec<SessionGroup> {
                     .cmp(&left.updated_at_unix_ms)
                     .then_with(|| left.key().cmp(&right.key()))
             });
-            let (key, label) = match connector_id {
+            let (key, label, page) = match connector_id.as_deref() {
                 Some(connector_id) => (
-                    connector_id.clone(),
-                    connector_display_name(state, &connector_id),
+                    connector_id.to_owned(),
+                    connector_display_name(state, connector_id),
+                    state.sessions.connector_pages.get(connector_id),
                 ),
-                None => ("orchestral".to_owned(), "Orchestral".to_owned()),
+                None => ("orchestral".to_owned(), "Orchestral".to_owned(), None),
             };
             SessionGroup {
                 key,
                 label,
+                connector_id,
                 sessions,
+                has_more: page.is_some_and(|page| page.next_cursor.is_some()),
+                loading_more: page.is_some_and(|page| page.loading_more),
+                load_error: page.and_then(|page| page.error.clone()),
             }
         })
         .collect::<Vec<_>>();
@@ -563,6 +606,7 @@ fn run_label(run: Option<&RunState>, now: f64) -> (String, &'static str) {
 mod tests {
     use super::*;
     use crate::model::{AgentConnectorView, AgentSessionCapabilitiesView};
+    use crate::state::AgentSessionListState;
 
     fn session(id: &str, connector_id: Option<&str>, updated_at_unix_ms: i64) -> SessionView {
         SessionView {
@@ -606,6 +650,14 @@ mod tests {
             session("codex-new", Some("codex/local"), 40),
             session("native-new", None, 30),
         ];
+        state.sessions.connector_pages.insert(
+            "codex/local".to_owned(),
+            AgentSessionListState {
+                next_cursor: Some("next-codex-page".to_owned()),
+                loading_more: false,
+                error: None,
+            },
+        );
 
         let groups = group_sessions(&state);
 
@@ -633,5 +685,31 @@ mod tests {
             vec!["codex-new", "same-id"]
         );
         assert_ne!(groups[1].sessions[0].key(), groups[2].sessions[1].key());
+        assert!(groups[2].has_more);
+        assert_eq!(groups[2].connector_id.as_deref(), Some("codex/local"));
+        assert!(!groups[1].has_more);
+        assert!(groups[0].connector_id.is_none());
+    }
+
+    #[test]
+    fn empty_connector_group_keeps_its_initial_load_error_and_retry_state_visible() {
+        let mut state = AppState::new(true);
+        state.connectors.items = vec![connector("codex/local", "Codex")];
+        state.sessions.connector_pages.insert(
+            "codex/local".to_owned(),
+            AgentSessionListState {
+                next_cursor: None,
+                loading_more: false,
+                error: Some("Codex 暂时不可用".to_owned()),
+            },
+        );
+
+        let groups = group_sessions(&state);
+        let codex = groups.iter().find(|group| group.label == "Codex").unwrap();
+
+        assert!(codex.sessions.is_empty());
+        assert_eq!(codex.load_error.as_deref(), Some("Codex 暂时不可用"));
+        assert!(!codex.has_more);
+        assert_eq!(codex.connector_id.as_deref(), Some("codex/local"));
     }
 }

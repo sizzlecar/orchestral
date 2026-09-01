@@ -315,20 +315,52 @@ struct AgentSessionQuery {
 async fn get_agent_session(
     State(state): State<RemoteApiState>,
     Query(query): Query<AgentSessionQuery>,
-) -> Result<Json<AgentSessionDetail>, ApiError> {
-    Ok(Json(
-        state
-            .agent_directory
-            .read_session_page(
-                &AgentConnectorId::new(query.connector_id),
-                &AgentSessionId::new(query.session_id),
-                AgentSessionReadQuery {
-                    cursor: query.cursor,
-                    limit: query.limit.unwrap_or(100),
-                },
-            )
-            .await?,
-    ))
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let detail = state
+        .agent_directory
+        .read_session_page(
+            &AgentConnectorId::new(query.connector_id),
+            &AgentSessionId::new(query.session_id),
+            AgentSessionReadQuery {
+                cursor: query.cursor,
+                limit: query.limit.unwrap_or(100),
+            },
+        )
+        .await?;
+    let body = serde_json::to_vec(&detail)
+        .map_err(|error| ApiError::internal("agent_session_encode_failed", error.to_string()))?;
+    let etag = format!(
+        "\"{}\"",
+        orchestral_core::agent_protocol::wire::Digest::sha256(&body)
+    );
+    let mut response = if request_etag_matches(&headers, &etag) {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response()
+    };
+    response.headers_mut().insert(
+        header::ETAG,
+        header::HeaderValue::from_str(&etag).expect("SHA-256 ETag is a valid header value"),
+    );
+    Ok(response)
+}
+
+fn request_etag_matches(headers: &HeaderMap, etag: &str) -> bool {
+    headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|values| {
+            values
+                .split(',')
+                .map(str::trim)
+                .any(|candidate| candidate == "*" || candidate == etag)
+        })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1739,6 +1771,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let session_etag = response
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert!(body.len() < 512 * 1_024);
         let session: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -1752,6 +1791,27 @@ mod tests {
                 .unwrap()["activity_id"],
             "activity-59"
         );
+
+        let mut conditional = authorized(
+            "GET",
+            "/agent-session?connector_id=fixture%2Flocal&session_id=fixture-session&limit=100",
+            &token,
+            serde_json::Value::Null,
+        );
+        conditional.headers_mut().insert(
+            header::IF_NONE_MATCH,
+            header::HeaderValue::from_str(&session_etag).unwrap(),
+        );
+        let response = app.clone().oneshot(conditional).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(response.headers()[header::ETAG], session_etag);
+        assert!(response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty());
 
         let response = app
             .clone()

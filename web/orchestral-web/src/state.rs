@@ -38,6 +38,14 @@ pub struct SessionsState {
     pub status: LoadStatus,
     pub items: Vec<SessionView>,
     pub selected_id: Option<String>,
+    pub connector_pages: BTreeMap<String, AgentSessionListState>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AgentSessionListState {
+    pub next_cursor: Option<String>,
+    pub loading_more: bool,
     pub error: Option<String>,
 }
 
@@ -114,6 +122,8 @@ pub struct RunState {
     pub messages: Vec<Message>,
     pub streamed_outputs: BTreeMap<String, StreamedOutput>,
     pub committed_output_ids: BTreeSet<String>,
+    /// Durable output event ids already represented by a terminal snapshot.
+    pub terminal_supporting_event_ids: BTreeSet<String>,
     pub telemetry_ids: Vec<String>,
     pub presentation_cursor: u64,
     pub activities: Vec<ToolActivity>,
@@ -122,6 +132,9 @@ pub struct RunState {
     /// Opaque cursor for the next, older page of an external Agent transcript.
     pub history_next_cursor: Option<String>,
     pub history_loading_earlier: bool,
+    /// Once pagination starts, live-edge snapshots must not rewind the older
+    /// history cursor or unlock a request that is already in flight.
+    pub history_pagination_started: bool,
     pub progress: Option<Progress>,
     pub delivery: Option<Value>,
     pub partial_delivery: Option<Value>,
@@ -146,6 +159,7 @@ impl RunState {
             messages: Vec::new(),
             streamed_outputs: BTreeMap::new(),
             committed_output_ids: BTreeSet::new(),
+            terminal_supporting_event_ids: BTreeSet::new(),
             telemetry_ids: Vec::new(),
             presentation_cursor: 0,
             activities: Vec::new(),
@@ -153,6 +167,7 @@ impl RunState {
             pending: Vec::new(),
             history_next_cursor: None,
             history_loading_earlier: false,
+            history_pagination_started: false,
             progress: None,
             delivery: None,
             partial_delivery: None,
@@ -203,6 +218,23 @@ impl RunState {
             .filter(|value| !value.is_null())
             .cloned()
             .or_else(|| self.partial_delivery.clone());
+        match status.as_str() {
+            "delivered" => self.append_terminal_message(
+                self.delivery.clone(),
+                "delivery_id",
+                "delivery",
+                "final_response",
+                false,
+            ),
+            "incomplete" => self.append_terminal_message(
+                self.partial_delivery.clone(),
+                "partial_delivery_id",
+                "partial-delivery",
+                "response",
+                true,
+            ),
+            _ => {}
+        }
         if !is_terminal(&status) && status != "accepted" {
             self.started_at.get_or_insert(now);
         }
@@ -387,9 +419,8 @@ impl RunState {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 if !text.is_empty()
-                    && !self.messages.iter().any(|message| {
-                        message.role == "assistant" && message.text == text && !message.optimistic
-                    })
+                    && !self.messages.iter().any(|message| message.id == event_id)
+                    && !self.terminal_supporting_event_ids.contains(event_id)
                 {
                     let order = self
                         .streamed_outputs
@@ -438,8 +469,9 @@ impl RunState {
                 self.completed_at.get_or_insert(now);
                 self.pending.clear();
                 self.append_terminal_message(
-                    event_id,
                     self.delivery.clone(),
+                    "delivery_id",
+                    "delivery",
                     "final_response",
                     false,
                 );
@@ -450,8 +482,9 @@ impl RunState {
                 self.completed_at.get_or_insert(now);
                 self.pending.clear();
                 self.append_terminal_message(
-                    event_id,
                     self.partial_delivery.clone(),
+                    "partial_delivery_id",
+                    "partial-delivery",
                     "response",
                     true,
                 );
@@ -558,26 +591,48 @@ impl RunState {
 
     fn append_terminal_message(
         &mut self,
-        event_id: &str,
         envelope: Option<Value>,
+        identity_field: &str,
+        identity_prefix: &str,
         field: &str,
         partial: bool,
     ) {
+        let identity = envelope
+            .as_ref()
+            .and_then(|value| value.get(identity_field))
+            .and_then(value_id)
+            .unwrap_or_else(|| self.id.clone());
+        let message_id = format!("{identity_prefix}:{identity}");
+        let supporting_event_ids = envelope
+            .as_ref()
+            .and_then(|value| value.get("provenance"))
+            .and_then(|value| value.get("supporting_event_ids"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(value_id)
+            .collect::<Vec<_>>();
         let text = envelope
             .as_ref()
             .and_then(|value| value.get(field))
             .map(content_text)
             .unwrap_or_default();
+        let represented_by_output = supporting_event_ids.iter().any(|event_id| {
+            self.messages
+                .iter()
+                .any(|message| message.id == *event_id && message.text == text)
+        });
         if text.is_empty()
-            || self.messages.iter().any(|message| {
-                message.role == "assistant" && message.text == text && !message.optimistic
-            })
+            || represented_by_output
+            || self.messages.iter().any(|message| message.id == message_id)
         {
             return;
         }
+        self.terminal_supporting_event_ids
+            .extend(supporting_event_ids);
         let order = self.next_order();
         self.messages.push(Message {
-            id: format!("{event_id}-delivery"),
+            id: message_id,
             role: "assistant".to_owned(),
             text,
             order,
@@ -811,17 +866,39 @@ impl AppState {
         let connector_id = detail.summary.connector_id.clone();
         let session_id = detail.summary.session_id.clone();
         let run_id = format!("agent-history:{connector_id}:{session_id}");
+
+        if let Some(session) = self.sessions.items.iter_mut().find(|session| {
+            session.id == session_id
+                && session.connector_id.as_deref() == Some(connector_id.as_str())
+        }) {
+            session.title = detail.summary.title.clone();
+            session.preview = detail.summary.preview.clone();
+            session.cwd = detail.summary.cwd.clone();
+            session.state = Some(detail.summary.state.clone());
+            if let Some(created_at) = detail.summary.created_at_unix_ms {
+                session.created_at_unix_ms = created_at;
+            }
+            if let Some(updated_at) = detail.summary.updated_at_unix_ms {
+                session.updated_at_unix_ms = updated_at;
+            }
+            if !session.run_ids.contains(&run_id) {
+                session.run_ids.insert(0, run_id.clone());
+            }
+        } else {
+            self.sessions
+                .items
+                .push(detail.summary.clone().into_session());
+        }
+
         let run = self.ensure_run_source(&run_id, Some(session_id), Some(connector_id));
         run.status = "delivered".to_owned();
-        run.messages.clear();
-        run.activities.clear();
         run.commands.clear();
         run.streamed_outputs.clear();
-        run.presentation_cursor = 0;
-        append_agent_history(run, detail.turns, false);
+        project_latest_agent_history(run, detail.turns);
         run.pending = detail.pending_requests;
-        run.history_next_cursor = detail.next_cursor;
-        run.history_loading_earlier = false;
+        if !run.history_pagination_started {
+            run.history_next_cursor = detail.next_cursor;
+        }
     }
 
     /// Prepends one older Agent transcript page without replacing the latest
@@ -833,6 +910,7 @@ impl AppState {
         let run_id = format!("agent-history:{connector_id}:{session_id}");
         let run = self.ensure_run_source(&run_id, Some(session_id), Some(connector_id));
         append_agent_history(run, detail.turns, true);
+        run.history_pagination_started = true;
         run.history_next_cursor = detail.next_cursor;
         run.history_loading_earlier = false;
     }
@@ -863,6 +941,21 @@ impl AppState {
         })
     }
 
+    pub fn pending_run(&self) -> Option<&RunState> {
+        if let Some(active) = self.active_run().filter(|run| !run.pending.is_empty()) {
+            return Some(active);
+        }
+        let session = self.selected_session()?;
+        if let Some(history) = session
+            .history_run_id()
+            .and_then(|run_id| self.runs.get(&run_id))
+            .filter(|run| !run.pending.is_empty())
+        {
+            return Some(history);
+        }
+        self.current_run()
+    }
+
     pub fn recoverable_run(&self) -> Option<&RunState> {
         self.current_run().filter(|run| run.status == "unknown")
     }
@@ -886,6 +979,43 @@ impl AgentHistoryItem {
         match self {
             Self::Message(message) => message.order = order,
             Self::Activity(activity) => activity.order = order,
+        }
+    }
+}
+
+fn project_latest_agent_history(run: &mut RunState, turns: Vec<crate::model::AgentSessionTurn>) {
+    let mut incoming_ids = BTreeSet::new();
+    let mut incoming = turns
+        .into_iter()
+        .flat_map(|turn| turn.activities)
+        .filter_map(agent_history_item)
+        .filter(|item| incoming_ids.insert(item.id().to_owned()))
+        .collect::<Vec<_>>();
+
+    // External transcripts are append-only. An item that falls out of the
+    // bounded latest window has become history; it was not deleted. Refresh
+    // only ids present in the new snapshot so the sliding window cannot lose
+    // an activity after pagination has already reached the beginning.
+    let replaced_ids = incoming_ids.clone();
+    run.messages
+        .retain(|message| !replaced_ids.contains(&message.id));
+    run.activities
+        .retain(|activity| !replaced_ids.contains(&activity.id));
+    run.presentation_cursor = run
+        .messages
+        .iter()
+        .map(|message| message.order)
+        .chain(run.activities.iter().map(|activity| activity.order))
+        .max()
+        .unwrap_or_default();
+
+    for item in &mut incoming {
+        item.set_order(run.next_order());
+    }
+    for item in incoming {
+        match item {
+            AgentHistoryItem::Message(message) => run.messages.push(message),
+            AgentHistoryItem::Activity(activity) => run.activities.push(activity),
         }
     }
 }
@@ -1095,6 +1225,13 @@ pub fn contents_text(contents: Option<&Value>) -> String {
         .filter(|value| !value.is_empty())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn value_id(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| value.get("0").and_then(Value::as_str).map(str::to_owned))
 }
 
 pub fn status_from_view(view: &Value) -> String {
@@ -1346,6 +1483,159 @@ mod tests {
     }
 
     #[test]
+    fn terminal_run_view_projects_delivery_once_without_waiting_for_journal_replay() {
+        let delivery = serde_json::json!({
+            "delivery_id": "delivery-1",
+            "final_response": {"body": {"kind": "inline", "value": "Codex finished"}},
+            "provenance": {"supporting_event_ids": ["output-event"]}
+        });
+        let view = serde_json::json!({
+            "execution": {"session_id": "session-1"},
+            "state": {
+                "state": "terminal",
+                "terminal": {"type": "delivered", "delivery_id": "delivery-1"}
+            },
+            "last_run_seq": 2,
+            "pending_requests": [],
+            "input": content("do it"),
+            "delivery": delivery.clone(),
+            "partial_delivery": null
+        });
+        let mut run = RunState::new("run-1", None);
+
+        run.apply_view(view.clone(), 1.0);
+        run.apply_view(view, 2.0);
+        run.project_durable(
+            &record(
+                1,
+                "output-event",
+                serde_json::json!({
+                    "type": "output_committed",
+                    "output_id": "output-1",
+                    "content": content("Codex finished")
+                }),
+            ),
+            3.0,
+        );
+        run.project_durable(
+            &record(
+                2,
+                "delivery-event",
+                serde_json::json!({
+                    "type": "delivery_committed",
+                    "delivery": delivery
+                }),
+            ),
+            4.0,
+        );
+
+        let assistant = run
+            .messages
+            .iter()
+            .filter(|message| message.role == "assistant")
+            .collect::<Vec<_>>();
+        assert_eq!(assistant.len(), 1);
+        assert_eq!(assistant[0].id, "delivery:delivery-1");
+        assert_eq!(assistant[0].text, "Codex finished");
+        assert!(!assistant[0].partial);
+    }
+
+    #[test]
+    fn terminal_view_reuses_an_already_projected_supporting_output() {
+        let delivery = serde_json::json!({
+            "delivery_id": "delivery-1",
+            "final_response": {"body": {"kind": "inline", "value": "done"}},
+            "provenance": {"supporting_event_ids": ["output-event"]}
+        });
+        let mut run = RunState::new("run-1", None);
+        run.project_durable(
+            &record(
+                1,
+                "output-event",
+                serde_json::json!({
+                    "type": "output_committed",
+                    "output_id": "output-1",
+                    "content": content("done")
+                }),
+            ),
+            1.0,
+        );
+
+        run.apply_view(
+            serde_json::json!({
+                "state": {
+                    "state": "terminal",
+                    "terminal": {"type": "delivered", "delivery_id": "delivery-1"}
+                },
+                "last_run_seq": 2,
+                "pending_requests": [],
+                "delivery": delivery
+            }),
+            2.0,
+        );
+
+        assert_eq!(run.messages.len(), 1);
+        assert_eq!(run.messages[0].id, "output-event");
+        assert_eq!(run.messages[0].text, "done");
+    }
+
+    #[test]
+    fn distinct_output_events_with_identical_text_remain_visible() {
+        let mut run = RunState::new("run-1", None);
+        for (sequence, event_id, output_id) in [
+            (1, "output-event-1", "output-1"),
+            (2, "output-event-2", "output-2"),
+        ] {
+            run.project_durable(
+                &record(
+                    sequence,
+                    event_id,
+                    serde_json::json!({
+                        "type": "output_committed",
+                        "output_id": output_id,
+                        "content": content("same text")
+                    }),
+                ),
+                sequence as f64,
+            );
+        }
+
+        assert_eq!(run.messages.len(), 2);
+        assert_eq!(run.messages[0].id, "output-event-1");
+        assert_eq!(run.messages[1].id, "output-event-2");
+    }
+
+    #[test]
+    fn incomplete_run_view_projects_partial_response_with_a_stable_identity() {
+        let view = serde_json::json!({
+            "execution": {"session_id": "session-1"},
+            "state": {
+                "state": "terminal",
+                "terminal": {
+                    "type": "incomplete",
+                    "reason": {"type": "limit_reached", "limit": "model_steps"}
+                }
+            },
+            "last_run_seq": 4,
+            "pending_requests": [],
+            "delivery": null,
+            "partial_delivery": {
+                "partial_delivery_id": "partial-1",
+                "response": {"body": {"kind": "inline", "value": "Partial result"}}
+            }
+        });
+        let mut run = RunState::new("run-1", None);
+
+        run.apply_view(view.clone(), 1.0);
+        run.apply_view(view, 2.0);
+
+        assert_eq!(run.messages.len(), 1);
+        assert_eq!(run.messages[0].id, "partial-delivery:partial-1");
+        assert_eq!(run.messages[0].text, "Partial result");
+        assert!(run.messages[0].partial);
+    }
+
+    #[test]
     fn connector_namespace_prevents_same_session_id_from_colliding() {
         let native: SessionView = serde_json::from_value(serde_json::json!({
             "id": "same-id",
@@ -1559,6 +1849,170 @@ mod tests {
         assert_eq!(run.pending[0]["request_id"], "latest-request");
         assert!(run.history_next_cursor.is_none());
         assert!(!run.history_loading_earlier);
+    }
+
+    #[test]
+    fn refreshing_agent_snapshot_preserves_controlled_runs_and_exposes_agent_pending() {
+        let history_id = "agent-history:codex/local:thread-1";
+        let mut state = AppState::new(true);
+        state.sessions.items.push(SessionView {
+            id: "thread-1".to_owned(),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 2,
+            run_ids: vec![history_id.to_owned(), "controlled-run".to_owned()],
+            connector_id: Some("codex/local".to_owned()),
+            title: Some("Old title".to_owned()),
+            preview: None,
+            cwd: None,
+            state: Some("active".to_owned()),
+        });
+        state.sessions.selected_id = Some("codex/local\0thread-1".to_owned());
+        state
+            .ensure_run_source(
+                "controlled-run",
+                Some("thread-1".to_owned()),
+                Some("codex/local".to_owned()),
+            )
+            .status = "delivered".to_owned();
+        let detail: AgentSessionDetail = serde_json::from_value(serde_json::json!({
+            "summary": {
+                "connector_id": "codex/local",
+                "session_id": "thread-1",
+                "title": "Fresh title",
+                "preview": "Fresh preview",
+                "updated_at_unix_ms": 42,
+                "state": "waiting_approval"
+            },
+            "turns": [],
+            "pending_requests": [{"request_id": "approval-1"}],
+            "next_cursor": null
+        }))
+        .unwrap();
+
+        state.project_agent_session(detail);
+
+        let session = state.selected_session().unwrap();
+        assert_eq!(session.title.as_deref(), Some("Fresh title"));
+        assert_eq!(session.preview.as_deref(), Some("Fresh preview"));
+        assert_eq!(session.updated_at_unix_ms, 42);
+        assert_eq!(session.state.as_deref(), Some("waiting_approval"));
+        assert!(session.run_ids.iter().any(|run| run == "controlled-run"));
+        assert_eq!(
+            state.pending_run().map(|run| run.id.as_str()),
+            Some(history_id)
+        );
+    }
+
+    #[test]
+    fn polling_latest_agent_history_preserves_older_pages_and_pagination_state() {
+        let latest: AgentSessionDetail = serde_json::from_value(serde_json::json!({
+            "summary": {
+                "connector_id": "codex/local",
+                "session_id": "thread-1",
+                "state": "active"
+            },
+            "turns": [{
+                "turn_id": "latest",
+                "status": "running",
+                "activities": [
+                    {
+                        "activity_id": "agent-edge",
+                        "kind": "agent_message",
+                        "status": "completed",
+                        "content": [{"body": {"kind": "inline", "value": "edge of latest window"}}]
+                    },
+                    {
+                        "activity_id": "user-new",
+                        "kind": "user_message",
+                        "status": "completed",
+                        "content": [{"body": {"kind": "inline", "value": "new question"}}]
+                    }
+                ]
+            }],
+            "pending_requests": [],
+            "next_cursor": "cursor-1"
+        }))
+        .unwrap();
+        let older: AgentSessionDetail = serde_json::from_value(serde_json::json!({
+            "summary": {
+                "connector_id": "codex/local",
+                "session_id": "thread-1",
+                "state": "active"
+            },
+            "turns": [{
+                "turn_id": "older",
+                "status": "completed",
+                "activities": [{
+                    "activity_id": "user-old",
+                    "kind": "user_message",
+                    "status": "completed",
+                    "content": [{"body": {"kind": "inline", "value": "old question"}}]
+                }]
+            }],
+            "pending_requests": [],
+            "next_cursor": "cursor-2"
+        }))
+        .unwrap();
+        let refreshed: AgentSessionDetail = serde_json::from_value(serde_json::json!({
+            "summary": {
+                "connector_id": "codex/local",
+                "session_id": "thread-1",
+                "state": "waiting_input"
+            },
+            "turns": [{
+                "turn_id": "latest",
+                "status": "running",
+                "activities": [
+                    {
+                        "activity_id": "user-new",
+                        "kind": "user_message",
+                        "status": "completed",
+                        "content": [{"body": {"kind": "inline", "value": "new question updated"}}]
+                    },
+                    {
+                        "activity_id": "agent-new",
+                        "kind": "agent_message",
+                        "status": "running",
+                        "content": [{"body": {"kind": "inline", "value": "working"}}]
+                    }
+                ]
+            }],
+            "pending_requests": [{"request_id": "input-1"}],
+            "next_cursor": "cursor-1"
+        }))
+        .unwrap();
+        let mut state = AppState::new(true);
+        state.project_agent_session(latest);
+        state.prepend_agent_session_history(older);
+        state
+            .runs
+            .get_mut("agent-history:codex/local:thread-1")
+            .unwrap()
+            .history_loading_earlier = true;
+
+        state.project_agent_session(refreshed);
+
+        let run = state
+            .runs
+            .get("agent-history:codex/local:thread-1")
+            .unwrap();
+        let timeline = timeline_for_run(run);
+        assert_eq!(timeline.len(), 4);
+        assert!(
+            matches!(&timeline[0], TimelineItem::Message(message) if message.text == "old question")
+        );
+        assert!(
+            matches!(&timeline[1], TimelineItem::Message(message) if message.text == "edge of latest window")
+        );
+        assert!(
+            matches!(&timeline[2], TimelineItem::Message(message) if message.text == "new question updated")
+        );
+        assert!(
+            matches!(&timeline[3], TimelineItem::Message(message) if message.text == "working")
+        );
+        assert_eq!(run.history_next_cursor.as_deref(), Some("cursor-2"));
+        assert!(run.history_loading_earlier);
+        assert_eq!(run.pending[0]["request_id"], "input-1");
     }
 
     #[test]
