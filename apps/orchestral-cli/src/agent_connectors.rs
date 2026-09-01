@@ -18,18 +18,25 @@ use crate::mcp_config::user_config_root;
 
 pub(crate) async fn build_agent_directory() -> anyhow::Result<Arc<AgentDirectory>> {
     let directory = Arc::new(AgentDirectory::new());
+    let config_root = user_config_root()?;
     let config = CodexAppServerConfig {
         executable: resolve_codex_executable(
             std::env::var_os("ORCHESTRAL_CODEX_PATH").as_deref(),
             std::env::var_os("PATH").as_deref(),
             user_home_dir().as_deref(),
         ),
+        dispatch_journal_dir: Some(
+            config_root
+                .join("agent-connectors")
+                .join("codex-local")
+                .join("dispatch"),
+        ),
         ..CodexAppServerConfig::default()
     };
     let codex = Arc::new(CodexConnector::new(config));
     let journal = Arc::new(
         FileAgentJournalStore::open(
-            user_config_root()?
+            config_root
                 .join("agent-connectors")
                 .join("codex-local")
                 .join("journal"),

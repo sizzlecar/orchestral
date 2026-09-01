@@ -249,7 +249,10 @@ impl CodexConnector {
     #[cfg(test)]
     fn with_client(rpc: Arc<CodexRpcClient>, user_agent: impl Into<String>) -> Self {
         Self {
-            config: CodexAppServerConfig::default(),
+            config: CodexAppServerConfig {
+                dispatch_journal_dir: None,
+                ..CodexAppServerConfig::default()
+            },
             client: AsyncMutex::new(Some(Arc::new(ConnectedClient {
                 rpc,
                 user_agent: user_agent.into(),
@@ -266,7 +269,10 @@ impl CodexConnector {
     #[cfg(test)]
     fn with_reconnect_client(rpc: Arc<CodexRpcClient>, reconnect_rpc: Arc<CodexRpcClient>) -> Self {
         Self {
-            config: CodexAppServerConfig::default(),
+            config: CodexAppServerConfig {
+                dispatch_journal_dir: None,
+                ..CodexAppServerConfig::default()
+            },
             client: AsyncMutex::new(Some(Arc::new(ConnectedClient {
                 rpc,
                 user_agent: "codex/test".to_owned(),

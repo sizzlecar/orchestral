@@ -13,8 +13,8 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use orchestral_core::agent_connector::{
     AgentConnectorId, AgentSessionActionId, AgentSessionActionOutcome, AgentSessionListQuery,
-    AgentSessionPage, AgentSessionReadQuery, AgentSessionSummary,
-    CreateAgentSessionRequest, InvokeAgentSessionActionRequest,
+    AgentSessionPage, AgentSessionReadQuery, AgentSessionSummary, CreateAgentSessionRequest,
+    InvokeAgentSessionActionRequest,
 };
 use orchestral_core::agent_protocol::spi::AgentStartError;
 use orchestral_core::agent_protocol::wire::{
@@ -1205,9 +1205,10 @@ mod tests {
         AgentSessionActionDescriptor, AgentSessionActionExecution, AgentSessionActionOutcome,
         AgentSessionActionStatus, AgentSessionActivity, AgentSessionActivityId,
         AgentSessionActivityKind, AgentSessionActivityStatus, AgentSessionCapabilities,
-        AgentSessionState, AgentSessionSummary, AgentSessionTurn, AgentSessionTurnId,
-        AgentSessionTurnStatus, CreateAgentSessionRequest, InvokeAgentSessionActionRequest,
-        SESSION_FORK_ACTION, SESSION_RENAME_ACTION, SESSION_REVIEW_ACTION,
+        AgentSessionDetail, AgentSessionState, AgentSessionSummary, AgentSessionTurn,
+        AgentSessionTurnId, AgentSessionTurnStatus, CreateAgentSessionRequest,
+        InvokeAgentSessionActionRequest, SESSION_FORK_ACTION, SESSION_RENAME_ACTION,
+        SESSION_REVIEW_ACTION,
     };
     use orchestral_core::agent_protocol::{
         spi::{AgentProvider, AgentRecovery, AgentRecoveryRequest, AgentStart, AgentStartError},

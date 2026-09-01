@@ -1,4 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, OpenOptions};
+use std::io::{ErrorKind, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -17,10 +20,11 @@ use orchestral_core::agent_protocol::wire::{
     AgentExecutionRef, AgentFailure, AgentId, AgentProtocolError, AgentProtocolErrorCode,
     AgentProviderId, AgentProviderStreamItem, AgentRejection, AgentRejectionCode, AgentSessionId,
     AgentStartRequest, AgentTelemetry, AgentTelemetryEnvelope, ApprovalDecision, CancelSupport,
-    Content, ContentBody, ControlCapabilities, DeliveryId, Digest, EffectMediation, Extensions,
-    OutputId, PendingRequest, PendingRequestKind, PendingRequestPayload, ProtocolVersion,
-    Provenance, ProviderCommandDisposition, ProviderCommandOutcome, RequestId, RequestResolution,
-    RunId, TelemetryId, ToolActivityEvidence, ToolActivityId, ToolActivityState,
+    CommandId, Content, ContentBody, ControlCapabilities, DeliveryId, Digest, EffectMediation,
+    Extensions, IncompleteReason, OutputId, PendingRequest, PendingRequestKind,
+    PendingRequestPayload, ProtocolVersion, Provenance, ProviderCommandDisposition,
+    ProviderCommandOutcome, RequestId, RequestResolution, RunId, TelemetryId, ToolActivityEvidence,
+    ToolActivityId, ToolActivityState,
 };
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
@@ -31,6 +35,14 @@ use crate::{CodexConnector, ConnectedClient};
 
 const PROVIDER_ID: &str = "codex/app-server";
 const AGENT_ID: &str = "codex/local";
+#[cfg(not(test))]
+const EXTERNAL_QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(1_500);
+#[cfg(test)]
+const EXTERNAL_QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const EXTERNAL_QUEUE_TURN_PAGE_LIMIT: u32 = 50;
+const EXTERNAL_QUEUE_AMBIGUOUS_POLL_LIMIT: u16 = 20;
+const EXTERNAL_QUEUE_PAGE_LIMIT: u32 = 100;
+const EXTERNAL_HISTORY_TELEMETRY_LIMIT: usize = 256;
 
 #[derive(Default)]
 pub(crate) struct ProviderState {
@@ -59,9 +71,49 @@ struct CodexRun {
     final_response: Mutex<String>,
     pending: Mutex<BTreeMap<RequestId, NativePendingRequest>>,
     commands: Mutex<BTreeMap<String, (Digest, ProviderCommandDisposition)>>,
+    route: Mutex<Option<NativeRunRoute>>,
+    observed_item_ids: Mutex<BTreeSet<String>>,
+    cancel_request: Mutex<Option<(CommandId, String)>>,
     telemetry_seq: AtomicU64,
+    external_monitor_running: AtomicBool,
+    stop_requested_published: AtomicBool,
     detached: AtomicBool,
+    finalizing: AtomicBool,
     terminal: AtomicBool,
+}
+
+#[derive(Clone, Debug)]
+enum NativeRunRoute {
+    Direct,
+    ExternalQueue {
+        queued_submission_id: Option<String>,
+        client_message_id: String,
+        input_digest: Digest,
+        phase: ExternalQueuePhase,
+        ambiguous_polls: u16,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExternalQueuePhase {
+    Submitting,
+    Queued,
+    Started,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExternalQueueObservation {
+    Queued,
+    TurnObserved,
+    Terminal,
+    Missing,
+    OutcomeUnknown,
+}
+
+#[derive(Debug)]
+enum DispatchClaim {
+    Acquired(PathBuf),
+    Existing,
 }
 
 #[derive(Clone)]
@@ -69,6 +121,34 @@ struct NativePendingRequest {
     rpc_id: Value,
     kind: PendingRequestKind,
     params: Value,
+}
+
+fn new_codex_run(
+    request: AgentStartRequest,
+    execution: AgentExecutionRef,
+    admission: AgentAdmission,
+) -> Arc<CodexRun> {
+    let (sender, _) = broadcast::channel(512);
+    Arc::new(CodexRun {
+        request,
+        execution,
+        admission,
+        sender,
+        durable: Mutex::new(Vec::new()),
+        turn_id: Mutex::new(None),
+        final_response: Mutex::new(String::new()),
+        pending: Mutex::new(BTreeMap::new()),
+        commands: Mutex::new(BTreeMap::new()),
+        route: Mutex::new(None),
+        observed_item_ids: Mutex::new(BTreeSet::new()),
+        cancel_request: Mutex::new(None),
+        telemetry_seq: AtomicU64::new(0),
+        external_monitor_running: AtomicBool::new(false),
+        stop_requested_published: AtomicBool::new(false),
+        detached: AtomicBool::new(false),
+        finalizing: AtomicBool::new(false),
+        terminal: AtomicBool::new(false),
+    })
 }
 
 impl CodexConnector {
@@ -88,8 +168,13 @@ impl CodexConnector {
                 session_reuse: true,
                 structured_output: false,
                 controls: ControlCapabilities {
-                    steer: true,
-                    cancel: CancelSupport::Confirmed,
+                    // A session owned by another Codex process can accept a
+                    // durable next-turn message but cannot be live-steered.
+                    // Static capabilities are the safe intersection of every
+                    // route; a future protocol revision can negotiate these
+                    // controls per execution after ownership is known.
+                    steer: false,
+                    cancel: CancelSupport::BestEffort,
                     recover: true,
                 },
                 pending_request_kinds: BTreeSet::from([
@@ -125,13 +210,21 @@ impl CodexConnector {
                 self.remove_failed_start(&run);
             })?;
         }
+        let input = action
+            .is_none()
+            .then(|| codex_input(&run.request))
+            .transpose()
+            .map_err(|error| {
+                self.remove_failed_start(&run);
+                AgentStartError::Rejected(AgentRejection::new(
+                    AgentRejectionCode::InvalidSpec,
+                    error.to_string(),
+                ))
+            })?;
         self.invalidate_session_cache(&session_id);
-        let needs_resume = self
-            .provider_state()
-            .loaded_sessions
-            .insert(session_id.clone());
+        let needs_resume = !self.provider_state().loaded_sessions.contains(&session_id);
         if needs_resume {
-            if let Err(error) = connected
+            match connected
                 .rpc
                 .request(
                     "thread/resume",
@@ -142,9 +235,23 @@ impl CodexConnector {
                 )
                 .await
             {
-                let loaded_without_rollout = unmaterialized_resume_without_rollout(&error)
-                    && client_has_loaded_session(&connected.rpc, &session_id).await;
-                if !loaded_without_rollout {
+                Ok(_) => self.provider_state().mark_loaded(session_id.clone()),
+                Err(error)
+                    if unmaterialized_resume_without_rollout(&error)
+                        && client_has_loaded_session(&connected.rpc, &session_id).await =>
+                {
+                    self.provider_state().mark_loaded(session_id.clone());
+                }
+                Err(error) if active_writer_conflict(&error) && action.is_none() => {
+                    return self
+                        .start_external_queued_run(
+                            connected.rpc.clone(),
+                            run,
+                            input.expect("ordinary run input must be present"),
+                        )
+                        .await;
+                }
+                Err(error) => {
                     self.remove_failed_start(&run);
                     return Err(start_transport_error(error, false));
                 }
@@ -155,13 +262,7 @@ impl CodexConnector {
                 .start_native_action(connected, run, action, notifications)
                 .await;
         }
-        let input = codex_input(&run.request).map_err(|error| {
-            self.remove_failed_start(&run);
-            AgentStartError::Rejected(AgentRejection::new(
-                AgentRejectionCode::InvalidSpec,
-                error.to_string(),
-            ))
-        })?;
+        let input = input.expect("ordinary run input must be present");
         let result = match connected
             .rpc
             .request(
@@ -194,11 +295,242 @@ impl CodexConnector {
                 ))
             })?
             .to_owned();
+        *lock(&run.route) = Some(NativeRunRoute::Direct);
         establish_turn(&run, &turn_id);
         tokio::spawn(async move {
             monitor_native_run(connected.rpc.clone(), run, turn_id, notifications).await;
         });
         Ok(())
+    }
+
+    async fn start_external_queued_run(
+        &self,
+        rpc: Arc<CodexRpcClient>,
+        run: Arc<CodexRun>,
+        input: Value,
+    ) -> Result<(), AgentStartError> {
+        let session_id = run.execution.session_id.clone();
+        let client_message_id = queued_client_message_id(&run.execution);
+        let input_digest =
+            codex_user_input_digest(&input).map_err(AgentStartError::OutcomeUnknown)?;
+        // Record identity before dispatch. queue/add is not idempotent by
+        // clientUserMessageId, so a lost response must be reconciled through
+        // queue/history reads and must never be retried blindly.
+        *lock(&run.route) = Some(NativeRunRoute::ExternalQueue {
+            queued_submission_id: None,
+            client_message_id: client_message_id.clone(),
+            input_digest: input_digest.clone(),
+            phase: ExternalQueuePhase::Submitting,
+            ambiguous_polls: 0,
+        });
+        // The client id is derived from the immutable execution identity, so
+        // this read-before-write also reconciles an add committed by a prior
+        // Orchestral process whose response was lost. Codex queue/add itself
+        // does not deduplicate clientUserMessageId.
+        match reconcile_external_queued_run(&rpc, &run)
+            .await
+            .map_err(AgentStartError::OutcomeUnknown)?
+        {
+            ExternalQueueObservation::Queued | ExternalQueueObservation::TurnObserved => {
+                run.detached.store(false, Ordering::SeqCst);
+                spawn_external_queue_monitor(rpc, run);
+                return Ok(());
+            }
+            ExternalQueueObservation::Terminal => return Ok(()),
+            ExternalQueueObservation::Missing => {
+                if let Some(NativeRunRoute::ExternalQueue {
+                    ambiguous_polls, ..
+                }) = lock(&run.route).as_mut()
+                {
+                    *ambiguous_polls = 0;
+                }
+            }
+            ExternalQueueObservation::OutcomeUnknown => {
+                run.detached.store(true, Ordering::SeqCst);
+                return Err(AgentStartError::OutcomeUnknown(protocol_error(
+                    "Codex queue dispatch could not be reconciled before submission",
+                    true,
+                )));
+            }
+        }
+        // Claim dispatch durably before calling Codex. This is the
+        // at-most-once boundary: queue/add does not deduplicate client IDs and
+        // Codex removes a queue item before its turn is necessarily visible in
+        // history. A second process that sees this claim observes only; it
+        // never performs another add during that dequeue/history gap.
+        let claim =
+            match self.claim_external_queue_dispatch(&run, &client_message_id, &input_digest) {
+                Ok(claim) => claim,
+                Err(error @ AgentStartError::Rejected(_)) => {
+                    // No durable claim means no queue effect could have started.
+                    // Release the in-memory session reservation so a transient
+                    // filesystem failure remains safely retryable.
+                    self.remove_failed_start(&run);
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            };
+        let claim_path = match claim {
+            DispatchClaim::Acquired(path) => path,
+            DispatchClaim::Existing => {
+                run.detached.store(false, Ordering::SeqCst);
+                spawn_external_queue_monitor(rpc, run);
+                return Ok(());
+            }
+        };
+        let result = match rpc
+            .request(
+                "thread/queue/add",
+                json!({
+                    "threadId": session_id.as_str(),
+                    "input": input,
+                    "clientUserMessageId": client_message_id
+                }),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(
+                error @ (CodexTransportError::Timeout
+                | CodexTransportError::Closed
+                | CodexTransportError::Disconnected(_)),
+            ) => {
+                run.detached.store(true, Ordering::SeqCst);
+                return Err(start_transport_error(error, true));
+            }
+            Err(error) => {
+                // A JSON-RPC rejection proves that Codex did not accept this
+                // dispatch. Release only the claim owned by this attempt so a
+                // corrected retry may submit it. Transport ambiguity keeps the
+                // claim permanently and therefore cannot duplicate work.
+                match fs::remove_file(&claim_path) {
+                    Ok(()) => {
+                        self.remove_failed_start(&run);
+                        return Err(start_transport_error(error, false));
+                    }
+                    Err(cleanup) if cleanup.kind() == ErrorKind::NotFound => {
+                        self.remove_failed_start(&run);
+                        return Err(start_transport_error(error, false));
+                    }
+                    Err(cleanup) => {
+                        run.detached.store(true, Ordering::SeqCst);
+                        return Err(AgentStartError::OutcomeUnknown(protocol_error(
+                            format!(
+                                "Codex rejected queue/add but its dispatch claim '{}' could not be removed: {cleanup}",
+                                claim_path.display()
+                            ),
+                            false,
+                        )));
+                    }
+                }
+            }
+        };
+        let queued_submission_id = result
+            .pointer("/queuedSubmission/id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                run.detached.store(true, Ordering::SeqCst);
+                AgentStartError::OutcomeUnknown(protocol_error(
+                    "Codex thread/queue/add omitted queuedSubmission.id",
+                    false,
+                ))
+            })?
+            .to_owned();
+        if let Some(NativeRunRoute::ExternalQueue {
+            queued_submission_id: stored_id,
+            phase,
+            ..
+        }) = lock(&run.route).as_mut()
+        {
+            *stored_id = Some(queued_submission_id);
+            *phase = ExternalQueuePhase::Queued;
+        }
+        spawn_external_queue_monitor(rpc, run);
+        Ok(())
+    }
+
+    fn claim_external_queue_dispatch(
+        &self,
+        run: &CodexRun,
+        client_message_id: &str,
+        input_digest: &Digest,
+    ) -> Result<DispatchClaim, AgentStartError> {
+        let Some(root) = self.config.dispatch_journal_dir.as_ref() else {
+            #[cfg(test)]
+            return Ok(DispatchClaim::Acquired(PathBuf::new()));
+            #[cfg(not(test))]
+            return Err(AgentStartError::Rejected(AgentRejection::new(
+                AgentRejectionCode::ProviderUnavailable,
+                "Codex cross-process queueing requires a durable dispatch journal",
+            )));
+        };
+        fs::create_dir_all(root).map_err(|error| {
+            AgentStartError::Rejected(AgentRejection::new(
+                AgentRejectionCode::ProviderUnavailable,
+                format!(
+                    "cannot create Codex dispatch journal '{}': {error}",
+                    root.display()
+                ),
+            ))
+        })?;
+        let claim_key = Digest::sha256(client_message_id.as_bytes());
+        let path = root.join(format!("{}.json", claim_key.as_str()));
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                return Ok(DispatchClaim::Existing);
+            }
+            Err(error) => {
+                return Err(AgentStartError::Rejected(AgentRejection::new(
+                    AgentRejectionCode::ProviderUnavailable,
+                    format!(
+                        "cannot claim Codex queue dispatch '{}': {error}",
+                        path.display()
+                    ),
+                )));
+            }
+        };
+        let record = json!({
+            "schema_version": 1,
+            "run_id": run.execution.run_id.as_str(),
+            "session_id": run.execution.session_id.as_str(),
+            "client_message_id": client_message_id,
+            "input_digest": input_digest.as_str()
+        });
+        let encoded = serde_json::to_vec(&record).map_err(|error| {
+            AgentStartError::OutcomeUnknown(protocol_error(
+                format!("cannot encode Codex dispatch claim: {error}"),
+                false,
+            ))
+        })?;
+        file.write_all(&encoded)
+            .and_then(|()| file.write_all(b"\n"))
+            .and_then(|()| file.sync_all())
+            .map_err(|error| {
+                // Never remove a partially written claim: creation already
+                // established the at-most-once boundary.
+                AgentStartError::OutcomeUnknown(protocol_error(
+                    format!(
+                        "cannot durably record Codex queue dispatch '{}': {error}",
+                        path.display()
+                    ),
+                    false,
+                ))
+            })?;
+        #[cfg(unix)]
+        fs::File::open(root)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                AgentStartError::OutcomeUnknown(protocol_error(
+                    format!(
+                        "cannot sync Codex dispatch journal directory '{}': {error}",
+                        root.display()
+                    ),
+                    false,
+                ))
+            })?;
+        Ok(DispatchClaim::Acquired(path))
     }
 
     async fn start_native_action(
@@ -282,11 +614,61 @@ impl CodexConnector {
             }
         };
 
+        *lock(&run.route) = Some(NativeRunRoute::Direct);
         establish_turn(&run, &turn_id);
         tokio::spawn(async move {
             monitor_native_run(connected.rpc.clone(), run, turn_id, notifications).await;
         });
         Ok(())
+    }
+
+    async fn prepare_idempotent_start(&self, run: &Arc<CodexRun>) -> Result<(), AgentStartError> {
+        if run.terminal.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let route = { lock(&run.route).clone() };
+        match route {
+            Some(NativeRunRoute::ExternalQueue { .. }) => {
+                if !run.detached.load(Ordering::SeqCst)
+                    && run.external_monitor_running.load(Ordering::SeqCst)
+                {
+                    return Ok(());
+                }
+                let connected = self.client().await.map_err(|error| {
+                    AgentStartError::OutcomeUnknown(connector_to_protocol(error))
+                })?;
+                match reconcile_external_queued_run(&connected.rpc, run)
+                    .await
+                    .map_err(AgentStartError::OutcomeUnknown)?
+                {
+                    ExternalQueueObservation::Queued | ExternalQueueObservation::TurnObserved => {
+                        run.detached.store(false, Ordering::SeqCst);
+                        spawn_external_queue_monitor(connected.rpc.clone(), Arc::clone(run));
+                        Ok(())
+                    }
+                    ExternalQueueObservation::Terminal => Ok(()),
+                    ExternalQueueObservation::Missing
+                    | ExternalQueueObservation::OutcomeUnknown => {
+                        run.detached.store(true, Ordering::SeqCst);
+                        Err(AgentStartError::OutcomeUnknown(protocol_error(
+                            "Codex queue dispatch is still being reconciled; retry the same Run identity",
+                            true,
+                        )))
+                    }
+                }
+            }
+            Some(NativeRunRoute::Direct) if run.detached.load(Ordering::SeqCst) => {
+                Err(AgentStartError::OutcomeUnknown(protocol_error(
+                    "Codex direct start outcome is unknown; recover the existing Run",
+                    true,
+                )))
+            }
+            Some(NativeRunRoute::Direct) => Ok(()),
+            None => Err(AgentStartError::OutcomeUnknown(protocol_error(
+                "Codex start is still being established; retry the same Run identity",
+                true,
+            ))),
+        }
     }
 
     fn action_transport_failure(
@@ -318,6 +700,22 @@ fn unmaterialized_resume_without_rollout(error: &CodexTransportError) -> bool {
         error,
         CodexTransportError::Rpc(message)
             if message.contains("no rollout found for thread id")
+    )
+}
+
+fn active_writer_conflict(error: &CodexTransportError) -> bool {
+    matches!(
+        error,
+        CodexTransportError::Rpc(message)
+            if message.contains("already has an active writer")
+    )
+}
+
+fn queued_client_message_id(execution: &AgentExecutionRef) -> String {
+    format!(
+        "orchestral:{}:{}",
+        execution.run_id.as_str(),
+        execution.spec_digest.as_str()
     )
 }
 
@@ -383,7 +781,7 @@ impl AgentProvider for CodexConnector {
             AgentRejection::new(AgentRejectionCode::RunIdConflict, error.to_string())
         })?;
 
-        let run = {
+        let (run, is_new) = {
             let mut state = self.provider_state();
             if let Some(existing) = state.runs.get(&request.run.spec.run_id) {
                 if existing.request != request || existing.execution != execution {
@@ -393,52 +791,44 @@ impl AgentProvider for CodexConnector {
                     )
                     .into());
                 }
-                return Ok(AgentStart {
-                    execution: existing.execution.clone(),
-                    admission: existing.admission.clone(),
-                    stream: stream_for(existing),
-                });
-            }
-            if state.sessions.contains_key(&request.run.spec.session_id) {
-                let existing_terminal = state
-                    .sessions
-                    .get(&request.run.spec.session_id)
-                    .and_then(|run_id| state.runs.get(run_id))
-                    .is_some_and(|run| run.terminal.load(Ordering::SeqCst));
-                if existing_terminal {
-                    state.sessions.remove(&request.run.spec.session_id);
-                } else {
-                    return Err(AgentRejection::new(
-                        AgentRejectionCode::SessionConflict,
-                        "Codex permits one Orchestral Run per active session",
-                    )
-                    .into());
+                (Arc::clone(existing), false)
+            } else {
+                if state.sessions.contains_key(&request.run.spec.session_id) {
+                    let existing_terminal = state
+                        .sessions
+                        .get(&request.run.spec.session_id)
+                        .and_then(|run_id| state.runs.get(run_id))
+                        .is_some_and(|run| run.terminal.load(Ordering::SeqCst));
+                    if existing_terminal {
+                        state.sessions.remove(&request.run.spec.session_id);
+                    } else {
+                        return Err(AgentRejection::new(
+                            AgentRejectionCode::SessionConflict,
+                            "Codex permits one Orchestral Run per active session",
+                        )
+                        .into());
+                    }
                 }
+                let run = new_codex_run(request.clone(), execution.clone(), admission.clone());
+                state.sessions.insert(
+                    request.run.spec.session_id.clone(),
+                    request.run.spec.run_id.clone(),
+                );
+                state
+                    .runs
+                    .insert(request.run.spec.run_id.clone(), Arc::clone(&run));
+                (run, true)
             }
-            let (sender, _) = broadcast::channel(512);
-            let run = Arc::new(CodexRun {
-                request: request.clone(),
-                execution: execution.clone(),
-                admission: admission.clone(),
-                sender,
-                durable: Mutex::new(Vec::new()),
-                turn_id: Mutex::new(None),
-                final_response: Mutex::new(String::new()),
-                pending: Mutex::new(BTreeMap::new()),
-                commands: Mutex::new(BTreeMap::new()),
-                telemetry_seq: AtomicU64::new(0),
-                detached: AtomicBool::new(false),
-                terminal: AtomicBool::new(false),
-            });
-            state.sessions.insert(
-                request.run.spec.session_id.clone(),
-                request.run.spec.run_id.clone(),
-            );
-            state
-                .runs
-                .insert(request.run.spec.run_id.clone(), Arc::clone(&run));
-            run
         };
+
+        if !is_new {
+            self.prepare_idempotent_start(&run).await?;
+            return Ok(AgentStart {
+                execution: run.execution.clone(),
+                admission: run.admission.clone(),
+                stream: stream_for(&run),
+            });
+        }
 
         let connected = match self.client().await {
             Ok(connected) => connected,
@@ -516,25 +906,57 @@ impl AgentProvider for CodexConnector {
         &self,
         request: AgentRecoveryRequest,
     ) -> Result<AgentRecovery, AgentProtocolError> {
-        request.validate_for(&Self::provider_descriptor())?;
-        let run = self
+        let descriptor = Self::provider_descriptor();
+        request.validate_for(&descriptor)?;
+        let existing = self
             .provider_state()
             .runs
             .get(&request.execution.run_id)
-            .cloned()
-            .ok_or_else(|| {
-                AgentProtocolError::new(
+            .cloned();
+        let reconstructed = existing.is_none();
+        let run = if let Some(run) = existing {
+            run
+        } else {
+            if AgentSessionActionInvocation::from_run(&request.start_request.run.spec)
+                .map_err(connector_to_protocol)?
+                .is_some()
+            {
+                return Err(AgentProtocolError::new(
                     AgentProtocolErrorCode::RunNotFound,
-                    "Codex run is not available for process-local recovery",
-                )
-            })?;
+                    "Codex native actions cannot be reconstructed after provider restart",
+                ));
+            }
+            let compatibility = descriptor
+                .descriptor
+                .check_run_compatibility(&request.start_request.run)
+                .map_err(|error| protocol_error(error.to_string(), false))?;
+            let admission = AgentAdmission {
+                skipped_optional_bindings: compatibility.skipped_optional_bindings,
+            };
+            let input = codex_input(&request.start_request)?;
+            let input_digest = codex_user_input_digest(&input)?;
+            let run = new_codex_run(
+                request.start_request.clone(),
+                request.execution.clone(),
+                admission,
+            );
+            *lock(&run.route) = Some(NativeRunRoute::ExternalQueue {
+                queued_submission_id: None,
+                client_message_id: queued_client_message_id(&request.execution),
+                input_digest,
+                phase: ExternalQueuePhase::Submitting,
+                ambiguous_polls: 0,
+            });
+            run.detached.store(true, Ordering::SeqCst);
+            run
+        };
         if run.request != request.start_request || run.execution != request.execution {
             return Err(AgentProtocolError::new(
                 AgentProtocolErrorCode::RunIdConflict,
                 "Codex recovery identity does not match the original run",
             ));
         }
-        if !run.detached.load(Ordering::SeqCst) {
+        if !reconstructed && !run.detached.load(Ordering::SeqCst) {
             return Err(AgentProtocolError::new(
                 AgentProtocolErrorCode::InvalidTransition,
                 "Codex run is not detached",
@@ -542,6 +964,47 @@ impl AgentProvider for CodexConnector {
         }
 
         let connected = self.client().await.map_err(connector_to_protocol)?;
+        if matches!(
+            lock(&run.route).as_ref(),
+            Some(NativeRunRoute::ExternalQueue { .. })
+        ) {
+            match reconcile_external_queued_run(&connected.rpc, &run).await? {
+                ExternalQueueObservation::Queued | ExternalQueueObservation::TurnObserved => {
+                    run.detached.store(false, Ordering::SeqCst);
+                }
+                ExternalQueueObservation::Terminal => {
+                    run.detached.store(false, Ordering::SeqCst);
+                }
+                ExternalQueueObservation::Missing | ExternalQueueObservation::OutcomeUnknown => {
+                    return Err(protocol_error(
+                        "Codex could not find durable queue or turn evidence for this recovered execution",
+                        true,
+                    ));
+                }
+            }
+            if reconstructed {
+                let mut state = self.provider_state();
+                if let Some(existing_run_id) = state.sessions.get(&run.execution.session_id) {
+                    if existing_run_id != &run.execution.run_id {
+                        return Err(AgentProtocolError::new(
+                            AgentProtocolErrorCode::RunIdConflict,
+                            "another Codex run already controls the recovered session",
+                        ));
+                    }
+                }
+                state.sessions.insert(
+                    run.execution.session_id.clone(),
+                    run.execution.run_id.clone(),
+                );
+                state
+                    .runs
+                    .insert(run.execution.run_id.clone(), Arc::clone(&run));
+            }
+            if !run.terminal.load(Ordering::SeqCst) {
+                spawn_external_queue_monitor(connected.rpc.clone(), Arc::clone(&run));
+            }
+            return Ok(AgentRecovery::reattached(stream_for(&run)));
+        }
         let notifications = connected.rpc.subscribe();
         let session_id = run.execution.session_id.clone();
         connected
@@ -624,6 +1087,22 @@ async fn apply_native_command(
     run: &Arc<CodexRun>,
     command: &AgentCommandEnvelope,
 ) -> Result<(), AgentProtocolError> {
+    let route = { lock(&run.route).clone() };
+    if let Some(NativeRunRoute::ExternalQueue {
+        queued_submission_id,
+        phase,
+        ..
+    }) = route
+    {
+        return apply_external_queued_command(
+            rpc,
+            run,
+            command,
+            queued_submission_id.as_deref(),
+            phase,
+        )
+        .await;
+    }
     let thread_id = run.execution.session_id.as_str();
     let turn_id = lock(&run.turn_id).clone().ok_or_else(|| {
         AgentProtocolError::new(
@@ -644,13 +1123,19 @@ async fn apply_native_command(
             .await
             .map_err(transport_to_protocol)?;
         }
-        AgentCommand::Cancel { .. } => {
-            rpc.request(
-                "turn/interrupt",
-                json!({"threadId": thread_id, "turnId": turn_id}),
-            )
-            .await
-            .map_err(transport_to_protocol)?;
+        AgentCommand::Cancel { reason } => {
+            *lock(&run.cancel_request) = Some((command.command_id.clone(), reason.clone()));
+            if let Err(error) = rpc
+                .request(
+                    "turn/interrupt",
+                    json!({"threadId": thread_id, "turnId": turn_id}),
+                )
+                .await
+            {
+                clear_cancel_request(run, &command.command_id);
+                return Err(transport_to_protocol(error));
+            }
+            publish_stop_requested(run, reason.clone(), command.command_id.clone());
         }
         AgentCommand::ResolveRequest { response } => {
             let request_id = command.request_id.as_ref().ok_or_else(|| {
@@ -704,6 +1189,530 @@ async fn apply_native_command(
         }
     }
     Ok(())
+}
+
+async fn apply_external_queued_command(
+    rpc: &CodexRpcClient,
+    run: &Arc<CodexRun>,
+    command: &AgentCommandEnvelope,
+    queued_submission_id: Option<&str>,
+    phase: ExternalQueuePhase,
+) -> Result<(), AgentProtocolError> {
+    match &command.payload {
+        AgentCommand::Cancel { reason }
+            if phase == ExternalQueuePhase::Queued && queued_submission_id.is_some() =>
+        {
+            let queued_submission_id = queued_submission_id.expect("guarded queued submission id");
+            *lock(&run.cancel_request) =
+                Some((command.command_id.clone(), reason.clone()));
+            let result = match rpc
+                .request(
+                    "thread/queue/delete",
+                    json!({
+                        "threadId": run.execution.session_id.as_str(),
+                        "queuedSubmissionId": queued_submission_id
+                    }),
+                )
+                .await
+            {
+                Ok(result) => result,
+                Err(
+                    error @ (CodexTransportError::Timeout
+                    | CodexTransportError::Closed
+                    | CodexTransportError::Disconnected(_)),
+                ) => {
+                    // The delete may or may not have reached Codex. Do not
+                    // publish StopRequested: if the queued turn subsequently
+                    // starts, that would create the illegal Host transition
+                    // Stopping -> RunStarted. The retryable transport error is
+                    // the only honest best-effort outcome.
+                    clear_cancel_request(run, &command.command_id);
+                    return Err(transport_to_protocol(error));
+                }
+                Err(error) => {
+                    clear_cancel_request(run, &command.command_id);
+                    return Err(transport_to_protocol(error));
+                }
+            };
+            if result.get("deleted").and_then(Value::as_bool) != Some(true) {
+                clear_cancel_request(run, &command.command_id);
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::InvalidTransition,
+                    "Codex queued message is no longer pending; its external owner may have started it",
+                ));
+            }
+            publish_cancelled(run, reason.clone(), command.command_id.clone());
+            Ok(())
+        }
+        AgentCommand::Cancel { .. } if phase == ExternalQueuePhase::Submitting => {
+            Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidTransition,
+                "Codex queue dispatch outcome is unknown; cancellation cannot be proven safe",
+            ))
+        }
+        AgentCommand::Cancel { .. } => Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::Unsupported,
+            "Codex external owner may already have started this queued turn; cancellation is unavailable across process ownership",
+        )),
+        AgentCommand::Steer { .. } => Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::Unsupported,
+            "Codex does not expose cross-process live steering; submit another queued message instead",
+        )),
+        AgentCommand::ResolveRequest { .. } => Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::Unsupported,
+            "Codex approvals are process-local to the external session owner",
+        )),
+        _ => Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::Unsupported,
+            "Codex external queued run does not support this command type",
+        )),
+    }
+}
+
+fn spawn_external_queue_monitor(rpc: Arc<CodexRpcClient>, run: Arc<CodexRun>) {
+    if run
+        .external_monitor_running
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    tokio::spawn(async move {
+        monitor_external_queued_run(rpc, Arc::clone(&run)).await;
+        run.external_monitor_running.store(false, Ordering::SeqCst);
+    });
+}
+
+async fn monitor_external_queued_run(rpc: Arc<CodexRpcClient>, run: Arc<CodexRun>) {
+    loop {
+        if run.terminal.load(Ordering::SeqCst) {
+            return;
+        }
+        match reconcile_external_queued_run(&rpc, &run).await {
+            Ok(
+                ExternalQueueObservation::Queued
+                | ExternalQueueObservation::TurnObserved
+                | ExternalQueueObservation::Missing,
+            ) => {
+                run.detached.store(false, Ordering::SeqCst);
+            }
+            Ok(ExternalQueueObservation::Terminal) => return,
+            Ok(ExternalQueueObservation::OutcomeUnknown) => {
+                detach_external_run(
+                    &run,
+                    "Codex no longer exposes the queued message or its resulting turn",
+                    true,
+                );
+                return;
+            }
+            Err(error) => {
+                run.detached.store(true, Ordering::SeqCst);
+                let _ = run.sender.send(Err(error));
+                return;
+            }
+        }
+        tokio::time::sleep(EXTERNAL_QUEUE_POLL_INTERVAL).await;
+    }
+}
+
+async fn reconcile_external_queued_run(
+    rpc: &CodexRpcClient,
+    run: &Arc<CodexRun>,
+) -> Result<ExternalQueueObservation, AgentProtocolError> {
+    let route = { lock(&run.route).clone() };
+    let (client_message_id, input_digest, phase) = match route {
+        Some(NativeRunRoute::ExternalQueue {
+            client_message_id,
+            input_digest,
+            phase,
+            ..
+        }) => (client_message_id, input_digest, phase),
+        _ => {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidTransition,
+                "Codex run is not routed through the external queue",
+            ));
+        }
+    };
+
+    if phase != ExternalQueuePhase::Started {
+        if let Some(submission) =
+            find_queued_submission(rpc, run.execution.session_id.as_str(), &client_message_id)
+                .await?
+        {
+            validate_correlated_input(
+                submission.get("input"),
+                &input_digest,
+                "Codex queued submission",
+            )?;
+            let submission_id = submission
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| protocol_error("Codex queued submission omitted id", false))?
+                .to_owned();
+            if let Some(NativeRunRoute::ExternalQueue {
+                queued_submission_id,
+                phase,
+                ambiguous_polls,
+                ..
+            }) = lock(&run.route).as_mut()
+            {
+                *queued_submission_id = Some(submission_id);
+                *phase = ExternalQueuePhase::Queued;
+                *ambiguous_polls = 0;
+            }
+            return Ok(ExternalQueueObservation::Queued);
+        }
+    }
+
+    if let Some(turn) =
+        find_external_turn(rpc, run.execution.session_id.as_str(), &client_message_id).await?
+    {
+        let correlated_input = turn
+            .get("items")
+            .and_then(Value::as_array)
+            .and_then(|items| {
+                items.iter().find_map(|item| {
+                    (item.get("type").and_then(Value::as_str) == Some("userMessage")
+                        && item.get("clientId").and_then(Value::as_str)
+                            == Some(client_message_id.as_str()))
+                    .then(|| item.get("content"))
+                    .flatten()
+                })
+            });
+        validate_correlated_input(correlated_input, &input_digest, "Codex queued turn")?;
+        let turn_id = turn
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| protocol_error("Codex queued turn omitted id", false))?;
+        establish_external_turn(run, turn_id)?;
+        observe_external_turn_items(run, &turn);
+
+        let status = turn.get("status").and_then(Value::as_str);
+        let terminal = external_turn_is_terminal(&turn);
+        if terminal {
+            if let Ok(items) =
+                load_external_turn_items(rpc, run.execution.session_id.as_str(), turn_id).await
+            {
+                let detailed = json!({"items": items});
+                observe_external_turn_items(run, &detailed);
+                restore_final_response(run, &detailed);
+            }
+            restore_final_response(run, &turn);
+            finish_run(run, Some(&turn));
+            return Ok(ExternalQueueObservation::Terminal);
+        }
+        if matches!(status, Some("inProgress" | "interrupted" | "failed")) {
+            return Ok(ExternalQueueObservation::TurnObserved);
+        }
+        return Err(protocol_error(
+            format!("Codex queued turn returned unsupported status: {status:?}"),
+            false,
+        ));
+    }
+
+    let exhausted = if let Some(NativeRunRoute::ExternalQueue {
+        ambiguous_polls, ..
+    }) = lock(&run.route).as_mut()
+    {
+        *ambiguous_polls = ambiguous_polls.saturating_add(1);
+        *ambiguous_polls >= EXTERNAL_QUEUE_AMBIGUOUS_POLL_LIMIT
+    } else {
+        true
+    };
+    Ok(if exhausted {
+        ExternalQueueObservation::OutcomeUnknown
+    } else {
+        ExternalQueueObservation::Missing
+    })
+}
+
+async fn find_queued_submission(
+    rpc: &CodexRpcClient,
+    thread_id: &str,
+    client_message_id: &str,
+) -> Result<Option<Value>, AgentProtocolError> {
+    let mut cursor = None;
+    let mut seen_cursors = BTreeSet::new();
+    loop {
+        let result = rpc
+            .request(
+                "thread/queue/list",
+                json!({
+                    "threadId": thread_id,
+                    "cursor": cursor,
+                    "limit": EXTERNAL_QUEUE_PAGE_LIMIT
+                }),
+            )
+            .await
+            .map_err(transport_to_protocol)?;
+        let data = result
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| protocol_error("Codex thread/queue/list omitted data", false))?;
+        if let Some(submission) = data.iter().find(|submission| {
+            submission
+                .get("clientUserMessageId")
+                .and_then(Value::as_str)
+                == Some(client_message_id)
+        }) {
+            return Ok(Some(submission.clone()));
+        }
+        cursor = next_page_cursor(&result, &mut seen_cursors, "thread/queue/list")?;
+        if cursor.is_none() {
+            return Ok(None);
+        }
+    }
+}
+
+async fn find_external_turn(
+    rpc: &CodexRpcClient,
+    thread_id: &str,
+    client_message_id: &str,
+) -> Result<Option<Value>, AgentProtocolError> {
+    let mut cursor = None;
+    let mut seen_cursors = BTreeSet::new();
+    loop {
+        let result = rpc
+            .request(
+                "thread/turns/list",
+                json!({
+                    "threadId": thread_id,
+                    "cursor": cursor,
+                    "limit": EXTERNAL_QUEUE_TURN_PAGE_LIMIT,
+                    "sortDirection": "desc",
+                    "itemsView": "summary"
+                }),
+            )
+            .await
+            .map_err(transport_to_protocol)?;
+        let turns = result
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| protocol_error("Codex thread/turns/list omitted data", false))?;
+        if let Some(turn) = turns
+            .iter()
+            .find(|turn| turn_contains_client_message(turn, client_message_id))
+        {
+            return Ok(Some(turn.clone()));
+        }
+        cursor = next_page_cursor(&result, &mut seen_cursors, "thread/turns/list")?;
+        if cursor.is_none() {
+            return Ok(None);
+        }
+    }
+}
+
+async fn load_external_turn_items(
+    rpc: &CodexRpcClient,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<Vec<Value>, AgentProtocolError> {
+    let mut cursor = None;
+    let mut seen_cursors = BTreeSet::new();
+    let mut items = Vec::new();
+    loop {
+        let result = rpc
+            .request(
+                "thread/items/list",
+                json!({
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "cursor": cursor,
+                    "limit": EXTERNAL_QUEUE_PAGE_LIMIT,
+                    "sortDirection": "asc"
+                }),
+            )
+            .await
+            .map_err(transport_to_protocol)?;
+        let entries = result
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| protocol_error("Codex thread/items/list omitted data", false))?;
+        items.extend(
+            entries
+                .iter()
+                .filter_map(|entry| entry.get("item").cloned()),
+        );
+        cursor = next_page_cursor(&result, &mut seen_cursors, "thread/items/list")?;
+        if cursor.is_none() {
+            return Ok(items);
+        }
+    }
+}
+
+fn next_page_cursor(
+    result: &Value,
+    seen: &mut BTreeSet<String>,
+    method: &str,
+) -> Result<Option<String>, AgentProtocolError> {
+    let Some(cursor) = result
+        .get("nextCursor")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return Ok(None);
+    };
+    if !seen.insert(cursor.clone()) {
+        return Err(protocol_error(
+            format!("Codex {method} repeated its pagination cursor"),
+            false,
+        ));
+    }
+    Ok(Some(cursor))
+}
+
+fn establish_external_turn(run: &Arc<CodexRun>, turn_id: &str) -> Result<(), AgentProtocolError> {
+    {
+        let mut stored_turn_id = lock(&run.turn_id);
+        if let Some(existing) = stored_turn_id.as_ref() {
+            if existing != turn_id {
+                return Err(protocol_error(
+                    "Codex correlated one queued message with multiple turns",
+                    false,
+                ));
+            }
+        } else {
+            *stored_turn_id = Some(turn_id.to_owned());
+        }
+    }
+    let should_publish_started = if let Some(NativeRunRoute::ExternalQueue {
+        phase,
+        ambiguous_polls,
+        ..
+    }) = lock(&run.route).as_mut()
+    {
+        let changed = *phase != ExternalQueuePhase::Started;
+        *phase = ExternalQueuePhase::Started;
+        *ambiguous_polls = 0;
+        changed
+    } else {
+        false
+    };
+    if should_publish_started {
+        publish_run_started(run);
+    }
+    Ok(())
+}
+
+fn validate_correlated_input(
+    input: Option<&Value>,
+    expected: &Digest,
+    source: &str,
+) -> Result<(), AgentProtocolError> {
+    let actual = input
+        .ok_or_else(|| protocol_error(format!("{source} omitted correlated input"), false))
+        .and_then(codex_user_input_digest)?;
+    if &actual != expected {
+        return Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::DuplicateConflict,
+            format!("{source} input changed after Orchestral submitted it"),
+        ));
+    }
+    Ok(())
+}
+
+fn codex_user_input_digest(input: &Value) -> Result<Digest, AgentProtocolError> {
+    let entries = input
+        .as_array()
+        .ok_or_else(|| protocol_error("Codex user input must be an array", false))?;
+    let text = entries
+        .iter()
+        .map(|entry| match entry.get("type").and_then(Value::as_str) {
+            Some("text") => entry
+                .get("text")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| protocol_error("Codex text input omitted text", false)),
+            kind => Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::Unsupported,
+                format!("Codex queued input contains unsupported item type: {kind:?}"),
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .join("\n");
+    Ok(Digest::sha256(text.into_bytes()))
+}
+
+fn detach_external_run(run: &CodexRun, message: impl Into<String>, retryable: bool) {
+    run.detached.store(true, Ordering::SeqCst);
+    let _ = run
+        .sender
+        .send(Err(protocol_error(message.into(), retryable)));
+}
+
+fn turn_contains_client_message(turn: &Value, client_message_id: &str) -> bool {
+    turn.get("items")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("type").and_then(Value::as_str) == Some("userMessage")
+                    && item.get("clientId").and_then(Value::as_str) == Some(client_message_id)
+            })
+        })
+}
+
+fn observe_external_turn_items(run: &Arc<CodexRun>, turn: &Value) {
+    let terminal = external_turn_is_terminal(turn);
+    let items = turn
+        .get("items")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let eligible = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            let item_type = item.get("type").and_then(Value::as_str);
+            let item_terminal = matches!(
+                item.get("status").and_then(Value::as_str),
+                Some("completed" | "failed" | "interrupted" | "declined")
+            );
+            item_type != Some("userMessage")
+                && (terminal || item_type != Some("agentMessage"))
+                && (terminal || item_terminal)
+        })
+        .collect::<Vec<_>>();
+    let eligible_len = eligible.len();
+    let edge = EXTERNAL_HISTORY_TELEMETRY_LIMIT / 2;
+    for (position, (index, item)) in eligible.into_iter().enumerate() {
+        // Telemetry is observational and non-durable. Keep a bounded first and
+        // latest window so a large historical turn cannot overflow the live
+        // broadcast and hide the durable terminal delivery from the Host.
+        if eligible_len > EXTERNAL_HISTORY_TELEMETRY_LIMIT
+            && position >= edge
+            && position < eligible_len - edge
+        {
+            continue;
+        }
+        let item_type = item.get("type").and_then(Value::as_str);
+        let item_id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{}-{index}", item_type.unwrap_or("item")));
+        if lock(&run.observed_item_ids).insert(item_id) {
+            handle_completed_item(run, Some(item));
+        }
+    }
+}
+
+fn external_turn_is_terminal(turn: &Value) -> bool {
+    match turn.get("status").and_then(Value::as_str) {
+        Some("completed" | "failed") => true,
+        // A non-owner Codex app-server normalizes an externally active turn to
+        // interrupted without completedAt. Requiring the completion marker here
+        // prevents a long-running external turn from being ended prematurely.
+        Some("interrupted") => external_turn_has_completed(turn),
+        _ => false,
+    }
+}
+
+fn external_turn_has_completed(turn: &Value) -> bool {
+    turn.get("completedAt")
+        .is_some_and(|value| !value.is_null())
 }
 
 async fn monitor_native_run(
@@ -793,6 +1802,10 @@ async fn monitor_native_run(
 
 fn establish_turn(run: &Arc<CodexRun>, turn_id: &str) {
     *lock(&run.turn_id) = Some(turn_id.to_owned());
+    publish_run_started(run);
+}
+
+fn publish_run_started(run: &Arc<CodexRun>) {
     publish_event(
         run,
         AgentEventDraft {
@@ -1063,7 +2076,7 @@ fn open_native_request(run: &Arc<CodexRun>, message: &Value, kind: PendingReques
 }
 
 fn finish_run(run: &Arc<CodexRun>, turn: Option<&Value>) {
-    if run.terminal.load(Ordering::SeqCst) {
+    if run.terminal.load(Ordering::SeqCst) || run.finalizing.load(Ordering::SeqCst) {
         return;
     }
     let status = turn
@@ -1072,71 +2085,62 @@ fn finish_run(run: &Arc<CodexRun>, turn: Option<&Value>) {
         .unwrap_or("failed");
     match status {
         "completed" => {
-            if run.terminal.swap(true, Ordering::SeqCst) {
-                return;
-            }
             let response = lock(&run.final_response).clone();
             let output_event_id = event_id(run, "output");
-            publish_event(
+            publish_terminal_events(
                 run,
-                AgentEventDraft {
-                    event_id: output_event_id.clone(),
-                    run_id: run.execution.run_id.clone(),
-                    causation_id: None,
-                    source_fingerprint: None,
-                    payload: AgentEvent::OutputCommitted {
-                        output_id: output_id(run),
-                        content: vec![Content::text(response.clone())],
+                vec![
+                    AgentEventDraft {
+                        event_id: output_event_id.clone(),
+                        run_id: run.execution.run_id.clone(),
+                        causation_id: None,
+                        source_fingerprint: None,
+                        payload: AgentEvent::OutputCommitted {
+                            output_id: output_id(run),
+                            content: vec![Content::text(response.clone())],
+                        },
                     },
-                },
-            );
-            publish_event(
-                run,
-                AgentEventDraft {
-                    event_id: event_id(run, "delivered"),
-                    run_id: run.execution.run_id.clone(),
-                    causation_id: None,
-                    source_fingerprint: None,
-                    payload: AgentEvent::DeliveryCommitted {
-                        delivery: AgentDelivery {
-                            delivery_id: DeliveryId::new(format!(
-                                "codex-{}-delivery",
-                                run.execution.run_id.as_str()
-                            )),
-                            run_id: run.execution.run_id.clone(),
-                            spec_digest: run.execution.spec_digest.clone(),
-                            final_response: Content::text(response),
-                            outputs: Vec::new(),
-                            artifacts: Vec::new(),
-                            unresolved_issues: Vec::new(),
-                            usage: None,
-                            provenance: Provenance {
-                                provider_id: run.execution.provider_id.clone(),
-                                agent_id: run.execution.agent_id.clone(),
-                                supporting_event_ids: vec![output_event_id],
-                                extensions: Extensions::new(),
+                    AgentEventDraft {
+                        event_id: event_id(run, "delivered"),
+                        run_id: run.execution.run_id.clone(),
+                        causation_id: None,
+                        source_fingerprint: None,
+                        payload: AgentEvent::DeliveryCommitted {
+                            delivery: AgentDelivery {
+                                delivery_id: DeliveryId::new(format!(
+                                    "codex-{}-delivery",
+                                    run.execution.run_id.as_str()
+                                )),
+                                run_id: run.execution.run_id.clone(),
+                                spec_digest: run.execution.spec_digest.clone(),
+                                final_response: Content::text(response),
+                                outputs: Vec::new(),
+                                artifacts: Vec::new(),
+                                unresolved_issues: Vec::new(),
+                                usage: None,
+                                provenance: Provenance {
+                                    provider_id: run.execution.provider_id.clone(),
+                                    agent_id: run.execution.agent_id.clone(),
+                                    supporting_event_ids: vec![output_event_id],
+                                    extensions: Extensions::new(),
+                                },
                             },
                         },
                     },
-                },
+                ],
             );
         }
         "interrupted" => {
-            if run.terminal.swap(true, Ordering::SeqCst) {
-                return;
-            }
-            publish_event(
-                run,
-                AgentEventDraft {
-                    event_id: event_id(run, "cancelled"),
-                    run_id: run.execution.run_id.clone(),
-                    causation_id: None,
-                    source_fingerprint: None,
-                    payload: AgentEvent::RunCancelled {
-                        reason: "Codex turn was interrupted".to_owned(),
+            if let Some((command_id, reason)) = lock(&run.cancel_request).clone() {
+                publish_cancelled(run, reason, command_id);
+            } else {
+                publish_incomplete(
+                    run,
+                    IncompleteReason::Interrupted {
+                        reason: "Codex turn was interrupted by its native owner".to_owned(),
                     },
-                },
-            )
+                );
+            }
         }
         _ => {
             let message = turn
@@ -1165,12 +2169,9 @@ fn restore_final_response(run: &CodexRun, turn: &Value) {
 }
 
 fn publish_failure(run: &Arc<CodexRun>, code: &str, message: &str, retryable: bool) {
-    if run.terminal.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    publish_event(
+    publish_terminal_events(
         run,
-        AgentEventDraft {
+        vec![AgentEventDraft {
             event_id: event_id(run, "failed"),
             run_id: run.execution.run_id.clone(),
             causation_id: None,
@@ -1183,12 +2184,128 @@ fn publish_failure(run: &Arc<CodexRun>, code: &str, message: &str, retryable: bo
                     details: Value::Null,
                 },
             },
-        },
+        }],
     );
 }
 
+fn publish_incomplete(run: &Arc<CodexRun>, reason: IncompleteReason) {
+    publish_terminal_events(
+        run,
+        vec![AgentEventDraft {
+            event_id: event_id(run, "incomplete"),
+            run_id: run.execution.run_id.clone(),
+            causation_id: None,
+            source_fingerprint: None,
+            payload: AgentEvent::RunIncomplete {
+                reason,
+                partial_delivery: None,
+            },
+        }],
+    );
+}
+
+fn publish_stop_requested(run: &Arc<CodexRun>, reason: String, command_id: CommandId) {
+    if run.finalizing.load(Ordering::SeqCst) || run.terminal.load(Ordering::SeqCst) {
+        return;
+    }
+    let mut durable = lock(&run.durable);
+    if run.finalizing.load(Ordering::SeqCst)
+        || run.terminal.load(Ordering::SeqCst)
+        || run.stop_requested_published.load(Ordering::SeqCst)
+    {
+        return;
+    }
+    append_event_locked(
+        run,
+        &mut durable,
+        AgentEventDraft {
+            event_id: event_id(run, "stop-requested"),
+            run_id: run.execution.run_id.clone(),
+            causation_id: Some(command_id),
+            source_fingerprint: None,
+            payload: AgentEvent::StopRequested { reason },
+        },
+    );
+    run.stop_requested_published.store(true, Ordering::SeqCst);
+}
+
+fn publish_cancelled(run: &Arc<CodexRun>, reason: String, command_id: CommandId) {
+    if run
+        .finalizing
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    let mut durable = lock(&run.durable);
+    if !run.stop_requested_published.load(Ordering::SeqCst) {
+        append_event_locked(
+            run,
+            &mut durable,
+            AgentEventDraft {
+                event_id: event_id(run, "stop-requested"),
+                run_id: run.execution.run_id.clone(),
+                causation_id: Some(command_id),
+                source_fingerprint: None,
+                payload: AgentEvent::StopRequested {
+                    reason: reason.clone(),
+                },
+            },
+        );
+        run.stop_requested_published.store(true, Ordering::SeqCst);
+    }
+    append_event_locked(
+        run,
+        &mut durable,
+        AgentEventDraft {
+            event_id: event_id(run, "cancelled"),
+            run_id: run.execution.run_id.clone(),
+            causation_id: None,
+            source_fingerprint: None,
+            payload: AgentEvent::RunCancelled { reason },
+        },
+    );
+    run.terminal.store(true, Ordering::SeqCst);
+}
+
+fn clear_cancel_request(run: &CodexRun, command_id: &CommandId) {
+    let mut pending = lock(&run.cancel_request);
+    if pending
+        .as_ref()
+        .is_some_and(|(pending_id, _)| pending_id == command_id)
+    {
+        *pending = None;
+    }
+}
+
+fn publish_terminal_events(run: &Arc<CodexRun>, drafts: Vec<AgentEventDraft>) {
+    if run
+        .finalizing
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    let mut durable = lock(&run.durable);
+    for draft in drafts {
+        append_event_locked(run, &mut durable, draft);
+    }
+    run.terminal.store(true, Ordering::SeqCst);
+}
+
 fn publish_event(run: &Arc<CodexRun>, draft: AgentEventDraft) {
-    lock(&run.durable).push(draft.clone());
+    if run.finalizing.load(Ordering::SeqCst) || run.terminal.load(Ordering::SeqCst) {
+        return;
+    }
+    let mut durable = lock(&run.durable);
+    if run.finalizing.load(Ordering::SeqCst) || run.terminal.load(Ordering::SeqCst) {
+        return;
+    }
+    append_event_locked(run, &mut durable, draft);
+}
+
+fn append_event_locked(run: &CodexRun, durable: &mut Vec<AgentEventDraft>, draft: AgentEventDraft) {
+    durable.push(draft.clone());
     let _ = run
         .sender
         .send(Ok(AgentProviderStreamItem::Event(Box::new(draft))));
@@ -1210,13 +2327,18 @@ fn publish_telemetry(run: &Arc<CodexRun>, payload: AgentTelemetry) {
 }
 
 fn stream_for(run: &CodexRun) -> AgentProviderStream {
-    let receiver = run.sender.subscribe();
-    let replay = lock(&run.durable)
-        .clone()
+    let (receiver, replay, closed) = {
+        let durable = lock(&run.durable);
+        let receiver = run.sender.subscribe();
+        let replay = durable.clone();
+        let closed = run.terminal.load(Ordering::SeqCst) || run.detached.load(Ordering::SeqCst);
+        (receiver, replay, closed)
+    };
+    let replay = replay
         .into_iter()
         .map(|draft| Ok(AgentProviderStreamItem::Event(Box::new(draft))));
     let replay = stream::iter(replay);
-    if run.terminal.load(Ordering::SeqCst) || run.detached.load(Ordering::SeqCst) {
+    if closed {
         return replay.boxed();
     }
     let live = stream::unfold(receiver, |mut receiver| async move {
@@ -1434,7 +2556,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn active_writer_is_a_typed_session_conflict() {
+    fn active_writer_actions_remain_a_typed_session_conflict() {
         let error = start_transport_error(
             CodexTransportError::Rpc("thread fixture already has an active writer".to_owned()),
             false,
@@ -1446,6 +2568,789 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn dispatch_claim_is_atomic_across_connector_instances() {
+        let fixture = tempfile::TempDir::new().unwrap();
+        let dispatch_dir = fixture.path().join("dispatch");
+        let (client_io, _server_io) = duplex(64 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let rpc =
+            CodexRpcClient::from_io(client_read, client_write, Duration::from_secs(1), 64 * 1024);
+        let mut first = CodexConnector::with_client(rpc.clone(), "codex/test-first");
+        first.config.dispatch_journal_dir = Some(dispatch_dir.clone());
+        let mut second = CodexConnector::with_client(rpc, "codex/test-second");
+        second.config.dispatch_journal_dir = Some(dispatch_dir.clone());
+        let run = test_run("thread-claim", "run-claim");
+        let client_message_id = queued_client_message_id(&run.execution);
+        let input_digest =
+            codex_user_input_digest(&json!([{"type": "text", "text": "fix the failing test"}]))
+                .unwrap();
+
+        assert!(matches!(
+            first
+                .claim_external_queue_dispatch(&run, &client_message_id, &input_digest)
+                .unwrap(),
+            DispatchClaim::Acquired(_)
+        ));
+        assert!(matches!(
+            second
+                .claim_external_queue_dispatch(&run, &client_message_id, &input_digest)
+                .unwrap(),
+            DispatchClaim::Existing
+        ));
+        assert_eq!(fs::read_dir(dispatch_dir).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_dispatch_claim_releases_the_session_reservation() {
+        let fixture = tempfile::TempDir::new().unwrap();
+        let blocking_file = fixture.path().join("not-a-directory");
+        fs::write(&blocking_file, b"fixture").unwrap();
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let mut connector = CodexConnector::with_client(rpc, "codex/test");
+        connector.config.dispatch_journal_dir = Some(blocking_file.join("dispatch"));
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            let resume = next_request(&mut lines).await;
+            server_write_error(
+                &mut server_write,
+                &resume,
+                "thread already has an active writer",
+            )
+            .await;
+            for _ in 0..2 {
+                let request = next_request(&mut lines).await;
+                server_write_result(
+                    &mut server_write,
+                    &request,
+                    json!({"data": [], "nextCursor": null}),
+                )
+                .await;
+            }
+        });
+
+        match connector
+            .start(start_request("thread-claim-failure", "run-claim-failure"))
+            .await
+        {
+            Err(AgentStartError::Rejected(AgentRejection {
+                code: AgentRejectionCode::ProviderUnavailable,
+                ..
+            })) => {}
+            Err(error) => panic!("unexpected dispatch claim error: {error}"),
+            Ok(_) => panic!("invalid dispatch journal unexpectedly accepted a run"),
+        }
+        {
+            let state = connector.provider_state();
+            assert!(state.runs.is_empty());
+            assert!(state.sessions.is_empty());
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn persisted_claim_prevents_readd_during_dequeue_history_gap() {
+        let fixture = tempfile::TempDir::new().unwrap();
+        let dispatch_dir = fixture.path().join("dispatch");
+        let captured_add = Arc::new(Mutex::new(None));
+
+        let (first_io, first_server_io) = duplex(1024 * 1024);
+        let (first_read, first_write) = tokio::io::split(first_io);
+        let (first_server_read, mut first_server_write) = tokio::io::split(first_server_io);
+        let first_rpc = CodexRpcClient::from_io(
+            first_read,
+            first_write,
+            Duration::from_millis(30),
+            1024 * 1024,
+        );
+        let mut first = CodexConnector::with_client(first_rpc, "codex/test-first");
+        first.config.dispatch_journal_dir = Some(dispatch_dir.clone());
+        let captured_for_server = Arc::clone(&captured_add);
+        let first_server = tokio::spawn(async move {
+            let mut lines = BufReader::new(first_server_read).lines();
+            let resume = next_request(&mut lines).await;
+            server_write_error(
+                &mut first_server_write,
+                &resume,
+                "thread already has an active writer",
+            )
+            .await;
+            for _ in 0..2 {
+                let request = next_request(&mut lines).await;
+                server_write_result(
+                    &mut first_server_write,
+                    &request,
+                    json!({"data": [], "nextCursor": null}),
+                )
+                .await;
+            }
+            let add = next_request(&mut lines).await;
+            assert_eq!(add["method"], "thread/queue/add");
+            *lock(&captured_for_server) = Some(add);
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        });
+        let request = start_request("thread-gap", "run-gap");
+        let first_result = first.start(request.clone()).await;
+        match first_result {
+            Err(AgentStartError::OutcomeUnknown(_)) => {}
+            Err(error) => panic!("unexpected first dispatch error: {error}"),
+            Ok(_) => panic!("lost queue/add response unexpectedly confirmed start"),
+        }
+        first_server.await.unwrap();
+        let add = lock(&captured_add).clone().unwrap();
+
+        let (second_io, second_server_io) = duplex(1024 * 1024);
+        let (second_read, second_write) = tokio::io::split(second_io);
+        let (second_server_read, mut second_server_write) = tokio::io::split(second_server_io);
+        let second_rpc = CodexRpcClient::from_io(
+            second_read,
+            second_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let mut second = CodexConnector::with_client(second_rpc, "codex/test-second");
+        second.config.dispatch_journal_dir = Some(dispatch_dir);
+        let second_server = tokio::spawn(async move {
+            let mut lines = BufReader::new(second_server_read).lines();
+            let resume = next_request(&mut lines).await;
+            server_write_error(
+                &mut second_server_write,
+                &resume,
+                "thread already has an active writer",
+            )
+            .await;
+            for _ in 0..2 {
+                let request = next_request(&mut lines).await;
+                server_write_result(
+                    &mut second_server_write,
+                    &request,
+                    json!({"data": [], "nextCursor": null}),
+                )
+                .await;
+            }
+            let observed = next_request(&mut lines).await;
+            assert_eq!(observed["method"], "thread/queue/list");
+            server_write_result(
+                &mut second_server_write,
+                &observed,
+                json!({
+                    "data": [{
+                        "id": "already-dispatched",
+                        "input": add["params"]["input"],
+                        "clientUserMessageId": add["params"]["clientUserMessageId"]
+                    }],
+                    "nextCursor": null
+                }),
+            )
+            .await;
+        });
+
+        second
+            .start(request)
+            .await
+            .expect("a persisted dispatch claim must observe instead of re-adding");
+        second_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_writer_routes_user_message_through_durable_queue() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let connector = CodexConnector::with_client(rpc, "codex/test");
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            let resume = next_request(&mut lines).await;
+            assert_eq!(resume["method"], "thread/resume");
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({
+                            "id": resume["id"],
+                            "error": {
+                                "code": -32000,
+                                "message": "thread thread-external already has an active writer"
+                            }
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let preflight_queue = next_request(&mut lines).await;
+            assert_eq!(preflight_queue["method"], "thread/queue/list");
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"id": preflight_queue["id"], "result": {"data": [], "nextCursor": null}})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let preflight_turns = next_request(&mut lines).await;
+            assert_eq!(preflight_turns["method"], "thread/turns/list");
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"id": preflight_turns["id"], "result": {"data": [], "nextCursor": null}})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let queue = next_request(&mut lines).await;
+            assert_eq!(queue["method"], "thread/queue/add");
+            assert_eq!(queue["params"]["threadId"], "thread-external");
+            let client_message_id = queue["params"]["clientUserMessageId"]
+                .as_str()
+                .expect("queue client id")
+                .to_owned();
+            assert!(client_message_id.starts_with("orchestral:run-external:"));
+            assert_eq!(queue["params"]["input"][0]["text"], "fix the failing test");
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({
+                            "id": queue["id"],
+                            "result": {
+                                "queuedSubmission": {
+                                    "id": "queued-1",
+                                    "input": queue["params"]["input"],
+                                    "clientUserMessageId": client_message_id
+                                }
+                            }
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let queued = next_request(&mut lines).await;
+            assert_eq!(queued["method"], "thread/queue/list");
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({
+                            "id": queued["id"],
+                            "result": {
+                                "data": [{
+                                    "id": "queued-1",
+                                    "input": [{"type": "text", "text": "fix the failing test", "text_elements": []}],
+                                    "clientUserMessageId": client_message_id
+                                }],
+                                "nextCursor": null
+                            }
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let consumed = next_request(&mut lines).await;
+            assert_eq!(consumed["method"], "thread/queue/list");
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"id": consumed["id"], "result": {"data": [], "nextCursor": null}})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let turns = next_request(&mut lines).await;
+            assert_eq!(turns["method"], "thread/turns/list");
+            assert_eq!(turns["params"]["sortDirection"], "desc");
+            assert_eq!(turns["params"]["itemsView"], "summary");
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({
+                            "id": turns["id"],
+                            "result": {
+                                "data": [{
+                                    "id": "turn-external",
+                                    "status": "interrupted",
+                                    "completedAt": null,
+                                    "items": [
+                                        {
+                                            "type": "userMessage",
+                                            "id": "user-external",
+                                            "clientId": client_message_id,
+                                            "content": [{"type": "text", "text": "fix the failing test"}]
+                                        }
+                                    ]
+                                }],
+                                "nextCursor": null
+                            }
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let completed_turns = next_request(&mut lines).await;
+            assert_eq!(completed_turns["method"], "thread/turns/list");
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({
+                            "id": completed_turns["id"],
+                            "result": {
+                                "data": [{
+                                    "id": "turn-external",
+                                    "status": "completed",
+                                    "completedAt": 1_788_000_000,
+                                    "items": [
+                                        {
+                                            "type": "userMessage",
+                                            "id": "user-external",
+                                            "clientId": client_message_id,
+                                            "content": [{"type": "text", "text": "fix the failing test"}]
+                                        },
+                                        {
+                                            "type": "agentMessage",
+                                            "id": "agent-external",
+                                            "text": "queued work completed"
+                                        }
+                                    ]
+                                }],
+                                "nextCursor": null
+                            }
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let items = next_request(&mut lines).await;
+            assert_eq!(items["method"], "thread/items/list");
+            assert_eq!(items["params"]["turnId"], "turn-external");
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({
+                            "id": items["id"],
+                            "result": {
+                                "data": [
+                                    {"turnId": "turn-external", "item": {
+                                        "type": "userMessage", "id": "user-external",
+                                        "clientId": client_message_id,
+                                        "content": [{"type": "text", "text": "fix the failing test"}]
+                                    }},
+                                    {"turnId": "turn-external", "item": {
+                                        "type": "commandExecution", "id": "command-external",
+                                        "command": "cargo test", "status": "completed"
+                                    }},
+                                    {"turnId": "turn-external", "item": {
+                                        "type": "agentMessage", "id": "agent-external",
+                                        "text": "queued work completed"
+                                    }}
+                                ],
+                                "nextCursor": null,
+                                "backwardsCursor": null
+                            }
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+
+        let mut stream = connector
+            .start(start_request("thread-external", "run-external"))
+            .await
+            .expect("active writer must accept a durable queued message")
+            .stream;
+        let mut delivered = None;
+        let mut saw_tool = false;
+        while let Some(item) = timeout(Duration::from_secs(4), stream.next())
+            .await
+            .expect("queued run stream timed out")
+        {
+            match item.unwrap() {
+                AgentProviderStreamItem::Event(event) => {
+                    if let AgentEvent::DeliveryCommitted { delivery } = event.payload {
+                        delivered = Some(delivery);
+                        break;
+                    }
+                }
+                AgentProviderStreamItem::Telemetry(telemetry) => {
+                    saw_tool |= matches!(telemetry.payload, AgentTelemetry::ToolActivity { .. });
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            delivered.expect("queued run must deliver").final_response,
+            Content::text("queued work completed")
+        );
+        assert!(saw_tool);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lost_queue_add_response_is_reconciled_without_duplicate_submission() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_millis(40),
+            1024 * 1024,
+        );
+        let connector = CodexConnector::with_client(rpc, "codex/test");
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            let resume = next_request(&mut lines).await;
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"id": resume["id"], "error": {"code": -32000, "message": "thread already has an active writer"}})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let preflight_queue = next_request(&mut lines).await;
+            assert_eq!(preflight_queue["method"], "thread/queue/list");
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"id": preflight_queue["id"], "result": {"data": [], "nextCursor": null}})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let preflight_turns = next_request(&mut lines).await;
+            assert_eq!(preflight_turns["method"], "thread/turns/list");
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"id": preflight_turns["id"], "result": {"data": [], "nextCursor": null}})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let add = next_request(&mut lines).await;
+            assert_eq!(add["method"], "thread/queue/add");
+            let client_id = add["params"]["clientUserMessageId"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            // Deliberately lose the add response. The next request must inspect
+            // the durable queue, never dispatch a second queue/add.
+            let reconcile = next_request(&mut lines).await;
+            assert_eq!(reconcile["method"], "thread/queue/list");
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({
+                            "id": reconcile["id"],
+                            "result": {
+                                "data": [{
+                                    "id": "queued-after-timeout",
+                                    "input": add["params"]["input"],
+                                    "clientUserMessageId": client_id
+                                }],
+                                "nextCursor": null
+                            }
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let monitored = next_request(&mut lines).await;
+            assert_eq!(monitored["method"], "thread/queue/list");
+        });
+
+        let request = start_request("thread-timeout", "run-timeout");
+        assert!(matches!(
+            connector.start(request.clone()).await,
+            Err(AgentStartError::OutcomeUnknown(_))
+        ));
+        let retried = connector
+            .start(request)
+            .await
+            .expect("same immutable start must reconcile the queued message");
+        assert_eq!(retried.execution.run_id, RunId::new("run-timeout"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_queue_reconciliation_follows_opaque_pagination_cursors() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            let queue_page_one = next_request(&mut lines).await;
+            assert_eq!(queue_page_one["method"], "thread/queue/list");
+            assert!(queue_page_one["params"]["cursor"].is_null());
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"id": queue_page_one["id"], "result": {
+                            "data": [{"id": "other", "input": [], "clientUserMessageId": "other"}],
+                            "nextCursor": "queue-page-2"
+                        }})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let queue_page_two = next_request(&mut lines).await;
+            assert_eq!(queue_page_two["params"]["cursor"], "queue-page-2");
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"id": queue_page_two["id"], "result": {
+                            "data": [{"id": "target", "input": [{"type": "text", "text": "target"}], "clientUserMessageId": "target-client"}],
+                            "nextCursor": null
+                        }})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let turns_page_one = next_request(&mut lines).await;
+            assert_eq!(turns_page_one["method"], "thread/turns/list");
+            assert!(turns_page_one["params"]["cursor"].is_null());
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"id": turns_page_one["id"], "result": {
+                            "data": [{"id": "other-turn", "status": "completed", "items": []}],
+                            "nextCursor": "turn-page-2",
+                            "backwardsCursor": "do-not-use"
+                        }})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let turns_page_two = next_request(&mut lines).await;
+            assert_eq!(turns_page_two["params"]["cursor"], "turn-page-2");
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"id": turns_page_two["id"], "result": {
+                            "data": [{"id": "target-turn", "status": "inProgress", "items": [{
+                                "type": "userMessage", "id": "target-user", "clientId": "target-client",
+                                "content": [{"type": "text", "text": "target"}]
+                            }]}],
+                            "nextCursor": null,
+                            "backwardsCursor": "ignored"
+                        }})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+
+        let queued = find_queued_submission(&rpc, "thread-pages", "target-client")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(queued["id"], "target");
+        let turn = find_external_turn(&rpc, "thread-pages", "target-client")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(turn["id"], "target-turn");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconstructs_a_queued_run_after_provider_restart_without_readding() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let connector = CodexConnector::with_client(rpc, "codex/test");
+        let descriptor = CodexConnector::provider_descriptor();
+        let start = start_request("thread-restart", "run-restart");
+        let execution = AgentExecutionRef::for_start(&start, &descriptor).unwrap();
+        let client_id = queued_client_message_id(&execution);
+        let expected_client_id = client_id.clone();
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            for _ in 0..2 {
+                let list = next_request(&mut lines).await;
+                assert_eq!(list["method"], "thread/queue/list");
+                server_write
+                    .write_all(
+                        format!(
+                            "{}\n",
+                            json!({"id": list["id"], "result": {
+                                "data": [{
+                                    "id": "queued-before-restart",
+                                    "input": [{"type": "text", "text": "fix the failing test"}],
+                                    "clientUserMessageId": expected_client_id
+                                }],
+                                "nextCursor": null
+                            }})
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let recovery = AgentRecoveryRequest::new(start, execution.clone(), &descriptor).unwrap();
+        let recovered = connector.recover(recovery).await.unwrap();
+        let (_stream, confirmation) = recovered.into_parts();
+        confirmation.await.unwrap();
+        assert!(client_id.starts_with("orchestral:run-restart:"));
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn external_history_telemetry_is_bounded_and_keeps_both_edges() {
+        let run = test_run("thread-history", "run-history");
+        let items = (0..700)
+            .map(|index| {
+                json!({
+                    "type": "commandExecution",
+                    "id": format!("command-{index}"),
+                    "command": format!("command {index}"),
+                    "status": "completed"
+                })
+            })
+            .collect::<Vec<_>>();
+        observe_external_turn_items(&run, &json!({"status": "completed", "items": items}));
+
+        assert_eq!(
+            run.telemetry_seq.load(Ordering::SeqCst),
+            EXTERNAL_HISTORY_TELEMETRY_LIMIT as u64
+        );
+        let observed = lock(&run.observed_item_ids);
+        assert!(observed.contains("command-0"));
+        assert!(observed.contains("command-699"));
+        assert!(!observed.contains("command-350"));
+    }
+
+    #[test]
+    fn failed_without_timestamp_is_terminal_but_external_interrupted_is_ambiguous() {
+        assert!(external_turn_is_terminal(
+            &json!({"status": "failed", "completedAt": null})
+        ));
+        assert!(!external_turn_is_terminal(
+            &json!({"status": "interrupted", "completedAt": null})
+        ));
+        assert!(external_turn_is_terminal(
+            &json!({"status": "interrupted", "completedAt": 1})
+        ));
+    }
+
+    #[tokio::test]
+    async fn queued_cancel_uses_exact_delete_and_lost_response_stays_ambiguous() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, _server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_millis(25),
+            1024 * 1024,
+        );
+        let run = test_run("thread-cancel-queued", "run-cancel-queued");
+        let command = AgentCommandEnvelope::new(
+            CommandId::new("cancel-queued"),
+            run.execution.run_id.clone(),
+            None,
+            AgentCommand::Cancel {
+                reason: "stop queued work".to_owned(),
+            },
+        )
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            let delete = next_request(&mut lines).await;
+            assert_eq!(delete["method"], "thread/queue/delete");
+            assert_eq!(delete["params"]["threadId"], "thread-cancel-queued");
+            assert_eq!(delete["params"]["queuedSubmissionId"], "queued-cancel");
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        });
+
+        let error = apply_external_queued_command(
+            &rpc,
+            &run,
+            &command,
+            Some("queued-cancel"),
+            ExternalQueuePhase::Queued,
+        )
+        .await
+        .expect_err("lost delete response must remain an ambiguous best-effort stop");
+        assert_eq!(error.code, AgentProtocolErrorCode::ProviderUnavailable);
+        assert!(error.retryable);
+        assert!(!run.terminal.load(Ordering::SeqCst));
+        assert!(!lock(&run.durable)
+            .iter()
+            .any(|event| matches!(event.payload, AgentEvent::StopRequested { .. })));
+        assert!(!lock(&run.durable)
+            .iter()
+            .any(|event| matches!(event.payload, AgentEvent::RunCancelled { .. })));
+        server.await.unwrap();
     }
 
     fn start_request(session_id: &str, run_id: &str) -> AgentStartRequest {
@@ -1462,6 +3367,13 @@ mod tests {
             &descriptor,
         )
         .unwrap()
+    }
+
+    fn test_run(session_id: &str, run_id: &str) -> Arc<CodexRun> {
+        let descriptor = CodexConnector::provider_descriptor();
+        let request = start_request(session_id, run_id);
+        let execution = AgentExecutionRef::for_start(&request, &descriptor).unwrap();
+        new_codex_run(request, execution, AgentAdmission::default())
     }
 
     fn action_start_request(
@@ -1498,14 +3410,42 @@ mod tests {
         serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap()
     }
 
+    async fn server_write_result(
+        writer: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        request: &Value,
+        result: Value,
+    ) {
+        writer
+            .write_all(format!("{}\n", json!({"id": request["id"], "result": result})).as_bytes())
+            .await
+            .unwrap();
+    }
+
+    async fn server_write_error(
+        writer: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        request: &Value,
+        message: &str,
+    ) {
+        writer
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"id": request["id"], "error": {"code": -32000, "message": message}})
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn descriptor_promises_only_implemented_controls() {
         let descriptor = CodexConnector::provider_descriptor();
         assert!(descriptor.descriptor.capabilities.session_reuse);
-        assert!(descriptor.descriptor.capabilities.controls.steer);
+        assert!(!descriptor.descriptor.capabilities.controls.steer);
         assert_eq!(
             descriptor.descriptor.capabilities.controls.cancel,
-            CancelSupport::Confirmed
+            CancelSupport::BestEffort
         );
         assert!(descriptor.descriptor.capabilities.controls.recover);
         assert_eq!(
@@ -2000,6 +3940,86 @@ mod tests {
             view.delivery.unwrap().final_response,
             Content::text("verified")
         );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn host_controller_accepts_confirmed_direct_cancellation_sequence() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let connector = Arc::new(CodexConnector::with_client(rpc, "codex/test"));
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            let resume = next_request(&mut lines).await;
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"id": resume["id"], "result": {"thread": {"id": "thread-cancel"}}})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let start = next_request(&mut lines).await;
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"id": start["id"], "result": {"turn": {"id": "turn-cancel", "status": "inProgress", "items": []}}})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let interrupt = next_request(&mut lines).await;
+            assert_eq!(interrupt["method"], "turn/interrupt");
+            server_write
+                .write_all(format!("{}\n", json!({"id": interrupt["id"], "result": {}})).as_bytes())
+                .await
+                .unwrap();
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"method": "turn/completed", "params": {"threadId": "thread-cancel", "turn": {"id": "turn-cancel", "status": "interrupted", "items": []}}})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let provider: Arc<dyn AgentProvider> = connector;
+        let controller = Arc::new(
+            AgentController::new(provider, ProviderBindingRef::new("codex/local")).unwrap(),
+        );
+        let run = AgentRunEnvelope::new(
+            ProtocolVersion::new(1, 0),
+            AgentSessionId::new("thread-cancel"),
+            RunId::new("run-cancel"),
+            vec![Content::text("cancel me")],
+        )
+        .unwrap();
+        let execution = controller.start(run).await.unwrap();
+        controller
+            .cancel(&execution.run_id, "user stopped")
+            .await
+            .unwrap();
+        let view = timeout(
+            Duration::from_secs(1),
+            controller.wait_for_terminal(&execution.run_id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(view.state.status(), AgentRunStatus::Cancelled);
         server.await.unwrap();
     }
 

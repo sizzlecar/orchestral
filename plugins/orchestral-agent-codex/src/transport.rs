@@ -78,6 +78,11 @@ async fn start_shared_daemon(config: &CodexAppServerConfig) -> Result<(), CodexT
 pub struct CodexAppServerConfig {
     pub executable: PathBuf,
     pub endpoint: CodexAppServerEndpoint,
+    /// Durable at-most-once claims for cross-process `thread/queue/add`.
+    ///
+    /// Codex does not deduplicate `clientUserMessageId`, so the connector must
+    /// record intent before dispatch whenever another process owns the thread.
+    pub dispatch_journal_dir: Option<PathBuf>,
     pub request_timeout: Duration,
     pub max_frame_bytes: usize,
     pub daemon_start_timeout: Duration,
@@ -88,11 +93,46 @@ impl Default for CodexAppServerConfig {
         Self {
             executable: PathBuf::from("codex"),
             endpoint: default_endpoint(),
+            dispatch_journal_dir: default_dispatch_journal_dir(),
             request_timeout: Duration::from_secs(30),
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             daemon_start_timeout: DEFAULT_DAEMON_START_TIMEOUT,
         }
     }
+}
+
+fn default_dispatch_journal_dir() -> Option<PathBuf> {
+    if let Some(root) = std::env::var_os("ORCHESTRAL_HOME").filter(|value| !value.is_empty()) {
+        return Some(
+            PathBuf::from(root)
+                .join("agent-connectors")
+                .join("codex-local")
+                .join("dispatch"),
+        );
+    }
+    if let Some(root) = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
+        return Some(
+            PathBuf::from(root)
+                .join("orchestral")
+                .join("agent-connectors")
+                .join("codex-local")
+                .join("dispatch"),
+        );
+    }
+    if let Some(root) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
+        return Some(
+            PathBuf::from(root).join(".config/orchestral/agent-connectors/codex-local/dispatch"),
+        );
+    }
+    std::env::var_os("APPDATA")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(|root| {
+            root.join("orchestral")
+                .join("agent-connectors")
+                .join("codex-local")
+                .join("dispatch")
+        })
 }
 
 fn default_endpoint() -> CodexAppServerEndpoint {
@@ -239,6 +279,9 @@ impl CodexRpcClient {
                         "name": "orchestral",
                         "title": "Orchestral",
                         "version": env!("CARGO_PKG_VERSION")
+                    },
+                    "capabilities": {
+                        "experimentalApi": true
                     }
                 }),
             )
@@ -810,6 +853,10 @@ mod tests {
                 WebSocketMessage::Text(text) => serde_json::from_str::<Value>(&text).unwrap(),
                 other => panic!("unexpected initialize frame: {other:?}"),
             };
+            assert_eq!(
+                initialize["params"]["capabilities"]["experimentalApi"],
+                true
+            );
             websocket
                 .send(WebSocketMessage::Text(
                     json!({
