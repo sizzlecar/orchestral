@@ -702,6 +702,21 @@ pub struct UiState {
     pub notice: Option<Notice>,
 }
 
+impl UiState {
+    pub fn show_notice(&mut self, notice: Notice) {
+        self.notice = Some(notice);
+    }
+
+    pub fn dismiss_notice(&mut self, id: u64) -> bool {
+        if self.notice.as_ref().is_some_and(|notice| notice.id == id) {
+            self.notice = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
     pub message: String,
@@ -1335,5 +1350,25 @@ mod tests {
         assert!(
             matches!(&timeline[2], TimelineItem::Message(message) if message.role == "assistant")
         );
+    }
+
+    #[test]
+    fn an_old_notice_timeout_cannot_dismiss_a_newer_error() {
+        let mut ui = UiState::default();
+        ui.show_notice(Notice {
+            message: "first".to_owned(),
+            tone: "error".to_owned(),
+            id: 1,
+        });
+        ui.show_notice(Notice {
+            message: "second".to_owned(),
+            tone: "error".to_owned(),
+            id: 2,
+        });
+
+        assert!(!ui.dismiss_notice(1));
+        assert_eq!(ui.notice.as_ref().map(|notice| notice.id), Some(2));
+        assert!(ui.dismiss_notice(2));
+        assert!(ui.notice.is_none());
     }
 }

@@ -1103,10 +1103,16 @@ impl AppController {
 
     pub fn notice(mut self, message: &str, tone: &str) {
         let id = platform::now() as u64;
-        self.state.write().ui.notice = Some(Notice {
+        self.state.write().ui.show_notice(Notice {
             message: message.to_owned(),
             tone: tone.to_owned(),
             id,
+        });
+        let timeout_ms = if tone == "error" { 10_000 } else { 5_000 };
+        let mut state = self.state;
+        spawn(async move {
+            TimeoutFuture::new(timeout_ms).await;
+            state.write().ui.dismiss_notice(id);
         });
     }
 

@@ -2235,8 +2235,9 @@ svg {
 .toast-region {
   position: fixed;
   z-index: 120;
+  top: calc(var(--topbar-height) + 10px + env(safe-area-inset-top));
   right: max(12px, env(safe-area-inset-right));
-  bottom: calc(12px + env(safe-area-inset-bottom));
+  bottom: auto;
   left: max(12px, env(safe-area-inset-left));
   display: grid;
   justify-items: center;
@@ -2245,9 +2246,14 @@ svg {
 }
 
 .toast {
-  width: fit-content;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px;
+  align-items: start;
+  gap: 8px;
+  width: min(100%, 460px);
   max-width: min(100%, 460px);
-  padding: 10px 13px;
+  max-height: min(30dvh, 180px);
+  padding: 10px 9px 10px 13px;
   border: 1px solid var(--line-strong);
   border-radius: 11px;
   background: var(--surface);
@@ -2257,6 +2263,26 @@ svg {
   line-height: 1.45;
   pointer-events: auto;
   animation: toast-in 180ms ease-out both;
+}
+
+.toast__message {
+  min-width: 0;
+  max-height: min(24dvh, 138px);
+  overflow: auto;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.toast__dismiss {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: 8px;
+  color: currentColor;
+  font-size: 18px;
+  line-height: 1;
 }
 
 .toast.is-error {
@@ -2486,6 +2512,7 @@ svg {
   }
 
   .toast-region {
+    top: 14px;
     left: calc(var(--sidebar-width) + 12px);
   }
 }

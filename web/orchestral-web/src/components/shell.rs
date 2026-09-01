@@ -249,7 +249,18 @@ pub fn Workspace() -> Element {
         SessionActionsPanel {}
         if let Some(notice) = state.ui.notice {
             div { class: "toast-region", aria_live: "polite",
-                div { class: "toast toast--{notice.tone}", "{notice.message}" }
+                div { class: "toast toast--{notice.tone}",
+                    span { class: "toast__message", "{notice.message}" }
+                    button {
+                        class: "toast__dismiss",
+                        r#type: "button",
+                        aria_label: "关闭提示",
+                        onclick: move |_| {
+                            controller.state.write().ui.dismiss_notice(notice.id);
+                        },
+                        "×"
+                    }
+                }
             }
         }
     }
