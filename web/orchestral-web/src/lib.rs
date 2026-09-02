@@ -51,4 +51,15 @@ mod shell_layout_tests {
         assert!(!shell.contains("100svh"));
         assert!(!shell.contains("100dvh"));
     }
+
+    #[test]
+    fn conversation_header_reserves_a_scrollable_row_for_session_metadata() {
+        let header = rule(".conversation-header");
+        assert!(header.contains("display: grid"));
+        assert!(header.contains("grid-template-columns: minmax(0, 1fr) auto"));
+
+        let metadata = rule(".conversation-header__meta");
+        assert!(metadata.contains("grid-column: 1 / -1"));
+        assert!(metadata.contains("overflow-x: auto"));
+    }
 }

@@ -633,6 +633,7 @@ mod tests {
             created_at_unix_ms: Some(1),
             updated_at_unix_ms: Some(2),
             state: AgentSessionState::Idle,
+            execution_profile: Default::default(),
             extensions: BTreeMap::new(),
         }
     }

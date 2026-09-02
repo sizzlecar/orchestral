@@ -75,6 +75,8 @@ pub struct SessionView {
     pub cwd: Option<String>,
     #[serde(default)]
     pub state: Option<String>,
+    #[serde(default)]
+    pub execution_profile: AgentSessionExecutionProfile,
 }
 
 impl SessionView {
@@ -164,6 +166,56 @@ pub struct AgentSessionSummary {
     #[serde(default)]
     pub updated_at_unix_ms: Option<i64>,
     pub state: String,
+    #[serde(default)]
+    pub execution_profile: AgentSessionExecutionProfile,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSessionExecutionProfile {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub permissions: AgentSessionPermissions,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSessionPermissions {
+    #[serde(default)]
+    pub filesystem: Option<AgentFilesystemAccess>,
+    #[serde(default)]
+    pub network: Option<AgentNetworkAccess>,
+    #[serde(default)]
+    pub approvals: Option<AgentApprovalMode>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentFilesystemAccess {
+    ReadOnly,
+    WorkspaceWrite,
+    FullAccess,
+    External,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentNetworkAccess {
+    Disabled,
+    Restricted,
+    Enabled,
+    External,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentApprovalMode {
+    Restricted,
+    OnRequest,
+    Never,
+    Granular,
+    External,
 }
 
 impl AgentSessionSummary {
@@ -181,6 +233,7 @@ impl AgentSessionSummary {
             preview: self.preview,
             cwd: self.cwd,
             state: Some(self.state),
+            execution_profile: self.execution_profile,
         }
     }
 }
@@ -370,6 +423,46 @@ mod tests {
         .unwrap();
 
         assert_eq!(detail.next_cursor.as_deref(), Some("activity-offset-v1:40"));
+    }
+
+    #[test]
+    fn session_detail_decodes_provider_neutral_execution_metadata() {
+        let detail: AgentSessionDetail = serde_json::from_value(serde_json::json!({
+            "summary": {
+                "connector_id": "fixture/local",
+                "session_id": "thread-1",
+                "cwd": "/workspace/project",
+                "state": "active",
+                "execution_profile": {
+                    "model": "fixture-large",
+                    "reasoning_effort": "high",
+                    "permissions": {
+                        "filesystem": "workspace_write",
+                        "network": "restricted",
+                        "approvals": "on_request"
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(detail.summary.cwd.as_deref(), Some("/workspace/project"));
+        assert_eq!(
+            detail.summary.execution_profile.model.as_deref(),
+            Some("fixture-large")
+        );
+        assert_eq!(
+            detail.summary.execution_profile.permissions.filesystem,
+            Some(AgentFilesystemAccess::WorkspaceWrite)
+        );
+        assert_eq!(
+            detail.summary.execution_profile.permissions.network,
+            Some(AgentNetworkAccess::Restricted)
+        );
+        assert_eq!(
+            detail.summary.execution_profile.permissions.approvals,
+            Some(AgentApprovalMode::OnRequest)
+        );
     }
 
     #[test]

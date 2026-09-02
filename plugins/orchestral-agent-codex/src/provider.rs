@@ -294,7 +294,9 @@ impl CodexConnector {
                     )
                     .await
                 {
-                    Ok(_) => {}
+                    Ok(result) => {
+                        self.remember_execution_profile(&run.execution.session_id, &result);
+                    }
                     Err(error)
                         if active_writer_conflict(&error)
                             && client_has_loaded_session(
@@ -406,6 +408,7 @@ impl CodexConnector {
                 .await
             {
                 Ok(result) => {
+                    self.remember_execution_profile(&session_id, &result);
                     resumed_thread = result.get("thread").cloned();
                     self.provider_state().mark_loaded(session_id.clone());
                 }
@@ -1471,7 +1474,7 @@ impl AgentProvider for CodexConnector {
         }
         let notifications = connected.rpc.subscribe();
         let session_id = run.execution.session_id.clone();
-        connected
+        let result = connected
             .rpc
             .request(
                 "thread/resume",
@@ -1483,6 +1486,7 @@ impl AgentProvider for CodexConnector {
             )
             .await
             .map_err(transport_to_protocol)?;
+        self.remember_execution_profile(&session_id, &result);
         self.provider_state()
             .loaded_sessions
             .insert(session_id.clone());

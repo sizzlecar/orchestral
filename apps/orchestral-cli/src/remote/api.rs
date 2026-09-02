@@ -2829,6 +2829,7 @@ mod tests {
                 created_at_unix_ms: Some(1_000),
                 updated_at_unix_ms: Some(2_000),
                 state: AgentSessionState::Idle,
+                execution_profile: Default::default(),
                 extensions: BTreeMap::new(),
             }
         }

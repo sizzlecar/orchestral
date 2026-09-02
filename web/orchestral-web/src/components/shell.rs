@@ -8,7 +8,10 @@ use crate::components::pending::PendingPanel;
 use crate::components::session_control::{NewSessionPanel, SessionActionsPanel};
 use crate::components::settings::SettingsPanel;
 use crate::components::timeline::ConversationTimeline;
-use crate::model::SessionView;
+use crate::model::{
+    AgentApprovalMode, AgentFilesystemAccess, AgentNetworkAccess, AgentSessionPermissions,
+    SessionView,
+};
 use crate::state::{AppState, AuthStatus, LoadStatus, RunState};
 
 const SIDEBAR_SESSIONS_PER_PAGE: usize = 10;
@@ -89,6 +92,7 @@ pub fn Workspace() -> Element {
         .and_then(|session| session.connector_id.as_deref())
         .map(|connector_id| connector_display_name(&state, connector_id))
         .unwrap_or_else(|| "Orchestral".to_owned());
+    let session_metadata = selected.as_ref().map(session_metadata).unwrap_or_default();
     let run = state.current_run().cloned();
     let has_session_actions = state
         .selected_connector()
@@ -366,6 +370,18 @@ pub fn Workspace() -> Element {
                                 }
                             }
                             RunStatusBadge { run }
+                        }
+                        if !session_metadata.is_empty() {
+                            div { class: "conversation-header__meta", aria_label: "Agent 会话配置",
+                                for (label, value) in session_metadata {
+                                    div {
+                                        class: "session-meta-chip",
+                                        title: "{label}：{value}",
+                                        span { class: "session-meta-chip__label", "{label}" }
+                                        span { class: "session-meta-chip__value", "{value}" }
+                                    }
+                                }
+                            }
                         }
                     }
                     ConversationTimeline {}
@@ -791,6 +807,82 @@ fn connector_display_name(state: &AppState, connector_id: &str) -> String {
         })
 }
 
+fn session_metadata(session: &SessionView) -> Vec<(&'static str, String)> {
+    let mut metadata = Vec::new();
+    if let Some(cwd) = session
+        .cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|cwd| !cwd.is_empty())
+    {
+        metadata.push(("目录", cwd.to_owned()));
+    }
+    if let Some(model) = session
+        .execution_profile
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        metadata.push(("模型", model.to_owned()));
+    }
+    if let Some(effort) = session
+        .execution_profile
+        .reasoning_effort
+        .as_deref()
+        .map(str::trim)
+        .filter(|effort| !effort.is_empty())
+    {
+        metadata.push(("推理", reasoning_effort_label(effort)));
+    }
+    if let Some(permissions) = permissions_label(&session.execution_profile.permissions) {
+        metadata.push(("权限", permissions));
+    }
+    metadata
+}
+
+fn reasoning_effort_label(effort: &str) -> String {
+    match effort {
+        "low" => "低".to_owned(),
+        "medium" => "中".to_owned(),
+        "high" => "高".to_owned(),
+        "xhigh" => "很高".to_owned(),
+        "max" => "最高".to_owned(),
+        "ultra" => "极高".to_owned(),
+        _ => effort.to_owned(),
+    }
+}
+
+fn permissions_label(permissions: &AgentSessionPermissions) -> Option<String> {
+    let mut labels = Vec::new();
+    if let Some(filesystem) = permissions.filesystem {
+        labels.push(match filesystem {
+            AgentFilesystemAccess::ReadOnly => "只读",
+            AgentFilesystemAccess::WorkspaceWrite => "工作区可写",
+            AgentFilesystemAccess::FullAccess => "完全访问",
+            AgentFilesystemAccess::External => "文件权限由 Agent 控制",
+        });
+    }
+    if let Some(network) = permissions.network {
+        labels.push(match network {
+            AgentNetworkAccess::Disabled => "网络关闭",
+            AgentNetworkAccess::Restricted => "网络受限",
+            AgentNetworkAccess::Enabled => "网络开启",
+            AgentNetworkAccess::External => "网络由 Agent 控制",
+        });
+    }
+    if let Some(approvals) = permissions.approvals {
+        labels.push(match approvals {
+            AgentApprovalMode::Restricted => "受限操作需审批",
+            AgentApprovalMode::OnRequest => "按需审批",
+            AgentApprovalMode::Never => "无需审批",
+            AgentApprovalMode::Granular => "细粒度审批",
+            AgentApprovalMode::External => "审批由 Agent 控制",
+        });
+    }
+    (!labels.is_empty()).then(|| labels.join(" · "))
+}
+
 fn format_date(milliseconds: i64) -> String {
     let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(milliseconds as f64));
     date.to_locale_string("zh-CN", &wasm_bindgen::JsValue::UNDEFINED)
@@ -826,7 +918,9 @@ fn run_label(run: Option<&RunState>, now: f64) -> (String, &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AgentConnectorView, AgentSessionCapabilitiesView};
+    use crate::model::{
+        AgentConnectorView, AgentSessionCapabilitiesView, AgentSessionExecutionProfile,
+    };
     use crate::state::{AgentSessionListState, Message};
 
     fn session(id: &str, connector_id: Option<&str>, updated_at_unix_ms: i64) -> SessionView {
@@ -840,6 +934,7 @@ mod tests {
             preview: None,
             cwd: None,
             state: None,
+            execution_profile: Default::default(),
         }
     }
 
@@ -856,6 +951,32 @@ mod tests {
             creation: None,
             actions: Vec::new(),
         }
+    }
+
+    #[test]
+    fn session_metadata_is_provider_neutral_and_omits_unknown_fields() {
+        let mut view = session("thread-1", Some("fixture/local"), 1);
+        view.cwd = Some("/workspace/project".to_owned());
+        view.execution_profile = AgentSessionExecutionProfile {
+            model: Some("fixture-large".to_owned()),
+            reasoning_effort: Some("high".to_owned()),
+            permissions: AgentSessionPermissions {
+                filesystem: Some(AgentFilesystemAccess::WorkspaceWrite),
+                network: Some(AgentNetworkAccess::Restricted),
+                approvals: Some(AgentApprovalMode::OnRequest),
+            },
+        };
+
+        assert_eq!(
+            session_metadata(&view),
+            vec![
+                ("目录", "/workspace/project".to_owned()),
+                ("模型", "fixture-large".to_owned()),
+                ("推理", "高".to_owned()),
+                ("权限", "工作区可写 · 网络受限 · 按需审批".to_owned()),
+            ]
+        );
+        assert!(session_metadata(&session("empty", Some("other/local"), 1)).is_empty());
     }
 
     #[test]

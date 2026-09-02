@@ -19,15 +19,16 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use orchestral_core::agent_connector::{
-    paginate_session_detail, AgentConnector, AgentConnectorDescriptor, AgentConnectorError,
-    AgentConnectorErrorCode, AgentConnectorHealth, AgentConnectorId, AgentSessionActionDescriptor,
+    paginate_session_detail, AgentApprovalMode, AgentConnector, AgentConnectorDescriptor,
+    AgentConnectorError, AgentConnectorErrorCode, AgentConnectorHealth, AgentConnectorId,
+    AgentFilesystemAccess, AgentNetworkAccess, AgentSessionActionDescriptor,
     AgentSessionActionExecution, AgentSessionActionId, AgentSessionActionOutcome,
     AgentSessionActionStatus, AgentSessionCapabilities, AgentSessionChange, AgentSessionChangeKind,
-    AgentSessionCreationDescriptor, AgentSessionDetail, AgentSessionListQuery, AgentSessionPage,
-    AgentSessionReadQuery, AgentSessionSummary, AgentSessionTurnId, AgentSessionTurnStatus,
-    CreateAgentSessionRequest, InvokeAgentSessionActionRequest, SESSION_COMPACT_ACTION,
-    SESSION_FORK_ACTION, SESSION_RENAME_ACTION, SESSION_REVIEW_ACTION,
-    SESSION_SET_PERMISSIONS_ACTION,
+    AgentSessionCreationDescriptor, AgentSessionDetail, AgentSessionExecutionProfile,
+    AgentSessionListQuery, AgentSessionPage, AgentSessionPermissions, AgentSessionReadQuery,
+    AgentSessionSummary, AgentSessionTurnId, AgentSessionTurnStatus, CreateAgentSessionRequest,
+    InvokeAgentSessionActionRequest, SESSION_COMPACT_ACTION, SESSION_FORK_ACTION,
+    SESSION_RENAME_ACTION, SESSION_REVIEW_ACTION, SESSION_SET_PERMISSIONS_ACTION,
 };
 use orchestral_core::agent_protocol::wire::{AgentSessionId, ProviderBindingRef};
 use orchestral_core::io::{ArtifactPublisher, ArtifactResolver, BlobStore};
@@ -103,6 +104,7 @@ pub struct CodexConnector {
     client: AsyncMutex<Option<Arc<ConnectedClient>>>,
     limits: NormalizationLimits,
     provider_state: StdMutex<provider::ProviderState>,
+    session_execution_profiles: Arc<StdMutex<BTreeMap<String, AgentSessionExecutionProfile>>>,
     session_list_cache: StdMutex<BTreeMap<SessionListCacheKey, SessionListCacheEntry>>,
     session_list_cache_path: Option<PathBuf>,
     session_list_gate: AsyncMutex<()>,
@@ -123,6 +125,7 @@ impl CodexConnector {
             client: AsyncMutex::new(None),
             limits: NormalizationLimits::default(),
             provider_state: StdMutex::new(provider::ProviderState::default()),
+            session_execution_profiles: Arc::new(StdMutex::new(BTreeMap::new())),
             session_list_cache: StdMutex::new(BTreeMap::new()),
             session_list_cache_path: None,
             session_list_gate: AsyncMutex::new(()),
@@ -223,7 +226,25 @@ impl CodexConnector {
         let thread = result
             .get("thread")
             .ok_or_else(|| AgentConnectorError::protocol("thread/read omitted thread"))?;
-        normalize::session_summary(&self.describe().connector_id, thread)
+        let summary = normalize::session_summary(&self.describe().connector_id, thread)?;
+        Ok(self.enrich_summary(summary))
+    }
+
+    fn remember_execution_profile(&self, session_id: &AgentSessionId, value: &Value) {
+        remember_execution_profile(&self.session_execution_profiles, session_id, value);
+    }
+
+    fn enrich_summary(&self, mut summary: AgentSessionSummary) -> AgentSessionSummary {
+        if let Some(profile) = self
+            .session_execution_profiles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(summary.session_id.as_str())
+            .cloned()
+        {
+            summary.execution_profile = profile;
+        }
+        summary
     }
 
     async fn read_persisted_session_page(
@@ -641,6 +662,7 @@ impl CodexConnector {
             }))),
             limits: NormalizationLimits::default(),
             provider_state: StdMutex::new(provider::ProviderState::default()),
+            session_execution_profiles: Arc::new(StdMutex::new(BTreeMap::new())),
             session_list_cache: StdMutex::new(BTreeMap::new()),
             session_list_cache_path: None,
             session_list_gate: AsyncMutex::new(()),
@@ -668,6 +690,7 @@ impl CodexConnector {
             }))),
             limits: NormalizationLimits::default(),
             provider_state: StdMutex::new(provider::ProviderState::default()),
+            session_execution_profiles: Arc::new(StdMutex::new(BTreeMap::new())),
             session_list_cache: StdMutex::new(BTreeMap::new()),
             session_list_cache_path: None,
             session_list_gate: AsyncMutex::new(()),
@@ -851,6 +874,11 @@ impl AgentConnector for CodexConnector {
         // Subscribe to transport notifications before attaching so events
         // emitted during the metadata-only resume cannot be lost.
         let mut native = client.rpc.subscribe();
+        let had_execution_profile = self
+            .session_execution_profiles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(session_id.as_str());
         let already_loaded = self
             .provider_state
             .lock()
@@ -886,7 +914,8 @@ impl AgentConnector for CodexConnector {
                         ));
                     }
                 }
-                attach.map_err(connector_transport_error)?;
+                let attach = attach.map_err(connector_transport_error)?;
+                self.remember_execution_profile(session_id, &attach);
                 self.provider_state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -898,14 +927,43 @@ impl AgentConnector for CodexConnector {
         let limits = self.limits.clone();
         let artifact_blob_store = self.artifact_blob_store.clone();
         let generated_artifacts = self.generated_artifacts.clone();
+        let session_execution_profiles = Arc::clone(&self.session_execution_profiles);
         let (changes, receiver) = broadcast::channel(64);
+        let learned_execution_profile = !had_execution_profile
+            && self
+                .session_execution_profiles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(session_id.as_str());
+        let initial_sequence = u64::from(learned_execution_profile);
+        if learned_execution_profile {
+            let _ = changes.send(AgentSessionChange {
+                connector_id: connector_id.clone(),
+                session_id: watched_session_id.clone(),
+                sequence: initial_sequence,
+                change: AgentSessionChangeKind::RefreshRequired {
+                    reason: "execution_profile_attached".to_owned(),
+                },
+            });
+        }
         tokio::spawn(async move {
-            let mut sequence = 0_u64;
+            let mut sequence = initial_sequence;
             loop {
                 match native.recv().await {
                     Ok(CodexTransportEvent::Message(message))
                         if is_session_change_notification(&message, &watched_session_id) =>
                     {
+                        if message.get("method").and_then(Value::as_str)
+                            == Some("thread/settings/updated")
+                        {
+                            remember_execution_profile(
+                                &session_execution_profiles,
+                                &watched_session_id,
+                                message
+                                    .pointer("/params/threadSettings")
+                                    .unwrap_or(&message),
+                            );
+                        }
                         let mut change = native_session_change(&message, &limits);
                         generated_artifacts
                             .enrich_change(
@@ -994,7 +1052,9 @@ impl AgentConnector for CodexConnector {
         let thread = result
             .get("thread")
             .ok_or_else(|| AgentConnectorError::protocol("thread/start omitted thread"))?;
-        let mut summary = normalize::session_summary(&self.describe().connector_id, thread)?;
+        let summary = normalize::session_summary(&self.describe().connector_id, thread)?;
+        self.remember_execution_profile(&summary.session_id, &result);
+        let mut summary = self.enrich_summary(summary);
         if let Some(title) = title {
             client
                 .rpc
@@ -1049,6 +1109,8 @@ impl AgentConnector for CodexConnector {
                     .get("thread")
                     .ok_or_else(|| AgentConnectorError::protocol("thread/fork omitted thread"))?;
                 let summary = normalize::session_summary(&self.describe().connector_id, thread)?;
+                self.remember_execution_profile(&summary.session_id, &result);
+                let summary = self.enrich_summary(summary);
                 self.provider_state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1071,18 +1133,27 @@ impl AgentConnector for CodexConnector {
             SESSION_SET_PERMISSIONS_ACTION => {
                 let permissions = permission_settings(&request.arguments)?;
                 let client = self.client().await?;
+                let sandbox_policy = sandbox_policy(&permissions.sandbox_mode);
+                let approval_policy = permissions.approval_policy;
                 client
                     .rpc
                     .request(
                         "thread/settings/update",
                         json!({
                             "threadId": request.session_id.as_str(),
-                            "sandboxPolicy": sandbox_policy(&permissions.sandbox_mode),
-                            "approvalPolicy": permissions.approval_policy,
+                            "sandboxPolicy": sandbox_policy,
+                            "approvalPolicy": approval_policy,
                         }),
                     )
                     .await
                     .map_err(connector_transport_error)?;
+                self.remember_execution_profile(
+                    &request.session_id,
+                    &json!({
+                        "sandboxPolicy": sandbox_policy,
+                        "approvalPolicy": approval_policy,
+                    }),
+                );
                 Some(self.read_summary(&client, &request.session_id).await?)
             }
             _ => {
@@ -1382,6 +1453,125 @@ fn insert_optional(object: &mut Value, key: &str, value: Option<Value>) {
     }
 }
 
+fn remember_execution_profile(
+    profiles: &Arc<StdMutex<BTreeMap<String, AgentSessionExecutionProfile>>>,
+    session_id: &AgentSessionId,
+    value: &Value,
+) {
+    let Some(incoming) = execution_profile_from_value(value) else {
+        return;
+    };
+    let mut profiles = profiles
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let current = profiles.entry(session_id.as_str().to_owned()).or_default();
+    if incoming.model.is_some() {
+        current.model = incoming.model;
+    }
+    if incoming.reasoning_effort.is_some() {
+        current.reasoning_effort = incoming.reasoning_effort;
+    }
+    if incoming.permissions.filesystem.is_some() {
+        current.permissions.filesystem = incoming.permissions.filesystem;
+    }
+    if incoming.permissions.network.is_some() {
+        current.permissions.network = incoming.permissions.network;
+    }
+    if incoming.permissions.approvals.is_some() {
+        current.permissions.approvals = incoming.permissions.approvals;
+    }
+}
+
+fn execution_profile_from_value(value: &Value) -> Option<AgentSessionExecutionProfile> {
+    let settings = value
+        .get("threadSettings")
+        .or_else(|| value.pointer("/params/threadSettings"))
+        .unwrap_or(value);
+    let model = non_empty_value_string(settings.get("model"))
+        .or_else(|| non_empty_value_string(value.get("model")));
+    let reasoning_effort = non_empty_value_string(settings.get("effort"))
+        .or_else(|| non_empty_value_string(settings.get("reasoningEffort")))
+        .or_else(|| non_empty_value_string(value.get("reasoningEffort")))
+        .or_else(|| non_empty_value_string(value.pointer("/config/model_reasoning_effort")));
+    let sandbox = settings
+        .get("sandboxPolicy")
+        .or_else(|| settings.get("sandbox"))
+        .or_else(|| value.get("sandboxPolicy"))
+        .or_else(|| value.get("sandbox"));
+    let approval = settings
+        .get("approvalPolicy")
+        .or_else(|| value.get("approvalPolicy"));
+    let permissions = AgentSessionPermissions {
+        filesystem: sandbox.and_then(filesystem_access),
+        network: sandbox.and_then(network_access),
+        approvals: approval.and_then(approval_mode),
+    };
+    let profile = AgentSessionExecutionProfile {
+        model,
+        reasoning_effort,
+        permissions,
+    };
+    (profile != AgentSessionExecutionProfile::default()).then_some(profile)
+}
+
+fn non_empty_value_string(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn sandbox_kind(value: &Value) -> Option<&str> {
+    value
+        .get("type")
+        .and_then(Value::as_str)
+        .or_else(|| value.as_str())
+}
+
+fn filesystem_access(value: &Value) -> Option<AgentFilesystemAccess> {
+    match sandbox_kind(value)? {
+        "readOnly" | "read-only" | "readonly" => Some(AgentFilesystemAccess::ReadOnly),
+        "workspaceWrite" | "workspace-write" => Some(AgentFilesystemAccess::WorkspaceWrite),
+        "dangerFullAccess" | "danger-full-access" | "full-access" => {
+            Some(AgentFilesystemAccess::FullAccess)
+        }
+        _ => Some(AgentFilesystemAccess::External),
+    }
+}
+
+fn network_access(value: &Value) -> Option<AgentNetworkAccess> {
+    if matches!(
+        sandbox_kind(value),
+        Some("dangerFullAccess" | "danger-full-access")
+    ) {
+        return Some(AgentNetworkAccess::Enabled);
+    }
+    match value.get("networkAccess")? {
+        Value::Bool(false) => Some(AgentNetworkAccess::Disabled),
+        Value::Bool(true) => Some(AgentNetworkAccess::Enabled),
+        Value::String(mode) => match mode.as_str() {
+            "disabled" | "none" => Some(AgentNetworkAccess::Disabled),
+            "restricted" => Some(AgentNetworkAccess::Restricted),
+            "enabled" | "full" => Some(AgentNetworkAccess::Enabled),
+            _ => Some(AgentNetworkAccess::External),
+        },
+        _ => Some(AgentNetworkAccess::External),
+    }
+}
+
+fn approval_mode(value: &Value) -> Option<AgentApprovalMode> {
+    if value.get("granular").is_some() {
+        return Some(AgentApprovalMode::Granular);
+    }
+    match value.as_str()? {
+        "untrusted" | "restricted" => Some(AgentApprovalMode::Restricted),
+        "on-request" | "onRequest" => Some(AgentApprovalMode::OnRequest),
+        "never" => Some(AgentApprovalMode::Never),
+        _ => Some(AgentApprovalMode::External),
+    }
+}
+
 fn connector_transport_error(error: CodexTransportError) -> AgentConnectorError {
     let (code, retryable) = match error {
         CodexTransportError::Spawn(_) | CodexTransportError::DaemonStart(_) => {
@@ -1431,6 +1621,7 @@ fn is_session_change_notification(message: &Value, session_id: &AgentSessionId) 
             Some(
                 "thread/status/changed"
                     | "thread/name/updated"
+                    | "thread/settings/updated"
                     | "thread/queue/changed"
                     | "thread/compacted"
                     | "thread/reverted"
@@ -1506,6 +1697,73 @@ mod tests {
 
     const ONE_PIXEL_PNG: &str =
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+    #[test]
+    fn native_settings_map_into_provider_neutral_execution_profile() {
+        let profile = execution_profile_from_value(&json!({
+            "model": "gpt-fixture",
+            "reasoningEffort": "high",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "networkAccess": false,
+                "writableRoots": ["/workspace"]
+            },
+            "approvalPolicy": "on-request"
+        }))
+        .unwrap();
+
+        assert_eq!(profile.model.as_deref(), Some("gpt-fixture"));
+        assert_eq!(profile.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            profile.permissions.filesystem,
+            Some(AgentFilesystemAccess::WorkspaceWrite)
+        );
+        assert_eq!(
+            profile.permissions.network,
+            Some(AgentNetworkAccess::Disabled)
+        );
+        assert_eq!(
+            profile.permissions.approvals,
+            Some(AgentApprovalMode::OnRequest)
+        );
+    }
+
+    #[test]
+    fn settings_notifications_merge_without_erasing_known_profile_fields() {
+        let profiles = Arc::new(StdMutex::new(BTreeMap::new()));
+        let session_id = AgentSessionId::new("thread-1");
+        remember_execution_profile(
+            &profiles,
+            &session_id,
+            &json!({"model": "gpt-fixture", "reasoningEffort": "medium"}),
+        );
+        remember_execution_profile(
+            &profiles,
+            &session_id,
+            &json!({
+                "threadSettings": {
+                    "sandboxPolicy": {"type": "dangerFullAccess"},
+                    "approvalPolicy": "never"
+                }
+            }),
+        );
+
+        let profile = profiles.lock().unwrap().get("thread-1").cloned().unwrap();
+        assert_eq!(profile.model.as_deref(), Some("gpt-fixture"));
+        assert_eq!(profile.reasoning_effort.as_deref(), Some("medium"));
+        assert_eq!(
+            profile.permissions.filesystem,
+            Some(AgentFilesystemAccess::FullAccess)
+        );
+        assert_eq!(
+            profile.permissions.network,
+            Some(AgentNetworkAccess::Enabled)
+        );
+        assert_eq!(
+            profile.permissions.approvals,
+            Some(AgentApprovalMode::Never)
+        );
+    }
 
     struct RecordingWriteBlobStore {
         writes: AtomicUsize,

@@ -37,6 +37,7 @@ impl FixtureConnector {
                 created_at_unix_ms: Some(1_000 + index as i64),
                 updated_at_unix_ms: Some(2_000 + index as i64),
                 state: AgentSessionState::Detached,
+                execution_profile: Default::default(),
                 extensions: BTreeMap::new(),
             })
             .collect();

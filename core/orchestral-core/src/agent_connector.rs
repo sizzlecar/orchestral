@@ -243,6 +243,63 @@ pub enum AgentSessionState {
     Unavailable,
 }
 
+/// Provider-neutral execution settings reported for an Agent session.
+///
+/// Every field is optional because not every Agent exposes every setting and
+/// older sessions may be observable without their original launch metadata.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSessionExecutionProfile {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub permissions: AgentSessionPermissions,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSessionPermissions {
+    #[serde(default)]
+    pub filesystem: Option<AgentFilesystemAccess>,
+    #[serde(default)]
+    pub network: Option<AgentNetworkAccess>,
+    #[serde(default)]
+    pub approvals: Option<AgentApprovalMode>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AgentFilesystemAccess {
+    ReadOnly,
+    WorkspaceWrite,
+    FullAccess,
+    External,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AgentNetworkAccess {
+    Disabled,
+    Restricted,
+    Enabled,
+    External,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AgentApprovalMode {
+    Restricted,
+    OnRequest,
+    Never,
+    Granular,
+    External,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSessionSummary {
@@ -261,6 +318,8 @@ pub struct AgentSessionSummary {
     pub updated_at_unix_ms: Option<i64>,
     pub state: AgentSessionState,
     #[serde(default)]
+    pub execution_profile: AgentSessionExecutionProfile,
+    #[serde(default)]
     pub extensions: BTreeMap<String, Value>,
 }
 
@@ -272,6 +331,16 @@ impl AgentSessionSummary {
             ));
         }
         if self.cwd.as_ref().is_some_and(|cwd| cwd.trim().is_empty())
+            || self
+                .execution_profile
+                .model
+                .as_ref()
+                .is_some_and(|model| model.trim().is_empty())
+            || self
+                .execution_profile
+                .reasoning_effort
+                .as_ref()
+                .is_some_and(|effort| effort.trim().is_empty())
             || self
                 .created_at_unix_ms
                 .is_some_and(|timestamp| timestamp < 0)
@@ -940,6 +1009,7 @@ mod tests {
                 created_at_unix_ms: None,
                 updated_at_unix_ms: None,
                 state: AgentSessionState::Detached,
+                execution_profile: Default::default(),
                 extensions: BTreeMap::new(),
             }],
             next_cursor: None,
@@ -948,6 +1018,31 @@ mod tests {
             .validate_for(&descriptor().connector_id, 50)
             .expect_err("mismatched connector must fail");
         assert_eq!(error.code, AgentConnectorErrorCode::Protocol);
+    }
+
+    #[test]
+    fn session_summary_rejects_blank_execution_metadata() {
+        let connector_id = descriptor().connector_id;
+        let summary = AgentSessionSummary {
+            connector_id: connector_id.clone(),
+            session_id: AgentSessionId::new("session-1"),
+            title: None,
+            preview: None,
+            cwd: Some("/workspace".to_owned()),
+            created_at_unix_ms: None,
+            updated_at_unix_ms: None,
+            state: AgentSessionState::Idle,
+            execution_profile: AgentSessionExecutionProfile {
+                model: Some("  ".to_owned()),
+                ..Default::default()
+            },
+            extensions: BTreeMap::new(),
+        };
+
+        assert_eq!(
+            summary.validate_for(&connector_id).unwrap_err().code,
+            AgentConnectorErrorCode::Protocol
+        );
     }
 
     #[test]
@@ -973,6 +1068,7 @@ mod tests {
                 created_at_unix_ms: None,
                 updated_at_unix_ms: None,
                 state: AgentSessionState::Idle,
+                execution_profile: Default::default(),
                 extensions: BTreeMap::new(),
             },
             turns: vec![AgentSessionTurn {

@@ -6,7 +6,7 @@ use crate::browser::api::ApiCredential;
 use crate::browser::controller::{AppController, LiveTransportControls};
 use crate::browser::{platform, storage};
 use crate::components::{AuthScreen, Workspace};
-use crate::state::{AppState, AuthStatus};
+use crate::state::{AgentSessionReconcileCoordinator, AppState, AuthStatus};
 
 const CSS: Asset = asset!("/assets/styles.css");
 
@@ -20,6 +20,7 @@ pub fn App() -> Element {
     let stream_generation = use_signal(|| 0_u64);
     let agent_session_stream_abort = use_signal(|| None::<web_sys::AbortController>);
     let agent_session_stream_generation = use_signal(|| 0_u64);
+    let agent_session_reconcile = use_signal(AgentSessionReconcileCoordinator::default);
     let install_event = use_signal(|| None::<wasm_bindgen::JsValue>);
     let controller = use_context_provider(|| {
         AppController::new(
@@ -32,6 +33,7 @@ pub fn App() -> Element {
                 run_generation: stream_generation,
                 agent_session_abort: agent_session_stream_abort,
                 agent_session_generation: agent_session_stream_generation,
+                agent_session_reconcile,
             },
             install_event,
         )

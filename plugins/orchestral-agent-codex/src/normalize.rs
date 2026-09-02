@@ -228,6 +228,7 @@ pub(crate) fn session_summary(
         created_at_unix_ms: timestamp_ms(thread.get("createdAt")),
         updated_at_unix_ms: timestamp_ms(thread.get("updatedAt")),
         state: session_state(status),
+        execution_profile: Default::default(),
         extensions,
     })
 }

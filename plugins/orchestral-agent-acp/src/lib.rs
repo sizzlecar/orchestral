@@ -152,6 +152,7 @@ impl AcpConnector {
             created_at_unix_ms: None,
             updated_at_unix_ms: None,
             state: AgentSessionState::Detached,
+            execution_profile: Default::default(),
             extensions: BTreeMap::new(),
         };
         summary.validate_for(&self.connector_id())?;
@@ -416,6 +417,7 @@ impl AgentConnector for AcpConnector {
             created_at_unix_ms: None,
             updated_at_unix_ms: None,
             state: AgentSessionState::Idle,
+            execution_profile: Default::default(),
             extensions: BTreeMap::new(),
         };
         summary.validate_for(&self.connector_id())?;

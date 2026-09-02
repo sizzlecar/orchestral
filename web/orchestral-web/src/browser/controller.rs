@@ -16,8 +16,8 @@ use crate::model::{
     UploadedArtifact,
 };
 use crate::state::{
-    is_terminal, AgentSessionListState, AppState, AuthStatus, ConnectorsState, LoadStatus, Notice,
-    SessionsState,
+    is_terminal, AgentSessionListState, AgentSessionReconcileCoordinator, AppState, AuthStatus,
+    ConnectorsState, LoadStatus, Notice, SessionsState,
 };
 
 const AGENT_HISTORY_PAGE_LIMIT: u32 = 100;
@@ -26,6 +26,7 @@ const AGENT_OBSERVER_ACTIVE_INTERVAL_MS: u32 = 1_500;
 const AGENT_OBSERVER_IDLE_INTERVAL_MS: u32 = 2_000;
 const AGENT_OBSERVER_BACKGROUND_INTERVAL_MS: u32 = 15_000;
 const AGENT_OBSERVER_MAX_BACKOFF_MS: u32 = 30_000;
+const AGENT_RECONCILE_DEBOUNCE_MS: u32 = 120;
 const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +117,7 @@ pub struct LiveTransportControls {
     pub run_generation: Signal<u64>,
     pub agent_session_abort: Signal<Option<web_sys::AbortController>>,
     pub agent_session_generation: Signal<u64>,
+    pub(crate) agent_session_reconcile: Signal<AgentSessionReconcileCoordinator>,
 }
 
 #[derive(Clone, Copy)]
@@ -128,6 +130,7 @@ pub struct AppController {
     pub stream_generation: Signal<u64>,
     pub agent_session_stream_abort: Signal<Option<web_sys::AbortController>>,
     pub agent_session_stream_generation: Signal<u64>,
+    agent_session_reconcile: Signal<AgentSessionReconcileCoordinator>,
     pub install_event: Signal<Option<JsValue>>,
     api: ApiClient,
 }
@@ -150,6 +153,7 @@ impl AppController {
             stream_generation: streams.run_generation,
             agent_session_stream_abort: streams.agent_session_abort,
             agent_session_stream_generation: streams.agent_session_generation,
+            agent_session_reconcile: streams.agent_session_reconcile,
             install_event,
             api: ApiClient,
         }
@@ -1936,9 +1940,8 @@ impl AppController {
             &change.change,
             AgentSessionChangeKindView::RefreshRequired { .. }
         ) {
-            return self
-                .refresh_agent_session_observation(target, generation, signal)
-                .await;
+            self.schedule_agent_session_reconciliation(target, generation, signal);
+            return Ok(());
         }
 
         let follow_timeline = platform::timeline_is_near_end();
@@ -1958,6 +1961,55 @@ impl AppController {
             });
         }
         Ok(())
+    }
+
+    fn schedule_agent_session_reconciliation(
+        mut self,
+        target: AgentSessionObservationTarget,
+        generation: u64,
+        signal: web_sys::AbortSignal,
+    ) {
+        let should_start = self.agent_session_reconcile.write().request(generation);
+        if !should_start {
+            return;
+        }
+        spawn(async move {
+            loop {
+                // Let a native notification burst settle before reconciling.
+                // Normal item/turn changes continue to apply immediately while
+                // provider events that lack an incremental representation are
+                // collapsed into this one authoritative read.
+                TimeoutFuture::new(AGENT_RECONCILE_DEBOUNCE_MS).await;
+                if signal.aborted()
+                    || *self.agent_session_stream_generation.read() != generation
+                    || !agent_observation_is_current(&self.state.read(), &target)
+                {
+                    self.agent_session_reconcile.write().finish(generation);
+                    return;
+                }
+                let checkpoint = self.agent_session_reconcile.read().checkpoint();
+                if let Err(error) = self
+                    .refresh_agent_session_observation(target.clone(), generation, signal.clone())
+                    .await
+                {
+                    self.agent_session_reconcile.write().finish(generation);
+                    if error.status == 401 {
+                        self.clear_auth(Some(error.message)).await;
+                    } else {
+                        self.state.write().connection.error = Some(error.message);
+                    }
+                    return;
+                }
+                if !self
+                    .agent_session_reconcile
+                    .read()
+                    .has_trailing_request(generation, checkpoint)
+                {
+                    self.agent_session_reconcile.write().finish(generation);
+                    return;
+                }
+            }
+        });
     }
 
     async fn refresh_agent_session_observation(
@@ -2629,6 +2681,7 @@ mod tests {
             preview: None,
             cwd: None,
             state: None,
+            execution_profile: Default::default(),
         }
     }
 
@@ -2644,6 +2697,7 @@ mod tests {
             preview: None,
             cwd: None,
             state: Some("active".to_owned()),
+            execution_profile: Default::default(),
         });
         state.sessions.selected_id = Some("codex/local\0thread-1".to_owned());
         state
@@ -2756,6 +2810,7 @@ mod tests {
             preview: None,
             cwd: None,
             state: None,
+            execution_profile: Default::default(),
         };
         let mut pages = BTreeMap::from([(
             "codex/local".to_owned(),
@@ -2814,6 +2869,7 @@ mod tests {
             preview: None,
             cwd: None,
             state: Some("active".to_owned()),
+            execution_profile: Default::default(),
         };
         let incoming = SessionView {
             title: Some("Renamed".to_owned()),
@@ -2841,6 +2897,7 @@ mod tests {
             preview: None,
             cwd: None,
             state: Some("active".to_owned()),
+            execution_profile: Default::default(),
         };
         let incoming_external = SessionView {
             title: Some("New title".to_owned()),

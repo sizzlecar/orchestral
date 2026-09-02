@@ -10,6 +10,40 @@ use crate::model::{
 const MAX_TELEMETRY_IDS: usize = 800;
 const INITIAL_INPUT_ORDER: u64 = 0;
 
+/// Browser-independent state machine for collapsing invalidation bursts into
+/// one authoritative read plus, when events arrive during that read, one
+/// trailing reconciliation pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AgentSessionReconcileCoordinator {
+    requested: u64,
+    worker_generation: Option<u64>,
+}
+
+impl AgentSessionReconcileCoordinator {
+    pub fn request(&mut self, generation: u64) -> bool {
+        self.requested = self.requested.saturating_add(1);
+        if self.worker_generation == Some(generation) {
+            return false;
+        }
+        self.worker_generation = Some(generation);
+        true
+    }
+
+    pub fn checkpoint(&self) -> u64 {
+        self.requested
+    }
+
+    pub fn has_trailing_request(&self, generation: u64, checkpoint: u64) -> bool {
+        self.worker_generation == Some(generation) && self.requested != checkpoint
+    }
+
+    pub fn finish(&mut self, generation: u64) {
+        if self.worker_generation == Some(generation) {
+            self.worker_generation = None;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LoadStatus {
     #[default]
@@ -1051,10 +1085,21 @@ impl AppState {
     pub fn project_agent_session(&mut self, detail: AgentSessionDetail) -> bool {
         let connector_id = detail.summary.connector_id.clone();
         let session_id = detail.summary.session_id.clone();
+        let session_key = format!("{connector_id}\0{session_id}");
         if let Some(cursor) = detail.stream_cursor {
-            self.sessions
+            // A full reconciliation may race an incremental SSE mutation. An
+            // older snapshot must never replace a newer browser projection or
+            // move its cursor backwards; doing so made the newest messages
+            // disappear/reappear and visibly remounted the live edge.
+            if self
+                .sessions
                 .stream_cursors
-                .insert(format!("{connector_id}\0{session_id}"), cursor);
+                .get(&session_key)
+                .is_some_and(|current| *current > cursor)
+            {
+                return false;
+            }
+            self.sessions.stream_cursors.insert(session_key, cursor);
         }
         let timeline_before = self.agent_session_timeline_snapshot(&connector_id, &session_id);
         let run_id = format!("agent-history:{connector_id}:{session_id}");
@@ -1073,6 +1118,7 @@ impl AppState {
             session.preview = detail.summary.preview.clone();
             session.cwd = detail.summary.cwd.clone();
             session.state = Some(detail.summary.state.clone());
+            session.execution_profile = detail.summary.execution_profile.clone();
             if let Some(created_at) = detail.summary.created_at_unix_ms {
                 session.created_at_unix_ms = created_at;
             }
@@ -2264,6 +2310,71 @@ mod tests {
     }
 
     #[test]
+    fn refresh_reconciliation_coalesces_bursts_and_allows_one_trailing_pass() {
+        let mut coordinator = AgentSessionReconcileCoordinator::default();
+
+        assert!(coordinator.request(7));
+        assert!(!coordinator.request(7));
+        let checkpoint = coordinator.checkpoint();
+        assert!(!coordinator.has_trailing_request(7, checkpoint));
+
+        assert!(!coordinator.request(7));
+        assert!(coordinator.has_trailing_request(7, checkpoint));
+        coordinator.finish(7);
+        assert!(coordinator.request(7));
+
+        // A stale worker must not clear the current generation.
+        assert!(coordinator.request(8));
+        coordinator.finish(7);
+        assert!(!coordinator.request(8));
+    }
+
+    fn agent_detail_at(cursor: u64, activity_id: &str, text: &str) -> AgentSessionDetail {
+        serde_json::from_value(serde_json::json!({
+            "summary": {
+                "connector_id": "fixture/local",
+                "session_id": "thread-1",
+                "updated_at_unix_ms": cursor,
+                "state": "active"
+            },
+            "turns": [{
+                "turn_id": "turn-1",
+                "status": "active",
+                "activities": [{
+                    "activity_id": activity_id,
+                    "kind": "agent_message",
+                    "status": "completed",
+                    "content": [{"body": {"kind": "inline", "value": text}}]
+                }]
+            }],
+            "stream_cursor": cursor
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn stale_detail_snapshot_cannot_replace_a_newer_live_edge_or_rewind_cursor() {
+        let mut state = AppState::new(true);
+        assert!(state.project_agent_session(agent_detail_at(10, "message-new", "new")));
+
+        assert!(!state.project_agent_session(agent_detail_at(9, "message-old", "old")));
+
+        let session = state.sessions.items.first().unwrap();
+        let messages = timeline_blocks_for_session(&state, session)
+            .into_iter()
+            .filter_map(|entry| match entry.block {
+                TimelineBlock::Entry(TimelineItem::Message(message)) => Some(message.text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(messages, vec!["new"]);
+        assert_eq!(
+            state.sessions.stream_cursors.get("fixture/local\0thread-1"),
+            Some(&10)
+        );
+    }
+
+    #[test]
     fn generated_image_artifact_projects_to_preview_and_download_markdown() {
         let reference = "a".repeat(64);
         let content = serde_json::json!({
@@ -2752,6 +2863,7 @@ mod tests {
             preview: None,
             cwd: None,
             state: Some("active".to_owned()),
+            execution_profile: Default::default(),
         });
         state.sessions.selected_id = Some("agent/local\0thread-1".to_owned());
         state
@@ -3832,6 +3944,7 @@ mod tests {
             preview: None,
             cwd: None,
             state: Some("active".to_owned()),
+            execution_profile: Default::default(),
         });
         state.sessions.selected_id = Some("codex/local\0thread-1".to_owned());
         state
