@@ -11,6 +11,54 @@ pub struct DeviceView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadedArtifact {
+    pub artifact_ref: String,
+    pub file_name: String,
+    pub media_type: String,
+    pub byte_size: u64,
+    pub sha256: String,
+    pub download_url: String,
+    #[serde(default)]
+    pub agent_url: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
+impl UploadedArtifact {
+    pub fn command_value(&self) -> Value {
+        serde_json::json!({
+            "artifact_ref": self.artifact_ref,
+            "digest": self.sha256,
+            "file_name": self.file_name,
+            "media_type": self.media_type,
+            "byte_size": self.byte_size,
+        })
+    }
+}
+
+/// Durable browser intent written before an Agent control request leaves the
+/// device. Replays retain the original Run/Command identity, so multiple tabs
+/// and ambiguous network failures cannot execute the input twice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutboxEntry {
+    pub id: String,
+    pub connector_id: Option<String>,
+    pub session_id: String,
+    pub input: String,
+    pub attachments: Vec<UploadedArtifact>,
+    pub native_anchor_id: Option<String>,
+    pub created_at_unix_ms: i64,
+    pub operation: OutboxOperation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OutboxOperation {
+    Start { run_id: String },
+    Steer { run_id: String, command_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionView {
     pub id: String,
     pub created_at_unix_ms: i64,
@@ -51,7 +99,20 @@ pub struct AgentConnectorView {
     pub agent_family: String,
     pub capabilities: AgentSessionCapabilitiesView,
     #[serde(default)]
+    pub creation: Option<AgentSessionCreationView>,
+    #[serde(default)]
     pub actions: Vec<AgentSessionActionView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentSessionCreationView {
+    pub accepts_cwd: bool,
+    #[serde(default)]
+    pub default_cwd: Option<String>,
+    #[serde(default)]
+    pub input_schema: Option<Value>,
+    #[serde(default)]
+    pub connection_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +210,14 @@ pub struct AgentSessionDetail {
     pub turns: Vec<AgentSessionTurn>,
     #[serde(default)]
     pub pending_requests: Vec<Value>,
+    /// Host-controlled Run snapshots associated with this native Agent
+    /// session. These preserve the command target across a browser reload.
+    #[serde(default)]
+    pub controlled_runs: Vec<Value>,
+    /// Canonical Host session-stream cursor captured before this snapshot was
+    /// read. It closes the snapshot/subscription race across tabs and devices.
+    #[serde(default)]
+    pub stream_cursor: Option<u64>,
     /// Opaque cursor for the next, older page of session history.
     #[serde(default)]
     pub next_cursor: Option<String>,
@@ -173,6 +242,31 @@ pub struct AgentSessionActivity {
     pub content: Vec<Value>,
     #[serde(default)]
     pub details: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentSessionChangeView {
+    pub connector_id: String,
+    pub session_id: String,
+    pub sequence: u64,
+    pub change: AgentSessionChangeKindView,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentSessionChangeKindView {
+    ActivityUpsert {
+        turn_id: String,
+        turn_status: String,
+        activity: AgentSessionActivity,
+    },
+    TurnStatus {
+        turn_id: String,
+        status: String,
+    },
+    RefreshRequired {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -201,6 +295,15 @@ mod tests {
             "agent_family": "coding-agent",
             "display_name": "Fixture",
             "capabilities": {"list": true, "read": true, "create": true},
+            "creation": {
+                "accepts_cwd": true,
+                "default_cwd": "/fixture",
+                "connection_hint": "Shared owner",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"mode": {"type": "string"}}
+                }
+            },
             "actions": [{
                 "action_id": "session.rename",
                 "title": "Rename",
@@ -216,6 +319,14 @@ mod tests {
         .unwrap();
 
         assert!(connector.capabilities.create);
+        assert!(connector.creation.as_ref().unwrap().accepts_cwd);
+        assert_eq!(
+            connector
+                .creation
+                .as_ref()
+                .and_then(|creation| creation.connection_hint.as_deref()),
+            Some("Shared owner")
+        );
         assert_eq!(connector.actions[0].action_id, "session.rename");
         assert_eq!(
             connector.actions[0].execution,
@@ -260,12 +371,43 @@ mod tests {
 
         assert_eq!(detail.next_cursor.as_deref(), Some("activity-offset-v1:40"));
     }
+
+    #[test]
+    fn outbox_round_trip_preserves_idempotency_and_r2_artifacts() {
+        let entry = OutboxEntry {
+            id: "steer:command-1".to_owned(),
+            connector_id: Some("codex/local".to_owned()),
+            session_id: "thread-1".to_owned(),
+            input: "review this".to_owned(),
+            attachments: vec![UploadedArtifact {
+                artifact_ref: "sha256:abc".to_owned(),
+                file_name: "report.txt".to_owned(),
+                media_type: "text/plain".to_owned(),
+                byte_size: 12,
+                sha256: "abc".to_owned(),
+                download_url: "https://files.example/report.txt".to_owned(),
+                agent_url: None,
+                expires_at: None,
+            }],
+            native_anchor_id: Some("native-tail".to_owned()),
+            created_at_unix_ms: 42,
+            operation: OutboxOperation::Steer {
+                run_id: "run-1".to_owned(),
+                command_id: "command-1".to_owned(),
+            },
+        };
+
+        let encoded = serde_json::to_value(&entry).unwrap();
+        let decoded: OutboxEntry = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, entry);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamEvent {
     Durable { id: Option<String>, data: String },
     Telemetry { data: String },
+    SessionChanged { id: Option<String>, data: String },
     Error { data: String },
     KeepAlive,
 }

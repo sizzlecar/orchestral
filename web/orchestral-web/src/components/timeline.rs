@@ -3,27 +3,37 @@ use serde_json::Value;
 
 use crate::browser::{controller::AppController, platform};
 use crate::markdown;
+use crate::presentation::{
+    activity_group_expansion_for_status, operation_details_expanded_by_default,
+    operation_is_failure, operation_is_running,
+};
 use crate::state::{
-    timeline_blocks_for_run, CommandActivity, TimelineBlock, TimelineItem, ToolActivity,
+    timeline_blocks_for_session, timeline_run_ids_for_session, CommandActivity, TimelineBlock,
+    TimelineItem, ToolActivity,
 };
 
 #[component]
 pub fn ConversationTimeline() -> Element {
     let controller = consume_context::<AppController>();
     let state = controller.state.read();
-    let runs = state
+    let loading_session = state
+        .selected_session()
+        .is_some_and(|session| state.ui.loading_session.as_deref() == Some(session.key().as_str()));
+    let (blocks, runs) = state
         .selected_session()
         .map(|session| {
-            session
-                .run_ids
+            let blocks = timeline_blocks_for_session(&state, session)
+                .into_iter()
+                .map(|entry| (entry.key(), entry))
+                .collect::<Vec<_>>();
+            let runs = timeline_run_ids_for_session(&state, session)
                 .iter()
                 .filter_map(|run_id| state.runs.get(run_id).cloned())
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (blocks, runs)
         })
         .unwrap_or_default();
-    let empty = runs
-        .iter()
-        .all(|run| timeline_blocks_for_run(run).is_empty());
+    let empty = blocks.is_empty();
     let history_pagination = state.selected_session().and_then(|session| {
         let run_id = session.history_run_id()?;
         let run = state.runs.get(&run_id)?;
@@ -53,7 +63,14 @@ pub fn ConversationTimeline() -> Element {
                     }
                 }
             }
-            if empty {
+            if empty && loading_session {
+                div { class: "timeline-skeleton", role: "status", aria_label: "正在加载会话内容",
+                    span { class: "timeline-skeleton__line timeline-skeleton__line--short" }
+                    span { class: "timeline-skeleton__bubble" }
+                    span { class: "timeline-skeleton__line" }
+                    span { class: "timeline-skeleton__line timeline-skeleton__line--medium" }
+                }
+            } else if empty {
                 div { class: "empty-state",
                     div { class: "empty-state__mark", aria_hidden: "true", "✦" }
                     p { class: "eyebrow", "随时可以开始" }
@@ -63,10 +80,14 @@ pub fn ConversationTimeline() -> Element {
                     }
                 }
             } else {
-                for run in runs {
-                    for (index, block) in timeline_blocks_for_run(&run).into_iter().enumerate() {
-                        TimelineBlockView { key: "{run.id}-{index}", run_id: run.id.clone(), block }
+                for (key, entry) in blocks {
+                    TimelineBlockView {
+                        key: "{key}",
+                        run_id: entry.run_id,
+                        block: entry.block
                     }
+                }
+                for run in runs {
                     if let Some(failure) = run.failure.as_ref() {
                         RunFailure { value: failure.clone() }
                     } else if let Some(error) = run.error.as_ref() {
@@ -89,22 +110,38 @@ fn TimelineBlockView(run_id: String, block: TimelineBlock) -> Element {
 #[component]
 fn TimelineEntry(run_id: String, item: TimelineItem) -> Element {
     match item {
-        TimelineItem::Message(message) => rsx! {
-            MessageView {
-                id: message.id,
-                role: message.role,
-                text: message.text,
-                optimistic: message.optimistic,
-                partial: message.partial,
-                streaming: false
+        TimelineItem::Message(message) => {
+            let controller = consume_context::<AppController>();
+            let accepted = message.role == "user"
+                && !message.optimistic
+                && !message.deferred
+                && controller
+                    .state
+                    .read()
+                    .runs
+                    .get(&run_id)
+                    .is_some_and(|run| run.status == "accepted");
+            rsx! {
+                MessageView {
+                    id: message.id,
+                    role: message.role,
+                    text: message.text,
+                    optimistic: message.optimistic,
+                    accepted,
+                    deferred: message.deferred,
+                    partial: message.partial,
+                    streaming: false
+                }
             }
-        },
+        }
         TimelineItem::Stream(output) => rsx! {
             MessageView {
                 id: format!("stream-{run_id}-{}", output.output_id),
                 role: "assistant".to_owned(),
                 text: output.text,
                 optimistic: false,
+                accepted: false,
+                deferred: false,
                 partial: false,
                 streaming: true
             }
@@ -134,11 +171,11 @@ fn TimelineEntry(run_id: String, item: TimelineItem) -> Element {
 fn ActivityGroupView(items: Vec<TimelineItem>) -> Element {
     let failures = items
         .iter()
-        .filter(|item| operation_state(item).is_some_and(is_failure_state))
+        .filter(|item| operation_state(item).is_some_and(operation_is_failure))
         .count();
     let running = items
         .iter()
-        .filter(|item| operation_state(item).is_some_and(is_running_state))
+        .filter(|item| operation_state(item).is_some_and(operation_is_running))
         .count();
     let state = if failures > 0 {
         "failed"
@@ -160,13 +197,16 @@ fn ActivityGroupView(items: Vec<TimelineItem>) -> Element {
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "Agent 操作".to_owned());
     let count = items.len();
-    let mut expanded = use_signal(|| failures > 0);
+    let mut expanded = use_signal(|| running > 0);
 
-    use_effect(use_reactive((&failures,), move |(failures,)| {
-        if failures > 0 {
-            expanded.set(true);
-        }
-    }));
+    use_effect(use_reactive(
+        (&failures, &running),
+        move |(failures, running)| {
+            if let Some(next) = activity_group_expansion_for_status(failures, running) {
+                expanded.set(next);
+            }
+        },
+    ));
 
     rsx! {
         section { class: "run-activity", aria_label: "运行活动",
@@ -214,17 +254,22 @@ fn MessageView(
     role: String,
     text: String,
     optimistic: bool,
+    accepted: bool,
+    deferred: bool,
     partial: bool,
     streaming: bool,
 ) -> Element {
     let controller = consume_context::<AppController>();
     let class = format!(
-        "message message--{role}{}{}",
+        "message message--{role}{}{}{}{}",
         if partial { " message--partial" } else { "" },
-        if streaming { " is-streaming" } else { "" }
+        if streaming { " is-streaming" } else { "" },
+        if accepted { " message--accepted" } else { "" },
+        if deferred { " message--deferred" } else { "" }
     );
     let copy = text.clone();
-    let rendered = (role == "assistant").then(|| markdown::render(&text));
+    let rendered = (role == "assistant" || text.contains("](/api/v1/attachments/"))
+        .then(|| markdown::render(&text));
     rsx! {
         article { class, "data-message-id": id,
             span { class: "message__role", if role == "user" { "你" } else { "Orchestral" } }
@@ -250,13 +295,15 @@ fn MessageView(
                 }
             }
             if optimistic { span { class: "message__meta", "发送中…" } }
+            if accepted { span { class: "message__meta", "已接收，等待 Agent 开始" } }
+            if deferred { span { class: "message__meta", "已排队，等待原 Agent 接收" } }
         }
     }
 }
 
 #[component]
 fn ToolActivityView(activity: ToolActivity) -> Element {
-    let open = is_running_state(&activity.state) || is_failure_state(&activity.state);
+    let open = operation_details_expanded_by_default(&activity.state);
     rsx! {
         details { class: "activity-item", open,
             summary { class: "activity-item__summary",
@@ -279,7 +326,7 @@ fn ToolActivityView(activity: ToolActivity) -> Element {
 
 #[component]
 fn CommandActivityView(command: CommandActivity) -> Element {
-    let open = is_failure_state(&command.state);
+    let open = operation_details_expanded_by_default(&command.state);
     rsx! {
         details { class: "activity-item activity-item--command", open,
             summary { class: "activity-item__summary",
@@ -311,14 +358,6 @@ fn operation_name(item: &TimelineItem) -> String {
         TimelineItem::Command(command) => command.kind.replace('_', " "),
         _ => String::new(),
     }
-}
-
-fn is_failure_state(state: &str) -> bool {
-    matches!(state, "failed" | "error" | "rejected")
-}
-
-fn is_running_state(state: &str) -> bool {
-    matches!(state, "running" | "pending" | "received")
 }
 
 #[component]

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use futures_util::{stream, StreamExt};
 use orchestral_agent_protocol_testkit::{
     ProviderFixtureFactory, ProviderScenario, ScriptedStatelessFactory, SessionfulRecoverFactory,
     TestProbes,
@@ -14,18 +15,128 @@ use orchestral_core::agent_protocol::{
         AgentStartError, InMemoryAgentJournalStore,
     },
     wire::{
-        AgentCommandEnvelope, AgentDescriptorEnvelope, AgentEvent, AgentExecutionRef,
-        AgentProtocolError, AgentProtocolErrorCode, AgentStartRequest, ProviderBindingRef,
-        ProviderCommandDisposition,
+        AgentCommand, AgentCommandEnvelope, AgentDescriptorEnvelope, AgentEvent, AgentExecutionRef,
+        AgentProtocolError, AgentProtocolErrorCode, AgentStartRequest, CommandId, Content,
+        ProviderBindingRef, ProviderCommandDisposition,
     },
 };
 use orchestral_runtime::{AgentClient, AgentController};
+use tokio::sync::Notify;
 
 struct RecoveryOrderProvider {
     inner: Arc<dyn AgentProvider>,
     journal: Arc<InMemoryAgentJournalStore>,
     confirmed_after_restore: Arc<AtomicBool>,
     fail_after_restore: bool,
+}
+
+struct CommandThenDisconnectProvider {
+    inner: Arc<dyn AgentProvider>,
+    disconnect: Arc<Notify>,
+}
+
+struct DescriptorOverrideProvider {
+    inner: Arc<dyn AgentProvider>,
+    descriptor: AgentDescriptorEnvelope,
+}
+
+struct StalledRecoveryProvider {
+    inner: Arc<dyn AgentProvider>,
+}
+
+#[async_trait]
+impl AgentProvider for StalledRecoveryProvider {
+    fn describe(&self) -> AgentDescriptorEnvelope {
+        self.inner.describe()
+    }
+
+    async fn start(&self, request: AgentStartRequest) -> Result<AgentStart, AgentStartError> {
+        self.inner.start(request).await
+    }
+
+    async fn command(
+        &self,
+        execution: &AgentExecutionRef,
+        command: AgentCommandEnvelope,
+    ) -> Result<ProviderCommandDisposition, AgentProtocolError> {
+        self.inner.command(execution, command).await
+    }
+
+    async fn recover(
+        &self,
+        _request: AgentRecoveryRequest,
+    ) -> Result<AgentRecovery, AgentProtocolError> {
+        Ok(AgentRecovery::reattached(stream::pending().boxed()))
+    }
+}
+
+#[async_trait]
+impl AgentProvider for DescriptorOverrideProvider {
+    fn describe(&self) -> AgentDescriptorEnvelope {
+        self.descriptor.clone()
+    }
+
+    async fn start(&self, request: AgentStartRequest) -> Result<AgentStart, AgentStartError> {
+        self.inner.start(request).await
+    }
+
+    async fn command(
+        &self,
+        execution: &AgentExecutionRef,
+        command: AgentCommandEnvelope,
+    ) -> Result<ProviderCommandDisposition, AgentProtocolError> {
+        self.inner.command(execution, command).await
+    }
+
+    async fn recover(
+        &self,
+        request: AgentRecoveryRequest,
+    ) -> Result<AgentRecovery, AgentProtocolError> {
+        self.inner.recover(request).await
+    }
+}
+
+#[async_trait]
+impl AgentProvider for CommandThenDisconnectProvider {
+    fn describe(&self) -> AgentDescriptorEnvelope {
+        self.inner.describe()
+    }
+
+    async fn start(&self, request: AgentStartRequest) -> Result<AgentStart, AgentStartError> {
+        let started = self.inner.start(request).await?;
+        let disconnect = self.disconnect.clone();
+        let stream = started
+            .stream
+            .take(1)
+            .chain(stream::once(async move {
+                disconnect.notified().await;
+                Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::ProviderUnavailable,
+                    "fixture stream disconnected after command",
+                ))
+            }))
+            .boxed();
+        Ok(AgentStart {
+            execution: started.execution,
+            admission: started.admission,
+            stream,
+        })
+    }
+
+    async fn command(
+        &self,
+        execution: &AgentExecutionRef,
+        command: AgentCommandEnvelope,
+    ) -> Result<ProviderCommandDisposition, AgentProtocolError> {
+        self.inner.command(execution, command).await
+    }
+
+    async fn recover(
+        &self,
+        request: AgentRecoveryRequest,
+    ) -> Result<AgentRecovery, AgentProtocolError> {
+        self.inner.recover(request).await
+    }
 }
 
 #[async_trait]
@@ -215,6 +326,57 @@ async fn a_new_controller_rehydrates_inspect_and_events_from_the_agent_journal()
 }
 
 #[tokio::test]
+async fn a_descriptor_upgrade_identifies_an_old_run_without_rehydrating_it() {
+    let factory = ScriptedStatelessFactory::conformant().expect("fixture descriptor");
+    let scenario = ProviderScenario::standard(&factory.descriptor()).expect("fixture scenario");
+    let journal = Arc::new(InMemoryAgentJournalStore::default());
+    let first = Arc::new(
+        AgentController::with_journal_store(
+            factory.create(scenario.clone(), TestProbes::default()),
+            ProviderBindingRef::new("durable-binding"),
+            journal.clone(),
+        )
+        .expect("first controller binds provider"),
+    );
+    let execution = first
+        .start(scenario.start_request.run.clone())
+        .await
+        .expect("run starts");
+    first
+        .wait_for_terminal(&execution.run_id)
+        .await
+        .expect("run reaches terminal before upgrade");
+    drop(first);
+
+    let mut upgraded_descriptor = factory.descriptor().descriptor;
+    upgraded_descriptor
+        .accepted_content_types
+        .insert("image/png".to_owned());
+    let upgraded_descriptor = AgentDescriptorEnvelope::seal(upgraded_descriptor)
+        .expect("upgraded descriptor remains valid");
+    let upgraded_provider = Arc::new(DescriptorOverrideProvider {
+        inner: factory.create(scenario, TestProbes::default()),
+        descriptor: upgraded_descriptor,
+    });
+    let upgraded = AgentController::with_journal_store(
+        upgraded_provider,
+        ProviderBindingRef::new("durable-binding"),
+        journal,
+    )
+    .expect("upgraded controller binds provider");
+
+    assert!(!upgraded
+        .can_control_run(&execution.run_id)
+        .await
+        .expect("old registration remains discoverable"));
+    assert!(matches!(
+        upgraded.inspect(&execution.run_id).await,
+        Err(orchestral_runtime::AgentControlError::Protocol(error))
+            if error.code == AgentProtocolErrorCode::RunIdConflict
+    ));
+}
+
+#[tokio::test]
 async fn recovery_continuation_opens_only_after_continuity_restore_is_durable() {
     let factory = SessionfulRecoverFactory::new().expect("fixture descriptor");
     let mut scenario = ProviderScenario::standard(&factory.descriptor()).expect("fixture scenario");
@@ -264,6 +426,99 @@ async fn recovery_continuation_opens_only_after_continuity_restore_is_durable() 
         .records
         .iter()
         .any(|record| { matches!(&record.event.payload, AgentEvent::ContinuityRestored { .. }) }));
+}
+
+#[tokio::test]
+async fn recovery_rejects_a_provider_that_never_replays_its_committed_prefix() {
+    let factory = SessionfulRecoverFactory::new().expect("fixture descriptor");
+    let mut scenario = ProviderScenario::standard(&factory.descriptor()).expect("fixture scenario");
+    scenario.immediate_events.truncate(1);
+    let provider = Arc::new(StalledRecoveryProvider {
+        inner: factory.create(scenario.clone(), TestProbes::default()),
+    });
+    let controller = Arc::new(
+        AgentController::new(provider, ProviderBindingRef::new("conformance-binding"))
+            .expect("controller binds provider"),
+    );
+
+    let execution = controller
+        .start(scenario.start_request.run)
+        .await
+        .expect("non-terminal run starts");
+    controller
+        .wait_for_terminal(&execution.run_id)
+        .await
+        .expect_err("finite non-terminal stream becomes Unknown");
+
+    let started = Instant::now();
+    let error = controller
+        .recover(&execution.run_id)
+        .await
+        .expect_err("a missing recovery prefix is rejected");
+    assert!(matches!(
+        error,
+        orchestral_runtime::AgentControlError::RecoveryMismatch(ref run_id)
+            if run_id == &execution.run_id
+    ));
+    assert!(started.elapsed() < Duration::from_secs(3));
+}
+
+#[tokio::test]
+async fn recovery_uses_host_committed_command_dispositions_without_stream_replay() {
+    let factory = SessionfulRecoverFactory::new().expect("fixture descriptor");
+    let mut scenario = ProviderScenario::standard(&factory.descriptor()).expect("fixture scenario");
+    scenario.immediate_events.truncate(1);
+    let disconnect = Arc::new(Notify::new());
+    let provider = Arc::new(CommandThenDisconnectProvider {
+        inner: factory.create(scenario.clone(), TestProbes::default()),
+        disconnect: disconnect.clone(),
+    });
+    let controller = Arc::new(
+        AgentController::new(
+            provider,
+            ProviderBindingRef::new("command-recovery-binding"),
+        )
+        .expect("controller binds provider"),
+    );
+
+    let execution = controller
+        .start(scenario.start_request.run)
+        .await
+        .expect("non-terminal run starts");
+    let command = AgentCommandEnvelope::new(
+        CommandId::new("command-before-restart"),
+        execution.run_id.clone(),
+        None,
+        AgentCommand::Steer {
+            content: vec![Content::text("continue")],
+        },
+    )
+    .expect("command is valid");
+    controller
+        .command(command)
+        .await
+        .expect("command disposition is Host-committed");
+    disconnect.notify_one();
+    controller
+        .wait_for_terminal(&execution.run_id)
+        .await
+        .expect_err("fixture disconnect makes continuity unknown");
+
+    controller
+        .recover(&execution.run_id)
+        .await
+        .expect("native replay plus Host command evidence restores continuity");
+    let events = controller
+        .events(&execution.run_id, 0)
+        .await
+        .expect("journal remains readable");
+    assert!(events.iter().any(|record| matches!(
+        record.event.payload,
+        AgentEvent::CommandDispositionRecorded { .. }
+    )));
+    assert!(events
+        .iter()
+        .any(|record| matches!(record.event.payload, AgentEvent::ContinuityRestored { .. })));
 }
 
 #[tokio::test]

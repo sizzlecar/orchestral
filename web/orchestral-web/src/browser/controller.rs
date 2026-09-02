@@ -1,13 +1,20 @@
 use std::collections::BTreeMap;
 
+use dioxus::html::FileData;
 use dioxus::prelude::{spawn, ReadableExt, Signal, WritableExt};
+use futures_util::{stream, StreamExt};
 use gloo_timers::future::TimeoutFuture;
 use serde_json::{json, Value};
+use sha2::{Digest as _, Sha256};
 use wasm_bindgen::{closure::Closure, JsValue};
 
 use crate::browser::api::{AgentSessionObservation, ApiClient, ApiCredential, ApiError};
 use crate::browser::{platform, storage};
-use crate::model::{AgentConnectorView, AgentSessionActionStatusView, SessionView, StreamEvent};
+use crate::model::{
+    AgentConnectorView, AgentSessionActionStatusView, AgentSessionChangeKindView,
+    AgentSessionChangeView, OutboxEntry, OutboxOperation, SessionView, StreamEvent,
+    UploadedArtifact,
+};
 use crate::state::{
     is_terminal, AgentSessionListState, AppState, AuthStatus, ConnectorsState, LoadStatus, Notice,
     SessionsState,
@@ -16,8 +23,10 @@ use crate::state::{
 const AGENT_HISTORY_PAGE_LIMIT: u32 = 100;
 const AGENT_SESSION_LIST_PAGE_LIMIT: u32 = 25;
 const AGENT_OBSERVER_ACTIVE_INTERVAL_MS: u32 = 1_500;
-const AGENT_OBSERVER_IDLE_INTERVAL_MS: u32 = 12_000;
+const AGENT_OBSERVER_IDLE_INTERVAL_MS: u32 = 2_000;
+const AGENT_OBSERVER_BACKGROUND_INTERVAL_MS: u32 = 15_000;
 const AGENT_OBSERVER_MAX_BACKOFF_MS: u32 = 30_000;
+const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AgentSessionObservationTarget {
@@ -26,8 +35,14 @@ struct AgentSessionObservationTarget {
     session_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveTransportPlan {
+    agent_session: Option<AgentSessionObservationTarget>,
+    run_id: Option<String>,
+}
+
 fn selected_agent_observation_target(state: &AppState) -> Option<AgentSessionObservationTarget> {
-    if !state.connection.online || orchestral_run_blocks_agent_observation(state) {
+    if !state.connection.online {
         return None;
     }
     let session = state.selected_session()?;
@@ -38,27 +53,21 @@ fn selected_agent_observation_target(state: &AppState) -> Option<AgentSessionObs
     })
 }
 
-fn orchestral_run_blocks_agent_observation(state: &AppState) -> bool {
-    state.selected_session().is_some_and(|session| {
-        session
-            .run_ids
-            .iter()
-            .filter(|run_id| !run_id.starts_with("agent-history:"))
-            .filter_map(|run_id| state.runs.get(run_id))
-            .any(|run| {
-                matches!(
-                    run.status.as_str(),
-                    "loading" | "submitting" | "accepted" | "running" | "waiting" | "stopping"
-                )
-            })
-    })
+fn live_transport_plan(state: &AppState) -> LiveTransportPlan {
+    LiveTransportPlan {
+        agent_session: selected_agent_observation_target(state),
+        run_id: state.observable_run().map(|run| run.id.clone()),
+    }
 }
 
 fn agent_observation_is_current(state: &AppState, target: &AgentSessionObservationTarget) -> bool {
     selected_agent_observation_target(state).as_ref() == Some(target)
 }
 
-fn agent_observation_interval_ms(session_state: &str) -> u32 {
+fn agent_observation_interval_ms(session_state: &str, document_visible: bool) -> u32 {
+    if !document_visible {
+        return AGENT_OBSERVER_BACKGROUND_INTERVAL_MS;
+    }
     match session_state {
         "active" | "running" | "waiting" | "waiting_input" | "waiting_approval"
         | "busy_elsewhere" => AGENT_OBSERVER_ACTIVE_INTERVAL_MS,
@@ -71,6 +80,44 @@ fn agent_observation_backoff_ms(consecutive_errors: u32) -> u32 {
     (1_000_u32.saturating_mul(2_u32.saturating_pow(exponent))).min(AGENT_OBSERVER_MAX_BACKOFF_MS)
 }
 
+fn mark_observation_healthy(state: &mut AppState, mode: &str) {
+    if state.connection.stream != mode
+        || state.connection.attempt != 0
+        || state.connection.error.is_some()
+    {
+        state.connection.stream = mode.to_owned();
+        state.connection.attempt = 0;
+        state.connection.error = None;
+        state.connection.last_connected_at = Some(platform::now());
+    }
+}
+
+fn optimistic_artifact_message(input: &str, attachments: &[UploadedArtifact]) -> String {
+    let mut message = if input.is_empty() {
+        "请查看并处理随消息附上的文件。".to_owned()
+    } else {
+        input.to_owned()
+    };
+    for attachment in attachments {
+        message.push_str(&format!(
+            "\n\n[附件：{}]({}) · {} · {} bytes",
+            attachment.file_name,
+            attachment.download_url,
+            attachment.media_type,
+            attachment.byte_size
+        ));
+    }
+    message
+}
+
+#[derive(Clone, Copy)]
+pub struct LiveTransportControls {
+    pub run_abort: Signal<Option<web_sys::AbortController>>,
+    pub run_generation: Signal<u64>,
+    pub agent_session_abort: Signal<Option<web_sys::AbortController>>,
+    pub agent_session_generation: Signal<u64>,
+}
+
 #[derive(Clone, Copy)]
 pub struct AppController {
     pub state: Signal<AppState>,
@@ -79,6 +126,8 @@ pub struct AppController {
     pub preferences: Signal<storage::Preferences>,
     pub stream_abort: Signal<Option<web_sys::AbortController>>,
     pub stream_generation: Signal<u64>,
+    pub agent_session_stream_abort: Signal<Option<web_sys::AbortController>>,
+    pub agent_session_stream_generation: Signal<u64>,
     pub install_event: Signal<Option<JsValue>>,
     api: ApiClient,
 }
@@ -89,8 +138,7 @@ impl AppController {
         token: Signal<Option<ApiCredential>>,
         pairing_secret: Signal<Option<String>>,
         preferences: Signal<storage::Preferences>,
-        stream_abort: Signal<Option<web_sys::AbortController>>,
-        stream_generation: Signal<u64>,
+        streams: LiveTransportControls,
         install_event: Signal<Option<JsValue>>,
     ) -> Self {
         Self {
@@ -98,8 +146,10 @@ impl AppController {
             token,
             pairing_secret,
             preferences,
-            stream_abort,
-            stream_generation,
+            stream_abort: streams.run_abort,
+            stream_generation: streams.run_generation,
+            agent_session_stream_abort: streams.agent_session_abort,
+            agent_session_stream_generation: streams.agent_session_generation,
             install_event,
             api: ApiClient,
         }
@@ -237,6 +287,103 @@ impl AppController {
     pub async fn load_workspace(self) {
         self.refresh_devices().await;
         self.refresh_sessions(true).await;
+        self.flush_outbox().await;
+    }
+
+    async fn flush_outbox(mut self) {
+        if !platform::is_online() {
+            return;
+        }
+        let Some(token) = self.token.read().clone() else {
+            return;
+        };
+        let entries = match storage::load_outbox().await {
+            Ok(entries) => entries,
+            Err(error) => {
+                self.notice(&format!("无法读取本地 Outbox：{error}"), "warning");
+                return;
+            }
+        };
+        let mut delivered = false;
+        for entry in entries {
+            let result = match &entry.operation {
+                OutboxOperation::Start { run_id } => match entry.connector_id.as_deref() {
+                    Some(connector_id) => {
+                        self.api
+                            .start_agent_run(
+                                &token,
+                                connector_id,
+                                &entry.session_id,
+                                run_id,
+                                &entry.input,
+                                &entry.attachments,
+                            )
+                            .await
+                    }
+                    None => {
+                        self.api
+                            .start_run(
+                                &token,
+                                &entry.session_id,
+                                run_id,
+                                &entry.input,
+                                &entry.attachments,
+                            )
+                            .await
+                    }
+                },
+                OutboxOperation::Steer { run_id, command_id } => {
+                    self.api
+                        .steer(
+                            &token,
+                            run_id,
+                            command_id,
+                            &entry.input,
+                            entry.connector_id.as_deref(),
+                            &entry.attachments,
+                        )
+                        .await
+                }
+            };
+            match result {
+                Ok(response) => {
+                    if matches!(&entry.operation, OutboxOperation::Steer { .. }) {
+                        if let Err(error) = check_ack(&response, "Outbox 重放") {
+                            let _ = storage::delete_outbox(&entry.id).await;
+                            self.notice(&error.message, "error");
+                            continue;
+                        }
+                    }
+                    match storage::delete_outbox(&entry.id).await {
+                        Ok(()) => delivered = true,
+                        Err(error) => self.notice(
+                            &format!("Outbox 已送达，但本地确认写入失败：{error}"),
+                            "warning",
+                        ),
+                    }
+                }
+                Err(error) if error.status == 401 => {
+                    self.clear_auth(Some(error.message)).await;
+                    return;
+                }
+                Err(error) if error.status == 0 => {
+                    let mut state = self.state.write();
+                    state.connection.error = Some("Outbox 等待网络恢复后重试".to_owned());
+                    return;
+                }
+                Err(error) => {
+                    // A definitive HTTP rejection cannot become successful by
+                    // replaying the same immutable identity forever. Retain
+                    // the user's original composer draft in the immediate
+                    // path, and retire this failed durable operation.
+                    let _ = storage::delete_outbox(&entry.id).await;
+                    self.notice(&presented_api_error(&error), "error");
+                }
+            }
+        }
+        if delivered {
+            self.refresh_sessions(true).await;
+        }
     }
 
     pub async fn refresh_devices(mut self) {
@@ -376,11 +523,13 @@ impl AppController {
                 let selected_id = retained_selection(current_selected_id.as_deref(), &sessions);
                 {
                     let mut state = self.state.write();
+                    let stream_cursors = std::mem::take(&mut state.sessions.stream_cursors);
                     state.sessions = SessionsState {
                         status: LoadStatus::Ready,
                         items: sessions,
                         selected_id: selected_id.clone(),
                         connector_pages,
+                        stream_cursors,
                         error: None,
                     };
                 }
@@ -491,7 +640,105 @@ impl AppController {
         }
     }
 
+    /// Refreshes only the visible session source. Connector refreshes replace
+    /// the first page in place while retaining the currently selected session
+    /// if it lives on an older page; the conversation view is never reloaded.
+    pub async fn refresh_session_group(mut self, connector_id: Option<String>) {
+        let Some(connector_id) = connector_id else {
+            self.refresh_sessions(false).await;
+            self.state.write().ui.session_page = 0;
+            return;
+        };
+        if !platform::is_online() {
+            self.notice("当前离线，恢复连接后再刷新会话", "warning");
+            return;
+        }
+        let Some(token) = self.token.read().clone() else {
+            return;
+        };
+        {
+            let mut state = self.state.write();
+            let page = state
+                .sessions
+                .connector_pages
+                .entry(connector_id.clone())
+                .or_default();
+            if page.loading_more {
+                return;
+            }
+            page.loading_more = true;
+            page.error = None;
+        }
+        match self
+            .api
+            .agent_sessions(&token, &connector_id, None, AGENT_SESSION_LIST_PAGE_LIMIT)
+            .await
+        {
+            Ok(page) => {
+                let incoming = page
+                    .sessions
+                    .into_iter()
+                    .map(|session| session.into_session())
+                    .collect::<Vec<_>>();
+                let mut state = self.state.write();
+                let selected_id = state.sessions.selected_id.clone();
+                state.sessions.items.retain(|session| {
+                    session.connector_id.as_deref() != Some(connector_id.as_str())
+                        || selected_id.as_deref() == Some(session.key().as_str())
+                });
+                merge_session_page(&mut state.sessions.items, incoming);
+                if let Some(list_state) = state.sessions.connector_pages.get_mut(&connector_id) {
+                    list_state.next_cursor = page.next_cursor;
+                    list_state.loading_more = false;
+                    list_state.error = None;
+                }
+                if state.ui.session_tab.as_deref() == Some(connector_id.as_str()) {
+                    state.ui.session_page = 0;
+                }
+            }
+            Err(error) if error.status == 401 => self.clear_auth(Some(error.message)).await,
+            Err(error) => {
+                if let Some(page) = self
+                    .state
+                    .write()
+                    .sessions
+                    .connector_pages
+                    .get_mut(&connector_id)
+                {
+                    page.loading_more = false;
+                    page.error = Some(error.message.clone());
+                }
+                self.notice(&error.message, "error");
+            }
+        }
+    }
+
     pub async fn load_session(mut self, session_key: String) {
+        self.state.write().ui.loading_session = Some(session_key.clone());
+        self.load_session_inner(session_key.clone()).await;
+        let still_selected = {
+            let mut state = self.state.write();
+            if state.ui.loading_session.as_deref() == Some(session_key.as_str()) {
+                state.ui.loading_session = None;
+            }
+            state.sessions.selected_id.as_deref() == Some(session_key.as_str())
+        };
+        if still_selected {
+            let controller = self;
+            spawn(async move {
+                // Let Dioxus commit the newly projected timeline before
+                // measuring its scroll height.
+                TimeoutFuture::new(0).await;
+                if controller.state.read().sessions.selected_id.as_deref()
+                    == Some(session_key.as_str())
+                {
+                    platform::scroll_timeline_to_end();
+                }
+            });
+        }
+    }
+
+    async fn load_session_inner(mut self, session_key: String) {
         self.stop_stream();
         let Some(session) = self
             .state
@@ -570,16 +817,36 @@ impl AppController {
                 }
             }
         }
-        for run_id in &session.run_ids {
-            if self.state.read().sessions.selected_id.as_deref() != Some(session_key.as_str()) {
-                return;
-            }
-            if run_id.starts_with("agent-history:") {
-                continue;
-            }
-            self.load_run_snapshot(run_id, &session.id, session.connector_id.as_deref())
-                .await;
-        }
+        let run_ids = session
+            .run_ids
+            .iter()
+            .filter(|run_id| !run_id.starts_with("agent-history:"))
+            .filter(|run_id| {
+                self.state
+                    .read()
+                    .runs
+                    .get(*run_id)
+                    .is_none_or(|run| run.view.is_none() || !is_terminal(&run.status))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        stream::iter(run_ids)
+            .for_each_concurrent(4, |run_id| {
+                let controller = self;
+                let session_id = session.id.clone();
+                let connector_id = session.connector_id.clone();
+                let selected_key = session_key.clone();
+                async move {
+                    if controller.state.read().sessions.selected_id.as_deref()
+                        == Some(selected_key.as_str())
+                    {
+                        controller
+                            .load_run_snapshot(&run_id, &session_id, connector_id.as_deref())
+                            .await;
+                    }
+                }
+            })
+            .await;
         if self.state.read().sessions.selected_id.as_deref() != Some(session_key.as_str()) {
             return;
         }
@@ -673,8 +940,10 @@ impl AppController {
                 )
                 .cursor
         };
-        let events = self.api.events(&token, run_id, cursor, connector_id).await;
-        let view = self.api.get_run(&token, run_id, connector_id).await;
+        let (events, view) = futures_util::join!(
+            self.api.events(&token, run_id, cursor, connector_id),
+            self.api.get_run(&token, run_id, connector_id)
+        );
         if let Ok(page) = events {
             let now = platform::now();
             let mut state = self.state.write();
@@ -686,19 +955,29 @@ impl AppController {
             for record in page.records {
                 run.project_durable(&record, now);
             }
+            state.reconcile_request_actions(run_id);
         }
         match view {
             Ok(view) => {
-                self.state
-                    .write()
+                let mut state = self.state.write();
+                state
                     .ensure_run_source(
                         run_id,
                         Some(session_id.to_owned()),
                         connector_id.map(str::to_owned),
                     )
                     .apply_view(view, platform::now());
+                state.reconcile_request_actions(run_id);
             }
             Err(error) if error.status == 401 => self.clear_auth(Some(error.message)).await,
+            Err(error) if error.status == 404 => {
+                let mut state = self.state.write();
+                state.runs.remove(run_id);
+                state.run_order.retain(|id| id != run_id);
+                for session in &mut state.sessions.items {
+                    session.run_ids.retain(|id| id != run_id);
+                }
+            }
             Err(error) => {
                 let mut state = self.state.write();
                 let run = state.ensure_run_source(
@@ -731,7 +1010,7 @@ impl AppController {
             .await;
     }
 
-    pub async fn create_session(self) -> Option<SessionView> {
+    pub async fn create_session(mut self) -> Option<SessionView> {
         if !platform::is_online() {
             self.notice("离线时无法创建会话", "warning");
             return None;
@@ -742,6 +1021,11 @@ impl AppController {
         self.set_busy(false);
         match result {
             Ok(session) => {
+                {
+                    let mut state = self.state.write();
+                    state.ui.session_tab = Some("orchestral".to_owned());
+                    state.ui.session_page = 0;
+                }
                 self.upsert_session(session.clone(), true);
                 self.load_session(session.key()).await;
                 Some(session)
@@ -756,6 +1040,8 @@ impl AppController {
     pub async fn create_agent_session(
         mut self,
         connector: AgentConnectorView,
+        cwd: Option<String>,
+        options: Value,
     ) -> Option<SessionView> {
         if !platform::is_online() {
             self.notice("离线时无法创建会话", "warning");
@@ -769,15 +1055,32 @@ impl AppController {
         self.set_busy(true);
         let result = self
             .api
-            .create_agent_session(&token, &connector.connector_id, None, None)
+            .create_agent_session(
+                &token,
+                &connector.connector_id,
+                cwd.as_deref(),
+                None,
+                options,
+            )
             .await;
         self.set_busy(false);
         match result {
             Ok(summary) => {
                 let session = summary.into_session();
-                self.state.write().ui.new_session_open = false;
-                self.upsert_session(session.clone(), true);
-                self.load_session(session.key()).await;
+                let session_key = session.key();
+                self.stop_stream();
+                self.upsert_session(session.clone(), false);
+                {
+                    let mut state = self.state.write();
+                    state.activate_created_agent_session(
+                        connector.connector_id.clone(),
+                        session_key,
+                    );
+                }
+                // `thread/start` returns authoritative metadata and a new
+                // thread has no persisted turns. Start live observation in
+                // the background instead of showing the history-loading UI.
+                self.resume_live_transport_for_selection(0);
                 Some(session)
             }
             Err(error) => {
@@ -914,21 +1217,49 @@ impl AppController {
         }
     }
 
-    pub async fn submit(mut self, text: String) {
-        let input = text.trim().to_owned();
-        if input.is_empty() || self.state.read().ui.composer_busy {
-            return;
+    pub async fn upload_artifact(self, file: FileData) -> Result<UploadedArtifact, String> {
+        let Some(token) = self.token.read().clone() else {
+            return Err("当前设备尚未登录".to_owned());
+        };
+        if file.size() == 0 || file.size() > MAX_ARTIFACT_BYTES {
+            return Err("文件必须在 1 byte 到 64 MiB 之间".to_owned());
         }
+        let file_name = file.name();
+        let media_type = file
+            .content_type()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "application/octet-stream".to_owned());
+        let bytes = file
+            .read_bytes()
+            .await
+            .map_err(|error| format!("读取文件失败：{error}"))?;
+        let sha256 = hex::encode(Sha256::digest(&bytes));
+        self.api
+            .upload_artifact(&token, &file_name, &media_type, &bytes, &sha256)
+            .await
+            .map_err(|error| presented_api_error(&error))
+    }
+
+    /// Submits one composer operation and reports whether the caller may clear
+    /// its draft. A transport failure is ambiguous because the Host can have
+    /// committed the idempotent command before the response was lost; in that
+    /// case the optimistic message stays visible and the draft may clear.
+    pub async fn submit(mut self, text: String, attachments: Vec<UploadedArtifact>) -> bool {
+        let input = text.trim().to_owned();
+        if (input.is_empty() && attachments.is_empty()) || self.state.read().ui.composer_busy {
+            return false;
+        }
+        let display_input = optimistic_artifact_message(&input, &attachments);
         if !platform::is_online() {
             self.notice("当前离线，恢复连接后再发送", "warning");
-            return;
+            return false;
         }
         if self.state.read().recoverable_run().is_some() {
-            self.notice("运行连接已中断，请先恢复连接", "warning");
-            return;
+            self.notice("Agent 状态正在自动恢复，请稍后再发送", "warning");
+            return false;
         }
         let Some(token) = self.token.read().clone() else {
-            return;
+            return false;
         };
         self.set_busy(true);
         let session = match self.state.read().selected_session().cloned() {
@@ -941,36 +1272,110 @@ impl AppController {
                 Err(error) => {
                     self.set_busy(false);
                     self.handle_api_error(error).await;
-                    return;
+                    return false;
                 }
             },
         };
         let operation_session_key = session.key();
+        let native_anchor_id = self.state.read().selected_native_tail_id();
 
         let active_run_id = { self.state.read().active_run().map(|run| run.id.clone()) };
         if let Some(run_id) = active_run_id {
-            match self
+            let command_id = match platform::new_uuid() {
+                Ok(command_id) => command_id,
+                Err(error) => {
+                    self.notice(&error.message, "error");
+                    self.set_busy(false);
+                    return false;
+                }
+            };
+            let outbox = OutboxEntry {
+                id: format!("steer:{command_id}"),
+                connector_id: session.connector_id.clone(),
+                session_id: session.id.clone(),
+                input: input.clone(),
+                attachments: attachments.clone(),
+                native_anchor_id: native_anchor_id.clone(),
+                created_at_unix_ms: platform::now() as i64,
+                operation: OutboxOperation::Steer {
+                    run_id: run_id.clone(),
+                    command_id: command_id.clone(),
+                },
+            };
+            if let Err(error) = storage::save_outbox(&outbox).await {
+                self.notice(&format!("发送前无法保存本地 Outbox：{error}"), "error");
+                self.set_busy(false);
+                return false;
+            }
+            let optimistic_message_id = format!("steer-{command_id}");
+            self.state
+                .write()
+                .ensure_run_source(
+                    &run_id,
+                    Some(session.id.clone()),
+                    session.connector_id.clone(),
+                )
+                .optimistic_steer(
+                    optimistic_message_id.clone(),
+                    display_input.clone(),
+                    platform::now(),
+                    native_anchor_id,
+                );
+            spawn(async move {
+                TimeoutFuture::new(0).await;
+                platform::scroll_timeline_to_end();
+            });
+            let accepted = match self
                 .api
-                .steer(&token, &run_id, &input, session.connector_id.as_deref())
+                .steer(
+                    &token,
+                    &run_id,
+                    &command_id,
+                    &input,
+                    session.connector_id.as_deref(),
+                    &attachments,
+                )
                 .await
             {
                 Ok(ack) => match check_ack(&ack, "引导") {
-                    Ok(command_id) => {
-                        self.state
-                            .write()
-                            .ensure_run_source(
-                                &run_id,
-                                Some(session.id.clone()),
-                                session.connector_id.clone(),
-                            )
-                            .optimistic_steer(format!("steer-{command_id}"), input);
+                    Ok(_) => {
+                        if let Err(error) = storage::delete_outbox(&outbox.id).await {
+                            self.notice(
+                                &format!("已发送，但清理本地 Outbox 失败：{error}"),
+                                "warning",
+                            );
+                        }
+                        true
                     }
-                    Err(error) => self.notice(&error.message, "error"),
+                    Err(error) => {
+                        if let Some(run) = self.state.write().runs.get_mut(&run_id) {
+                            run.messages
+                                .retain(|message| message.id != optimistic_message_id);
+                        }
+                        let _ = storage::delete_outbox(&outbox.id).await;
+                        self.notice(&error.message, "error");
+                        false
+                    }
                 },
-                Err(error) => self.handle_api_error(error).await,
-            }
+                Err(error) => {
+                    // A transport error is ambiguous: the Host may already
+                    // have accepted this exact command id. Keep that local
+                    // message for later reconciliation, while definitive
+                    // rejections remove it immediately.
+                    let ambiguous = error.status == 0;
+                    if !ambiguous {
+                        if let Some(run) = self.state.write().runs.get_mut(&run_id) {
+                            run.messages
+                                .retain(|message| message.id != optimistic_message_id);
+                        }
+                        let _ = storage::delete_outbox(&outbox.id).await;
+                    }
+                    self.handle_api_error(error).await;
+                    ambiguous
+                }
+            };
             self.set_busy(false);
-            return;
+            return accepted;
         }
 
         let run_id = match platform::new_uuid() {
@@ -978,9 +1383,26 @@ impl AppController {
             Err(error) => {
                 self.notice(&error.message, "error");
                 self.set_busy(false);
-                return;
+                return false;
             }
         };
+        let outbox = OutboxEntry {
+            id: format!("start:{run_id}"),
+            connector_id: session.connector_id.clone(),
+            session_id: session.id.clone(),
+            input: input.clone(),
+            attachments: attachments.clone(),
+            native_anchor_id: native_anchor_id.clone(),
+            created_at_unix_ms: platform::now() as i64,
+            operation: OutboxOperation::Start {
+                run_id: run_id.clone(),
+            },
+        };
+        if let Err(error) = storage::save_outbox(&outbox).await {
+            self.notice(&format!("发送前无法保存本地 Outbox：{error}"), "error");
+            self.set_busy(false);
+            return false;
+        }
         let now = platform::now();
         let mut pending_session = session.clone();
         pending_session.updated_at_unix_ms = now as i64;
@@ -995,7 +1417,7 @@ impl AppController {
                 Some(session.id.clone()),
                 session.connector_id.clone(),
             )
-            .optimistic_start_input(input.clone(), now);
+            .optimistic_start_input(display_input.clone(), now, native_anchor_id.clone());
         self.stop_stream();
         spawn(async move {
             TimeoutFuture::new(0).await;
@@ -1005,41 +1427,41 @@ impl AppController {
         let start = match session.connector_id.as_deref() {
             Some(connector_id) => {
                 self.api
-                    .start_agent_run(&token, connector_id, &session.id, &run_id, &input)
+                    .start_agent_run(
+                        &token,
+                        connector_id,
+                        &session.id,
+                        &run_id,
+                        &input,
+                        &attachments,
+                    )
                     .await
             }
             None => {
                 self.api
-                    .start_run(&token, &session.id, &run_id, &input)
+                    .start_run(&token, &session.id, &run_id, &input, &attachments)
                     .await
             }
         };
-        match start {
+        let accepted = match start {
             Ok(response) => {
                 let actual_run_id = response
                     .get("run_id")
                     .and_then(value_as_id)
                     .unwrap_or_else(|| run_id.clone());
+                let operation = response
+                    .get("operation")
+                    .and_then(Value::as_str)
+                    .unwrap_or("started");
+                let command_id = response.get("command_id").and_then(value_as_id);
                 if actual_run_id != run_id {
                     let mut state = self.state.write();
-                    if let Some(mut provisional) = state.runs.remove(&run_id) {
-                        provisional.id = actual_run_id.clone();
-                        provisional.session_id = Some(session.id.clone());
-                        provisional.connector_id = session.connector_id.clone();
-                        if let Some(initial) = provisional
-                            .messages
-                            .iter_mut()
-                            .find(|message| message.role == "user" && !message.steering)
-                        {
-                            initial.id = format!("optimistic-input-{actual_run_id}");
-                        }
-                        state.runs.insert(actual_run_id.clone(), provisional);
-                    }
-                    for item in &mut state.run_order {
-                        if item == &run_id {
-                            *item = actual_run_id.clone();
-                        }
-                    }
+                    // Another tab may have won the session operation and the
+                    // Host atomically converted this stale "start" into a
+                    // steer on the existing Run. Never replace that Run with
+                    // this tab's provisional local projection.
+                    state.runs.remove(&run_id);
+                    state.run_order.retain(|item| item != &run_id);
                 }
                 let mut updated = session.clone();
                 updated.updated_at_unix_ms = platform::now() as i64;
@@ -1056,7 +1478,16 @@ impl AppController {
                         Some(session.id.clone()),
                         session.connector_id.clone(),
                     );
-                    run.record_started_input(input, platform::now());
+                    match operation {
+                        "steered" => run.optimistic_steer(
+                            format!("steer-{}", command_id.as_deref().unwrap_or(run_id.as_str())),
+                            display_input,
+                            platform::now(),
+                            native_anchor_id,
+                        ),
+                        "replayed" => {}
+                        _ => run.record_accepted_input(display_input, platform::now()),
+                    }
                     if let Some(view) = response.get("view") {
                         run.apply_view(view.clone(), platform::now());
                     }
@@ -1067,71 +1498,43 @@ impl AppController {
                 {
                     self.resume_live_transport_for_selection(0);
                 }
+                if let Err(error) = storage::delete_outbox(&outbox.id).await {
+                    self.notice(
+                        &format!("已发送，但清理本地 Outbox 失败：{error}"),
+                        "warning",
+                    );
+                }
+                true
             }
             Err(error) => {
-                if let Some(run) = self.state.write().runs.get_mut(&run_id) {
-                    run.reject_optimistic_start(error.message.clone(), platform::now());
+                let ambiguous = error.status == 0;
+                let presented = presented_api_error(&error);
+                if ambiguous {
+                    self.notice(
+                        "发送结果暂时未知，已保存在 Outbox 并将在重连后核对",
+                        "warning",
+                    );
+                } else {
+                    let _ = storage::delete_outbox(&outbox.id).await;
+                    if let Some(run) = self.state.write().runs.get_mut(&run_id) {
+                        run.reject_optimistic_start(presented.clone(), platform::now());
+                    }
+                    if error.code == "live_control_unavailable" {
+                        self.notice(&presented, "warning");
+                    } else {
+                        self.handle_api_error(error).await;
+                    }
                 }
-                self.handle_api_error(error).await;
                 if self.state.read().sessions.selected_id.as_deref()
                     == Some(operation_session_key.as_str())
                 {
                     self.resume_live_transport_for_selection(0);
                 }
+                ambiguous
             }
-        }
-        self.set_busy(false);
-    }
-
-    pub async fn recover_current_run(mut self) {
-        if !platform::is_online() {
-            self.notice("当前离线，恢复网络后再重连任务", "warning");
-            return;
-        }
-        let Some(token) = self.token.read().clone() else {
-            return;
         };
-        let Some((run_id, connector_id, operation_session_key)) = ({
-            let state = self.state.read();
-            state.recoverable_run().map(|run| {
-                (
-                    run.id.clone(),
-                    run.connector_id.clone(),
-                    state.sessions.selected_id.clone().unwrap_or_default(),
-                )
-            })
-        }) else {
-            return;
-        };
-        self.set_busy(true);
-        self.stop_stream();
-        match self
-            .api
-            .recover(&token, &run_id, connector_id.as_deref())
-            .await
-        {
-            Ok(view) => {
-                self.state
-                    .write()
-                    .ensure_run_source(&run_id, None, connector_id)
-                    .apply_view(view, platform::now());
-                self.refresh_run(&run_id).await;
-                if self.state.read().sessions.selected_id.as_deref()
-                    == Some(operation_session_key.as_str())
-                {
-                    self.resume_live_transport_for_selection(0);
-                }
-            }
-            Err(error) => {
-                self.handle_api_error(error).await;
-                if self.state.read().sessions.selected_id.as_deref()
-                    == Some(operation_session_key.as_str())
-                {
-                    self.resume_live_transport_for_selection(0);
-                }
-            }
-        }
         self.set_busy(false);
+        accepted
     }
 
     pub async fn cancel(self) {
@@ -1166,17 +1569,23 @@ impl AppController {
         self.set_busy(false);
     }
 
-    pub async fn resolve_input(self, run_id: String, request_id: String, text: String) {
+    pub async fn resolve_input(mut self, run_id: String, request_id: String, text: String) {
         let Some(token) = self.token.read().clone() else {
             return;
         };
+        {
+            let mut state = self.state.write();
+            if state.ui.request_is_resolving(&run_id, &request_id) {
+                return;
+            }
+            state.ui.set_request_resolving(&run_id, &request_id, true);
+        }
         let connector_id = self
             .state
             .read()
             .runs
             .get(&run_id)
             .and_then(|run| run.connector_id.clone());
-        self.set_busy(true);
         match self
             .api
             .resolve_input(
@@ -1190,27 +1599,49 @@ impl AppController {
         {
             Ok(ack) => {
                 if let Err(error) = check_ack(&ack, "回复") {
+                    self.state
+                        .write()
+                        .ui
+                        .set_request_resolving(&run_id, &request_id, false);
                     self.notice(&error.message, "error");
                 } else {
                     self.refresh_run(&run_id).await;
                 }
             }
-            Err(error) => self.handle_api_error(error).await,
+            Err(error) if is_stale_request_error(&error) => {
+                self.state
+                    .write()
+                    .remove_pending_request(&run_id, &request_id);
+                self.notice("该请求已由其他客户端处理", "info");
+                self.refresh_run(&run_id).await;
+            }
+            Err(error) => {
+                self.state
+                    .write()
+                    .ui
+                    .set_request_resolving(&run_id, &request_id, false);
+                self.handle_api_error(error).await;
+            }
         }
-        self.set_busy(false);
     }
 
-    pub async fn resolve_approval(self, run_id: String, request_id: String, decision: String) {
+    pub async fn resolve_approval(mut self, run_id: String, request_id: String, decision: String) {
         let Some(token) = self.token.read().clone() else {
             return;
         };
+        {
+            let mut state = self.state.write();
+            if state.ui.request_is_resolving(&run_id, &request_id) {
+                return;
+            }
+            state.ui.set_request_resolving(&run_id, &request_id, true);
+        }
         let connector_id = self
             .state
             .read()
             .runs
             .get(&run_id)
             .and_then(|run| run.connector_id.clone());
-        self.set_busy(true);
         match self
             .api
             .resolve_approval(
@@ -1224,14 +1655,30 @@ impl AppController {
         {
             Ok(ack) => {
                 if let Err(error) = check_ack(&ack, "批准") {
+                    self.state
+                        .write()
+                        .ui
+                        .set_request_resolving(&run_id, &request_id, false);
                     self.notice(&error.message, "error");
                 } else {
                     self.refresh_run(&run_id).await;
                 }
             }
-            Err(error) => self.handle_api_error(error).await,
+            Err(error) if is_stale_request_error(&error) => {
+                self.state
+                    .write()
+                    .remove_pending_request(&run_id, &request_id);
+                self.notice("该审批已由其他客户端处理", "info");
+                self.refresh_run(&run_id).await;
+            }
+            Err(error) => {
+                self.state
+                    .write()
+                    .ui
+                    .set_request_resolving(&run_id, &request_id, false);
+                self.handle_api_error(error).await;
+            }
         }
-        self.set_busy(false);
     }
 
     pub async fn revoke_device(mut self, device_id: String, current: bool) {
@@ -1256,13 +1703,21 @@ impl AppController {
     }
 
     fn resume_live_transport_for_selection(self, initial_observer_errors: u32) {
-        let active = self.state.read().active_run().map(|run| run.id.clone());
-        if let Some(run_id) = active {
-            self.start_stream(run_id);
-        } else if selected_agent_observation_target(&self.state.read()).is_some() {
+        let plan = live_transport_plan(&self.state.read());
+        if plan.agent_session.is_some() {
             self.start_selected_agent_observer(initial_observer_errors);
         } else {
-            self.stop_stream_and_set_idle();
+            let controller = self;
+            controller.stop_agent_session_observer();
+        }
+        if let Some(run_id) = plan.run_id {
+            self.start_stream(run_id);
+        } else {
+            let controller = self;
+            controller.stop_run_stream();
+            if plan.agent_session.is_none() {
+                controller.stop_stream_and_set_idle();
+            }
         }
     }
 
@@ -1288,7 +1743,7 @@ impl AppController {
         session_state: String,
         initial_errors: u32,
     ) {
-        self.stop_stream();
+        self.stop_agent_session_observer();
         if !agent_observation_is_current(&self.state.read(), &target) {
             return;
         }
@@ -1296,9 +1751,13 @@ impl AppController {
             self.notice("浏览器无法启动 Agent 会话自动刷新", "error");
             return;
         };
-        self.stream_abort.set(Some(controller.clone()));
-        let generation = self.stream_generation.read().saturating_add(1);
-        self.stream_generation.set(generation);
+        self.agent_session_stream_abort
+            .set(Some(controller.clone()));
+        let generation = self
+            .agent_session_stream_generation
+            .read()
+            .saturating_add(1);
+        self.agent_session_stream_generation.set(generation);
         {
             let mut state = self.state.write();
             state.connection.stream = if initial_errors == 0 {
@@ -1327,6 +1786,221 @@ impl AppController {
     async fn follow_agent_session_observer(
         mut self,
         target: AgentSessionObservationTarget,
+        session_state: String,
+        controller: web_sys::AbortController,
+        generation: u64,
+        initial_errors: u32,
+    ) {
+        let mut consecutive_errors = initial_errors;
+        loop {
+            if controller.signal().aborted()
+                || *self.agent_session_stream_generation.read() != generation
+                || !agent_observation_is_current(&self.state.read(), &target)
+            {
+                return;
+            }
+            let Some(token) = self.token.read().clone() else {
+                return;
+            };
+            {
+                let mut state = self.state.write();
+                state.connection.stream = if consecutive_errors == 0 {
+                    "connecting"
+                } else {
+                    "reconnecting"
+                }
+                .to_owned();
+                state.connection.attempt = consecutive_errors;
+                state.connection.error = None;
+            }
+            let refresh_controller = self;
+            let refresh_target = target.clone();
+            let refresh_signal = controller.signal();
+            let after = self
+                .state
+                .read()
+                .sessions
+                .stream_cursors
+                .get(&target.session_key)
+                .copied()
+                .unwrap_or_default();
+            let result = self
+                .api
+                .stream_agent_session(
+                    &token,
+                    &target.connector_id,
+                    &target.session_id,
+                    after,
+                    &controller.signal(),
+                    move |change| {
+                        let controller = refresh_controller;
+                        let target = refresh_target.clone();
+                        let signal = refresh_signal.clone();
+                        async move {
+                            controller
+                                .apply_agent_session_observation_change(
+                                    target, generation, signal, change,
+                                )
+                                .await
+                        }
+                    },
+                )
+                .await;
+            if controller.signal().aborted()
+                || *self.agent_session_stream_generation.read() != generation
+            {
+                return;
+            }
+            match result {
+                Err(error) if error.status == 501 => {
+                    self.follow_agent_session_polling_observer(
+                        target,
+                        session_state,
+                        controller,
+                        generation,
+                        consecutive_errors,
+                    )
+                    .await;
+                    return;
+                }
+                Err(error) if error.status == 401 => {
+                    if agent_observation_is_current(&self.state.read(), &target) {
+                        self.clear_auth(Some(error.message)).await;
+                    }
+                    return;
+                }
+                Err(error) if error.status == 404 => {
+                    let mut state = self.state.write();
+                    if !agent_observation_is_current(&state, &target) {
+                        return;
+                    }
+                    state
+                        .sessions
+                        .items
+                        .retain(|session| session.key() != target.session_key);
+                    state.sessions.selected_id = None;
+                    drop(state);
+                    self.stop_stream_and_set_idle();
+                    self.notice("会话已不存在，已从列表移除", "warning");
+                    return;
+                }
+                Ok(()) => {
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    self.state.write().connection.error =
+                        Some("Agent 会话实时连接已关闭，正在重连".to_owned());
+                }
+                Err(error) => {
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    self.state.write().connection.error = Some(error.message);
+                }
+            }
+            self.state.write().connection.attempt = consecutive_errors;
+            TimeoutFuture::new(agent_observation_backoff_ms(consecutive_errors)).await;
+        }
+    }
+
+    async fn apply_agent_session_observation_change(
+        mut self,
+        target: AgentSessionObservationTarget,
+        generation: u64,
+        signal: web_sys::AbortSignal,
+        change: AgentSessionChangeView,
+    ) -> Result<(), ApiError> {
+        if signal.aborted()
+            || *self.agent_session_stream_generation.read() != generation
+            || !agent_observation_is_current(&self.state.read(), &target)
+        {
+            return Ok(());
+        }
+        if change.connector_id != target.connector_id || change.session_id != target.session_id {
+            return Err(ApiError {
+                message: "Agent session stream returned a change for another session".to_owned(),
+                status: 0,
+                code: "session_change_target_mismatch".to_owned(),
+                details: None,
+            });
+        }
+        if matches!(
+            &change.change,
+            AgentSessionChangeKindView::RefreshRequired { .. }
+        ) {
+            return self
+                .refresh_agent_session_observation(target, generation, signal)
+                .await;
+        }
+
+        let follow_timeline = platform::timeline_is_near_end();
+        let current = self.state.read().clone();
+        let mut next = current.clone();
+        let tail_before = next.selected_timeline_tail_key();
+        next.apply_agent_session_change(change);
+        mark_observation_healthy(&mut next, "live");
+        let tail_appended = tail_before != next.selected_timeline_tail_key();
+        if next != current {
+            self.state.set(next);
+        }
+        if tail_appended && follow_timeline {
+            spawn(async move {
+                TimeoutFuture::new(0).await;
+                platform::scroll_timeline_to_end();
+            });
+        }
+        Ok(())
+    }
+
+    async fn refresh_agent_session_observation(
+        mut self,
+        target: AgentSessionObservationTarget,
+        generation: u64,
+        signal: web_sys::AbortSignal,
+    ) -> Result<(), ApiError> {
+        if signal.aborted()
+            || *self.agent_session_stream_generation.read() != generation
+            || !agent_observation_is_current(&self.state.read(), &target)
+        {
+            return Ok(());
+        }
+        let Some(token) = self.token.read().clone() else {
+            return Ok(());
+        };
+        let detail = self
+            .api
+            .agent_session(
+                &token,
+                &target.connector_id,
+                &target.session_id,
+                None,
+                AGENT_HISTORY_PAGE_LIMIT,
+            )
+            .await?;
+        if signal.aborted()
+            || *self.agent_session_stream_generation.read() != generation
+            || !agent_observation_is_current(&self.state.read(), &target)
+        {
+            return Ok(());
+        }
+        let follow_timeline = platform::timeline_is_near_end();
+        let current = self.state.read().clone();
+        let mut next = current.clone();
+        let tail_before = next.selected_timeline_tail_key();
+        next.project_agent_session(detail);
+        mark_observation_healthy(&mut next, "live");
+        let tail_appended = tail_before != next.selected_timeline_tail_key();
+        if next != current {
+            self.state.set(next);
+        }
+        if tail_appended && follow_timeline {
+            spawn(async move {
+                TimeoutFuture::new(0).await;
+                platform::scroll_timeline_to_end();
+            });
+        }
+        Ok(())
+    }
+
+    async fn follow_agent_session_polling_observer(
+        mut self,
+        target: AgentSessionObservationTarget,
         mut session_state: String,
         controller: web_sys::AbortController,
         generation: u64,
@@ -1336,19 +2010,19 @@ impl AppController {
         let mut etag = None;
         loop {
             if controller.signal().aborted()
-                || *self.stream_generation.read() != generation
+                || *self.agent_session_stream_generation.read() != generation
                 || !agent_observation_is_current(&self.state.read(), &target)
             {
                 return;
             }
             let delay = if consecutive_errors == 0 {
-                agent_observation_interval_ms(&session_state)
+                agent_observation_interval_ms(&session_state, platform::is_document_visible())
             } else {
                 agent_observation_backoff_ms(consecutive_errors)
             };
             TimeoutFuture::new(delay).await;
             if controller.signal().aborted()
-                || *self.stream_generation.read() != generation
+                || *self.agent_session_stream_generation.read() != generation
                 || !agent_observation_is_current(&self.state.read(), &target)
             {
                 return;
@@ -1367,21 +2041,31 @@ impl AppController {
                     etag.as_deref(),
                 )
                 .await;
-            if controller.signal().aborted() || *self.stream_generation.read() != generation {
+            if controller.signal().aborted()
+                || *self.agent_session_stream_generation.read() != generation
+            {
                 return;
             }
 
             match result {
                 Ok(AgentSessionObservation::NotModified { etag: next_etag }) => {
                     etag = next_etag;
-                    let mut state = self.state.write();
-                    if !agent_observation_is_current(&state, &target) {
+                    let healthy = {
+                        let state = self.state.read();
+                        if !agent_observation_is_current(&state, &target) {
+                            return;
+                        }
+                        state.connection.stream == "observing"
+                            && state.connection.attempt == 0
+                            && state.connection.error.is_none()
+                    };
+                    if !healthy {
+                        let mut state = self.state.write();
+                        mark_observation_healthy(&mut state, "observing");
+                    }
+                    if !agent_observation_is_current(&self.state.read(), &target) {
                         return;
                     }
-                    state.connection.stream = "observing".to_owned();
-                    state.connection.attempt = 0;
-                    state.connection.error = None;
-                    state.connection.last_connected_at = Some(platform::now());
                     consecutive_errors = 0;
                 }
                 Ok(AgentSessionObservation::Modified {
@@ -1390,16 +2074,25 @@ impl AppController {
                 }) => {
                     etag = next_etag;
                     let next_session_state = detail.summary.state.clone();
-                    let mut state = self.state.write();
-                    if !agent_observation_is_current(&state, &target) {
+                    let follow_timeline = platform::timeline_is_near_end();
+                    let current = self.state.read().clone();
+                    if !agent_observation_is_current(&current, &target) {
                         return;
                     }
-                    state.project_agent_session(detail);
-                    state.connection.stream = "observing".to_owned();
-                    state.connection.attempt = 0;
-                    state.connection.error = None;
-                    state.connection.last_connected_at = Some(platform::now());
-                    drop(state);
+                    let mut next = current.clone();
+                    let tail_before = next.selected_timeline_tail_key();
+                    next.project_agent_session(*detail);
+                    mark_observation_healthy(&mut next, "observing");
+                    let tail_appended = tail_before != next.selected_timeline_tail_key();
+                    if next != current {
+                        self.state.set(next);
+                    }
+                    if tail_appended && follow_timeline {
+                        spawn(async move {
+                            TimeoutFuture::new(0).await;
+                            platform::scroll_timeline_to_end();
+                        });
+                    }
                     session_state = next_session_state;
                     consecutive_errors = 0;
                 }
@@ -1440,7 +2133,7 @@ impl AppController {
     }
 
     pub fn start_stream(mut self, run_id: String) {
-        self.stop_stream();
+        self.stop_run_stream();
         let Ok(controller) = web_sys::AbortController::new() else {
             self.notice("浏览器无法建立可取消的实时连接", "error");
             return;
@@ -1453,12 +2146,28 @@ impl AppController {
         });
     }
 
-    fn stop_stream(mut self) {
+    fn stop_run_stream(mut self) {
         if let Some(controller) = self.stream_abort.take() {
             controller.abort();
         }
         let generation = self.stream_generation.read().saturating_add(1);
         self.stream_generation.set(generation);
+    }
+
+    fn stop_agent_session_observer(mut self) {
+        if let Some(controller) = self.agent_session_stream_abort.take() {
+            controller.abort();
+        }
+        let generation = self
+            .agent_session_stream_generation
+            .read()
+            .saturating_add(1);
+        self.agent_session_stream_generation.set(generation);
+    }
+
+    fn stop_stream(self) {
+        self.stop_run_stream();
+        self.stop_agent_session_observer();
     }
 
     fn stop_stream_and_set_idle(mut self) {
@@ -1484,6 +2193,27 @@ impl AppController {
         loop {
             if controller.signal().aborted() || *self.stream_generation.read() != generation {
                 return;
+            }
+            if attempt > 0 {
+                // A Host restart can close the SSE connection after recording
+                // continuity loss and restore the Run before the replacement
+                // stream is attached. Re-read the bounded Run snapshot so the
+                // composer does not depend on a missed transition or a full
+                // browser refresh to leave `unknown`.
+                self.refresh_run(&run_id).await;
+                if controller.signal().aborted() || *self.stream_generation.read() != generation {
+                    return;
+                }
+                if self
+                    .state
+                    .read()
+                    .runs
+                    .get(&run_id)
+                    .is_some_and(|run| is_terminal(&run.status))
+                {
+                    self.finish_terminal_stream(generation);
+                    return;
+                }
             }
             let Some(token) = self.token.read().clone() else {
                 return;
@@ -1559,9 +2289,13 @@ impl AppController {
         if *self.stream_generation.read() != generation {
             return;
         }
+        let follow_timeline = platform::timeline_is_near_end();
+        let tail_before = self.state.read().selected_timeline_tail_key();
+        let mut timeline_changed = false;
         match event {
             StreamEvent::Durable { data, .. } => {
                 if let Ok(record) = serde_json::from_str::<Value>(&data) {
+                    timeline_changed = true;
                     let terminal = {
                         let mut state = self.state.write();
                         state.connection.stream = "live".to_owned();
@@ -1569,7 +2303,9 @@ impl AppController {
                         state.connection.last_connected_at = Some(platform::now());
                         let run = state.ensure_run(run_id, None);
                         run.project_durable(&record, platform::now());
-                        is_terminal(&run.status)
+                        let terminal = is_terminal(&run.status);
+                        state.reconcile_request_actions(run_id);
+                        terminal
                     };
                     if terminal {
                         self.finish_terminal_stream(generation);
@@ -1578,11 +2314,13 @@ impl AppController {
             }
             StreamEvent::Telemetry { data } => {
                 if let Ok(telemetry) = serde_json::from_str::<Value>(&data) {
+                    timeline_changed = true;
                     let mut state = self.state.write();
                     state.connection.stream = "live".to_owned();
                     state.ensure_run(run_id, None).project_telemetry(&telemetry);
                 }
             }
+            StreamEvent::SessionChanged { .. } => {}
             StreamEvent::Error { data } => {
                 let message = serde_json::from_str::<Value>(&data)
                     .ok()
@@ -1601,17 +2339,33 @@ impl AppController {
                 self.state.write().connection.stream = "live".to_owned();
             }
         }
+        let tail_appended =
+            timeline_changed && tail_before != self.state.read().selected_timeline_tail_key();
+        if tail_appended && follow_timeline {
+            spawn(async move {
+                TimeoutFuture::new(0).await;
+                platform::scroll_timeline_to_end();
+            });
+        }
     }
 
     fn finish_terminal_stream(self, generation: u64) {
         if *self.stream_generation.read() != generation {
             return;
         }
-        self.resume_live_transport_for_selection(0);
+        self.stop_run_stream();
+        if self.agent_session_stream_abort.read().is_none()
+            && selected_agent_observation_target(&self.state.read()).is_some()
+        {
+            self.start_selected_agent_observer(0);
+        }
     }
 
     pub fn window_listeners(self) -> Vec<Closure<dyn FnMut(web_sys::Event)>> {
         let mut listeners = Vec::new();
+        if let Ok(listener) = platform::install_visual_viewport_sync() {
+            listeners.push(listener);
+        }
         if let Ok(listener) = platform::add_window_listener("online", move |_| {
             let mut controller = self;
             controller.state.write().connection.online = true;
@@ -1731,6 +2485,15 @@ fn merge_session(existing: Option<&SessionView>, mut incoming: SessionView) -> S
     incoming
 }
 
+fn presented_api_error(error: &ApiError) -> String {
+    if error.code == "live_control_unavailable" {
+        "这个会话由另一个 Codex 进程持有，当前无法实时 steer；请改用 shared daemon 托管的会话"
+            .to_owned()
+    } else {
+        error.message.clone()
+    }
+}
+
 fn merge_sessions(existing: &[SessionView], incoming: Vec<SessionView>) -> Vec<SessionView> {
     incoming
         .into_iter()
@@ -1824,6 +2587,14 @@ fn check_ack(ack: &Value, operation: &str) -> Result<String, ApiError> {
     }
 }
 
+fn is_stale_request_error(error: &ApiError) -> bool {
+    error.status == 409
+        && matches!(
+            error.code.as_str(),
+            "request_not_pending" | "approval_unavailable"
+        )
+}
+
 fn value_as_id(value: &Value) -> Option<String> {
     value
         .as_str()
@@ -1884,16 +2655,20 @@ mod tests {
             "busy_elsewhere",
         ] {
             assert_eq!(
-                agent_observation_interval_ms(status),
+                agent_observation_interval_ms(status, true),
                 AGENT_OBSERVER_ACTIVE_INTERVAL_MS
             );
         }
         for status in ["idle", "detached", "unavailable", "unknown"] {
             assert_eq!(
-                agent_observation_interval_ms(status),
+                agent_observation_interval_ms(status, true),
                 AGENT_OBSERVER_IDLE_INTERVAL_MS
             );
         }
+        assert_eq!(
+            agent_observation_interval_ms("active", false),
+            AGENT_OBSERVER_BACKGROUND_INTERVAL_MS
+        );
         assert_eq!(
             (1..=7)
                 .map(agent_observation_backoff_ms)
@@ -1903,7 +2678,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_observation_guard_tracks_selection_connectivity_and_controlled_runs() {
+    fn agent_observation_guard_tracks_selection_and_connectivity_during_controlled_runs() {
         let mut state = selected_external_state();
         let target = selected_agent_observation_target(&state).unwrap();
         assert!(agent_observation_is_current(&state, &target));
@@ -1922,7 +2697,18 @@ mod tests {
                 Some("codex/local".to_owned()),
             )
             .status = "submitting".to_owned();
-        assert!(selected_agent_observation_target(&state).is_none());
+        let submitting = live_transport_plan(&state);
+        assert_eq!(submitting.agent_session, Some(target.clone()));
+        assert_eq!(submitting.run_id, None);
+        assert_eq!(
+            selected_agent_observation_target(&state),
+            Some(target.clone())
+        );
+
+        state.runs.get_mut("controlled-run").unwrap().status = "accepted".to_owned();
+        let running = live_transport_plan(&state);
+        assert_eq!(running.agent_session, Some(target.clone()));
+        assert_eq!(running.run_id.as_deref(), Some("controlled-run"));
 
         state.runs.get_mut("controlled-run").unwrap().status = "delivered".to_owned();
         assert_eq!(
@@ -2077,6 +2863,24 @@ mod tests {
     fn accepted_ack_returns_command_id() {
         let ack = json!({ "command_id": "cmd-1", "state": { "state": "accepted" } });
         assert_eq!(check_ack(&ack, "test").unwrap(), "cmd-1");
+    }
+
+    #[test]
+    fn only_authoritative_stale_request_conflicts_remove_cards() {
+        for code in ["request_not_pending", "approval_unavailable"] {
+            assert!(is_stale_request_error(&ApiError {
+                message: "stale".to_owned(),
+                status: 409,
+                code: code.to_owned(),
+                details: None,
+            }));
+        }
+        assert!(!is_stale_request_error(&ApiError {
+            message: "wrong approval choice".to_owned(),
+            status: 409,
+            code: "session_approval_unavailable".to_owned(),
+            details: None,
+        }));
     }
 
     #[test]

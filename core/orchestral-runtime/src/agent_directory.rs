@@ -10,15 +10,16 @@ use std::sync::Arc;
 use orchestral_core::agent_connector::{
     AgentConnector, AgentConnectorDescriptor, AgentConnectorError, AgentConnectorHealth,
     AgentConnectorId, AgentSessionActionExecution, AgentSessionActionInvocation,
-    AgentSessionActionOutcome, AgentSessionActionStatus, AgentSessionDetail, AgentSessionListQuery,
-    AgentSessionPage, AgentSessionReadQuery, AgentSessionSummary, CreateAgentSessionRequest,
-    InvokeAgentSessionActionRequest,
+    AgentSessionActionOutcome, AgentSessionActionStatus, AgentSessionChange, AgentSessionDetail,
+    AgentSessionListQuery, AgentSessionPage, AgentSessionReadQuery, AgentSessionSummary,
+    CreateAgentSessionRequest, InvokeAgentSessionActionRequest,
 };
 use orchestral_core::agent_protocol::spi::{
     AgentJournalStore, AgentProvider, InMemoryAgentJournalStore,
 };
 use orchestral_core::agent_protocol::wire::{AgentSessionId, RunId};
 use thiserror::Error;
+use tokio::sync::broadcast;
 use tokio::sync::RwLock;
 
 use crate::api::AgentApi;
@@ -161,6 +162,22 @@ impl AgentDirectory {
         Ok(detail)
     }
 
+    pub async fn subscribe_session_changes(
+        &self,
+        connector_id: &AgentConnectorId,
+        session_id: &AgentSessionId,
+    ) -> Result<broadcast::Receiver<AgentSessionChange>, AgentDirectoryError> {
+        if session_id.is_empty() {
+            return Err(AgentConnectorError::invalid("session id must not be empty").into());
+        }
+        let entry = self.entry(connector_id).await?;
+        self.verify_descriptor(&entry)?;
+        Ok(entry
+            .connector
+            .subscribe_session_changes(session_id)
+            .await?)
+    }
+
     pub async fn create_session(
         &self,
         connector_id: &AgentConnectorId,
@@ -293,6 +310,28 @@ impl AgentDirectory {
         let entry = self.entry(connector_id).await?;
         entry.api.create_session(Some(session_id.clone())).await?;
         Ok(entry.api.start_text(session_id, run_id, input).await?)
+    }
+
+    /// Start one Agent Protocol Run with provider-neutral Content blocks.
+    pub async fn start_content(
+        &self,
+        connector_id: &AgentConnectorId,
+        session_id: &AgentSessionId,
+        run_id: Option<RunId>,
+        input: Vec<orchestral_core::agent_protocol::wire::Content>,
+    ) -> Result<AgentRunHandle, AgentDirectoryError> {
+        self.read_session_page(
+            connector_id,
+            session_id,
+            AgentSessionReadQuery {
+                cursor: None,
+                limit: 1,
+            },
+        )
+        .await?;
+        let entry = self.entry(connector_id).await?;
+        entry.api.create_session(Some(session_id.clone())).await?;
+        Ok(entry.api.start_content(session_id, run_id, input).await?)
     }
 
     pub async fn agent_api(

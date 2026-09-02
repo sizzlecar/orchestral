@@ -72,6 +72,7 @@ async fn queues_into_a_thread_owned_by_another_codex_process() {
     let connector = Arc::new(CodexConnector::new(CodexAppServerConfig {
         executable: wrapper,
         endpoint: CodexAppServerEndpoint::PrivateStdio,
+        allow_deferred_queue: true,
         dispatch_journal_dir: Some(fixture.path().join("orchestral-dispatch")),
         request_timeout: Duration::from_secs(10),
         max_frame_bytes: 16 * 1024 * 1024,

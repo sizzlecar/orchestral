@@ -1,6 +1,11 @@
+use std::cell::Cell;
+use std::rc::Rc;
+
 use js_sys::{Array, Function, Reflect, Uint8Array};
 use wasm_bindgen::{closure::Closure, JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
+
+const TIMELINE_FOLLOW_EDGE_PX: i32 = 8;
 
 pub fn window() -> Result<web_sys::Window, String> {
     web_sys::window().ok_or_else(|| "Browser window is unavailable".to_owned())
@@ -14,6 +19,12 @@ pub fn is_online() -> bool {
     web_sys::window()
         .map(|window| window.navigator().on_line())
         .unwrap_or(false)
+}
+
+pub fn is_document_visible() -> bool {
+    web_sys::window()
+        .and_then(|window| window.document())
+        .is_none_or(|document| document.visibility_state() == web_sys::VisibilityState::Visible)
 }
 
 pub fn new_uuid() -> Result<String, crate::browser::api::ApiError> {
@@ -91,6 +102,56 @@ pub fn apply_theme(theme: &str) {
     }
 }
 
+/// Pins the application root to the portion of the page that is actually
+/// visible. iOS browsers keep a separate layout viewport while their address
+/// bar or keyboard moves the visual viewport; a plain `position: fixed` shell
+/// otherwise remains underneath browser chrome.
+pub fn install_visual_viewport_sync() -> Result<Closure<dyn FnMut(web_sys::Event)>, String> {
+    let viewport = window()?
+        .visual_viewport()
+        .ok_or_else(|| "Visual Viewport API is unavailable".to_owned())?;
+    sync_visual_viewport(&viewport)?;
+
+    let observed_viewport = viewport.clone();
+    let listener = Closure::wrap(Box::new(move |_event: web_sys::Event| {
+        let _ = sync_visual_viewport(&observed_viewport);
+    }) as Box<dyn FnMut(web_sys::Event)>);
+    viewport
+        .add_event_listener_with_callback("resize", listener.as_ref().unchecked_ref())
+        .map_err(js_error)?;
+    viewport
+        .add_event_listener_with_callback("scroll", listener.as_ref().unchecked_ref())
+        .map_err(js_error)?;
+    Ok(listener)
+}
+
+fn sync_visual_viewport(viewport: &web_sys::VisualViewport) -> Result<(), String> {
+    let root = window()?
+        .document()
+        .and_then(|document| document.document_element())
+        .and_then(|element| element.dyn_into::<web_sys::HtmlElement>().ok())
+        .ok_or_else(|| "Document root is unavailable".to_owned())?;
+    let device_pixel_ratio = window()?.device_pixel_ratio().max(1.0);
+    let css_px = |value: f64| {
+        let value = (value * device_pixel_ratio).round() / device_pixel_ratio;
+        format!("{value:.3}px")
+    };
+    let style = root.style();
+    style
+        .set_property("--visual-viewport-top", &css_px(viewport.offset_top()))
+        .map_err(js_error)?;
+    style
+        .set_property("--visual-viewport-left", &css_px(viewport.offset_left()))
+        .map_err(js_error)?;
+    style
+        .set_property("--visual-viewport-width", &css_px(viewport.width()))
+        .map_err(js_error)?;
+    style
+        .set_property("--visual-viewport-height", &css_px(viewport.height()))
+        .map_err(js_error)?;
+    Ok(())
+}
+
 pub fn scroll_timeline_to_end() {
     let Some(document) = web_sys::window().and_then(|window| window.document()) else {
         return;
@@ -102,6 +163,25 @@ pub fn scroll_timeline_to_end() {
         return;
     };
     element.set_scroll_top(element.scroll_height());
+}
+
+/// Whether live updates should keep following the transcript. Once the user
+/// scrolls up to read history, updates must not yank the viewport away.
+pub fn timeline_is_near_end() -> bool {
+    let Some(document) = web_sys::window().and_then(|window| window.document()) else {
+        return true;
+    };
+    let Ok(Some(element)) = document.query_selector(".message-list") else {
+        return true;
+    };
+    let Ok(element) = element.dyn_into::<web_sys::HtmlElement>() else {
+        return true;
+    };
+    let remaining = element
+        .scroll_height()
+        .saturating_sub(element.client_height())
+        .saturating_sub(element.scroll_top());
+    remaining <= TIMELINE_FOLLOW_EDGE_PX
 }
 
 pub fn timeline_scroll_anchor() -> Option<(i32, i32)> {
@@ -155,6 +235,45 @@ pub async fn register_service_worker() -> Result<(), String> {
         // only offline/install support is unavailable there.
         return Ok(());
     };
+    let update_pending = Rc::new(Cell::new(false));
+    let pending_from_worker = update_pending.clone();
+    let on_worker_message =
+        Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            let data = Reflect::get(event.as_ref(), &JsValue::from_str("data")).ok();
+            let kind = data.as_ref().and_then(|data| {
+                Reflect::get(data, &JsValue::from_str("type"))
+                    .ok()
+                    .and_then(|value| value.as_string())
+            });
+            if kind.as_deref() == Some("ORCHESTRAL_UPDATE_READY") {
+                pending_from_worker.set(true);
+                if !is_document_visible() {
+                    let _ =
+                        window().and_then(|window| window.location().reload().map_err(js_error));
+                }
+            }
+        });
+    service_workers
+        .add_event_listener_with_callback("message", on_worker_message.as_ref().unchecked_ref())
+        .map_err(js_error)?;
+    on_worker_message.forget();
+
+    if let Some(document) = web_sys::window().and_then(|window| window.document()) {
+        let pending_on_visibility = update_pending;
+        let on_visibility = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+            if pending_on_visibility.get() && !is_document_visible() {
+                let _ = window().and_then(|window| window.location().reload().map_err(js_error));
+            }
+        });
+        document
+            .add_event_listener_with_callback(
+                "visibilitychange",
+                on_visibility.as_ref().unchecked_ref(),
+            )
+            .map_err(js_error)?;
+        on_visibility.forget();
+    }
+
     JsFuture::from(service_workers.register("./sw.js"))
         .await
         .map(|_| ())

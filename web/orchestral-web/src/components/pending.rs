@@ -30,6 +30,11 @@ fn PendingCard(run: RunState, request: Value) -> Element {
         .unwrap_or("external");
     let request_id = request_id(&request);
     let run_id = run.id.clone();
+    let resolving = controller
+        .state
+        .read()
+        .ui
+        .request_is_resolving(&run_id, &request_id);
     match kind {
         "input" => {
             let mut response = use_signal(String::new);
@@ -37,7 +42,7 @@ fn PendingCard(run: RunState, request: Value) -> Element {
             let submit_run = run_id.clone();
             let submit_request = request_id.clone();
             rsx! {
-                article { class: "pending-card", "data-request-id": request_id,
+                article { class: "pending-card", "data-request-id": request_id, "data-state": if resolving { "resolving" } else { "pending" },
                     form {
                         class: "pending-card__form",
                         onsubmit: move |event| {
@@ -58,11 +63,14 @@ fn PendingCard(run: RunState, request: Value) -> Element {
                             rows: "2",
                             maxlength: "20000",
                             required: true,
+                            disabled: resolving,
                             placeholder: "输入回复…",
                             value: response,
                             oninput: move |event| response.set(event.value())
                         }
-                        button { class: "pending-card__primary", r#type: "submit", "继续" }
+                        button { class: "pending-card__primary", r#type: "submit", disabled: resolving,
+                            if resolving { "处理中…" } else { "继续" }
+                        }
                     }
                 }
             }
@@ -83,7 +91,7 @@ fn PendingCard(run: RunState, request: Value) -> Element {
                 .unwrap_or(&Value::Null)
                 .is_null();
             rsx! {
-                article { class: "pending-card pending-card--approval", "data-request-id": request_id.clone(),
+                article { class: "pending-card pending-card--approval", "data-request-id": request_id.clone(), "data-state": if resolving { "resolving" } else { "pending" },
                     div { class: "pending-card__heading",
                         span { class: "pending-card__badge pending-card__badge--warning", "需要批准" }
                         h2 { "{headline}" }
@@ -127,6 +135,9 @@ fn PendingCard(run: RunState, request: Value) -> Element {
                             request_id: request_id.clone(),
                             decision: "deny"
                         }
+                        if resolving {
+                            span { class: "pending-card__resolving", role: "status", "处理中…" }
+                        }
                     }
                 }
             }
@@ -150,10 +161,16 @@ fn ApprovalButton(
     decision: &'static str,
 ) -> Element {
     let controller = consume_context::<AppController>();
+    let resolving = controller
+        .state
+        .read()
+        .ui
+        .request_is_resolving(&run_id, &request_id);
     rsx! {
         button {
             class,
             r#type: "button",
+            disabled: resolving,
             onclick: move |_| {
                 let run_id = run_id.clone();
                 let request_id = request_id.clone();

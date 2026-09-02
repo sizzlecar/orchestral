@@ -1,5 +1,9 @@
 const CACHE_PREFIX = "orchestral-dioxus-";
-const CACHE_NAME = `${CACHE_PREFIX}v2`;
+// Replaced by scripts/build_web.sh with the fingerprinted JavaScript bundle.
+// This makes every release a distinct worker so installed PWAs cannot remain
+// indefinitely on an old WASM application shell.
+const BUILD_ID = "__ORCHESTRAL_BUILD_ID__";
+const CACHE_NAME = `${CACHE_PREFIX}${BUILD_ID}`;
 const SHELL_FILES = [
     "./",
     "./index.html",
@@ -36,6 +40,9 @@ self.addEventListener("install", (event) => {
 self.addEventListener("activate", (event) => {
     event.waitUntil((async () => {
         const names = await caches.keys();
+        const upgrading = names.some((name) =>
+            name.startsWith(CACHE_PREFIX) && name !== CACHE_NAME
+        );
         await Promise.all(names
             .filter((name) => name.startsWith(CACHE_PREFIX) && name !== CACHE_NAME)
             .map((name) => caches.delete(name)));
@@ -49,6 +56,23 @@ self.addEventListener("activate", (event) => {
             return isSensitive(request, url) ? cache.delete(request) : Promise.resolve(false);
         }));
         await self.clients.claim();
+
+        // Never reload a visible conversation during deployment. Hidden
+        // clients may update immediately; visible clients apply the update
+        // when the page next enters the background.
+        if (upgrading) {
+            const windows = await self.clients.matchAll({
+                type: "window",
+                includeUncontrolled: true,
+            });
+            await Promise.all(windows.map((client) => {
+                if (client.visibilityState !== "visible" && "navigate" in client) {
+                    return client.navigate(client.url);
+                }
+                client.postMessage({ type: "ORCHESTRAL_UPDATE_READY" });
+                return Promise.resolve();
+            }));
+        }
     })());
 });
 

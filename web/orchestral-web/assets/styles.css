@@ -124,8 +124,6 @@ html {
 }
 
 body {
-  position: fixed;
-  inset: 0;
   width: 100%;
   height: 100%;
   min-width: 300px;
@@ -144,9 +142,17 @@ body {
 }
 
 #main {
-  width: 100%;
-  height: 100%;
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: var(--visual-viewport-width, 100vw);
+  height: var(--visual-viewport-height, 100dvh);
   overflow: hidden;
+  transform: translate3d(
+    var(--visual-viewport-left, 0),
+    var(--visual-viewport-top, 0),
+    0
+  );
 }
 
 ::selection {
@@ -251,9 +257,7 @@ svg {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   width: 100%;
-  height: 100vh;
-  height: 100svh;
-  height: 100dvh;
+  height: 100%;
   overflow: hidden;
   background: var(--page);
 }
@@ -495,6 +499,51 @@ svg {
   margin-top: 20px;
 }
 
+.thread-tabs {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 4px;
+  padding: 3px;
+  margin-bottom: 8px;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--surface-muted);
+  scrollbar-width: none;
+}
+
+.thread-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.thread-tab {
+  display: inline-flex;
+  flex: 1 0 auto;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 34px;
+  padding: 0 10px;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 680;
+  white-space: nowrap;
+}
+
+.thread-tab.is-active {
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+  color: var(--ink);
+}
+
+.thread-tab__count {
+  color: var(--faint);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+
 .thread-groups {
   display: flex;
   flex: 1 1 auto;
@@ -507,6 +556,27 @@ svg {
 
 .thread-group + .thread-group {
   margin-top: 13px;
+}
+
+.thread-group__toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 34px;
+  padding: 0 9px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 680;
+}
+
+.thread-group__refresh {
+  min-height: 28px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--ink-soft);
+  font-size: 10px;
 }
 
 .thread-group__label {
@@ -543,6 +613,39 @@ svg {
   color: var(--danger);
   font-size: 10px;
   line-height: 1.45;
+}
+
+.thread-pagination {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 7px;
+  padding: 9px;
+  margin-top: 5px;
+  border-top: 1px solid var(--line);
+}
+
+.thread-pagination__button {
+  min-height: 32px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink-soft);
+  font-size: 10px;
+  font-weight: 680;
+}
+
+.thread-pagination__button:disabled {
+  opacity: 0.42;
+}
+
+.thread-pagination__status {
+  min-width: 46px;
+  color: var(--muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
 }
 
 .section-label {
@@ -857,7 +960,9 @@ svg {
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
-  scroll-behavior: smooth;
+  /* Programmatic live-follow must be stable under polling. Repeated smooth
+     scroll animations make an unchanged transcript visibly pulse on iOS. */
+  scroll-behavior: auto;
   scroll-padding-block: 24px;
   scrollbar-color: var(--line-strong) transparent;
   -webkit-user-select: text;
@@ -929,6 +1034,48 @@ svg {
   color: var(--muted);
   font-size: 14px;
   line-height: 1.65;
+}
+
+.timeline-skeleton {
+  display: grid;
+  align-content: center;
+  gap: 13px;
+  width: min(100%, 820px);
+  min-height: 100%;
+  margin: 0 auto;
+}
+
+.timeline-skeleton__line,
+.timeline-skeleton__bubble {
+  display: block;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--surface-muted), var(--surface), var(--surface-muted));
+  background-size: 220% 100%;
+  animation: timeline-skeleton-pulse 1.25s ease-in-out infinite;
+}
+
+.timeline-skeleton__line {
+  width: 72%;
+  height: 12px;
+}
+
+.timeline-skeleton__line--short {
+  width: 22%;
+}
+
+.timeline-skeleton__line--medium {
+  width: 48%;
+}
+
+.timeline-skeleton__bubble {
+  justify-self: end;
+  width: min(74%, 520px);
+  height: 54px;
+  border-radius: 16px 16px 5px 16px;
+}
+
+@keyframes timeline-skeleton-pulse {
+  to { background-position: -220% 0; }
 }
 
 .prompt-grid {
@@ -1056,6 +1203,28 @@ svg {
   color: var(--ink);
 }
 
+.message--user .message__meta {
+  justify-self: end;
+}
+
+.message--accepted .message__content {
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--line));
+}
+
+.message--accepted .message__meta {
+  color: var(--muted);
+}
+
+.message--deferred .message__content {
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--warning) 34%, var(--line));
+  background: color-mix(in srgb, var(--warning-soft) 72%, var(--surface));
+}
+
+.message--deferred .message__meta {
+  color: var(--warning);
+}
+
 .message__copy {
   grid-area: copy;
   justify-self: end;
@@ -1100,6 +1269,18 @@ svg {
 
 .message__content a {
   color: var(--accent-ink);
+}
+
+.message__content img {
+  display: block;
+  width: auto;
+  max-width: 100%;
+  max-height: min(58vh, 720px);
+  margin: 10px 0;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  object-fit: contain;
+  background: var(--surface-muted);
 }
 
 .message__content code,
@@ -1890,6 +2071,89 @@ svg {
   box-shadow: var(--shadow-md), var(--shadow-focus);
 }
 
+.composer-file-input {
+  position: fixed;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.attach-button {
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 34px;
+  height: 42px;
+  color: var(--muted);
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.composer-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  width: min(100%, 820px);
+  margin: 0 auto 7px;
+}
+
+.composer-attachment {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  max-width: min(100%, 320px);
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: var(--shadow-sm);
+}
+
+.composer-attachment a {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 7px;
+  padding: 7px 4px 7px 10px;
+  color: inherit;
+  text-decoration: none;
+}
+
+.composer-attachment__name {
+  overflow: hidden;
+  font-size: 11px;
+  font-weight: 680;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-attachment__meta,
+.composer-uploading {
+  flex: 0 0 auto;
+  color: var(--faint);
+  font-size: 9px;
+}
+
+.composer-attachment__remove {
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 28px;
+  height: 30px;
+  padding: 0;
+  color: var(--muted);
+  font-size: 17px;
+}
+
+.composer-upload-error {
+  color: var(--danger);
+  font-size: 10px;
+}
+
 .composer-form textarea {
   field-sizing: content;
   flex: 1 1 auto;
@@ -2133,6 +2397,45 @@ svg {
   font-size: 10px;
 }
 
+.session-create-card {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: 14px;
+  background: var(--surface-muted);
+}
+
+.session-create-card__head {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+}
+
+.session-create-card__transport {
+  margin: 0;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 10px;
+}
+
+.session-create-card__cwd-shortcuts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.session-create-card__cwd-shortcut {
+  min-height: 30px;
+  padding: 0 9px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--ink-soft);
+  font-size: 10px;
+}
+
 .session-action-card {
   display: grid;
   gap: 12px;
@@ -2179,6 +2482,7 @@ svg {
 }
 
 .session-action-field input,
+.session-action-field select,
 .session-action-field textarea {
   width: 100%;
   min-height: 42px;
@@ -2191,6 +2495,10 @@ svg {
   font: inherit;
   font-size: 12px;
   font-weight: 450;
+}
+
+.session-action-field select {
+  padding-right: 30px;
 }
 
 .session-action-field textarea {
@@ -2302,9 +2610,9 @@ svg {
 .toast-region {
   position: fixed;
   z-index: 120;
-  top: calc(var(--topbar-height) + 10px + env(safe-area-inset-top));
+  top: auto;
   right: max(12px, env(safe-area-inset-right));
-  bottom: auto;
+  bottom: calc(92px + env(safe-area-inset-bottom));
   left: max(12px, env(safe-area-inset-left));
   display: grid;
   justify-items: center;
@@ -2368,6 +2676,12 @@ svg {
   border-color: color-mix(in srgb, var(--success) 34%, var(--line));
   background: var(--success-soft);
   color: var(--success);
+}
+
+.toast--warning {
+  border-color: color-mix(in srgb, var(--warning) 38%, var(--line));
+  background: var(--warning-soft);
+  color: var(--warning);
 }
 
 @keyframes toast-in {
@@ -2485,6 +2799,7 @@ svg {
   /* iOS Safari zooms the visual viewport when a focused form control uses a
      font smaller than 16px. Keep mobile controls at 16px so the composer and
      pending-request forms remain aligned with the visible viewport. */
+  .composer-form textarea,
   textarea,
   input,
   select {
@@ -2579,7 +2894,8 @@ svg {
   }
 
   .toast-region {
-    top: 14px;
+    top: auto;
+    bottom: 94px;
     left: calc(var(--sidebar-width) + 12px);
   }
 }

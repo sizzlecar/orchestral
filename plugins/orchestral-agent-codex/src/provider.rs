@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use futures_util::stream::{self, StreamExt};
 use orchestral_core::agent_connector::{
     AgentSessionActionInvocation, SESSION_COMPACT_ACTION, SESSION_REVIEW_ACTION,
@@ -26,6 +28,9 @@ use orchestral_core::agent_protocol::wire::{
     ProviderCommandOutcome, RequestId, RequestResolution, RunId, TelemetryId, ToolActivityEvidence,
     ToolActivityId, ToolActivityState,
 };
+use orchestral_core::io::{
+    ArtifactPublishRequest, ArtifactPublisher, ArtifactResolver, BlobId, BlobStore,
+};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use tokio::time::{timeout, Duration};
@@ -35,6 +40,33 @@ use crate::{CodexConnector, ConnectedClient};
 
 const PROVIDER_ID: &str = "codex/app-server";
 const AGENT_ID: &str = "codex/local";
+
+pub(crate) fn artifact_dynamic_tools() -> Value {
+    json!([{
+        "type": "function",
+        "name": "publish_artifact",
+        "description": "Publish a file created inside this session's workspace to private Artifact storage so the remote PWA user can download it. Use this for generated reports, archives, images, spreadsheets, and other deliverables. The file must already exist under the current workspace.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative path, or an absolute path inside the current workspace."
+                },
+                "file_name": {
+                    "type": "string",
+                    "description": "Optional download file name."
+                },
+                "media_type": {
+                    "type": "string",
+                    "description": "Optional MIME type; inferred from common extensions when omitted."
+                }
+            },
+            "required": ["path"]
+        }
+    }])
+}
 #[cfg(not(test))]
 const EXTERNAL_QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(1_500);
 #[cfg(test)]
@@ -42,7 +74,16 @@ const EXTERNAL_QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const EXTERNAL_QUEUE_TURN_PAGE_LIMIT: u32 = 50;
 const EXTERNAL_QUEUE_AMBIGUOUS_POLL_LIMIT: u16 = 20;
 const EXTERNAL_QUEUE_PAGE_LIMIT: u32 = 100;
+// App-server reconstructs the rollout index for every item page. Recovery can
+// otherwise reread a large active thread hundreds of times merely to locate
+// one immutable client id. Use a larger bounded page only for exact identity
+// reconciliation; normal transcript pagination remains at 100.
+const EXTERNAL_RECOVERY_ITEM_PAGE_LIMIT: u32 = 1_000;
 const EXTERNAL_HISTORY_TELEMETRY_LIMIT: usize = 256;
+#[cfg(not(test))]
+const DIRECT_RUN_POLL_INTERVAL: Duration = Duration::from_millis(1_500);
+#[cfg(test)]
+const DIRECT_RUN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Default)]
 pub(crate) struct ProviderState {
@@ -59,12 +100,17 @@ impl ProviderState {
     pub(crate) fn mark_loaded(&mut self, session_id: AgentSessionId) {
         self.loaded_sessions.insert(session_id);
     }
+
+    pub(crate) fn is_loaded(&self, session_id: &AgentSessionId) -> bool {
+        self.loaded_sessions.contains(session_id)
+    }
 }
 
 struct CodexRun {
     request: AgentStartRequest,
     execution: AgentExecutionRef,
     admission: AgentAdmission,
+    artifact_publisher: Option<Arc<dyn ArtifactPublisher>>,
     sender: broadcast::Sender<Result<AgentProviderStreamItem, AgentProtocolError>>,
     durable: Mutex<Vec<AgentEventDraft>>,
     turn_id: Mutex<Option<String>>,
@@ -127,12 +173,14 @@ fn new_codex_run(
     request: AgentStartRequest,
     execution: AgentExecutionRef,
     admission: AgentAdmission,
+    artifact_publisher: Option<Arc<dyn ArtifactPublisher>>,
 ) -> Arc<CodexRun> {
     let (sender, _) = broadcast::channel(512);
     Arc::new(CodexRun {
         request,
         execution,
         admission,
+        artifact_publisher,
         sender,
         durable: Mutex::new(Vec::new()),
         turn_id: Mutex::new(None),
@@ -158,22 +206,143 @@ impl CodexConnector {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Rebind a non-terminal Host Run to its exact native turn after the Host
+    /// process restarts. A loaded thread is only transport evidence; another
+    /// client may already have started a newer turn in the same session. The
+    /// immutable Orchestral client id and input digest are the ownership proof.
+    async fn adopt_loaded_active_turn_for_recovery(
+        &self,
+        connected: &Arc<ConnectedClient>,
+        run: &Arc<CodexRun>,
+    ) -> Result<bool, AgentProtocolError> {
+        if self.config.allow_deferred_queue
+            || !client_has_loaded_session(&connected.rpc, &run.execution.session_id).await
+        {
+            return Ok(false);
+        }
+        let client_message_id = match lock(&run.route).clone() {
+            Some(NativeRunRoute::ExternalQueue {
+                client_message_id, ..
+            }) => client_message_id,
+            _ => return Ok(false),
+        };
+        let Some((turn_id, _correlated_item)) = find_external_turn_item(
+            &connected.rpc,
+            run.execution.session_id.as_str(),
+            None,
+            &client_message_id,
+            "desc",
+        )
+        .await?
+        else {
+            return Ok(false);
+        };
+        // The client id contains both Run identity and immutable spec digest.
+        // That is the direct-turn recovery proof. Do not compare the native
+        // user item byte-for-byte: Codex intentionally materializes inline
+        // image data as a local/native image entry in persisted history.
+        // External queue reconciliation still validates its unmodified input
+        // digest because queue submissions preserve the submitted payload.
+        let Some(turn) =
+            find_native_turn_metadata(&connected.rpc, &run.execution.session_id, &turn_id)
+                .await
+                .map_err(transport_to_protocol)?
+        else {
+            return Ok(false);
+        };
+        {
+            let mut state = self.provider_state();
+            if state
+                .sessions
+                .get(&run.execution.session_id)
+                .is_some_and(|existing| existing != &run.execution.run_id)
+            {
+                return Ok(false);
+            }
+            state.sessions.insert(
+                run.execution.session_id.clone(),
+                run.execution.run_id.clone(),
+            );
+            state
+                .runs
+                .insert(run.execution.run_id.clone(), Arc::clone(run));
+            state.mark_loaded(run.execution.session_id.clone());
+        }
+        *lock(&run.route) = Some(NativeRunRoute::Direct);
+        // Recovery must replay the same deterministic Provider prefix that the
+        // Host already committed. Merely attaching the live monitor leaves an
+        // empty replay stream, so AgentController waits forever for RunStarted
+        // while holding the per-Run recovery gate.
+        establish_turn(run, &turn_id);
+        run.detached.store(false, Ordering::SeqCst);
+        match turn.get("status").and_then(Value::as_str) {
+            Some("inProgress") => {
+                // `thread/resume` atomically subscribes this new Host
+                // connection to notifications for an already loaded thread.
+                // Polling in `monitor_native_run` remains the lossless fallback
+                // when an older app-server reports an active-writer conflict.
+                let notifications = connected.rpc.subscribe();
+                match connected
+                    .rpc
+                    .request(
+                        "thread/resume",
+                        json!({
+                            "threadId": run.execution.session_id.as_str(),
+                            "excludeTurns": true,
+                            "persistExtendedHistory": true
+                        }),
+                    )
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(error)
+                        if active_writer_conflict(&error)
+                            && client_has_loaded_session(
+                                &connected.rpc,
+                                &run.execution.session_id,
+                            )
+                            .await => {}
+                    Err(error) => return Err(transport_to_protocol(error)),
+                }
+                let monitored_run = Arc::clone(run);
+                let rpc = connected.rpc.clone();
+                tokio::spawn(async move {
+                    monitor_native_run(rpc, monitored_run, turn_id, notifications).await;
+                });
+            }
+            Some("completed" | "failed") | Some("interrupted")
+                if external_turn_is_terminal(&turn) =>
+            {
+                restore_direct_turn(&connected.rpc, run, &turn_id, &turn).await;
+            }
+            status => {
+                return Err(protocol_error(
+                    format!("Codex returned an unsupported recovered turn status: {status:?}"),
+                    true,
+                ));
+            }
+        }
+        Ok(true)
+    }
+
     fn provider_descriptor() -> AgentDescriptorEnvelope {
         AgentDescriptorEnvelope::seal(AgentDescriptor {
             provider_id: AgentProviderId::new(PROVIDER_ID),
             agent_id: AgentId::new(AGENT_ID),
             supported_protocol_versions: vec![ProtocolVersion::new(1, 0)],
-            accepted_content_types: BTreeSet::from(["text/plain".to_owned()]),
+            // Artifact Content is resolved immediately before native dispatch.
+            // Codex receives images natively and other MIME types as a safe
+            // download reference, so the adapter can truthfully accept all.
+            accepted_content_types: BTreeSet::from(["*/*".to_owned()]),
             capabilities: AgentCapabilities {
                 session_reuse: true,
                 structured_output: false,
                 controls: ControlCapabilities {
-                    // A session owned by another Codex process can accept a
-                    // durable next-turn message but cannot be live-steered.
-                    // Static capabilities are the safe intersection of every
-                    // route; a future protocol revision can negotiate these
-                    // controls per execution after ownership is known.
-                    steer: false,
+                    // Production defaults require the shared owner topology:
+                    // accepted interactive Runs are therefore genuinely
+                    // steerable. Deferred cross-process delivery is an
+                    // explicit compatibility opt-in, not the PWA send path.
+                    steer: true,
                     cancel: CancelSupport::BestEffort,
                     recover: true,
                 },
@@ -210,19 +379,19 @@ impl CodexConnector {
                 self.remove_failed_start(&run);
             })?;
         }
-        let input = action
-            .is_none()
-            .then(|| codex_input(&run.request))
-            .transpose()
-            .map_err(|error| {
+        let input = if action.is_none() {
+            Some(self.codex_input(&run.request).await.map_err(|error| {
                 self.remove_failed_start(&run);
                 AgentStartError::Rejected(AgentRejection::new(
                     AgentRejectionCode::InvalidSpec,
                     error.to_string(),
                 ))
-            })?;
-        self.invalidate_session_cache(&session_id);
+            })?)
+        } else {
+            None
+        };
         let needs_resume = !self.provider_state().loaded_sessions.contains(&session_id);
+        let mut resumed_thread = None;
         if needs_resume {
             match connected
                 .rpc
@@ -230,12 +399,16 @@ impl CodexConnector {
                     "thread/resume",
                     json!({
                         "threadId": session_id.as_str(),
+                        "excludeTurns": true,
                         "persistExtendedHistory": true
                     }),
                 )
                 .await
             {
-                Ok(_) => self.provider_state().mark_loaded(session_id.clone()),
+                Ok(result) => {
+                    resumed_thread = result.get("thread").cloned();
+                    self.provider_state().mark_loaded(session_id.clone());
+                }
                 Err(error)
                     if unmaterialized_resume_without_rollout(&error)
                         && client_has_loaded_session(&connected.rpc, &session_id).await =>
@@ -243,13 +416,38 @@ impl CodexConnector {
                     self.provider_state().mark_loaded(session_id.clone());
                 }
                 Err(error) if active_writer_conflict(&error) && action.is_none() => {
-                    return self
-                        .start_external_queued_run(
-                            connected.rpc.clone(),
-                            run,
-                            input.expect("ordinary run input must be present"),
-                        )
-                        .await;
+                    // A shared daemon has one native writer but may expose it
+                    // to several control clients. If this exact daemon lists
+                    // the thread as loaded, continue against its authoritative
+                    // active turn and let strict turn/steer enforce identity.
+                    // A private app-server cannot see another process here, so
+                    // it still takes the explicit conflict/queue path below.
+                    if !self.config.allow_deferred_queue
+                        && client_has_loaded_session(&connected.rpc, &session_id).await
+                    {
+                        self.provider_state().mark_loaded(session_id.clone());
+                    } else if self.config.allow_deferred_queue {
+                        return self
+                            .start_external_queued_run(
+                                connected.rpc.clone(),
+                                run,
+                                input.expect("ordinary run input must be present"),
+                            )
+                            .await;
+                    } else {
+                        self.remove_failed_start(&run);
+                        return Err(AgentStartError::Rejected(
+                            AgentRejection::new(
+                                AgentRejectionCode::UnsupportedCapability,
+                                "live_control_unavailable: this Codex thread is owned by another process and cannot receive real-time steer",
+                            )
+                            .with_details(json!({
+                                "code": "live_control_unavailable",
+                                "delivery": "realtime_only",
+                                "session_id": session_id.as_str()
+                            })),
+                        ));
+                    }
                 }
                 Err(error) => {
                     self.remove_failed_start(&run);
@@ -263,11 +461,76 @@ impl CodexConnector {
                 .await;
         }
         let input = input.expect("ordinary run input must be present");
+        let active_turn_id = match resumed_thread.as_ref() {
+            Some(thread) => active_turn_id(thread).map(str::to_owned),
+            None => match latest_native_turn(&connected.rpc, &session_id).await {
+                Ok(turn) => turn.as_ref().and_then(active_turn_id_from_turn),
+                Err(_) => None,
+            },
+        };
+        if let Some(turn_id) = active_turn_id {
+            // Persist the authoritative target before dispatch so a lost
+            // response can be recovered against the same native turn without
+            // issuing the steer twice.
+            *lock(&run.route) = Some(NativeRunRoute::Direct);
+            *lock(&run.turn_id) = Some(turn_id.clone());
+            let result = match connected
+                .rpc
+                .request(
+                    "turn/steer",
+                    json!({
+                        "threadId": session_id.as_str(),
+                        "expectedTurnId": turn_id,
+                        "clientUserMessageId": queued_client_message_id(&run.execution),
+                        "input": input
+                    }),
+                )
+                .await
+            {
+                Ok(result) => result,
+                Err(
+                    error @ (CodexTransportError::Timeout
+                    | CodexTransportError::Closed
+                    | CodexTransportError::Disconnected(_)),
+                ) => return Err(start_transport_error(error, true)),
+                Err(error) => {
+                    self.remove_failed_start(&run);
+                    return Err(start_transport_error(error, false));
+                }
+            };
+            let accepted_turn_id = result
+                .get("turnId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    AgentStartError::OutcomeUnknown(protocol_error(
+                        "Codex turn/steer omitted turnId",
+                        false,
+                    ))
+                })?;
+            if accepted_turn_id != turn_id {
+                return Err(AgentStartError::OutcomeUnknown(protocol_error(
+                    "Codex turn/steer accepted a different active turn",
+                    false,
+                )));
+            }
+            establish_turn(&run, &turn_id);
+            let monitored_turn_id = turn_id.to_owned();
+            tokio::spawn(async move {
+                monitor_native_run(connected.rpc.clone(), run, monitored_turn_id, notifications)
+                    .await;
+            });
+            return Ok(());
+        }
         let result = match connected
             .rpc
             .request(
                 "turn/start",
-                json!({"threadId": session_id.as_str(), "input": input}),
+                json!({
+                    "threadId": session_id.as_str(),
+                    "clientUserMessageId": queued_client_message_id(&run.execution),
+                    "input": input
+                }),
             )
             .await
         {
@@ -373,9 +636,17 @@ impl CodexConnector {
         let claim_path = match claim {
             DispatchClaim::Acquired(path) => path,
             DispatchClaim::Existing => {
-                run.detached.store(false, Ordering::SeqCst);
+                // A claim proves only that some process crossed the local
+                // at-most-once boundary. It does not prove queue/add reached
+                // Codex. Keep observing the immutable identity, but do not let
+                // the Host report a successfully queued Run until queue or turn
+                // evidence is visible remotely.
+                run.detached.store(true, Ordering::SeqCst);
                 spawn_external_queue_monitor(rpc, run);
-                return Ok(());
+                return Err(AgentStartError::OutcomeUnknown(protocol_error(
+                    "Codex queue dispatch has a durable local claim but no remote queue or turn evidence yet; state reconciliation is in progress",
+                    true,
+                )));
             }
         };
         let result = match rpc
@@ -628,8 +899,9 @@ impl CodexConnector {
         }
         let route = { lock(&run.route).clone() };
         match route {
-            Some(NativeRunRoute::ExternalQueue { .. }) => {
-                if !run.detached.load(Ordering::SeqCst)
+            Some(NativeRunRoute::ExternalQueue { phase, .. }) => {
+                if phase != ExternalQueuePhase::Submitting
+                    && !run.detached.load(Ordering::SeqCst)
                     && run.external_monitor_running.load(Ordering::SeqCst)
                 {
                     return Ok(());
@@ -695,6 +967,114 @@ impl CodexConnector {
     }
 }
 
+fn active_turn_id(thread: &Value) -> Option<&str> {
+    thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .and_then(|turns| {
+            turns
+                .iter()
+                .rev()
+                .find(|turn| turn.get("status").and_then(Value::as_str) == Some("inProgress"))
+        })
+        .and_then(|turn| turn.get("id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+}
+
+fn active_turn_id_from_turn(turn: &Value) -> Option<String> {
+    (turn.get("status").and_then(Value::as_str) == Some("inProgress"))
+        .then(|| turn.get("id").and_then(Value::as_str))
+        .flatten()
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
+async fn latest_native_turn(
+    rpc: &CodexRpcClient,
+    session_id: &AgentSessionId,
+) -> Result<Option<Value>, CodexTransportError> {
+    let result = rpc
+        .request(
+            "thread/turns/list",
+            json!({
+                "threadId": session_id.as_str(),
+                "limit": 1,
+                "sortDirection": "desc",
+                "itemsView": "notLoaded"
+            }),
+        )
+        .await?;
+    Ok(result
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|turns| turns.first())
+        .cloned())
+}
+
+async fn find_native_turn(
+    rpc: &CodexRpcClient,
+    session_id: &AgentSessionId,
+    target_turn_id: &str,
+) -> Result<Option<Value>, CodexTransportError> {
+    find_native_turn_with_items_view(rpc, session_id, target_turn_id, "full").await
+}
+
+async fn find_native_turn_metadata(
+    rpc: &CodexRpcClient,
+    session_id: &AgentSessionId,
+    target_turn_id: &str,
+) -> Result<Option<Value>, CodexTransportError> {
+    find_native_turn_with_items_view(rpc, session_id, target_turn_id, "notLoaded").await
+}
+
+async fn find_native_turn_with_items_view(
+    rpc: &CodexRpcClient,
+    session_id: &AgentSessionId,
+    target_turn_id: &str,
+    items_view: &str,
+) -> Result<Option<Value>, CodexTransportError> {
+    let mut cursor = None;
+    let mut seen_cursors = BTreeSet::new();
+    loop {
+        let result = rpc
+            .request(
+                "thread/turns/list",
+                json!({
+                    "threadId": session_id.as_str(),
+                    "cursor": cursor,
+                    "limit": 50,
+                    "sortDirection": "desc",
+                    "itemsView": items_view
+                }),
+            )
+            .await?;
+        if let Some(turn) = result
+            .get("data")
+            .and_then(Value::as_array)
+            .and_then(|turns| {
+                turns
+                    .iter()
+                    .find(|turn| turn.get("id").and_then(Value::as_str) == Some(target_turn_id))
+            })
+        {
+            return Ok(Some(turn.clone()));
+        }
+        cursor = result
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let Some(next) = cursor.as_ref() else {
+            return Ok(None);
+        };
+        if next.trim().is_empty() || !seen_cursors.insert(next.clone()) {
+            return Err(CodexTransportError::Rpc(
+                "thread/turns/list returned a non-advancing cursor".to_owned(),
+            ));
+        }
+    }
+}
+
 fn unmaterialized_resume_without_rollout(error: &CodexTransportError) -> bool {
     matches!(
         error,
@@ -719,7 +1099,10 @@ fn queued_client_message_id(execution: &AgentExecutionRef) -> String {
     )
 }
 
-async fn client_has_loaded_session(rpc: &CodexRpcClient, session_id: &AgentSessionId) -> bool {
+pub(crate) async fn client_has_loaded_session(
+    rpc: &CodexRpcClient,
+    session_id: &AgentSessionId,
+) -> bool {
     let mut cursor = None;
     loop {
         let result = match rpc
@@ -809,7 +1192,12 @@ impl AgentProvider for CodexConnector {
                         .into());
                     }
                 }
-                let run = new_codex_run(request.clone(), execution.clone(), admission.clone());
+                let run = new_codex_run(
+                    request.clone(),
+                    execution.clone(),
+                    admission.clone(),
+                    self.artifact_publisher.clone(),
+                );
                 state.sessions.insert(
                     request.run.spec.session_id.clone(),
                     request.run.spec.run_id.clone(),
@@ -887,19 +1275,68 @@ impl AgentProvider for CodexConnector {
             duplicate.duplicate = true;
             return Ok(duplicate);
         }
+        if run.terminal.load(Ordering::SeqCst) {
+            return Ok(record_command_disposition(
+                &run,
+                &command,
+                ProviderCommandOutcome::Rejected {
+                    code: AgentProtocolErrorCode::TerminalRun,
+                    message: "Codex turn is already terminal; start a new Run for this message"
+                        .to_owned(),
+                },
+            ));
+        }
         let connected = self.client().await.map_err(connector_to_protocol)?;
-        apply_native_command(&connected.rpc, &run, &command).await?;
-        let disposition = ProviderCommandDisposition {
-            command_id: command.command_id.clone(),
-            run_id: command.run_id.clone(),
-            outcome: ProviderCommandOutcome::Accepted,
-            duplicate: false,
-        };
-        lock(&run.commands).insert(
-            command.command_id.as_str().to_owned(),
-            (command.command_digest.clone(), disposition.clone()),
-        );
-        Ok(disposition)
+        if matches!(lock(&run.route).as_ref(), Some(NativeRunRoute::Direct))
+            && matches!(
+                command.payload,
+                AgentCommand::Steer { .. } | AgentCommand::Cancel { .. }
+            )
+        {
+            match direct_turn_is_active(&connected.rpc, &run).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Ok(record_command_disposition(
+                        &run,
+                        &command,
+                        ProviderCommandOutcome::Rejected {
+                            code: if run.terminal.load(Ordering::SeqCst) {
+                                AgentProtocolErrorCode::TerminalRun
+                            } else {
+                                AgentProtocolErrorCode::InvalidTransition
+                            },
+                            message: "The bound Codex turn is no longer active; the session has been reconciled. Send the message again to start a new Run".to_owned(),
+                        },
+                    ));
+                }
+                Err(error) => {
+                    return Ok(record_command_disposition(
+                        &run,
+                        &command,
+                        ProviderCommandOutcome::Rejected {
+                            code: error.code,
+                            message: format!(
+                                "Could not verify the bound Codex turn before dispatch: {}",
+                                error.message
+                            ),
+                        },
+                    ));
+                }
+            }
+        }
+        apply_native_command(
+            &connected.rpc,
+            &run,
+            &command,
+            self.artifact_resolver.as_deref(),
+            self.artifact_blob_store.as_deref(),
+        )
+        .await?;
+        Ok(record_command_disposition(
+            &run,
+            &command,
+            ProviderCommandOutcome::Accepted,
+        ))
     }
 
     async fn recover(
@@ -933,12 +1370,13 @@ impl AgentProvider for CodexConnector {
             let admission = AgentAdmission {
                 skipped_optional_bindings: compatibility.skipped_optional_bindings,
             };
-            let input = codex_input(&request.start_request)?;
+            let input = self.codex_input(&request.start_request).await?;
             let input_digest = codex_user_input_digest(&input)?;
             let run = new_codex_run(
                 request.start_request.clone(),
                 request.execution.clone(),
                 admission,
+                self.artifact_publisher.clone(),
             );
             *lock(&run.route) = Some(NativeRunRoute::ExternalQueue {
                 queued_submission_id: None,
@@ -964,6 +1402,13 @@ impl AgentProvider for CodexConnector {
         }
 
         let connected = self.client().await.map_err(connector_to_protocol)?;
+        if reconstructed
+            && self
+                .adopt_loaded_active_turn_for_recovery(&connected, &run)
+                .await?
+        {
+            return Ok(AgentRecovery::reattached(stream_for(&run)));
+        }
         if matches!(
             lock(&run.route).as_ref(),
             Some(NativeRunRoute::ExternalQueue { .. })
@@ -984,21 +1429,40 @@ impl AgentProvider for CodexConnector {
             }
             if reconstructed {
                 let mut state = self.provider_state();
-                if let Some(existing_run_id) = state.sessions.get(&run.execution.session_id) {
-                    if existing_run_id != &run.execution.run_id {
-                        return Err(AgentProtocolError::new(
-                            AgentProtocolErrorCode::RunIdConflict,
-                            "another Codex run already controls the recovered session",
-                        ));
+                let superseded = state
+                    .sessions
+                    .get(&run.execution.session_id)
+                    .is_some_and(|existing_run_id| existing_run_id != &run.execution.run_id);
+                if superseded {
+                    // A browser may have started a replacement Run after a
+                    // Host restart but before it rediscovered the original Run
+                    // identity. Only the latest Run may remain commandable for
+                    // the Codex session. The older durable Run still needs an
+                    // authoritative terminal boundary, otherwise every stale
+                    // SSE reconnect retries recovery forever.
+                    drop(state);
+                    if !run.terminal.load(Ordering::SeqCst) {
+                        publish_incomplete(
+                            &run,
+                            IncompleteReason::ProviderEnded {
+                                reason: "Superseded by a newer Orchestral Run controlling the same Codex session"
+                                    .to_owned(),
+                            },
+                        );
                     }
+                    state = self.provider_state();
+                    state
+                        .runs
+                        .insert(run.execution.run_id.clone(), Arc::clone(&run));
+                } else {
+                    state.sessions.insert(
+                        run.execution.session_id.clone(),
+                        run.execution.run_id.clone(),
+                    );
+                    state
+                        .runs
+                        .insert(run.execution.run_id.clone(), Arc::clone(&run));
                 }
-                state.sessions.insert(
-                    run.execution.session_id.clone(),
-                    run.execution.run_id.clone(),
-                );
-                state
-                    .runs
-                    .insert(run.execution.run_id.clone(), Arc::clone(&run));
             }
             if !run.terminal.load(Ordering::SeqCst) {
                 spawn_external_queue_monitor(connected.rpc.clone(), Arc::clone(&run));
@@ -1013,6 +1477,7 @@ impl AgentProvider for CodexConnector {
                 "thread/resume",
                 json!({
                     "threadId": session_id.as_str(),
+                    "excludeTurns": true,
                     "persistExtendedHistory": true
                 }),
             )
@@ -1021,28 +1486,15 @@ impl AgentProvider for CodexConnector {
         self.provider_state()
             .loaded_sessions
             .insert(session_id.clone());
-        let result = connected
-            .rpc
-            .request(
-                "thread/read",
-                json!({"threadId": session_id.as_str(), "includeTurns": true}),
-            )
-            .await
-            .map_err(transport_to_protocol)?;
         let turn_id = lock(&run.turn_id).clone().ok_or_else(|| {
             AgentProtocolError::new(
                 AgentProtocolErrorCode::InvalidTransition,
                 "Codex recovery omitted the original turn identity",
             )
         })?;
-        let turn = result
-            .pointer("/thread/turns")
-            .and_then(Value::as_array)
-            .and_then(|turns| {
-                turns
-                    .iter()
-                    .find(|turn| turn.get("id").and_then(Value::as_str) == Some(turn_id.as_str()))
-            })
+        let turn = find_native_turn(&connected.rpc, &session_id, &turn_id)
+            .await
+            .map_err(transport_to_protocol)?
             .ok_or_else(|| {
                 AgentProtocolError::new(
                     AgentProtocolErrorCode::ProviderUnavailable,
@@ -1066,8 +1518,8 @@ impl AgentProvider for CodexConnector {
                 });
             }
             Some("completed" | "interrupted" | "failed") => {
-                restore_final_response(&run, turn);
-                finish_run(&run, Some(turn));
+                restore_final_response(&run, &turn);
+                finish_run(&run, Some(&turn));
             }
             status => {
                 run.detached.store(true, Ordering::SeqCst);
@@ -1086,6 +1538,8 @@ async fn apply_native_command(
     rpc: &CodexRpcClient,
     run: &Arc<CodexRun>,
     command: &AgentCommandEnvelope,
+    artifact_resolver: Option<&dyn ArtifactResolver>,
+    artifact_blob_store: Option<&dyn BlobStore>,
 ) -> Result<(), AgentProtocolError> {
     let route = { lock(&run.route).clone() };
     if let Some(NativeRunRoute::ExternalQueue {
@@ -1112,16 +1566,23 @@ async fn apply_native_command(
     })?;
     match &command.payload {
         AgentCommand::Steer { content } => {
-            rpc.request(
+            let result = rpc.request(
                 "turn/steer",
                 json!({
                     "threadId": thread_id,
-                    "expectedTurnId": turn_id,
-                    "input": codex_content(content)?
+                    "expectedTurnId": &turn_id,
+                    "clientUserMessageId": command_client_message_id(command),
+                    "input": codex_content(content, artifact_resolver, artifact_blob_store).await?
                 }),
             )
             .await
             .map_err(transport_to_protocol)?;
+            if result.get("turnId").and_then(Value::as_str) != Some(turn_id.as_str()) {
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::InvalidTransition,
+                    "Codex turn/steer acknowledged a different native turn",
+                ));
+            }
         }
         AgentCommand::Cancel { reason } => {
             *lock(&run.cancel_request) = Some((command.command_id.clone(), reason.clone()));
@@ -1189,6 +1650,33 @@ async fn apply_native_command(
         }
     }
     Ok(())
+}
+
+fn record_command_disposition(
+    run: &CodexRun,
+    command: &AgentCommandEnvelope,
+    outcome: ProviderCommandOutcome,
+) -> ProviderCommandDisposition {
+    let disposition = ProviderCommandDisposition {
+        command_id: command.command_id.clone(),
+        run_id: command.run_id.clone(),
+        outcome,
+        duplicate: false,
+    };
+    lock(&run.commands).insert(
+        command.command_id.as_str().to_owned(),
+        (command.command_digest.clone(), disposition.clone()),
+    );
+    disposition
+}
+
+fn command_client_message_id(command: &AgentCommandEnvelope) -> String {
+    format!(
+        "orchestral-command:{}:{}:{}",
+        command.run_id.as_str(),
+        command.command_id.as_str(),
+        command.command_digest.as_str()
+    )
 }
 
 async fn apply_external_queued_command(
@@ -1366,8 +1854,13 @@ async fn reconcile_external_queued_run(
         }
     }
 
-    if let Some(turn) =
-        find_external_turn(rpc, run.execution.session_id.as_str(), &client_message_id).await?
+    if let Some(turn) = find_external_turn(
+        rpc,
+        run.execution.session_id.as_str(),
+        &client_message_id,
+        run.detached.load(Ordering::SeqCst),
+    )
+    .await?
     {
         let correlated_input = turn
             .get("items")
@@ -1471,7 +1964,51 @@ async fn find_external_turn(
     rpc: &CodexRpcClient,
     thread_id: &str,
     client_message_id: &str,
+    scan_native_items: bool,
 ) -> Result<Option<Value>, AgentProtocolError> {
+    if scan_native_items {
+        // A turn summary contains only its first user item and final agent
+        // item. Recovery usually targets a steer submitted while that turn was
+        // already active, so exhausting summary history first is both unable
+        // to match and pathologically slow for long sessions. The native item
+        // index is ordered newest-first and retains the exact client identity.
+        let session_id = AgentSessionId::new(thread_id);
+        if let Some(mut latest_turn) = latest_native_turn(rpc, &session_id)
+            .await
+            .map_err(transport_to_protocol)?
+        {
+            let latest_turn_id = latest_turn
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if let Some(latest_turn_id) = latest_turn_id {
+                if let Some((_, correlated_item)) = find_external_turn_item(
+                    rpc,
+                    thread_id,
+                    Some(&latest_turn_id),
+                    client_message_id,
+                    "asc",
+                )
+                .await?
+                {
+                    latest_turn["items"] = Value::Array(vec![correlated_item]);
+                    return Ok(Some(latest_turn));
+                }
+            }
+        }
+        if let Some((turn_id, correlated_item)) =
+            find_external_turn_item(rpc, thread_id, None, client_message_id, "desc").await?
+        {
+            if let Some(mut turn) = find_native_turn_metadata(rpc, &session_id, &turn_id)
+                .await
+                .map_err(transport_to_protocol)?
+            {
+                turn["items"] = Value::Array(vec![correlated_item]);
+                return Ok(Some(turn));
+            }
+        }
+    }
+
     let mut cursor = None;
     let mut seen_cursors = BTreeSet::new();
     loop {
@@ -1499,6 +2036,57 @@ async fn find_external_turn(
             return Ok(Some(turn.clone()));
         }
         cursor = next_page_cursor(&result, &mut seen_cursors, "thread/turns/list")?;
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    Ok(None)
+}
+
+async fn find_external_turn_item(
+    rpc: &CodexRpcClient,
+    thread_id: &str,
+    turn_id: Option<&str>,
+    client_message_id: &str,
+    sort_direction: &str,
+) -> Result<Option<(String, Value)>, AgentProtocolError> {
+    let mut cursor = None;
+    let mut seen_cursors = BTreeSet::new();
+    loop {
+        let mut params = json!({
+            "threadId": thread_id,
+            "cursor": cursor,
+            "limit": EXTERNAL_RECOVERY_ITEM_PAGE_LIMIT,
+            "sortDirection": sort_direction
+        });
+        if let Some(turn_id) = turn_id {
+            params["turnId"] = Value::String(turn_id.to_owned());
+        }
+        let result = rpc
+            .request("thread/items/list", params)
+            .await
+            .map_err(transport_to_protocol)?;
+        let entries = result
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| protocol_error("Codex thread/items/list omitted data", false))?;
+        if let Some((turn_id, item)) = entries.iter().find_map(|entry| {
+            let item = entry.get("item")?;
+            (item.get("type").and_then(Value::as_str) == Some("userMessage")
+                && item.get("clientId").and_then(Value::as_str) == Some(client_message_id))
+            .then(|| {
+                entry
+                    .get("turnId")
+                    .and_then(Value::as_str)
+                    .filter(|turn_id| !turn_id.is_empty())
+                    .map(|turn_id| (turn_id.to_owned(), item.clone()))
+            })
+            .flatten()
+        }) {
+            return Ok(Some((turn_id, item)));
+        }
+        cursor = next_page_cursor(&result, &mut seen_cursors, "thread/items/list")?;
         if cursor.is_none() {
             return Ok(None);
         }
@@ -1618,22 +2206,39 @@ fn codex_user_input_digest(input: &Value) -> Result<Digest, AgentProtocolError> 
     let entries = input
         .as_array()
         .ok_or_else(|| protocol_error("Codex user input must be an array", false))?;
-    let text = entries
+    let all_text = entries
         .iter()
-        .map(|entry| match entry.get("type").and_then(Value::as_str) {
-            Some("text") => entry
-                .get("text")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .ok_or_else(|| protocol_error("Codex text input omitted text", false)),
-            kind => Err(AgentProtocolError::new(
-                AgentProtocolErrorCode::Unsupported,
-                format!("Codex queued input contains unsupported item type: {kind:?}"),
-            )),
-        })
-        .collect::<Result<Vec<_>, _>>()?
-        .join("\n");
-    Ok(Digest::sha256(text.into_bytes()))
+        .all(|entry| entry.get("type").and_then(Value::as_str) == Some("text"));
+    if all_text {
+        let text = entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| protocol_error("Codex text input omitted text", false))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .join("\n");
+        // Preserve the pre-Artifact digest for text-only queued Runs.
+        return Ok(Digest::sha256(text.into_bytes()));
+    }
+    for entry in entries {
+        match entry.get("type").and_then(Value::as_str) {
+            Some("text") if entry.get("text").and_then(Value::as_str).is_some() => {}
+            Some("image") if entry.get("url").and_then(Value::as_str).is_some() => {}
+            kind => {
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::Unsupported,
+                    format!("Codex queued input contains unsupported item type: {kind:?}"),
+                ));
+            }
+        }
+    }
+    let encoded = serde_json::to_vec(entries)
+        .map_err(|error| protocol_error(format!("encode Codex input digest: {error}"), false))?;
+    Ok(Digest::sha256(encoded))
 }
 
 fn detach_external_run(run: &CodexRun, message: impl Into<String>, retryable: bool) {
@@ -1715,14 +2320,123 @@ fn external_turn_has_completed(turn: &Value) -> bool {
         .is_some_and(|value| !value.is_null())
 }
 
+/// Checks the one authoritative live edge before a side-effecting direct
+/// command. When the bound turn is already terminal, reconcile it immediately
+/// so the Host can stop presenting an indefinitely commandable Run.
+async fn direct_turn_is_active(
+    rpc: &CodexRpcClient,
+    run: &Arc<CodexRun>,
+) -> Result<bool, AgentProtocolError> {
+    let turn_id = lock(&run.turn_id).clone().ok_or_else(|| {
+        AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidTransition,
+            "Codex turn is not established",
+        )
+    })?;
+    let Some(latest) = latest_native_turn(rpc, &run.execution.session_id)
+        .await
+        .map_err(transport_to_protocol)?
+    else {
+        return Ok(false);
+    };
+    let latest_id = latest.get("id").and_then(Value::as_str);
+    if latest_id == Some(turn_id.as_str())
+        && latest.get("status").and_then(Value::as_str) == Some("inProgress")
+    {
+        return Ok(true);
+    }
+    if latest_id == Some(turn_id.as_str()) && external_turn_is_terminal(&latest) {
+        restore_direct_turn(rpc, run, &turn_id, &latest).await;
+    }
+    Ok(false)
+}
+
+/// Polls the exact bound turn as a fallback for notification loss. Looking up
+/// by turn id is intentionally separate from `latest_native_turn`: a newer
+/// unrelated turn must never be adopted as this Orchestral Run.
+async fn reconcile_bound_direct_turn(
+    rpc: &CodexRpcClient,
+    run: &Arc<CodexRun>,
+    turn_id: &str,
+) -> Result<bool, AgentProtocolError> {
+    let turn = match latest_native_turn(rpc, &run.execution.session_id)
+        .await
+        .map_err(transport_to_protocol)?
+    {
+        Some(latest) if latest.get("id").and_then(Value::as_str) == Some(turn_id) => latest,
+        _ => find_native_turn_metadata(rpc, &run.execution.session_id, turn_id)
+            .await
+            .map_err(transport_to_protocol)?
+            .ok_or_else(|| {
+                protocol_error(
+                    "Codex authoritative history omitted the bound direct turn",
+                    true,
+                )
+            })?,
+    };
+    match turn.get("status").and_then(Value::as_str) {
+        Some("inProgress") => Ok(false),
+        Some("completed" | "failed") => {
+            restore_direct_turn(rpc, run, turn_id, &turn).await;
+            Ok(true)
+        }
+        Some("interrupted") if external_turn_is_terminal(&turn) => {
+            restore_direct_turn(rpc, run, turn_id, &turn).await;
+            Ok(true)
+        }
+        Some("interrupted") => Ok(false),
+        status => Err(protocol_error(
+            format!("Codex returned an unsupported bound turn status: {status:?}"),
+            true,
+        )),
+    }
+}
+
+async fn restore_direct_turn(
+    rpc: &CodexRpcClient,
+    run: &Arc<CodexRun>,
+    turn_id: &str,
+    turn: &Value,
+) {
+    if let Ok(items) =
+        load_external_turn_items(rpc, run.execution.session_id.as_str(), turn_id).await
+    {
+        let detailed = json!({"items": items});
+        observe_external_turn_items(run, &detailed);
+        restore_final_response(run, &detailed);
+    }
+    restore_final_response(run, turn);
+    finish_run(run, Some(turn));
+}
+
 async fn monitor_native_run(
     rpc: Arc<CodexRpcClient>,
     run: Arc<CodexRun>,
     turn_id: String,
     mut notifications: broadcast::Receiver<CodexTransportEvent>,
 ) {
+    let mut poll = tokio::time::interval(DIRECT_RUN_POLL_INTERVAL);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // `interval` fires immediately. Notifications own the hot path; polling
+    // starts only after one complete interval.
+    poll.tick().await;
     loop {
-        let message = match notifications.recv().await {
+        let received = tokio::select! {
+            received = notifications.recv() => Some(received),
+            _ = poll.tick() => None,
+        };
+        let Some(received) = received else {
+            match reconcile_bound_direct_turn(&rpc, &run, &turn_id).await {
+                Ok(true) => return,
+                Ok(false) => continue,
+                Err(error) => {
+                    run.detached.store(true, Ordering::SeqCst);
+                    let _ = run.sender.send(Err(error));
+                    return;
+                }
+            }
+        };
+        let message = match received {
             Ok(CodexTransportEvent::Message(message)) => message,
             Ok(CodexTransportEvent::Disconnected { reason }) => {
                 run.detached.store(true, Ordering::SeqCst);
@@ -1775,21 +2489,9 @@ async fn monitor_native_run(
             "item/tool/requestUserInput" => {
                 open_native_request(&run, &message, PendingRequestKind::Input);
             }
+            "serverRequest/resolved" => close_native_request(&run, &message),
             "item/tool/call" => {
-                if let Some(id) = message.get("id") {
-                    let _ = rpc
-                        .respond(
-                            id.clone(),
-                            json!({
-                                "contentItems": [{
-                                    "type": "inputText",
-                                    "text": "Orchestral does not provide this dynamic tool"
-                                }],
-                                "success": false
-                            }),
-                        )
-                        .await;
-                }
+                respond_dynamic_tool(&rpc, &run, &message).await;
             }
             "turn/completed" => {
                 finish_run(&run, message.pointer("/params/turn"));
@@ -1798,6 +2500,96 @@ async fn monitor_native_run(
             _ => {}
         }
     }
+}
+
+async fn respond_dynamic_tool(rpc: &CodexRpcClient, run: &CodexRun, message: &Value) {
+    let Some(id) = message.get("id").cloned() else {
+        return;
+    };
+    let result = publish_artifact_tool(rpc, run, message.pointer("/params")).await;
+    let (success, text) = match result {
+        Ok(text) => (true, text),
+        Err(error) => (false, error),
+    };
+    let _ = rpc
+        .respond(
+            id,
+            json!({
+                "contentItems": [{"type": "inputText", "text": text}],
+                "success": success
+            }),
+        )
+        .await;
+}
+
+async fn publish_artifact_tool(
+    rpc: &CodexRpcClient,
+    run: &CodexRun,
+    params: Option<&Value>,
+) -> Result<String, String> {
+    let params = params.ok_or_else(|| "dynamic tool call omitted params".to_owned())?;
+    if params
+        .get("namespace")
+        .is_some_and(|value| !value.is_null())
+        || params.get("tool").and_then(Value::as_str) != Some("publish_artifact")
+    {
+        return Err("Orchestral does not provide this dynamic tool".to_owned());
+    }
+    let publisher = run
+        .artifact_publisher
+        .as_ref()
+        .ok_or_else(|| "Artifact publication is not configured on this Host".to_owned())?;
+    let arguments = params
+        .get("arguments")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "publish_artifact arguments must be an object".to_owned())?;
+    let source_path = arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "publish_artifact requires a non-empty path".to_owned())?;
+    let optional_string = |name: &str| -> Result<Option<String>, String> {
+        match arguments.get(name) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value.clone())),
+            Some(_) => Err(format!(
+                "publish_artifact {name} must be a non-empty string"
+            )),
+        }
+    };
+    let thread = rpc
+        .request(
+            "thread/read",
+            json!({
+                "threadId": run.execution.session_id.as_str(),
+                "includeTurns": false
+            }),
+        )
+        .await
+        .map_err(|error| format!("could not read the session workspace: {error}"))?;
+    let workspace_root = thread
+        .pointer("/thread/cwd")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Codex session has no workspace directory".to_owned())?;
+    let artifact = publisher
+        .publish(ArtifactPublishRequest {
+            workspace_root: PathBuf::from(workspace_root),
+            source_path: PathBuf::from(source_path),
+            file_name: optional_string("file_name")?,
+            media_type: optional_string("media_type")?,
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    let file_name = artifact.file_name.as_deref().unwrap_or("artifact");
+    Ok(format!(
+        "Published `{file_name}` ({} bytes, {}, sha256 {}). Give the user this download link: [{}]({})",
+        artifact.byte_size,
+        artifact.media_type,
+        artifact.artifact.digest.as_str(),
+        file_name,
+        artifact.uri
+    ))
 }
 
 fn establish_turn(run: &Arc<CodexRun>, turn_id: &str) {
@@ -2070,6 +2862,42 @@ fn open_native_request(run: &Arc<CodexRun>, message: &Value, kind: PendingReques
                     blocking: true,
                     payload,
                 },
+            },
+        },
+    );
+}
+
+fn close_native_request(run: &Arc<CodexRun>, message: &Value) {
+    let Some(native_request_id) = message.pointer("/params/requestId") else {
+        return;
+    };
+    let request_id = {
+        let pending = lock(&run.pending);
+        pending
+            .iter()
+            .find(|(_, native)| &native.rpc_id == native_request_id)
+            .map(|(request_id, _)| request_id.clone())
+    };
+    let Some(request_id) = request_id else {
+        return;
+    };
+    if lock(&run.pending).remove(&request_id).is_none() {
+        return;
+    }
+    publish_event(
+        run,
+        AgentEventDraft {
+            event_id: AgentEventId::new(format!(
+                "codex-{}-request-{}-closed",
+                run.execution.run_id.as_str(),
+                request_id.as_str()
+            )),
+            run_id: run.execution.run_id.clone(),
+            causation_id: None,
+            source_fingerprint: None,
+            payload: AgentEvent::RequestClosed {
+                request_id,
+                reason: "Codex reported that the server request was resolved or cleared".to_owned(),
             },
         },
     );
@@ -2402,13 +3230,158 @@ fn native_resolution(
     }
 }
 
-fn codex_input(request: &AgentStartRequest) -> Result<Value, AgentProtocolError> {
-    codex_content(&request.run.spec.input)
+impl CodexConnector {
+    async fn codex_input(&self, request: &AgentStartRequest) -> Result<Value, AgentProtocolError> {
+        codex_content(
+            &request.run.spec.input,
+            self.artifact_resolver.as_deref(),
+            self.artifact_blob_store.as_deref(),
+        )
+        .await
+    }
 }
 
-fn codex_content(content: &[Content]) -> Result<Value, AgentProtocolError> {
-    let text = content_text(content)?;
-    Ok(json!([{"type": "text", "text": text}]))
+async fn codex_content(
+    content: &[Content],
+    artifact_resolver: Option<&dyn ArtifactResolver>,
+    artifact_blob_store: Option<&dyn BlobStore>,
+) -> Result<Value, AgentProtocolError> {
+    let mut inline_text = Vec::new();
+    let mut native_artifacts = Vec::new();
+    for content in content {
+        match (&content.media_type[..], &content.body) {
+            ("text/plain", ContentBody::Inline(Value::String(text))) => {
+                inline_text.push(text.clone());
+            }
+            (_, ContentBody::Artifact(artifact)) => {
+                if content.media_type.starts_with("image/") {
+                    let blob_store = artifact_blob_store.ok_or_else(|| {
+                        AgentProtocolError::new(
+                            AgentProtocolErrorCode::ProviderUnavailable,
+                            "Codex image input requires a configured Host BlobStore",
+                        )
+                    })?;
+                    let data_url =
+                        inline_image_data_url(artifact, &content.media_type, blob_store).await?;
+                    native_artifacts.push(json!({"type": "image", "url": data_url}));
+                    continue;
+                }
+                let resolver = artifact_resolver.ok_or_else(|| {
+                    AgentProtocolError::new(
+                        AgentProtocolErrorCode::ProviderUnavailable,
+                        "Codex Artifact input requires a configured Host resolver",
+                    )
+                })?;
+                let resolved = resolver.resolve(artifact).await.map_err(|error| {
+                    AgentProtocolError::new(
+                        AgentProtocolErrorCode::ProviderUnavailable,
+                        format!("Codex could not resolve Artifact input: {error}"),
+                    )
+                    .with_retryable(true)
+                })?;
+                if resolved.media_type != content.media_type {
+                    return Err(AgentProtocolError::new(
+                        AgentProtocolErrorCode::InvalidDigest,
+                        "resolved Artifact media type differs from durable Content",
+                    ));
+                }
+                let label = resolved
+                    .file_name
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("attachment");
+                native_artifacts.push(json!({
+                    "type": "text",
+                    "text": format!(
+                        "Attached file: {label} (type {}, {} bytes)\nDownload: {}",
+                        resolved.media_type, resolved.byte_size, resolved.uri
+                    )
+                }));
+            }
+            _ => {
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::Unsupported,
+                    "Codex adapter accepts text/plain inline data or Artifact content",
+                ));
+            }
+        }
+    }
+    let mut native = Vec::new();
+    if !inline_text.is_empty() {
+        native.push(json!({"type": "text", "text": inline_text.join("\n")}));
+    }
+    native.extend(native_artifacts);
+    if native.is_empty() {
+        return Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidSpec,
+            "Codex input must not be empty",
+        ));
+    }
+    Ok(Value::Array(native))
+}
+
+async fn inline_image_data_url(
+    artifact: &orchestral_core::agent_protocol::wire::ArtifactRefWithDigest,
+    media_type: &str,
+    blob_store: &dyn BlobStore,
+) -> Result<String, AgentProtocolError> {
+    let mut blob = blob_store
+        .read(&BlobId::new(artifact.artifact_ref.as_str()))
+        .await
+        .map_err(|error| {
+            AgentProtocolError::new(
+                AgentProtocolErrorCode::ProviderUnavailable,
+                format!("Codex could not read image Artifact input: {error}"),
+            )
+            .with_retryable(true)
+        })?;
+    if blob.meta.id.as_str() != artifact.artifact_ref.as_str()
+        || blob.meta.mime_type.as_deref() != Some(media_type)
+        || blob
+            .meta
+            .checksum_sha256
+            .as_deref()
+            .is_some_and(|digest| digest != artifact.digest.as_str())
+    {
+        return Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidDigest,
+            "BlobStore image metadata differs from durable Artifact input",
+        ));
+    }
+
+    let expected_size = usize::try_from(blob.meta.byte_size).map_err(|_| {
+        AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidSpec,
+            "image Artifact is too large to inline for Codex",
+        )
+    })?;
+    let mut bytes = Vec::with_capacity(expected_size);
+    while let Some(chunk) = blob.body.next().await {
+        let chunk = chunk.map_err(|error| {
+            AgentProtocolError::new(
+                AgentProtocolErrorCode::ProviderUnavailable,
+                format!("Codex could not stream image Artifact input: {error}"),
+            )
+            .with_retryable(true)
+        })?;
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() > expected_size {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidDigest,
+                "BlobStore image body exceeded its declared byte size",
+            ));
+        }
+    }
+    if bytes.len() != expected_size || Digest::sha256(&bytes) != artifact.digest {
+        return Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidDigest,
+            "BlobStore image body failed Artifact integrity validation",
+        ));
+    }
+    Ok(format!(
+        "data:{media_type};base64,{}",
+        BASE64_STANDARD.encode(bytes)
+    ))
 }
 
 fn content_text(content: &[Content]) -> Result<String, AgentProtocolError> {
@@ -2544,6 +3517,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use std::time::Duration;
 
+    use bytes::Bytes;
+    use chrono::Utc;
     use futures_util::StreamExt;
     use orchestral_core::agent_protocol::reference::AgentRunStatus;
     use orchestral_core::agent_protocol::spi::AgentProvider;
@@ -2552,8 +3527,105 @@ mod tests {
     };
     use orchestral_runtime::AgentController;
     use tokio::io::{duplex, AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::sync::oneshot;
 
     use super::*;
+
+    struct StaticImageBlobStore {
+        id: String,
+        media_type: String,
+        bytes: Vec<u8>,
+    }
+
+    #[async_trait]
+    impl BlobStore for StaticImageBlobStore {
+        async fn write(
+            &self,
+            _request: orchestral_core::io::BlobWriteRequest,
+        ) -> Result<orchestral_core::io::BlobMeta, orchestral_core::io::BlobIoError> {
+            Err(orchestral_core::io::BlobIoError::Unsupported(
+                "test store is read-only".to_owned(),
+            ))
+        }
+
+        async fn read(
+            &self,
+            blob_id: &BlobId,
+        ) -> Result<orchestral_core::io::BlobRead, orchestral_core::io::BlobIoError> {
+            if blob_id.as_str() != self.id {
+                return Err(orchestral_core::io::BlobIoError::NotFound(
+                    blob_id.to_string(),
+                ));
+            }
+            let bytes = self.bytes.clone();
+            let now = Utc::now();
+            Ok(orchestral_core::io::BlobRead {
+                meta: orchestral_core::io::BlobMeta {
+                    id: BlobId::new(&self.id),
+                    file_name: Some("fixture.png".to_owned()),
+                    mime_type: Some(self.media_type.clone()),
+                    byte_size: bytes.len() as u64,
+                    checksum_sha256: Some(self.id.clone()),
+                    metadata: json!({}),
+                    created_at: now,
+                    updated_at: now,
+                },
+                body: Box::pin(futures_util::stream::once(
+                    async move { Ok(Bytes::from(bytes)) },
+                )),
+            })
+        }
+
+        async fn head(
+            &self,
+            _blob_id: &BlobId,
+        ) -> Result<orchestral_core::io::BlobHead, orchestral_core::io::BlobIoError> {
+            Err(orchestral_core::io::BlobIoError::Unsupported(
+                "test store does not implement head".to_owned(),
+            ))
+        }
+
+        async fn delete(
+            &self,
+            _blob_id: &BlobId,
+        ) -> Result<bool, orchestral_core::io::BlobIoError> {
+            Err(orchestral_core::io::BlobIoError::Unsupported(
+                "test store is read-only".to_owned(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn image_artifacts_are_inlined_for_codex_instead_of_forwarding_remote_urls() {
+        let bytes = b"fixture-png".to_vec();
+        let digest = Digest::sha256(&bytes);
+        let store = StaticImageBlobStore {
+            id: digest.to_string(),
+            media_type: "image/png".to_owned(),
+            bytes,
+        };
+        let artifact = orchestral_core::agent_protocol::wire::ArtifactRefWithDigest {
+            artifact_ref: orchestral_core::agent_protocol::wire::ArtifactRef::new(digest.as_str()),
+            digest,
+        };
+        let content = vec![Content {
+            media_type: "image/png".to_owned(),
+            schema_id: None,
+            body: ContentBody::Artifact(artifact),
+        }];
+
+        let native = codex_content(&content, None, Some(&store)).await.unwrap();
+
+        assert_eq!(native[0]["type"], "image");
+        assert_eq!(
+            native[0]["url"],
+            format!(
+                "data:image/png;base64,{}",
+                BASE64_STANDARD.encode(b"fixture-png")
+            )
+        );
+        assert!(!native[0]["url"].as_str().unwrap().starts_with("http"));
+    }
 
     #[test]
     fn active_writer_actions_remain_a_typed_session_conflict() {
@@ -2659,6 +3731,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_dispatch_claim_cleanup_preserves_the_uncertain_run() {
+        let fixture = tempfile::TempDir::new().unwrap();
+        let dispatch_dir = fixture.path().join("dispatch");
+        let request = start_request("thread-claim-cleanup", "run-claim-cleanup");
+        let descriptor = CodexConnector::provider_descriptor();
+        let execution = AgentExecutionRef::for_start(&request, &descriptor).unwrap();
+        let client_message_id = queued_client_message_id(&execution);
+        let claim_key = Digest::sha256(client_message_id.as_bytes());
+        let claim_path = dispatch_dir.join(format!("{}.json", claim_key.as_str()));
+
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let mut connector = CodexConnector::with_client(rpc, "codex/test");
+        connector.config.dispatch_journal_dir = Some(dispatch_dir);
+        let claim_path_for_server = claim_path.clone();
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            let resume = next_request(&mut lines).await;
+            server_write_error(
+                &mut server_write,
+                &resume,
+                "thread already has an active writer",
+            )
+            .await;
+            for _ in 0..2 {
+                let request = next_request(&mut lines).await;
+                server_write_result(
+                    &mut server_write,
+                    &request,
+                    json!({"data": [], "nextCursor": null}),
+                )
+                .await;
+            }
+
+            let add = next_request(&mut lines).await;
+            assert_eq!(add["method"], "thread/queue/add");
+            fs::remove_file(&claim_path_for_server).unwrap();
+            fs::create_dir(&claim_path_for_server).unwrap();
+            server_write_error(&mut server_write, &add, "queue rejected the submission").await;
+        });
+
+        match connector.start(request).await {
+            Err(AgentStartError::OutcomeUnknown(error)) => {
+                assert!(error.message.contains("dispatch claim"));
+            }
+            Err(error) => panic!("unexpected dispatch cleanup error: {error}"),
+            Ok(_) => panic!("failed dispatch claim cleanup unexpectedly accepted a run"),
+        }
+        {
+            let state = connector.provider_state();
+            assert!(state.runs.contains_key(&RunId::new("run-claim-cleanup")));
+            assert!(state
+                .sessions
+                .contains_key(&AgentSessionId::new("thread-claim-cleanup")));
+        }
+        assert!(claim_path.is_dir());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn submitting_claim_does_not_succeed_only_because_a_monitor_is_running() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let connector = CodexConnector::with_client(rpc, "codex/test");
+        let run = test_run("thread-submitting", "run-submitting");
+        let input = json!([{"type": "text", "text": "fix the failing test"}]);
+        *lock(&run.route) = Some(NativeRunRoute::ExternalQueue {
+            queued_submission_id: None,
+            client_message_id: "submitting-client".to_owned(),
+            input_digest: codex_user_input_digest(&input).unwrap(),
+            phase: ExternalQueuePhase::Submitting,
+            ambiguous_polls: 0,
+        });
+        run.detached.store(false, Ordering::SeqCst);
+        run.external_monitor_running.store(true, Ordering::SeqCst);
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            for method in ["thread/queue/list", "thread/turns/list"] {
+                let request = next_request(&mut lines).await;
+                assert_eq!(request["method"], method);
+                server_write_result(
+                    &mut server_write,
+                    &request,
+                    json!({"data": [], "nextCursor": null}),
+                )
+                .await;
+            }
+        });
+
+        match connector.prepare_idempotent_start(&run).await {
+            Err(AgentStartError::OutcomeUnknown(error)) => {
+                assert!(error.retryable);
+                assert!(error.message.contains("still being reconciled"));
+            }
+            Err(error) => panic!("unexpected submitting-claim error: {error}"),
+            Ok(()) => panic!("monitor activity is not remote dispatch evidence"),
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn persisted_claim_prevents_readd_during_dequeue_history_gap() {
         let fixture = tempfile::TempDir::new().unwrap();
         let dispatch_dir = fixture.path().join("dispatch");
@@ -2720,6 +3907,8 @@ mod tests {
         );
         let mut second = CodexConnector::with_client(second_rpc, "codex/test-second");
         second.config.dispatch_journal_dir = Some(dispatch_dir);
+        let (evidence_tx, evidence_rx) = oneshot::channel();
+        let (finish_tx, finish_rx) = oneshot::channel();
         let second_server = tokio::spawn(async move {
             let mut lines = BufReader::new(second_server_read).lines();
             let resume = next_request(&mut lines).await;
@@ -2753,13 +3942,574 @@ mod tests {
                 }),
             )
             .await;
+            evidence_tx.send(()).unwrap();
+            finish_rx.await.unwrap();
         });
 
+        match second.start(request.clone()).await {
+            Err(AgentStartError::OutcomeUnknown(error)) => {
+                assert!(error.retryable);
+                assert!(error
+                    .message
+                    .contains("state reconciliation is in progress"));
+            }
+            Err(error) => panic!("unexpected persisted-claim error: {error}"),
+            Ok(_) => panic!("a local dispatch claim without remote evidence must not succeed"),
+        }
+        timeout(Duration::from_secs(1), evidence_rx)
+            .await
+            .expect("remote queue evidence timed out")
+            .unwrap();
+        let observed_run = second
+            .provider_state()
+            .runs
+            .get(&RunId::new("run-gap"))
+            .cloned()
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    lock(&observed_run.route).as_ref(),
+                    Some(NativeRunRoute::ExternalQueue {
+                        phase: ExternalQueuePhase::Queued,
+                        ..
+                    })
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("remote queue evidence was not applied");
         second
             .start(request)
             .await
-            .expect("a persisted dispatch claim must observe instead of re-adding");
+            .expect("the same Run may succeed after remote queue evidence appears");
+        finish_tx.send(()).unwrap();
         second_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_submission_stays_accepted_until_its_correlated_turn_is_observed() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let connector = Arc::new(CodexConnector::with_client(rpc, "codex/test"));
+        let (queued_tx, queued_rx) = oneshot::channel();
+        let (allow_turn_tx, allow_turn_rx) = oneshot::channel();
+        let (turn_tx, turn_rx) = oneshot::channel();
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            let resume = next_request(&mut lines).await;
+            assert_eq!(resume["method"], "thread/resume");
+            server_write_error(
+                &mut server_write,
+                &resume,
+                "thread already has an active writer",
+            )
+            .await;
+
+            for method in ["thread/queue/list", "thread/turns/list"] {
+                let request = next_request(&mut lines).await;
+                assert_eq!(request["method"], method);
+                server_write_result(
+                    &mut server_write,
+                    &request,
+                    json!({"data": [], "nextCursor": null}),
+                )
+                .await;
+            }
+
+            let add = next_request(&mut lines).await;
+            assert_eq!(add["method"], "thread/queue/add");
+            let client_message_id = add["params"]["clientUserMessageId"]
+                .as_str()
+                .expect("queue client id")
+                .to_owned();
+            let input = add["params"]["input"].clone();
+            server_write_result(
+                &mut server_write,
+                &add,
+                json!({
+                    "queuedSubmission": {
+                        "id": "queued-boundary",
+                        "input": input,
+                        "clientUserMessageId": client_message_id
+                    }
+                }),
+            )
+            .await;
+
+            let queued = next_request(&mut lines).await;
+            assert_eq!(queued["method"], "thread/queue/list");
+            server_write_result(
+                &mut server_write,
+                &queued,
+                json!({
+                    "data": [{
+                        "id": "queued-boundary",
+                        "input": input,
+                        "clientUserMessageId": client_message_id
+                    }],
+                    "nextCursor": null
+                }),
+            )
+            .await;
+            queued_tx.send(()).unwrap();
+            allow_turn_rx.await.unwrap();
+
+            let consumed = next_request(&mut lines).await;
+            assert_eq!(consumed["method"], "thread/queue/list");
+            server_write_result(
+                &mut server_write,
+                &consumed,
+                json!({"data": [], "nextCursor": null}),
+            )
+            .await;
+            let turns = next_request(&mut lines).await;
+            assert_eq!(turns["method"], "thread/turns/list");
+            server_write_result(
+                &mut server_write,
+                &turns,
+                json!({
+                    "data": [{
+                        "id": "turn-boundary",
+                        "status": "inProgress",
+                        "completedAt": null,
+                        "items": [{
+                            "type": "userMessage",
+                            "id": "user-boundary",
+                            "clientId": client_message_id,
+                            "content": input
+                        }]
+                    }],
+                    "nextCursor": null
+                }),
+            )
+            .await;
+            turn_tx.send(()).unwrap();
+            finish_rx.await.unwrap();
+        });
+
+        let provider: Arc<dyn AgentProvider> = connector;
+        let controller = Arc::new(
+            AgentController::new(provider, ProviderBindingRef::new("codex/local")).unwrap(),
+        );
+        let run = start_request("thread-boundary", "run-boundary").run;
+        let execution = controller.start(run).await.unwrap();
+        timeout(Duration::from_secs(1), queued_rx)
+            .await
+            .expect("queued observation timed out")
+            .unwrap();
+
+        let accepted = controller.inspect(&execution.run_id).await.unwrap();
+        assert_eq!(accepted.state.status(), AgentRunStatus::Accepted);
+        let accepted_journal = controller.events(&execution.run_id, 0).await.unwrap();
+        assert_eq!(accepted_journal.len(), 1);
+        assert!(matches!(
+            &accepted_journal[0].event.payload,
+            AgentEvent::RunAccepted { .. }
+        ));
+
+        allow_turn_tx.send(()).unwrap();
+        timeout(Duration::from_secs(1), turn_rx)
+            .await
+            .expect("turn observation timed out")
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if controller
+                    .inspect(&execution.run_id)
+                    .await
+                    .unwrap()
+                    .state
+                    .status()
+                    == AgentRunStatus::Running
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("correlated turn did not publish RunStarted");
+        let running_journal = controller.events(&execution.run_id, 0).await.unwrap();
+        assert_eq!(
+            running_journal
+                .iter()
+                .filter(|record| matches!(&record.event.payload, AgentEvent::RunStarted))
+                .count(),
+            1
+        );
+
+        finish_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mismatched_external_turn_never_publishes_run_started() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let run = test_run("thread-mismatch", "run-mismatch");
+        let client_message_id = "expected-client".to_owned();
+        let expected_input = json!([{"type": "text", "text": "fix the failing test"}]);
+        *lock(&run.route) = Some(NativeRunRoute::ExternalQueue {
+            queued_submission_id: Some("queued-mismatch".to_owned()),
+            client_message_id: client_message_id.clone(),
+            input_digest: codex_user_input_digest(&expected_input).unwrap(),
+            phase: ExternalQueuePhase::Queued,
+            ambiguous_polls: 0,
+        });
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            let queue = next_request(&mut lines).await;
+            assert_eq!(queue["method"], "thread/queue/list");
+            server_write_result(
+                &mut server_write,
+                &queue,
+                json!({"data": [], "nextCursor": null}),
+            )
+            .await;
+            let turns = next_request(&mut lines).await;
+            assert_eq!(turns["method"], "thread/turns/list");
+            server_write_result(
+                &mut server_write,
+                &turns,
+                json!({
+                    "data": [
+                        {
+                            "id": "turn-other-client",
+                            "status": "inProgress",
+                            "items": [{
+                                "type": "userMessage",
+                                "id": "user-other-client",
+                                "clientId": "other-client",
+                                "content": expected_input
+                            }]
+                        },
+                        {
+                            "id": "turn-changed-input",
+                            "status": "inProgress",
+                            "items": [{
+                                "type": "userMessage",
+                                "id": "user-changed-input",
+                                "clientId": client_message_id,
+                                "content": [{"type": "text", "text": "different input"}]
+                            }]
+                        }
+                    ],
+                    "nextCursor": null
+                }),
+            )
+            .await;
+        });
+
+        let error = reconcile_external_queued_run(&rpc, &run)
+            .await
+            .expect_err("changed correlated input must be rejected");
+        assert_eq!(error.code, AgentProtocolErrorCode::DuplicateConflict);
+        assert!(lock(&run.turn_id).is_none());
+        assert!(!lock(&run.durable)
+            .iter()
+            .any(|event| matches!(event.payload, AgentEvent::RunStarted)));
+        assert!(matches!(
+            lock(&run.route).as_ref(),
+            Some(NativeRunRoute::ExternalQueue {
+                phase: ExternalQueuePhase::Queued,
+                ..
+            })
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_owner_active_turn_accepts_initial_input_through_strict_steer() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let connector = CodexConnector::with_client(rpc, "codex/test");
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            let resume = next_request(&mut lines).await;
+            assert_eq!(resume["method"], "thread/resume");
+            server_write_result(
+                &mut server_write,
+                &resume,
+                json!({
+                    "thread": {
+                        "id": "thread-live",
+                        "turns": [{
+                            "id": "turn-live",
+                            "status": "inProgress",
+                            "items": []
+                        }]
+                    }
+                }),
+            )
+            .await;
+
+            let steer = next_request(&mut lines).await;
+            assert_eq!(steer["method"], "turn/steer");
+            assert_eq!(steer["params"]["threadId"], "thread-live");
+            assert_eq!(steer["params"]["expectedTurnId"], "turn-live");
+            assert_eq!(steer["params"]["input"][0]["text"], "fix the failing test");
+            assert!(steer["params"]["clientUserMessageId"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("orchestral:run-live:")));
+            server_write_result(&mut server_write, &steer, json!({"turnId": "turn-live"})).await;
+            for notification in [
+                json!({
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "threadId": "thread-live",
+                        "turnId": "turn-live",
+                        "itemId": "message-live",
+                        "delta": "Steer received."
+                    }
+                }),
+                json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-live",
+                        "turn": {
+                            "id": "turn-live",
+                            "status": "completed",
+                            "items": [{
+                                "id": "message-live",
+                                "type": "agentMessage",
+                                "text": "Steer received."
+                            }]
+                        }
+                    }
+                }),
+            ] {
+                server_write
+                    .write_all(format!("{notification}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let mut stream = connector
+            .start(start_request("thread-live", "run-live"))
+            .await
+            .expect("shared owner must accept a strict live steer")
+            .stream;
+        let mut started = false;
+        let mut delivery = None;
+        while let Some(item) = timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("live steer stream timed out")
+        {
+            if let AgentProviderStreamItem::Event(event) = item.unwrap() {
+                match event.payload {
+                    AgentEvent::RunStarted => started = true,
+                    AgentEvent::DeliveryCommitted { delivery: value } => {
+                        delivery = Some(value);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(started);
+        assert_eq!(
+            delivery.expect("live steer must complete").final_response,
+            Content::text("Steer received.")
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_daemon_loaded_writer_accepts_strict_steer_without_reattaching() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let mut connector = CodexConnector::with_client(rpc, "codex/test");
+        connector.config.allow_deferred_queue = false;
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            let resume = next_request(&mut lines).await;
+            assert_eq!(resume["method"], "thread/resume");
+            server_write_error(
+                &mut server_write,
+                &resume,
+                "thread thread-live already has an active writer",
+            )
+            .await;
+
+            let loaded = next_request(&mut lines).await;
+            assert_eq!(loaded["method"], "thread/loaded/list");
+            server_write_result(
+                &mut server_write,
+                &loaded,
+                json!({"data": ["thread-live"], "nextCursor": null}),
+            )
+            .await;
+
+            let turns = next_request(&mut lines).await;
+            assert_eq!(turns["method"], "thread/turns/list");
+            server_write_result(
+                &mut server_write,
+                &turns,
+                json!({
+                    "data": [{"id": "turn-live", "status": "inProgress", "items": []}],
+                    "nextCursor": null
+                }),
+            )
+            .await;
+
+            let steer = next_request(&mut lines).await;
+            assert_eq!(steer["method"], "turn/steer");
+            assert_eq!(steer["params"]["expectedTurnId"], "turn-live");
+            server_write_result(&mut server_write, &steer, json!({"turnId": "turn-live"})).await;
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n{}\n",
+                        json!({
+                            "method": "item/agentMessage/delta",
+                            "params": {
+                                "threadId": "thread-live",
+                                "turnId": "turn-live",
+                                "itemId": "message-live",
+                                "delta": "Shared daemon steer received."
+                            }
+                        }),
+                        json!({
+                            "method": "turn/completed",
+                            "params": {
+                                "threadId": "thread-live",
+                                "turn": {
+                                    "id": "turn-live",
+                                    "status": "completed",
+                                    "items": [{
+                                        "id": "message-live",
+                                        "type": "agentMessage",
+                                        "text": "Shared daemon steer received."
+                                    }]
+                                }
+                            }
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+
+        let mut stream = connector
+            .start(start_request("thread-live", "run-live"))
+            .await
+            .expect("a writer loaded in the same daemon must remain steerable")
+            .stream;
+        let mut delivered = None;
+        while let Some(item) = timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("shared daemon steer stream timed out")
+        {
+            if let AgentProviderStreamItem::Event(event) = item.unwrap() {
+                if let AgentEvent::DeliveryCommitted { delivery } = event.payload {
+                    delivered = Some(delivery);
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            delivered
+                .expect("shared daemon steer must deliver")
+                .final_response,
+            Content::text("Shared daemon steer received.")
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_external_writer_is_rejected_when_live_control_is_required() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let mut connector = CodexConnector::with_client(rpc, "codex/test");
+        connector.config.allow_deferred_queue = false;
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            let resume = next_request(&mut lines).await;
+            assert_eq!(resume["method"], "thread/resume");
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({
+                            "id": resume["id"],
+                            "error": {
+                                "code": -32600,
+                                "message": "thread already has an active writer"
+                            }
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let loaded = next_request(&mut lines).await;
+            assert_eq!(loaded["method"], "thread/loaded/list");
+            server_write_result(
+                &mut server_write,
+                &loaded,
+                json!({"data": [], "nextCursor": null}),
+            )
+            .await;
+        });
+
+        let error = match connector
+            .start(start_request("thread-embedded", "run-embedded"))
+            .await
+        {
+            Ok(_) => panic!("embedded owner must not be presented as a successful send"),
+            Err(error) => error,
+        };
+        let AgentStartError::Rejected(rejection) = error else {
+            panic!("live-control refusal must be a deterministic rejection");
+        };
+        assert_eq!(rejection.code, AgentRejectionCode::UnsupportedCapability);
+        assert_eq!(
+            rejection.details.get("code").and_then(Value::as_str),
+            Some("live_control_unavailable")
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -3206,11 +4956,185 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(queued["id"], "target");
-        let turn = find_external_turn(&rpc, "thread-pages", "target-client")
+        let turn = find_external_turn(&rpc, "thread-pages", "target-client", false)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(turn["id"], "target-turn");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_finds_a_mid_turn_steer_through_native_item_pagination() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            let metadata = next_request(&mut lines).await;
+            assert_eq!(metadata["method"], "thread/turns/list");
+            assert_eq!(metadata["params"]["itemsView"], "notLoaded");
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"id": metadata["id"], "result": {
+                            "data": [{
+                                "id": "turn-active",
+                                "status": "inProgress",
+                                "items": []
+                            }],
+                            "nextCursor": null
+                        }})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let items = next_request(&mut lines).await;
+            assert_eq!(items["method"], "thread/items/list");
+            assert_eq!(items["params"]["turnId"], "turn-active");
+            assert_eq!(items["params"]["sortDirection"], "asc");
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"id": items["id"], "result": {
+                            "data": [{
+                                "turnId": "turn-active",
+                                "item": {
+                                    "type": "userMessage",
+                                    "id": "steer-user",
+                                    "clientId": "target-client",
+                                    "content": [{"type": "text", "text": "continue safely"}]
+                                }
+                            }],
+                            "nextCursor": null
+                        }})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+
+        let turn = find_external_turn(&rpc, "thread-steer", "target-client", true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(turn["id"], "turn-active");
+        assert_eq!(turn["status"], "inProgress");
+        assert_eq!(turn["items"][0]["id"], "steer-user");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restarted_realtime_run_adopts_only_its_correlated_shared_daemon_turn() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let mut connector = CodexConnector::with_client(rpc, "codex/test");
+        connector.config.allow_deferred_queue = false;
+        let descriptor = CodexConnector::provider_descriptor();
+        let start = start_request("thread-realtime", "run-realtime");
+        let execution = AgentExecutionRef::for_start(&start, &descriptor).unwrap();
+        let expected_client_id = queued_client_message_id(&execution);
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            let loaded = next_request(&mut lines).await;
+            assert_eq!(loaded["method"], "thread/loaded/list");
+            server_write_result(
+                &mut server_write,
+                &loaded,
+                json!({"data": ["thread-realtime"], "nextCursor": null}),
+            )
+            .await;
+
+            let correlated = next_request(&mut lines).await;
+            assert_eq!(correlated["method"], "thread/items/list");
+            assert!(correlated["params"]["turnId"].is_null());
+            server_write_result(
+                &mut server_write,
+                &correlated,
+                json!({
+                    "data": [{
+                        "turnId": "turn-realtime",
+                        "item": {
+                            "id": "user-realtime",
+                            "type": "userMessage",
+                            "clientId": expected_client_id,
+                            "content": [
+                                {"type": "text", "text": "fix the failing test"},
+                                {"type": "localImage", "path": "/private/tmp/materialized.png"}
+                            ]
+                        }
+                    }],
+                    "nextCursor": null
+                }),
+            )
+            .await;
+
+            let turns = next_request(&mut lines).await;
+            assert_eq!(turns["method"], "thread/turns/list");
+            assert_eq!(turns["params"]["itemsView"], "notLoaded");
+            server_write_result(
+                &mut server_write,
+                &turns,
+                json!({
+                    "data": [
+                        {"id": "turn-unrelated-newer", "status": "inProgress"},
+                        {"id": "turn-realtime", "status": "inProgress"}
+                    ],
+                    "nextCursor": null
+                }),
+            )
+            .await;
+
+            let resume = next_request(&mut lines).await;
+            assert_eq!(resume["method"], "thread/resume");
+            server_write_result(
+                &mut server_write,
+                &resume,
+                json!({"thread": {"id": "thread-realtime"}}),
+            )
+            .await;
+        });
+
+        let recovery = AgentRecoveryRequest::new(start, execution, &descriptor).unwrap();
+        let recovered = connector.recover(recovery).await.unwrap();
+        let (mut stream, confirmation) = recovered.into_parts();
+        let started = stream.next().await.unwrap().unwrap();
+        assert!(matches!(
+            started,
+            AgentProviderStreamItem::Event(draft)
+                if matches!(draft.payload, AgentEvent::RunStarted)
+        ));
+        confirmation.await.unwrap();
+        let run = connector
+            .provider_state()
+            .runs
+            .get(&RunId::new("run-realtime"))
+            .cloned()
+            .unwrap();
+        assert!(matches!(
+            lock(&run.route).as_ref(),
+            Some(NativeRunRoute::Direct)
+        ));
+        assert_eq!(lock(&run.turn_id).as_deref(), Some("turn-realtime"));
+        assert!(!run.detached.load(Ordering::SeqCst));
         server.await.unwrap();
     }
 
@@ -3261,6 +5185,74 @@ mod tests {
         let (_stream, confirmation) = recovered.into_parts();
         confirmation.await.unwrap();
         assert!(client_id.starts_with("orchestral:run-restart:"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn superseded_recovery_converges_instead_of_retrying_session_conflict() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let connector = CodexConnector::with_client(rpc, "codex/test");
+        let descriptor = CodexConnector::provider_descriptor();
+        let start = start_request("thread-superseded", "run-old");
+        let execution = AgentExecutionRef::for_start(&start, &descriptor).unwrap();
+        let client_id = queued_client_message_id(&execution);
+        let newer = test_run("thread-superseded", "run-newer");
+        {
+            let mut state = connector.provider_state();
+            state.sessions.insert(
+                AgentSessionId::new("thread-superseded"),
+                RunId::new("run-newer"),
+            );
+            state.runs.insert(RunId::new("run-newer"), newer);
+        }
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            let list = next_request(&mut lines).await;
+            assert_eq!(list["method"], "thread/queue/list");
+            server_write_result(
+                &mut server_write,
+                &list,
+                json!({
+                    "data": [{
+                        "id": "old-before-reload",
+                        "input": [{"type": "text", "text": "fix the failing test"}],
+                        "clientUserMessageId": client_id
+                    }],
+                    "nextCursor": null
+                }),
+            )
+            .await;
+        });
+
+        let recovery = AgentRecoveryRequest::new(start, execution, &descriptor).unwrap();
+        let recovered = connector.recover(recovery).await.unwrap();
+        let (_stream, confirmation) = recovered.into_parts();
+        confirmation.await.unwrap();
+        let old = connector
+            .provider_state()
+            .runs
+            .get(&RunId::new("run-old"))
+            .cloned()
+            .unwrap();
+        assert!(old.terminal.load(Ordering::SeqCst));
+        assert!(lock(&old.durable)
+            .iter()
+            .any(|event| matches!(event.payload, AgentEvent::RunIncomplete { .. })));
+        assert_eq!(
+            connector
+                .provider_state()
+                .sessions
+                .get(&AgentSessionId::new("thread-superseded")),
+            Some(&RunId::new("run-newer"))
+        );
         server.await.unwrap();
     }
 
@@ -3373,7 +5365,19 @@ mod tests {
         let descriptor = CodexConnector::provider_descriptor();
         let request = start_request(session_id, run_id);
         let execution = AgentExecutionRef::for_start(&request, &descriptor).unwrap();
-        new_codex_run(request, execution, AgentAdmission::default())
+        new_codex_run(request, execution, AgentAdmission::default(), None)
+    }
+
+    #[test]
+    fn artifact_tool_contract_is_provider_neutral_and_workspace_scoped() {
+        let tools = artifact_dynamic_tools();
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "publish_artifact");
+        assert_eq!(tools[0]["inputSchema"]["required"], json!(["path"]));
+        assert_eq!(
+            tools[0]["inputSchema"]["additionalProperties"],
+            Value::Bool(false)
+        );
     }
 
     fn action_start_request(
@@ -3442,7 +5446,7 @@ mod tests {
     fn descriptor_promises_only_implemented_controls() {
         let descriptor = CodexConnector::provider_descriptor();
         assert!(descriptor.descriptor.capabilities.session_reuse);
-        assert!(!descriptor.descriptor.capabilities.controls.steer);
+        assert!(descriptor.descriptor.capabilities.controls.steer);
         assert_eq!(
             descriptor.descriptor.capabilities.controls.cancel,
             CancelSupport::BestEffort
@@ -3712,6 +5716,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn competing_client_resolution_closes_the_host_approval_before_delivery() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let connector = CodexConnector::with_client(rpc, "codex/test");
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            let resume = next_request(&mut lines).await;
+            server_write_result(
+                &mut server_write,
+                &resume,
+                json!({"thread": {"id": "thread-race", "turns": []}}),
+            )
+            .await;
+            let start = next_request(&mut lines).await;
+            assert_eq!(start["method"], "turn/start");
+            server_write_result(
+                &mut server_write,
+                &start,
+                json!({"turn": {"id": "turn-race", "status": "inProgress", "items": []}}),
+            )
+            .await;
+            for notification in [
+                json!({
+                    "method": "item/commandExecution/requestApproval",
+                    "id": 70,
+                    "params": {
+                        "threadId": "thread-race",
+                        "turnId": "turn-race",
+                        "itemId": "command-race",
+                        "command": "cargo test",
+                        "reason": "run tests"
+                    }
+                }),
+                json!({
+                    "method": "serverRequest/resolved",
+                    "params": {"threadId": "thread-race", "requestId": 70}
+                }),
+                json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-race",
+                        "turn": {
+                            "id": "turn-race",
+                            "status": "completed",
+                            "items": [{
+                                "id": "message-race",
+                                "type": "agentMessage",
+                                "text": "Tests passed."
+                            }]
+                        }
+                    }
+                }),
+            ] {
+                server_write
+                    .write_all(format!("{notification}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let mut stream = connector
+            .start(start_request("thread-race", "run-race"))
+            .await
+            .unwrap()
+            .stream;
+        let mut saw_open = false;
+        let mut saw_closed = false;
+        let mut delivered = false;
+        while let Some(item) = timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("approval race stream timed out")
+        {
+            if let AgentProviderStreamItem::Event(event) = item.unwrap() {
+                match event.payload {
+                    AgentEvent::RequestOpened { .. } => saw_open = true,
+                    AgentEvent::RequestClosed { .. } => saw_closed = true,
+                    AgentEvent::DeliveryCommitted { .. } => {
+                        delivered = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_open && saw_closed && delivered);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn relays_approval_steer_and_cancel_without_session_grant() {
         let (client_io, server_io) = duplex(1024 * 1024);
         let (client_read, client_write) = tokio::io::split(client_io);
@@ -3764,9 +5864,23 @@ mod tests {
                 json!({"id": 70, "result": {"decision": "accept"}})
             );
 
+            let steer_preflight = next_request(&mut lines).await;
+            assert_eq!(steer_preflight["method"], "thread/turns/list");
+            server_write_result(
+                &mut server_write,
+                &steer_preflight,
+                json!({
+                    "data": [{"id": "turn-2", "status": "inProgress"}],
+                    "nextCursor": null
+                }),
+            )
+            .await;
             let steer = next_request(&mut lines).await;
             assert_eq!(steer["method"], "turn/steer");
             assert_eq!(steer["params"]["expectedTurnId"], "turn-2");
+            assert!(steer["params"]["clientUserMessageId"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("orchestral-command:run-2:steer-command:")));
             server_write
                 .write_all(
                     format!(
@@ -3778,6 +5892,17 @@ mod tests {
                 .await
                 .unwrap();
 
+            let cancel_preflight = next_request(&mut lines).await;
+            assert_eq!(cancel_preflight["method"], "thread/turns/list");
+            server_write_result(
+                &mut server_write,
+                &cancel_preflight,
+                json!({
+                    "data": [{"id": "turn-2", "status": "inProgress"}],
+                    "nextCursor": null
+                }),
+            )
+            .await;
             let cancel = next_request(&mut lines).await;
             assert_eq!(cancel["method"], "turn/interrupt");
             server_write
@@ -3873,6 +5998,146 @@ mod tests {
                 break;
             }
         }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_direct_steer_is_durably_rejected_without_touching_a_newer_turn() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let connector = CodexConnector::with_client(rpc, "codex/test");
+        let run = test_run("thread-stale", "run-stale");
+        *lock(&run.route) = Some(NativeRunRoute::Direct);
+        *lock(&run.turn_id) = Some("turn-original".to_owned());
+        {
+            let mut state = connector.provider_state();
+            state
+                .runs
+                .insert(run.execution.run_id.clone(), Arc::clone(&run));
+            state.sessions.insert(
+                run.execution.session_id.clone(),
+                run.execution.run_id.clone(),
+            );
+        }
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            let preflight = next_request(&mut lines).await;
+            assert_eq!(preflight["method"], "thread/turns/list");
+            server_write_result(
+                &mut server_write,
+                &preflight,
+                json!({
+                    "data": [{"id": "turn-unrelated-newer", "status": "inProgress"}],
+                    "nextCursor": null
+                }),
+            )
+            .await;
+            assert!(timeout(Duration::from_millis(50), lines.next_line())
+                .await
+                .is_err());
+        });
+        let command = AgentCommandEnvelope::new(
+            CommandId::new("stale-steer"),
+            run.execution.run_id.clone(),
+            None,
+            AgentCommand::Steer {
+                content: vec![Content::text("must not reach the newer turn")],
+            },
+        )
+        .unwrap();
+        let disposition = connector.command(&run.execution, command).await.unwrap();
+        assert!(matches!(
+            disposition.outcome,
+            ProviderCommandOutcome::Rejected {
+                code: AgentProtocolErrorCode::InvalidTransition,
+                ..
+            }
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_monitor_poll_recovers_a_missed_turn_completed_notification() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let run = test_run("thread-poll", "run-poll");
+        establish_turn(&run, "turn-poll");
+        let notifications = rpc.subscribe();
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            let latest = next_request(&mut lines).await;
+            assert_eq!(latest["method"], "thread/turns/list");
+            server_write_result(
+                &mut server_write,
+                &latest,
+                json!({
+                    "data": [{
+                        "id": "turn-poll",
+                        "status": "completed",
+                        "completedAt": 1
+                    }],
+                    "nextCursor": null
+                }),
+            )
+            .await;
+            let items = next_request(&mut lines).await;
+            assert_eq!(items["method"], "thread/items/list");
+            assert_eq!(items["params"]["turnId"], "turn-poll");
+            server_write_result(
+                &mut server_write,
+                &items,
+                json!({
+                    "data": [{
+                        "turnId": "turn-poll",
+                        "item": {
+                            "id": "agent-poll",
+                            "type": "agentMessage",
+                            "status": "completed",
+                            "text": "recovered by polling"
+                        }
+                    }],
+                    "nextCursor": null
+                }),
+            )
+            .await;
+        });
+        let monitored = Arc::clone(&run);
+        let monitored_rpc = rpc.clone();
+        let task = tokio::spawn(async move {
+            monitor_native_run(
+                monitored_rpc,
+                monitored,
+                "turn-poll".to_owned(),
+                notifications,
+            )
+            .await;
+        });
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(run.terminal.load(Ordering::SeqCst));
+        assert!(lock(&run.durable).iter().any(|event| {
+            matches!(
+                &event.payload,
+                AgentEvent::DeliveryCommitted { delivery }
+                    if delivery.final_response == Content::text("recovered by polling")
+            )
+        }));
         server.await.unwrap();
     }
 
@@ -3979,6 +6244,17 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            let preflight = next_request(&mut lines).await;
+            assert_eq!(preflight["method"], "thread/turns/list");
+            server_write_result(
+                &mut server_write,
+                &preflight,
+                json!({
+                    "data": [{"id": "turn-cancel", "status": "inProgress"}],
+                    "nextCursor": null
+                }),
+            )
+            .await;
             let interrupt = next_request(&mut lines).await;
             assert_eq!(interrupt["method"], "turn/interrupt");
             server_write
@@ -4219,6 +6495,22 @@ mod tests {
                 .await
                 .unwrap();
 
+            let read = next_request(&mut lines).await;
+            assert_eq!(read["method"], "thread/turns/list");
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({
+                            "id": read["id"],
+                            "result": {"data": [], "nextCursor": null, "backwardsCursor": null}
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
             let start = next_request(&mut lines).await;
             assert_eq!(start["method"], "turn/start");
             assert_eq!(start["params"]["threadId"], "thread-empty-loaded");
@@ -4331,16 +6623,14 @@ mod tests {
                 .await
                 .unwrap();
             let read = next_request(&mut lines).await;
-            assert_eq!(read["method"], "thread/read");
+            assert_eq!(read["method"], "thread/turns/list");
             second_server_write
                 .write_all(
                     format!(
                         "{}\n",
                         json!({
                             "id": read["id"],
-                            "result": {"thread": {
-                                "id": "thread-recover",
-                                "turns": [{
+                            "result": {"data": [{
                                     "id": "turn-recover",
                                     "status": "completed",
                                     "items": [{
@@ -4348,8 +6638,7 @@ mod tests {
                                         "id": "answer-recover",
                                         "text": "recovered answer"
                                     }]
-                                }]
-                            }}
+                                }], "nextCursor": null, "backwardsCursor": null}
                         })
                     )
                     .as_bytes(),

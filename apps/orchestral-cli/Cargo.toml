@@ -20,6 +20,7 @@ orchestral-core = { workspace = true }
 orchestral-runtime = { workspace = true }
 orchestral-agent-codex = { workspace = true }
 orchestral-agent-journal-fs = { path = "../../plugins/orchestral-agent-journal-fs" }
+orchestral-artifact-r2 = { workspace = true }
 orchestral-blob-fs = { path = "../../plugins/orchestral-blob-fs" }
 orchestral-model-gemini = { workspace = true }
 orchestral-model-openai = { workspace = true }
@@ -32,6 +33,7 @@ serde = { workspace = true }
 serde_yaml = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1"
 futures-util = "0.3"

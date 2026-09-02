@@ -11,12 +11,17 @@ use std::sync::Arc;
 use anyhow::Context;
 use orchestral_agent_codex::{CodexAppServerConfig, CodexConnector};
 use orchestral_agent_journal_fs::FileAgentJournalStore;
-use orchestral_core::agent_connector::{AgentConnector, AgentSessionListQuery};
+use orchestral_core::agent_connector::AgentSessionListQuery;
+use orchestral_core::io::{ArtifactPublisher, ArtifactResolver, BlobStore};
 use orchestral_runtime::AgentDirectory;
 
 use crate::mcp_config::user_config_root;
 
-pub(crate) async fn build_agent_directory() -> anyhow::Result<Arc<AgentDirectory>> {
+pub(crate) async fn build_agent_directory(
+    artifact_resolver: Option<Arc<dyn ArtifactResolver>>,
+    artifact_blob_store: Option<Arc<dyn BlobStore>>,
+    artifact_publisher: Option<Arc<dyn ArtifactPublisher>>,
+) -> anyhow::Result<Arc<AgentDirectory>> {
     let directory = Arc::new(AgentDirectory::new());
     let config_root = user_config_root()?;
     let config = CodexAppServerConfig {
@@ -33,7 +38,23 @@ pub(crate) async fn build_agent_directory() -> anyhow::Result<Arc<AgentDirectory
         ),
         ..CodexAppServerConfig::default()
     };
-    let codex = Arc::new(CodexConnector::new(config));
+    let session_list_cache_path = config_root
+        .join("agent-connectors")
+        .join("codex-local")
+        .join("session-list-cache.json");
+    let codex = Arc::new(
+        match (artifact_resolver, artifact_blob_store, artifact_publisher) {
+            (Some(resolver), Some(blob_store), Some(publisher)) => {
+                CodexConnector::with_artifact_services(config, resolver, blob_store, publisher)
+            }
+            (Some(resolver), Some(blob_store), None) => {
+                CodexConnector::with_artifact_io(config, resolver, blob_store)
+            }
+            (Some(resolver), None, _) => CodexConnector::with_artifact_resolver(config, resolver),
+            _ => CodexConnector::new(config),
+        }
+        .with_session_list_cache_path(session_list_cache_path),
+    );
     let journal = Arc::new(
         FileAgentJournalStore::open(
             config_root
@@ -48,12 +69,29 @@ pub(crate) async fn build_agent_directory() -> anyhow::Result<Arc<AgentDirectory
         .await
         .context("register Codex Agent connector")?;
     tokio::spawn(async move {
-        let _ = codex
-            .list_sessions(AgentSessionListQuery {
-                limit: 25,
-                ..AgentSessionListQuery::default()
-            })
-            .await;
+        let query = AgentSessionListQuery {
+            limit: 25,
+            ..AgentSessionListQuery::default()
+        };
+        if let Err(error) = codex.refresh_session_list(query.clone()).await {
+            tracing::warn!(%error, "Codex session-list background refresh failed");
+        }
+        loop {
+            tokio::select! {
+                () = codex.wait_for_session_list_refresh() => {}
+                () = tokio::time::sleep(std::time::Duration::from_secs(5 * 60)) => {}
+            }
+            // Collapse a burst of page loads or session mutations, then avoid
+            // repeating a scan for a notification queued during the scan that
+            // just completed.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if let Err(error) = codex
+                .refresh_session_list_if_stale(query.clone(), std::time::Duration::ZERO)
+                .await
+            {
+                tracing::warn!(%error, "Codex session-list background refresh failed");
+            }
+        }
     });
     Ok(directory)
 }

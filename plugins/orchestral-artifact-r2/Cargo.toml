@@ -1,6 +1,6 @@
 [package]
-name = "orchestral-agent-codex"
-description = "Codex app-server connector for Orchestral"
+name = "orchestral-artifact-r2"
+description = "Private Cloudflare R2 Artifact store and resolver plugin for Orchestral"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,20 +10,16 @@ homepage.workspace = true
 [dependencies]
 orchestral-core = { workspace = true }
 async-trait = { workspace = true }
-base64 = { workspace = true }
-bytes = { workspace = true }
-futures-util = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
-tokio = { workspace = true }
-tokio-tungstenite = { workspace = true }
-toml = { workspace = true }
-tracing = { workspace = true }
-
-[dev-dependencies]
 bytes = { workspace = true }
 chrono = { workspace = true }
-orchestral-runtime = { workspace = true }
-tempfile = "3"
+futures-util = { workspace = true }
+hex = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true }
+
+
+[dev-dependencies]
+tempfile = "3"

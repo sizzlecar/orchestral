@@ -32,7 +32,9 @@ pub mod prelude {
         Executor, ExecutorContext, NodeState, StepExecutionPort, StepExecutionRequest, StepOutcome,
     };
     pub use crate::io::{
-        BlobHead, BlobId, BlobIoError, BlobMeta, BlobRead, BlobStore, BlobStream, BlobWriteRequest,
+        ArtifactPublishError, ArtifactPublishRequest, ArtifactPublisher, ArtifactResolveError,
+        ArtifactResolver, BlobHead, BlobId, BlobIoError, BlobMeta, BlobRead, BlobStore, BlobStream,
+        BlobWriteRequest, ResolvedArtifact,
     };
     pub use crate::normalizer::{
         FixError, NormalizeError, NormalizedPlan, PlanFixer, PlanNormalizer, PlanValidator,
@@ -48,7 +50,9 @@ pub use executor::{
     StepOutcome,
 };
 pub use io::{
-    BlobHead, BlobId, BlobIoError, BlobMeta, BlobRead, BlobStore, BlobStream, BlobWriteRequest,
+    ArtifactPublishError, ArtifactPublishRequest, ArtifactPublisher, ArtifactResolveError,
+    ArtifactResolver, BlobHead, BlobId, BlobIoError, BlobMeta, BlobRead, BlobStore, BlobStream,
+    BlobWriteRequest, ResolvedArtifact,
 };
 pub use normalizer::{NormalizedPlan, PlanNormalizer};
 pub use types::{Plan, Step, StepId, StepIoBinding, StepKind, WorkflowId};

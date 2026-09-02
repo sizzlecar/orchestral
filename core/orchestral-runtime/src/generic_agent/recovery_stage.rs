@@ -192,7 +192,9 @@ pub(super) fn stage_observed_recovery(
                     resolution: resolution.clone(),
                 });
             }
-            AgentEvent::RequestOpened { .. } | AgentEvent::RequestResolved { .. } => {
+            AgentEvent::RequestOpened { .. }
+            | AgentEvent::RequestResolved { .. }
+            | AgentEvent::RequestClosed { .. } => {
                 return Err(AgentProtocolError::new(
                     AgentProtocolErrorCode::InvalidDigest,
                     "recovered interaction crossed the observed input request boundary",
@@ -241,7 +243,9 @@ pub(super) fn stage_workflow_recovery(
     if recovery_events.iter().any(|event| {
         matches!(
             &event.payload,
-            AgentEvent::RequestOpened { .. } | AgentEvent::RequestResolved { .. }
+            AgentEvent::RequestOpened { .. }
+                | AgentEvent::RequestResolved { .. }
+                | AgentEvent::RequestClosed { .. }
         )
     }) {
         return Err(AgentProtocolError::new(
@@ -398,7 +402,9 @@ pub(super) fn stage_skill_recovery(
     if recovery_events.iter().any(|event| {
         matches!(
             &event.payload,
-            AgentEvent::RequestOpened { .. } | AgentEvent::RequestResolved { .. }
+            AgentEvent::RequestOpened { .. }
+                | AgentEvent::RequestResolved { .. }
+                | AgentEvent::RequestClosed { .. }
         )
     }) {
         return Err(AgentProtocolError::new(
@@ -439,7 +445,9 @@ pub(super) fn stage_tool_recovery(
     if recovery_events.iter().any(|event| {
         matches!(
             &event.payload,
-            AgentEvent::RequestOpened { .. } | AgentEvent::RequestResolved { .. }
+            AgentEvent::RequestOpened { .. }
+                | AgentEvent::RequestResolved { .. }
+                | AgentEvent::RequestClosed { .. }
         )
     }) {
         return Err(AgentProtocolError::new(
@@ -521,7 +529,9 @@ pub(super) fn stage_approval_recovery(
                     resolution,
                 )?);
             }
-            AgentEvent::RequestOpened { .. } | AgentEvent::RequestResolved { .. } => {
+            AgentEvent::RequestOpened { .. }
+            | AgentEvent::RequestResolved { .. }
+            | AgentEvent::RequestClosed { .. } => {
                 return Err(AgentProtocolError::new(
                     AgentProtocolErrorCode::InvalidDigest,
                     "recovered interaction crossed the observed approval request boundary",

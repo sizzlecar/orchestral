@@ -11,6 +11,7 @@ use std::fmt;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::broadcast;
 
 use crate::agent_protocol::wire::{
     AgentRunSpec, AgentSessionId, Content, PendingRequest, ProviderBindingRef, RunId,
@@ -55,6 +56,9 @@ pub const SESSION_FORK_ACTION: &str = "session.fork";
 pub const SESSION_RENAME_ACTION: &str = "session.rename";
 pub const SESSION_SET_MODEL_ACTION: &str = "session.set_model";
 pub const SESSION_SET_REASONING_ACTION: &str = "session.set_reasoning";
+/// Provider-neutral action for changing the execution permission envelope used
+/// by subsequent turns in an existing session.
+pub const SESSION_SET_PERMISSIONS_ACTION: &str = "session.set_permissions";
 /// Provider-neutral Run extension used when a session action has a lifecycle.
 /// Concrete adapters translate the action id and arguments to their native
 /// protocol; consumers must not place provider wire method names here.
@@ -156,6 +160,11 @@ pub struct AgentConnectorDescriptor {
     pub agent_family: String,
     pub display_name: String,
     pub capabilities: AgentSessionCapabilities,
+    /// Declarative creation form. The Host and UI render this contract without
+    /// knowing provider-specific option names; only the connector interprets
+    /// the submitted `options` value.
+    #[serde(default)]
+    pub creation: Option<AgentSessionCreationDescriptor>,
     #[serde(default)]
     pub actions: Vec<AgentSessionActionDescriptor>,
 }
@@ -174,6 +183,11 @@ impl AgentConnectorDescriptor {
         if !self.capabilities.list || !self.capabilities.read {
             return Err(AgentConnectorError::invalid(
                 "connector must support session listing and reading",
+            ));
+        }
+        if !self.capabilities.create && self.creation.is_some() {
+            return Err(AgentConnectorError::invalid(
+                "connector without session creation cannot declare a creation form",
             ));
         }
         let mut action_ids = BTreeSet::new();
@@ -196,6 +210,24 @@ impl AgentConnectorDescriptor {
             .iter()
             .find(|action| &action.action_id == action_id)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSessionCreationDescriptor {
+    /// Whether callers may select the Agent's working directory.
+    pub accepts_cwd: bool,
+    /// Host-side directory suggested when the caller has no current session.
+    #[serde(default)]
+    pub default_cwd: Option<String>,
+    /// JSON Schema for provider-owned creation options. `None` means that no
+    /// additional options are accepted.
+    #[serde(default)]
+    pub input_schema: Option<Value>,
+    /// Human-facing topology hint, such as a shared local daemon. This is
+    /// descriptive only and must never be parsed for behavior.
+    #[serde(default)]
+    pub connection_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -367,6 +399,40 @@ pub struct AgentSessionDetail {
     pub next_cursor: Option<String>,
 }
 
+/// Provider-neutral incremental mutation for a connector-owned session.
+///
+/// Connectors should emit stable activity identities whenever the native
+/// protocol exposes them. `RefreshRequired` is the explicit escape hatch for
+/// metadata changes or sequence gaps that cannot be represented losslessly;
+/// consumers must not turn every normal activity event into a page reload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AgentSessionChangeKind {
+    ActivityUpsert {
+        turn_id: AgentSessionTurnId,
+        turn_status: AgentSessionTurnStatus,
+        activity: AgentSessionActivity,
+    },
+    TurnStatus {
+        turn_id: AgentSessionTurnId,
+        status: AgentSessionTurnStatus,
+    },
+    RefreshRequired {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSessionChange {
+    pub connector_id: AgentConnectorId,
+    pub session_id: AgentSessionId,
+    /// Monotonic within one live subscription. It is an observation cursor,
+    /// not a durable history cursor.
+    pub sequence: u64,
+    pub change: AgentSessionChangeKind,
+}
+
 impl AgentSessionDetail {
     pub fn validate_for(&self, connector_id: &AgentConnectorId) -> Result<(), AgentConnectorError> {
         self.summary.validate_for(connector_id)?;
@@ -536,6 +602,10 @@ pub struct CreateAgentSessionRequest {
     pub cwd: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
+    /// Connector-owned creation options validated against the descriptor's
+    /// schema. Core and clients preserve this value without interpreting it.
+    #[serde(default)]
+    pub options: Value,
     #[serde(default)]
     pub extensions: BTreeMap<String, Value>,
 }
@@ -715,6 +785,18 @@ pub trait AgentConnector: Send + Sync {
         paginate_session_detail(&detail, query)
     }
 
+    /// Subscribes to provider-native session invalidations. Connectors that do
+    /// not expose a live observation channel may keep the default and clients
+    /// will fall back to bounded polling.
+    async fn subscribe_session_changes(
+        &self,
+        _session_id: &AgentSessionId,
+    ) -> Result<broadcast::Receiver<AgentSessionChange>, AgentConnectorError> {
+        Err(AgentConnectorError::unsupported(
+            "connector does not support live session observation",
+        ))
+    }
+
     async fn create_session(
         &self,
         _request: CreateAgentSessionRequest,
@@ -816,6 +898,7 @@ mod tests {
             agent_family: "coding-agent".to_owned(),
             display_name: "Fixture Agent".to_owned(),
             capabilities: AgentSessionCapabilities::discoverable(),
+            creation: None,
             actions: vec![AgentSessionActionDescriptor {
                 action_id: AgentSessionActionId::new(SESSION_COMPACT_ACTION),
                 title: "Compact".to_owned(),

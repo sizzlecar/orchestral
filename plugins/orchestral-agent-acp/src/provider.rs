@@ -983,6 +983,7 @@ mod tests {
             .create_session(CreateAgentSessionRequest {
                 cwd: Some("/repo".to_owned()),
                 title: None,
+                options: Value::Null,
                 extensions: BTreeMap::new(),
             })
             .await

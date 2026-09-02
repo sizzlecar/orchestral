@@ -523,6 +523,28 @@
           ]
         },
         {
+          "description": "The Provider authoritatively reports that a request is no longer\npending, but cannot attest which competing client supplied a response\n(or whether native lifecycle cleanup cleared it).",
+          "type": "object",
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "type": {
+              "type": "string",
+              "const": "request_closed"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "request_id",
+            "reason"
+          ]
+        },
+        {
           "type": "object",
           "properties": {
             "reason": {

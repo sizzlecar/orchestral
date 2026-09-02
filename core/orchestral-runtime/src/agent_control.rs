@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::StreamExt;
 use orchestral_core::agent_protocol::{
@@ -29,6 +30,9 @@ use orchestral_core::agent_protocol::{
 };
 use thiserror::Error;
 use tokio::sync::{broadcast, Mutex, Notify, RwLock};
+use tokio::time::timeout;
+
+const RECOVERY_PREFIX_ITEM_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Ordered durable facts and best-effort live telemetry emitted by a Run.
 #[derive(Debug, Clone)]
@@ -315,6 +319,28 @@ impl AgentController {
         Ok(self.journal_store.catalog_runs().await?)
     }
 
+    /// Reports whether a durable Run was registered against this controller's
+    /// current immutable Provider contract.
+    ///
+    /// Discovery surfaces use this before enriching a native session with a
+    /// Host-controlled Run. A Provider upgrade may legitimately change its
+    /// descriptor digest; those older journals remain durable history, but
+    /// they cannot be rehydrated or controlled by the new binding.
+    pub async fn can_control_run(&self, run_id: &RunId) -> Result<bool, AgentControlError> {
+        if let Some(slot) = self.runs.read().await.get(run_id).cloned() {
+            let entry = slot.entry.lock().await;
+            return Ok(self.registration_matches_current(&entry.request, &entry.execution));
+        }
+        let Some(stored) = self.journal_store.load_run(run_id).await? else {
+            return Ok(false);
+        };
+        stored.validate_shape()?;
+        Ok(self.registration_matches_current(
+            &stored.registration.request,
+            &stored.registration.execution,
+        ))
+    }
+
     pub async fn has_run(&self, run_id: &RunId) -> Result<bool, AgentControlError> {
         if self.runs.read().await.contains_key(run_id) {
             return Ok(true);
@@ -471,7 +497,23 @@ impl AgentController {
                     record.event.run_seq <= last_confirmed_seq
                         && matches!(record.authority, AgentEventAuthority::Provider)
                 })
-                .map(|record| (record.event.event_id.clone(), record.draft_digest.clone()))
+                .map(|record| {
+                    (
+                        record.event.event_id.clone(),
+                        record.draft_digest.clone(),
+                        // Command dispositions are synchronous control-plane
+                        // responses that the Host already validated against
+                        // and committed with the command envelope. They do
+                        // not belong to the Provider's native observation
+                        // stream after a process restart, so requiring an
+                        // adapter to replay them makes otherwise valid native
+                        // continuity unrecoverable.
+                        !matches!(
+                            record.event.payload,
+                            AgentEvent::CommandDispositionRecorded { .. }
+                        ),
+                    )
+                })
                 .collect::<Vec<_>>();
             (
                 entry.request.clone(),
@@ -487,9 +529,21 @@ impl AgentController {
         let recovered = self.provider.recover(recovery).await?;
         let (mut stream, confirmation) = recovered.into_parts();
         let mut matched_digests = Vec::with_capacity(expected_provider_prefix.len());
-        for (expected_event_id, expected_draft_digest) in &expected_provider_prefix {
+        let mut optional_stream_replays = Vec::new();
+        for (expected_event_id, expected_draft_digest, requires_stream_replay) in
+            &expected_provider_prefix
+        {
+            if !requires_stream_replay {
+                matched_digests.push(expected_draft_digest.clone());
+                optional_stream_replays
+                    .push((expected_event_id.clone(), expected_draft_digest.clone()));
+                continue;
+            }
             loop {
-                match stream.next().await {
+                let recovered_item = timeout(RECOVERY_PREFIX_ITEM_TIMEOUT, stream.next())
+                    .await
+                    .map_err(|_| AgentControlError::RecoveryMismatch(run_id.clone()))?;
+                match recovered_item {
                     Some(Ok(AgentProviderStreamItem::Telemetry(telemetry))) => {
                         telemetry.validate_integrity()?;
                         if telemetry.run_id != *run_id {
@@ -498,13 +552,28 @@ impl AgentController {
                         slot.publish(AgentControlEvent::Telemetry(telemetry));
                     }
                     Some(Ok(AgentProviderStreamItem::Event(draft))) => {
-                        if draft.event_id != *expected_event_id
-                            || draft.computed_digest()? != *expected_draft_digest
+                        let draft_digest = draft.computed_digest()?;
+                        if draft.event_id == *expected_event_id
+                            && draft_digest == *expected_draft_digest
                         {
-                            return Err(AgentControlError::RecoveryMismatch(run_id.clone()));
+                            // Any earlier optional command dispositions that
+                            // were not emitted are already proven by the Host
+                            // command journal. They cannot validly appear
+                            // after this later native observation.
+                            optional_stream_replays.clear();
+                            matched_digests.push(expected_draft_digest.clone());
+                            break;
                         }
-                        matched_digests.push(expected_draft_digest.clone());
-                        break;
+                        if let Some(position) = optional_stream_replays.iter().position(
+                            |(optional_event_id, optional_digest)| {
+                                draft.event_id == *optional_event_id
+                                    && draft_digest == *optional_digest
+                            },
+                        ) {
+                            optional_stream_replays.drain(..=position);
+                            continue;
+                        }
+                        return Err(AgentControlError::RecoveryMismatch(run_id.clone()));
                     }
                     Some(Ok(_)) | Some(Err(_)) | None => {
                         return Err(AgentControlError::RecoveryMismatch(run_id.clone()));
@@ -663,6 +732,17 @@ impl AgentController {
             events,
             changed: Notify::new(),
         }))
+    }
+
+    fn registration_matches_current(
+        &self,
+        request: &AgentStartRequest,
+        execution: &AgentExecutionRef,
+    ) -> bool {
+        request.provider_binding == self.binding_ref
+            && request.expected_descriptor_digest == self.descriptor.descriptor_digest
+            && execution.binding_ref == self.binding_ref
+            && execution.descriptor_digest == self.descriptor.descriptor_digest
     }
 
     async fn drive_stream(

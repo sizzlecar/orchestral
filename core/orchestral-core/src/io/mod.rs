@@ -11,6 +11,9 @@ use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
+use std::path::PathBuf;
+
+use crate::agent_protocol::wire::ArtifactRefWithDigest;
 
 /// Strongly-typed blob id.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -177,4 +180,77 @@ pub trait BlobStore: Send + Sync {
 
     /// Delete a blob by id.
     async fn delete(&self, blob_id: &BlobId) -> Result<bool, BlobIoError>;
+}
+
+/// Short-lived, provider-consumable access to one immutable Artifact.
+///
+/// The protocol keeps [`ArtifactRefWithDigest`] stable and storage-neutral;
+/// adapters resolve it immediately before a native start/command so expiring
+/// object-store URLs never become part of the durable Run identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedArtifact {
+    pub artifact: ArtifactRefWithDigest,
+    pub uri: String,
+    pub file_name: Option<String>,
+    pub media_type: String,
+    pub byte_size: u64,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ArtifactResolveError {
+    #[error("invalid artifact reference: {0}")]
+    Invalid(String),
+    #[error("artifact not found: {0}")]
+    NotFound(String),
+    #[error("artifact integrity mismatch: {0}")]
+    Integrity(String),
+    #[error("artifact resolver unavailable: {0}")]
+    Unavailable(String),
+    #[error("artifact resolver failed: {0}")]
+    Internal(String),
+}
+
+/// Storage-neutral bridge from durable Artifact identity to temporary Agent
+/// access. Concrete R2/S3/filesystem implementations belong in plugins.
+#[async_trait]
+pub trait ArtifactResolver: Send + Sync {
+    async fn resolve(
+        &self,
+        artifact: &ArtifactRefWithDigest,
+    ) -> Result<ResolvedArtifact, ArtifactResolveError>;
+}
+
+/// A Host-local file selected by an Agent for publication to remote users.
+/// `workspace_root` is an authorization boundary, not merely a path hint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactPublishRequest {
+    pub workspace_root: PathBuf,
+    pub source_path: PathBuf,
+    pub file_name: Option<String>,
+    pub media_type: Option<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ArtifactPublishError {
+    #[error("invalid artifact publication request: {0}")]
+    Invalid(String),
+    #[error("artifact source not found: {0}")]
+    NotFound(String),
+    #[error("artifact source is outside the authorized workspace: {0}")]
+    OutsideWorkspace(String),
+    #[error("artifact publication is unavailable: {0}")]
+    Unavailable(String),
+    #[error("artifact publication failed: {0}")]
+    Internal(String),
+}
+
+/// Storage-neutral publication capability that Agent adapters can expose
+/// through their native tool/function mechanism.
+#[async_trait]
+pub trait ArtifactPublisher: Send + Sync {
+    async fn publish(
+        &self,
+        request: ArtifactPublishRequest,
+    ) -> Result<ResolvedArtifact, ArtifactPublishError>;
 }

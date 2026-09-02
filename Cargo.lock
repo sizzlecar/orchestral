@@ -3075,14 +3075,20 @@ name = "orchestral-agent-codex"
 version = "0.2.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
  "futures-util",
  "orchestral-core",
  "orchestral-runtime",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-tungstenite",
+ "toml",
+ "tracing",
 ]
 
 [[package]]
@@ -3109,6 +3115,24 @@ dependencies = [
  "orchestral-core",
  "schemars 1.2.2",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "orchestral-artifact-r2"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "futures-util",
+ "hex",
+ "orchestral-core",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
  "tokio",
 ]
 
@@ -3148,6 +3172,7 @@ dependencies = [
  "orchestral-agent-codex",
  "orchestral-agent-journal-fs",
  "orchestral-agent-protocol-testkit",
+ "orchestral-artifact-r2",
  "orchestral-blob-fs",
  "orchestral-core",
  "orchestral-mcp-streamable-http",
@@ -3168,6 +3193,7 @@ dependencies = [
  "toml",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "unicode-width",
  "uuid",
 ]
@@ -3310,6 +3336,7 @@ dependencies = [
  "futures-util",
  "gloo-net 0.7.0",
  "gloo-timers",
+ "hex",
  "js-sys",
  "pretty_assertions",
  "pulldown-cmark",
@@ -3317,6 +3344,7 @@ dependencies = [
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 1.0.69",
  "wasm-bindgen",
  "wasm-bindgen-futures",

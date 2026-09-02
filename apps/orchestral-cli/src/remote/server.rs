@@ -7,7 +7,9 @@ use std::time::Duration;
 use anyhow::{bail, Context};
 use axum::Router;
 use clap::Args;
+use orchestral_artifact_r2::R2ArtifactStore;
 use orchestral_core::agent_protocol::reference::AgentRunStatus;
+use orchestral_core::io::{ArtifactPublisher, ArtifactResolver, BlobStore};
 use qrcode::render::unicode;
 use qrcode::QrCode;
 
@@ -15,13 +17,17 @@ use crate::agent::{build_agent_host, AgentRunOptions};
 use crate::agent_connectors::build_agent_directory;
 use crate::mcp_config::user_config_root;
 
-use super::api::spawn_remembered_approval_driver;
+use super::api::{spawn_remembered_approval_driver, spawn_run_supervisor};
 use super::{
-    asset_router, router, GatewayAuthenticator, JwtGatewayAuthenticator, JwtGatewayConfig,
-    PairingTicket, RemoteApiState, RemoteRegistry,
+    router, router_with_artifact_origin, GatewayAuthenticator, JwtGatewayAuthenticator,
+    JwtGatewayConfig, PairingTicket, RemoteApiState, RemoteRegistry,
 };
 
 const DEFAULT_PAIRING_TTL_SECS: u64 = 5 * 60;
+const ARTIFACT_ENV_FILE: &str = "ORCHESTRAL_ARTIFACT_R2_ENV";
+const ARTIFACT_INTERNAL_URL: &str = "ORCHESTRAL_ARTIFACT_R2_INTERNAL_URL";
+const ARTIFACT_KEYCHAIN_SERVICE: &str = "ORCHESTRAL_ARTIFACT_R2_KEYCHAIN_SERVICE";
+const ARTIFACT_KEYCHAIN_ACCOUNT: &str = "ORCHESTRAL_ARTIFACT_R2_KEYCHAIN_ACCOUNT";
 
 #[derive(Debug, Clone, Args)]
 pub struct ServeCommand {
@@ -99,18 +105,43 @@ pub(crate) async fn serve(command: ServeCommand, options: AgentRunOptions) -> an
     }
 
     let host = build_agent_host(&options).await?;
-    let agent_directory = build_agent_directory().await?;
+    let artifact_store = configured_artifact_store()
+        .context("configure R2 Artifact store")?
+        .map(Arc::new);
+    let artifact_image_origin = artifact_store.as_ref().map(|store| store.access_origin());
+    let artifact_resolver = artifact_store
+        .as_ref()
+        .map(|store| Arc::clone(store) as Arc<dyn ArtifactResolver>);
+    let artifact_blob_store = artifact_store
+        .as_ref()
+        .map(|store| Arc::clone(store) as Arc<dyn BlobStore>);
+    let artifact_publisher = artifact_store
+        .as_ref()
+        .map(|store| Arc::clone(store) as Arc<dyn ArtifactPublisher>);
+    let agent_directory = build_agent_directory(
+        artifact_resolver.clone(),
+        artifact_blob_store.clone(),
+        artifact_publisher,
+    )
+    .await?;
     let remote_state = RemoteApiState {
         agent: host.api.clone(),
         agent_directory,
         approvals: host.approvals.clone(),
         registry,
         gateway_authenticator: gateway_authenticator.clone(),
+        run_supervisors: Arc::default(),
+        session_coordinators: Arc::default(),
+        artifact_resolver,
+        artifact_blob_store,
     };
     recover_registered_runs(&remote_state).await;
-    let app = Router::new()
-        .nest("/api/v1", router(remote_state))
-        .merge(asset_router());
+    let app =
+        Router::new()
+            .nest("/api/v1", router(remote_state))
+            .merge(router_with_artifact_origin(
+                artifact_image_origin.as_deref(),
+            ));
     let listener = tokio::net::TcpListener::bind(command.listen)
         .await
         .with_context(|| format!("bind Orchestral Host gateway at {}", command.listen))?;
@@ -120,13 +151,18 @@ pub(crate) async fn serve(command: ServeCommand, options: AgentRunOptions) -> an
         .clone()
         .unwrap_or_else(|| format!("http://{local_address}"));
 
-    eprintln!(
-        "Orchestral Host: backend={} model={} listen={local_address}",
-        host.backend_name, host.model
+    tracing::info!(
+        backend = host.backend_name,
+        model = host.model,
+        listen = %local_address,
+        "Orchestral Host listening"
     );
-    eprintln!("Device registry: {}", state_path.display());
+    tracing::info!(path = %state_path.display(), "Device registry opened");
     if gateway_authenticator.is_some() {
-        eprintln!("Remote authentication: signed reverse-proxy JWT");
+        tracing::info!(
+            mode = "signed_reverse_proxy_jwt",
+            "Remote authentication configured"
+        );
     }
     if let Some(ticket) = pairing {
         let pairing_url = format!(
@@ -136,7 +172,7 @@ pub(crate) async fn serve(command: ServeCommand, options: AgentRunOptions) -> an
         );
         print_pairing(&pairing_url, ticket.expires_at_unix_ms)?;
     } else {
-        eprintln!("Open {public_url}");
+        tracing::info!(%public_url, "Orchestral Host ready");
     }
 
     let result = axum::serve(listener, app)
@@ -145,6 +181,30 @@ pub(crate) async fn serve(command: ServeCommand, options: AgentRunOptions) -> an
         .context("serve Orchestral Host gateway");
     host.shutdown().await;
     result
+}
+
+fn configured_artifact_store() -> anyhow::Result<Option<R2ArtifactStore>> {
+    if let Some(path) = std::env::var_os(ARTIFACT_ENV_FILE).filter(|value| !value.is_empty()) {
+        return R2ArtifactStore::from_env_file(PathBuf::from(path).as_path())
+            .map(Some)
+            .map_err(Into::into);
+    }
+
+    let internal_url = std::env::var(ARTIFACT_INTERNAL_URL).ok();
+    let keychain_service = std::env::var(ARTIFACT_KEYCHAIN_SERVICE).ok();
+    let keychain_account = std::env::var(ARTIFACT_KEYCHAIN_ACCOUNT).ok();
+    match (internal_url, keychain_service, keychain_account) {
+        (None, None, None) => Ok(None),
+        (Some(internal_url), Some(service), Some(account)) => {
+            R2ArtifactStore::from_macos_keychain(&internal_url, &service, &account)
+                .map(Some)
+                .map_err(Into::into)
+        }
+        _ => bail!(
+            "{ARTIFACT_INTERNAL_URL}, {ARTIFACT_KEYCHAIN_SERVICE}, and \
+             {ARTIFACT_KEYCHAIN_ACCOUNT} must be configured together"
+        ),
+    }
 }
 
 /// Restores every durable, non-terminal Run owned by the remote registry
@@ -160,7 +220,7 @@ async fn recover_registered_runs(state: &RemoteApiState) {
             .collect::<std::collections::BTreeSet<_>>(),
         Err(error) => {
             tracing::warn!(%error, "could not enumerate durable Runs during Host recovery");
-            return;
+            std::collections::BTreeSet::new()
         }
     };
 
@@ -184,6 +244,65 @@ async fn recover_registered_runs(state: &RemoteApiState) {
         }
 
         spawn_remembered_approval_driver(state.clone(), run_id);
+    }
+
+    // Connector Runs live in independent Agent controllers and journals. They
+    // must be supervised at Host startup too; otherwise Codex continuity is
+    // restored only when a browser refresh happens to request that exact Run.
+    for descriptor in state.agent_directory.connectors().await {
+        let connector_id = descriptor.connector_id;
+        let agent = match state.agent_directory.agent_api(&connector_id).await {
+            Ok(agent) => agent,
+            Err(error) => {
+                tracing::warn!(connector_id = %connector_id.as_str(), %error, "could not open connector Agent controller during Host recovery");
+                continue;
+            }
+        };
+        let mut catalog = match agent.catalog_runs().await {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                tracing::warn!(connector_id = %connector_id.as_str(), %error, "could not enumerate connector Runs during Host recovery");
+                continue;
+            }
+        };
+        catalog.sort_by_key(|entry| {
+            std::cmp::Reverse((entry.updated_at_unix_ms, entry.created_at_unix_ms))
+        });
+        let mut inspected_sessions = std::collections::BTreeSet::new();
+        for entry in catalog {
+            // The newest Run is the sole authority for a connector session.
+            // If it is terminal, an older Unknown Run was superseded and must
+            // never be resurrected as the session controller.
+            if !inspected_sessions.insert(entry.session_id.clone()) {
+                continue;
+            }
+            let view = match agent.inspect(&entry.run_id).await {
+                Ok(view) => view,
+                Err(error) => {
+                    tracing::warn!(
+                        connector_id = %connector_id.as_str(),
+                        run_id = %entry.run_id.as_str(),
+                        %error,
+                        "could not inspect connector Run during Host recovery"
+                    );
+                    continue;
+                }
+            };
+            if view.state.is_terminal() {
+                continue;
+            }
+            tracing::info!(
+                connector_id = %connector_id.as_str(),
+                run_id = %entry.run_id.as_str(),
+                "supervising connector Run during Host recovery"
+            );
+            spawn_run_supervisor(
+                state.clone(),
+                agent.clone(),
+                Some(connector_id.clone()),
+                entry.run_id,
+            );
+        }
     }
 }
 

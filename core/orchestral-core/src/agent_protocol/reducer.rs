@@ -600,6 +600,7 @@ fn reduce_snapshot(
             }
             if snapshot.pending_requests.contains_key(&request.request_id)
                 || snapshot.resolved_requests.contains_key(&request.request_id)
+                || snapshot.closed_requests.contains(&request.request_id)
             {
                 return Err(invalid_transition("request_id was already used"));
             }
@@ -647,6 +648,17 @@ fn reduce_snapshot(
                 .expect("causal command was checked")
                 .clone();
             mark_command_applied(snapshot, &command_id, envelope.run_seq)?;
+        }
+        AgentEvent::RequestClosed { request_id, .. } => {
+            require_phase(
+                snapshot,
+                &[PhaseKind::Running, PhaseKind::Stopping],
+                "RequestClosed",
+            )?;
+            if snapshot.pending_requests.remove(request_id).is_none() {
+                return Err(invalid_transition("request_id is not pending"));
+            }
+            snapshot.closed_requests.insert(request_id.clone());
         }
         AgentEvent::StopRequested { reason } => {
             require_phase(
@@ -1383,6 +1395,42 @@ mod tests {
             .applied_seq
             .is_some());
         assert_eq!(reducer.state().status(), AgentRunStatus::Running);
+    }
+
+    #[test]
+    fn provider_can_close_a_request_resolved_by_a_competing_client() {
+        let (run, mut reducer) = make_reducer(Vec::new());
+        accept_and_start(&run, &mut reducer);
+        let request_id = RequestId::new("request-external-client");
+        apply(
+            &mut reducer,
+            AgentEvent::RequestOpened {
+                request: PendingRequest {
+                    request_id: request_id.clone(),
+                    blocking: true,
+                    payload: PendingRequestPayload::Approval {
+                        operation_digest: Digest::sha256(b"operation"),
+                        requested_scope: vec!["command".to_owned()],
+                        session_approval_scope: None,
+                        reason: "approve command".to_owned(),
+                    },
+                },
+            },
+            None,
+        );
+
+        apply(
+            &mut reducer,
+            AgentEvent::RequestClosed {
+                request_id: request_id.clone(),
+                reason: "another subscribed client resolved the native request".to_owned(),
+            },
+            None,
+        );
+
+        assert_eq!(reducer.state().status(), AgentRunStatus::Running);
+        assert!(reducer.view().pending_requests.is_empty());
+        assert!(reducer.snapshot().closed_requests.contains(&request_id));
     }
 
     #[test]

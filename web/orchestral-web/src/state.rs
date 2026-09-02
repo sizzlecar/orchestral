@@ -2,7 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
-use crate::model::{AgentConnectorView, AgentSessionDetail, DeviceView, SessionView};
+use crate::model::{
+    AgentConnectorView, AgentSessionChangeKindView, AgentSessionChangeView, AgentSessionDetail,
+    DeviceView, SessionView,
+};
 
 const MAX_TELEMETRY_IDS: usize = 800;
 const INITIAL_INPUT_ORDER: u64 = 0;
@@ -39,6 +42,9 @@ pub struct SessionsState {
     pub items: Vec<SessionView>,
     pub selected_id: Option<String>,
     pub connector_pages: BTreeMap<String, AgentSessionListState>,
+    /// Last canonically applied Host event sequence for each external Agent
+    /// session, keyed by `SessionView::key()`.
+    pub stream_cursors: BTreeMap<String, u64>,
     pub error: Option<String>,
 }
 
@@ -66,10 +72,20 @@ pub struct ConnectorsState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
     pub id: String,
+    /// Optional native client correlation id echoed by the Agent runtime.
+    pub client_id: Option<String>,
     pub role: String,
     pub text: String,
     pub order: u64,
+    /// Presentation-only wall-clock anchor. It is not part of Agent Protocol
+    /// ordering and is used only to merge a Host mirror into native history.
+    pub occurred_at_unix_ms: Option<i64>,
+    /// Stable native activity that was at the live edge when this Host input
+    /// was submitted. It is a structural merge anchor, not a timestamp.
+    pub native_anchor_id: Option<String>,
     pub optimistic: bool,
+    /// The owning native Agent has not consumed this externally queued input.
+    pub deferred: bool,
     pub partial: bool,
     pub steering: bool,
 }
@@ -135,6 +151,13 @@ pub struct RunState {
     /// Once pagination starts, live-edge snapshots must not rewind the older
     /// history cursor or unlock a request that is already in flight.
     pub history_pagination_started: bool,
+    /// First visible native activity id for each turn in the current live
+    /// window. This preserves a structural insertion anchor when the bounded
+    /// page contains a response but not its older correlated user item.
+    pub history_live_turn_starts: Vec<String>,
+    /// First visible activity keyed by native turn id. Incremental activity
+    /// upserts extend this map without rebuilding the bounded transcript.
+    pub history_live_turn_ids: BTreeMap<String, String>,
     pub progress: Option<Progress>,
     pub delivery: Option<Value>,
     pub partial_delivery: Option<Value>,
@@ -168,6 +191,8 @@ impl RunState {
             history_next_cursor: None,
             history_loading_earlier: false,
             history_pagination_started: false,
+            history_live_turn_starts: Vec::new(),
+            history_live_turn_ids: BTreeMap::new(),
             progress: None,
             delivery: None,
             partial_delivery: None,
@@ -184,9 +209,16 @@ impl RunState {
     }
 
     pub fn apply_view(&mut self, view: Value, now: f64) {
+        if let Some(created_at) = view
+            .get("created_at_unix_ms")
+            .and_then(Value::as_i64)
+            .filter(|created_at| *created_at > 0)
+        {
+            self.started_at = Some(created_at as f64);
+        }
         let initial_input = contents_text(view.get("input"));
         if !initial_input.is_empty() {
-            self.confirm_initial_input(initial_input);
+            self.confirm_initial_input(initial_input, self.started_at.map(|value| value as i64));
         }
         let view_cursor = view
             .get("last_run_seq")
@@ -240,6 +272,7 @@ impl RunState {
         }
         if is_terminal(&status) {
             self.completed_at.get_or_insert(now);
+            self.settle_unresolved_commands_for_terminal();
         }
         self.error = if status == "unknown" {
             view.get("state")
@@ -256,13 +289,13 @@ impl RunState {
 
     /// Records the initial user input after the Host accepted `start_run`.
     ///
-    /// Unlike a locally queued message this is already confirmed by the HTTP
-    /// response. Initial input is part of the immutable Run spec, so it does
-    /// not produce the steer-only `input_committed` journal event.
-    pub fn record_started_input(&mut self, input: String, now: f64) {
-        self.status = "running".to_owned();
-        self.started_at = Some(now);
-        self.confirm_initial_input(input);
+    /// HTTP acceptance proves only that the immutable Run was registered. A
+    /// connector may still be waiting in its native queue, so `RunStarted`
+    /// remains the sole authority that advances this state to `running`.
+    pub fn record_accepted_input(&mut self, input: String, now: f64) {
+        self.status = "accepted".to_owned();
+        self.started_at.get_or_insert(now);
+        self.confirm_initial_input(input, Some(now as i64));
     }
 
     /// Projects a start request before the network round trip completes.
@@ -270,17 +303,26 @@ impl RunState {
     /// The browser owns this short-lived state. It keeps the user's submitted
     /// text visible while the Host accepts the immutable Run specification,
     /// without pretending that the Run is already steerable or cancellable.
-    pub fn optimistic_start_input(&mut self, input: String, now: f64) {
+    pub fn optimistic_start_input(
+        &mut self,
+        input: String,
+        now: f64,
+        native_anchor_id: Option<String>,
+    ) {
         self.status = "submitting".to_owned();
         self.started_at = Some(now);
         self.messages
             .retain(|message| !(message.role == "user" && !message.steering && message.optimistic));
         self.messages.push(Message {
             id: format!("optimistic-input-{}", self.id),
+            client_id: None,
             role: "user".to_owned(),
             text: input,
             order: INITIAL_INPUT_ORDER,
+            occurred_at_unix_ms: Some(now as i64),
+            native_anchor_id,
             optimistic: true,
+            deferred: false,
             partial: false,
             steering: false,
         });
@@ -295,7 +337,7 @@ impl RunState {
         }
     }
 
-    fn confirm_initial_input(&mut self, input: String) {
+    fn confirm_initial_input(&mut self, input: String, occurred_at_unix_ms: Option<i64>) {
         if let Some(message) = self
             .messages
             .iter_mut()
@@ -304,29 +346,44 @@ impl RunState {
             if message.optimistic || message.text == input {
                 message.text = input;
                 message.order = INITIAL_INPUT_ORDER;
+                message.occurred_at_unix_ms = message.occurred_at_unix_ms.or(occurred_at_unix_ms);
                 message.optimistic = false;
                 return;
             }
         }
         self.messages.push(Message {
             id: format!("initial-input-{}", self.id),
+            client_id: None,
             role: "user".to_owned(),
             text: input,
             order: INITIAL_INPUT_ORDER,
+            occurred_at_unix_ms,
+            native_anchor_id: None,
             optimistic: false,
+            deferred: false,
             partial: false,
             steering: false,
         });
     }
 
-    pub fn optimistic_steer(&mut self, id: String, text: String) {
+    pub fn optimistic_steer(
+        &mut self,
+        id: String,
+        text: String,
+        now: f64,
+        native_anchor_id: Option<String>,
+    ) {
         let order = self.next_order();
         self.messages.push(Message {
             id,
+            client_id: None,
             role: "user".to_owned(),
             text,
             order,
+            occurred_at_unix_ms: Some(now as i64),
+            native_anchor_id,
             optimistic: false,
+            deferred: false,
             partial: false,
             steering: true,
         });
@@ -380,33 +437,50 @@ impl RunState {
             }
             "input_committed" => {
                 let text = contents_text(payload.get("content"));
-                let prior_order = self
-                    .messages
-                    .iter()
-                    .find(|message| message.role == "user" && message.optimistic)
-                    .map(|message| message.order);
+                // `start_run` acceptance confirms the optimistic input before
+                // this durable event is fetched. Match the stable initial
+                // projection as well as the still-optimistic form so the
+                // authoritative event replaces it instead of creating a
+                // second, unanchored user message.
+                let prior_index = self.messages.iter().position(|message| {
+                    message.role == "user"
+                        && !message.steering
+                        && (message.optimistic
+                            || message.id == format!("optimistic-input-{}", self.id)
+                            || message.id == format!("initial-input-{}", self.id)
+                            || message.text == text)
+                });
+                let prior_order = prior_index.map(|index| self.messages[index].order);
+                let prior_native_anchor =
+                    prior_index.and_then(|index| self.messages[index].native_anchor_id.clone());
+                let prior_occurred_at =
+                    prior_index.and_then(|index| self.messages[index].occurred_at_unix_ms);
                 let order = prior_order.unwrap_or_else(|| self.next_order());
-                if let Some(index) = self
-                    .messages
-                    .iter()
-                    .position(|message| message.role == "user" && message.optimistic)
-                {
+                if let Some(index) = prior_index {
                     self.messages[index] = Message {
                         id: event_id.to_owned(),
+                        client_id: None,
                         role: "user".to_owned(),
                         text,
                         order,
+                        occurred_at_unix_ms: prior_occurred_at.or(Some(now as i64)),
+                        native_anchor_id: prior_native_anchor,
                         optimistic: false,
+                        deferred: false,
                         partial: false,
                         steering: false,
                     };
                 } else if !text.is_empty() {
                     self.messages.push(Message {
                         id: event_id.to_owned(),
+                        client_id: None,
                         role: "user".to_owned(),
                         text,
                         order,
+                        occurred_at_unix_ms: Some(now as i64),
+                        native_anchor_id: None,
                         optimistic: false,
+                        deferred: false,
                         partial: false,
                         steering: false,
                     });
@@ -429,10 +503,14 @@ impl RunState {
                         .unwrap_or_else(|| self.next_order());
                     self.messages.push(Message {
                         id: event_id.to_owned(),
+                        client_id: None,
                         role: "assistant".to_owned(),
                         text,
                         order,
+                        occurred_at_unix_ms: Some(now as i64),
+                        native_anchor_id: None,
                         optimistic: false,
+                        deferred: false,
                         partial: false,
                         steering: false,
                     });
@@ -452,7 +530,7 @@ impl RunState {
                     }
                 }
             }
-            "request_resolved" => {
+            "request_resolved" | "request_closed" => {
                 let request_id = payload.get("request_id").and_then(Value::as_str);
                 self.pending
                     .retain(|item| item.get("request_id").and_then(Value::as_str) != request_id);
@@ -460,7 +538,7 @@ impl RunState {
                     self.status = "running".to_owned();
                 }
             }
-            "command_received" => self.project_command_received(payload, sequence),
+            "command_received" => self.project_command_received(payload, sequence, now),
             "command_disposition_recorded" => self.project_command_disposition(payload, sequence),
             "stop_requested" => self.status = "stopping".to_owned(),
             "delivery_committed" => {
@@ -468,6 +546,7 @@ impl RunState {
                 self.delivery = payload.get("delivery").cloned();
                 self.completed_at.get_or_insert(now);
                 self.pending.clear();
+                self.settle_unresolved_commands_for_terminal();
                 self.append_terminal_message(
                     self.delivery.clone(),
                     "delivery_id",
@@ -481,6 +560,7 @@ impl RunState {
                 self.partial_delivery = payload.get("partial_delivery").cloned();
                 self.completed_at.get_or_insert(now);
                 self.pending.clear();
+                self.settle_unresolved_commands_for_terminal();
                 self.append_terminal_message(
                     self.partial_delivery.clone(),
                     "partial_delivery_id",
@@ -494,6 +574,7 @@ impl RunState {
                 self.failure = payload.get("failure").cloned();
                 self.completed_at.get_or_insert(now);
                 self.pending.clear();
+                self.settle_unresolved_commands_for_terminal();
             }
             "run_cancelled" => {
                 self.status = "cancelled".to_owned();
@@ -503,6 +584,7 @@ impl RunState {
                 }));
                 self.completed_at.get_or_insert(now);
                 self.pending.clear();
+                self.settle_unresolved_commands_for_terminal();
             }
             "continuity_lost" => {
                 self.status = "unknown".to_owned();
@@ -524,13 +606,37 @@ impl RunState {
         }
     }
 
-    fn project_command_received(&mut self, payload: &Value, _sequence: u64) {
+    fn project_command_received(&mut self, payload: &Value, _sequence: u64, _now: f64) {
         let Some(command) = payload.get("command") else {
             return;
         };
         let Some(id) = command.get("command_id").and_then(Value::as_str) else {
             return;
         };
+        let command_payload = command.get("payload").unwrap_or(&Value::Null);
+        if command_payload.get("type").and_then(Value::as_str) == Some("steer") {
+            let text = contents_text(command_payload.get("content"));
+            let message_id = format!("steer-{id}");
+            if !text.is_empty() && !self.messages.iter().any(|message| message.id == message_id) {
+                let message_order = self.next_order();
+                self.messages.push(Message {
+                    id: message_id,
+                    client_id: None,
+                    role: "user".to_owned(),
+                    text,
+                    order: message_order,
+                    // Durable command order comes from `run_seq`. Using each
+                    // browser's receipt clock here made the same steer land at
+                    // different native-history positions on different devices.
+                    occurred_at_unix_ms: None,
+                    native_anchor_id: None,
+                    optimistic: false,
+                    deferred: false,
+                    partial: false,
+                    steering: true,
+                });
+            }
+        }
         let previous_order = self
             .commands
             .iter()
@@ -538,7 +644,6 @@ impl RunState {
             .map(|item| item.order);
         let order = previous_order.unwrap_or_else(|| self.next_order());
         self.commands.retain(|item| item.id != id);
-        let command_payload = command.get("payload").unwrap_or(&Value::Null);
         self.commands.push(CommandActivity {
             id: id.to_owned(),
             kind: command_payload
@@ -589,6 +694,19 @@ impl RunState {
         self.commands.push(item);
     }
 
+    fn settle_unresolved_commands_for_terminal(&mut self) {
+        for command in &mut self.commands {
+            if command.state == "received" {
+                command.state = "rejected".to_owned();
+                command.outcome = Some(serde_json::json!({
+                    "outcome": "rejected",
+                    "code": "run_ended_before_command_disposition",
+                    "message": "The Run ended before the Agent accepted this command; it was not applied."
+                }));
+            }
+        }
+    }
+
     fn append_terminal_message(
         &mut self,
         envelope: Option<Value>,
@@ -633,10 +751,14 @@ impl RunState {
         let order = self.next_order();
         self.messages.push(Message {
             id: message_id,
+            client_id: None,
             role: "assistant".to_owned(),
             text,
             order,
+            occurred_at_unix_ms: None,
+            native_anchor_id: None,
             optimistic: false,
+            deferred: false,
             partial,
             steering: false,
         });
@@ -753,10 +875,19 @@ pub struct ConnectionState {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct UiState {
     pub drawer_open: bool,
+    /// Active session source tab (`orchestral` or an Agent connector id).
+    pub session_tab: Option<String>,
+    /// Zero-based page within the active session source tab.
+    pub session_page: usize,
     pub settings_open: bool,
     pub new_session_open: bool,
     pub session_actions_open: bool,
     pub composer_busy: bool,
+    /// Session whose transcript is currently being loaded. This is keyed so
+    /// an older request cannot clear the loading state of a newer selection.
+    pub loading_session: Option<String>,
+    /// Pending request actions in flight, keyed as `run_id:request_id`.
+    pub resolving_requests: BTreeSet<String>,
     pub installing: bool,
     pub install_available: bool,
     pub notice: Option<Notice>,
@@ -773,6 +904,24 @@ impl UiState {
             true
         } else {
             false
+        }
+    }
+
+    pub fn request_action_key(run_id: &str, request_id: &str) -> String {
+        format!("{run_id}:{request_id}")
+    }
+
+    pub fn request_is_resolving(&self, run_id: &str, request_id: &str) -> bool {
+        self.resolving_requests
+            .contains(&Self::request_action_key(run_id, request_id))
+    }
+
+    pub fn set_request_resolving(&mut self, run_id: &str, request_id: &str, resolving: bool) {
+        let key = Self::request_action_key(run_id, request_id);
+        if resolving {
+            self.resolving_requests.insert(key);
+        } else {
+            self.resolving_requests.remove(&key);
         }
     }
 }
@@ -854,6 +1003,20 @@ impl AppState {
             .find(|session| session.key() == selected)
     }
 
+    /// Activates a session that the Host has just created. A new Agent
+    /// session has no persisted transcript yet, so presenting it must not
+    /// inherit an older selection's loading state or imply that history is
+    /// still being fetched.
+    pub fn activate_created_agent_session(&mut self, connector_id: String, session_key: String) {
+        self.sessions.selected_id = Some(session_key);
+        self.ui.new_session_open = false;
+        self.ui.drawer_open = false;
+        self.ui.session_actions_open = false;
+        self.ui.loading_session = None;
+        self.ui.session_tab = Some(connector_id);
+        self.ui.session_page = 0;
+    }
+
     pub fn selected_connector(&self) -> Option<&AgentConnectorView> {
         let connector_id = self.selected_session()?.connector_id.as_deref()?;
         self.connectors
@@ -862,10 +1025,45 @@ impl AppState {
             .find(|connector| connector.connector_id == connector_id)
     }
 
-    pub fn project_agent_session(&mut self, detail: AgentSessionDetail) {
+    /// Stable identity of the last rendered timeline block for the selected
+    /// session. Live observers use this to distinguish an appended message
+    /// from an in-place activity/status refresh. Only the former should move
+    /// a viewport that is following the live edge.
+    pub fn selected_timeline_tail_key(&self) -> Option<String> {
+        let session = self.selected_session()?;
+        timeline_blocks_for_session(self, session)
+            .last()
+            .map(SessionTimelineBlock::key)
+    }
+
+    /// Last provider-owned activity visible when a Host input is submitted.
+    /// Capturing this stable identity prevents a fresh controlled Run from
+    /// being guessed into the beginning of the previous native turn.
+    pub fn selected_native_tail_id(&self) -> Option<String> {
+        let history_id = self.selected_session()?.history_run_id()?;
+        timeline_for_run(self.runs.get(&history_id)?)
+            .iter()
+            .rev()
+            .find_map(timeline_item_native_id)
+            .map(str::to_owned)
+    }
+
+    pub fn project_agent_session(&mut self, detail: AgentSessionDetail) -> bool {
         let connector_id = detail.summary.connector_id.clone();
         let session_id = detail.summary.session_id.clone();
+        if let Some(cursor) = detail.stream_cursor {
+            self.sessions
+                .stream_cursors
+                .insert(format!("{connector_id}\0{session_id}"), cursor);
+        }
+        let timeline_before = self.agent_session_timeline_snapshot(&connector_id, &session_id);
         let run_id = format!("agent-history:{connector_id}:{session_id}");
+        let projection_time = detail.summary.updated_at_unix_ms.unwrap_or_default() as f64;
+        let controlled_runs = detail.controlled_runs.clone();
+        let controlled_run_ids = controlled_runs
+            .iter()
+            .filter_map(controlled_run_id)
+            .collect::<Vec<_>>();
 
         if let Some(session) = self.sessions.items.iter_mut().find(|session| {
             session.id == session_id
@@ -884,13 +1082,18 @@ impl AppState {
             if !session.run_ids.contains(&run_id) {
                 session.run_ids.insert(0, run_id.clone());
             }
+            for controlled_run_id in &controlled_run_ids {
+                if !session.run_ids.contains(controlled_run_id) {
+                    session.run_ids.push(controlled_run_id.clone());
+                }
+            }
         } else {
-            self.sessions
-                .items
-                .push(detail.summary.clone().into_session());
+            let mut session = detail.summary.clone().into_session();
+            session.run_ids.extend(controlled_run_ids.iter().cloned());
+            self.sessions.items.push(session);
         }
 
-        let run = self.ensure_run_source(&run_id, Some(session_id), Some(connector_id));
+        let run = self.ensure_run_source(&run_id, Some(session_id), Some(connector_id.clone()));
         run.status = "delivered".to_owned();
         run.commands.clear();
         run.streamed_outputs.clear();
@@ -899,6 +1102,124 @@ impl AppState {
         if !run.history_pagination_started {
             run.history_next_cursor = detail.next_cursor;
         }
+        self.reconcile_request_actions(&run_id);
+        for view in controlled_runs {
+            let Some(controlled_run_id) = controlled_run_id(&view) else {
+                continue;
+            };
+            self.ensure_run_source(
+                &controlled_run_id,
+                Some(detail.summary.session_id.clone()),
+                Some(detail.summary.connector_id.clone()),
+            )
+            .apply_view(view, projection_time);
+            self.reconcile_request_actions(&controlled_run_id);
+        }
+        timeline_before
+            != self.agent_session_timeline_snapshot(&connector_id, &detail.summary.session_id)
+    }
+
+    /// Applies one provider-neutral live mutation without rebuilding the
+    /// bounded session page. Stable activity ids make retries idempotent and
+    /// preserve an existing item's presentation order.
+    pub fn apply_agent_session_change(&mut self, change: AgentSessionChangeView) -> bool {
+        let connector_id = change.connector_id;
+        let session_id = change.session_id;
+        let sequence = change.sequence;
+        let timeline_before = self.agent_session_timeline_snapshot(&connector_id, &session_id);
+        let run_id = format!("agent-history:{connector_id}:{session_id}");
+
+        match change.change {
+            AgentSessionChangeKindView::RefreshRequired { .. } => return false,
+            AgentSessionChangeKindView::TurnStatus { status, .. } => {
+                if let Some(session) = self.sessions.items.iter_mut().find(|session| {
+                    session.id == session_id
+                        && session.connector_id.as_deref() == Some(connector_id.as_str())
+                }) {
+                    session.state = Some(session_state_for_turn_status(&status).to_owned());
+                }
+            }
+            AgentSessionChangeKindView::ActivityUpsert {
+                turn_id,
+                turn_status,
+                activity,
+            } => {
+                if let Some(session) = self.sessions.items.iter_mut().find(|session| {
+                    session.id == session_id
+                        && session.connector_id.as_deref() == Some(connector_id.as_str())
+                }) {
+                    session.state = Some(session_state_for_turn_status(&turn_status).to_owned());
+                    if !session.run_ids.contains(&run_id) {
+                        session.run_ids.insert(0, run_id.clone());
+                    }
+                }
+
+                let run = self.ensure_run_source(
+                    &run_id,
+                    Some(session_id.clone()),
+                    Some(connector_id.clone()),
+                );
+                run.status = "delivered".to_owned();
+                let activity_id = activity.activity_id.clone();
+                if !run.history_live_turn_ids.contains_key(&turn_id) {
+                    run.history_live_turn_starts.push(activity_id.clone());
+                    run.history_live_turn_ids
+                        .insert(turn_id, activity_id.clone());
+                }
+                let existing_order = run
+                    .messages
+                    .iter()
+                    .find(|message| message.id == activity_id)
+                    .map(|message| message.order)
+                    .or_else(|| {
+                        run.activities
+                            .iter()
+                            .find(|item| item.id == activity_id)
+                            .map(|item| item.order)
+                    });
+                run.messages.retain(|message| message.id != activity_id);
+                run.activities.retain(|item| item.id != activity_id);
+                if let Some(mut item) = agent_history_item(activity) {
+                    let order = existing_order.unwrap_or_else(|| run.next_order());
+                    item.set_order(order);
+                    match item {
+                        AgentHistoryItem::Message(message) => run.messages.push(message),
+                        AgentHistoryItem::Activity(activity) => run.activities.push(activity),
+                    }
+                }
+            }
+        }
+
+        self.sessions
+            .stream_cursors
+            .insert(format!("{connector_id}\0{session_id}"), sequence);
+
+        timeline_before != self.agent_session_timeline_snapshot(&connector_id, &session_id)
+    }
+
+    fn agent_session_timeline_snapshot(
+        &self,
+        connector_id: &str,
+        session_id: &str,
+    ) -> Vec<AgentSessionTimelineSnapshot> {
+        let Some(session) = self.sessions.items.iter().find(|session| {
+            session.id == session_id && session.connector_id.as_deref() == Some(connector_id)
+        }) else {
+            return Vec::new();
+        };
+        timeline_run_ids_for_session(self, session)
+            .into_iter()
+            .filter_map(|run_id| {
+                let run = self.runs.get(&run_id)?;
+                Some(AgentSessionTimelineSnapshot {
+                    run_id,
+                    status: run.status.clone(),
+                    blocks: timeline_blocks_for_run(run),
+                    failure: run.failure.clone(),
+                    error: run.error.clone(),
+                })
+            })
+            .collect()
     }
 
     /// Prepends one older Agent transcript page without replacing the latest
@@ -941,8 +1262,23 @@ impl AppState {
         })
     }
 
+    /// A non-terminal Run whose durable SSE stream must remain attached.
+    /// `unknown` means Provider continuity is being reconciled; it is not a
+    /// browser transport state and must still receive ContinuityRestored.
+    pub fn observable_run(&self) -> Option<&RunState> {
+        self.current_run().filter(|run| {
+            matches!(
+                run.status.as_str(),
+                "accepted" | "running" | "waiting" | "stopping" | "unknown"
+            )
+        })
+    }
+
     pub fn pending_run(&self) -> Option<&RunState> {
-        if let Some(active) = self.active_run().filter(|run| !run.pending.is_empty()) {
+        if let Some(active) = self
+            .active_run()
+            .filter(|run| run.status != "unknown" && !run.pending.is_empty())
+        {
             return Some(active);
         }
         let session = self.selected_session()?;
@@ -958,6 +1294,41 @@ impl AppState {
 
     pub fn recoverable_run(&self) -> Option<&RunState> {
         self.current_run().filter(|run| run.status == "unknown")
+    }
+
+    /// Drops request-action locks that are no longer backed by a pending
+    /// request in the latest durable event or bounded Run snapshot.
+    pub fn reconcile_request_actions(&mut self, run_id: &str) {
+        let prefix = format!("{run_id}:");
+        let pending = self
+            .runs
+            .get(run_id)
+            .map(|run| {
+                run.pending
+                    .iter()
+                    .filter_map(|request| request.get("request_id").and_then(Value::as_str))
+                    .map(|request_id| UiState::request_action_key(run_id, request_id))
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        self.ui
+            .resolving_requests
+            .retain(|key| !key.starts_with(&prefix) || pending.contains(key));
+    }
+
+    pub fn remove_pending_request(&mut self, run_id: &str, request_id: &str) -> bool {
+        let removed = self.runs.get_mut(run_id).is_some_and(|run| {
+            let before = run.pending.len();
+            run.pending.retain(|request| {
+                request.get("request_id").and_then(Value::as_str) != Some(request_id)
+            });
+            if run.status == "waiting" && !has_blocking_request(&run.pending) {
+                run.status = "running".to_owned();
+            }
+            run.pending.len() != before
+        });
+        self.ui.set_request_resolving(run_id, request_id, false);
+        removed
     }
 }
 
@@ -984,6 +1355,19 @@ impl AgentHistoryItem {
 }
 
 fn project_latest_agent_history(run: &mut RunState, turns: Vec<crate::model::AgentSessionTurn>) {
+    run.history_live_turn_ids = turns
+        .iter()
+        .filter_map(|turn| {
+            turn.activities
+                .first()
+                .map(|activity| (turn.turn_id.clone(), activity.activity_id.clone()))
+        })
+        .collect();
+    run.history_live_turn_starts = turns
+        .iter()
+        .filter_map(|turn| turn.activities.first())
+        .map(|activity| activity.activity_id.clone())
+        .collect();
     let mut incoming_ids = BTreeSet::new();
     let mut incoming = turns
         .into_iter()
@@ -992,10 +1376,39 @@ fn project_latest_agent_history(run: &mut RunState, turns: Vec<crate::model::Age
         .filter(|item| incoming_ids.insert(item.id().to_owned()))
         .collect::<Vec<_>>();
 
-    // External transcripts are append-only. An item that falls out of the
-    // bounded latest window has become history; it was not deleted. Refresh
-    // only ids present in the new snapshot so the sliding window cannot lose
-    // an activity after pagination has already reached the beginning.
+    if !run.history_pagination_started {
+        // Before the user asks for older pages, the server snapshot is the
+        // complete bounded live window. Rebuild it deterministically instead
+        // of retaining items that slid out and assigning every overlapping id
+        // a larger order on each refresh. The latter made an unchanged Codex
+        // session mutate forever and caused the mobile viewport to jump.
+        run.messages.clear();
+        run.activities.clear();
+        run.presentation_cursor = 0;
+        for item in &mut incoming {
+            item.set_order(run.next_order());
+        }
+        for item in incoming {
+            match item {
+                AgentHistoryItem::Message(message) => run.messages.push(message),
+                AgentHistoryItem::Activity(activity) => run.activities.push(activity),
+            }
+        }
+        return;
+    }
+
+    // Once pagination starts, older cached pages stay present. Refresh the
+    // overlapping live edge in place and append only genuinely new ids.
+    let existing_orders = run
+        .messages
+        .iter()
+        .map(|message| (message.id.clone(), message.order))
+        .chain(
+            run.activities
+                .iter()
+                .map(|activity| (activity.id.clone(), activity.order)),
+        )
+        .collect::<BTreeMap<_, _>>();
     let replaced_ids = incoming_ids.clone();
     run.messages
         .retain(|message| !replaced_ids.contains(&message.id));
@@ -1010,13 +1423,24 @@ fn project_latest_agent_history(run: &mut RunState, turns: Vec<crate::model::Age
         .unwrap_or_default();
 
     for item in &mut incoming {
-        item.set_order(run.next_order());
+        if let Some(order) = existing_orders.get(item.id()) {
+            item.set_order(*order);
+        } else {
+            item.set_order(run.next_order());
+        }
     }
     for item in incoming {
         match item {
             AgentHistoryItem::Message(message) => run.messages.push(message),
             AgentHistoryItem::Activity(activity) => run.activities.push(activity),
         }
+    }
+}
+
+fn session_state_for_turn_status(status: &str) -> &'static str {
+    match status {
+        "pending" | "active" => "active",
+        _ => "idle",
     }
 }
 
@@ -1064,10 +1488,17 @@ fn append_agent_history(
 
 fn agent_history_item(activity: crate::model::AgentSessionActivity) -> Option<AgentHistoryItem> {
     let text = contents_text(Some(&Value::Array(activity.content.clone())));
+    let occurred_at_unix_ms =
+        native_activity_timestamp_ms(&activity.activity_id).map(|value| value as i64);
     match activity.kind.as_str() {
         "user_message" | "agent_message" if !text.is_empty() => {
             Some(AgentHistoryItem::Message(Message {
                 id: activity.activity_id,
+                client_id: activity
+                    .details
+                    .get("clientId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 role: if activity.kind == "user_message" {
                     "user".to_owned()
                 } else {
@@ -1075,7 +1506,11 @@ fn agent_history_item(activity: crate::model::AgentSessionActivity) -> Option<Ag
                 },
                 text,
                 order: 0,
+                occurred_at_unix_ms,
+                native_anchor_id: None,
                 optimistic: false,
+                deferred: activity.status == "pending"
+                    && activity.details.get("phase").and_then(Value::as_str) == Some("deferred"),
                 partial: false,
                 steering: false,
             }))
@@ -1136,6 +1571,44 @@ pub enum TimelineBlock {
     ActivityGroup(Vec<TimelineItem>),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionTimelineBlock {
+    pub run_id: String,
+    pub block: TimelineBlock,
+}
+
+impl SessionTimelineBlock {
+    pub fn key(&self) -> String {
+        let (kind, item) = match &self.block {
+            TimelineBlock::Entry(item) => ("entry", item),
+            TimelineBlock::ActivityGroup(items) => (
+                "operations",
+                items.first().expect("activity group is never empty"),
+            ),
+        };
+        format!("{}:{kind}:{}", self.run_id, timeline_item_id(item))
+    }
+}
+
+fn timeline_item_id(item: &TimelineItem) -> String {
+    match item {
+        TimelineItem::Message(message) => message.id.clone(),
+        TimelineItem::Stream(output) => output.output_id.clone(),
+        TimelineItem::Activity(activity) => activity.id.clone(),
+        TimelineItem::Command(command) => command.id.clone(),
+        TimelineItem::Progress(progress) => format!("progress-{}", progress.order),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct AgentSessionTimelineSnapshot {
+    run_id: String,
+    status: String,
+    blocks: Vec<TimelineBlock>,
+    failure: Option<Value>,
+    error: Option<String>,
+}
+
 impl TimelineItem {
     pub fn order(&self) -> u64 {
         match self {
@@ -1164,33 +1637,488 @@ pub fn timeline_for_run(run: &RunState) -> Vec<TimelineItem> {
     items
 }
 
+/// Returns the session runs that still contribute unique timeline content.
+///
+/// A controlled external-Agent run is an optimistic Host-side mirror of a
+/// native turn. Once the native transcript echoes the Orchestral client id,
+/// that transcript becomes authoritative and the mirror must disappear.
+/// Correlation is identity-based so two legitimate messages with identical
+/// text remain visible.
+pub fn timeline_run_ids_for_session(state: &AppState, session: &SessionView) -> Vec<String> {
+    let represented_runs = session
+        .history_run_id()
+        .and_then(|history_id| state.runs.get(&history_id))
+        .into_iter()
+        .flat_map(|run| run.messages.iter())
+        .filter_map(|message| message.client_id.as_deref())
+        .filter_map(orchestral_run_id_from_client_id)
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+
+    session
+        .run_ids
+        .iter()
+        .filter(|run_id| {
+            run_id.starts_with("agent-history:") || !represented_runs.contains(run_id.as_str())
+        })
+        .cloned()
+        .collect()
+}
+
+/// Merges the bounded native transcript with any Host-controlled mirror.
+///
+/// Codex pages by activity and response size. A latest page can therefore
+/// contain an assistant response while the correlated user activity is only
+/// present on an older page. Each Host user input is a stable in-memory anchor
+/// for placing its still-needed mirror before later native activities instead
+/// of appending it to the end of the conversation.
+pub fn timeline_blocks_for_session(
+    state: &AppState,
+    session: &SessionView,
+) -> Vec<SessionTimelineBlock> {
+    let run_ids = timeline_run_ids_for_session(state, session);
+    let history_id = session.history_run_id();
+    let Some(history_id) = history_id.filter(|history_id| state.runs.contains_key(history_id))
+    else {
+        return fold_session_timeline(
+            run_ids
+                .into_iter()
+                .filter_map(|run_id| {
+                    state
+                        .runs
+                        .get(&run_id)
+                        .map(|run| (run_id, timeline_for_run(run)))
+                })
+                .flat_map(|(run_id, items)| {
+                    items.into_iter().map(move |item| (run_id.clone(), item))
+                }),
+        );
+    };
+    let Some(history) = state.runs.get(&history_id) else {
+        return Vec::new();
+    };
+
+    let history_items = timeline_for_run(history);
+    let history_times = effective_native_timestamps(&history_items);
+    let represented_command_ids = history
+        .messages
+        .iter()
+        .filter_map(|message| message.client_id.as_deref())
+        .filter_map(orchestral_command_identity)
+        .fold(
+            BTreeMap::<String, BTreeSet<String>>::new(),
+            |mut commands, (run_id, command_id)| {
+                commands
+                    .entry(run_id.to_owned())
+                    .or_default()
+                    .insert(command_id.to_owned());
+                commands
+            },
+        );
+    let latest_turn_start = history
+        .history_live_turn_starts
+        .last()
+        .and_then(|activity_id| {
+            history_items
+                .iter()
+                .position(|item| timeline_item_native_id(item) == Some(activity_id.as_str()))
+        });
+    let mut insertions = BTreeMap::<usize, Vec<(String, Vec<TimelineItem>)>>::new();
+
+    let fully_visible_runs = run_ids.into_iter().collect::<BTreeSet<_>>();
+    let mut controlled = session
+        .run_ids
+        .iter()
+        .filter(|run_id| *run_id != &history_id)
+        .cloned()
+        .enumerate()
+        .filter_map(|(run_index, run_id)| {
+            let run = state.runs.get(&run_id)?;
+            let segments = if fully_visible_runs.contains(&run_id) {
+                controlled_timeline_segments(run, represented_command_ids.get(&run_id))
+            } else {
+                unrepresented_controlled_input_segments(run, represented_command_ids.get(&run_id))
+            };
+            Some(segments.into_iter().enumerate().map(
+                move |(segment_index, (started_at, native_anchor_id, steering, items))| {
+                    (
+                        started_at,
+                        run_index,
+                        segment_index,
+                        run_id.clone(),
+                        native_anchor_id,
+                        steering,
+                        items,
+                    )
+                },
+            ))
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    controlled.sort_by(|left, right| {
+        left.0
+            .partial_cmp(&right.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+
+    for (started_at, _, _segment_index, run_id, native_anchor_id, steering, mut items) in controlled
+    {
+        let time_insertion = || {
+            started_at
+                .map(|started_at| (started_at / 1_000.0).floor() * 1_000.0)
+                .and_then(|started_at| {
+                    history_times.iter().position(|timestamp| {
+                        timestamp.is_some_and(|timestamp| timestamp >= started_at)
+                    })
+                })
+        };
+        let response_turn_start = (!steering)
+            .then(|| {
+                controlled_response_turn_start(
+                    &history_items,
+                    &history.history_live_turn_starts,
+                    &items,
+                )
+            })
+            .flatten();
+        let explicit_insertion = native_anchor_id
+            .as_deref()
+            .and_then(|activity_id| {
+                history_items
+                    .iter()
+                    .position(|item| timeline_item_native_id(item) == Some(activity_id))
+            })
+            .map(|index| index.saturating_add(1));
+        let insertion = if !steering {
+            // A terminal Host mirror contains the same assistant response as
+            // its native turn. That response is a stronger structural anchor
+            // than filesystem timestamps, which Codex can rewrite while a
+            // rollout is active. Insert before the matching turn even when a
+            // newer native turn is already visible.
+            response_turn_start
+                .or(explicit_insertion)
+                .or_else(time_insertion)
+                .unwrap_or_else(|| latest_turn_start.unwrap_or(history_items.len()))
+        } else {
+            // Each steer captures the native edge visible at submission.
+            // Time remains only a legacy fallback for pre-anchor state.
+            explicit_insertion
+                .or_else(time_insertion)
+                .unwrap_or(history_items.len())
+        };
+        if response_turn_start.is_some() {
+            // The native transcript owns the response body. The controlled
+            // mirror remains only to supply the missing user/command events;
+            // rendering its terminal response again would duplicate it.
+            items.retain(|item| {
+                !matches!(item, TimelineItem::Message(message)
+                    if message.role == "assistant"
+                        && history_items.iter().any(|native| matches!(native,
+                            TimelineItem::Message(native_message)
+                                if native_message.role == "assistant"
+                                    && native_message.text == message.text)))
+            });
+        }
+        insertions
+            .entry(insertion)
+            .or_default()
+            .push((run_id, items));
+    }
+
+    let mut merged = Vec::new();
+    for (index, item) in history_items.into_iter().enumerate() {
+        append_session_insertions(&mut merged, insertions.remove(&index));
+        merged.push((history_id.clone(), item));
+    }
+    append_session_insertions(&mut merged, insertions.remove(&history_times.len()));
+    fold_session_timeline(merged)
+}
+
+fn controlled_response_turn_start(
+    history_items: &[TimelineItem],
+    turn_start_ids: &[String],
+    controlled_items: &[TimelineItem],
+) -> Option<usize> {
+    let controlled_responses = controlled_items
+        .iter()
+        .filter_map(|item| match item {
+            TimelineItem::Message(message)
+                if message.role == "assistant" && !message.text.is_empty() =>
+            {
+                Some(message.text.as_str())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    if controlled_responses.is_empty() {
+        return None;
+    }
+    let response_index =
+        history_items
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, item)| match item {
+                TimelineItem::Message(message)
+                    if message.role == "assistant"
+                        && controlled_responses.contains(message.text.as_str()) =>
+                {
+                    Some(index)
+                }
+                _ => None,
+            })?;
+    turn_start_ids
+        .iter()
+        .filter_map(|activity_id| {
+            history_items
+                .iter()
+                .position(|item| timeline_item_native_id(item) == Some(activity_id.as_str()))
+        })
+        .take_while(|index| *index <= response_index)
+        .last()
+        .or(Some(response_index))
+}
+
+type ControlledTimelineSegment = (Option<f64>, Option<String>, bool, Vec<TimelineItem>);
+
+fn controlled_timeline_segments(
+    run: &RunState,
+    represented_command_ids: Option<&BTreeSet<String>>,
+) -> Vec<ControlledTimelineSegment> {
+    let mut segments = Vec::new();
+    let mut anchor = run.started_at;
+    let mut native_anchor_id = None;
+    let mut steering = false;
+    let mut items = Vec::new();
+
+    for item in timeline_for_run(run).into_iter().filter(|item| match item {
+        TimelineItem::Message(message) if message.steering => message
+            .id
+            .strip_prefix("steer-")
+            .is_none_or(|id| !represented_command_ids.is_some_and(|ids| ids.contains(id))),
+        TimelineItem::Command(command) => {
+            !represented_command_ids.is_some_and(|ids| ids.contains(&command.id))
+        }
+        _ => true,
+    }) {
+        if let TimelineItem::Message(message) = &item {
+            if message.role == "user" {
+                if !items.is_empty() {
+                    segments.push((
+                        anchor,
+                        native_anchor_id.take(),
+                        steering,
+                        std::mem::take(&mut items),
+                    ));
+                }
+                anchor = message
+                    .occurred_at_unix_ms
+                    .map(|value| value as f64)
+                    .or_else(|| (!message.steering).then_some(run.started_at).flatten());
+                native_anchor_id = message.native_anchor_id.clone();
+                steering = message.steering;
+            }
+        }
+        items.push(item);
+    }
+    if !items.is_empty() {
+        segments.push((anchor, native_anchor_id, steering, items));
+    }
+    segments
+}
+
+/// Once a native transcript owns a Run's initial turn, retain only Host steer
+/// messages that have not acquired their own native command identity yet.
+/// Hiding the entire Run at the first native echo made a newly accepted steer
+/// disappear until Codex emitted its later user-message notification.
+fn unrepresented_controlled_input_segments(
+    run: &RunState,
+    represented_command_ids: Option<&BTreeSet<String>>,
+) -> Vec<ControlledTimelineSegment> {
+    timeline_for_run(run)
+        .into_iter()
+        .filter_map(|item| {
+            let TimelineItem::Message(message) = &item else {
+                return None;
+            };
+            if !message.steering {
+                return None;
+            }
+            let command_id = message.id.strip_prefix("steer-")?.to_owned();
+            if represented_command_ids.is_some_and(|ids| ids.contains(&command_id)) {
+                return None;
+            }
+            let anchor = message.occurred_at_unix_ms.map(|value| value as f64);
+            let native_anchor_id = message.native_anchor_id.clone();
+            let mut items = vec![item];
+            if let Some(command) = run
+                .commands
+                .iter()
+                .find(|command| command.id == command_id)
+                .cloned()
+            {
+                items.push(TimelineItem::Command(command));
+            }
+            Some((anchor, native_anchor_id, true, items))
+        })
+        .collect()
+}
+
+fn append_session_insertions(
+    merged: &mut Vec<(String, TimelineItem)>,
+    insertions: Option<Vec<(String, Vec<TimelineItem>)>>,
+) {
+    for (run_id, items) in insertions.into_iter().flatten() {
+        merged.extend(items.into_iter().map(|item| (run_id.clone(), item)));
+    }
+}
+
+fn effective_native_timestamps(items: &[TimelineItem]) -> Vec<Option<f64>> {
+    let mut timestamps = items
+        .iter()
+        .map(timeline_item_native_timestamp)
+        .collect::<Vec<_>>();
+
+    // Commands may use random UUIDs. Keep them next to the following native
+    // response whose id does carry time, which also ensures a Host user input
+    // is placed before the work it triggered.
+    let mut next = None;
+    for timestamp in timestamps.iter_mut().rev() {
+        if timestamp.is_some() {
+            next = *timestamp;
+        } else if next.is_some() {
+            *timestamp = next;
+        }
+    }
+    let mut previous = None;
+    for timestamp in &mut timestamps {
+        if timestamp.is_some() {
+            previous = *timestamp;
+        } else if previous.is_some() {
+            *timestamp = previous;
+        }
+    }
+    timestamps
+}
+
+fn timeline_item_native_timestamp(item: &TimelineItem) -> Option<f64> {
+    let id = timeline_item_native_id(item)?;
+    native_activity_timestamp_ms(id).map(|timestamp| timestamp as f64)
+}
+
+fn timeline_item_native_id(item: &TimelineItem) -> Option<&str> {
+    match item {
+        TimelineItem::Message(message) => Some(&message.id),
+        TimelineItem::Stream(output) => Some(&output.output_id),
+        TimelineItem::Activity(activity) => Some(&activity.id),
+        TimelineItem::Command(command) => Some(&command.id),
+        TimelineItem::Progress(_) => None,
+    }
+}
+
+fn native_activity_timestamp_ms(id: &str) -> Option<u64> {
+    const EARLIEST_PLAUSIBLE_MS: u64 = 1_577_836_800_000;
+    const LATEST_PLAUSIBLE_MS: u64 = 4_102_444_800_000;
+
+    let compact = id.replace('-', "");
+    if compact.len() == 32 && compact.as_bytes().get(12) == Some(&b'7') {
+        let timestamp = u64::from_str_radix(&compact[..12], 16).ok()?;
+        if (EARLIEST_PLAUSIBLE_MS..=LATEST_PLAUSIBLE_MS).contains(&timestamp) {
+            return Some(timestamp);
+        }
+    }
+
+    // OpenAI response item ids encode creation seconds after a 16-hex random
+    // prefix and the `01` version marker (for example `msg_…01xxxxxxxx`).
+    let suffix = id.split_once('_')?.1;
+    if suffix.len() < 26 || suffix.get(16..18) != Some("01") {
+        return None;
+    }
+    let timestamp = u64::from_str_radix(suffix.get(18..26)?, 16)
+        .ok()?
+        .saturating_mul(1_000);
+    (EARLIEST_PLAUSIBLE_MS..=LATEST_PLAUSIBLE_MS)
+        .contains(&timestamp)
+        .then_some(timestamp)
+}
+
+fn orchestral_run_id_from_client_id(client_id: &str) -> Option<&str> {
+    let value = client_id.strip_prefix("orchestral:")?;
+    let (run_id, digest) = value.split_once(':')?;
+    (!run_id.is_empty() && !digest.is_empty()).then_some(run_id)
+}
+
+fn orchestral_command_identity(client_id: &str) -> Option<(&str, &str)> {
+    let value = client_id.strip_prefix("orchestral-command:")?;
+    let mut fields = value.splitn(3, ':');
+    let run_id = fields.next()?;
+    let command_id = fields.next()?;
+    let digest = fields.next()?;
+    (!run_id.is_empty() && !command_id.is_empty() && !digest.is_empty())
+        .then_some((run_id, command_id))
+}
+
 /// Folds consecutive tool and command events into one disclosure block.
 ///
 /// Message and progress boundaries remain visible in chronological order, but
 /// long agent loops no longer consume one full card per operation. The full
 /// evidence stays available inside the group when the user expands it.
 pub fn timeline_blocks_for_run(run: &RunState) -> Vec<TimelineBlock> {
+    fold_session_timeline(
+        timeline_for_run(run)
+            .into_iter()
+            .map(|item| (run.id.clone(), item)),
+    )
+    .into_iter()
+    .map(|entry| entry.block)
+    .collect()
+}
+
+fn fold_session_timeline(
+    entries: impl IntoIterator<Item = (String, TimelineItem)>,
+) -> Vec<SessionTimelineBlock> {
     let mut blocks = Vec::new();
+    let mut activity_run_id = None::<String>;
     let mut activities = Vec::new();
 
-    for item in timeline_for_run(run) {
+    for (run_id, item) in entries {
         if matches!(item, TimelineItem::Activity(_) | TimelineItem::Command(_)) {
+            if activity_run_id
+                .as_deref()
+                .is_some_and(|active| active != run_id)
+            {
+                flush_session_activities(&mut blocks, &mut activity_run_id, &mut activities);
+            }
+            activity_run_id.get_or_insert_with(|| run_id.clone());
             activities.push(item);
             continue;
         }
 
-        if !activities.is_empty() {
-            blocks.push(TimelineBlock::ActivityGroup(std::mem::take(
-                &mut activities,
-            )));
-        }
-        blocks.push(TimelineBlock::Entry(item));
+        flush_session_activities(&mut blocks, &mut activity_run_id, &mut activities);
+        blocks.push(SessionTimelineBlock {
+            run_id,
+            block: TimelineBlock::Entry(item),
+        });
     }
 
-    if !activities.is_empty() {
-        blocks.push(TimelineBlock::ActivityGroup(activities));
-    }
+    flush_session_activities(&mut blocks, &mut activity_run_id, &mut activities);
     blocks
+}
+
+fn flush_session_activities(
+    blocks: &mut Vec<SessionTimelineBlock>,
+    run_id: &mut Option<String>,
+    activities: &mut Vec<TimelineItem>,
+) {
+    if activities.is_empty() {
+        return;
+    }
+    blocks.push(SessionTimelineBlock {
+        run_id: run_id.take().expect("activity group has an owning Run"),
+        block: TimelineBlock::ActivityGroup(std::mem::take(activities)),
+    });
 }
 
 pub fn content_text(content: &Value) -> String {
@@ -1210,7 +2138,28 @@ pub fn content_text(content: &Value) -> String {
             .and_then(|value| value.get("value"))
             .and_then(|value| value.get("artifact_ref"))
             .and_then(Value::as_str)
-            .map(|reference| format!("[Artifact: {reference}]"))
+            .map(|reference| {
+                let short = reference.chars().take(12).collect::<String>();
+                let url = content
+                    .pointer("/access/uri")
+                    .and_then(Value::as_str)
+                    .filter(|uri| uri.starts_with("https://"))
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("/api/v1/attachments/{reference}"));
+                if content
+                    .get("media_type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|media_type| media_type.starts_with("image/"))
+                {
+                    let preview_url = format!(
+                        "{url}{}preview=1",
+                        if url.contains('?') { '&' } else { '?' }
+                    );
+                    format!("![生成图片]({preview_url})\n\n[下载原图 · {short}…]({url})")
+                } else {
+                    format!("[下载附件 · {short}…]({url})")
+                }
+            })
             .unwrap_or_else(|| "[Artifact]".to_owned()),
         _ => String::new(),
     }
@@ -1232,6 +2181,10 @@ fn value_id(value: &Value) -> Option<String> {
         .as_str()
         .map(str::to_owned)
         .or_else(|| value.get("0").and_then(Value::as_str).map(str::to_owned))
+}
+
+fn controlled_run_id(view: &Value) -> Option<String> {
+    view.pointer("/execution/run_id").and_then(value_id)
 }
 
 pub fn status_from_view(view: &Value) -> String {
@@ -1285,6 +2238,7 @@ fn command_summary(payload: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{AgentSessionActivity, AgentSessionTurn};
 
     fn content(value: &str) -> Value {
         serde_json::json!([{"body": {"kind": "inline", "value": value}}])
@@ -1298,6 +2252,69 @@ mod tests {
                 "payload": payload,
             }
         })
+    }
+
+    fn uuid_v7_at(timestamp_ms: u64, tail: u64) -> String {
+        let timestamp = format!("{timestamp_ms:012x}");
+        format!(
+            "{}-{}-7000-8000-{tail:012x}",
+            &timestamp[..8],
+            &timestamp[8..]
+        )
+    }
+
+    #[test]
+    fn generated_image_artifact_projects_to_preview_and_download_markdown() {
+        let reference = "a".repeat(64);
+        let content = serde_json::json!({
+            "media_type": "image/png",
+            "body": {
+                "kind": "artifact",
+                "value": {
+                    "artifact_ref": reference,
+                    "digest": "a".repeat(64)
+                }
+            }
+        });
+
+        let projected = content_text(&content);
+
+        assert!(projected.contains("?preview=1)"));
+        assert!(projected.contains("[下载原图 · aaaaaaaaaaaa…](/api/v1/attachments/"));
+        let rendered = crate::markdown::render(&projected);
+        assert!(rendered.contains("<img src=\"/api/v1/attachments/"));
+        assert!(rendered.contains("<a href=\"/api/v1/attachments/"));
+    }
+
+    #[test]
+    fn resolved_image_artifact_uses_the_direct_object_store_url() {
+        let reference = "b".repeat(64);
+        let direct =
+            format!("https://orchestral-files.example/v1/blobs/{reference}?capability=signed");
+        let content = serde_json::json!({
+            "media_type": "image/png",
+            "body": {
+                "kind": "artifact",
+                "value": {
+                    "artifact_ref": reference,
+                    "digest": "b".repeat(64)
+                }
+            },
+            "access": {
+                "uri": direct,
+                "media_type": "image/png",
+                "byte_size": 123
+            }
+        });
+
+        let projected = content_text(&content);
+
+        assert!(projected.contains("https://orchestral-files.example/v1/blobs/"));
+        assert!(projected.contains("capability=signed&preview=1"));
+        assert!(!projected.contains("/api/v1/attachments/"));
+        let rendered = crate::markdown::render(&projected);
+        assert!(rendered.contains("<img src=\"https://orchestral-files.example/"));
+        assert!(rendered.contains("<a href=\"https://orchestral-files.example/"));
     }
 
     #[test]
@@ -1341,7 +2358,7 @@ mod tests {
     #[test]
     fn consecutive_operations_fold_into_one_timeline_block() {
         let mut run = RunState::new("run-1", None);
-        run.record_started_input("inspect".to_owned(), 1.0);
+        run.record_accepted_input("inspect".to_owned(), 1.0);
         run.project_telemetry(&serde_json::json!({
             "telemetry_id": "tool-1",
             "payload": {
@@ -1430,13 +2447,14 @@ mod tests {
     #[test]
     fn accepted_start_input_is_not_left_in_sending_state() {
         let mut run = RunState::new("run-1", None);
-        run.optimistic_start_input("inspect the project".to_owned(), 0.5);
+        run.optimistic_start_input("inspect the project".to_owned(), 0.5, None);
 
         assert_eq!(run.status, "submitting");
         assert!(run.messages[0].optimistic);
 
-        run.record_started_input("inspect the project".to_owned(), 1.0);
+        run.record_accepted_input("inspect the project".to_owned(), 1.0);
 
+        assert_eq!(run.status, "accepted");
         assert_eq!(run.messages.len(), 1);
         assert!(!run.messages[0].optimistic);
         assert_eq!(run.messages[0].text, "inspect the project");
@@ -1538,6 +2556,47 @@ mod tests {
         assert_eq!(assistant[0].id, "delivery:delivery-1");
         assert_eq!(assistant[0].text, "Codex finished");
         assert!(!assistant[0].partial);
+    }
+
+    #[test]
+    fn terminal_run_does_not_leave_received_commands_running_forever() {
+        let mut run = RunState::new("run-1", None);
+        run.project_durable(
+            &record(
+                1,
+                "command-event",
+                serde_json::json!({
+                    "type": "command_received",
+                    "command": {
+                        "command_id": "command-1",
+                        "payload": {"type": "steer", "content": content("too late")}
+                    }
+                }),
+            ),
+            1.0,
+        );
+
+        run.apply_view(
+            serde_json::json!({
+                "state": {
+                    "state": "terminal",
+                    "terminal": {"type": "delivered", "delivery_id": "delivery-1"}
+                },
+                "last_run_seq": 2,
+                "pending_requests": []
+            }),
+            2.0,
+        );
+
+        assert_eq!(run.commands[0].state, "rejected");
+        assert_eq!(
+            run.commands[0]
+                .outcome
+                .as_ref()
+                .and_then(|value| value.get("code"))
+                .and_then(Value::as_str),
+            Some("run_ended_before_command_disposition")
+        );
     }
 
     #[test]
@@ -1657,6 +2716,30 @@ mod tests {
     }
 
     #[test]
+    fn newly_created_agent_session_opens_as_empty_without_a_loading_placeholder() {
+        let mut state = AppState::new(true);
+        state.ui.loading_session = Some("codex/local\0old-thread".to_owned());
+        state.ui.new_session_open = true;
+        state.ui.drawer_open = true;
+        state.ui.session_actions_open = true;
+
+        state.activate_created_agent_session(
+            "codex/local".to_owned(),
+            "codex/local\0new-thread".to_owned(),
+        );
+
+        assert_eq!(
+            state.sessions.selected_id.as_deref(),
+            Some("codex/local\0new-thread")
+        );
+        assert_eq!(state.ui.session_tab.as_deref(), Some("codex/local"));
+        assert_eq!(state.ui.loading_session, None);
+        assert!(!state.ui.new_session_open);
+        assert!(!state.ui.drawer_open);
+        assert!(!state.ui.session_actions_open);
+    }
+
+    #[test]
     fn unknown_run_requires_recovery_instead_of_steer() {
         let mut state = AppState::new(true);
         state.sessions.items.push(SessionView {
@@ -1684,6 +2767,76 @@ mod tests {
             state.recoverable_run().map(|run| run.id.as_str()),
             Some("run-1")
         );
+    }
+
+    #[test]
+    fn request_action_locks_follow_authoritative_pending_state() {
+        let mut state = AppState::new(true);
+        let run = state.ensure_run("run-1", None);
+        run.status = "waiting".to_owned();
+        run.pending = vec![serde_json::json!({
+            "request_id": "still-pending",
+            "blocking": true
+        })];
+        state
+            .ui
+            .set_request_resolving("run-1", "still-pending", true);
+        state
+            .ui
+            .set_request_resolving("run-1", "already-resolved", true);
+        state
+            .ui
+            .set_request_resolving("another-run", "request", true);
+
+        state.reconcile_request_actions("run-1");
+
+        assert!(state.ui.request_is_resolving("run-1", "still-pending"));
+        assert!(!state.ui.request_is_resolving("run-1", "already-resolved"));
+        assert!(state.ui.request_is_resolving("another-run", "request"));
+
+        assert!(state.remove_pending_request("run-1", "still-pending"));
+        assert!(!state.ui.request_is_resolving("run-1", "still-pending"));
+        assert!(state.runs["run-1"].pending.is_empty());
+        assert_eq!(state.runs["run-1"].status, "running");
+    }
+
+    #[test]
+    fn competing_client_request_close_clears_the_pending_card() {
+        let mut run = RunState::new("run-1", None);
+        run.status = "running".to_owned();
+        run.project_durable(
+            &serde_json::json!({
+                "event_id": "opened-1",
+                "run_seq": 1,
+                "payload": {
+                    "type": "request_opened",
+                    "request": {
+                        "request_id": "approval-1",
+                        "blocking": true
+                    }
+                }
+            }),
+            1.0,
+        );
+
+        assert_eq!(run.status, "waiting");
+        assert_eq!(run.pending.len(), 1);
+
+        run.project_durable(
+            &serde_json::json!({
+                "event_id": "closed-1",
+                "run_seq": 2,
+                "payload": {
+                    "type": "request_closed",
+                    "request_id": "approval-1",
+                    "reason": "resolved_by_competing_client"
+                }
+            }),
+            2.0,
+        );
+
+        assert_eq!(run.status, "running");
+        assert!(run.pending.is_empty());
     }
 
     #[test]
@@ -1726,7 +2879,11 @@ mod tests {
         }))
         .unwrap();
         let mut state = AppState::new(true);
-        state.project_agent_session(detail);
+        assert!(state.project_agent_session(detail.clone()));
+        assert!(
+            !state.project_agent_session(detail),
+            "an unchanged polling snapshot must not trigger live-follow scrolling"
+        );
 
         let run = state
             .runs
@@ -1744,6 +2901,741 @@ mod tests {
             run.history_next_cursor.as_deref(),
             Some("activity-offset-v1:3")
         );
+    }
+
+    #[test]
+    fn refreshed_agent_session_restores_its_active_controlled_run() {
+        let detail: AgentSessionDetail = serde_json::from_value(serde_json::json!({
+            "summary": {
+                "connector_id": "codex/local",
+                "session_id": "thread-1",
+                "updated_at_unix_ms": 10,
+                "state": "active"
+            },
+            "turns": [],
+            "pending_requests": [],
+            "controlled_runs": [{
+                "created_at_unix_ms": 5,
+                "execution": {
+                    "session_id": "thread-1",
+                    "run_id": "controlled-run"
+                },
+                "state": {"state": "running"},
+                "last_run_seq": 2,
+                "input": [{"body": {"kind": "inline", "value": "continue"}}]
+            }]
+        }))
+        .unwrap();
+        let mut state = AppState::new(true);
+
+        state.project_agent_session(detail);
+        state.sessions.selected_id = Some("codex/local\0thread-1".to_owned());
+
+        let session = state.sessions.items.first().unwrap();
+        assert_eq!(
+            session.run_ids,
+            vec![
+                "agent-history:codex/local:thread-1".to_owned(),
+                "controlled-run".to_owned()
+            ]
+        );
+        let active = state
+            .active_run()
+            .expect("controlled Run remains steerable");
+        assert_eq!(active.id, "controlled-run");
+        assert_eq!(active.connector_id.as_deref(), Some("codex/local"));
+        assert_eq!(active.started_at, Some(5.0));
+    }
+
+    #[test]
+    fn bounded_native_page_places_each_controlled_steer_before_its_later_response() {
+        let created_at = 1_788_303_954_016_u64;
+        let steer_at = created_at + 4_000;
+        let older_response_id = uuid_v7_at(created_at + 2_000, 1);
+        let newer_response_id = uuid_v7_at(created_at + 6_000, 2);
+        let detail: AgentSessionDetail = serde_json::from_value(serde_json::json!({
+            "summary": {
+                "connector_id": "codex/local",
+                "session_id": "thread-1",
+                "updated_at_unix_ms": created_at + 7_000,
+                "state": "active"
+            },
+            "turns": [{
+                "turn_id": "turn-1",
+                "status": "in_progress",
+                "activities": [
+                    {
+                        "activity_id": older_response_id,
+                        "kind": "agent_message",
+                        "status": "completed",
+                        "content": [{"body": {"kind": "inline", "value": "older response"}}]
+                    },
+                    {
+                        "activity_id": "0d5ec963-c1f5-4d31-8c6e-ef49c79f20cb",
+                        "kind": "reasoning",
+                        "status": "completed",
+                        "title": "Reasoning",
+                        "content": []
+                    },
+                    {
+                        "activity_id": newer_response_id,
+                        "kind": "agent_message",
+                        "status": "completed",
+                        "content": [{"body": {"kind": "inline", "value": "later response"}}]
+                    }
+                ]
+            }],
+            "pending_requests": [],
+            "controlled_runs": [{
+                "created_at_unix_ms": created_at,
+                "execution": {
+                    "session_id": "thread-1",
+                    "run_id": "controlled-run"
+                },
+                "state": {"state": "running"},
+                "last_run_seq": 2,
+                "input": [{"body": {"kind": "inline", "value": "initial request"}}]
+            }]
+        }))
+        .unwrap();
+        let mut state = AppState::new(true);
+        state.project_agent_session(detail);
+        state
+            .runs
+            .get_mut("controlled-run")
+            .unwrap()
+            .optimistic_steer(
+                "steer-latest".to_owned(),
+                "what is wrong?".to_owned(),
+                steer_at as f64,
+                None,
+            );
+
+        let session = state.sessions.items.first().unwrap();
+        let messages = timeline_blocks_for_session(&state, session)
+            .into_iter()
+            .filter_map(|entry| match entry.block {
+                TimelineBlock::Entry(TimelineItem::Message(message)) => {
+                    Some((message.role, message.text))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            messages,
+            vec![
+                ("user".to_owned(), "initial request".to_owned()),
+                ("assistant".to_owned(), "older response".to_owned()),
+                ("user".to_owned(), "what is wrong?".to_owned()),
+                ("assistant".to_owned(), "later response".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn fresh_controlled_run_stays_after_the_native_edge_visible_at_submission() {
+        let detail: AgentSessionDetail = serde_json::from_value(serde_json::json!({
+            "summary": {
+                "connector_id": "codex/local",
+                "session_id": "thread-anchored",
+                "state": "idle"
+            },
+            "turns": [{
+                "turn_id": "turn-previous",
+                "status": "completed",
+                "activities": [
+                    {
+                        "activity_id": "native-user-previous",
+                        "kind": "user_message",
+                        "status": "completed",
+                        "content": [{"body": {"kind": "inline", "value": "previous question"}}]
+                    },
+                    {
+                        "activity_id": "native-answer-previous",
+                        "kind": "agent_message",
+                        "status": "completed",
+                        "content": [{"body": {"kind": "inline", "value": "previous answer"}}]
+                    }
+                ]
+            }],
+            "pending_requests": []
+        }))
+        .unwrap();
+        let mut state = AppState::new(true);
+        state.project_agent_session(detail);
+        state.sessions.selected_id = Some("codex/local\0thread-anchored".to_owned());
+        let native_anchor = state.selected_native_tail_id();
+        assert_eq!(native_anchor.as_deref(), Some("native-answer-previous"));
+
+        let run = state.ensure_run_source(
+            "fresh-run",
+            Some("thread-anchored".to_owned()),
+            Some("codex/local".to_owned()),
+        );
+        run.optimistic_start_input("new question".to_owned(), 10_000.0, native_anchor.clone());
+        run.optimistic_steer(
+            "follow-up-command".to_owned(),
+            "follow-up question".to_owned(),
+            11_000.0,
+            native_anchor,
+        );
+        state.sessions.items[0].run_ids.push("fresh-run".to_owned());
+
+        let messages = timeline_blocks_for_session(&state, &state.sessions.items[0])
+            .into_iter()
+            .filter_map(|entry| match entry.block {
+                TimelineBlock::Entry(TimelineItem::Message(message)) => Some(message.text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages,
+            vec![
+                "previous question",
+                "previous answer",
+                "new question",
+                "follow-up question"
+            ]
+        );
+    }
+
+    #[test]
+    fn accepted_input_is_replaced_by_its_durable_event_without_losing_the_native_anchor() {
+        let mut run = RunState::new("fresh-run", Some("thread-anchored".to_owned()));
+        run.optimistic_start_input(
+            "new question".to_owned(),
+            10_000.0,
+            Some("native-answer-previous".to_owned()),
+        );
+
+        // This is the real browser order: the start HTTP response arrives
+        // before the durable stream catches up with InputCommitted.
+        run.record_accepted_input("new question".to_owned(), 10_100.0);
+        run.project_durable(
+            &record(
+                1,
+                "input-event",
+                serde_json::json!({
+                    "type": "input_committed",
+                    "content": content("new question")
+                }),
+            ),
+            10_200.0,
+        );
+
+        assert_eq!(run.messages.len(), 1);
+        assert_eq!(run.messages[0].id, "input-event");
+        assert_eq!(run.messages[0].text, "new question");
+        assert_eq!(
+            run.messages[0].native_anchor_id.as_deref(),
+            Some("native-answer-previous")
+        );
+        assert!(!run.messages[0].optimistic);
+    }
+
+    #[test]
+    fn durable_steer_rehydrates_its_user_message_before_the_command_card() {
+        let mut run = RunState::new("run-1", Some("thread-1".to_owned()));
+        run.project_durable(
+            &record(
+                1,
+                "command-event",
+                serde_json::json!({
+                    "type": "command_received",
+                    "command": {
+                        "command_id": "command-1",
+                        "payload": {
+                            "type": "steer",
+                            "content": content("follow up")
+                        }
+                    }
+                }),
+            ),
+            10_000.0,
+        );
+
+        let timeline = timeline_for_run(&run);
+        assert!(matches!(
+            &timeline[0],
+            TimelineItem::Message(message)
+                if message.id == "steer-command-1" && message.text == "follow up"
+        ));
+        assert!(matches!(
+            &timeline[1],
+            TimelineItem::Command(command) if command.id == "command-1"
+        ));
+    }
+
+    #[test]
+    fn two_clients_replaying_one_durable_steer_converge_on_identical_order() {
+        let detail = || {
+            serde_json::from_value::<AgentSessionDetail>(serde_json::json!({
+                "summary": {
+                    "connector_id": "codex/local",
+                    "session_id": "thread-shared",
+                    "state": "active"
+                },
+                "turns": [{
+                    "turn_id": "turn-previous",
+                    "status": "completed",
+                    "activities": [
+                        {
+                            "activity_id": "native-user-previous",
+                            "kind": "user_message",
+                            "status": "completed",
+                            "content": [{"body": {"kind": "inline", "value": "previous"}}]
+                        },
+                        {
+                            "activity_id": "native-answer-previous",
+                            "kind": "agent_message",
+                            "status": "completed",
+                            "content": [{"body": {"kind": "inline", "value": "answer"}}]
+                        }
+                    ]
+                }],
+                "pending_requests": []
+            }))
+            .unwrap()
+        };
+        let client = || {
+            let mut state = AppState::new(true);
+            state.project_agent_session(detail());
+            state.sessions.selected_id = Some("codex/local\0thread-shared".to_owned());
+            state.ensure_run_source(
+                "run-shared",
+                Some("thread-shared".to_owned()),
+                Some("codex/local".to_owned()),
+            );
+            state.sessions.items[0]
+                .run_ids
+                .push("run-shared".to_owned());
+            state
+        };
+        let visible_messages = |state: &AppState| {
+            timeline_blocks_for_session(state, &state.sessions.items[0])
+                .into_iter()
+                .filter_map(|entry| match entry.block {
+                    TimelineBlock::Entry(TimelineItem::Message(message)) => Some(message.text),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut desktop = client();
+        let mut phone = client();
+        desktop
+            .runs
+            .get_mut("run-shared")
+            .unwrap()
+            .optimistic_steer(
+                "steer-command-shared".to_owned(),
+                "latest".to_owned(),
+                10_000.0,
+                Some("native-answer-previous".to_owned()),
+            );
+        let command = record(
+            1,
+            "command-event-shared",
+            serde_json::json!({
+                "type": "command_received",
+                "command": {
+                    "command_id": "command-shared",
+                    "payload": {"type": "steer", "content": content("latest")}
+                }
+            }),
+        );
+        desktop
+            .runs
+            .get_mut("run-shared")
+            .unwrap()
+            .project_durable(&command, 10_100.0);
+        phone
+            .runs
+            .get_mut("run-shared")
+            .unwrap()
+            .project_durable(&command, 99_900.0);
+
+        assert_eq!(visible_messages(&desktop), ["previous", "answer", "latest"]);
+        assert_eq!(visible_messages(&desktop), visible_messages(&phone));
+
+        let mut echoed = detail();
+        echoed.turns.push(AgentSessionTurn {
+            turn_id: "turn-latest".to_owned(),
+            status: "active".to_owned(),
+            activities: vec![AgentSessionActivity {
+                activity_id: "native-command-shared".to_owned(),
+                kind: "user_message".to_owned(),
+                status: "completed".to_owned(),
+                title: None,
+                content: vec![serde_json::json!({
+                    "body": {"kind": "inline", "value": "latest"}
+                })],
+                details: serde_json::json!({
+                    "clientId": "orchestral-command:run-shared:command-shared:sha256:digest"
+                }),
+            }],
+        });
+        desktop.project_agent_session(echoed.clone());
+        phone.project_agent_session(echoed);
+        assert_eq!(visible_messages(&desktop), ["previous", "answer", "latest"]);
+        assert_eq!(visible_messages(&desktop), visible_messages(&phone));
+    }
+
+    #[test]
+    fn native_initial_echo_does_not_hide_a_later_unrepresented_steer() {
+        let initial_detail = serde_json::json!({
+            "summary": {
+                "connector_id": "codex/local",
+                "session_id": "thread-1",
+                "state": "active"
+            },
+            "turns": [{
+                "turn_id": "turn-1",
+                "status": "active",
+                "activities": [
+                    {
+                        "activity_id": "native-initial",
+                        "kind": "user_message",
+                        "status": "completed",
+                        "content": [{"body": {"kind": "inline", "value": "initial"}}],
+                        "details": {"clientId": "orchestral:run-1:sha256:initial"}
+                    },
+                    {
+                        "activity_id": "native-answer",
+                        "kind": "agent_message",
+                        "status": "completed",
+                        "content": [{"body": {"kind": "inline", "value": "working"}}]
+                    }
+                ]
+            }],
+            "pending_requests": []
+        });
+        let mut state = AppState::new(true);
+        state.project_agent_session(serde_json::from_value(initial_detail.clone()).unwrap());
+        state.sessions.selected_id = Some("codex/local\0thread-1".to_owned());
+        let run = state.ensure_run_source(
+            "run-1",
+            Some("thread-1".to_owned()),
+            Some("codex/local".to_owned()),
+        );
+        run.optimistic_start_input("initial".to_owned(), 1.0, None);
+        run.record_accepted_input("initial".to_owned(), 2.0);
+        run.optimistic_steer(
+            "steer-command-1".to_owned(),
+            "latest steer".to_owned(),
+            3.0,
+            Some("native-answer".to_owned()),
+        );
+        state.sessions.items[0].run_ids.push("run-1".to_owned());
+
+        let visible_text = |state: &AppState| {
+            timeline_blocks_for_session(state, &state.sessions.items[0])
+                .into_iter()
+                .filter_map(|entry| match entry.block {
+                    TimelineBlock::Entry(TimelineItem::Message(message)) => Some(message.text),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(visible_text(&state), ["initial", "working", "latest steer"]);
+
+        let mut native_command_detail = initial_detail;
+        native_command_detail["turns"][0]["activities"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "activity_id": "native-command-1",
+                "kind": "user_message",
+                "status": "completed",
+                "content": [{"body": {"kind": "inline", "value": "latest steer"}}],
+                "details": {
+                    "clientId": "orchestral-command:run-1:command-1:sha256:digest"
+                }
+            }));
+        state.project_agent_session(serde_json::from_value(native_command_detail).unwrap());
+
+        assert_eq!(visible_text(&state), ["initial", "working", "latest steer"]);
+    }
+
+    #[test]
+    fn missing_correlated_user_uses_latest_native_turn_boundary_not_a_rewritten_file_time() {
+        let earlier = uuid_v7_at(1_788_303_950_000, 1);
+        let latest = uuid_v7_at(1_788_303_954_000, 2);
+        let detail: AgentSessionDetail = serde_json::from_value(serde_json::json!({
+            "summary": {
+                "connector_id": "codex/local",
+                "session_id": "thread-1",
+                "state": "active"
+            },
+            "turns": [
+                {
+                    "turn_id": "turn-earlier",
+                    "status": "completed",
+                    "activities": [{
+                        "activity_id": earlier,
+                        "kind": "agent_message",
+                        "status": "completed",
+                        "content": [{"body": {"kind": "inline", "value": "earlier answer"}}]
+                    }]
+                },
+                {
+                    "turn_id": "turn-controlled",
+                    "status": "running",
+                    "activities": [{
+                        "activity_id": latest,
+                        "kind": "agent_message",
+                        "status": "completed",
+                        "content": [{"body": {"kind": "inline", "value": "controlled answer"}}]
+                    }]
+                }
+            ],
+            "pending_requests": [],
+            "controlled_runs": [{
+                "created_at_unix_ms": 1_788_303_960_000_u64,
+                "execution": {"session_id": "thread-1", "run_id": "controlled-run"},
+                "state": {"state": "running"},
+                "last_run_seq": 2,
+                "input": [{"body": {"kind": "inline", "value": "triggering question"}}]
+            }]
+        }))
+        .unwrap();
+        let mut state = AppState::new(true);
+        state.project_agent_session(detail);
+        let session = state.sessions.items.first().unwrap();
+        let messages = timeline_blocks_for_session(&state, session)
+            .into_iter()
+            .filter_map(|entry| match entry.block {
+                TimelineBlock::Entry(TimelineItem::Message(message)) => Some(message.text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages,
+            vec!["earlier answer", "triggering question", "controlled answer"]
+        );
+    }
+
+    #[test]
+    fn terminal_mirror_anchors_to_its_matching_older_turn_and_deduplicates_response() {
+        let controlled_response = uuid_v7_at(1_788_303_950_000, 1);
+        let newer_response = uuid_v7_at(1_788_303_954_000, 2);
+        let detail: AgentSessionDetail = serde_json::from_value(serde_json::json!({
+            "summary": {
+                "connector_id": "codex/local",
+                "session_id": "thread-1",
+                "state": "active"
+            },
+            "turns": [
+                {
+                    "turn_id": "turn-controlled",
+                    "status": "completed",
+                    "activities": [{
+                        "activity_id": controlled_response,
+                        "kind": "agent_message",
+                        "status": "completed",
+                        "content": [{"body": {"kind": "inline", "value": "controlled answer"}}]
+                    }]
+                },
+                {
+                    "turn_id": "turn-newer",
+                    "status": "running",
+                    "activities": [{
+                        "activity_id": newer_response,
+                        "kind": "agent_message",
+                        "status": "completed",
+                        "content": [{"body": {"kind": "inline", "value": "newer answer"}}]
+                    }]
+                }
+            ],
+            "pending_requests": [],
+            "controlled_runs": [{
+                "created_at_unix_ms": 1_788_303_960_000_u64,
+                "execution": {"session_id": "thread-1", "run_id": "controlled-run"},
+                "state": {
+                    "state": "terminal",
+                    "terminal": {"type": "delivered", "delivery_id": "delivery-1"}
+                },
+                "last_run_seq": 14,
+                "input": [{"body": {"kind": "inline", "value": "triggering question"}}],
+                "delivery": {
+                    "delivery_id": "delivery-1",
+                    "final_response": {"body": {"kind": "inline", "value": "controlled answer"}},
+                    "provenance": {"supporting_event_ids": []}
+                }
+            }]
+        }))
+        .unwrap();
+        let mut state = AppState::new(true);
+        state.project_agent_session(detail);
+        let session = state.sessions.items.first().unwrap();
+        let messages = timeline_blocks_for_session(&state, session)
+            .into_iter()
+            .filter_map(|entry| match entry.block {
+                TimelineBlock::Entry(TimelineItem::Message(message)) => Some(message.text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            messages,
+            vec!["triggering question", "controlled answer", "newer answer"]
+        );
+    }
+
+    #[test]
+    fn a_sliding_live_window_converges_after_one_projection() {
+        let detail = |ids: &[(&str, &str)]| {
+            serde_json::from_value::<AgentSessionDetail>(serde_json::json!({
+                "summary": {
+                    "connector_id": "codex/local",
+                    "session_id": "thread-1",
+                    "state": "active"
+                },
+                "turns": [{
+                    "turn_id": "turn-live",
+                    "status": "running",
+                    "activities": ids.iter().map(|(id, text)| serde_json::json!({
+                        "activity_id": id,
+                        "kind": "agent_message",
+                        "status": "completed",
+                        "content": [{"body": {"kind": "inline", "value": text}}]
+                    })).collect::<Vec<_>>()
+                }],
+                "pending_requests": []
+            }))
+            .unwrap()
+        };
+        let mut state = AppState::new(true);
+        state.project_agent_session(detail(&[("old", "old"), ("overlap", "overlap")]));
+        let shifted = detail(&[("overlap", "overlap"), ("new", "new")]);
+        assert!(state.project_agent_session(shifted.clone()));
+        assert!(
+            !state.project_agent_session(shifted),
+            "the same shifted window must not keep changing orders or scrolling"
+        );
+        let run = &state.runs["agent-history:codex/local:thread-1"];
+        assert_eq!(run.messages.len(), 2);
+        assert_eq!(run.messages[0].id, "overlap");
+        assert_eq!(run.messages[1].id, "new");
+    }
+
+    #[test]
+    fn codex_native_activity_ids_expose_stable_time_anchors() {
+        assert_eq!(
+            native_activity_timestamp_ms("rs_0123456789abcdef016a9755a4deadbeef"),
+            Some(1_788_302_756_000)
+        );
+        let timestamp = 1_788_303_954_016;
+        assert_eq!(
+            native_activity_timestamp_ms(&uuid_v7_at(timestamp, 1)),
+            Some(timestamp)
+        );
+        assert_eq!(
+            native_activity_timestamp_ms("0d5ec963-c1f5-4d31-8c6e-ef49c79f20cb"),
+            None
+        );
+    }
+
+    #[test]
+    fn native_client_id_replaces_only_its_controlled_run_mirror() {
+        let detail: AgentSessionDetail = serde_json::from_value(serde_json::json!({
+            "summary": {
+                "connector_id": "codex/local",
+                "session_id": "thread-1",
+                "state": "idle"
+            },
+            "turns": [{
+                "turn_id": "turn-1",
+                "status": "completed",
+                "activities": [
+                    {
+                        "activity_id": "native-user-1",
+                        "kind": "user_message",
+                        "status": "completed",
+                        "content": [{"body": {"kind": "inline", "value": "你好"}}],
+                        "details": {"clientId": "orchestral:run-1:sha256:digest"}
+                    },
+                    {
+                        "activity_id": "native-agent-1",
+                        "kind": "agent_message",
+                        "status": "completed",
+                        "content": [{"body": {"kind": "inline", "value": "你好！"}}]
+                    }
+                ]
+            }],
+            "pending_requests": []
+        }))
+        .unwrap();
+        let mut state = AppState::new(true);
+        state.project_agent_session(detail);
+
+        for run_id in ["run-1", "run-2"] {
+            let run = state.ensure_run_source(
+                run_id,
+                Some("thread-1".to_owned()),
+                Some("codex/local".to_owned()),
+            );
+            run.optimistic_start_input("你好".to_owned(), 1.0, None);
+            run.record_accepted_input("你好".to_owned(), 2.0);
+        }
+        let session = state
+            .sessions
+            .items
+            .iter_mut()
+            .find(|session| session.id == "thread-1")
+            .unwrap();
+        session
+            .run_ids
+            .extend(["run-1".to_owned(), "run-2".to_owned()]);
+
+        let session = state.sessions.items.first().unwrap();
+        assert_eq!(
+            timeline_run_ids_for_session(&state, session),
+            vec![
+                "agent-history:codex/local:thread-1".to_owned(),
+                "run-2".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn deferred_agent_queue_item_is_not_presented_as_running() {
+        let detail: AgentSessionDetail = serde_json::from_value(serde_json::json!({
+            "summary": {
+                "connector_id": "codex/local",
+                "session_id": "thread-1",
+                "state": "busy_elsewhere"
+            },
+            "turns": [{
+                "turn_id": "deferred-queue-1",
+                "status": "pending",
+                "activities": [{
+                    "activity_id": "deferred-user-queue-1",
+                    "kind": "user_message",
+                    "status": "pending",
+                    "title": "Queued for owning Agent",
+                    "content": [{"body": {"kind": "inline", "value": "continue"}}],
+                    "details": {
+                        "phase": "deferred",
+                        "queue_submission_id": "queue-1",
+                        "client_message_id": "client-1",
+                        "queue_position": 1
+                    }
+                }]
+            }],
+            "pending_requests": [],
+            "next_cursor": null
+        }))
+        .unwrap();
+        let mut state = AppState::new(true);
+        state.project_agent_session(detail);
+
+        let run = &state.runs["agent-history:codex/local:thread-1"];
+        assert_eq!(run.status, "delivered");
+        assert_eq!(run.messages.len(), 1);
+        assert!(run.messages[0].deferred);
+        assert!(!run.messages[0].optimistic);
     }
 
     #[test]
@@ -1849,6 +3741,81 @@ mod tests {
         assert_eq!(run.pending[0]["request_id"], "latest-request");
         assert!(run.history_next_cursor.is_none());
         assert!(!run.history_loading_earlier);
+    }
+
+    #[test]
+    fn live_agent_changes_upsert_in_place_and_append_without_a_snapshot() {
+        let detail: AgentSessionDetail = serde_json::from_value(serde_json::json!({
+            "summary": {
+                "connector_id": "codex/local",
+                "session_id": "thread-live",
+                "state": "active"
+            },
+            "turns": [],
+            "pending_requests": [],
+            "next_cursor": null
+        }))
+        .unwrap();
+        let mut state = AppState::new(true);
+        state.project_agent_session(detail);
+        state.sessions.selected_id = Some("codex/local\0thread-live".to_owned());
+
+        let user_change: AgentSessionChangeView = serde_json::from_value(serde_json::json!({
+            "connector_id": "codex/local",
+            "session_id": "thread-live",
+            "sequence": 1,
+            "change": {
+                "type": "activity_upsert",
+                "turn_id": "turn-1",
+                "turn_status": "active",
+                "activity": {
+                    "activity_id": "user-1",
+                    "kind": "user_message",
+                    "status": "completed",
+                    "content": [{"body": {"kind": "inline", "value": "hello"}}]
+                }
+            }
+        }))
+        .unwrap();
+        assert!(state.apply_agent_session_change(user_change.clone()));
+        let stable_tail = state.selected_timeline_tail_key();
+        assert!(!state.apply_agent_session_change(user_change.clone()));
+
+        let mut edited = user_change;
+        if let AgentSessionChangeKindView::ActivityUpsert { activity, .. } = &mut edited.change {
+            activity.content = content("hello edited").as_array().unwrap().clone();
+        }
+        assert!(state.apply_agent_session_change(edited));
+        assert_eq!(state.selected_timeline_tail_key(), stable_tail);
+
+        let assistant_change: AgentSessionChangeView = serde_json::from_value(serde_json::json!({
+            "connector_id": "codex/local",
+            "session_id": "thread-live",
+            "sequence": 2,
+            "change": {
+                "type": "activity_upsert",
+                "turn_id": "turn-1",
+                "turn_status": "active",
+                "activity": {
+                    "activity_id": "assistant-1",
+                    "kind": "agent_message",
+                    "status": "completed",
+                    "content": [{"body": {"kind": "inline", "value": "world"}}]
+                }
+            }
+        }))
+        .unwrap();
+        assert!(state.apply_agent_session_change(assistant_change));
+        assert_ne!(state.selected_timeline_tail_key(), stable_tail);
+
+        let run = state
+            .runs
+            .get("agent-history:codex/local:thread-live")
+            .unwrap();
+        assert_eq!(run.messages.len(), 2);
+        assert_eq!(run.messages[0].text, "hello edited");
+        assert_eq!(run.messages[1].text, "world");
+        assert_eq!(run.history_live_turn_starts, ["user-1"]);
     }
 
     #[test]

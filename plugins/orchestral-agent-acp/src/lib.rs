@@ -15,9 +15,9 @@ use orchestral_core::agent_connector::{
     AgentConnector, AgentConnectorDescriptor, AgentConnectorError, AgentConnectorErrorCode,
     AgentConnectorHealth, AgentConnectorId, AgentSessionActivity, AgentSessionActivityId,
     AgentSessionActivityKind, AgentSessionActivityStatus, AgentSessionCapabilities,
-    AgentSessionDetail, AgentSessionListQuery, AgentSessionPage, AgentSessionState,
-    AgentSessionSummary, AgentSessionTurn, AgentSessionTurnId, AgentSessionTurnStatus,
-    CreateAgentSessionRequest,
+    AgentSessionCreationDescriptor, AgentSessionDetail, AgentSessionListQuery, AgentSessionPage,
+    AgentSessionState, AgentSessionSummary, AgentSessionTurn, AgentSessionTurnId,
+    AgentSessionTurnStatus, CreateAgentSessionRequest,
 };
 use orchestral_core::agent_protocol::wire::{AgentSessionId, Content, ProviderBindingRef};
 use serde_json::{json, Value};
@@ -276,6 +276,14 @@ impl AgentConnector for AcpConnector {
                 read: true,
                 create: true,
             },
+            creation: Some(AgentSessionCreationDescriptor {
+                accepts_cwd: true,
+                default_cwd: std::env::current_dir()
+                    .ok()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                input_schema: None,
+                connection_hint: None,
+            }),
             actions: Vec::new(),
         }
     }
@@ -383,9 +391,9 @@ impl AgentConnector for AcpConnector {
         &self,
         request: CreateAgentSessionRequest,
     ) -> Result<AgentSessionSummary, AgentConnectorError> {
-        if request.title.is_some() || !request.extensions.is_empty() {
+        if request.title.is_some() || !request.options.is_null() || !request.extensions.is_empty() {
             return Err(AgentConnectorError::unsupported(
-                "ACP session/new does not define title or connector extensions",
+                "ACP session/new does not define title, options, or connector extensions",
             ));
         }
         let cwd = request
@@ -661,6 +669,7 @@ mod tests {
             .create_session(CreateAgentSessionRequest {
                 cwd: Some("/repo".to_owned()),
                 title: None,
+                options: Value::Null,
                 extensions: BTreeMap::new(),
             })
             .await

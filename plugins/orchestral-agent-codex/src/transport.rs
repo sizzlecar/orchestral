@@ -26,9 +26,9 @@ use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
 #[cfg(unix)]
 use tokio_tungstenite::{client_async_with_config, WebSocketStream};
 
-// `thread/read(includeTurns=true)` is one JSON-RPC frame and Codex currently
-// offers no turn pagination. Long-lived coding sessions can legitimately
-// exceed 64 MiB before Orchestral applies its bounded normalization.
+// Keep a generous transport ceiling for legacy app-server responses. Session
+// history itself is read through native paginated endpoints, so normal PWA
+// refreshes never depend on receiving a whole rollout in one frame.
 const DEFAULT_MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_DAEMON_START_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -78,6 +78,14 @@ async fn start_shared_daemon(config: &CodexAppServerConfig) -> Result<(), CodexT
 pub struct CodexAppServerConfig {
     pub executable: PathBuf,
     pub endpoint: CodexAppServerEndpoint,
+    /// Allows delivery through `thread/queue/add` when another app-server
+    /// process owns the thread writer.
+    ///
+    /// This is disabled by default because an embedded Codex owner does not
+    /// provide live-control semantics and may never consume the shared
+    /// daemon's queue. Interactive hosts should fail explicitly instead of
+    /// presenting that path as a successful send.
+    pub allow_deferred_queue: bool,
     /// Durable at-most-once claims for cross-process `thread/queue/add`.
     ///
     /// Codex does not deduplicate `clientUserMessageId`, so the connector must
@@ -93,6 +101,7 @@ impl Default for CodexAppServerConfig {
         Self {
             executable: PathBuf::from("codex"),
             endpoint: default_endpoint(),
+            allow_deferred_queue: false,
             dispatch_journal_dir: default_dispatch_journal_dir(),
             request_timeout: Duration::from_secs(30),
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,

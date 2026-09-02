@@ -665,7 +665,8 @@ fn project_durable(state: &mut UiState, record: &AgentJournalRecord) -> bool {
         AgentEvent::RequestOpened { request } => {
             project_pending(state, &record.event.run_id, request);
         }
-        AgentEvent::RequestResolved { request_id, .. } => {
+        AgentEvent::RequestResolved { request_id, .. }
+        | AgentEvent::RequestClosed { request_id, .. } => {
             update(
                 state,
                 UiMsg::RequestResolved {

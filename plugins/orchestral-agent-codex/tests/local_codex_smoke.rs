@@ -47,6 +47,7 @@ async fn creates_and_reads_an_empty_local_codex_session() {
         .create_session(CreateAgentSessionRequest {
             cwd: None,
             title: Some("orchestral-empty-session-smoke".to_owned()),
+            options: serde_json::Value::Null,
             extensions: BTreeMap::new(),
         })
         .await
@@ -79,6 +80,7 @@ async fn creates_and_sends_the_first_turn_without_resuming_an_empty_thread() {
             CreateAgentSessionRequest {
                 cwd: None,
                 title: Some("orchestral-first-turn-smoke".to_owned()),
+                options: serde_json::Value::Null,
                 extensions: BTreeMap::new(),
             },
         )

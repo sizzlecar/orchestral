@@ -141,7 +141,9 @@ pub trait AgentProvider: Send + Sync {
     ///
     /// Provider-native cursors remain adapter-private. Normalized
     /// `events(after_run_seq)` replay belongs to the Host Agent journal, not
-    /// this SPI. Replayed drafts must retain stable event IDs for exact dedupe.
+    /// this SPI. Replayed native observation drafts must retain stable event
+    /// IDs for exact dedupe. Synchronous `command` dispositions are validated
+    /// and retained by the Host and are not part of this recovery stream.
     async fn recover(
         &self,
         request: AgentRecoveryRequest,

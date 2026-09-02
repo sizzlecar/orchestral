@@ -22,6 +22,16 @@ cd "${WEB_ROOT}"
 rm -rf "${DX_OUTPUT}"
 dx build --web --release --debug-symbols=false --cargo-args="--locked"
 
+# Bind the service-worker cache/version to the generated JavaScript bundle.
+# The worker source therefore changes on every application release and can
+# atomically move already-installed PWAs to the matching WASM shell.
+BUNDLE_ID="$(sed -n 's/.*orchestral-web-\([A-Za-z0-9_-]*\)\.js.*/\1/p' "${DX_OUTPUT}/index.html" | head -1)"
+if [[ -z "${BUNDLE_ID}" ]]; then
+  echo "Unable to find the fingerprinted web bundle in generated index.html" >&2
+  exit 1
+fi
+sed -i '' "s/__ORCHESTRAL_BUILD_ID__/${BUNDLE_ID}/g" "${DX_OUTPUT}/sw.js"
+
 mkdir -p "${DIST}"
 rsync --archive --delete "${DX_OUTPUT}/" "${DIST}/"
 echo "Dioxus distribution refreshed at ${DIST}"

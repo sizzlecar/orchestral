@@ -155,7 +155,7 @@ struct ActionArgs {
 
 impl SessionsCommand {
     pub(crate) async fn run(self, default_cwd: Option<PathBuf>) -> anyhow::Result<()> {
-        let directory = build_agent_directory().await?;
+        let directory = build_agent_directory(None, None, None).await?;
         let stdout = std::io::stdout();
         self.run_with_directory(directory, default_cwd, &mut stdout.lock())
             .await
@@ -269,6 +269,7 @@ impl SessionsCommand {
                         CreateAgentSessionRequest {
                             cwd: default_cwd.map(path_text).transpose()?,
                             title: args.title,
+                            options: serde_json::Value::Null,
                             extensions: Default::default(),
                         },
                     )
@@ -542,6 +543,7 @@ mod tests {
                     create: true,
                     ..AgentSessionCapabilities::discoverable()
                 },
+                creation: None,
                 actions: vec![
                     AgentSessionActionDescriptor {
                         action_id: AgentSessionActionId::new(SESSION_RENAME_ACTION),

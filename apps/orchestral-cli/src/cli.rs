@@ -1,7 +1,9 @@
 use std::env;
+use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use tracing_subscriber::EnvFilter;
 
 use crate::envfile::load_env_file;
 use crate::runtime::ModelOverrides;
@@ -82,6 +84,7 @@ impl Cli {
             load_env_file(env_file)?;
         }
         ensure_log_filter(self.verbose);
+        install_tracing_subscriber();
         let model_overrides = self.model_overrides();
         let options = crate::agent::AgentRunOptions {
             config: self.config,
@@ -110,6 +113,22 @@ fn ensure_log_filter(verbose: bool) {
     if !verbose && env::var("RUST_LOG").is_err() {
         env::set_var("RUST_LOG", "info");
     }
+}
+
+fn install_tracing_subscriber() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|error| {
+        eprintln!("Invalid RUST_LOG filter ({error}); falling back to info");
+        EnvFilter::new("info")
+    });
+    // Embedders and tests may already own the global subscriber. In that case
+    // retaining their subscriber is safer than failing the command at startup.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(io::stderr)
+        .with_ansi(io::stderr().is_terminal())
+        .with_target(true)
+        .compact()
+        .try_init();
 }
 
 #[cfg(test)]

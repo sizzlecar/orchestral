@@ -2,8 +2,12 @@ use rexie::{ObjectStore, Rexie, TransactionMode};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsValue;
 
+use crate::model::OutboxEntry;
+
 const DATABASE_NAME: &str = "orchestral-pwa";
-const STORE_NAME: &str = "secrets";
+const DATABASE_VERSION: u32 = 2;
+const SECRETS_STORE: &str = "secrets";
+const OUTBOX_STORE: &str = "outbox";
 const TOKEN_KEY: &str = "device-token";
 const PREFERENCES_KEY: &str = "orchestral.preferences.v1";
 
@@ -33,8 +37,9 @@ fn default_theme() -> String {
 
 async fn database() -> Result<Rexie, String> {
     Rexie::builder(DATABASE_NAME)
-        .version(1)
-        .add_object_store(ObjectStore::new(STORE_NAME))
+        .version(DATABASE_VERSION)
+        .add_object_store(ObjectStore::new(SECRETS_STORE))
+        .add_object_store(ObjectStore::new(OUTBOX_STORE))
         .build()
         .await
         .map_err(|error| error.to_string())
@@ -43,10 +48,10 @@ async fn database() -> Result<Rexie, String> {
 pub async fn load_token() -> Result<Option<String>, String> {
     let database = database().await?;
     let transaction = database
-        .transaction(&[STORE_NAME], TransactionMode::ReadOnly)
+        .transaction(&[SECRETS_STORE], TransactionMode::ReadOnly)
         .map_err(|error| error.to_string())?;
     let store = transaction
-        .store(STORE_NAME)
+        .store(SECRETS_STORE)
         .map_err(|error| error.to_string())?;
     let value = store
         .get(JsValue::from_str(TOKEN_KEY))
@@ -62,10 +67,10 @@ pub async fn load_token() -> Result<Option<String>, String> {
 pub async fn save_token(token: &str) -> Result<(), String> {
     let database = database().await?;
     let transaction = database
-        .transaction(&[STORE_NAME], TransactionMode::ReadWrite)
+        .transaction(&[SECRETS_STORE], TransactionMode::ReadWrite)
         .map_err(|error| error.to_string())?;
     let store = transaction
-        .store(STORE_NAME)
+        .store(SECRETS_STORE)
         .map_err(|error| error.to_string())?;
     store
         .put(
@@ -84,13 +89,76 @@ pub async fn save_token(token: &str) -> Result<(), String> {
 pub async fn clear_token() -> Result<(), String> {
     let database = database().await?;
     let transaction = database
-        .transaction(&[STORE_NAME], TransactionMode::ReadWrite)
+        .transaction(&[SECRETS_STORE], TransactionMode::ReadWrite)
         .map_err(|error| error.to_string())?;
     let store = transaction
-        .store(STORE_NAME)
+        .store(SECRETS_STORE)
         .map_err(|error| error.to_string())?;
     store
         .delete(JsValue::from_str(TOKEN_KEY))
+        .await
+        .map_err(|error| error.to_string())?;
+    transaction
+        .done()
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+pub async fn save_outbox(entry: &OutboxEntry) -> Result<(), String> {
+    let database = database().await?;
+    let transaction = database
+        .transaction(&[OUTBOX_STORE], TransactionMode::ReadWrite)
+        .map_err(|error| error.to_string())?;
+    let store = transaction
+        .store(OUTBOX_STORE)
+        .map_err(|error| error.to_string())?;
+    let value = serde_wasm_bindgen::to_value(entry).map_err(|error| error.to_string())?;
+    store
+        .put(&value, Some(&JsValue::from_str(&entry.id)))
+        .await
+        .map_err(|error| error.to_string())?;
+    transaction
+        .done()
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+pub async fn load_outbox() -> Result<Vec<OutboxEntry>, String> {
+    let database = database().await?;
+    let transaction = database
+        .transaction(&[OUTBOX_STORE], TransactionMode::ReadOnly)
+        .map_err(|error| error.to_string())?;
+    let store = transaction
+        .store(OUTBOX_STORE)
+        .map_err(|error| error.to_string())?;
+    let values = store
+        .get_all(None, None)
+        .await
+        .map_err(|error| error.to_string())?;
+    transaction
+        .done()
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut entries = values
+        .into_iter()
+        .map(|value| serde_wasm_bindgen::from_value(value).map_err(|error| error.to_string()))
+        .collect::<Result<Vec<OutboxEntry>, String>>()?;
+    entries.sort_by_key(|entry| (entry.created_at_unix_ms, entry.id.clone()));
+    Ok(entries)
+}
+
+pub async fn delete_outbox(id: &str) -> Result<(), String> {
+    let database = database().await?;
+    let transaction = database
+        .transaction(&[OUTBOX_STORE], TransactionMode::ReadWrite)
+        .map_err(|error| error.to_string())?;
+    let store = transaction
+        .store(OUTBOX_STORE)
+        .map_err(|error| error.to_string())?;
+    store
+        .delete(JsValue::from_str(id))
         .await
         .map_err(|error| error.to_string())?;
     transaction

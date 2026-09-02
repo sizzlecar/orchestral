@@ -47,6 +47,7 @@ impl FixtureConnector {
                 agent_family: "coding-agent".to_owned(),
                 display_name: "Fixture Agent".to_owned(),
                 capabilities: AgentSessionCapabilities::discoverable(),
+                creation: None,
                 actions: vec![
                     AgentSessionActionDescriptor {
                         action_id: AgentSessionActionId::new(SESSION_COMPACT_ACTION),

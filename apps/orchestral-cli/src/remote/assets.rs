@@ -1,4 +1,4 @@
-use axum::extract::Path;
+use axum::extract::{Path, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -8,16 +8,41 @@ use include_dir::{include_dir, Dir, File};
 static PWA: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../web/orchestral-web/dist");
 
 pub fn router() -> Router {
+    router_with_artifact_origin(None)
+}
+
+pub fn router_with_artifact_origin(artifact_origin: Option<&str>) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/{*path}", get(asset))
+        .with_state(AssetPolicy::new(artifact_origin))
 }
 
-async fn index() -> Response {
-    asset_response(PWA.get_file("index.html"), "index.html")
+#[derive(Clone)]
+struct AssetPolicy {
+    content_security_policy: HeaderValue,
 }
 
-async fn asset(Path(path): Path<String>) -> Response {
+impl AssetPolicy {
+    fn new(artifact_origin: Option<&str>) -> Self {
+        let image_sources = artifact_origin
+            .map(|origin| format!("'self' data: {origin}"))
+            .unwrap_or_else(|| "'self' data:".to_owned());
+        let policy = format!(
+            "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; object-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src {image_sources}; font-src 'self'; connect-src 'self'; manifest-src 'self'; worker-src 'self'"
+        );
+        Self {
+            content_security_policy: HeaderValue::try_from(policy)
+                .expect("validated Artifact HTTPS origin produces a valid CSP"),
+        }
+    }
+}
+
+async fn index(State(policy): State<AssetPolicy>) -> Response {
+    asset_response(PWA.get_file("index.html"), "index.html", &policy)
+}
+
+async fn asset(State(policy): State<AssetPolicy>, Path(path): Path<String>) -> Response {
     if path
         .split('/')
         .any(|segment| segment.is_empty() || segment == "." || segment == "..")
@@ -25,7 +50,7 @@ async fn asset(Path(path): Path<String>) -> Response {
     {
         return StatusCode::NOT_FOUND.into_response();
     }
-    asset_response(PWA.get_file(&path), &path)
+    asset_response(PWA.get_file(&path), &path, &policy)
 }
 
 fn allowed_asset_path(path: &str) -> bool {
@@ -35,7 +60,7 @@ fn allowed_asset_path(path: &str) -> bool {
         || (path.starts_with("icons/") && (path.ends_with(".svg") || path.ends_with(".png")))
 }
 
-fn asset_response(file: Option<&File<'_>>, path: &str) -> Response {
+fn asset_response(file: Option<&File<'_>>, path: &str, policy: &AssetPolicy) -> Response {
     let Some(file) = file else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -52,9 +77,7 @@ fn asset_response(file: Option<&File<'_>>, path: &str) -> Response {
     );
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(
-            "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; object-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; manifest-src 'self'; worker-src 'self'",
-        ),
+        policy.content_security_policy.clone(),
     );
     headers.insert(
         header::REFERRER_POLICY,
@@ -139,6 +162,18 @@ mod tests {
             .headers()
             .get("cross-origin-opener-policy")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn configured_artifact_origin_is_the_only_external_image_source() {
+        let response = router_with_artifact_origin(Some("https://files.example"))
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let policy = response.headers()[header::CONTENT_SECURITY_POLICY]
+            .to_str()
+            .unwrap();
+        assert!(policy.contains("img-src 'self' data: https://files.example; font-src 'self'"));
     }
 
     #[tokio::test]

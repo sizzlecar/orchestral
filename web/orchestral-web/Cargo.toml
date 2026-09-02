@@ -26,9 +26,11 @@ web = [
 [dependencies]
 dioxus = { version = "=0.7.9", default-features = false, features = ["lib", "launch"] }
 futures-util = { workspace = true }
+hex = { workspace = true }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 
 gloo-timers = { version = "0.3", features = ["futures"], optional = true }
@@ -47,6 +49,7 @@ features = [
     "AbortController",
     "AbortSignal",
     "Clipboard",
+    "CssStyleDeclaration",
     "Crypto",
     "Document",
     "DomException",
@@ -82,6 +85,7 @@ features = [
     "Storage",
     "VisibilityState",
     "UrlSearchParams",
+    "VisualViewport",
     "Window",
 ]
 

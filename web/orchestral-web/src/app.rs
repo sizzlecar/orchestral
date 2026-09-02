@@ -3,7 +3,7 @@ use std::rc::Rc;
 use dioxus::prelude::*;
 
 use crate::browser::api::ApiCredential;
-use crate::browser::controller::AppController;
+use crate::browser::controller::{AppController, LiveTransportControls};
 use crate::browser::{platform, storage};
 use crate::components::{AuthScreen, Workspace};
 use crate::state::{AppState, AuthStatus};
@@ -18,6 +18,8 @@ pub fn App() -> Element {
     let preferences = use_signal(storage::load_preferences);
     let stream_abort = use_signal(|| None::<web_sys::AbortController>);
     let stream_generation = use_signal(|| 0_u64);
+    let agent_session_stream_abort = use_signal(|| None::<web_sys::AbortController>);
+    let agent_session_stream_generation = use_signal(|| 0_u64);
     let install_event = use_signal(|| None::<wasm_bindgen::JsValue>);
     let controller = use_context_provider(|| {
         AppController::new(
@@ -25,8 +27,12 @@ pub fn App() -> Element {
             token,
             pairing_secret,
             preferences,
-            stream_abort,
-            stream_generation,
+            LiveTransportControls {
+                run_abort: stream_abort,
+                run_generation: stream_generation,
+                agent_session_abort: agent_session_stream_abort,
+                agent_session_generation: agent_session_stream_generation,
+            },
             install_event,
         )
     });

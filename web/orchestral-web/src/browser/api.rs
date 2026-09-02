@@ -1,3 +1,5 @@
+use std::future::Future;
+
 use futures_util::StreamExt;
 use gloo_net::http::{Request, RequestBuilder, Response};
 use js_sys::Uint8Array;
@@ -9,10 +11,11 @@ use wasm_bindgen::JsValue;
 
 use crate::browser::platform::new_uuid;
 use crate::model::{
-    AgentConnectorView, AgentSessionActionOutcome, AgentSessionDetail, AgentSessionPage,
-    AgentSessionSummary, DeviceView, EventsResponse, PairingClaim, SessionView, StreamEvent,
+    AgentConnectorView, AgentSessionActionOutcome, AgentSessionChangeKindView,
+    AgentSessionChangeView, AgentSessionDetail, AgentSessionPage, AgentSessionSummary, DeviceView,
+    EventsResponse, PairingClaim, SessionView, StreamEvent, UploadedArtifact,
 };
-use crate::sse::SseParser;
+use crate::sse::{SessionSequenceDisposition, SessionSequenceGuard, SseParser};
 
 const API_BASE: &str = "/api/v1";
 
@@ -51,7 +54,7 @@ pub enum AgentSessionObservation {
         etag: Option<String>,
     },
     Modified {
-        detail: AgentSessionDetail,
+        detail: Box<AgentSessionDetail>,
         etag: Option<String>,
     },
 }
@@ -140,6 +143,7 @@ impl ApiClient {
         connector_id: &str,
         cwd: Option<&str>,
         title: Option<&str>,
+        options: Value,
     ) -> Result<AgentSessionSummary, ApiError> {
         self.post(
             "/agent-sessions",
@@ -148,6 +152,7 @@ impl ApiClient {
                 "connector_id": connector_id,
                 "cwd": cwd,
                 "title": title,
+                "options": options,
             }),
         )
         .await
@@ -197,7 +202,7 @@ impl ApiClient {
         }
         let detail = response.json().await.map_err(ApiError::transport)?;
         Ok(AgentSessionObservation::Modified {
-            detail,
+            detail: Box::new(detail),
             etag: response_etag,
         })
     }
@@ -261,11 +266,16 @@ impl ApiClient {
         session_id: &str,
         run_id: &str,
         input: &str,
+        attachments: &[UploadedArtifact],
     ) -> Result<Value, ApiError> {
         self.post(
             &format!("/sessions/{}/runs", encode(session_id)),
             credential,
-            &json!({ "run_id": run_id, "input": input }),
+            &json!({
+                "run_id": run_id,
+                "input": input,
+                "attachments": attachment_values(attachments),
+            }),
         )
         .await
     }
@@ -277,6 +287,7 @@ impl ApiClient {
         session_id: &str,
         run_id: &str,
         input: &str,
+        attachments: &[UploadedArtifact],
     ) -> Result<Value, ApiError> {
         self.post(
             "/agent-runs",
@@ -285,7 +296,8 @@ impl ApiClient {
                 "connector_id": connector_id,
                 "session_id": session_id,
                 "run_id": run_id,
-                "input": input
+                "input": input,
+                "attachments": attachment_values(attachments),
             }),
         )
         .await
@@ -295,15 +307,46 @@ impl ApiClient {
         &self,
         credential: &ApiCredential,
         run_id: &str,
+        command_id: &str,
         text: &str,
         connector_id: Option<&str>,
+        attachments: &[UploadedArtifact],
     ) -> Result<Value, ApiError> {
-        self.command(
-            credential,
+        self.post(
             &with_connector(&format!("/runs/{}/steer", encode(run_id)), connector_id),
-            json!({ "text": text }),
+            credential,
+            &json!({
+                "command_id": command_id,
+                "text": text,
+                "attachments": attachment_values(attachments),
+            }),
         )
         .await
+    }
+
+    pub async fn upload_artifact(
+        &self,
+        credential: &ApiCredential,
+        file_name: &str,
+        media_type: &str,
+        bytes: &[u8],
+        sha256: &str,
+    ) -> Result<UploadedArtifact, ApiError> {
+        let path = format!(
+            "{API_BASE}/attachments?file_name={}&media_type={}",
+            encode(file_name),
+            encode(media_type)
+        );
+        let body = Uint8Array::from(bytes);
+        let request = self
+            .authenticated(Request::post(&path), credential)
+            .header("Content-Type", media_type)
+            .header("X-File-Size", &bytes.len().to_string())
+            .header("X-File-Sha256", sha256)
+            .body(body)
+            .map_err(ApiError::transport)?;
+        let response = request.send().await.map_err(ApiError::transport)?;
+        decode(response).await
     }
 
     pub async fn cancel(
@@ -434,6 +477,92 @@ impl ApiClient {
         Ok(())
     }
 
+    pub async fn stream_agent_session<F, Fut>(
+        &self,
+        credential: &ApiCredential,
+        connector_id: &str,
+        session_id: &str,
+        after: u64,
+        signal: &web_sys::AbortSignal,
+        mut on_change: F,
+    ) -> Result<(), ApiError>
+    where
+        F: FnMut(AgentSessionChangeView) -> Fut,
+        Fut: Future<Output = Result<(), ApiError>>,
+    {
+        let path = format!(
+            "/agent-session/stream?connector_id={}&session_id={}&after={after}",
+            encode(connector_id),
+            encode(session_id)
+        );
+        let mut request = Request::get(&format!("{API_BASE}{path}"))
+            .header("Accept", "text/event-stream")
+            .header("Cache-Control", "no-cache")
+            .abort_signal(Some(signal));
+        if after > 0 {
+            request = request.header("Last-Event-ID", &after.to_string());
+        }
+        let response = self
+            .authenticated(request, credential)
+            .send()
+            .await
+            .map_err(ApiError::transport)?;
+        if !response.ok() {
+            return Err(error_response(response).await);
+        }
+        let body = response.body().ok_or_else(|| ApiError {
+            message: "Streaming is not supported by this browser or proxy".to_owned(),
+            status: 0,
+            code: "stream_unavailable".to_owned(),
+            details: None,
+        })?;
+        let mut stream = wasm_streams::ReadableStream::from_raw(body).into_stream();
+        let mut parser = SseParser::default();
+        let mut sequence_guard = SessionSequenceGuard::with_cursor(after);
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| ApiError::transport(js_message(&error)))?;
+            let bytes = Uint8Array::new(&chunk).to_vec();
+            for event in parser.push(&bytes) {
+                match event {
+                    StreamEvent::SessionChanged { data, .. } => {
+                        let change: AgentSessionChangeView =
+                            serde_json::from_str(&data).map_err(|error| ApiError {
+                                message: format!("Invalid Agent session change: {error}"),
+                                status: 0,
+                                code: "invalid_session_change".to_owned(),
+                                details: None,
+                            })?;
+                        match sequence_guard.observe(change.sequence) {
+                            SessionSequenceDisposition::Apply => on_change(change).await?,
+                            SessionSequenceDisposition::IgnoreDuplicate => {}
+                            SessionSequenceDisposition::RefreshSnapshot => {
+                                on_change(AgentSessionChangeView {
+                                    connector_id: change.connector_id,
+                                    session_id: change.session_id,
+                                    sequence: change.sequence,
+                                    change: AgentSessionChangeKindView::RefreshRequired {
+                                        reason: "browser_sequence_gap".to_owned(),
+                                    },
+                                })
+                                .await?;
+                            }
+                        }
+                    }
+                    StreamEvent::Error { data } => {
+                        return Err(ApiError {
+                            message: data,
+                            status: 0,
+                            code: "session_stream_failed".to_owned(),
+                            details: None,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn command(
         &self,
         credential: &ApiCredential,
@@ -552,6 +681,13 @@ fn encode(value: &str) -> String {
     js_sys::encode_uri_component(value)
         .as_string()
         .unwrap_or_default()
+}
+
+fn attachment_values(attachments: &[UploadedArtifact]) -> Vec<Value> {
+    attachments
+        .iter()
+        .map(UploadedArtifact::command_value)
+        .collect()
 }
 
 fn agent_session_path(

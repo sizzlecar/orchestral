@@ -47,6 +47,7 @@ pub(crate) fn session_page(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn session_detail(
     connector_id: &AgentConnectorId,
     result: &Value,
@@ -71,6 +72,138 @@ pub(crate) fn session_detail(
         turns,
         pending_requests: Vec::new(),
         next_cursor: None,
+    })
+}
+
+/// Normalizes one native `thread/items/list` page. Codex returns item pages in
+/// descending order when reading from the live edge; Orchestral timelines are
+/// chronological, so the page is reversed before grouping entries by turn.
+pub(crate) fn session_items_page(
+    summary: AgentSessionSummary,
+    result: &Value,
+    live_edge: bool,
+    limits: &NormalizationLimits,
+) -> Result<AgentSessionDetail, AgentConnectorError> {
+    let data = result
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AgentConnectorError::protocol("thread/items/list omitted data"))?;
+    let newest_turn_id = data
+        .first()
+        .and_then(|entry| entry.get("turnId"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let mut turns = Vec::<AgentSessionTurn>::new();
+    let mut turn_indexes = BTreeMap::<String, usize>::new();
+    for entry in data.iter().rev() {
+        let turn_id = required_string(entry, "turnId", "thread item entry")?;
+        let item = entry
+            .get("item")
+            .ok_or_else(|| AgentConnectorError::protocol("thread item entry omitted item"))?;
+        let turn_index = match turn_indexes.get(turn_id).copied() {
+            Some(index) => index,
+            None => {
+                let index = turns.len();
+                turn_indexes.insert(turn_id.to_owned(), index);
+                turns.push(AgentSessionTurn {
+                    turn_id: AgentSessionTurnId::new(turn_id),
+                    status: AgentSessionTurnStatus::Completed,
+                    activities: Vec::new(),
+                });
+                index
+            }
+        };
+        let activity_index = turns[turn_index].activities.len();
+        turns[turn_index].activities.push(normalize_activity(
+            turn_id,
+            activity_index,
+            item,
+            limits,
+        ));
+    }
+    if live_edge
+        && matches!(
+            summary.state,
+            AgentSessionState::Active
+                | AgentSessionState::WaitingInput
+                | AgentSessionState::WaitingApproval
+                | AgentSessionState::BusyElsewhere
+        )
+    {
+        if let Some(index) = newest_turn_id
+            .as_ref()
+            .and_then(|turn_id| turn_indexes.get(turn_id))
+        {
+            turns[*index].status = AgentSessionTurnStatus::Active;
+        }
+    }
+    Ok(AgentSessionDetail {
+        summary,
+        turns,
+        pending_requests: Vec::new(),
+        next_cursor: result
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+/// Compatibility projection for legacy Codex threads. The native endpoint
+/// returns only a bounded turn page; Orchestral never requests the complete
+/// Legacy whole-thread snapshot used only by compatibility unit tests.
+pub(crate) fn session_turns_page(
+    summary: AgentSessionSummary,
+    result: &Value,
+    limits: &NormalizationLimits,
+) -> Result<AgentSessionDetail, AgentConnectorError> {
+    let data = result
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AgentConnectorError::protocol("thread/turns/list omitted data"))?;
+    let turns = data
+        .iter()
+        .rev()
+        .map(|turn| normalize_turn(turn, limits))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(AgentSessionDetail {
+        summary,
+        turns,
+        pending_requests: Vec::new(),
+        next_cursor: result
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+pub(crate) fn deferred_queue_turn(
+    submission: &Value,
+    queue_position: usize,
+    limits: &NormalizationLimits,
+) -> Result<AgentSessionTurn, AgentConnectorError> {
+    let submission_id = required_string(submission, "id", "queued submission")?;
+    let client_message_id =
+        required_string(submission, "clientUserMessageId", "queued submission")?;
+    let text = message_content(submission.get("input"))
+        .map(|text| truncate_chars(&text, limits.max_text_chars))
+        .unwrap_or_else(|| "（非文本输入已排队）".to_owned());
+    Ok(AgentSessionTurn {
+        turn_id: AgentSessionTurnId::new(format!("deferred-{submission_id}")),
+        status: AgentSessionTurnStatus::Pending,
+        activities: vec![AgentSessionActivity {
+            activity_id: AgentSessionActivityId::new(format!("deferred-user-{submission_id}")),
+            kind: AgentSessionActivityKind::UserMessage,
+            status: AgentSessionActivityStatus::Pending,
+            title: Some("Queued for owning Agent".to_owned()),
+            content: vec![Content::text(text)],
+            details: json!({
+                "type": "deferred_user_message",
+                "phase": "deferred",
+                "queue_submission_id": submission_id,
+                "client_message_id": client_message_id,
+                "queue_position": queue_position,
+            }),
+        }],
     })
 }
 
@@ -122,7 +255,7 @@ fn normalize_turn(
     })
 }
 
-fn normalize_activity(
+pub(crate) fn normalize_activity(
     turn_id: &str,
     index: usize,
     item: &Value,
@@ -170,6 +303,11 @@ fn normalize_activity(
             Some("Context compacted".to_owned()),
             None,
         ),
+        "Extension" | "extension" if crate::generated_artifact::is_generated_image_item(item) => (
+            AgentSessionActivityKind::AgentMessage,
+            Some("Generated image".to_owned()),
+            None,
+        ),
         "mcpToolCall" | "dynamicToolCall" | "collabAgentToolCall" | "webSearch" => (
             AgentSessionActivityKind::ToolCall,
             optional_string(item, "tool")
@@ -202,12 +340,14 @@ fn selected_details(item: &Value, max_chars: usize) -> Value {
     for key in [
         "type",
         "status",
+        "clientId",
         "cwd",
         "exitCode",
         "durationMs",
         "phase",
         "server",
         "tool",
+        "kind",
     ] {
         if let Some(value) = item.get(key) {
             selected.insert(key.to_owned(), bounded_json(value, max_chars));
@@ -362,7 +502,7 @@ mod tests {
                         "id": "turn-1",
                         "status": "completed",
                         "items": [
-                            {"type": "userMessage", "id": "u1", "content": [{"type": "text", "text": "hello"}]},
+                            {"type": "userMessage", "id": "u1", "clientId": "orchestral:run-1:digest", "content": [{"type": "text", "text": "hello"}]},
                             {"type": "commandExecution", "id": "c1", "command": "cargo test", "status": "completed", "aggregatedOutput": "abcdefghijklmnop"},
                             {"type": "fileChange", "id": "f1", "status": "completed", "changes": ["src/lib.rs"]}
                         ]
@@ -378,11 +518,40 @@ mod tests {
         assert_eq!(detail.summary.state, AgentSessionState::WaitingApproval);
         assert_eq!(detail.turns[0].activities.len(), 3);
         assert_eq!(
+            detail.turns[0].activities[0].details["clientId"],
+            "orchestral:run-1:digest"
+        );
+        assert_eq!(
             detail.turns[0].activities[1].kind,
             AgentSessionActivityKind::Command
         );
         let body = serde_json::to_string(&detail.turns[0].activities[1].content).unwrap();
         assert!(body.contains("truncated by Orchestral"));
+    }
+
+    #[test]
+    fn deferred_queue_submission_has_pending_status_and_correlation_metadata() {
+        let turn = deferred_queue_turn(
+            &json!({
+                "id": "queue-1",
+                "clientUserMessageId": "client-1",
+                "input": [{"type": "text", "text": "continue the task"}]
+            }),
+            3,
+            &NormalizationLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(turn.turn_id.as_str(), "deferred-queue-1");
+        assert_eq!(turn.status, AgentSessionTurnStatus::Pending);
+        assert_eq!(
+            turn.activities[0].status,
+            AgentSessionActivityStatus::Pending
+        );
+        assert_eq!(turn.activities[0].details["phase"], "deferred");
+        assert_eq!(turn.activities[0].details["queue_submission_id"], "queue-1");
+        assert_eq!(turn.activities[0].details["client_message_id"], "client-1");
+        assert_eq!(turn.activities[0].details["queue_position"], 3);
     }
 
     #[test]
@@ -396,5 +565,30 @@ mod tests {
         assert_eq!(activity.kind, AgentSessionActivityKind::Other);
         assert_eq!(activity.title.as_deref(), Some("futureItem"));
         assert!(activity.details.get("secretPayload").is_none());
+    }
+
+    #[test]
+    fn native_image_generation_is_a_visible_agent_message_without_embedding_base64() {
+        let activity = normalize_activity(
+            "turn-1",
+            0,
+            &json!({
+                "type": "Extension",
+                "kind": "image_gen.generation",
+                "id": "image-1",
+                "status": "completed",
+                "result": "large-base64-payload",
+                "savedPath": "/private/generated/image.png",
+                "failure": null
+            }),
+            &NormalizationLimits::default(),
+        );
+
+        assert_eq!(activity.kind, AgentSessionActivityKind::AgentMessage);
+        assert_eq!(activity.title.as_deref(), Some("Generated image"));
+        assert!(activity.content.is_empty());
+        assert_eq!(activity.details["kind"], "image_gen.generation");
+        assert!(activity.details.get("result").is_none());
+        assert!(activity.details.get("savedPath").is_none());
     }
 }

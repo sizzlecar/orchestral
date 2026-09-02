@@ -936,11 +936,12 @@ impl AgentDescriptor {
             ));
         }
 
-        let unsupported_content = run
-            .spec
-            .input
-            .iter()
-            .find(|content| !self.accepted_content_types.contains(&content.media_type));
+        let unsupported_content = run.spec.input.iter().find(|content| {
+            !self
+                .accepted_content_types
+                .iter()
+                .any(|accepted| media_type_matches(accepted, &content.media_type))
+        });
         if let Some(content) = unsupported_content {
             return Err(AgentRejection::new(
                 AgentRejectionCode::UnsupportedCapability,
@@ -1067,6 +1068,15 @@ impl AgentDescriptor {
             skipped_optional_bindings,
         })
     }
+}
+
+fn media_type_matches(accepted: &str, actual: &str) -> bool {
+    if accepted == actual || accepted == "*/*" {
+        return true;
+    }
+    accepted
+        .strip_suffix("/*")
+        .is_some_and(|family| !family.is_empty() && actual.starts_with(&format!("{family}/")))
 }
 
 fn unsupported_resource(
@@ -1921,6 +1931,13 @@ pub enum AgentEvent {
         resolution: RequestResolution,
         resolution_digest: Digest,
     },
+    /// The Provider authoritatively reports that a request is no longer
+    /// pending, but cannot attest which competing client supplied a response
+    /// (or whether native lifecycle cleanup cleared it).
+    RequestClosed {
+        request_id: RequestId,
+        reason: String,
+    },
     StopRequested {
         reason: String,
     },
@@ -2083,6 +2100,14 @@ impl AgentEvent {
                     "resolved request_id must not be empty",
                 ));
             }
+            Self::RequestClosed { request_id, reason }
+                if request_id.is_empty() || reason.trim().is_empty() =>
+            {
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::InvalidSpec,
+                    "closed request requires a request_id and reason",
+                ));
+            }
             Self::StopRequested { reason } | Self::RunCancelled { reason }
                 if reason.trim().is_empty() =>
             {
@@ -2115,6 +2140,7 @@ impl AgentEvent {
             | Self::CommandReceived { .. }
             | Self::CommandDispositionRecorded { .. }
             | Self::RequestResolved { .. }
+            | Self::RequestClosed { .. }
             | Self::StopRequested { .. }
             | Self::RunCancelled { .. }
             | Self::ContinuityLost { .. }
@@ -3095,6 +3121,8 @@ pub(crate) struct AgentExecutionSnapshot {
     #[serde(default)]
     pub resolved_requests: BTreeMap<RequestId, Digest>,
     #[serde(default)]
+    pub closed_requests: BTreeSet<RequestId>,
+    #[serde(default)]
     pub skipped_optional_bindings: BTreeMap<ResourceBindingId, ResourceBindingSkip>,
     #[serde(default)]
     pub resource_requirements: BTreeMap<ResourceBindingId, BindingRequirement>,
@@ -3132,6 +3160,7 @@ impl AgentExecutionSnapshot {
             commands: BTreeMap::new(),
             committed_inputs: BTreeMap::new(),
             resolved_requests: BTreeMap::new(),
+            closed_requests: BTreeSet::new(),
             skipped_optional_bindings: BTreeMap::new(),
             resource_requirements,
             committed_outputs: BTreeMap::new(),

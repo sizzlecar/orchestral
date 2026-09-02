@@ -70,20 +70,38 @@ impl AgentApi {
         run_id: Option<RunId>,
         input: impl Into<String>,
     ) -> Result<AgentRunHandle, AgentSdkError> {
+        let input = input.into();
+        if input.trim().is_empty() {
+            return Err(AgentSdkError::InvalidInput(
+                "Agent input must not be empty".to_owned(),
+            ));
+        }
+        self.start_content(session_id, run_id, vec![Content::text(input)])
+            .await
+    }
+
+    pub async fn start_content(
+        &self,
+        session_id: &AgentSessionId,
+        run_id: Option<RunId>,
+        input: Vec<Content>,
+    ) -> Result<AgentRunHandle, AgentSdkError> {
+        if input.is_empty() {
+            return Err(AgentSdkError::InvalidInput(
+                "Agent input must not be empty".to_owned(),
+            ));
+        }
         let client = self.session(session_id).await?;
         match run_id {
-            Some(run_id) => {
-                let input = input.into();
-                if input.trim().is_empty() {
-                    return Err(AgentSdkError::InvalidInput(
-                        "Agent input must not be empty".to_owned(),
-                    ));
-                }
+            Some(run_id) => client.start_with_run_id(run_id, input).await,
+            None => {
                 client
-                    .start_with_run_id(run_id, vec![Content::text(input)])
+                    .start_with_run_id(
+                        RunId::new(format!("api-session-{}", uuid::Uuid::new_v4())),
+                        input,
+                    )
                     .await
             }
-            None => client.start_text(input).await,
         }
     }
 
@@ -110,6 +128,10 @@ impl AgentApi {
 
     pub async fn catalog_runs(&self) -> Result<Vec<AgentRunCatalogEntry>, AgentSdkError> {
         Ok(self.controller.catalog_runs().await?)
+    }
+
+    pub async fn can_control_run(&self, run_id: &RunId) -> Result<bool, AgentSdkError> {
+        Ok(self.controller.can_control_run(run_id).await?)
     }
 
     pub async fn has_run(&self, run_id: &RunId) -> Result<bool, AgentSdkError> {
