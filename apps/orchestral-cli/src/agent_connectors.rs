@@ -84,14 +84,8 @@ pub(crate) async fn build_agent_directory(
             limit: 25,
             ..AgentSessionListQuery::default()
         };
-        if let Err(error) = codex.refresh_session_list(query.clone()).await {
-            tracing::warn!(%error, "Codex session-list background refresh failed");
-        }
         loop {
-            tokio::select! {
-                () = codex.wait_for_session_list_refresh() => {}
-                () = tokio::time::sleep(std::time::Duration::from_secs(5 * 60)) => {}
-            }
+            codex.wait_for_session_list_refresh().await;
             // Collapse a burst of page loads or session mutations, then avoid
             // repeating a scan for a notification queued during the scan that
             // just completed.

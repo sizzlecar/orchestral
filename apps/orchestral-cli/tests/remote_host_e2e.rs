@@ -57,6 +57,9 @@ async fn released_binary_serves_embedded_pwa_and_authenticated_host_api() {
     let address = reserve_address();
     let child = Command::new(env!("CARGO_BIN_EXE_orchestral"))
         .current_dir(&root.path)
+        // The released Host opens its Agent journals with a single-writer
+        // lease. E2E state must never alias a developer's running Host.
+        .env("ORCHESTRAL_HOME", root.path.join("orchestral-home"))
         .env("OPENAI_API_KEY", "fixture-key")
         .args([
             "serve",

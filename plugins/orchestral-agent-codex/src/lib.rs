@@ -546,7 +546,14 @@ impl CodexConnector {
         let client = self.client().await?;
         let mut params = json!({
             "limit": query.limit,
-            "sortKey": "updated_at"
+            "sortKey": "updated_at",
+            // Codex already maintains an indexed session projection in its
+            // state DB. The default list path also scans rollout JSONL files
+            // to repair metadata; large CODEX_HOME directories can make that
+            // scan take seconds even when the caller requests one small page.
+            // Session detail still reads the authoritative thread through the
+            // app-server, while list discovery stays bounded and indexed.
+            "useStateDbOnly": true
         });
         insert_optional(
             &mut params,
@@ -1575,6 +1582,7 @@ mod tests {
                 serde_json::from_str(&requests.next_line().await.unwrap().unwrap()).unwrap();
             assert_eq!(list["method"], "thread/list");
             assert_eq!(list["params"]["searchTerm"], "compiler");
+            assert_eq!(list["params"]["useStateDbOnly"], true);
             server_write.write_all(format!("{}\n", json!({
                 "id": list["id"],
                 "result": {
@@ -1776,6 +1784,7 @@ mod tests {
             let mut requests = BufReader::new(server_read).lines();
             let request = read_request(&mut requests).await;
             assert_eq!(request["method"], "thread/list");
+            assert_eq!(request["params"]["useStateDbOnly"], true);
             write_result(
                 &mut server_write,
                 &request,
@@ -1846,6 +1855,7 @@ mod tests {
             let mut requests = BufReader::new(server_read).lines();
             let request = read_request(&mut requests).await;
             assert_eq!(request["method"], "thread/list");
+            assert_eq!(request["params"]["useStateDbOnly"], true);
             tokio::time::sleep(Duration::from_millis(20)).await;
             write_result(
                 &mut server_write,

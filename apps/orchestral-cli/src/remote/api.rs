@@ -1430,6 +1430,15 @@ async fn supervise_run(
                     tokio::time::sleep(run_supervisor_backoff(failures)).await;
                 }
                 Err(error) => {
+                    if !is_retryable_agent_error(&error) {
+                        tracing::info!(
+                            connector_id = connector_id.as_ref().map(AgentConnectorId::as_str),
+                            run_id = %run_id.as_str(),
+                            %error,
+                            "Agent Run requires manual recovery; stopped automatic retries"
+                        );
+                        return;
+                    }
                     failures = failures.saturating_add(1);
                     tracing::warn!(
                         connector_id = connector_id.as_ref().map(AgentConnectorId::as_str),
@@ -1453,6 +1462,29 @@ async fn supervise_run(
                 tokio::time::sleep(run_supervisor_backoff(failures)).await;
             }
         }
+    }
+}
+
+/// Distinguishes transient supervision failures from durable contract or
+/// recovery-boundary rejections. Retrying a non-retryable protocol error can
+/// never change the outcome and otherwise produces an endless warning loop.
+pub(super) fn is_retryable_agent_error(error: &AgentSdkError) -> bool {
+    match error {
+        AgentSdkError::InvalidInput(_) => false,
+        AgentSdkError::Protocol(error)
+        | AgentSdkError::Control(AgentControlError::Protocol(error)) => error.retryable,
+        AgentSdkError::Control(AgentControlError::Start(AgentStartError::Rejected(rejection))) => {
+            rejection.retryable
+        }
+        AgentSdkError::Control(AgentControlError::Start(AgentStartError::OutcomeUnknown(_)))
+        | AgentSdkError::Control(AgentControlError::Journal(_))
+        | AgentSdkError::ControlStreamClosed(_) => true,
+        AgentSdkError::Control(
+            AgentControlError::RunNotFound(_)
+            | AgentControlError::ContinuityUnknown(_)
+            | AgentControlError::RecoveryMismatch(_),
+        ) => false,
+        _ => true,
     }
 }
 
@@ -2475,6 +2507,29 @@ mod tests {
     use orchestral_runtime::{AgentApprovalBridge, AgentController};
     use tokio::sync::broadcast;
     use tower::ServiceExt;
+
+    #[test]
+    fn supervision_retries_only_retryable_agent_failures() {
+        let permanent =
+            AgentSdkError::Control(AgentControlError::Protocol(AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidTransition,
+                "manual recovery required",
+            )));
+        assert!(!is_retryable_agent_error(&permanent));
+
+        let transient = AgentSdkError::Control(AgentControlError::Protocol(
+            AgentProtocolError::new(
+                AgentProtocolErrorCode::ProviderUnavailable,
+                "provider restarting",
+            )
+            .with_retryable(true),
+        ));
+        assert!(is_retryable_agent_error(&transient));
+
+        let missing =
+            AgentSdkError::Control(AgentControlError::RunNotFound(RunId::new("missing-run")));
+        assert!(!is_retryable_agent_error(&missing));
+    }
 
     #[test]
     fn session_creation_expands_host_home_shortcuts_without_touching_other_paths() {

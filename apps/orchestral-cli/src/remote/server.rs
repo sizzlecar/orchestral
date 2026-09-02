@@ -17,7 +17,9 @@ use crate::agent::{build_agent_host, AgentRunOptions};
 use crate::agent_connectors::{build_agent_directory, AgentJournalAccess};
 use crate::mcp_config::user_config_root;
 
-use super::api::{spawn_remembered_approval_driver, spawn_run_supervisor};
+use super::api::{
+    is_retryable_agent_error, spawn_remembered_approval_driver, spawn_run_supervisor,
+};
 use super::{
     router, router_with_artifact_origin, GatewayAuthenticator, JwtGatewayAuthenticator,
     JwtGatewayConfig, PairingTicket, RemoteApiState, RemoteRegistry,
@@ -214,6 +216,9 @@ fn configured_artifact_store() -> anyhow::Result<Option<R2ArtifactStore>> {
 /// and replays its committed prefix, which also re-stages any pending approval
 /// in the replacement Host broker.
 async fn recover_registered_runs(state: &RemoteApiState) {
+    let mut incompatible_runs = 0_u64;
+    let mut manual_recovery_runs = 0_u64;
+    let mut supervised_runs = 0_u64;
     let run_ids = match state.agent.catalog_runs().await {
         Ok(entries) => entries
             .into_iter()
@@ -226,6 +231,21 @@ async fn recover_registered_runs(state: &RemoteApiState) {
     };
 
     for run_id in run_ids {
+        match state.agent.can_control_run(&run_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                incompatible_runs = incompatible_runs.saturating_add(1);
+                tracing::debug!(
+                    run_id = %run_id.as_str(),
+                    "ignored durable Run registered against an older Provider contract"
+                );
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(run_id = %run_id.as_str(), %error, "could not validate registered remote Run during Host recovery");
+                continue;
+            }
+        }
         let view = match state.agent.inspect(&run_id).await {
             Ok(view) => view,
             Err(error) => {
@@ -239,12 +259,18 @@ async fn recover_registered_runs(state: &RemoteApiState) {
 
         if view.state.status() == AgentRunStatus::Unknown {
             if let Err(error) = state.agent.recover(&run_id).await {
-                tracing::warn!(run_id = %run_id.as_str(), %error, "could not recover registered remote Run");
+                if is_retryable_agent_error(&error) {
+                    tracing::warn!(run_id = %run_id.as_str(), %error, "could not recover registered remote Run");
+                } else {
+                    manual_recovery_runs = manual_recovery_runs.saturating_add(1);
+                    tracing::debug!(run_id = %run_id.as_str(), %error, "registered remote Run requires manual recovery");
+                }
                 continue;
             }
         }
 
         spawn_remembered_approval_driver(state.clone(), run_id);
+        supervised_runs = supervised_runs.saturating_add(1);
     }
 
     // Connector Runs live in independent Agent controllers and journals. They
@@ -277,6 +303,27 @@ async fn recover_registered_runs(state: &RemoteApiState) {
             if !inspected_sessions.insert(entry.session_id.clone()) {
                 continue;
             }
+            match agent.can_control_run(&entry.run_id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    incompatible_runs = incompatible_runs.saturating_add(1);
+                    tracing::debug!(
+                        connector_id = %connector_id.as_str(),
+                        run_id = %entry.run_id.as_str(),
+                        "ignored connector Run registered against an older Provider contract"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        connector_id = %connector_id.as_str(),
+                        run_id = %entry.run_id.as_str(),
+                        %error,
+                        "could not validate connector Run during Host recovery"
+                    );
+                    continue;
+                }
+            }
             let view = match agent.inspect(&entry.run_id).await {
                 Ok(view) => view,
                 Err(error) => {
@@ -292,6 +339,27 @@ async fn recover_registered_runs(state: &RemoteApiState) {
             if view.state.is_terminal() {
                 continue;
             }
+            if view.state.status() == AgentRunStatus::Unknown {
+                if let Err(error) = agent.recover(&entry.run_id).await {
+                    if is_retryable_agent_error(&error) {
+                        tracing::warn!(
+                            connector_id = %connector_id.as_str(),
+                            run_id = %entry.run_id.as_str(),
+                            %error,
+                            "could not recover connector Run during Host recovery"
+                        );
+                    } else {
+                        manual_recovery_runs = manual_recovery_runs.saturating_add(1);
+                        tracing::debug!(
+                            connector_id = %connector_id.as_str(),
+                            run_id = %entry.run_id.as_str(),
+                            %error,
+                            "connector Run requires manual recovery"
+                        );
+                    }
+                    continue;
+                }
+            }
             tracing::info!(
                 connector_id = %connector_id.as_str(),
                 run_id = %entry.run_id.as_str(),
@@ -303,8 +371,15 @@ async fn recover_registered_runs(state: &RemoteApiState) {
                 Some(connector_id.clone()),
                 entry.run_id,
             );
+            supervised_runs = supervised_runs.saturating_add(1);
         }
     }
+    tracing::info!(
+        supervised_runs,
+        incompatible_runs,
+        manual_recovery_runs,
+        "completed durable Agent Run recovery audit"
+    );
 }
 
 fn validate_public_surface(command: &ServeCommand) -> anyhow::Result<()> {
