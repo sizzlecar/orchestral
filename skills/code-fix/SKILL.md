@@ -1,7 +1,10 @@
 ---
 name: code-fix
 description: "Use codex or claude to analyze, review, fix, or optimize code. Trigger when the user mentions codex, claude, code review, code fix, bug fix, code analysis, code optimization, or asks to consult an AI coding assistant about any codebase."
-compatibility: "Requires codex CLI on PATH with MCP server support."
+compatibility:
+  any_programs:
+    - [codex, claude]
+  required_features: [mcp]
 metadata:
   author: orchestral
   version: "0.6.0"

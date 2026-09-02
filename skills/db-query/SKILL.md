@@ -1,7 +1,9 @@
 ---
 name: db-query
 description: "Query MySQL databases, summarize results, and export to CSV/Excel. Use when the user asks to check data, run SQL queries, export tables, or generate data reports from a database."
-compatibility: "Requires mysql CLI client. Environment variables: DB_HOST, DB_USER, DB_PASS, DB_NAME (optional: DB_PORT defaults to 3306)."
+compatibility:
+  required_programs: [mysql]
+  required_environment: [DB_HOST, DB_USER, DB_PASS, DB_NAME]
 metadata:
   author: orchestral
   version: "0.1.0"

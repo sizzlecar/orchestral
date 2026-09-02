@@ -1,7 +1,9 @@
 ---
 name: jenkins-deploy
 description: "Build and deploy projects using Jenkins CI/CD. Use when the user asks to deploy, publish, release, build a project, or trigger a Jenkins job."
-compatibility: "Requires jenkins-cli (cargo install jenkins-cli). Environment variables: JENKINS_URL, JENKINS_USER, JENKINS_TOKEN."
+compatibility:
+  required_programs: [jenkins-cli]
+  required_environment: [JENKINS_URL, JENKINS_USER, JENKINS_TOKEN]
 metadata:
   author: orchestral
   version: "0.1.0"

@@ -1,7 +1,9 @@
 ---
 name: sls-query
 description: "Query Alibaba Cloud SLS (Simple Log Service) for application logs from test or production environments. Use when the user asks to check logs, search for errors, trace requests, or investigate incidents."
-compatibility: "Requires Python 3.8+ and aliyun-log-python-sdk."
+compatibility:
+  required_programs: [python3]
+  required_features: [python-package:aliyun-log]
 metadata:
   author: orchestral
   version: "0.1.0"

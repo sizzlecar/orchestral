@@ -1,7 +1,9 @@
 ---
 name: git-ops
 description: "Search and clone code repositories from Alibaba Cloud Codeup. Use when the user asks to find a repo, search projects, pull code, or check what repositories are available."
-compatibility: "Requires git CLI and Python 3.8+. Environment variables: CODEUP_TOKEN, CODEUP_ORG_ID."
+compatibility:
+  required_programs: [git, python3]
+  required_environment: [CODEUP_TOKEN, CODEUP_ORG_ID]
 metadata:
   author: orchestral
   version: "0.1.0"
