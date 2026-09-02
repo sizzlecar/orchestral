@@ -1,0 +1,40 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "orchestral-attachments",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [
+    {
+      "pattern": "orchestral.pandaailabs.com/api/v1/attachments*",
+      "zone_name": "pandaailabs.com"
+    },
+    {
+      "pattern": "orchestral-files.pandaailabs.com",
+      "custom_domain": true
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "ATTACHMENT_BUCKET",
+      "bucket_name": "pandavault-transfer"
+    }
+  ],
+  "vars": {
+    "APP_HOST": "orchestral.pandaailabs.com",
+    "PUBLIC_HOST": "orchestral-files.pandaailabs.com",
+    "TEAM_DOMAIN": "https://tiny-resonance-d6a6.cloudflareaccess.com",
+    "POLICY_AUD": "8c2340c348487450faa273f8dd13893a0e9e01f9fef37024629105ef43420909"
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true,
+      "persist": true
+    }
+  }
+}
