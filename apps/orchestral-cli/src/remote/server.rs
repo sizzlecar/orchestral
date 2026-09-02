@@ -263,6 +263,10 @@ async fn recover_registered_runs(state: &RemoteApiState) {
                     tracing::warn!(run_id = %run_id.as_str(), %error, "could not recover registered remote Run");
                 } else {
                     manual_recovery_runs = manual_recovery_runs.saturating_add(1);
+                    state.run_supervisors.mark_manual(
+                        super::api::RunSupervisorRegistry::key(None, &run_id),
+                        error.to_string(),
+                    );
                     tracing::debug!(run_id = %run_id.as_str(), %error, "registered remote Run requires manual recovery");
                 }
                 continue;
@@ -350,6 +354,13 @@ async fn recover_registered_runs(state: &RemoteApiState) {
                         );
                     } else {
                         manual_recovery_runs = manual_recovery_runs.saturating_add(1);
+                        state.run_supervisors.mark_manual(
+                            super::api::RunSupervisorRegistry::key(
+                                Some(&connector_id),
+                                &entry.run_id,
+                            ),
+                            error.to_string(),
+                        );
                         tracing::debug!(
                             connector_id = %connector_id.as_str(),
                             run_id = %entry.run_id.as_str(),

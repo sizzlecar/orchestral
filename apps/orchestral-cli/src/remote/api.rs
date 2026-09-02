@@ -47,10 +47,11 @@ const REQUEST_ID_HEADER: &str = "x-request-id";
 #[derive(Default)]
 pub struct RunSupervisorRegistry {
     active: Mutex<BTreeSet<String>>,
+    manual_recovery: Mutex<BTreeMap<String, String>>,
 }
 
 impl RunSupervisorRegistry {
-    fn key(connector_id: Option<&AgentConnectorId>, run_id: &RunId) -> String {
+    pub(super) fn key(connector_id: Option<&AgentConnectorId>, run_id: &RunId) -> String {
         format!(
             "{}\0{}",
             connector_id.map_or("orchestral", AgentConnectorId::as_str),
@@ -59,6 +60,14 @@ impl RunSupervisorRegistry {
     }
 
     fn begin(&self, key: &str) -> bool {
+        if self
+            .manual_recovery
+            .lock()
+            .expect("Run recovery registry lock poisoned")
+            .contains_key(key)
+        {
+            return false;
+        }
         self.active
             .lock()
             .expect("Run supervisor registry lock poisoned")
@@ -70,6 +79,28 @@ impl RunSupervisorRegistry {
             .lock()
             .expect("Run supervisor registry lock poisoned")
             .remove(key);
+    }
+
+    pub(super) fn mark_manual(&self, key: String, reason: String) {
+        self.manual_recovery
+            .lock()
+            .expect("Run recovery registry lock poisoned")
+            .insert(key, reason);
+    }
+
+    fn clear_manual(&self, key: &str) {
+        self.manual_recovery
+            .lock()
+            .expect("Run recovery registry lock poisoned")
+            .remove(key);
+    }
+
+    fn manual_reason(&self, key: &str) -> Option<String> {
+        self.manual_recovery
+            .lock()
+            .expect("Run recovery registry lock poisoned")
+            .get(key)
+            .cloned()
     }
 }
 
@@ -623,10 +654,12 @@ async fn controlled_session_runs(
     }
     let view = agent.inspect(&entry.run_id).await?;
     let created_at_unix_ms = entry.created_at_unix_ms;
-    let remote = RemoteRunView {
-        input: agent.initial_input(&entry.run_id).await?,
+    let remote = RemoteRunView::new(
+        state,
+        Some(connector_id),
         view,
-    };
+        agent.initial_input(&entry.run_id).await?,
+    );
     if !remote.view.state.is_terminal() {
         spawn_run_supervisor(
             state.clone(),
@@ -998,10 +1031,12 @@ async fn start_agent_run(
                 "run_id was already used with different input",
             ));
         }
-        let view = RemoteRunView {
-            view: agent.inspect(&run_id).await?,
-            input: agent.initial_input(&run_id).await?,
-        };
+        let view = RemoteRunView::new(
+            &state,
+            Some(&connector_id),
+            agent.inspect(&run_id).await?,
+            agent.initial_input(&run_id).await?,
+        );
         spawn_run_supervisor(
             state.clone(),
             agent,
@@ -1048,10 +1083,12 @@ async fn start_agent_run(
                     "the active Agent Run did not accept this session message",
                 ));
             }
-            let view = RemoteRunView {
-                view: agent.inspect(&entry.run_id).await?,
-                input: agent.initial_input(&entry.run_id).await?,
-            };
+            let view = RemoteRunView::new(
+                &state,
+                Some(&connector_id),
+                agent.inspect(&entry.run_id).await?,
+                agent.initial_input(&entry.run_id).await?,
+            );
             spawn_run_supervisor(
                 state.clone(),
                 agent,
@@ -1088,10 +1125,12 @@ async fn start_agent_run(
         Some(connector_id.clone()),
         run_id.clone(),
     );
-    let view = RemoteRunView {
-        view: handle.inspect().await?,
-        input: agent.initial_input(&run_id).await?,
-    };
+    let view = RemoteRunView::new(
+        &state,
+        Some(&connector_id),
+        handle.inspect().await?,
+        agent.initial_input(&run_id).await?,
+    );
     log_agent_input_accepted(&connector_id, &session_id, &run_id, "started", None);
     Ok((
         StatusCode::CREATED,
@@ -1320,6 +1359,56 @@ struct RemoteRunView {
     /// Immutable initial Run input. This is read from the controller-owned
     /// RunSpec rather than copied into the mobile session registry.
     input: Vec<Content>,
+    /// Host control-plane recovery disposition. Protocol `unknown` only says
+    /// continuity is unproven; it does not tell a client whether waiting can
+    /// make progress or whether the session must continue with a fresh Run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery: Option<RemoteRunRecoveryView>,
+}
+
+#[derive(Debug, Serialize)]
+struct RemoteRunRecoveryView {
+    mode: &'static str,
+    can_start_new_run: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+impl RemoteRunView {
+    fn new(
+        state: &RemoteApiState,
+        connector_id: Option<&AgentConnectorId>,
+        view: AgentRunView,
+        input: Vec<Content>,
+    ) -> Self {
+        let recovery = if view.state.status()
+            == orchestral_core::agent_protocol::reference::AgentRunStatus::Unknown
+        {
+            let key = RunSupervisorRegistry::key(connector_id, &view.execution.run_id);
+            match state.run_supervisors.manual_reason(&key) {
+                Some(reason) => Some(RemoteRunRecoveryView {
+                    mode: "manual",
+                    // A Run in `unknown` still owns its Session until the
+                    // runtime records a terminal event. Starting around that
+                    // invariant would create two writers for one Session.
+                    can_start_new_run: false,
+                    reason: Some(reason),
+                }),
+                None => Some(RemoteRunRecoveryView {
+                    mode: "automatic",
+                    can_start_new_run: false,
+                    reason: None,
+                }),
+            }
+        } else {
+            None
+        };
+        Self {
+            view,
+            input,
+            recovery,
+        }
+    }
 }
 
 async fn start_run(
@@ -1342,10 +1431,12 @@ async fn start_run(
         .start_text(&session_id, Some(run_id.clone()), request.input)
         .await?;
     spawn_remembered_approval_driver(state.clone(), run_id.clone());
-    let view = RemoteRunView {
-        view: handle.inspect().await?,
-        input: state.agent.initial_input(&run_id).await?,
-    };
+    let view = RemoteRunView::new(
+        &state,
+        None,
+        handle.inspect().await?,
+        state.agent.initial_input(&run_id).await?,
+    );
     Ok((StatusCode::CREATED, Json(StartRunResponse { run_id, view })))
 }
 
@@ -1409,6 +1500,9 @@ async fn supervise_run(
             }
         };
         if view.state.is_terminal() {
+            state
+                .run_supervisors
+                .clear_manual(&RunSupervisorRegistry::key(connector_id.as_ref(), &run_id));
             return;
         }
         if view.state.status()
@@ -1422,6 +1516,9 @@ async fn supervise_run(
                     // retaining exponential backoff prevents an unbounded
                     // continuity_lost/restored journal storm.
                     failures = failures.saturating_add(1);
+                    state
+                        .run_supervisors
+                        .clear_manual(&RunSupervisorRegistry::key(connector_id.as_ref(), &run_id));
                     tracing::info!(
                         connector_id = connector_id.as_ref().map(AgentConnectorId::as_str),
                         run_id = %run_id.as_str(),
@@ -1431,6 +1528,10 @@ async fn supervise_run(
                 }
                 Err(error) => {
                     if !is_retryable_agent_error(&error) {
+                        state.run_supervisors.mark_manual(
+                            RunSupervisorRegistry::key(connector_id.as_ref(), &run_id),
+                            error.to_string(),
+                        );
                         tracing::info!(
                             connector_id = connector_id.as_ref().map(AgentConnectorId::as_str),
                             run_id = %run_id.as_str(),
@@ -1543,11 +1644,19 @@ async fn inspect_run(
     Path(run_id): Path<String>,
     Query(query): Query<RunTargetQuery>,
 ) -> Result<Json<RemoteRunView>, ApiError> {
-    let (agent, run_id) = require_run(&state, query.connector_id.as_deref(), run_id).await?;
-    Ok(Json(RemoteRunView {
-        view: agent.inspect(&run_id).await?,
-        input: agent.initial_input(&run_id).await?,
-    }))
+    let connector_id = query.connector_id.as_deref().map(AgentConnectorId::new);
+    let (agent, run_id) = require_run(
+        &state,
+        connector_id.as_ref().map(AgentConnectorId::as_str),
+        run_id,
+    )
+    .await?;
+    Ok(Json(RemoteRunView::new(
+        &state,
+        connector_id.as_ref(),
+        agent.inspect(&run_id).await?,
+        agent.initial_input(&run_id).await?,
+    )))
 }
 
 async fn recover_run(
@@ -1555,19 +1664,45 @@ async fn recover_run(
     Path(run_id): Path<String>,
     Query(query): Query<RunTargetQuery>,
 ) -> Result<Json<RemoteRunView>, ApiError> {
-    let (agent, run_id) = require_run(&state, query.connector_id.as_deref(), run_id).await?;
+    let connector_id = query.connector_id.as_deref().map(AgentConnectorId::new);
+    let (agent, run_id) = require_run(
+        &state,
+        connector_id.as_ref().map(AgentConnectorId::as_str),
+        run_id,
+    )
+    .await?;
     let current = agent.inspect(&run_id).await?;
     let view = if current.state.status()
         == orchestral_core::agent_protocol::reference::AgentRunStatus::Unknown
     {
-        agent.recover(&run_id).await?
+        let key = RunSupervisorRegistry::key(connector_id.as_ref(), &run_id);
+        if state.run_supervisors.manual_reason(&key).is_some() {
+            current
+        } else {
+            match agent.recover(&run_id).await {
+                Ok(view) => {
+                    state.run_supervisors.clear_manual(&key);
+                    view
+                }
+                Err(error) if !is_retryable_agent_error(&error) => {
+                    state.run_supervisors.mark_manual(key, error.to_string());
+                    current
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
     } else {
+        state
+            .run_supervisors
+            .clear_manual(&RunSupervisorRegistry::key(connector_id.as_ref(), &run_id));
         current
     };
-    Ok(Json(RemoteRunView {
+    Ok(Json(RemoteRunView::new(
+        &state,
+        connector_id.as_ref(),
         view,
-        input: agent.initial_input(&run_id).await?,
-    }))
+        agent.initial_input(&run_id).await?,
+    )))
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -4038,6 +4173,8 @@ mod tests {
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let view: serde_json::Value = serde_json::from_slice(&body).unwrap();
             if view["state"]["state"] == "unknown" {
+                assert_eq!(view["recovery"]["mode"], "manual");
+                assert_eq!(view["recovery"]["can_start_new_run"], false);
                 unknown = true;
                 break;
             }
@@ -4062,6 +4199,27 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(error["code"], "run_recovery_pending");
+    }
+
+    #[test]
+    fn manual_recovery_registry_stops_repeat_supervision() {
+        let registry = RunSupervisorRegistry::default();
+        let run_id = RunId::new("manual-run");
+        let key = RunSupervisorRegistry::key(None, &run_id);
+
+        assert!(registry.begin(&key));
+        registry.finish(&key);
+        registry.mark_manual(key.clone(), "unsafe model boundary".to_owned());
+
+        assert!(!registry.begin(&key));
+        assert_eq!(
+            registry.manual_reason(&key).as_deref(),
+            Some("unsafe model boundary")
+        );
+
+        registry.clear_manual(&key);
+        assert!(registry.begin(&key));
+        registry.finish(&key);
     }
 
     #[tokio::test]

@@ -718,7 +718,11 @@ impl AppController {
     }
 
     pub async fn load_session(mut self, session_key: String) {
-        self.state.write().ui.loading_session = Some(session_key.clone());
+        {
+            let mut state = self.state.write();
+            state.ui.loading_session = Some(session_key.clone());
+            state.ui.timeline_scrolled_away = false;
+        }
         self.load_session_inner(session_key.clone()).await;
         let still_selected = {
             let mut state = self.state.write();
@@ -761,6 +765,7 @@ impl AppController {
             state.sessions.selected_id = Some(session_key.clone());
             state.ui.drawer_open = false;
             state.ui.session_actions_open = false;
+            state.ui.timeline_scrolled_away = false;
         }
         let mut initial_observer_errors = 0;
         if let Some(connector_id) = session.connector_id.as_deref() {
@@ -1325,6 +1330,7 @@ impl AppController {
                     platform::now(),
                     native_anchor_id,
                 );
+            self.state.write().ui.timeline_scrolled_away = false;
             spawn(async move {
                 TimeoutFuture::new(0).await;
                 platform::scroll_timeline_to_end();
@@ -1426,6 +1432,7 @@ impl AppController {
                 session.connector_id.clone(),
             )
             .optimistic_start_input(display_input.clone(), now, native_anchor_id.clone());
+        self.state.write().ui.timeline_scrolled_away = false;
         self.stop_stream();
         spawn(async move {
             TimeoutFuture::new(0).await;
@@ -2356,6 +2363,7 @@ impl AppController {
         let follow_timeline = platform::timeline_is_near_end();
         let tail_before = self.state.read().selected_timeline_tail_key();
         let mut timeline_changed = false;
+        let mut resolve_recovery = false;
         match event {
             StreamEvent::Durable { data, .. } => {
                 if let Ok(record) = serde_json::from_str::<Value>(&data) {
@@ -2368,6 +2376,7 @@ impl AppController {
                         let run = state.ensure_run(run_id, None);
                         run.project_durable(&record, platform::now());
                         let terminal = is_terminal(&run.status);
+                        resolve_recovery = run.status == "unknown" && !run.recovery_is_manual();
                         state.reconcile_request_actions(run_id);
                         terminal
                     };
@@ -2410,6 +2419,63 @@ impl AppController {
                 TimeoutFuture::new(0).await;
                 platform::scroll_timeline_to_end();
             });
+        }
+        if resolve_recovery {
+            let controller = self;
+            let run_id = run_id.to_owned();
+            spawn(async move {
+                // Let the Host supervisor publish its disposition first. The
+                // explicit endpoint is still authoritative if this client is
+                // the first observer after continuity loss.
+                TimeoutFuture::new(100).await;
+                controller.resolve_run_recovery(run_id, generation).await;
+            });
+        }
+    }
+
+    async fn resolve_run_recovery(mut self, run_id: String, generation: u64) {
+        if *self.stream_generation.read() != generation {
+            return;
+        }
+        let Some(token) = self.token.read().clone() else {
+            return;
+        };
+        let connector_id = self
+            .state
+            .read()
+            .runs
+            .get(&run_id)
+            .and_then(|run| run.connector_id.clone());
+        match self
+            .api
+            .recover(&token, &run_id, connector_id.as_deref())
+            .await
+        {
+            Ok(view) => {
+                if *self.stream_generation.read() != generation {
+                    return;
+                }
+                let manual = {
+                    let mut state = self.state.write();
+                    let run = state.ensure_run_source(&run_id, None, connector_id);
+                    run.apply_view(view, platform::now());
+                    run.recovery_is_manual()
+                };
+                if manual {
+                    self.stop_run_stream();
+                    let mut state = self.state.write();
+                    state.connection.stream = "idle".to_owned();
+                    state.connection.attempt = 0;
+                    state.connection.error = None;
+                }
+            }
+            Err(error) if error.status == 401 => self.clear_auth(Some(error.message)).await,
+            Err(error) => {
+                // Retryable recovery remains owned by the Host supervisor.
+                // Keep the durable Run stream attached without turning a
+                // control-plane delay into a browser reconnect loop.
+                self.state.write().connection.error = Some(error.message);
+            }
         }
     }
 
@@ -2477,6 +2543,19 @@ impl AppController {
         }
     }
 
+    pub fn update_timeline_scroll_state(mut self) {
+        let scrolled_away = !platform::timeline_is_near_end();
+        let mut state = self.state.write();
+        if state.ui.timeline_scrolled_away != scrolled_away {
+            state.ui.timeline_scrolled_away = scrolled_away;
+        }
+    }
+
+    pub fn jump_timeline_to_latest(mut self) {
+        self.state.write().ui.timeline_scrolled_away = false;
+        platform::scroll_timeline_to_end();
+    }
+
     pub fn set_theme(mut self, theme: String) {
         self.preferences.write().theme = theme.clone();
         storage::save_preferences(&self.preferences.read());
@@ -2526,6 +2605,7 @@ impl AppController {
         state.sessions.error = None;
         if select {
             state.sessions.selected_id = Some(session_key);
+            state.ui.timeline_scrolled_away = false;
         }
     }
 

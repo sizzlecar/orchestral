@@ -54,15 +54,13 @@ impl InternalGenericAgentProvider {
             }
             GenericCheckpointPhase::ModelAttemptOpen {
                 round, request_id, ..
-            } => Err(AgentProtocolError::new(
-                AgentProtocolErrorCode::InvalidTransition,
-                "Generic Agent recovery is unsafe while a model attempt outcome is unknown",
-            )
-            .with_details(serde_json::json!({
-                "boundary": "model_attempt_open",
-                "round": round,
-                "request_id": request_id,
-            }))),
+            } => stage_interrupted_model_recovery(
+                self.inner.clone(),
+                stored,
+                round,
+                request_id,
+                recovery_events,
+            ),
             GenericCheckpointPhase::ModelAttemptObserved {
                 boundary,
                 round,

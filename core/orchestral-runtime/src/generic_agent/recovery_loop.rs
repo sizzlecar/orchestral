@@ -28,6 +28,102 @@ pub(super) fn recovered_model_output_tokens(
     })
 }
 
+/// Closes a Run whose process disappeared after the model request was
+/// durably opened but before its outcome was observed.
+///
+/// Retrying that model request could duplicate work, while leaving the Run
+/// permanently Unknown prevents every later Run in the same Session. The
+/// only safe forward transition is therefore an explicit incomplete terminal.
+/// Its private-WAL commit remains behind the Host recovery confirmation gate,
+/// just like reconstructed executable work.
+pub(super) fn stage_interrupted_model_recovery(
+    inner: Arc<GenericInner>,
+    stored: StoredGenericAgentRun,
+    round: u64,
+    request_id: ModelRequestId,
+    recovery_events: Vec<AgentEventDraft>,
+) -> Result<AgentRecovery, AgentProtocolError> {
+    let run_id = stored.registration.execution.run_id.clone();
+    let expected_previous = stored.last_checkpoint_seq();
+    let terminal = AgentEventDraft {
+        event_id: AgentEventId::new(format!(
+            "generic-{}-model-attempt-interrupted-{round}",
+            run_id.as_str()
+        )),
+        run_id: run_id.clone(),
+        causation_id: None,
+        source_fingerprint: None,
+        payload: AgentEvent::RunIncomplete {
+            reason: IncompleteReason::Interrupted {
+                reason: "Host restarted before the model attempt outcome was observed".to_owned(),
+            },
+            partial_delivery: None,
+        },
+    };
+    terminal.validate_integrity()?;
+
+    let (sender, _) = broadcast::channel(inner.config.stream_buffer);
+    let receiver = sender.subscribe();
+    let replay = stream::iter(
+        recovery_events
+            .into_iter()
+            .map(|draft| Ok(AgentProviderStreamItem::Event(Box::new(draft)))),
+    );
+    let live = stream::unfold(receiver, |mut receiver| async move {
+        match receiver.recv().await {
+            Ok(item) => Some((item, receiver)),
+            Err(broadcast::error::RecvError::Lagged(skipped)) => Some((
+                Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::SequenceGap,
+                    format!("Generic Agent recovery stream lagged by {skipped}"),
+                )),
+                receiver,
+            )),
+            Err(broadcast::error::RecvError::Closed) => None,
+        }
+    });
+    let recovery_stream = replay.chain(live).boxed();
+    let checkpoint_store = inner.checkpoint_store.clone();
+    let confirmation_run_id = run_id.clone();
+    let confirmation_event = terminal.clone();
+    let confirmation = async move {
+        checkpoint_store
+            .append(
+                &confirmation_run_id,
+                expected_previous,
+                GenericCheckpointDraft {
+                    event_id: GenericCheckpointEventId::new(format!(
+                        "generic-{}-model-attempt-interrupted-{round}",
+                        confirmation_run_id.as_str()
+                    )),
+                    run_id: confirmation_run_id.clone(),
+                    payload: GenericCheckpointEvent::ProviderEventsCommitted {
+                        events: vec![confirmation_event.clone()],
+                    },
+                },
+            )
+            .map_err(checkpoint_recovery_error)?;
+        sender
+            .send(Ok(AgentProviderStreamItem::Event(Box::new(
+                confirmation_event,
+            ))))
+            .map_err(|_| {
+                AgentProtocolError::new(
+                    AgentProtocolErrorCode::ProviderUnavailable,
+                    "Host detached before the interrupted model Run was closed",
+                )
+                .with_retryable(true)
+                .with_details(serde_json::json!({
+                    "boundary": "model_attempt_open",
+                    "round": round,
+                    "request_id": request_id,
+                }))
+            })?;
+        Ok(())
+    };
+    Ok(AgentRecovery::staged(recovery_stream, confirmation))
+}
+
 pub(super) fn stage_loop_recovery(
     inner: Arc<GenericInner>,
     stored: StoredGenericAgentRun,

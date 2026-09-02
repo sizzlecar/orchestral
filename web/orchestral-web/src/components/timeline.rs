@@ -19,6 +19,7 @@ pub fn ConversationTimeline() -> Element {
     let loading_session = state
         .selected_session()
         .is_some_and(|session| state.ui.loading_session.as_deref() == Some(session.key().as_str()));
+    let scrolled_away = state.ui.timeline_scrolled_away;
     let (blocks, runs) = state
         .selected_session()
         .map(|session| {
@@ -44,55 +45,67 @@ pub fn ConversationTimeline() -> Element {
     drop(state);
 
     rsx! {
-        section {
-            class: "message-list",
-            role: "log",
-            aria_label: "对话内容",
-            aria_live: "polite",
-            if let Some((loading, online)) = history_pagination {
-                div { class: "history-pagination",
-                    button {
-                        class: "history-pagination__button",
-                        r#type: "button",
-                        disabled: loading || !online,
-                        aria_label: "加载更早的会话记录",
-                        onclick: move |_| {
-                            spawn(async move { controller.load_earlier_agent_history().await });
-                        },
-                        if loading { "正在加载更早记录…" } else { "加载更早记录" }
+        div { class: "timeline-stage",
+            section {
+                class: "message-list",
+                role: "log",
+                aria_label: "对话内容",
+                aria_live: "polite",
+                onscroll: move |_| controller.update_timeline_scroll_state(),
+                if let Some((loading, online)) = history_pagination {
+                    div { class: "history-pagination",
+                        button {
+                            class: "history-pagination__button",
+                            r#type: "button",
+                            disabled: loading || !online,
+                            aria_label: "加载更早的会话记录",
+                            onclick: move |_| {
+                                spawn(async move { controller.load_earlier_agent_history().await });
+                            },
+                            if loading { "正在加载更早记录…" } else { "加载更早记录" }
+                        }
+                    }
+                }
+                if empty && loading_session {
+                    div { class: "timeline-skeleton", role: "status", aria_label: "正在加载会话内容",
+                        span { class: "timeline-skeleton__line timeline-skeleton__line--short" }
+                        span { class: "timeline-skeleton__bubble" }
+                        span { class: "timeline-skeleton__line" }
+                        span { class: "timeline-skeleton__line timeline-skeleton__line--medium" }
+                    }
+                } else if empty {
+                    div { class: "empty-state",
+                        div { class: "empty-state__mark", aria_hidden: "true", "✦" }
+                        p { class: "eyebrow", "随时可以开始" }
+                        h2 { "今天想推进什么？" }
+                        p { class: "empty-state__intro",
+                            "描述目标、贴一段错误，或者交给我一项完整任务。过程与结果都会保留在这个会话里。"
+                        }
+                    }
+                } else {
+                    for (key, entry) in blocks {
+                        TimelineBlockView {
+                            key: "{key}",
+                            run_id: entry.run_id,
+                            block: entry.block
+                        }
+                    }
+                    for run in runs {
+                        if let Some(failure) = run.failure.as_ref() {
+                            RunFailure { value: failure.clone() }
+                        } else if let Some(error) = run.error.as_ref() {
+                            div { class: "run-failure", "{error}" }
+                        }
                     }
                 }
             }
-            if empty && loading_session {
-                div { class: "timeline-skeleton", role: "status", aria_label: "正在加载会话内容",
-                    span { class: "timeline-skeleton__line timeline-skeleton__line--short" }
-                    span { class: "timeline-skeleton__bubble" }
-                    span { class: "timeline-skeleton__line" }
-                    span { class: "timeline-skeleton__line timeline-skeleton__line--medium" }
-                }
-            } else if empty {
-                div { class: "empty-state",
-                    div { class: "empty-state__mark", aria_hidden: "true", "✦" }
-                    p { class: "eyebrow", "随时可以开始" }
-                    h2 { "今天想推进什么？" }
-                    p { class: "empty-state__intro",
-                        "描述目标、贴一段错误，或者交给我一项完整任务。过程与结果都会保留在这个会话里。"
-                    }
-                }
-            } else {
-                for (key, entry) in blocks {
-                    TimelineBlockView {
-                        key: "{key}",
-                        run_id: entry.run_id,
-                        block: entry.block
-                    }
-                }
-                for run in runs {
-                    if let Some(failure) = run.failure.as_ref() {
-                        RunFailure { value: failure.clone() }
-                    } else if let Some(error) = run.error.as_ref() {
-                        div { class: "run-failure", "{error}" }
-                    }
+            if scrolled_away {
+                button {
+                    class: "timeline-jump",
+                    r#type: "button",
+                    aria_label: "跳到最新消息",
+                    onclick: move |_| controller.jump_timeline_to_latest(),
+                    "↓ 最新消息"
                 }
             }
         }

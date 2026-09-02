@@ -158,6 +158,13 @@ pub struct Progress {
     pub order: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunRecoveryState {
+    pub mode: String,
+    pub can_start_new_run: bool,
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunState {
     pub id: String,
@@ -199,6 +206,10 @@ pub struct RunState {
     pub started_at: Option<f64>,
     pub completed_at: Option<f64>,
     pub error: Option<String>,
+    /// Host control-plane disposition for an `unknown` protocol state.
+    /// `unknown` alone cannot distinguish progress from an unrecoverable
+    /// execution boundary and previously locked the composer forever.
+    pub recovery: Option<RunRecoveryState>,
 }
 
 impl RunState {
@@ -234,12 +245,29 @@ impl RunState {
             started_at: None,
             completed_at: None,
             error: None,
+            recovery: None,
         }
     }
 
     fn next_order(&mut self) -> u64 {
         self.presentation_cursor = self.presentation_cursor.saturating_add(1);
         self.presentation_cursor
+    }
+
+    pub fn recovery_is_manual(&self) -> bool {
+        self.status == "unknown"
+            && self
+                .recovery
+                .as_ref()
+                .is_some_and(|recovery| recovery.mode == "manual")
+    }
+
+    pub fn recovery_allows_new_run(&self) -> bool {
+        self.recovery_is_manual()
+            && self
+                .recovery
+                .as_ref()
+                .is_some_and(|recovery| recovery.can_start_new_run)
     }
 
     pub fn apply_view(&mut self, view: Value, now: f64) {
@@ -308,11 +336,33 @@ impl RunState {
             self.completed_at.get_or_insert(now);
             self.settle_unresolved_commands_for_terminal();
         }
+        self.recovery = if status == "unknown" {
+            view.get("recovery").and_then(|recovery| {
+                Some(RunRecoveryState {
+                    mode: recovery.get("mode")?.as_str()?.to_owned(),
+                    can_start_new_run: recovery
+                        .get("can_start_new_run")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    reason: recovery
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                })
+            })
+        } else {
+            None
+        };
         self.error = if status == "unknown" {
-            view.get("state")
-                .and_then(|value| value.get("reason"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
+            self.recovery
+                .as_ref()
+                .and_then(|recovery| recovery.reason.clone())
+                .or_else(|| {
+                    view.get("state")
+                        .and_then(|value| value.get("reason"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
                 .or_else(|| self.error.clone())
         } else {
             None
@@ -622,6 +672,11 @@ impl RunState {
             }
             "continuity_lost" => {
                 self.status = "unknown".to_owned();
+                self.recovery = Some(RunRecoveryState {
+                    mode: "automatic".to_owned(),
+                    can_start_new_run: false,
+                    reason: None,
+                });
                 self.error = payload
                     .get("reason")
                     .and_then(Value::as_str)
@@ -635,6 +690,7 @@ impl RunState {
                 }
                 .to_owned();
                 self.error = None;
+                self.recovery = None;
             }
             _ => {}
         }
@@ -917,6 +973,10 @@ pub struct UiState {
     pub new_session_open: bool,
     pub session_actions_open: bool,
     pub composer_busy: bool,
+    /// The reader deliberately left the live edge. New events remain locally
+    /// merged but do not steal their scroll position; the UI exposes an
+    /// explicit jump-to-latest control instead.
+    pub timeline_scrolled_away: bool,
     /// Session whose transcript is currently being loaded. This is keyed so
     /// an older request cannot clear the loading state of a newer selection.
     pub loading_session: Option<String>,
@@ -1047,6 +1107,7 @@ impl AppState {
         self.ui.drawer_open = false;
         self.ui.session_actions_open = false;
         self.ui.loading_session = None;
+        self.ui.timeline_scrolled_away = false;
         self.ui.session_tab = Some(connector_id);
         self.ui.session_page = 0;
     }
@@ -1110,6 +1171,32 @@ impl AppState {
             .filter_map(controlled_run_id)
             .collect::<Vec<_>>();
 
+        // `controlled_runs` is an authoritative, bounded control-plane view,
+        // not an append-only history. Keeping every Run ever observed for a
+        // native session causes an old Host mirror to reappear as soon as its
+        // correlation id slides out of the provider's latest history page.
+        // Preserve only a local submission that has not reached the Host yet;
+        // all accepted Runs are represented by the response above.
+        let local_submissions = self
+            .sessions
+            .items
+            .iter()
+            .find(|session| {
+                session.id == session_id
+                    && session.connector_id.as_deref() == Some(connector_id.as_str())
+            })
+            .into_iter()
+            .flat_map(|session| session.run_ids.iter())
+            .filter(|candidate| *candidate != &run_id)
+            .filter(|candidate| !controlled_run_ids.contains(candidate))
+            .filter(|candidate| {
+                self.runs
+                    .get(*candidate)
+                    .is_some_and(|run| run.status == "submitting")
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
         if let Some(session) = self.sessions.items.iter_mut().find(|session| {
             session.id == session_id
                 && session.connector_id.as_deref() == Some(connector_id.as_str())
@@ -1125,14 +1212,10 @@ impl AppState {
             if let Some(updated_at) = detail.summary.updated_at_unix_ms {
                 session.updated_at_unix_ms = updated_at;
             }
-            if !session.run_ids.contains(&run_id) {
-                session.run_ids.insert(0, run_id.clone());
-            }
-            for controlled_run_id in &controlled_run_ids {
-                if !session.run_ids.contains(controlled_run_id) {
-                    session.run_ids.push(controlled_run_id.clone());
-                }
-            }
+            session.run_ids.clear();
+            session.run_ids.push(run_id.clone());
+            session.run_ids.extend(controlled_run_ids.iter().cloned());
+            session.run_ids.extend(local_submissions);
         } else {
             let mut session = detail.summary.clone().into_session();
             session.run_ids.extend(controlled_run_ids.iter().cloned());
@@ -1207,6 +1290,11 @@ impl AppState {
                 );
                 run.status = "delivered".to_owned();
                 let activity_id = activity.activity_id.clone();
+                let client_id = activity
+                    .details
+                    .get("clientId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
                 if !run.history_live_turn_ids.contains_key(&turn_id) {
                     run.history_live_turn_starts.push(activity_id.clone());
                     run.history_live_turn_ids
@@ -1215,7 +1303,12 @@ impl AppState {
                 let existing_order = run
                     .messages
                     .iter()
-                    .find(|message| message.id == activity_id)
+                    .find(|message| {
+                        message.id == activity_id
+                            || client_id.as_ref().is_some_and(|client_id| {
+                                message.client_id.as_ref() == Some(client_id)
+                            })
+                    })
                     .map(|message| message.order)
                     .or_else(|| {
                         run.activities
@@ -1223,7 +1316,12 @@ impl AppState {
                             .find(|item| item.id == activity_id)
                             .map(|item| item.order)
                     });
-                run.messages.retain(|message| message.id != activity_id);
+                run.messages.retain(|message| {
+                    message.id != activity_id
+                        && client_id
+                            .as_ref()
+                            .is_none_or(|client_id| message.client_id.as_ref() != Some(client_id))
+                });
                 run.activities.retain(|item| item.id != activity_id);
                 if let Some(mut item) = agent_history_item(activity) {
                     let order = existing_order.unwrap_or_else(|| run.next_order());
@@ -1316,7 +1414,7 @@ impl AppState {
             matches!(
                 run.status.as_str(),
                 "accepted" | "running" | "waiting" | "stopping" | "unknown"
-            )
+            ) && !run.recovery_is_manual()
         })
     }
 
@@ -1339,7 +1437,8 @@ impl AppState {
     }
 
     pub fn recoverable_run(&self) -> Option<&RunState> {
-        self.current_run().filter(|run| run.status == "unknown")
+        self.current_run()
+            .filter(|run| run.status == "unknown" && !run.recovery_allows_new_run())
     }
 
     /// Drops request-action locks that are no longer backed by a pending
@@ -1398,6 +1497,13 @@ impl AgentHistoryItem {
             Self::Activity(activity) => activity.order = order,
         }
     }
+
+    fn client_id(&self) -> Option<&str> {
+        match self {
+            Self::Message(message) => message.client_id.as_deref(),
+            Self::Activity(_) => None,
+        }
+    }
 }
 
 fn project_latest_agent_history(run: &mut RunState, turns: Vec<crate::model::AgentSessionTurn>) {
@@ -1415,11 +1521,21 @@ fn project_latest_agent_history(run: &mut RunState, turns: Vec<crate::model::Age
         .map(|activity| activity.activity_id.clone())
         .collect();
     let mut incoming_ids = BTreeSet::new();
+    let mut incoming_client_ids = BTreeSet::new();
     let mut incoming = turns
         .into_iter()
         .flat_map(|turn| turn.activities)
         .filter_map(agent_history_item)
-        .filter(|item| incoming_ids.insert(item.id().to_owned()))
+        .filter(|item| {
+            incoming_ids.insert(item.id().to_owned())
+                && match item {
+                    AgentHistoryItem::Message(message) => message
+                        .client_id
+                        .as_ref()
+                        .is_none_or(|client_id| incoming_client_ids.insert(client_id.clone())),
+                    AgentHistoryItem::Activity(_) => true,
+                }
+        })
         .collect::<Vec<_>>();
 
     if !run.history_pagination_started {
@@ -1455,9 +1571,24 @@ fn project_latest_agent_history(run: &mut RunState, turns: Vec<crate::model::Age
                 .map(|activity| (activity.id.clone(), activity.order)),
         )
         .collect::<BTreeMap<_, _>>();
+    let existing_client_orders = run
+        .messages
+        .iter()
+        .filter_map(|message| {
+            message
+                .client_id
+                .as_ref()
+                .map(|client_id| (client_id.clone(), message.order))
+        })
+        .collect::<BTreeMap<_, _>>();
     let replaced_ids = incoming_ids.clone();
-    run.messages
-        .retain(|message| !replaced_ids.contains(&message.id));
+    run.messages.retain(|message| {
+        !replaced_ids.contains(&message.id)
+            && message
+                .client_id
+                .as_ref()
+                .is_none_or(|client_id| !incoming_client_ids.contains(client_id))
+    });
     run.activities
         .retain(|activity| !replaced_ids.contains(&activity.id));
     run.presentation_cursor = run
@@ -1469,7 +1600,10 @@ fn project_latest_agent_history(run: &mut RunState, turns: Vec<crate::model::Age
         .unwrap_or_default();
 
     for item in &mut incoming {
-        if let Some(order) = existing_orders.get(item.id()) {
+        if let Some(order) = existing_orders.get(item.id()).or_else(|| {
+            item.client_id()
+                .and_then(|client_id| existing_client_orders.get(client_id))
+        }) {
             item.set_order(*order);
         } else {
             item.set_order(run.next_order());
@@ -1501,11 +1635,25 @@ fn append_agent_history(
         .map(|message| message.id.clone())
         .chain(run.activities.iter().map(|activity| activity.id.clone()))
         .collect::<BTreeSet<_>>();
+    let mut seen_client_ids = run
+        .messages
+        .iter()
+        .filter_map(|message| message.client_id.clone())
+        .collect::<BTreeSet<_>>();
     let mut items = turns
         .into_iter()
         .flat_map(|turn| turn.activities)
         .filter_map(agent_history_item)
-        .filter(|item| seen_ids.insert(item.id().to_owned()))
+        .filter(|item| {
+            seen_ids.insert(item.id().to_owned())
+                && match item {
+                    AgentHistoryItem::Message(message) => message
+                        .client_id
+                        .as_ref()
+                        .is_none_or(|client_id| seen_client_ids.insert(client_id.clone())),
+                    AgentHistoryItem::Activity(_) => true,
+                }
+        })
         .collect::<Vec<_>>();
 
     if prepend {
@@ -1697,7 +1845,7 @@ pub fn timeline_run_ids_for_session(state: &AppState, session: &SessionView) -> 
         .into_iter()
         .flat_map(|run| run.messages.iter())
         .filter_map(|message| message.client_id.as_deref())
-        .filter_map(orchestral_run_id_from_client_id)
+        .filter_map(orchestral_run_id_from_any_client_id)
         .map(str::to_owned)
         .collect::<BTreeSet<_>>();
 
@@ -2094,6 +2242,11 @@ fn orchestral_run_id_from_client_id(client_id: &str) -> Option<&str> {
     let value = client_id.strip_prefix("orchestral:")?;
     let (run_id, digest) = value.split_once(':')?;
     (!run_id.is_empty() && !digest.is_empty()).then_some(run_id)
+}
+
+fn orchestral_run_id_from_any_client_id(client_id: &str) -> Option<&str> {
+    orchestral_run_id_from_client_id(client_id)
+        .or_else(|| orchestral_command_identity(client_id).map(|(run_id, _command_id)| run_id))
 }
 
 fn orchestral_command_identity(client_id: &str) -> Option<(&str, &str)> {
@@ -2879,6 +3032,51 @@ mod tests {
             state.recoverable_run().map(|run| run.id.as_str()),
             Some("run-1")
         );
+    }
+
+    #[test]
+    fn manual_recovery_keeps_the_session_locked_until_a_terminal_event() {
+        let mut state = AppState::new(true);
+        state.sessions.items.push(SessionView {
+            id: "thread-1".to_owned(),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+            run_ids: vec!["run-1".to_owned()],
+            connector_id: None,
+            title: None,
+            preview: None,
+            cwd: None,
+            state: Some("active".to_owned()),
+            execution_profile: Default::default(),
+        });
+        state.sessions.selected_id = Some("thread-1".to_owned());
+        state
+            .ensure_run("run-1", Some("thread-1".to_owned()))
+            .apply_view(
+                serde_json::json!({
+                    "execution": {"session_id": "thread-1", "run_id": "run-1"},
+                    "state": {
+                        "state": "unknown",
+                        "last_confirmed_seq": 4,
+                        "reason": "Host continuity is unavailable"
+                    },
+                    "last_run_seq": 5,
+                    "pending_requests": [],
+                    "recovery": {
+                        "mode": "manual",
+                    "can_start_new_run": false,
+                        "reason": "model attempt outcome is unknown"
+                    }
+                }),
+                1.0,
+            );
+
+        let run = state.current_run().expect("manual Run remains visible");
+        assert!(run.recovery_is_manual());
+        assert!(!run.recovery_allows_new_run());
+        assert!(state.active_run().is_none());
+        assert!(state.observable_run().is_none());
+        assert!(state.recoverable_run().is_some());
     }
 
     #[test]
@@ -3712,6 +3910,214 @@ mod tests {
     }
 
     #[test]
+    fn native_steer_identity_hides_the_same_runs_initial_mirror() {
+        let detail: AgentSessionDetail = serde_json::from_value(serde_json::json!({
+            "summary": {
+                "connector_id": "codex/local",
+                "session_id": "thread-1",
+                "state": "active"
+            },
+            "turns": [{
+                "turn_id": "turn-latest",
+                "status": "active",
+                "activities": [{
+                    "activity_id": "native-steer",
+                    "kind": "user_message",
+                    "status": "completed",
+                    "content": [{"body": {"kind": "inline", "value": "latest steer"}}],
+                    "details": {
+                        "clientId": "orchestral-command:run-1:command-1:sha256:digest"
+                    }
+                }]
+            }],
+            "controlled_runs": [{
+                "created_at_unix_ms": 1000,
+                "execution": {"session_id": "thread-1", "run_id": "run-1"},
+                "state": {"state": "running"},
+                "last_run_seq": 2,
+                "input": [{"body": {"kind": "inline", "value": "old initial input"}}]
+            }]
+        }))
+        .unwrap();
+        let mut state = AppState::new(true);
+        state.project_agent_session(detail);
+
+        let session = state.sessions.items.first().unwrap();
+        assert_eq!(
+            timeline_run_ids_for_session(&state, session),
+            vec!["agent-history:codex/local:thread-1".to_owned()]
+        );
+        let messages = timeline_blocks_for_session(&state, session)
+            .into_iter()
+            .filter_map(|entry| match entry.block {
+                TimelineBlock::Entry(TimelineItem::Message(message)) => Some(message.text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(messages, ["latest steer"]);
+    }
+
+    #[test]
+    fn authoritative_session_projection_drops_stale_controlled_runs() {
+        let detail = |controlled_runs: Value| {
+            serde_json::from_value::<AgentSessionDetail>(serde_json::json!({
+                "summary": {
+                    "connector_id": "codex/local",
+                    "session_id": "thread-1",
+                    "state": "active"
+                },
+                "turns": [{
+                    "turn_id": "turn-latest",
+                    "status": "active",
+                    "activities": [{
+                        "activity_id": "native-latest",
+                        "kind": "agent_message",
+                        "status": "completed",
+                        "content": [{"body": {"kind": "inline", "value": "latest"}}]
+                    }]
+                }],
+                "controlled_runs": controlled_runs
+            }))
+            .unwrap()
+        };
+        let old_run = serde_json::json!([{
+            "created_at_unix_ms": 1000,
+            "execution": {"session_id": "thread-1", "run_id": "old-run"},
+            "state": {"state": "terminal", "terminal": {"type": "failed"}},
+            "last_run_seq": 4,
+            "input": [{"body": {"kind": "inline", "value": "old input"}}]
+        }]);
+        let mut state = AppState::new(true);
+        state.project_agent_session(detail(old_run));
+        assert!(state.sessions.items[0]
+            .run_ids
+            .contains(&"old-run".to_owned()));
+
+        state.project_agent_session(detail(serde_json::json!([])));
+
+        assert_eq!(
+            state.sessions.items[0].run_ids,
+            ["agent-history:codex/local:thread-1"]
+        );
+        let messages = timeline_blocks_for_session(&state, &state.sessions.items[0])
+            .into_iter()
+            .filter_map(|entry| match entry.block {
+                TimelineBlock::Entry(TimelineItem::Message(message)) => Some(message.text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(messages, ["latest"]);
+    }
+
+    #[test]
+    fn native_client_identity_is_idempotent_across_snapshot_and_sse() {
+        let mut state = AppState::new(true);
+        let detail: AgentSessionDetail = serde_json::from_value(serde_json::json!({
+            "summary": {
+                "connector_id": "codex/local",
+                "session_id": "thread-1",
+                "state": "active"
+            },
+            "turns": [{
+                "turn_id": "turn-1",
+                "status": "active",
+                "activities": [
+                    {
+                        "activity_id": "native-user-a",
+                        "kind": "user_message",
+                        "status": "completed",
+                        "content": [{"body": {"kind": "inline", "value": "one"}}],
+                        "details": {"clientId": "orchestral-command:run-1:command-1:digest"}
+                    },
+                    {
+                        "activity_id": "native-user-b",
+                        "kind": "user_message",
+                        "status": "completed",
+                        "content": [{"body": {"kind": "inline", "value": "duplicate"}}],
+                        "details": {"clientId": "orchestral-command:run-1:command-1:digest"}
+                    }
+                ]
+            }],
+            "stream_cursor": 1
+        }))
+        .unwrap();
+        state.project_agent_session(detail);
+        let run_id = "agent-history:codex/local:thread-1";
+        assert_eq!(state.runs[run_id].messages.len(), 1);
+        let stable_order = state.runs[run_id].messages[0].order;
+
+        state.apply_agent_session_change(AgentSessionChangeView {
+            connector_id: "codex/local".to_owned(),
+            session_id: "thread-1".to_owned(),
+            sequence: 2,
+            change: AgentSessionChangeKindView::ActivityUpsert {
+                turn_id: "turn-1".to_owned(),
+                turn_status: "active".to_owned(),
+                activity: AgentSessionActivity {
+                    activity_id: "native-user-c".to_owned(),
+                    kind: "user_message".to_owned(),
+                    status: "completed".to_owned(),
+                    title: None,
+                    content: vec![serde_json::json!({
+                        "body": {"kind": "inline", "value": "authoritative"}
+                    })],
+                    details: serde_json::json!({
+                        "clientId": "orchestral-command:run-1:command-1:digest"
+                    }),
+                },
+            },
+        });
+
+        assert_eq!(state.runs[run_id].messages.len(), 1);
+        assert_eq!(state.runs[run_id].messages[0].text, "authoritative");
+        assert_eq!(state.runs[run_id].messages[0].order, stable_order);
+    }
+
+    #[test]
+    fn native_client_identity_replaces_changed_activity_id_after_pagination() {
+        let detail = |activity_id: &str, text: &str| {
+            serde_json::from_value::<AgentSessionDetail>(serde_json::json!({
+                "summary": {
+                    "connector_id": "codex/local",
+                    "session_id": "thread-1",
+                    "state": "active"
+                },
+                "turns": [{
+                    "turn_id": "turn-1",
+                    "status": "active",
+                    "activities": [{
+                        "activity_id": activity_id,
+                        "kind": "user_message",
+                        "status": "completed",
+                        "content": [{"body": {"kind": "inline", "value": text}}],
+                        "details": {
+                            "clientId": "orchestral-command:run-1:command-1:digest"
+                        }
+                    }]
+                }]
+            }))
+            .unwrap()
+        };
+        let mut state = AppState::new(true);
+        state.project_agent_session(detail("native-user-a", "optimistic echo"));
+        let run_id = "agent-history:codex/local:thread-1";
+        let stable_order = state.runs[run_id].messages[0].order;
+        state
+            .runs
+            .get_mut(run_id)
+            .unwrap()
+            .history_pagination_started = true;
+
+        state.project_agent_session(detail("native-user-b", "authoritative echo"));
+
+        let messages = &state.runs[run_id].messages;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, "native-user-b");
+        assert_eq!(messages[0].text, "authoritative echo");
+        assert_eq!(messages[0].order, stable_order);
+    }
+
+    #[test]
     fn deferred_agent_queue_item_is_not_presented_as_running() {
         let detail: AgentSessionDetail = serde_json::from_value(serde_json::json!({
             "summary": {
@@ -3931,7 +4337,7 @@ mod tests {
     }
 
     #[test]
-    fn refreshing_agent_snapshot_preserves_controlled_runs_and_exposes_agent_pending() {
+    fn authoritative_agent_snapshot_drops_stale_controlled_run_and_exposes_pending() {
         let history_id = "agent-history:codex/local:thread-1";
         let mut state = AppState::new(true);
         state.sessions.items.push(SessionView {
@@ -3976,7 +4382,7 @@ mod tests {
         assert_eq!(session.preview.as_deref(), Some("Fresh preview"));
         assert_eq!(session.updated_at_unix_ms, 42);
         assert_eq!(session.state.as_deref(), Some("waiting_approval"));
-        assert!(session.run_ids.iter().any(|run| run == "controlled-run"));
+        assert!(!session.run_ids.iter().any(|run| run == "controlled-run"));
         assert_eq!(
             state.pending_run().map(|run| run.id.as_str()),
             Some(history_id)

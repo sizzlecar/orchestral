@@ -6200,7 +6200,7 @@ async fn terminal_private_wal_replays_from_a_new_generic_provider() {
 }
 
 #[tokio::test]
-async fn open_model_attempt_is_never_restarted_from_the_private_wal() {
+async fn open_model_attempt_is_not_restarted_and_becomes_incomplete() {
     let run_id = RunId::new("unsafe-model-recovery-run");
     let checkpoint_store = Arc::new(InMemoryGenericAgentCheckpointStore::default());
     let session_journal = Arc::new(InMemoryAgentSessionJournalStore::default());
@@ -6256,34 +6256,54 @@ async fn open_model_attempt_is_never_restarted_from_the_private_wal() {
     .expect("replacement Generic Agent starts")
     .with_checkpoint_store(checkpoint_store.clone())
     .expect("same private WAL binds to the replacement Provider");
-    let error = match second
+    let recovery = second
         .recover(
             AgentRecoveryRequest::new(request, execution.clone(), &descriptor)
                 .expect("recovery identity is valid"),
         )
         .await
-    {
-        Ok(_) => panic!("an open model attempt must not be restarted"),
-        Err(error) => error,
-    };
-    assert_eq!(error.code, AgentProtocolErrorCode::InvalidTransition);
-    assert_eq!(error.details["boundary"], "model_attempt_open");
-
-    first
-        .command(
-            &execution,
-            AgentCommandEnvelope::new(
-                CommandId::new("cleanup-unsafe-model-recovery"),
-                run_id,
-                None,
-                AgentCommand::Cancel {
-                    reason: "test cleanup".to_owned(),
-                },
-            )
-            .expect("cleanup command is valid"),
-        )
+        .expect("an open model attempt can be closed without restarting it");
+    let (mut recovered_stream, confirmation) = recovery.into_parts();
+    confirmation
         .await
-        .expect("cleanup cancellation is accepted");
+        .expect("Host confirmation durably closes the interrupted attempt");
+    let terminal = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            match recovered_stream.next().await {
+                Some(Ok(AgentProviderStreamItem::Event(event)))
+                    if matches!(&event.payload, AgentEvent::RunIncomplete { .. }) =>
+                {
+                    break *event;
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => panic!("interrupted recovery stream failed: {error}"),
+                None => panic!("interrupted recovery ended before its terminal event"),
+            }
+        }
+    })
+    .await
+    .expect("interrupted recovery publishes a terminal event");
+    assert!(matches!(
+        terminal.payload,
+        AgentEvent::RunIncomplete {
+            reason: IncompleteReason::Interrupted { .. },
+            partial_delivery: None,
+        }
+    ));
+    assert!(matches!(
+        checkpoint_store
+            .load_run(&run_id)
+            .expect("private WAL remains readable")
+            .expect("private Run remains registered")
+            .validate()
+            .expect("private WAL replays")
+            .phase,
+        GenericCheckpointPhase::Terminal
+    ));
+
+    // `first` models the process that disappeared. It must not be allowed to
+    // append another checkpoint after the replacement Provider has closed the
+    // Run; the Tokio test runtime aborts that deliberately orphaned task.
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

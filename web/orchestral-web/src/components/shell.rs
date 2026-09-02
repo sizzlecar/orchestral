@@ -12,7 +12,10 @@ use crate::model::{
     AgentApprovalMode, AgentFilesystemAccess, AgentNetworkAccess, AgentSessionPermissions,
     SessionView,
 };
-use crate::state::{AppState, AuthStatus, LoadStatus, RunState};
+use crate::state::{
+    timeline_blocks_for_session, AppState, AuthStatus, LoadStatus, RunState, TimelineBlock,
+    TimelineItem,
+};
 
 const SIDEBAR_SESSIONS_PER_PAGE: usize = 10;
 
@@ -467,6 +470,10 @@ fn Composer() -> Element {
     let mut upload_error = use_signal(|| None::<String>);
     let state = controller.state.read();
     let active = state.active_run().is_some();
+    let manual_recovery = state
+        .current_run()
+        .filter(|run| run.recovery_is_manual())
+        .map(|run| run.recovery_allows_new_run());
     let recoverable = state.recoverable_run().is_some();
     let input_disabled =
         !state.connection.online || state.auth.status != AuthStatus::Authenticated || recoverable;
@@ -478,14 +485,22 @@ fn Composer() -> Element {
         .active_run()
         .is_some_and(|run| run.status == "stopping");
     drop(state);
-    let placeholder = if recoverable {
+    let placeholder = if manual_recovery == Some(true) {
+        "上次任务已中断，可发送新消息继续…"
+    } else if manual_recovery == Some(false) {
+        "该任务需要在 Host 端人工恢复…"
+    } else if recoverable {
         "正在自动恢复，恢复后可继续…"
     } else if active {
         "补充指令（steer）…"
     } else {
         "告诉 Orchestral 你想完成什么…"
     };
-    let hint = if recoverable {
+    let hint = if manual_recovery == Some(true) {
+        "上次任务不会自动重试；本次发送将创建新任务"
+    } else if manual_recovery == Some(false) {
+        "自动恢复已停止，不会重复执行"
+    } else if recoverable {
         "正在自动恢复 Agent 状态，期间不会重复执行"
     } else if active {
         "当前发送会引导正在运行的任务"
@@ -537,15 +552,20 @@ fn Composer() -> Element {
                     let selected = attachments();
                     if text.trim().is_empty() && selected.is_empty() { return; }
                     upload_error.set(None);
+                    // Commit the composer locally before the Host resolves R2
+                    // content and starts the Agent. That remote acknowledgement
+                    // can take seconds and must not make the UI look frozen.
+                    draft.set(String::new());
+                    attachments.set(Vec::new());
                     spawn(async move {
-                        if controller.submit(text.clone(), selected.clone()).await {
-                            // Do not erase anything the user typed or attached
-                            // while the network request was in flight.
-                            if draft() == text {
-                                draft.set(String::new());
+                        if !controller.submit(text.clone(), selected.clone()).await {
+                            // Restore a definitively rejected submission only
+                            // when no newer draft would be overwritten.
+                            if draft().is_empty() {
+                                draft.set(text);
                             }
-                            if attachments() == selected {
-                                attachments.set(Vec::new());
+                            if attachments().is_empty() {
+                                attachments.set(selected);
                             }
                         }
                     });
@@ -610,13 +630,15 @@ fn Composer() -> Element {
                             let selected = attachments();
                             if text.trim().is_empty() && selected.is_empty() { return; }
                             upload_error.set(None);
+                            draft.set(String::new());
+                            attachments.set(Vec::new());
                             spawn(async move {
-                                if controller.submit(text.clone(), selected.clone()).await {
-                                    if draft() == text {
-                                        draft.set(String::new());
+                                if !controller.submit(text.clone(), selected.clone()).await {
+                                    if draft().is_empty() {
+                                        draft.set(text);
                                     }
-                                    if attachments() == selected {
-                                        attachments.set(Vec::new());
+                                    if attachments().is_empty() {
+                                        attachments.set(selected);
                                     }
                                 }
                             });
@@ -738,21 +760,18 @@ fn paginated_sessions(
 }
 
 fn session_title(state: &AppState, session: &SessionView) -> String {
-    for run_id in session.run_ids.iter().rev() {
-        if let Some(text) = state
-            .runs
-            .get(run_id)
-            .and_then(|run| {
-                run.messages
-                    .iter()
-                    .filter(|message| message.role == "user")
-                    .max_by_key(|message| message.order)
-            })
-            .map(|message| compact_session_title(&message.text))
-            .filter(|text| !text.is_empty())
-        {
-            return text;
-        }
+    if let Some(text) = timeline_blocks_for_session(state, session)
+        .into_iter()
+        .rev()
+        .find_map(|entry| match entry.block {
+            TimelineBlock::Entry(TimelineItem::Message(message)) if message.role == "user" => {
+                Some(compact_session_title(&message.text))
+            }
+            _ => None,
+        })
+        .filter(|text| !text.is_empty())
+    {
+        return text;
     }
     if let Some(preview) = session
         .preview
@@ -910,6 +929,7 @@ fn run_label(run: Option<&RunState>, now: f64) -> (String, &'static str) {
         "cancelled" => ("已取消".to_owned(), "idle"),
         "failed" => ("失败".to_owned(), "error"),
         "loading" => ("正在载入".to_owned(), "working"),
+        "unknown" if run.recovery_is_manual() => ("自动恢复已停止".to_owned(), "warning"),
         "unknown" => ("正在自动恢复".to_owned(), "warning"),
         _ => ("状态待确认".to_owned(), "warning"),
     }
@@ -919,7 +939,8 @@ fn run_label(run: Option<&RunState>, now: f64) -> (String, &'static str) {
 mod tests {
     use super::*;
     use crate::model::{
-        AgentConnectorView, AgentSessionCapabilitiesView, AgentSessionExecutionProfile,
+        AgentConnectorView, AgentSessionCapabilitiesView, AgentSessionDetail,
+        AgentSessionExecutionProfile,
     };
     use crate::state::{AgentSessionListState, Message};
 
@@ -1131,6 +1152,46 @@ mod tests {
     }
 
     #[test]
+    fn detail_title_uses_the_last_message_in_the_merged_timeline() {
+        let detail: AgentSessionDetail = serde_json::from_value(serde_json::json!({
+            "summary": {
+                "connector_id": "codex/local",
+                "session_id": "thread-1",
+                "title": "stale generated title",
+                "state": "active"
+            },
+            "turns": [{
+                "turn_id": "turn-latest",
+                "status": "active",
+                "activities": [{
+                    "activity_id": "native-latest-user",
+                    "kind": "user_message",
+                    "status": "completed",
+                    "content": [{"body": {"kind": "inline", "value": "真正的最新消息"}}],
+                    "details": {
+                        "clientId": "orchestral-command:run-1:command-1:digest"
+                    }
+                }]
+            }],
+            "controlled_runs": [{
+                "created_at_unix_ms": 1000,
+                "execution": {"session_id": "thread-1", "run_id": "run-1"},
+                "state": {"state": "running"},
+                "last_run_seq": 2,
+                "input": [{"body": {"kind": "inline", "value": "已经滑出最近页的旧消息"}}]
+            }]
+        }))
+        .unwrap();
+        let mut state = AppState::new(true);
+        state.project_agent_session(detail);
+
+        assert_eq!(
+            session_title(&state, &state.sessions.items[0]),
+            "真正的最新消息"
+        );
+    }
+
+    #[test]
     fn run_labels_distinguish_host_acceptance_from_native_execution() {
         let mut run = RunState::new("run-1", None);
         run.status = "accepted".to_owned();
@@ -1140,5 +1201,12 @@ mod tests {
 
         run.status = "unknown".to_owned();
         assert_eq!(run_label(Some(&run), 0.0).0, "正在自动恢复");
+
+        run.recovery = Some(crate::state::RunRecoveryState {
+            mode: "manual".to_owned(),
+            can_start_new_run: false,
+            reason: Some("unsafe boundary".to_owned()),
+        });
+        assert_eq!(run_label(Some(&run), 0.0).0, "自动恢复已停止");
     }
 }
