@@ -15,7 +15,7 @@ use orchestral_runtime::AgentDirectory;
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::agent_connectors::build_agent_directory;
+use crate::agent_connectors::{build_agent_directory, AgentJournalAccess};
 
 #[derive(Debug, Args)]
 pub(crate) struct SessionsCommand {
@@ -155,7 +155,12 @@ struct ActionArgs {
 
 impl SessionsCommand {
     pub(crate) async fn run(self, default_cwd: Option<PathBuf>) -> anyhow::Result<()> {
-        let directory = build_agent_directory(None, None, None).await?;
+        let journal_access = if self.command.requires_control_writer() {
+            AgentJournalAccess::SingleWriter
+        } else {
+            AgentJournalAccess::ReadOnly
+        };
+        let directory = build_agent_directory(None, None, None, journal_access).await?;
         let stdout = std::io::stdout();
         self.run_with_directory(directory, default_cwd, &mut stdout.lock())
             .await
@@ -381,6 +386,15 @@ impl SessionsCommand {
                 }
             }
         }
+    }
+}
+
+impl SessionsSubcommand {
+    fn requires_control_writer(&self) -> bool {
+        matches!(
+            self,
+            Self::Send(_) | Self::Steer(_) | Self::Cancel(_) | Self::Recover(_) | Self::Action(_)
+        )
     }
 }
 
@@ -647,6 +661,35 @@ mod tests {
             "continue the work",
         ])
         .expect("session turn command parses");
+    }
+
+    #[test]
+    fn discovery_commands_are_read_only_and_control_commands_require_the_writer() {
+        let read_only = [
+            SessionsSubcommand::Agents(OutputArgs { json: true }),
+            SessionsSubcommand::List(ListArgs {
+                connector: ConnectorArgs { connector: None },
+                limit: 25,
+                cursor: None,
+                search: None,
+                json: true,
+            }),
+            SessionsSubcommand::Show(SessionArgs {
+                session_id: "session".to_owned(),
+                connector: ConnectorArgs { connector: None },
+                json: true,
+            }),
+        ];
+        assert!(read_only
+            .iter()
+            .all(|command| !command.requires_control_writer()));
+
+        let control = SessionsSubcommand::Recover(RunArgs {
+            run_id: "run".to_owned(),
+            connector: ConnectorArgs { connector: None },
+            json: true,
+        });
+        assert!(control.requires_control_writer());
     }
 
     #[tokio::test]

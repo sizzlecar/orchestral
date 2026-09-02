@@ -14,7 +14,7 @@ use qrcode::render::unicode;
 use qrcode::QrCode;
 
 use crate::agent::{build_agent_host, AgentRunOptions};
-use crate::agent_connectors::build_agent_directory;
+use crate::agent_connectors::{build_agent_directory, AgentJournalAccess};
 use crate::mcp_config::user_config_root;
 
 use super::api::{spawn_remembered_approval_driver, spawn_run_supervisor};
@@ -122,6 +122,7 @@ pub(crate) async fn serve(command: ServeCommand, options: AgentRunOptions) -> an
         artifact_resolver.clone(),
         artifact_blob_store.clone(),
         artifact_publisher,
+        AgentJournalAccess::SingleWriter,
     )
     .await?;
     let remote_state = RemoteApiState {

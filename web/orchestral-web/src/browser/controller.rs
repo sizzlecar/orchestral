@@ -1339,12 +1339,16 @@ impl AppController {
             {
                 Ok(ack) => match check_ack(&ack, "引导") {
                     Ok(_) => {
-                        if let Err(error) = storage::delete_outbox(&outbox.id).await {
-                            self.notice(
-                                &format!("已发送，但清理本地 Outbox 失败：{error}"),
-                                "warning",
-                            );
-                        }
+                        let outbox_id = outbox.id.clone();
+                        let controller = self;
+                        spawn(async move {
+                            if let Err(error) = storage::delete_outbox(&outbox_id).await {
+                                controller.notice(
+                                    &format!("已发送，但清理本地 Outbox 失败：{error}"),
+                                    "warning",
+                                );
+                            }
+                        });
                         true
                     }
                     Err(error) => {
@@ -1492,18 +1496,26 @@ impl AppController {
                         run.apply_view(view.clone(), platform::now());
                     }
                 }
-                self.refresh_run(&actual_run_id).await;
-                if self.state.read().sessions.selected_id.as_deref()
-                    == Some(operation_session_key.as_str())
-                {
-                    self.resume_live_transport_for_selection(0);
-                }
-                if let Err(error) = storage::delete_outbox(&outbox.id).await {
-                    self.notice(
-                        &format!("已发送，但清理本地 Outbox 失败：{error}"),
-                        "warning",
-                    );
-                }
+                // The Host acknowledgement is the composer commit point.
+                // Snapshot reconciliation, transport replacement and Outbox
+                // cleanup are follow-up work and must not keep accepted text
+                // or attachments visible in the input field.
+                let outbox_id = outbox.id.clone();
+                let controller = self;
+                spawn(async move {
+                    if let Err(error) = storage::delete_outbox(&outbox_id).await {
+                        controller.notice(
+                            &format!("已发送，但清理本地 Outbox 失败：{error}"),
+                            "warning",
+                        );
+                    }
+                    controller.refresh_run(&actual_run_id).await;
+                    if controller.state.read().sessions.selected_id.as_deref()
+                        == Some(operation_session_key.as_str())
+                    {
+                        controller.resume_live_transport_for_selection(0);
+                    }
+                });
                 true
             }
             Err(error) => {

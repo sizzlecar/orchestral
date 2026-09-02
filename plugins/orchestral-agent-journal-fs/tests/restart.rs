@@ -16,6 +16,49 @@ use orchestral_core::agent_protocol::{
     AGENT_PROTOCOL_V1,
 };
 
+#[test]
+fn single_writer_lease_rejects_competing_control_and_releases_on_drop() {
+    let root = std::env::temp_dir().join(format!(
+        "orchestral-agent-writer-lease-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let writer = FileAgentJournalStore::open_single_writer(&root).expect("writer acquires lease");
+    let error = FileAgentJournalStore::open_single_writer(&root)
+        .err()
+        .expect("second writer is rejected");
+    assert!(error.to_string().contains("active control writer"));
+    FileAgentJournalStore::open_read_only(&root).expect("read-only discovery remains available");
+
+    drop(writer);
+    FileAgentJournalStore::open_single_writer(&root).expect("lease releases with writer");
+    std::fs::remove_dir_all(root).expect("temporary journal cleans up");
+}
+
+#[tokio::test]
+async fn read_only_discovery_controller_cannot_create_a_control_run() {
+    let root = std::env::temp_dir().join(format!(
+        "orchestral-agent-read-only-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let factory = ScriptedStatelessFactory::conformant().expect("fixture descriptor");
+    let scenario = ProviderScenario::standard(&factory.descriptor()).expect("fixture scenario");
+    let store = Arc::new(FileAgentJournalStore::open_read_only(&root).expect("reader opens"));
+    let controller = Arc::new(
+        AgentController::with_journal_store(
+            factory.create(scenario.clone(), TestProbes::default()),
+            ProviderBindingRef::new("filesystem-binding"),
+            store,
+        )
+        .expect("controller binds"),
+    );
+    let error = controller
+        .start(scenario.start_request.run)
+        .await
+        .expect_err("read-only controller cannot register a Run");
+    assert!(error.to_string().contains("open read-only"));
+    std::fs::remove_dir_all(root).expect("temporary journal cleans up");
+}
+
 #[tokio::test]
 async fn legacy_approval_digest_is_verified_and_upgraded_without_hiding_the_run() {
     let root = std::env::temp_dir().join(format!(

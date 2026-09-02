@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use fs2::FileExt;
 use orchestral_core::agent_protocol::{
     spi::{
         AgentJournalStore, AgentJournalStoreError, AgentRunCatalogEntry, AppendAgentRecordOutcome,
@@ -48,10 +49,33 @@ struct PersistedAgentRun {
 pub struct FileAgentJournalStore {
     root: Arc<PathBuf>,
     writer_gate: Arc<Mutex<()>>,
+    read_only: bool,
+    _writer_lease: Option<Arc<File>>,
 }
 
 impl FileAgentJournalStore {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, AgentJournalStoreError> {
+        Self::open_with_access(root, JournalAccess::UncoordinatedWriter)
+    }
+
+    /// Opens a filesystem journal as its sole cooperating writer.
+    ///
+    /// The lease lives for the lifetime of this store and prevents a second
+    /// Host or control CLI from rehydrating and mutating the same Run journal.
+    /// Read-only discovery clients may still open the directory concurrently.
+    pub fn open_single_writer(root: impl Into<PathBuf>) -> Result<Self, AgentJournalStoreError> {
+        Self::open_with_access(root, JournalAccess::SingleWriter)
+    }
+
+    /// Opens a journal for discovery without permission to mutate any trace.
+    pub fn open_read_only(root: impl Into<PathBuf>) -> Result<Self, AgentJournalStoreError> {
+        Self::open_with_access(root, JournalAccess::ReadOnly)
+    }
+
+    fn open_with_access(
+        root: impl Into<PathBuf>,
+        access: JournalAccess,
+    ) -> Result<Self, AgentJournalStoreError> {
         let root = root.into();
         fs::create_dir_all(&root).map_err(unavailable)?;
         let metadata = fs::metadata(&root).map_err(unavailable)?;
@@ -61,14 +85,46 @@ impl FileAgentJournalStore {
                 root.display()
             )));
         }
+        let writer_lease = if access == JournalAccess::SingleWriter {
+            let path = root.join(".writer.lock");
+            let lease = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .map_err(unavailable)?;
+            lease.try_lock_exclusive().map_err(|error| {
+                AgentJournalStoreError::Unavailable(format!(
+                    "Agent journal already has an active control writer at {}: {error}",
+                    root.display()
+                ))
+            })?;
+            Some(Arc::new(lease))
+        } else {
+            None
+        };
         Ok(Self {
             root: Arc::new(root),
             writer_gate: Arc::new(Mutex::new(())),
+            read_only: access == JournalAccess::ReadOnly,
+            _writer_lease: writer_lease,
         })
     }
 
     pub fn root(&self) -> &Path {
         self.root.as_path()
+    }
+
+    fn require_writer(&self) -> Result<(), String> {
+        if self.read_only {
+            Err(format!(
+                "Agent journal is open read-only: {}",
+                self.root.display()
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     fn run_path(&self, run_id: &RunId) -> PathBuf {
@@ -386,6 +442,13 @@ impl FileAgentJournalStore {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JournalAccess {
+    UncoordinatedWriter,
+    SingleWriter,
+    ReadOnly,
+}
+
 #[async_trait]
 impl AgentJournalStore for FileAgentJournalStore {
     async fn load_run(
@@ -401,6 +464,9 @@ impl AgentJournalStore for FileAgentJournalStore {
         run: StoredAgentRun,
     ) -> Result<CreateAgentRunOutcome, AgentJournalStoreError> {
         self.blocking(move |store| {
+            store
+                .require_writer()
+                .map_err(AgentJournalStoreError::Unavailable)?;
             let _guard = store
                 .writer_gate
                 .lock()
@@ -427,6 +493,9 @@ impl AgentJournalStore for FileAgentJournalStore {
     ) -> Result<AppendAgentRecordOutcome, AgentJournalStoreError> {
         let run_id = run_id.clone();
         self.blocking(move |store| {
+            store
+                .require_writer()
+                .map_err(AgentJournalStoreError::Unavailable)?;
             let _guard = store
                 .writer_gate
                 .lock()
@@ -683,6 +752,9 @@ impl AgentSessionJournalStore for FileAgentJournalStore {
         draft: AgentSessionEventDraft,
     ) -> Result<AgentSessionAppend, AgentSessionError> {
         self.session_blocking(move |store| {
+            store
+                .require_writer()
+                .map_err(AgentSessionError::StoreUnavailable)?;
             draft.validate()?;
             let draft_digest = draft.digest()?;
             let _guard = store.writer_gate.lock().map_err(|_| {
@@ -732,6 +804,9 @@ impl ToolEffectJournalStore for FileAgentJournalStore {
         draft: ToolEffectEventDraft,
     ) -> Result<ToolEffectAppend, ToolEffectError> {
         self.effect_blocking(move |store| {
+            store
+                .require_writer()
+                .map_err(ToolEffectError::StoreUnavailable)?;
             draft.validate()?;
             let draft_digest = draft.digest()?;
             let _guard = store.writer_gate.lock().map_err(|_| {
@@ -787,6 +862,7 @@ impl GenericAgentCheckpointStore for FileAgentJournalStore {
         &self,
         registration: GenericAgentRunRegistration,
     ) -> Result<CreateGenericRunOutcome, GenericCheckpointError> {
+        self.require_writer().map_err(checkpoint_unavailable)?;
         registration.validate()?;
         let run_id = registration.run_id().clone();
         let _guard = self
@@ -813,6 +889,7 @@ impl GenericAgentCheckpointStore for FileAgentJournalStore {
         expected_previous: u64,
         draft: GenericCheckpointDraft,
     ) -> Result<AppendGenericCheckpointOutcome, GenericCheckpointError> {
+        self.require_writer().map_err(checkpoint_unavailable)?;
         draft.validate()?;
         if draft.run_id != *run_id {
             return Err(GenericCheckpointError::InvalidData(

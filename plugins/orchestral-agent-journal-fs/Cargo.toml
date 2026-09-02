@@ -16,6 +16,7 @@ serde_json = { workspace = true }
 serde_jcs = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
+fs2 = { workspace = true }
 
 [dev-dependencies]
 orchestral-agent-protocol-testkit = { path = "../../testing/orchestral-agent-protocol-testkit" }

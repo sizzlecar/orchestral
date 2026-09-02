@@ -17,10 +17,17 @@ use orchestral_runtime::AgentDirectory;
 
 use crate::mcp_config::user_config_root;
 
+#[derive(Clone, Copy)]
+pub(crate) enum AgentJournalAccess {
+    SingleWriter,
+    ReadOnly,
+}
+
 pub(crate) async fn build_agent_directory(
     artifact_resolver: Option<Arc<dyn ArtifactResolver>>,
     artifact_blob_store: Option<Arc<dyn BlobStore>>,
     artifact_publisher: Option<Arc<dyn ArtifactPublisher>>,
+    journal_access: AgentJournalAccess,
 ) -> anyhow::Result<Arc<AgentDirectory>> {
     let directory = Arc::new(AgentDirectory::new());
     let config_root = user_config_root()?;
@@ -55,13 +62,17 @@ pub(crate) async fn build_agent_directory(
         }
         .with_session_list_cache_path(session_list_cache_path),
     );
+    let journal_root = config_root
+        .join("agent-connectors")
+        .join("codex-local")
+        .join("journal");
     let journal = Arc::new(
-        FileAgentJournalStore::open(
-            config_root
-                .join("agent-connectors")
-                .join("codex-local")
-                .join("journal"),
-        )
+        match journal_access {
+            AgentJournalAccess::SingleWriter => {
+                FileAgentJournalStore::open_single_writer(journal_root)
+            }
+            AgentJournalAccess::ReadOnly => FileAgentJournalStore::open_read_only(journal_root),
+        }
         .context("open Codex control journal")?,
     );
     directory
