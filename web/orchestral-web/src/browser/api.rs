@@ -19,6 +19,12 @@ use crate::sse::{SessionSequenceDisposition, SessionSequenceGuard, SseParser};
 
 const API_BASE: &str = "/api/v1";
 
+pub struct AgentInputRequest<'a> {
+    pub text: &'a str,
+    pub attachments: &'a [UploadedArtifact],
+    pub after_activity_id: Option<&'a str>,
+}
+
 #[derive(Debug, Clone, Error, PartialEq)]
 #[error("{message}")]
 pub struct ApiError {
@@ -286,8 +292,7 @@ impl ApiClient {
         connector_id: &str,
         session_id: &str,
         run_id: &str,
-        input: &str,
-        attachments: &[UploadedArtifact],
+        input: AgentInputRequest<'_>,
     ) -> Result<Value, ApiError> {
         self.post(
             "/agent-runs",
@@ -296,8 +301,9 @@ impl ApiClient {
                 "connector_id": connector_id,
                 "session_id": session_id,
                 "run_id": run_id,
-                "input": input,
-                "attachments": attachment_values(attachments),
+                "input": input.text,
+                "attachments": attachment_values(input.attachments),
+                "after_activity_id": input.after_activity_id,
             }),
         )
         .await
@@ -308,17 +314,17 @@ impl ApiClient {
         credential: &ApiCredential,
         run_id: &str,
         command_id: &str,
-        text: &str,
         connector_id: Option<&str>,
-        attachments: &[UploadedArtifact],
+        input: AgentInputRequest<'_>,
     ) -> Result<Value, ApiError> {
         self.post(
             &with_connector(&format!("/runs/{}/steer", encode(run_id)), connector_id),
             credential,
             &json!({
                 "command_id": command_id,
-                "text": text,
-                "attachments": attachment_values(attachments),
+                "text": input.text,
+                "attachments": attachment_values(input.attachments),
+                "after_activity_id": input.after_activity_id,
             }),
         )
         .await

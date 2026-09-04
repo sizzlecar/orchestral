@@ -873,7 +873,7 @@ impl AgentConnector for CodexConnector {
         let client = self.client().await?;
         // Subscribe to transport notifications before attaching so events
         // emitted during the metadata-only resume cannot be lost.
-        let mut native = client.rpc.subscribe();
+        let mut native = client.rpc.subscribe_session(session_id.as_str());
         let had_execution_profile = self
             .session_execution_profiles
             .lock()
@@ -1640,7 +1640,13 @@ fn native_session_change(message: &Value, limits: &NormalizationLimits) -> Agent
         .get("method")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
-    let turn_id = message.pointer("/params/turnId").and_then(Value::as_str);
+    // Item notifications carry `turnId`; current Codex turn notifications
+    // carry the full turn and identify it at `turn.id`. Accept both protocol
+    // generations so a terminal event is never downgraded to a blind refresh.
+    let turn_id = message
+        .pointer("/params/turnId")
+        .and_then(Value::as_str)
+        .or_else(|| message.pointer("/params/turn/id").and_then(Value::as_str));
     match (method, turn_id) {
         ("item/completed", Some(turn_id)) => {
             let Some(item) = message.pointer("/params/item") else {
@@ -1657,18 +1663,24 @@ fn native_session_change(message: &Value, limits: &NormalizationLimits) -> Agent
         ("turn/started", Some(turn_id)) => AgentSessionChangeKind::TurnStatus {
             turn_id: AgentSessionTurnId::new(turn_id),
             status: AgentSessionTurnStatus::Active,
+            failure: None,
         },
-        ("turn/completed", Some(turn_id)) => AgentSessionChangeKind::TurnStatus {
-            turn_id: AgentSessionTurnId::new(turn_id),
-            status: match message
-                .pointer("/params/turn/status")
+        ("turn/completed", Some(turn_id)) => {
+            let turn = message.pointer("/params/turn");
+            let status = match turn
+                .and_then(|turn| turn.get("status"))
                 .and_then(Value::as_str)
             {
                 Some("failed") => AgentSessionTurnStatus::Failed,
                 Some("interrupted") => AgentSessionTurnStatus::Interrupted,
                 _ => AgentSessionTurnStatus::Completed,
-            },
-        },
+            };
+            AgentSessionChangeKind::TurnStatus {
+                turn_id: AgentSessionTurnId::new(turn_id),
+                status,
+                failure: turn.and_then(|turn| normalize::turn_failure(turn, limits)),
+            }
+        }
         _ => AgentSessionChangeKind::RefreshRequired {
             reason: method.replace('/', "_"),
         },
@@ -2185,8 +2197,20 @@ mod tests {
                             "method": "turn/completed",
                             "params": {
                                 "threadId": "thread-watch",
-                                "turnId": "turn-2",
-                                "turn": {"status": "completed"}
+                                "turn": {
+                                    "id": "turn-2",
+                                    "status": "failed",
+                                    "error": {
+                                        "message": "proxy connection failed with status 502",
+                                        "codexErrorInfo": {
+                                            "responseStreamConnectionFailed": {
+                                                "httpStatusCode": 502
+                                            }
+                                        },
+                                        "additionalDetails": null,
+                                        "misalignment": null
+                                    }
+                                }
                             }
                         })
                     )
@@ -2220,9 +2244,12 @@ mod tests {
         assert!(matches!(
             completed.change,
             AgentSessionChangeKind::TurnStatus {
-                status: AgentSessionTurnStatus::Completed,
+                status: AgentSessionTurnStatus::Failed,
+                failure: Some(failure),
                 ..
-            }
+            } if failure.code == "codex_response_stream_connection_failed"
+                && failure.message == "proxy connection failed with status 502"
+                && failure.retryable
         ));
         server.await.unwrap();
     }

@@ -131,6 +131,7 @@ impl AgentConnector for FixtureConnector {
                 AgentSessionTurn {
                     turn_id: AgentSessionTurnId::new("turn-1"),
                     status: AgentSessionTurnStatus::Completed,
+                    failure: None,
                     activities: vec![Self::activity(
                         "activity-user",
                         AgentSessionActivityKind::UserMessage,
@@ -140,6 +141,7 @@ impl AgentConnector for FixtureConnector {
                 AgentSessionTurn {
                     turn_id: AgentSessionTurnId::new("turn-2"),
                     status: AgentSessionTurnStatus::Completed,
+                    failure: None,
                     activities: vec![
                         Self::activity(
                             "activity-plan",
@@ -156,6 +158,7 @@ impl AgentConnector for FixtureConnector {
                 AgentSessionTurn {
                     turn_id: AgentSessionTurnId::new("turn-3"),
                     status: AgentSessionTurnStatus::Completed,
+                    failure: None,
                     activities: vec![Self::activity(
                         "activity-file",
                         AgentSessionActivityKind::FileChange,

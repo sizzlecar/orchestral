@@ -13,7 +13,7 @@ use orchestral_core::agent_protocol::{
     wire::{
         AgentCommand, AgentCommandEnvelope, AgentExecutionRef, AgentJournalRecord,
         AgentRunEnvelope, AgentRunView, AgentSessionId, CommandAck, CommandId, Content,
-        ContentBody, RequestId, RequestResolution, ResourceBinding, RunId,
+        ContentBody, Extensions, RequestId, RequestResolution, ResourceBinding, RunId,
     },
     AGENT_PROTOCOL_V1,
 };
@@ -79,6 +79,16 @@ impl AgentClient {
         run_id: RunId,
         input: Vec<Content>,
     ) -> Result<AgentRunHandle, AgentSdkError> {
+        self.start_with_run_id_and_extensions(run_id, input, Extensions::new())
+            .await
+    }
+
+    pub async fn start_with_run_id_and_extensions(
+        &self,
+        run_id: RunId,
+        input: Vec<Content>,
+        extensions: Extensions,
+    ) -> Result<AgentRunHandle, AgentSdkError> {
         let mut run = AgentRunEnvelope::new(
             AGENT_PROTOCOL_V1,
             self.session_id.clone(),
@@ -86,6 +96,7 @@ impl AgentClient {
             input,
         )?;
         run.spec.resources = self.resources.as_ref().clone();
+        run.spec.extensions = extensions;
         let run = AgentRunEnvelope::seal(run.spec)?;
         let execution = self.controller.start(run).await?;
         Ok(AgentRunHandle {

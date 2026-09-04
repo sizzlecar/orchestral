@@ -1244,6 +1244,15 @@ pub struct AgentCommandEnvelope {
     #[serde(default)]
     pub request_id: Option<RequestId>,
     pub payload: AgentCommand,
+    /// Digest-bound Host metadata. Concrete Provider wire details do not
+    /// belong here; cross-cutting session/control semantics use namespaced
+    /// extensions instead.
+    #[serde(default, skip_serializing_if = "Extensions::is_empty")]
+    #[cfg_attr(
+        feature = "agent-protocol-schema",
+        schemars(with = "BTreeMap::<NamespacedExtensionKey, Value>")
+    )]
+    pub extensions: Extensions,
     pub command_digest: Digest,
 }
 
@@ -1253,6 +1262,8 @@ struct AgentCommandDigestView<'a> {
     run_id: &'a RunId,
     request_id: &'a Option<RequestId>,
     payload: &'a AgentCommand,
+    #[serde(skip_serializing_if = "Extensions::is_empty")]
+    extensions: &'a Extensions,
 }
 
 impl AgentCommandEnvelope {
@@ -1262,11 +1273,22 @@ impl AgentCommandEnvelope {
         request_id: Option<RequestId>,
         payload: AgentCommand,
     ) -> Result<Self, AgentProtocolError> {
+        Self::new_with_extensions(command_id, run_id, request_id, payload, Extensions::new())
+    }
+
+    pub fn new_with_extensions(
+        command_id: CommandId,
+        run_id: RunId,
+        request_id: Option<RequestId>,
+        payload: AgentCommand,
+        extensions: Extensions,
+    ) -> Result<Self, AgentProtocolError> {
         let mut command = Self {
             command_id,
             run_id,
             request_id,
             payload,
+            extensions,
             command_digest: Digest::sha256([]),
         };
         command.validate_shape()?;
@@ -1280,6 +1302,7 @@ impl AgentCommandEnvelope {
             run_id: &self.run_id,
             request_id: &self.request_id,
             payload: &self.payload,
+            extensions: &self.extensions,
         })
     }
 
@@ -1298,6 +1321,7 @@ impl AgentCommandEnvelope {
         if self.command_id.is_empty() || self.run_id.is_empty() {
             return Err(invalid_command("command_id and run_id must not be empty"));
         }
+        validate_extensions(&self.extensions)?;
         match (&self.request_id, &self.payload) {
             (None, AgentCommand::Steer { content }) if !content.is_empty() => {
                 for item in content {
@@ -1965,6 +1989,17 @@ pub enum AgentEvent {
     },
 }
 
+/// Provider-neutral evidence rule for one committed event during Run recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryReplayPolicy {
+    /// The recovered Provider stream must replay the exact event identity and
+    /// digest before the Host restores continuity.
+    ProviderEvidenceRequired,
+    /// The event is a completed Host-controlled fact already authenticated by
+    /// the durable Host journal; its digest remains bound into recovery proof.
+    HostJournalSufficient,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "agent-protocol-schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -2036,6 +2071,37 @@ impl AgentEvent {
                 | Self::ContinuityLost { .. }
                 | Self::ContinuityRestored { .. }
         )
+    }
+
+    /// Whether recovery of the current Run state requires this Provider event
+    /// to be replayed from authoritative Provider evidence.
+    ///
+    /// Command acknowledgements and completed control lifecycles are already
+    /// authenticated by the Host journal. Requiring an external Provider to
+    /// recreate their former notification stream after restart would conflate
+    /// event history with current native state. An unresolved request remains
+    /// strict because the recovered Provider must prove it can still service
+    /// that request. All native execution and output facts require replay.
+    pub fn recovery_replay_policy(
+        &self,
+        pending_request_ids: &BTreeSet<RequestId>,
+    ) -> RecoveryReplayPolicy {
+        match self {
+            Self::CommandDispositionRecorded { .. } | Self::StopRequested { .. } => {
+                RecoveryReplayPolicy::HostJournalSufficient
+            }
+            Self::RequestOpened { request } => {
+                if pending_request_ids.contains(&request.request_id) {
+                    RecoveryReplayPolicy::ProviderEvidenceRequired
+                } else {
+                    RecoveryReplayPolicy::HostJournalSufficient
+                }
+            }
+            Self::RequestResolved { .. } | Self::RequestClosed { .. } => {
+                RecoveryReplayPolicy::HostJournalSufficient
+            }
+            _ => RecoveryReplayPolicy::ProviderEvidenceRequired,
+        }
     }
 
     pub fn validate_integrity(&self) -> Result<(), AgentProtocolError> {
@@ -3463,6 +3529,50 @@ mod tests {
     }
 
     #[test]
+    fn command_extensions_are_digest_bound_and_empty_extensions_stay_wire_compatible() {
+        let legacy_shape = AgentCommandEnvelope::new(
+            CommandId::new("command-legacy"),
+            RunId::new("run-1"),
+            None,
+            AgentCommand::Steer {
+                content: vec![Content::text("continue")],
+            },
+        )
+        .unwrap();
+        let encoded = serde_json::to_value(&legacy_shape).unwrap();
+        assert!(encoded.get("extensions").is_none());
+        serde_json::from_value::<AgentCommandEnvelope>(encoded)
+            .unwrap()
+            .verify_digest()
+            .unwrap();
+
+        let mut extensions = Extensions::new();
+        extensions.insert(
+            "orchestral.dev/session-history-anchor".to_owned(),
+            serde_json::json!({"after_activity_id": "activity-1"}),
+        );
+        let mut anchored = AgentCommandEnvelope::new_with_extensions(
+            CommandId::new("command-anchored"),
+            RunId::new("run-1"),
+            None,
+            AgentCommand::Steer {
+                content: vec![Content::text("continue")],
+            },
+            extensions,
+        )
+        .unwrap();
+        anchored.verify_digest().unwrap();
+        anchored
+            .extensions
+            .get_mut("orchestral.dev/session-history-anchor")
+            .unwrap()["after_activity_id"] = Value::String("activity-2".to_owned());
+        assert_eq!(
+            anchored.verify_digest().unwrap_err().code,
+            AgentProtocolErrorCode::InvalidDigest
+        );
+    }
+
+    #[test]
     fn descriptor_digest_binds_start_and_execution_contract() {
         let descriptor = AgentDescriptorEnvelope::seal(descriptor()).expect("descriptor seals");
         let run = sample_run();
@@ -3588,5 +3698,58 @@ mod tests {
             .expect("Tool error deserializes")
             .validate_integrity()
             .is_ok());
+    }
+
+    #[test]
+    fn recovery_replay_policy_is_provider_neutral_and_state_based() {
+        let request = |id: &str| AgentEvent::RequestOpened {
+            request: PendingRequest {
+                request_id: RequestId::new(id),
+                blocking: true,
+                payload: PendingRequestPayload::Input {
+                    prompt: vec![Content::text("answer")],
+                    input_schema: None,
+                },
+            },
+        };
+        let pending = BTreeSet::from([RequestId::new("still-pending")]);
+
+        assert_eq!(
+            request("still-pending").recovery_replay_policy(&pending),
+            RecoveryReplayPolicy::ProviderEvidenceRequired
+        );
+        assert_eq!(
+            request("already-closed").recovery_replay_policy(&pending),
+            RecoveryReplayPolicy::HostJournalSufficient
+        );
+        for event in [
+            AgentEvent::RequestClosed {
+                request_id: RequestId::new("already-closed"),
+                reason: "resolved by the native owner".to_owned(),
+            },
+            AgentEvent::CommandDispositionRecorded {
+                command_id: CommandId::new("command-1"),
+                outcome: ProviderCommandOutcome::Accepted,
+            },
+            AgentEvent::StopRequested {
+                reason: "user requested cancellation".to_owned(),
+            },
+        ] {
+            assert_eq!(
+                event.recovery_replay_policy(&pending),
+                RecoveryReplayPolicy::HostJournalSufficient
+            );
+        }
+        for event in [
+            AgentEvent::RunStarted,
+            AgentEvent::InputCommitted {
+                content: vec![Content::text("durable input")],
+            },
+        ] {
+            assert_eq!(
+                event.recovery_replay_policy(&pending),
+                RecoveryReplayPolicy::ProviderEvidenceRequired
+            );
+        }
     }
 }

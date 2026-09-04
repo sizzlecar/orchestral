@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -5,9 +6,9 @@ use async_trait::async_trait;
 use futures_util::stream::BoxStream;
 
 use super::types::{
-    AgentAdmission, AgentCommandEnvelope, AgentDescriptorEnvelope, AgentExecutionRef,
-    AgentProtocolError, AgentProviderStreamItem, AgentRejection, AgentStartRequest,
-    ProviderCommandDisposition,
+    AgentAdmission, AgentCommandEnvelope, AgentDescriptorEnvelope, AgentEventDraft,
+    AgentExecutionRef, AgentProtocolError, AgentProtocolErrorCode, AgentProviderStreamItem,
+    AgentRejection, AgentStartRequest, ProviderCommandDisposition,
 };
 
 /// Unsequenced Provider observations plus best-effort telemetry. The Host
@@ -71,12 +72,16 @@ pub struct AgentStart {
 ///
 /// A Provider may reattach native work or reconstruct its private state, but it
 /// must preserve the same start/execution identity and must not duplicate
-/// externally observable effects. The Host separately verifies the replayed
-/// Provider event prefix before restoring continuity.
+/// externally observable effects. `committed_provider_prefix` is the exact,
+/// Host-authenticated Provider prefix already present in the Run journal. It
+/// lets a stateless adapter rebuild replay state without guessing from one
+/// provider's private history format. The Host still independently verifies
+/// the replayed prefix before restoring continuity.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentRecoveryRequest {
     pub start_request: AgentStartRequest,
     pub execution: AgentExecutionRef,
+    pub committed_provider_prefix: Vec<AgentEventDraft>,
 }
 
 impl AgentRecoveryRequest {
@@ -89,15 +94,53 @@ impl AgentRecoveryRequest {
         Ok(Self {
             start_request,
             execution,
+            committed_provider_prefix: Vec::new(),
         })
+    }
+
+    pub fn with_committed_provider_prefix(
+        mut self,
+        committed_provider_prefix: Vec<AgentEventDraft>,
+    ) -> Result<Self, AgentProtocolError> {
+        validate_committed_provider_prefix(&self.execution, committed_provider_prefix.as_slice())?;
+        self.committed_provider_prefix = committed_provider_prefix;
+        Ok(self)
     }
 
     pub fn validate_for(
         &self,
         descriptor: &AgentDescriptorEnvelope,
     ) -> Result<(), AgentProtocolError> {
-        self.execution.validate_for(&self.start_request, descriptor)
+        self.execution
+            .validate_for(&self.start_request, descriptor)?;
+        validate_committed_provider_prefix(
+            &self.execution,
+            self.committed_provider_prefix.as_slice(),
+        )
     }
+}
+
+fn validate_committed_provider_prefix(
+    execution: &AgentExecutionRef,
+    prefix: &[AgentEventDraft],
+) -> Result<(), AgentProtocolError> {
+    let mut event_ids = BTreeSet::new();
+    for draft in prefix {
+        draft.validate_integrity()?;
+        if draft.run_id != execution.run_id {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidSpec,
+                "committed Provider recovery event belongs to another Run",
+            ));
+        }
+        if !event_ids.insert(draft.event_id.as_str()) {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidSpec,
+                "committed Provider recovery prefix contains a duplicate event identity",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]

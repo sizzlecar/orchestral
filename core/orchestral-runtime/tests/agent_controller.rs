@@ -15,9 +15,11 @@ use orchestral_core::agent_protocol::{
         AgentStartError, InMemoryAgentJournalStore,
     },
     wire::{
-        AgentCommand, AgentCommandEnvelope, AgentDescriptorEnvelope, AgentEvent, AgentExecutionRef,
-        AgentProtocolError, AgentProtocolErrorCode, AgentStartRequest, CommandId, Content,
-        ProviderBindingRef, ProviderCommandDisposition,
+        AgentAdmission, AgentCommand, AgentCommandEnvelope, AgentDescriptorEnvelope, AgentEvent,
+        AgentEventDraft, AgentEventId, AgentExecutionRef, AgentProtocolError,
+        AgentProtocolErrorCode, AgentProviderStreamItem, AgentStartRequest, CommandId, Content,
+        PendingRequest, PendingRequestKind, PendingRequestPayload, ProviderBindingRef,
+        ProviderCommandDisposition, RequestId,
     },
 };
 use orchestral_runtime::{AgentClient, AgentController};
@@ -27,6 +29,7 @@ struct RecoveryOrderProvider {
     inner: Arc<dyn AgentProvider>,
     journal: Arc<InMemoryAgentJournalStore>,
     confirmed_after_restore: Arc<AtomicBool>,
+    committed_prefix_received: Arc<AtomicBool>,
     fail_after_restore: bool,
 }
 
@@ -42,6 +45,116 @@ struct DescriptorOverrideProvider {
 
 struct StalledRecoveryProvider {
     inner: Arc<dyn AgentProvider>,
+}
+
+struct SettledRequestRecoveryProvider {
+    descriptor: AgentDescriptorEnvelope,
+}
+
+impl SettledRequestRecoveryProvider {
+    fn run_started(run_id: &orchestral_core::agent_protocol::wire::RunId) -> AgentEventDraft {
+        AgentEventDraft {
+            event_id: AgentEventId::new(format!("settled-{run_id}-started")),
+            run_id: run_id.clone(),
+            causation_id: None,
+            source_fingerprint: None,
+            payload: AgentEvent::RunStarted,
+        }
+    }
+
+    fn request_opened(run_id: &orchestral_core::agent_protocol::wire::RunId) -> AgentEventDraft {
+        AgentEventDraft {
+            event_id: AgentEventId::new(format!("settled-{run_id}-request-opened")),
+            run_id: run_id.clone(),
+            causation_id: None,
+            source_fingerprint: None,
+            payload: AgentEvent::RequestOpened {
+                request: PendingRequest {
+                    request_id: RequestId::new("settled-request"),
+                    blocking: true,
+                    payload: PendingRequestPayload::Input {
+                        prompt: vec![Content::text("temporary native prompt")],
+                        input_schema: None,
+                    },
+                },
+            },
+        }
+    }
+
+    fn request_closed(run_id: &orchestral_core::agent_protocol::wire::RunId) -> AgentEventDraft {
+        AgentEventDraft {
+            event_id: AgentEventId::new(format!("settled-{run_id}-request-closed")),
+            run_id: run_id.clone(),
+            causation_id: None,
+            source_fingerprint: None,
+            payload: AgentEvent::RequestClosed {
+                request_id: RequestId::new("settled-request"),
+                reason: "native owner resolved the request".to_owned(),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl AgentProvider for SettledRequestRecoveryProvider {
+    fn describe(&self) -> AgentDescriptorEnvelope {
+        self.descriptor.clone()
+    }
+
+    async fn start(&self, request: AgentStartRequest) -> Result<AgentStart, AgentStartError> {
+        let execution = AgentExecutionRef::for_start(&request, &self.descriptor)
+            .map_err(AgentStartError::OutcomeUnknown)?;
+        let run_id = execution.run_id.clone();
+        let stream = stream::iter(vec![
+            Ok(AgentProviderStreamItem::Event(Box::new(Self::run_started(
+                &run_id,
+            )))),
+            Ok(AgentProviderStreamItem::Event(Box::new(
+                Self::request_opened(&run_id),
+            ))),
+            Ok(AgentProviderStreamItem::Event(Box::new(
+                Self::request_closed(&run_id),
+            ))),
+            Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::ProviderUnavailable,
+                "fixture transport disconnected",
+            )),
+        ])
+        .boxed();
+        Ok(AgentStart {
+            execution,
+            admission: AgentAdmission::default(),
+            stream,
+        })
+    }
+
+    async fn command(
+        &self,
+        execution: &AgentExecutionRef,
+        command: AgentCommandEnvelope,
+    ) -> Result<ProviderCommandDisposition, AgentProtocolError> {
+        Ok(ProviderCommandDisposition {
+            command_id: command.command_id,
+            run_id: execution.run_id.clone(),
+            outcome: orchestral_core::agent_protocol::wire::ProviderCommandOutcome::Unsupported {
+                feature: "fixture commands".to_owned(),
+            },
+            duplicate: false,
+        })
+    }
+
+    async fn recover(
+        &self,
+        request: AgentRecoveryRequest,
+    ) -> Result<AgentRecovery, AgentProtocolError> {
+        request.validate_for(&self.descriptor)?;
+        let replay = stream::iter(vec![Ok(AgentProviderStreamItem::Event(Box::new(
+            Self::run_started(&request.execution.run_id),
+        )))])
+        .chain(stream::pending())
+        .boxed();
+        Ok(AgentRecovery::reattached(replay))
+    }
 }
 
 #[async_trait]
@@ -162,6 +275,12 @@ impl AgentProvider for RecoveryOrderProvider {
         request: AgentRecoveryRequest,
     ) -> Result<AgentRecovery, AgentProtocolError> {
         let run_id = request.execution.run_id.clone();
+        self.committed_prefix_received.store(
+            request.committed_provider_prefix.iter().any(|draft| {
+                draft.run_id == run_id && matches!(draft.payload, AgentEvent::RunStarted)
+            }),
+            Ordering::SeqCst,
+        );
         let recovered = self.inner.recover(request).await?;
         let (stream, inner_confirmation) = recovered.into_parts();
         let journal = self.journal.clone();
@@ -383,10 +502,12 @@ async fn recovery_continuation_opens_only_after_continuity_restore_is_durable() 
     scenario.immediate_events.truncate(1);
     let journal = Arc::new(InMemoryAgentJournalStore::default());
     let confirmed_after_restore = Arc::new(AtomicBool::new(false));
+    let committed_prefix_received = Arc::new(AtomicBool::new(false));
     let provider = Arc::new(RecoveryOrderProvider {
         inner: factory.create(scenario.clone(), TestProbes::default()),
         journal: journal.clone(),
         confirmed_after_restore: confirmed_after_restore.clone(),
+        committed_prefix_received: committed_prefix_received.clone(),
         fail_after_restore: false,
     });
     let controller = Arc::new(
@@ -417,6 +538,7 @@ async fn recovery_continuation_opens_only_after_continuity_restore_is_durable() 
         .expect("matching Provider prefix restores continuity");
 
     assert!(confirmed_after_restore.load(Ordering::SeqCst));
+    assert!(committed_prefix_received.load(Ordering::SeqCst));
     let stored = journal
         .load_run(&execution.run_id)
         .await
@@ -461,6 +583,44 @@ async fn recovery_rejects_a_provider_that_never_replays_its_committed_prefix() {
             if run_id == &execution.run_id
     ));
     assert!(started.elapsed() < Duration::from_secs(3));
+}
+
+#[tokio::test]
+async fn recovery_accepts_a_request_lifecycle_that_settled_before_disconnect() {
+    let factory = SessionfulRecoverFactory::new().expect("fixture descriptor");
+    let mut descriptor = factory.descriptor().descriptor;
+    descriptor
+        .capabilities
+        .pending_request_kinds
+        .insert(PendingRequestKind::Input);
+    let descriptor = AgentDescriptorEnvelope::seal(descriptor).expect("fixture descriptor seals");
+    let scenario = ProviderScenario::standard(&descriptor).expect("fixture scenario");
+    let provider = Arc::new(SettledRequestRecoveryProvider {
+        descriptor: descriptor.clone(),
+    });
+    let controller = Arc::new(
+        AgentController::new(provider, ProviderBindingRef::new("conformance-binding"))
+            .expect("controller binds provider"),
+    );
+
+    let execution = controller
+        .start(scenario.start_request.run)
+        .await
+        .expect("run starts");
+    assert!(matches!(
+        controller.wait_for_terminal(&execution.run_id).await,
+        Err(orchestral_runtime::AgentControlError::ContinuityUnknown(_))
+    ));
+
+    let recovered = controller
+        .recover(&execution.run_id)
+        .await
+        .expect("settled request history is Host-proven and need not be replayed");
+    assert_eq!(recovered.state.status(), AgentRunStatus::Running);
+    let records = controller.events(&execution.run_id, 0).await.unwrap();
+    assert!(records
+        .iter()
+        .any(|record| { matches!(record.event.payload, AgentEvent::ContinuityRestored { .. }) }));
 }
 
 #[tokio::test]
@@ -531,6 +691,7 @@ async fn failed_recovery_confirmation_returns_the_run_to_unknown() {
         inner: factory.create(scenario.clone(), TestProbes::default()),
         journal: journal.clone(),
         confirmed_after_restore: Arc::new(AtomicBool::new(false)),
+        committed_prefix_received: Arc::new(AtomicBool::new(false)),
         fail_after_restore: true,
     });
     let controller = Arc::new(

@@ -538,6 +538,7 @@ fn history_turns(updates: Vec<Value>) -> Result<Vec<AgentSessionTurn>, AgentConn
         Ok(vec![AgentSessionTurn {
             turn_id: AgentSessionTurnId::new("acp-loaded-history"),
             status: AgentSessionTurnStatus::Completed,
+            failure: None,
             activities,
         }])
     }

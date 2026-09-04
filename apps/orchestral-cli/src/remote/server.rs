@@ -130,6 +130,10 @@ pub(crate) async fn serve(command: ServeCommand, options: AgentRunOptions) -> an
     let remote_state = RemoteApiState {
         agent: host.api.clone(),
         agent_directory,
+        native_session_defaults: super::state::NativeSessionDefaults {
+            cwd: Some(host.workspace_root.to_string_lossy().into_owned()),
+            execution_profile: host.execution_profile.clone(),
+        },
         approvals: host.approvals.clone(),
         registry,
         gateway_authenticator: gateway_authenticator.clone(),

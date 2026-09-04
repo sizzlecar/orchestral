@@ -57,7 +57,7 @@ pub mod reference {
     pub use super::reducer::{
         AgentRunReducer, ApplyOutcome, ReconciliationProofVerifier, SequencedApply,
     };
-    pub use super::types::{AgentContinuityState, AgentRunStatus};
+    pub use super::types::{AgentContinuityState, AgentRunStatus, RecoveryReplayPolicy};
 }
 
 /// Current Agent Protocol version implemented by this crate.

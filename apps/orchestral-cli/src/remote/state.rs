@@ -5,6 +5,7 @@ use anyhow::{bail, Context};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::Utc;
+use orchestral_core::agent_connector::AgentSessionExecutionProfile;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio::sync::Mutex;
@@ -28,6 +29,21 @@ pub struct SessionView {
     pub updated_at_unix_ms: i64,
     #[serde(default)]
     pub run_ids: Vec<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub execution_profile: AgentSessionExecutionProfile,
+}
+
+/// Execution metadata inherited by native Sessions from the composed Host.
+///
+/// This has the same provider-neutral profile shape as connector-backed Agent
+/// Sessions. It describes where a new turn will execute; immutable per-Run
+/// provenance remains the responsibility of the Run journal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NativeSessionDefaults {
+    pub cwd: Option<String>,
+    pub execution_profile: AgentSessionExecutionProfile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -9,6 +9,7 @@ use crate::model::{
 
 const MAX_TELEMETRY_IDS: usize = 800;
 const INITIAL_INPUT_ORDER: u64 = 0;
+const SESSION_HISTORY_ANCHOR_EXTENSION: &str = "orchestral.dev/session-history-anchor";
 
 /// Browser-independent state machine for collapsing invalidation bursts into
 /// one authoritative read plus, when events arrive during that read, one
@@ -165,6 +166,13 @@ pub struct RunRecoveryState {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunSupervisionState {
+    pub state: String,
+    pub reason: String,
+    pub detected_at_unix_ms: i64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunState {
     pub id: String,
@@ -199,17 +207,27 @@ pub struct RunState {
     /// First visible activity keyed by native turn id. Incremental activity
     /// upserts extend this map without rebuilding the bounded transcript.
     pub history_live_turn_ids: BTreeMap<String, String>,
+    /// Status of the newest provider-owned turn in the authoritative session
+    /// projection. This is presentation state only: the synthetic history Run
+    /// must never become a command target for steer, cancel, or recovery.
+    pub history_latest_turn_status: Option<String>,
     pub progress: Option<Progress>,
     pub delivery: Option<Value>,
     pub partial_delivery: Option<Value>,
     pub failure: Option<Value>,
     pub started_at: Option<f64>,
+    /// Authoritative Host catalog update time when this Run came from an
+    /// Agent-session control-plane projection.
+    pub updated_at_unix_ms: Option<i64>,
     pub completed_at: Option<f64>,
     pub error: Option<String>,
     /// Host control-plane disposition for an `unknown` protocol state.
     /// `unknown` alone cannot distinguish progress from an unrecoverable
     /// execution boundary and previously locked the composer forever.
     pub recovery: Option<RunRecoveryState>,
+    /// Host-side execution liveness, independent from transport continuity.
+    /// A Provider stream may remain connected while native work is stalled.
+    pub supervision: Option<RunSupervisionState>,
 }
 
 impl RunState {
@@ -238,14 +256,17 @@ impl RunState {
             history_pagination_started: false,
             history_live_turn_starts: Vec::new(),
             history_live_turn_ids: BTreeMap::new(),
+            history_latest_turn_status: None,
             progress: None,
             delivery: None,
             partial_delivery: None,
             failure: None,
             started_at: None,
+            updated_at_unix_ms: None,
             completed_at: None,
             error: None,
             recovery: None,
+            supervision: None,
         }
     }
 
@@ -278,9 +299,17 @@ impl RunState {
         {
             self.started_at = Some(created_at as f64);
         }
+        let history_anchor_id = view
+            .get("after_activity_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         let initial_input = contents_text(view.get("input"));
         if !initial_input.is_empty() {
-            self.confirm_initial_input(initial_input, self.started_at.map(|value| value as i64));
+            self.confirm_initial_input(
+                initial_input,
+                self.started_at.map(|value| value as i64),
+                history_anchor_id,
+            );
         }
         let view_cursor = view
             .get("last_run_seq")
@@ -288,6 +317,13 @@ impl RunState {
             .unwrap_or_default();
         if view_cursor < self.cursor {
             return;
+        }
+        if let Some(updated_at) = view
+            .get("updated_at_unix_ms")
+            .and_then(Value::as_i64)
+            .filter(|updated_at| *updated_at > 0)
+        {
+            self.updated_at_unix_ms = Some(updated_at);
         }
         let status = status_from_view(&view);
         self.session_id = view
@@ -353,6 +389,15 @@ impl RunState {
         } else {
             None
         };
+        self.supervision = view.get("supervision").and_then(|supervision| {
+            Some(RunSupervisionState {
+                state: supervision.get("state")?.as_str()?.to_owned(),
+                reason: supervision.get("reason")?.as_str()?.to_owned(),
+                detected_at_unix_ms: supervision
+                    .get("detected_at_unix_ms")
+                    .and_then(Value::as_i64)?,
+            })
+        });
         self.error = if status == "unknown" {
             self.recovery
                 .as_ref()
@@ -379,7 +424,7 @@ impl RunState {
     pub fn record_accepted_input(&mut self, input: String, now: f64) {
         self.status = "accepted".to_owned();
         self.started_at.get_or_insert(now);
-        self.confirm_initial_input(input, Some(now as i64));
+        self.confirm_initial_input(input, Some(now as i64), None);
     }
 
     /// Projects a start request before the network round trip completes.
@@ -421,7 +466,12 @@ impl RunState {
         }
     }
 
-    fn confirm_initial_input(&mut self, input: String, occurred_at_unix_ms: Option<i64>) {
+    fn confirm_initial_input(
+        &mut self,
+        input: String,
+        occurred_at_unix_ms: Option<i64>,
+        history_anchor_id: Option<String>,
+    ) {
         if let Some(message) = self
             .messages
             .iter_mut()
@@ -431,6 +481,9 @@ impl RunState {
                 message.text = input;
                 message.order = INITIAL_INPUT_ORDER;
                 message.occurred_at_unix_ms = message.occurred_at_unix_ms.or(occurred_at_unix_ms);
+                if message.native_anchor_id.is_none() {
+                    message.native_anchor_id = history_anchor_id;
+                }
                 message.optimistic = false;
                 return;
             }
@@ -442,7 +495,7 @@ impl RunState {
             text: input,
             order: INITIAL_INPUT_ORDER,
             occurred_at_unix_ms,
-            native_anchor_id: None,
+            native_anchor_id: history_anchor_id,
             optimistic: false,
             deferred: false,
             partial: false,
@@ -509,6 +562,7 @@ impl RunState {
 
         self.cursor = sequence;
         self.server_cursor = self.server_cursor.max(sequence);
+        self.updated_at_unix_ms = Some(self.updated_at_unix_ms.unwrap_or_default().max(now as i64));
         self.event_ids.push(event_id.to_owned());
         self.sequence_ids.insert(sequence, event_id.to_owned());
         self.error = None;
@@ -707,7 +761,21 @@ impl RunState {
         if command_payload.get("type").and_then(Value::as_str) == Some("steer") {
             let text = contents_text(command_payload.get("content"));
             let message_id = format!("steer-{id}");
-            if !text.is_empty() && !self.messages.iter().any(|message| message.id == message_id) {
+            let history_anchor_id = command
+                .get("extensions")
+                .and_then(|extensions| extensions.get(SESSION_HISTORY_ANCHOR_EXTENSION))
+                .and_then(|anchor| anchor.get("after_activity_id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if let Some(message) = self
+                .messages
+                .iter_mut()
+                .find(|message| message.id == message_id)
+            {
+                if message.native_anchor_id.is_none() {
+                    message.native_anchor_id = history_anchor_id;
+                }
+            } else if !text.is_empty() {
                 let message_order = self.next_order();
                 self.messages.push(Message {
                     id: message_id,
@@ -719,7 +787,7 @@ impl RunState {
                     // browser's receipt clock here made the same steer land at
                     // different native-history positions on different devices.
                     occurred_at_unix_ms: None,
-                    native_anchor_id: None,
+                    native_anchor_id: history_anchor_id,
                     optimistic: false,
                     deferred: false,
                     partial: false,
@@ -1120,15 +1188,18 @@ impl AppState {
             .find(|connector| connector.connector_id == connector_id)
     }
 
-    /// Stable identity of the last rendered timeline block for the selected
-    /// session. Live observers use this to distinguish an appended message
-    /// from an in-place activity/status refresh. Only the former should move
-    /// a viewport that is following the live edge.
-    pub fn selected_timeline_tail_key(&self) -> Option<String> {
+    /// Complete content that can affect the selected timeline's scroll
+    /// height. Live observers compare this around a projection so in-place
+    /// growth of the current message follows the live edge just like a newly
+    /// appended block. Session metadata-only refreshes remain scroll-neutral.
+    pub fn selected_timeline_content(
+        &self,
+    ) -> Option<(Vec<SessionTimelineBlock>, Option<SessionRunIssue>)> {
         let session = self.selected_session()?;
-        timeline_blocks_for_session(self, session)
-            .last()
-            .map(SessionTimelineBlock::key)
+        Some((
+            timeline_blocks_for_session(self, session),
+            latest_session_run_issue(self, session),
+        ))
     }
 
     /// Last provider-owned activity visible when a Host input is submitted.
@@ -1165,6 +1236,8 @@ impl AppState {
         let timeline_before = self.agent_session_timeline_snapshot(&connector_id, &session_id);
         let run_id = format!("agent-history:{connector_id}:{session_id}");
         let projection_time = detail.summary.updated_at_unix_ms.unwrap_or_default() as f64;
+        let latest_turn_status = detail.turns.last().map(|turn| turn.status.clone());
+        let latest_turn_failure = detail.turns.last().and_then(|turn| turn.failure.clone());
         let controlled_runs = detail.controlled_runs.clone();
         let controlled_run_ids = controlled_runs
             .iter()
@@ -1224,6 +1297,9 @@ impl AppState {
 
         let run = self.ensure_run_source(&run_id, Some(session_id), Some(connector_id.clone()));
         run.status = "delivered".to_owned();
+        run.history_latest_turn_status = latest_turn_status;
+        run.failure = latest_turn_failure;
+        run.error = None;
         run.commands.clear();
         run.streamed_outputs.clear();
         project_latest_agent_history(run, detail.turns);
@@ -1251,7 +1327,11 @@ impl AppState {
     /// Applies one provider-neutral live mutation without rebuilding the
     /// bounded session page. Stable activity ids make retries idempotent and
     /// preserve an existing item's presentation order.
-    pub fn apply_agent_session_change(&mut self, change: AgentSessionChangeView) -> bool {
+    pub fn apply_agent_session_change(
+        &mut self,
+        change: AgentSessionChangeView,
+        observed_at_unix_ms: i64,
+    ) -> bool {
         let connector_id = change.connector_id;
         let session_id = change.session_id;
         let sequence = change.sequence;
@@ -1260,13 +1340,25 @@ impl AppState {
 
         match change.change {
             AgentSessionChangeKindView::RefreshRequired { .. } => return false,
-            AgentSessionChangeKindView::TurnStatus { status, .. } => {
+            AgentSessionChangeKindView::TurnStatus {
+                status, failure, ..
+            } => {
                 if let Some(session) = self.sessions.items.iter_mut().find(|session| {
                     session.id == session_id
                         && session.connector_id.as_deref() == Some(connector_id.as_str())
                 }) {
                     session.state = Some(session_state_for_turn_status(&status).to_owned());
+                    session.updated_at_unix_ms =
+                        session.updated_at_unix_ms.max(observed_at_unix_ms);
                 }
+                let run = self.ensure_run_source(
+                    &run_id,
+                    Some(session_id.clone()),
+                    Some(connector_id.clone()),
+                );
+                run.history_latest_turn_status = Some(status);
+                run.failure = failure;
+                run.error = None;
             }
             AgentSessionChangeKindView::ActivityUpsert {
                 turn_id,
@@ -1278,6 +1370,8 @@ impl AppState {
                         && session.connector_id.as_deref() == Some(connector_id.as_str())
                 }) {
                     session.state = Some(session_state_for_turn_status(&turn_status).to_owned());
+                    session.updated_at_unix_ms =
+                        session.updated_at_unix_ms.max(observed_at_unix_ms);
                     if !session.run_ids.contains(&run_id) {
                         session.run_ids.insert(0, run_id.clone());
                     }
@@ -1289,6 +1383,9 @@ impl AppState {
                     Some(connector_id.clone()),
                 );
                 run.status = "delivered".to_owned();
+                run.history_latest_turn_status = Some(turn_status);
+                run.failure = None;
+                run.error = None;
                 let activity_id = activity.activity_id.clone();
                 let client_id = activity
                     .details
@@ -1859,6 +1956,32 @@ pub fn timeline_run_ids_for_session(state: &AppState, session: &SessionView) -> 
         .collect()
 }
 
+/// Returns the issue that owns the current session live edge.
+///
+/// Individual Run failures remain durable in `RunState`, but an older failed
+/// Run must not be presented as the session's current footer after a newer
+/// Run has started or completed. Doing so detached the failure from its turn
+/// and made a recovered conversation look permanently broken.
+pub fn latest_session_run_issue(
+    state: &AppState,
+    session: &SessionView,
+) -> Option<SessionRunIssue> {
+    let run = timeline_run_ids_for_session(state, session)
+        .into_iter()
+        .rev()
+        .find_map(|run_id| state.runs.get(&run_id))?;
+    run.failure
+        .clone()
+        .map(SessionRunIssue::Failure)
+        .or_else(|| run.error.clone().map(SessionRunIssue::ControlError))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionRunIssue {
+    Failure(Value),
+    ControlError(String),
+}
+
 /// Merges the bounded native transcript with any Host-controlled mirror.
 ///
 /// Codex pages by activity and response size. A latest page can therefore
@@ -1909,9 +2032,11 @@ pub fn timeline_blocks_for_session(
                 commands
             },
         );
-    let latest_turn_start = history
-        .history_live_turn_starts
-        .last()
+    let active_turn_start = history
+        .history_latest_turn_status
+        .as_deref()
+        .filter(|status| !matches!(*status, "completed" | "interrupted" | "failed"))
+        .and_then(|_| history.history_live_turn_starts.last())
         .and_then(|activity_id| {
             history_items
                 .iter()
@@ -1991,10 +2116,14 @@ pub fn timeline_blocks_for_session(
             // than filesystem timestamps, which Codex can rewrite while a
             // rollout is active. Insert before the matching turn even when a
             // newer native turn is already visible.
-            response_turn_start
-                .or(explicit_insertion)
+            explicit_insertion
+                .or(response_turn_start)
                 .or_else(time_insertion)
-                .unwrap_or_else(|| latest_turn_start.unwrap_or(history_items.len()))
+                // A currently active provider turn may already contain the
+                // controlled response while its user item fell off the bounded
+                // page, so fill that live turn boundary. A completed turn is
+                // immutable history: never split it for an uncorrelated Run.
+                .unwrap_or_else(|| active_turn_start.unwrap_or(history_items.len()))
         } else {
             // Each steer captures the native edge visible at submission.
             // Time remains only a legacy fallback for pre-anchor state.
@@ -3004,6 +3133,30 @@ mod tests {
     }
 
     #[test]
+    fn run_view_projects_provider_neutral_supervision_state() {
+        let mut run = RunState::new("run-stalled", Some("thread-1".to_owned()));
+        run.apply_view(
+            serde_json::json!({
+                "input": [],
+                "state": {"state": "running"},
+                "last_run_seq": 2,
+                "pending_requests": [],
+                "supervision": {
+                    "state": "interrupting",
+                    "reason": "execution lease expired",
+                    "detected_at_unix_ms": 1234
+                }
+            }),
+            2_000.0,
+        );
+
+        let supervision = run.supervision.expect("supervision is projected");
+        assert_eq!(supervision.state, "interrupting");
+        assert_eq!(supervision.reason, "execution lease expired");
+        assert_eq!(supervision.detected_at_unix_ms, 1234);
+    }
+
+    #[test]
     fn unknown_run_requires_recovery_instead_of_steer() {
         let mut state = AppState::new(true);
         state.sessions.items.push(SessionView {
@@ -3411,6 +3564,121 @@ mod tests {
     }
 
     #[test]
+    fn unanchored_fresh_run_never_splits_the_last_bounded_history_turn() {
+        let detail: AgentSessionDetail = serde_json::from_value(serde_json::json!({
+            "summary": {
+                "connector_id": "fixture/local",
+                "session_id": "bounded-thread",
+                "state": "active"
+            },
+            "turns": [{
+                "turn_id": "stale-latest-turn",
+                "status": "completed",
+                "activities": [
+                    {
+                        "activity_id": "old-user",
+                        "kind": "user_message",
+                        "status": "completed",
+                        "content": [{"body": {"kind": "inline", "value": "old question"}}]
+                    },
+                    {
+                        "activity_id": "old-answer-part-1",
+                        "kind": "agent_message",
+                        "status": "completed",
+                        "content": [{"body": {"kind": "inline", "value": "old answer part 1"}}]
+                    },
+                    {
+                        "activity_id": "old-reasoning",
+                        "kind": "reasoning",
+                        "status": "completed",
+                        "content": []
+                    },
+                    {
+                        "activity_id": "old-answer-tail",
+                        "kind": "agent_message",
+                        "status": "completed",
+                        "content": [{"body": {"kind": "inline", "value": "old answer tail"}}]
+                    }
+                ]
+            }],
+            "controlled_runs": [{
+                "created_at_unix_ms": 99_000,
+                "execution": {"session_id": "bounded-thread", "run_id": "fresh-run"},
+                "state": {"state": "running"},
+                "last_run_seq": 2,
+                "input": [{"body": {"kind": "inline", "value": "new question"}}]
+            }]
+        }))
+        .unwrap();
+        let mut state = AppState::new(true);
+        state.project_agent_session(detail);
+
+        let messages = timeline_blocks_for_session(&state, &state.sessions.items[0])
+            .into_iter()
+            .filter_map(|entry| match entry.block {
+                TimelineBlock::Entry(TimelineItem::Message(message)) => Some(message.text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages,
+            [
+                "old question",
+                "old answer part 1",
+                "old answer tail",
+                "new question"
+            ]
+        );
+    }
+
+    #[test]
+    fn projected_run_and_command_restore_their_history_anchors() {
+        let mut run = RunState::new("run-1", Some("thread-1".to_owned()));
+        run.apply_view(
+            serde_json::json!({
+                "created_at_unix_ms": 10_000,
+                "after_activity_id": "visible-tail-before-run",
+                "execution": {"session_id": "thread-1", "run_id": "run-1"},
+                "state": {"state": "running"},
+                "last_run_seq": 0,
+                "input": [{"body": {"kind": "inline", "value": "initial"}}]
+            }),
+            10_000.0,
+        );
+        run.project_durable(
+            &record(
+                1,
+                "command-event",
+                serde_json::json!({
+                    "type": "command_received",
+                    "command": {
+                        "command_id": "command-1",
+                        "payload": {
+                            "type": "steer",
+                            "content": content("follow up")
+                        },
+                        "extensions": {
+                            "orchestral.dev/session-history-anchor": {
+                                "after_activity_id": "visible-tail-before-steer"
+                            }
+                        }
+                    }
+                }),
+            ),
+            11_000.0,
+        );
+
+        assert_eq!(
+            run.messages[0].native_anchor_id.as_deref(),
+            Some("visible-tail-before-run")
+        );
+        assert_eq!(
+            run.messages[1].native_anchor_id.as_deref(),
+            Some("visible-tail-before-steer")
+        );
+    }
+
+    #[test]
     fn accepted_input_is_replaced_by_its_durable_event_without_losing_the_native_anchor() {
         let mut run = RunState::new("fresh-run", Some("thread-anchored".to_owned()));
         run.optimistic_start_input(
@@ -3573,6 +3841,7 @@ mod tests {
         echoed.turns.push(AgentSessionTurn {
             turn_id: "turn-latest".to_owned(),
             status: "active".to_owned(),
+            failure: None,
             activities: vec![AgentSessionActivity {
                 activity_id: "native-command-shared".to_owned(),
                 kind: "user_message".to_owned(),
@@ -3910,6 +4179,102 @@ mod tests {
     }
 
     #[test]
+    fn newer_success_supersedes_an_older_failure_at_the_session_live_edge() {
+        let mut state = AppState::new(true);
+        state.sessions.items.push(SessionView {
+            id: "thread-1".to_owned(),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 3,
+            run_ids: vec!["failed-run".to_owned(), "successful-run".to_owned()],
+            connector_id: None,
+            title: None,
+            preview: None,
+            cwd: None,
+            state: Some("idle".to_owned()),
+            execution_profile: Default::default(),
+        });
+        let failure = serde_json::json!({
+            "code": "model_unavailable",
+            "message": "temporary timeout"
+        });
+        let failed = state.ensure_run("failed-run", Some("thread-1".to_owned()));
+        failed.status = "failed".to_owned();
+        failed.failure = Some(failure.clone());
+        state
+            .ensure_run("successful-run", Some("thread-1".to_owned()))
+            .status = "delivered".to_owned();
+
+        let session = state.sessions.items.first().unwrap();
+        assert_eq!(latest_session_run_issue(&state, session), None);
+
+        let latest = state.runs.get_mut("successful-run").unwrap();
+        latest.status = "failed".to_owned();
+        latest.failure = Some(failure.clone());
+        let session = state.sessions.items.first().unwrap();
+        assert_eq!(
+            latest_session_run_issue(&state, session),
+            Some(SessionRunIssue::Failure(failure))
+        );
+    }
+
+    #[test]
+    fn native_turn_failure_is_visible_and_cleared_by_the_next_turn() {
+        let failure = serde_json::json!({
+            "code": "agent_transport_unavailable",
+            "message": "proxy connection failed with status 502",
+            "retryable": true,
+            "details": null
+        });
+        let detail: AgentSessionDetail = serde_json::from_value(serde_json::json!({
+            "summary": {
+                "connector_id": "fixture/local",
+                "session_id": "thread-1",
+                "state": "idle"
+            },
+            "turns": [{
+                "turn_id": "turn-failed",
+                "status": "failed",
+                "failure": failure,
+                "activities": []
+            }],
+            "stream_cursor": 4
+        }))
+        .unwrap();
+        let mut state = AppState::new(true);
+        state.project_agent_session(detail);
+
+        let session = state.sessions.items.first().unwrap();
+        assert_eq!(
+            latest_session_run_issue(&state, session),
+            Some(SessionRunIssue::Failure(failure.clone()))
+        );
+
+        let change: AgentSessionChangeView = serde_json::from_value(serde_json::json!({
+            "connector_id": "fixture/local",
+            "session_id": "thread-1",
+            "sequence": 5,
+            "change": {
+                "type": "turn_status",
+                "turn_id": "turn-next",
+                "status": "active"
+            }
+        }))
+        .unwrap();
+        state.apply_agent_session_change(change, 10);
+
+        let session = state.sessions.items.first().unwrap();
+        assert_eq!(latest_session_run_issue(&state, session), None);
+        let history = state
+            .runs
+            .get("agent-history:fixture/local:thread-1")
+            .unwrap();
+        assert_eq!(
+            history.history_latest_turn_status.as_deref(),
+            Some("active")
+        );
+    }
+
+    #[test]
     fn native_steer_identity_hides_the_same_runs_initial_mirror() {
         let detail: AgentSessionDetail = serde_json::from_value(serde_json::json!({
             "summary": {
@@ -4046,27 +4411,30 @@ mod tests {
         assert_eq!(state.runs[run_id].messages.len(), 1);
         let stable_order = state.runs[run_id].messages[0].order;
 
-        state.apply_agent_session_change(AgentSessionChangeView {
-            connector_id: "codex/local".to_owned(),
-            session_id: "thread-1".to_owned(),
-            sequence: 2,
-            change: AgentSessionChangeKindView::ActivityUpsert {
-                turn_id: "turn-1".to_owned(),
-                turn_status: "active".to_owned(),
-                activity: AgentSessionActivity {
-                    activity_id: "native-user-c".to_owned(),
-                    kind: "user_message".to_owned(),
-                    status: "completed".to_owned(),
-                    title: None,
-                    content: vec![serde_json::json!({
-                        "body": {"kind": "inline", "value": "authoritative"}
-                    })],
-                    details: serde_json::json!({
-                        "clientId": "orchestral-command:run-1:command-1:digest"
-                    }),
+        state.apply_agent_session_change(
+            AgentSessionChangeView {
+                connector_id: "codex/local".to_owned(),
+                session_id: "thread-1".to_owned(),
+                sequence: 2,
+                change: AgentSessionChangeKindView::ActivityUpsert {
+                    turn_id: "turn-1".to_owned(),
+                    turn_status: "active".to_owned(),
+                    activity: AgentSessionActivity {
+                        activity_id: "native-user-c".to_owned(),
+                        kind: "user_message".to_owned(),
+                        status: "completed".to_owned(),
+                        title: None,
+                        content: vec![serde_json::json!({
+                            "body": {"kind": "inline", "value": "authoritative"}
+                        })],
+                        details: serde_json::json!({
+                            "clientId": "orchestral-command:run-1:command-1:digest"
+                        }),
+                    },
                 },
             },
-        });
+            3_000,
+        );
 
         assert_eq!(state.runs[run_id].messages.len(), 1);
         assert_eq!(state.runs[run_id].messages[0].text, "authoritative");
@@ -4295,16 +4663,18 @@ mod tests {
             }
         }))
         .unwrap();
-        assert!(state.apply_agent_session_change(user_change.clone()));
-        let stable_tail = state.selected_timeline_tail_key();
-        assert!(!state.apply_agent_session_change(user_change.clone()));
+        assert!(state.apply_agent_session_change(user_change.clone(), 2_000));
+        let stable_timeline = state.selected_timeline_content();
+        assert!(!state.apply_agent_session_change(user_change.clone(), 2_000));
+        assert_eq!(state.selected_timeline_content(), stable_timeline);
 
         let mut edited = user_change;
         if let AgentSessionChangeKindView::ActivityUpsert { activity, .. } = &mut edited.change {
             activity.content = content("hello edited").as_array().unwrap().clone();
         }
-        assert!(state.apply_agent_session_change(edited));
-        assert_eq!(state.selected_timeline_tail_key(), stable_tail);
+        assert!(state.apply_agent_session_change(edited, 2_000));
+        assert_ne!(state.selected_timeline_content(), stable_timeline);
+        let edited_timeline = state.selected_timeline_content();
 
         let assistant_change: AgentSessionChangeView = serde_json::from_value(serde_json::json!({
             "connector_id": "codex/local",
@@ -4323,8 +4693,21 @@ mod tests {
             }
         }))
         .unwrap();
-        assert!(state.apply_agent_session_change(assistant_change));
-        assert_ne!(state.selected_timeline_tail_key(), stable_tail);
+        assert!(state.apply_agent_session_change(assistant_change, 3_000));
+        assert_ne!(state.selected_timeline_content(), edited_timeline);
+
+        let completed_change: AgentSessionChangeView = serde_json::from_value(serde_json::json!({
+            "connector_id": "codex/local",
+            "session_id": "thread-live",
+            "sequence": 3,
+            "change": {
+                "type": "turn_status",
+                "turn_id": "turn-1",
+                "status": "completed"
+            }
+        }))
+        .unwrap();
+        state.apply_agent_session_change(completed_change, 4_000);
 
         let run = state
             .runs
@@ -4334,6 +4717,10 @@ mod tests {
         assert_eq!(run.messages[0].text, "hello edited");
         assert_eq!(run.messages[1].text, "world");
         assert_eq!(run.history_live_turn_starts, ["user-1"]);
+        assert_eq!(run.history_latest_turn_status.as_deref(), Some("completed"));
+        let session = state.selected_session().expect("session remains selected");
+        assert_eq!(session.state.as_deref(), Some("idle"));
+        assert_eq!(session.updated_at_unix_ms, 4_000);
     }
 
     #[test]

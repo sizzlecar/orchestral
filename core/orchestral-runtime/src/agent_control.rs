@@ -13,7 +13,7 @@ use futures_util::StreamExt;
 use orchestral_core::agent_protocol::{
     reference::{
         AgentContinuityState, AgentRunReducer, AgentRunStatus, ApplyOutcome,
-        ReconciliationProofVerifier, SequencedApply,
+        ReconciliationProofVerifier, RecoveryReplayPolicy, SequencedApply,
     },
     spi::{
         AgentJournalStore, AgentJournalStoreError, AgentProvider, AgentProviderStream,
@@ -313,6 +313,16 @@ impl AgentController {
         Ok(input)
     }
 
+    /// Returns digest-bound metadata from the immutable Run specification.
+    pub async fn run_extensions(
+        &self,
+        run_id: &RunId,
+    ) -> Result<orchestral_core::agent_protocol::wire::Extensions, AgentControlError> {
+        let slot = self.run_slot(run_id).await?;
+        let extensions = slot.entry.lock().await.request.run.spec.extensions.clone();
+        Ok(extensions)
+    }
+
     /// Lists durable Runs directly from the Host journal. Transport-specific
     /// session registries must not maintain a second Run ownership index.
     pub async fn catalog_runs(&self) -> Result<Vec<AgentRunCatalogEntry>, AgentControlError> {
@@ -457,6 +467,7 @@ impl AgentController {
             start_request,
             execution,
             expected_provider_prefix,
+            committed_provider_prefix,
             last_confirmed_seq,
             loss_event_digest,
         ) = {
@@ -490,42 +501,58 @@ impl AgentController {
                 )
                 .into());
             }
-            let prefix = entry
+            let pending_request_ids = entry
+                .reducer
+                .view()
+                .pending_requests
+                .iter()
+                .map(|request| request.request_id.clone())
+                .collect();
+            let provider_records = entry
                 .journal
                 .iter()
                 .filter(|record| {
                     record.event.run_seq <= last_confirmed_seq
                         && matches!(record.authority, AgentEventAuthority::Provider)
                 })
+                .collect::<Vec<_>>();
+            let prefix = provider_records
+                .iter()
                 .map(|record| {
                     (
                         record.event.event_id.clone(),
                         record.draft_digest.clone(),
-                        // Command dispositions are synchronous control-plane
-                        // responses that the Host already validated against
-                        // and committed with the command envelope. They do
-                        // not belong to the Provider's native observation
-                        // stream after a process restart, so requiring an
-                        // adapter to replay them makes otherwise valid native
-                        // continuity unrecoverable.
-                        !matches!(
-                            record.event.payload,
-                            AgentEvent::CommandDispositionRecorded { .. }
-                        ),
+                        record
+                            .event
+                            .payload
+                            .recovery_replay_policy(&pending_request_ids)
+                            == RecoveryReplayPolicy::ProviderEvidenceRequired,
                     )
+                })
+                .collect::<Vec<_>>();
+            let committed_provider_prefix = provider_records
+                .iter()
+                .map(|record| AgentEventDraft {
+                    event_id: record.event.event_id.clone(),
+                    run_id: record.event.run_id.clone(),
+                    causation_id: record.event.causation_id.clone(),
+                    source_fingerprint: record.event.source_fingerprint.clone(),
+                    payload: record.event.payload.clone(),
                 })
                 .collect::<Vec<_>>();
             (
                 entry.request.clone(),
                 entry.execution.clone(),
                 prefix,
+                committed_provider_prefix,
                 last_confirmed_seq,
                 loss_record.event.event_digest.clone(),
             )
         };
 
         let recovery =
-            AgentRecoveryRequest::new(start_request, execution.clone(), &self.descriptor)?;
+            AgentRecoveryRequest::new(start_request, execution.clone(), &self.descriptor)?
+                .with_committed_provider_prefix(committed_provider_prefix)?;
         let recovered = self.provider.recover(recovery).await?;
         let (mut stream, confirmation) = recovered.into_parts();
         let mut matched_digests = Vec::with_capacity(expected_provider_prefix.len());

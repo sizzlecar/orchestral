@@ -8,7 +8,7 @@ use orchestral_core::agent_connector::AgentSessionActionInvocation;
 use orchestral_core::agent_protocol::spi::AgentRunCatalogEntry;
 use orchestral_core::agent_protocol::wire::{
     AgentCommandEnvelope, AgentJournalRecord, AgentRunView, AgentSessionId, CommandAck, Content,
-    ResourceBinding, RunId,
+    Extensions, ResourceBinding, RunId,
 };
 use tokio::sync::broadcast;
 use tokio::sync::RwLock;
@@ -86,6 +86,17 @@ impl AgentApi {
         run_id: Option<RunId>,
         input: Vec<Content>,
     ) -> Result<AgentRunHandle, AgentSdkError> {
+        self.start_content_with_extensions(session_id, run_id, input, Extensions::new())
+            .await
+    }
+
+    pub async fn start_content_with_extensions(
+        &self,
+        session_id: &AgentSessionId,
+        run_id: Option<RunId>,
+        input: Vec<Content>,
+        extensions: Extensions,
+    ) -> Result<AgentRunHandle, AgentSdkError> {
         if input.is_empty() {
             return Err(AgentSdkError::InvalidInput(
                 "Agent input must not be empty".to_owned(),
@@ -93,12 +104,17 @@ impl AgentApi {
         }
         let client = self.session(session_id).await?;
         match run_id {
-            Some(run_id) => client.start_with_run_id(run_id, input).await,
+            Some(run_id) => {
+                client
+                    .start_with_run_id_and_extensions(run_id, input, extensions)
+                    .await
+            }
             None => {
                 client
-                    .start_with_run_id(
+                    .start_with_run_id_and_extensions(
                         RunId::new(format!("api-session-{}", uuid::Uuid::new_v4())),
                         input,
+                        extensions,
                     )
                     .await
             }
@@ -124,6 +140,10 @@ impl AgentApi {
 
     pub async fn initial_input(&self, run_id: &RunId) -> Result<Vec<Content>, AgentSdkError> {
         Ok(self.controller.initial_input(run_id).await?)
+    }
+
+    pub async fn run_extensions(&self, run_id: &RunId) -> Result<Extensions, AgentSdkError> {
+        Ok(self.controller.run_extensions(run_id).await?)
     }
 
     pub async fn catalog_runs(&self) -> Result<Vec<AgentRunCatalogEntry>, AgentSdkError> {

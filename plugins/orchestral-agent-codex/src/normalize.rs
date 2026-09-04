@@ -6,7 +6,7 @@ use orchestral_core::agent_connector::{
     AgentSessionState, AgentSessionSummary, AgentSessionTurn, AgentSessionTurnId,
     AgentSessionTurnStatus,
 };
-use orchestral_core::agent_protocol::wire::{AgentSessionId, Content};
+use orchestral_core::agent_protocol::wire::{AgentFailure, AgentSessionId, Content};
 use serde_json::{json, Map, Value};
 
 #[derive(Debug, Clone)]
@@ -108,6 +108,7 @@ pub(crate) fn session_items_page(
                 turns.push(AgentSessionTurn {
                     turn_id: AgentSessionTurnId::new(turn_id),
                     status: AgentSessionTurnStatus::Completed,
+                    failure: None,
                     activities: Vec::new(),
                 });
                 index
@@ -190,6 +191,7 @@ pub(crate) fn deferred_queue_turn(
     Ok(AgentSessionTurn {
         turn_id: AgentSessionTurnId::new(format!("deferred-{submission_id}")),
         status: AgentSessionTurnStatus::Pending,
+        failure: None,
         activities: vec![AgentSessionActivity {
             activity_id: AgentSessionActivityId::new(format!("deferred-user-{submission_id}")),
             kind: AgentSessionActivityKind::UserMessage,
@@ -252,8 +254,65 @@ fn normalize_turn(
     Ok(AgentSessionTurn {
         turn_id: AgentSessionTurnId::new(id),
         status: turn_status(turn.get("status").and_then(Value::as_str)),
+        failure: turn_failure(turn, limits),
         activities,
     })
+}
+
+/// Maps a Codex-native terminal error into the shared Agent failure contract.
+/// Provider-specific detail remains available for diagnostics, while callers
+/// can render the stable code/message/retryable fields without knowing Codex.
+pub(crate) fn turn_failure(turn: &Value, limits: &NormalizationLimits) -> Option<AgentFailure> {
+    let error = turn.get("error")?.as_object()?;
+    let message = error.get("message")?.as_str()?.trim();
+    if message.is_empty() {
+        return None;
+    }
+    let native_kind = error.get("codexErrorInfo").and_then(codex_error_kind);
+    let code = native_kind
+        .map(|kind| format!("codex_{}", snake_case(kind)))
+        .unwrap_or_else(|| "agent_turn_failed".to_owned());
+    let retryable = native_kind.is_some_and(|kind| {
+        matches!(
+            kind,
+            "httpConnectionFailed"
+                | "responseStreamConnectionFailed"
+                | "responseStreamDisconnected"
+                | "responseTooManyFailedAttempts"
+                | "serverOverloaded"
+                | "rateLimitExceeded"
+                | "internalServerError"
+        )
+    });
+    Some(AgentFailure {
+        code,
+        message: truncate_chars(message, limits.max_text_chars),
+        retryable,
+        details: bounded_json(&Value::Object(error.clone()), limits.max_detail_chars),
+    })
+}
+
+fn codex_error_kind(value: &Value) -> Option<&str> {
+    value
+        .as_str()
+        .or_else(|| value.as_object()?.keys().next().map(String::as_str))
+}
+
+fn snake_case(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_ascii_uppercase() {
+            if !output.is_empty() {
+                output.push('_');
+            }
+            output.push(character.to_ascii_lowercase());
+        } else if character.is_ascii_alphanumeric() {
+            output.push(character.to_ascii_lowercase());
+        } else if !output.ends_with('_') {
+            output.push('_');
+        }
+    }
+    output.trim_matches('_').to_owned()
 }
 
 pub(crate) fn normalize_activity(
@@ -501,7 +560,11 @@ mod tests {
                     "status": {"type": "active", "activeFlags": ["waitingOnApproval"]},
                     "turns": [{
                         "id": "turn-1",
-                        "status": "completed",
+                        "status": "failed",
+                        "error": {
+                            "message": "upstream connection failed",
+                            "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 502}}
+                        },
                         "items": [
                             {"type": "userMessage", "id": "u1", "clientId": "orchestral:run-1:digest", "content": [{"type": "text", "text": "hello"}]},
                             {"type": "commandExecution", "id": "c1", "command": "cargo test", "status": "completed", "aggregatedOutput": "abcdefghijklmnop"},
@@ -518,6 +581,11 @@ mod tests {
         .unwrap();
         assert_eq!(detail.summary.state, AgentSessionState::WaitingApproval);
         assert_eq!(detail.turns[0].activities.len(), 3);
+        assert_eq!(
+            detail.turns[0].failure.as_ref().unwrap().code,
+            "codex_http_connection_failed"
+        );
+        assert!(detail.turns[0].failure.as_ref().unwrap().retryable);
         assert_eq!(
             detail.turns[0].activities[0].details["clientId"],
             "orchestral:run-1:digest"

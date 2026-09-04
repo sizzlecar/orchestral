@@ -1,8 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
@@ -80,6 +80,14 @@ const EXTERNAL_QUEUE_PAGE_LIMIT: u32 = 100;
 // reconciliation; normal transcript pagination remains at 100.
 const EXTERNAL_RECOVERY_ITEM_PAGE_LIMIT: u32 = 1_000;
 const EXTERNAL_HISTORY_TELEMETRY_LIMIT: usize = 256;
+// A newly steered shared-writer turn can be accepted before Codex publishes it
+// into either history view. Keep the live notification stream authoritative
+// during that short indexing window instead of detaching on the first poll.
+const DIRECT_HISTORY_MISS_LIMIT: u16 = 20;
+#[cfg(not(test))]
+const RECOVERY_EVIDENCE_MISS_LIMIT: u16 = 6;
+#[cfg(test)]
+const RECOVERY_EVIDENCE_MISS_LIMIT: u16 = 2;
 #[cfg(not(test))]
 const DIRECT_RUN_POLL_INTERVAL: Duration = Duration::from_millis(1_500);
 #[cfg(test)]
@@ -111,7 +119,8 @@ struct CodexRun {
     execution: AgentExecutionRef,
     admission: AgentAdmission,
     artifact_publisher: Option<Arc<dyn ArtifactPublisher>>,
-    sender: broadcast::Sender<Result<AgentProviderStreamItem, AgentProtocolError>>,
+    critical_sender: broadcast::Sender<Result<AgentProviderStreamItem, AgentProtocolError>>,
+    telemetry_sender: broadcast::Sender<AgentTelemetryEnvelope>,
     durable: Mutex<Vec<AgentEventDraft>>,
     turn_id: Mutex<Option<String>>,
     final_response: Mutex<String>,
@@ -121,6 +130,8 @@ struct CodexRun {
     observed_item_ids: Mutex<BTreeSet<String>>,
     cancel_request: Mutex<Option<(CommandId, String)>>,
     telemetry_seq: AtomicU64,
+    direct_history_misses: AtomicU16,
+    recovery_evidence_misses: AtomicU16,
     external_monitor_running: AtomicBool,
     stop_requested_published: AtomicBool,
     detached: AtomicBool,
@@ -175,13 +186,18 @@ fn new_codex_run(
     admission: AgentAdmission,
     artifact_publisher: Option<Arc<dyn ArtifactPublisher>>,
 ) -> Arc<CodexRun> {
-    let (sender, _) = broadcast::channel(512);
+    // Durable lifecycle events, errors, and low-volume tool activity must not
+    // compete with high-volume token telemetry for retention. Output deltas
+    // are intentionally lossy and restored by final DeliveryCommitted data.
+    let (critical_sender, _) = broadcast::channel(1_024);
+    let (telemetry_sender, _) = broadcast::channel(512);
     Arc::new(CodexRun {
         request,
         execution,
         admission,
         artifact_publisher,
-        sender,
+        critical_sender,
+        telemetry_sender,
         durable: Mutex::new(Vec::new()),
         turn_id: Mutex::new(None),
         final_response: Mutex::new(String::new()),
@@ -191,12 +207,20 @@ fn new_codex_run(
         observed_item_ids: Mutex::new(BTreeSet::new()),
         cancel_request: Mutex::new(None),
         telemetry_seq: AtomicU64::new(0),
+        direct_history_misses: AtomicU16::new(0),
+        recovery_evidence_misses: AtomicU16::new(0),
         external_monitor_running: AtomicBool::new(false),
         stop_requested_published: AtomicBool::new(false),
         detached: AtomicBool::new(false),
         finalizing: AtomicBool::new(false),
         terminal: AtomicBool::new(false),
     })
+}
+
+fn restore_committed_provider_prefix(run: &CodexRun, prefix: &[AgentEventDraft]) {
+    let mut durable = lock(&run.durable);
+    debug_assert!(durable.is_empty());
+    durable.extend_from_slice(prefix);
 }
 
 impl CodexConnector {
@@ -243,13 +267,25 @@ impl CodexConnector {
         // image data as a local/native image entry in persisted history.
         // External queue reconciliation still validates its unmodified input
         // digest because queue submissions preserve the submitted payload.
-        let Some(turn) =
-            find_native_turn_metadata(&connected.rpc, &run.execution.session_id, &turn_id)
-                .await
-                .map_err(transport_to_protocol)?
+        let Some(turn) = find_native_turn_or_loaded(
+            &connected.rpc,
+            &run.execution.session_id,
+            &turn_id,
+            "notLoaded",
+        )
+        .await?
         else {
             return Ok(false);
         };
+        if turn.get("status").and_then(Value::as_str) == Some("interrupted")
+            && !external_turn_is_terminal(&turn)
+        {
+            // An interrupted non-owner view is not evidence that this turn is
+            // still directly controllable. Preserve the external route until
+            // the shared reconciliation path proves either a live or terminal
+            // boundary; mutating first strands the Run in Direct forever.
+            return Ok(false);
+        }
         {
             let mut state = self.provider_state();
             if state
@@ -281,7 +317,9 @@ impl CodexConnector {
                 // connection to notifications for an already loaded thread.
                 // Polling in `monitor_native_run` remains the lossless fallback
                 // when an older app-server reports an active-writer conflict.
-                let notifications = connected.rpc.subscribe();
+                let notifications = connected
+                    .rpc
+                    .subscribe_session(run.execution.session_id.as_str());
                 match connected
                     .rpc
                     .request(
@@ -1015,20 +1053,24 @@ async fn latest_native_turn(
         .cloned())
 }
 
-async fn find_native_turn(
+/// The paginated history index may lag an actively written turn. Once that
+/// index is exhausted, inspect the loaded thread snapshot before declaring an
+/// exact native identity absent. This is a read-only Provider implementation
+/// detail; the Host recovery contract remains provider-neutral.
+async fn find_native_turn_or_loaded(
     rpc: &CodexRpcClient,
     session_id: &AgentSessionId,
     target_turn_id: &str,
-) -> Result<Option<Value>, CodexTransportError> {
-    find_native_turn_with_items_view(rpc, session_id, target_turn_id, "full").await
-}
-
-async fn find_native_turn_metadata(
-    rpc: &CodexRpcClient,
-    session_id: &AgentSessionId,
-    target_turn_id: &str,
-) -> Result<Option<Value>, CodexTransportError> {
-    find_native_turn_with_items_view(rpc, session_id, target_turn_id, "notLoaded").await
+    items_view: &str,
+) -> Result<Option<Value>, AgentProtocolError> {
+    if let Some(turn) =
+        find_native_turn_with_items_view(rpc, session_id, target_turn_id, items_view)
+            .await
+            .map_err(transport_to_protocol)?
+    {
+        return Ok(Some(turn));
+    }
+    find_loaded_thread_turn(rpc, session_id.as_str(), target_turn_id).await
 }
 
 async fn find_native_turn_with_items_view(
@@ -1231,7 +1273,9 @@ impl AgentProvider for CodexConnector {
                 )));
             }
         };
-        let notifications = connected.rpc.subscribe();
+        let notifications = connected
+            .rpc
+            .subscribe_session(run.execution.session_id.as_str());
         self.start_native_run(connected, Arc::clone(&run), notifications)
             .await?;
         Ok(AgentStart {
@@ -1354,6 +1398,10 @@ impl AgentProvider for CodexConnector {
             .get(&request.execution.run_id)
             .cloned();
         let reconstructed = existing.is_none();
+        let committed_run_started = request
+            .committed_provider_prefix
+            .iter()
+            .any(|draft| matches!(draft.payload, AgentEvent::RunStarted));
         let run = if let Some(run) = existing {
             run
         } else {
@@ -1385,9 +1433,17 @@ impl AgentProvider for CodexConnector {
                 queued_submission_id: None,
                 client_message_id: queued_client_message_id(&request.execution),
                 input_digest,
-                phase: ExternalQueuePhase::Submitting,
+                phase: if committed_run_started {
+                    // Host-authenticated lifecycle evidence is stronger than
+                    // a stale native queue snapshot. Recovery must never move
+                    // an already-started execution back to Submitting/Queued.
+                    ExternalQueuePhase::Started
+                } else {
+                    ExternalQueuePhase::Submitting
+                },
                 ambiguous_polls: 0,
             });
+            restore_committed_provider_prefix(&run, request.committed_provider_prefix.as_slice());
             run.detached.store(true, Ordering::SeqCst);
             run
         };
@@ -1398,17 +1454,19 @@ impl AgentProvider for CodexConnector {
             ));
         }
         if !reconstructed && !run.detached.load(Ordering::SeqCst) {
-            return Err(AgentProtocolError::new(
-                AgentProtocolErrorCode::InvalidTransition,
-                "Codex run is not detached",
-            ));
+            // The Host can lose only its Provider-stream subscriber (for
+            // example after a broadcast SequenceGap) while the exact native
+            // turn monitor remains healthy. Recovery in that state is a pure
+            // replay plus live re-subscription; reconnecting the app-server or
+            // spawning a second native monitor would be both unnecessary and
+            // unsafe.
+            return Ok(AgentRecovery::reattached(stream_for(&run)));
         }
 
         let connected = self.client().await.map_err(connector_to_protocol)?;
-        if reconstructed
-            && self
-                .adopt_loaded_active_turn_for_recovery(&connected, &run)
-                .await?
+        if self
+            .adopt_loaded_active_turn_for_recovery(&connected, &run)
+            .await?
         {
             return Ok(AgentRecovery::reattached(stream_for(&run)));
         }
@@ -1418,14 +1476,37 @@ impl AgentProvider for CodexConnector {
         ) {
             match reconcile_external_queued_run(&connected.rpc, &run).await? {
                 ExternalQueueObservation::Queued | ExternalQueueObservation::TurnObserved => {
+                    run.recovery_evidence_misses.store(0, Ordering::SeqCst);
                     run.detached.store(false, Ordering::SeqCst);
                 }
                 ExternalQueueObservation::Terminal => {
+                    run.recovery_evidence_misses.store(0, Ordering::SeqCst);
                     run.detached.store(false, Ordering::SeqCst);
                 }
                 ExternalQueueObservation::Missing | ExternalQueueObservation::OutcomeUnknown => {
+                    let misses = run.recovery_evidence_misses.fetch_add(1, Ordering::SeqCst) + 1;
+                    self.provider_state()
+                        .runs
+                        .insert(run.execution.run_id.clone(), Arc::clone(&run));
+                    if committed_run_started && misses >= RECOVERY_EVIDENCE_MISS_LIMIT {
+                        // The Host proves that native execution started, while
+                        // repeated complete-index and loaded-edge scans no
+                        // longer retain its immutable correlation id. Close
+                        // only after a grace window: a freshly steered turn is
+                        // accepted before either history view indexes it.
+                        publish_incomplete(
+                            &run,
+                            IncompleteReason::ProviderEnded {
+                                reason: "Provider-native execution is no longer retained after exhaustive recovery reconciliation"
+                                    .to_owned(),
+                            },
+                        );
+                        return Ok(AgentRecovery::reattached(stream_for(&run)));
+                    }
                     return Err(protocol_error(
-                        "Codex could not find durable queue or turn evidence for this recovered execution",
+                        format!(
+                            "Codex recovery evidence is not indexed yet (attempt {misses}/{RECOVERY_EVIDENCE_MISS_LIMIT})"
+                        ),
                         true,
                     ));
                 }
@@ -1472,7 +1553,9 @@ impl AgentProvider for CodexConnector {
             }
             return Ok(AgentRecovery::reattached(stream_for(&run)));
         }
-        let notifications = connected.rpc.subscribe();
+        let notifications = connected
+            .rpc
+            .subscribe_session(run.execution.session_id.as_str());
         let session_id = run.execution.session_id.clone();
         let result = connected
             .rpc
@@ -1496,16 +1579,18 @@ impl AgentProvider for CodexConnector {
                 "Codex recovery omitted the original turn identity",
             )
         })?;
-        let turn = find_native_turn(&connected.rpc, &session_id, &turn_id)
-            .await
-            .map_err(transport_to_protocol)?
-            .ok_or_else(|| {
-                AgentProtocolError::new(
-                    AgentProtocolErrorCode::ProviderUnavailable,
-                    "Codex authoritative thread history omitted the detached turn",
-                )
-                .with_retryable(true)
-            })?;
+        let Some(turn) =
+            find_native_turn_or_loaded(&connected.rpc, &session_id, &turn_id, "full").await?
+        else {
+            publish_incomplete(
+                &run,
+                IncompleteReason::ProviderEnded {
+                    reason: "Provider-native execution is no longer retained after exhaustive recovery reconciliation"
+                        .to_owned(),
+                },
+            );
+            return Ok(AgentRecovery::reattached(stream_for(&run)));
+        };
 
         run.detached.store(false, Ordering::SeqCst);
         match turn.get("status").and_then(Value::as_str) {
@@ -1799,7 +1884,7 @@ async fn monitor_external_queued_run(rpc: Arc<CodexRpcClient>, run: Arc<CodexRun
             }
             Err(error) => {
                 run.detached.store(true, Ordering::SeqCst);
-                let _ = run.sender.send(Err(error));
+                let _ = run.critical_sender.send(Err(error));
                 return;
             }
         }
@@ -1901,6 +1986,24 @@ async fn reconcile_external_queued_run(
             finish_run(run, Some(&turn));
             return Ok(ExternalQueueObservation::Terminal);
         }
+        if status == Some("interrupted") {
+            let superseded =
+                native_turn_was_superseded(rpc, &run.execution.session_id, &turn).await?;
+            if superseded {
+                // A thread executes only one native turn at a time. Codex may
+                // omit completedAt when a non-owner reads an interrupted turn.
+                // Either history view proving a newer turn is nevertheless an
+                // authoritative boundary for this exact Run.
+                publish_incomplete(
+                    run,
+                    IncompleteReason::ProviderEnded {
+                        reason: "Provider-native turn was superseded by a newer turn in the same session"
+                            .to_owned(),
+                    },
+                );
+                return Ok(ExternalQueueObservation::Terminal);
+            }
+        }
         if matches!(status, Some("inProgress" | "interrupted" | "failed")) {
             return Ok(ExternalQueueObservation::TurnObserved);
         }
@@ -1923,6 +2026,77 @@ async fn reconcile_external_queued_run(
         ExternalQueueObservation::OutcomeUnknown
     } else {
         ExternalQueueObservation::Missing
+    })
+}
+
+/// Proves that an ambiguous externally-owned turn can no longer be active.
+///
+/// Codex maintains both a paginated durable index and a loaded-thread edge.
+/// The index may lag the currently loaded session, so treating its first row
+/// as the sole latest turn can leave an interrupted Run commandable forever.
+/// A later turn in either view is sufficient because one Codex thread executes
+/// at most one native turn at a time.
+async fn native_turn_was_superseded(
+    rpc: &CodexRpcClient,
+    session_id: &AgentSessionId,
+    target_turn: &Value,
+) -> Result<bool, AgentProtocolError> {
+    let target_turn_id = target_turn
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| protocol_error("Codex target turn omitted id", false))?;
+    let target_started_at_ms = native_turn_started_at_ms(target_turn);
+    if let Some(latest) = latest_native_turn(rpc, session_id)
+        .await
+        .map_err(transport_to_protocol)?
+    {
+        let different = latest.get("id").and_then(Value::as_str) != Some(target_turn_id);
+        let provably_newer = target_started_at_ms.is_some_and(|target_started_at_ms| {
+            native_turn_started_at_ms(&latest)
+                .is_some_and(|latest_started_at_ms| latest_started_at_ms > target_started_at_ms)
+        });
+        if different && provably_newer {
+            return Ok(true);
+        }
+    }
+
+    let loaded = read_loaded_thread(rpc, session_id.as_str()).await?;
+    let turns = loaded
+        .get("turns")
+        .and_then(Value::as_array)
+        .ok_or_else(|| protocol_error("Codex loaded thread omitted turns", false))?;
+    let Some(target_started_at_ms) = target_started_at_ms else {
+        return Ok(false);
+    };
+    Ok(turns.iter().any(|turn| {
+        turn.get("id").and_then(Value::as_str) != Some(target_turn_id)
+            && native_turn_started_at_ms(turn)
+                .is_some_and(|started_at_ms| started_at_ms > target_started_at_ms)
+    }))
+}
+
+fn native_turn_started_at_ms(turn: &Value) -> Option<u64> {
+    turn.get("startedAtMs")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            turn.get("startedAt")
+                .and_then(Value::as_u64)
+                .and_then(|seconds| seconds.checked_mul(1_000))
+        })
+        .or_else(|| {
+            let id = uuid::Uuid::parse_str(turn.get("id")?.as_str()?).ok()?;
+            (id.get_version_num() == 7).then(|| {
+                id.as_bytes()[..6]
+                    .iter()
+                    .fold(0_u64, |timestamp, byte| (timestamp << 8) | u64::from(*byte))
+            })
+        })
+}
+
+fn native_turn_is_newer(candidate: &Value, target: &Value) -> bool {
+    native_turn_started_at_ms(target).is_some_and(|target_started_at_ms| {
+        native_turn_started_at_ms(candidate)
+            .is_some_and(|candidate_started_at_ms| candidate_started_at_ms > target_started_at_ms)
     })
 }
 
@@ -2003,9 +2177,8 @@ async fn find_external_turn(
         if let Some((turn_id, correlated_item)) =
             find_external_turn_item(rpc, thread_id, None, client_message_id, "desc").await?
         {
-            if let Some(mut turn) = find_native_turn_metadata(rpc, &session_id, &turn_id)
-                .await
-                .map_err(transport_to_protocol)?
+            if let Some(mut turn) =
+                find_native_turn_or_loaded(rpc, &session_id, &turn_id, "notLoaded").await?
             {
                 turn["items"] = Value::Array(vec![correlated_item]);
                 return Ok(Some(turn));
@@ -2092,9 +2265,74 @@ async fn find_external_turn_item(
         }
         cursor = next_page_cursor(&result, &mut seen_cursors, "thread/items/list")?;
         if cursor.is_none() {
-            return Ok(None);
+            return find_loaded_thread_item(rpc, thread_id, turn_id, client_message_id).await;
         }
     }
+}
+
+async fn read_loaded_thread(
+    rpc: &CodexRpcClient,
+    thread_id: &str,
+) -> Result<Value, AgentProtocolError> {
+    let result = rpc
+        .request(
+            "thread/read",
+            json!({"threadId": thread_id, "includeTurns": true}),
+        )
+        .await
+        .map_err(transport_to_protocol)?;
+    result
+        .get("thread")
+        .cloned()
+        .ok_or_else(|| protocol_error("Codex thread/read omitted thread", false))
+}
+
+async fn find_loaded_thread_turn(
+    rpc: &CodexRpcClient,
+    thread_id: &str,
+    target_turn_id: &str,
+) -> Result<Option<Value>, AgentProtocolError> {
+    let thread = read_loaded_thread(rpc, thread_id).await?;
+    Ok(thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .and_then(|turns| {
+            turns
+                .iter()
+                .find(|turn| turn.get("id").and_then(Value::as_str) == Some(target_turn_id))
+        })
+        .cloned())
+}
+
+async fn find_loaded_thread_item(
+    rpc: &CodexRpcClient,
+    thread_id: &str,
+    target_turn_id: Option<&str>,
+    client_message_id: &str,
+) -> Result<Option<(String, Value)>, AgentProtocolError> {
+    let thread = read_loaded_thread(rpc, thread_id).await?;
+    let turns = thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .ok_or_else(|| protocol_error("Codex loaded thread omitted turns", false))?;
+    Ok(turns.iter().find_map(|turn| {
+        let turn_id = turn
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|turn_id| !turn_id.is_empty())?;
+        if target_turn_id.is_some_and(|expected| expected != turn_id) {
+            return None;
+        }
+        turn.get("items")
+            .and_then(Value::as_array)
+            .and_then(|items| {
+                items.iter().find(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("userMessage")
+                        && item.get("clientId").and_then(Value::as_str) == Some(client_message_id)
+                })
+            })
+            .map(|item| (turn_id.to_owned(), item.clone()))
+    }))
 }
 
 async fn load_external_turn_items(
@@ -2248,7 +2486,7 @@ fn codex_user_input_digest(input: &Value) -> Result<Digest, AgentProtocolError> 
 fn detach_external_run(run: &CodexRun, message: impl Into<String>, retryable: bool) {
     run.detached.store(true, Ordering::SeqCst);
     let _ = run
-        .sender
+        .critical_sender
         .send(Err(protocol_error(message.into(), retryable)));
 }
 
@@ -2324,6 +2562,12 @@ fn external_turn_has_completed(turn: &Value) -> bool {
         .is_some_and(|value| !value.is_null())
 }
 
+fn direct_turn_is_terminal_for_run(run: &CodexRun, turn: &Value) -> bool {
+    external_turn_is_terminal(turn)
+        || (turn.get("status").and_then(Value::as_str) == Some("interrupted")
+            && lock(&run.cancel_request).is_some())
+}
+
 /// Checks the one authoritative live edge before a side-effecting direct
 /// command. When the bound turn is already terminal, reconcile it immediately
 /// so the Host can stop presenting an indefinitely commandable Run.
@@ -2351,6 +2595,11 @@ async fn direct_turn_is_active(
     }
     if latest_id == Some(turn_id.as_str()) && external_turn_is_terminal(&latest) {
         restore_direct_turn(rpc, run, &turn_id, &latest).await;
+    } else {
+        // Reconcile the exact target before rejecting the command. This also
+        // closes a Direct Run when a newer native turn proves it was
+        // superseded, instead of leaving the Host command channel occupied.
+        let _ = reconcile_bound_direct_turn(rpc, run, &turn_id).await?;
     }
     Ok(false)
 }
@@ -2363,32 +2612,78 @@ async fn reconcile_bound_direct_turn(
     run: &Arc<CodexRun>,
     turn_id: &str,
 ) -> Result<bool, AgentProtocolError> {
-    let turn = match latest_native_turn(rpc, &run.execution.session_id)
+    let latest = latest_native_turn(rpc, &run.execution.session_id)
         .await
-        .map_err(transport_to_protocol)?
-    {
-        Some(latest) if latest.get("id").and_then(Value::as_str) == Some(turn_id) => latest,
-        _ => find_native_turn_metadata(rpc, &run.execution.session_id, turn_id)
-            .await
-            .map_err(transport_to_protocol)?
-            .ok_or_else(|| {
-                protocol_error(
-                    "Codex authoritative history omitted the bound direct turn",
-                    true,
-                )
-            })?,
+        .map_err(transport_to_protocol)?;
+    let turn = match latest.as_ref() {
+        Some(latest) if latest.get("id").and_then(Value::as_str) == Some(turn_id) => {
+            Some(latest.clone())
+        }
+        _ => {
+            find_native_turn_or_loaded(rpc, &run.execution.session_id, turn_id, "notLoaded").await?
+        }
     };
+    let Some(turn) = turn else {
+        let misses = run.direct_history_misses.fetch_add(1, Ordering::SeqCst) + 1;
+        if misses < DIRECT_HISTORY_MISS_LIMIT {
+            tracing::debug!(
+                run_id = %run.execution.run_id,
+                session_id = %run.execution.session_id,
+                turn_id,
+                misses,
+                "waiting for Codex to index a bound direct turn"
+            );
+            return Ok(false);
+        }
+        return Err(protocol_error(
+            "Codex authoritative history repeatedly omitted the bound direct turn",
+            true,
+        ));
+    };
+    run.direct_history_misses.store(0, Ordering::SeqCst);
+    if latest.as_ref().is_some_and(|candidate| {
+        candidate.get("id").and_then(Value::as_str) != Some(turn_id)
+            && native_turn_is_newer(candidate, &turn)
+    }) {
+        publish_incomplete(
+            run,
+            IncompleteReason::ProviderEnded {
+                reason: "Provider-native turn was superseded by a newer turn in the same session"
+                    .to_owned(),
+            },
+        );
+        return Ok(true);
+    }
     match turn.get("status").and_then(Value::as_str) {
         Some("inProgress") => Ok(false),
         Some("completed" | "failed") => {
             restore_direct_turn(rpc, run, turn_id, &turn).await;
             Ok(true)
         }
-        Some("interrupted") if external_turn_is_terminal(&turn) => {
+        // `turn/interrupt` is an authoritative mutation acknowledged by the
+        // same shared daemon. Some Codex releases omit completedAt from the
+        // subsequent interrupted snapshot when a code-mode result was lost.
+        // Once this exact Run has an accepted cancel request, interrupted is
+        // therefore sufficient to converge; without that causal evidence the
+        // conservative external-owner rule still applies.
+        Some("interrupted") if direct_turn_is_terminal_for_run(run, &turn) => {
             restore_direct_turn(rpc, run, turn_id, &turn).await;
             Ok(true)
         }
-        Some("interrupted") => Ok(false),
+        Some("interrupted") => {
+            if native_turn_was_superseded(rpc, &run.execution.session_id, &turn).await? {
+                publish_incomplete(
+                    run,
+                    IncompleteReason::ProviderEnded {
+                        reason: "Provider-native turn was superseded by a newer turn in the same session"
+                            .to_owned(),
+                    },
+                );
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
         status => Err(protocol_error(
             format!("Codex returned an unsupported bound turn status: {status:?}"),
             true,
@@ -2435,7 +2730,7 @@ async fn monitor_native_run(
                 Ok(false) => continue,
                 Err(error) => {
                     run.detached.store(true, Ordering::SeqCst);
-                    let _ = run.sender.send(Err(error));
+                    let _ = run.critical_sender.send(Err(error));
                     return;
                 }
             }
@@ -2444,22 +2739,36 @@ async fn monitor_native_run(
             Ok(CodexTransportEvent::Message(message)) => message,
             Ok(CodexTransportEvent::Disconnected { reason }) => {
                 run.detached.store(true, Ordering::SeqCst);
-                let _ = run.sender.send(Err(protocol_error(
+                let _ = run.critical_sender.send(Err(protocol_error(
                     format!("Codex app-server disconnected: {reason}"),
                     true,
                 )));
                 return;
             }
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                let _ = run.sender.send(Err(AgentProtocolError::new(
-                    AgentProtocolErrorCode::SequenceGap,
-                    format!("Codex notification subscriber lagged by {skipped}"),
-                )));
-                continue;
+                // Notifications are an optimization; exact native history is
+                // the authority. A bounded subscriber gap must not poison the
+                // Host Run or disable future steering. Reconcile immediately
+                // and keep monitoring when the bound turn is still active.
+                tracing::warn!(
+                    run_id = %run.execution.run_id,
+                    session_id = %run.execution.session_id,
+                    skipped,
+                    "reconciling Codex Run after a notification gap"
+                );
+                match reconcile_bound_direct_turn(&rpc, &run, &turn_id).await {
+                    Ok(true) => return,
+                    Ok(false) => continue,
+                    Err(error) => {
+                        run.detached.store(true, Ordering::SeqCst);
+                        let _ = run.critical_sender.send(Err(error));
+                        return;
+                    }
+                }
             }
             Err(broadcast::error::RecvError::Closed) => {
                 run.detached.store(true, Ordering::SeqCst);
-                let _ = run.sender.send(Err(protocol_error(
+                let _ = run.critical_sender.send(Err(protocol_error(
                     "Codex app-server notification channel closed",
                     true,
                 )));
@@ -2469,6 +2778,7 @@ async fn monitor_native_run(
         if !belongs_to_run(&message, &run.execution.session_id, &turn_id) {
             continue;
         }
+        run.direct_history_misses.store(0, Ordering::SeqCst);
         let method = message
             .get("method")
             .and_then(Value::as_str)
@@ -2602,6 +2912,12 @@ fn establish_turn(run: &Arc<CodexRun>, turn_id: &str) {
 }
 
 fn publish_run_started(run: &Arc<CodexRun>) {
+    if lock(&run.durable)
+        .iter()
+        .any(|draft| matches!(draft.payload, AgentEvent::RunStarted))
+    {
+        return;
+    }
     publish_event(
         run,
         AgentEventDraft {
@@ -2795,15 +3111,26 @@ fn publish_tool(
         Some("interrupted") => ToolActivityState::Cancelled,
         _ => ToolActivityState::Succeeded,
     };
-    publish_telemetry(
-        run,
-        AgentTelemetry::ToolActivity {
-            activity_id: ToolActivityId::new(format!("codex-{id}")),
-            tool_name: tool_name.to_owned(),
-            state,
-            evidence,
-        },
-    );
+    let sequence = run.telemetry_seq.fetch_add(1, Ordering::SeqCst) + 1;
+    let _ = run
+        .critical_sender
+        .send(Ok(AgentProviderStreamItem::Telemetry(
+            AgentTelemetryEnvelope {
+                telemetry_id: TelemetryId::new(format!(
+                    "codex-{}-telemetry-{}",
+                    run.execution.run_id.as_str(),
+                    sequence
+                )),
+                run_id: run.execution.run_id.clone(),
+                provider_seq: Some(sequence),
+                payload: AgentTelemetry::ToolActivity {
+                    activity_id: ToolActivityId::new(format!("codex-{id}")),
+                    tool_name: tool_name.to_owned(),
+                    state,
+                    evidence,
+                },
+            },
+        )));
 }
 
 fn open_native_request(run: &Arc<CodexRun>, message: &Value, kind: PendingRequestKind) {
@@ -3137,15 +3464,28 @@ fn publish_event(run: &Arc<CodexRun>, draft: AgentEventDraft) {
 }
 
 fn append_event_locked(run: &CodexRun, durable: &mut Vec<AgentEventDraft>, draft: AgentEventDraft) {
+    if let Some(existing) = durable
+        .iter()
+        .find(|existing| existing.event_id == draft.event_id)
+    {
+        if existing != &draft {
+            tracing::error!(
+                run_id = %run.execution.run_id,
+                event_id = %draft.event_id,
+                "Codex reconstructed conflicting drafts for one durable event identity"
+            );
+        }
+        return;
+    }
     durable.push(draft.clone());
     let _ = run
-        .sender
+        .critical_sender
         .send(Ok(AgentProviderStreamItem::Event(Box::new(draft))));
 }
 
 fn publish_telemetry(run: &Arc<CodexRun>, payload: AgentTelemetry) {
     let sequence = run.telemetry_seq.fetch_add(1, Ordering::SeqCst) + 1;
-    let telemetry = AgentProviderStreamItem::Telemetry(AgentTelemetryEnvelope {
+    let telemetry = AgentTelemetryEnvelope {
         telemetry_id: TelemetryId::new(format!(
             "codex-{}-telemetry-{}",
             run.execution.run_id.as_str(),
@@ -3154,18 +3494,23 @@ fn publish_telemetry(run: &Arc<CodexRun>, payload: AgentTelemetry) {
         run_id: run.execution.run_id.clone(),
         provider_seq: Some(sequence),
         payload,
-    });
-    let _ = run.sender.send(Ok(telemetry));
+    };
+    let _ = run.telemetry_sender.send(telemetry);
 }
 
-fn stream_for(run: &CodexRun) -> AgentProviderStream {
-    let (receiver, replay, closed) = {
+fn stream_for(run: &Arc<CodexRun>) -> AgentProviderStream {
+    let (critical, telemetry, replay, closed) = {
         let durable = lock(&run.durable);
-        let receiver = run.sender.subscribe();
+        let critical = run.critical_sender.subscribe();
+        let telemetry = run.telemetry_sender.subscribe();
         let replay = durable.clone();
         let closed = run.terminal.load(Ordering::SeqCst) || run.detached.load(Ordering::SeqCst);
-        (receiver, replay, closed)
+        (critical, telemetry, replay, closed)
     };
+    let delivered_event_ids = replay
+        .iter()
+        .map(|draft| draft.event_id.as_str().to_owned())
+        .collect::<BTreeSet<_>>();
     let replay = replay
         .into_iter()
         .map(|draft| Ok(AgentProviderStreamItem::Event(Box::new(draft))));
@@ -3173,19 +3518,70 @@ fn stream_for(run: &CodexRun) -> AgentProviderStream {
     if closed {
         return replay.boxed();
     }
-    let live = stream::unfold(receiver, |mut receiver| async move {
-        match receiver.recv().await {
-            Ok(item) => Some((item, receiver)),
-            Err(broadcast::error::RecvError::Lagged(skipped)) => Some((
-                Err(AgentProtocolError::new(
-                    AgentProtocolErrorCode::SequenceGap,
-                    format!("Codex stream subscriber lagged by {skipped}"),
-                )),
-                receiver,
-            )),
-            Err(broadcast::error::RecvError::Closed) => None,
-        }
-    });
+    let state = (
+        Arc::clone(run),
+        critical,
+        telemetry,
+        delivered_event_ids,
+        VecDeque::new(),
+    );
+    let live = stream::unfold(
+        state,
+        |(run, mut critical, mut telemetry, mut delivered, mut pending)| async move {
+            loop {
+                if let Some(item) = pending.pop_front() {
+                    return Some((item, (run, critical, telemetry, delivered, pending)));
+                }
+                tokio::select! {
+                    biased;
+                    received = critical.recv() => match received {
+                        Ok(item) => {
+                            if let Ok(AgentProviderStreamItem::Event(draft)) = &item {
+                                if !delivered.insert(draft.event_id.as_str().to_owned()) {
+                                    continue;
+                                }
+                            }
+                            return Some((item, (run, critical, telemetry, delivered, pending)));
+                        }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            // This lane contains only durable events and rare
+                            // errors. Backfill durable events from the Run log
+                            // rather than escalating a recoverable queue gap.
+                            tracing::warn!(
+                                run_id = %run.execution.run_id,
+                                skipped,
+                                "backfilling durable Codex events after a subscriber gap"
+                            );
+                            let missing = lock(&run.durable)
+                                .iter()
+                                .filter(|draft| !delivered.contains(draft.event_id.as_str()))
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            for draft in missing {
+                                delivered.insert(draft.event_id.as_str().to_owned());
+                                pending.push_back(Ok(AgentProviderStreamItem::Event(Box::new(
+                                    draft,
+                                ))));
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return None,
+                    },
+                    received = telemetry.recv() => match received {
+                        Ok(envelope) => {
+                            return Some((
+                                Ok(AgentProviderStreamItem::Telemetry(envelope)),
+                                (run, critical, telemetry, delivered, pending),
+                            ));
+                        }
+                        // Output deltas are best-effort. The exact final text
+                        // arrives in the durable terminal delivery.
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => return None,
+                    },
+                }
+            }
+        },
+    );
     replay.chain(live).boxed()
 }
 
@@ -4672,6 +5068,42 @@ mod tests {
                 .await
                 .unwrap();
 
+            let interrupted_latest = next_request(&mut lines).await;
+            assert_eq!(interrupted_latest["method"], "thread/turns/list");
+            assert_eq!(interrupted_latest["params"]["limit"], 1);
+            server_write_result(
+                &mut server_write,
+                &interrupted_latest,
+                json!({
+                    "data": [{
+                        "id": "turn-external",
+                        "status": "interrupted",
+                        "completedAt": null
+                    }],
+                    "nextCursor": null
+                }),
+            )
+            .await;
+
+            let interrupted_loaded = next_request(&mut lines).await;
+            assert_eq!(interrupted_loaded["method"], "thread/read");
+            assert_eq!(interrupted_loaded["params"]["includeTurns"], true);
+            server_write_result(
+                &mut server_write,
+                &interrupted_loaded,
+                json!({
+                    "thread": {
+                        "id": "thread-external",
+                        "turns": [{
+                            "id": "turn-external",
+                            "status": "interrupted",
+                            "completedAt": null
+                        }]
+                    }
+                }),
+            )
+            .await;
+
             let completed_turns = next_request(&mut lines).await;
             assert_eq!(completed_turns["method"], "thread/turns/list");
             server_write
@@ -5143,6 +5575,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_finds_an_active_item_in_the_loaded_thread_edge() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            let indexed = next_request(&mut lines).await;
+            assert_eq!(indexed["method"], "thread/items/list");
+            server_write_result(
+                &mut server_write,
+                &indexed,
+                json!({"data": [], "nextCursor": null}),
+            )
+            .await;
+
+            let loaded = next_request(&mut lines).await;
+            assert_eq!(loaded["method"], "thread/read");
+            assert_eq!(loaded["params"]["includeTurns"], true);
+            server_write_result(
+                &mut server_write,
+                &loaded,
+                json!({"thread": {
+                    "id": "thread-loaded-edge",
+                    "turns": [{
+                        "id": "turn-loaded-edge",
+                        "status": "inProgress",
+                        "items": [{
+                            "id": "user-loaded-edge",
+                            "type": "userMessage",
+                            "clientId": "target-client",
+                            "content": [{"type": "text", "text": "still running"}]
+                        }]
+                    }]
+                }}),
+            )
+            .await;
+        });
+
+        let found =
+            find_external_turn_item(&rpc, "thread-loaded-edge", None, "target-client", "desc")
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(found.0, "turn-loaded-edge");
+        assert_eq!(found.1["id"], "user-loaded-edge");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn committed_started_run_converges_when_native_evidence_was_evicted() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let connector = CodexConnector::with_client(rpc, "codex/test");
+        let descriptor = CodexConnector::provider_descriptor();
+        let start = start_request("thread-evicted", "run-evicted");
+        let execution = AgentExecutionRef::for_start(&start, &descriptor).unwrap();
+        let committed_started = AgentEventDraft {
+            event_id: AgentEventId::new("committed-run-evicted-started"),
+            run_id: execution.run_id.clone(),
+            causation_id: None,
+            source_fingerprint: None,
+            payload: AgentEvent::RunStarted,
+        };
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            for _ in 0..RECOVERY_EVIDENCE_MISS_LIMIT {
+                let latest = next_request(&mut lines).await;
+                assert_eq!(latest["method"], "thread/turns/list");
+                assert_eq!(latest["params"]["limit"], 1);
+                server_write_result(
+                    &mut server_write,
+                    &latest,
+                    json!({"data": [], "nextCursor": null}),
+                )
+                .await;
+
+                let items = next_request(&mut lines).await;
+                assert_eq!(items["method"], "thread/items/list");
+                server_write_result(
+                    &mut server_write,
+                    &items,
+                    json!({"data": [], "nextCursor": null}),
+                )
+                .await;
+
+                let loaded = next_request(&mut lines).await;
+                assert_eq!(loaded["method"], "thread/read");
+                server_write_result(
+                    &mut server_write,
+                    &loaded,
+                    json!({"thread": {"id": "thread-evicted", "turns": []}}),
+                )
+                .await;
+
+                let turns = next_request(&mut lines).await;
+                assert_eq!(turns["method"], "thread/turns/list");
+                assert_eq!(turns["params"]["itemsView"], "summary");
+                server_write_result(
+                    &mut server_write,
+                    &turns,
+                    json!({"data": [], "nextCursor": null}),
+                )
+                .await;
+            }
+        });
+
+        let recovery = AgentRecoveryRequest::new(start, execution, &descriptor)
+            .unwrap()
+            .with_committed_provider_prefix(vec![committed_started.clone()])
+            .unwrap();
+        let first = connector.recover(recovery.clone()).await;
+        assert!(first.is_err());
+        let recovered = connector.recover(recovery).await.unwrap();
+        let (mut stream, confirmation) = recovered.into_parts();
+        assert_eq!(
+            stream.next().await.unwrap().unwrap(),
+            AgentProviderStreamItem::Event(Box::new(committed_started))
+        );
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            AgentProviderStreamItem::Event(draft)
+                if matches!(draft.payload, AgentEvent::RunIncomplete { .. })
+        ));
+        assert!(stream.next().await.is_none());
+        confirmation.await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn reconstructs_a_queued_run_after_provider_restart_without_readding() {
         let (client_io, server_io) = duplex(1024 * 1024);
         let (client_read, client_write) = tokio::io::split(client_io);
@@ -5298,6 +5872,189 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn accepted_cancel_makes_an_untimestamped_direct_interrupt_terminal() {
+        let run = test_run("thread-cancel-stall", "run-cancel-stall");
+        let interrupted = json!({"status": "interrupted", "completedAt": null});
+
+        assert!(!direct_turn_is_terminal_for_run(&run, &interrupted));
+        *lock(&run.cancel_request) = Some((
+            CommandId::new("watchdog-cancel"),
+            "execution lease expired".to_owned(),
+        ));
+        assert!(direct_turn_is_terminal_for_run(&run, &interrupted));
+    }
+
+    #[tokio::test]
+    async fn newer_turn_terminalizes_a_superseded_external_run() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let run = test_run("thread-superseded-native", "run-superseded-native");
+        let client_message_id = queued_client_message_id(&run.execution);
+        *lock(&run.route) = Some(NativeRunRoute::ExternalQueue {
+            queued_submission_id: None,
+            client_message_id: client_message_id.clone(),
+            input_digest: Digest::sha256("fix the failing test"),
+            phase: ExternalQueuePhase::Started,
+            ambiguous_polls: 0,
+        });
+        establish_turn(&run, "turn-superseded-native");
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            let exact = next_request(&mut lines).await;
+            assert_eq!(exact["method"], "thread/turns/list");
+            assert_eq!(exact["params"]["itemsView"], "summary");
+            server_write_result(
+                &mut server_write,
+                &exact,
+                json!({
+                    "data": [{
+                        "id": "turn-superseded-native",
+                        "status": "interrupted",
+                        "startedAt": 1,
+                        "completedAt": null,
+                        "items": [{
+                            "id": "user-superseded-native",
+                            "type": "userMessage",
+                            "clientId": client_message_id,
+                            "content": [{"type": "text", "text": "fix the failing test"}]
+                        }]
+                    }],
+                    "nextCursor": null
+                }),
+            )
+            .await;
+
+            let latest = next_request(&mut lines).await;
+            assert_eq!(latest["method"], "thread/turns/list");
+            assert_eq!(latest["params"]["limit"], 1);
+            server_write_result(
+                &mut server_write,
+                &latest,
+                json!({
+                    "data": [{
+                        "id": "turn-newer",
+                        "status": "inProgress",
+                        "startedAt": 2
+                    }],
+                    "nextCursor": null
+                }),
+            )
+            .await;
+        });
+
+        assert_eq!(
+            reconcile_external_queued_run(&rpc, &run).await.unwrap(),
+            ExternalQueueObservation::Terminal
+        );
+        assert!(run.terminal.load(Ordering::SeqCst));
+        assert!(lock(&run.durable)
+            .iter()
+            .any(|draft| matches!(draft.payload, AgentEvent::RunIncomplete { .. })));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn loaded_edge_terminalizes_run_when_history_latest_is_stale() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let run = test_run("thread-stale-latest", "run-stale-latest");
+        let client_message_id = queued_client_message_id(&run.execution);
+        *lock(&run.route) = Some(NativeRunRoute::ExternalQueue {
+            queued_submission_id: None,
+            client_message_id: client_message_id.clone(),
+            input_digest: Digest::sha256("fix the failing test"),
+            phase: ExternalQueuePhase::Started,
+            ambiguous_polls: 0,
+        });
+        establish_turn(&run, "01a06994-e956-7842-92a6-71ae06ccd22d");
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            let exact = next_request(&mut lines).await;
+            assert_eq!(exact["method"], "thread/turns/list");
+            server_write_result(
+                &mut server_write,
+                &exact,
+                json!({
+                    "data": [{
+                        "id": "01a06994-e956-7842-92a6-71ae06ccd22d",
+                        "status": "interrupted",
+                        "completedAt": null,
+                        "items": [{
+                            "id": "user-stale-latest",
+                            "type": "userMessage",
+                            "clientId": client_message_id,
+                            "content": [{"type": "text", "text": "fix the failing test"}]
+                        }]
+                    }],
+                    "nextCursor": null
+                }),
+            )
+            .await;
+
+            let indexed_latest = next_request(&mut lines).await;
+            assert_eq!(indexed_latest["method"], "thread/turns/list");
+            assert_eq!(indexed_latest["params"]["limit"], 1);
+            server_write_result(
+                &mut server_write,
+                &indexed_latest,
+                json!({
+                    "data": [{
+                        "id": "01a06994-e956-7842-92a6-71ae06ccd22d",
+                        "status": "interrupted"
+                    }],
+                    "nextCursor": null
+                }),
+            )
+            .await;
+
+            let loaded = next_request(&mut lines).await;
+            assert_eq!(loaded["method"], "thread/read");
+            assert_eq!(loaded["params"]["includeTurns"], true);
+            server_write_result(
+                &mut server_write,
+                &loaded,
+                json!({
+                    "thread": {
+                        "id": "thread-stale-latest",
+                        // A compacted/windowed loaded edge need not retain the
+                        // older target turn, but its UUIDv7 timestamp still
+                        // proves that this visible turn was created later.
+                        "turns": [{
+                            "id": "01a069a9-aa99-7690-8aaf-2aff5dd11d22",
+                            "status": "inProgress"
+                        }]
+                    }
+                }),
+            )
+            .await;
+        });
+
+        assert_eq!(
+            reconcile_external_queued_run(&rpc, &run).await.unwrap(),
+            ExternalQueueObservation::Terminal
+        );
+        assert!(run.terminal.load(Ordering::SeqCst));
+        assert!(lock(&run.durable)
+            .iter()
+            .any(|draft| matches!(draft.payload, AgentEvent::RunIncomplete { .. })));
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn queued_cancel_uses_exact_delete_and_lost_response_stays_ambiguous() {
         let (client_io, server_io) = duplex(1024 * 1024);
@@ -5370,6 +6127,107 @@ mod tests {
         let request = start_request(session_id, run_id);
         let execution = AgentExecutionRef::for_start(&request, &descriptor).unwrap();
         new_codex_run(request, execution, AgentAdmission::default(), None)
+    }
+
+    #[tokio::test]
+    async fn recovery_reattaches_an_in_memory_run_after_host_observer_gap() {
+        let (client_io, _server_io) = duplex(1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let rpc = CodexRpcClient::from_io(client_read, client_write, Duration::from_secs(1), 1024);
+        let connector = CodexConnector::with_client(rpc, "codex/test");
+        let descriptor = CodexConnector::provider_descriptor();
+        let run = test_run("thread-attached", "run-attached");
+        *lock(&run.route) = Some(NativeRunRoute::Direct);
+        establish_turn(&run, "turn-attached");
+        {
+            let mut state = connector.provider_state();
+            state.sessions.insert(
+                run.execution.session_id.clone(),
+                run.execution.run_id.clone(),
+            );
+            state
+                .runs
+                .insert(run.execution.run_id.clone(), Arc::clone(&run));
+        }
+
+        let request =
+            AgentRecoveryRequest::new(run.request.clone(), run.execution.clone(), &descriptor)
+                .unwrap();
+        let recovered = connector.recover(request).await.unwrap();
+        let (mut stream, confirmation) = recovered.into_parts();
+        let replayed = stream.next().await.unwrap().unwrap();
+
+        assert!(matches!(
+            replayed,
+            AgentProviderStreamItem::Event(draft)
+                if matches!(draft.payload, AgentEvent::RunStarted)
+        ));
+        confirmation.await.unwrap();
+        assert!(!run.detached.load(Ordering::SeqCst));
+        assert!(!run.terminal.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn telemetry_backlog_cannot_evict_a_durable_run_event() {
+        let run = test_run("thread-backlog", "run-backlog");
+        let mut stream = stream_for(&run);
+        for _ in 0..2_048 {
+            publish_telemetry(
+                &run,
+                AgentTelemetry::OutputDelta {
+                    output_id: output_id(&run),
+                    delta: Content::text("x"),
+                },
+            );
+        }
+        establish_turn(&run, "turn-backlog");
+
+        let item = timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            item,
+            AgentProviderStreamItem::Event(draft)
+                if matches!(draft.payload, AgentEvent::RunStarted)
+        ));
+    }
+
+    #[tokio::test]
+    async fn critical_subscriber_gap_backfills_every_durable_event() {
+        let run = test_run("thread-critical-gap", "run-critical-gap");
+        let mut stream = stream_for(&run);
+        let event_count = 1_100;
+        for index in 0..event_count {
+            publish_event(
+                &run,
+                AgentEventDraft {
+                    event_id: event_id(&run, &format!("backfill-{index}")),
+                    run_id: run.execution.run_id.clone(),
+                    causation_id: None,
+                    source_fingerprint: None,
+                    payload: AgentEvent::RunStarted,
+                },
+            );
+        }
+
+        let mut received = BTreeSet::new();
+        for _ in 0..event_count {
+            let item = timeout(Duration::from_secs(1), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let AgentProviderStreamItem::Event(draft) = item else {
+                panic!("expected a durable event");
+            };
+            assert!(received.insert(draft.event_id.as_str().to_owned()));
+        }
+        assert_eq!(received.len(), event_count);
+        assert!(timeout(Duration::from_millis(25), stream.next())
+            .await
+            .is_err());
     }
 
     #[test]
@@ -6019,7 +6877,9 @@ mod tests {
         let connector = CodexConnector::with_client(rpc, "codex/test");
         let run = test_run("thread-stale", "run-stale");
         *lock(&run.route) = Some(NativeRunRoute::Direct);
-        *lock(&run.turn_id) = Some("turn-original".to_owned());
+        let original_turn_id = "01a06994-e956-7842-92a6-71ae06ccd22d";
+        let newer_turn_id = "01a069a9-aa99-7690-8aaf-2aff5dd11d22";
+        *lock(&run.turn_id) = Some(original_turn_id.to_owned());
         {
             let mut state = connector.provider_state();
             state
@@ -6038,14 +6898,39 @@ mod tests {
                 &mut server_write,
                 &preflight,
                 json!({
-                    "data": [{"id": "turn-unrelated-newer", "status": "inProgress"}],
+                    "data": [{"id": newer_turn_id, "status": "inProgress"}],
                     "nextCursor": null
                 }),
             )
             .await;
-            assert!(timeout(Duration::from_millis(50), lines.next_line())
-                .await
-                .is_err());
+
+            let reconcile_latest = next_request(&mut lines).await;
+            assert_eq!(reconcile_latest["method"], "thread/turns/list");
+            server_write_result(
+                &mut server_write,
+                &reconcile_latest,
+                json!({
+                    "data": [{"id": newer_turn_id, "status": "inProgress"}],
+                    "nextCursor": null
+                }),
+            )
+            .await;
+
+            let exact = next_request(&mut lines).await;
+            assert_eq!(exact["method"], "thread/turns/list");
+            server_write_result(
+                &mut server_write,
+                &exact,
+                json!({
+                    "data": [{
+                        "id": original_turn_id,
+                        "status": "interrupted",
+                        "completedAt": null
+                    }],
+                    "nextCursor": null
+                }),
+            )
+            .await;
         });
         let command = AgentCommandEnvelope::new(
             CommandId::new("stale-steer"),
@@ -6060,15 +6945,19 @@ mod tests {
         assert!(matches!(
             disposition.outcome,
             ProviderCommandOutcome::Rejected {
-                code: AgentProtocolErrorCode::InvalidTransition,
+                code: AgentProtocolErrorCode::TerminalRun,
                 ..
             }
         ));
+        assert!(run.terminal.load(Ordering::SeqCst));
+        assert!(lock(&run.durable)
+            .iter()
+            .any(|draft| matches!(draft.payload, AgentEvent::RunIncomplete { .. })));
         server.await.unwrap();
     }
 
     #[tokio::test]
-    async fn direct_monitor_poll_recovers_a_missed_turn_completed_notification() {
+    async fn direct_monitor_reconciles_a_notification_gap_without_failing_the_run() {
         let (client_io, server_io) = duplex(1024 * 1024);
         let (client_read, client_write) = tokio::io::split(client_io);
         let (server_read, mut server_write) = tokio::io::split(server_io);
@@ -6080,7 +6969,19 @@ mod tests {
         );
         let run = test_run("thread-poll", "run-poll");
         establish_turn(&run, "turn-poll");
-        let notifications = rpc.subscribe();
+        let (notification_sender, notifications) = broadcast::channel(1);
+        for delta in ["first", "second"] {
+            notification_sender
+                .send(CodexTransportEvent::Message(json!({
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "threadId": "thread-poll",
+                        "turnId": "turn-poll",
+                        "delta": delta
+                    }
+                })))
+                .unwrap();
+        }
         let server = tokio::spawn(async move {
             let mut lines = BufReader::new(server_read).lines();
             let latest = next_request(&mut lines).await;
@@ -6142,6 +7043,58 @@ mod tests {
                     if delivery.final_response == Content::text("recovered by polling")
             )
         }));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fresh_direct_turn_tolerates_a_transient_history_index_miss() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let run = test_run("thread-index-lag", "run-index-lag");
+        establish_turn(&run, "turn-index-lag");
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            let latest = next_request(&mut lines).await;
+            assert_eq!(latest["method"], "thread/turns/list");
+            server_write_result(
+                &mut server_write,
+                &latest,
+                json!({"data": [], "nextCursor": null}),
+            )
+            .await;
+
+            let indexed = next_request(&mut lines).await;
+            assert_eq!(indexed["method"], "thread/turns/list");
+            server_write_result(
+                &mut server_write,
+                &indexed,
+                json!({"data": [], "nextCursor": null}),
+            )
+            .await;
+
+            let loaded = next_request(&mut lines).await;
+            assert_eq!(loaded["method"], "thread/read");
+            server_write_result(
+                &mut server_write,
+                &loaded,
+                json!({"thread": {"id": "thread-index-lag", "turns": []}}),
+            )
+            .await;
+        });
+
+        assert!(!reconcile_bound_direct_turn(&rpc, &run, "turn-index-lag")
+            .await
+            .unwrap());
+        assert_eq!(run.direct_history_misses.load(Ordering::SeqCst), 1);
+        assert!(!run.detached.load(Ordering::SeqCst));
+        assert!(!run.terminal.load(Ordering::SeqCst));
         server.await.unwrap();
     }
 

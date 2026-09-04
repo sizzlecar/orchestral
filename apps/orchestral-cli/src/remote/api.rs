@@ -13,16 +13,17 @@ use axum::response::{IntoResponse, Response, Sse};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use orchestral_core::agent_connector::{
-    AgentConnectorId, AgentSessionActionId, AgentSessionActionOutcome, AgentSessionChange,
-    AgentSessionListQuery, AgentSessionPage, AgentSessionReadQuery, AgentSessionSummary,
-    CreateAgentSessionRequest, InvokeAgentSessionActionRequest,
+    AgentConnectorId, AgentSessionActionId, AgentSessionActionOutcome, AgentSessionActivityId,
+    AgentSessionChange, AgentSessionHistoryAnchor, AgentSessionListQuery, AgentSessionPage,
+    AgentSessionReadQuery, AgentSessionSummary, CreateAgentSessionRequest,
+    InvokeAgentSessionActionRequest,
 };
 use orchestral_core::agent_protocol::spi::AgentStartError;
 use orchestral_core::agent_protocol::wire::{
-    AgentCommand, AgentCommandEnvelope, AgentRejectionCode, AgentRunView, AgentSessionId,
-    ApprovalDecision, ArtifactRef, ArtifactRefWithDigest, CommandAck, CommandAckState, CommandId,
-    Content, ContentBody, Digest, PendingRequest, PendingRequestPayload, RequestId,
-    RequestResolution, RunId,
+    AgentCommand, AgentCommandEnvelope, AgentEvent, AgentRejectionCode, AgentRunView,
+    AgentSessionId, ApprovalDecision, ArtifactRef, ArtifactRefWithDigest, CommandAck,
+    CommandAckState, CommandId, Content, ContentBody, Digest, Extensions, PendingRequest,
+    PendingRequestPayload, RequestId, RequestResolution, RunId,
 };
 use orchestral_core::io::{ArtifactResolver, BlobStore};
 use orchestral_runtime::api::AgentApi;
@@ -36,18 +37,68 @@ use tracing::Instrument;
 
 use super::auth::{GatewayAuthenticator, GatewayPrincipal};
 use super::session_coordinator::AgentSessionCoordinatorRegistry;
-use super::state::{DevicePrincipal, DeviceView, PairingClaim, RemoteRegistry, SessionView};
+use super::state::{
+    DevicePrincipal, DeviceView, NativeSessionDefaults, PairingClaim, RemoteRegistry, SessionView,
+};
 
 const APPROVAL_GRANT_TTL_MS: i64 = 5 * 60 * 1_000;
 const RUN_SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_secs(15);
 const RUN_SUPERVISOR_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const RUN_SUPERVISOR_MAX_BACKOFF: Duration = Duration::from_secs(5);
+const DEFAULT_RUN_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const DEFAULT_RUN_STOP_GRACE: Duration = Duration::from_secs(30);
 const REQUEST_ID_HEADER: &str = "x-request-id";
+
+#[derive(Debug, Clone, Copy)]
+struct RunSupervisionPolicy {
+    inactivity_timeout: Duration,
+    stop_grace: Duration,
+}
+
+impl Default for RunSupervisionPolicy {
+    fn default() -> Self {
+        Self {
+            inactivity_timeout: duration_from_env(
+                "ORCHESTRAL_AGENT_RUN_INACTIVITY_TIMEOUT_SECS",
+                DEFAULT_RUN_INACTIVITY_TIMEOUT,
+            ),
+            stop_grace: duration_from_env(
+                "ORCHESTRAL_AGENT_RUN_STOP_GRACE_SECS",
+                DEFAULT_RUN_STOP_GRACE,
+            ),
+        }
+    }
+}
+
+fn duration_from_env(name: &str, fallback: Duration) -> Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(fallback)
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RemoteRunSupervisionView {
+    state: &'static str,
+    reason: String,
+    detected_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+struct RunSupervisionIssue {
+    state: &'static str,
+    reason: String,
+    detected_at_unix_ms: i64,
+}
 
 #[derive(Default)]
 pub struct RunSupervisorRegistry {
     active: Mutex<BTreeSet<String>>,
     manual_recovery: Mutex<BTreeMap<String, String>>,
+    issues: Mutex<BTreeMap<String, RunSupervisionIssue>>,
+    policy: RunSupervisionPolicy,
 }
 
 impl RunSupervisorRegistry {
@@ -81,6 +132,45 @@ impl RunSupervisorRegistry {
             .remove(key);
     }
 
+    fn mark_issue(&self, key: String, state: &'static str, reason: String) {
+        let mut issues = self
+            .issues
+            .lock()
+            .expect("Run supervision registry lock poisoned");
+        let detected_at_unix_ms = issues
+            .get(&key)
+            .map(|issue| issue.detected_at_unix_ms)
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+        issues.insert(
+            key,
+            RunSupervisionIssue {
+                state,
+                reason,
+                detected_at_unix_ms,
+            },
+        );
+    }
+
+    fn clear_issue(&self, key: &str) {
+        self.issues
+            .lock()
+            .expect("Run supervision registry lock poisoned")
+            .remove(key);
+    }
+
+    fn issue(&self, key: &str) -> Option<RemoteRunSupervisionView> {
+        self.issues
+            .lock()
+            .expect("Run supervision registry lock poisoned")
+            .get(key)
+            .cloned()
+            .map(|issue| RemoteRunSupervisionView {
+                state: issue.state,
+                reason: issue.reason,
+                detected_at_unix_ms: issue.detected_at_unix_ms,
+            })
+    }
+
     pub(super) fn mark_manual(&self, key: String, reason: String) {
         self.manual_recovery
             .lock()
@@ -108,6 +198,7 @@ impl RunSupervisorRegistry {
 pub struct RemoteApiState {
     pub agent: AgentApi,
     pub agent_directory: Arc<AgentDirectory>,
+    pub native_session_defaults: NativeSessionDefaults,
     pub approvals: Arc<InMemoryHostApprovalBroker>,
     pub registry: RemoteRegistry,
     pub gateway_authenticator: Option<Arc<dyn GatewayAuthenticator>>,
@@ -396,6 +487,8 @@ async fn create_session(
         created_at_unix_ms: timestamp,
         updated_at_unix_ms: timestamp,
         run_ids: Vec::new(),
+        cwd: state.native_session_defaults.cwd.clone(),
+        execution_profile: state.native_session_defaults.execution_profile.clone(),
     };
     Ok((StatusCode::CREATED, Json(session)))
 }
@@ -608,7 +701,7 @@ struct RemoteAgentSessionDetail {
     /// Latest Host-controlled Run for this native session. The connector
     /// transcript alone cannot preserve this identity across a browser reload,
     /// yet commands must target the existing Run instead of starting a second
-    /// controller for the same Codex thread.
+    /// controller for the same connector-owned session.
     controlled_runs: Vec<ControlledRemoteRunView>,
     /// Canonical Host-side event cursor captured before the native snapshot
     /// read. Clients resume from this point and receive any concurrent changes
@@ -625,6 +718,14 @@ struct ControlledRemoteRunView {
     /// bounded native transcript. The native page can already contain the
     /// response while the correlated user item lives on an older page.
     created_at_unix_ms: i64,
+    /// Recency anchor used by clients to decide whether this Host mirror or a
+    /// later provider-owned turn describes the current Session status.
+    updated_at_unix_ms: i64,
+    /// Causal boundary captured when the Run was submitted. Unlike a browser
+    /// timestamp, this connector-issued identity survives refreshes, bounded
+    /// history windows and clocks on different devices.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    after_activity_id: Option<AgentSessionActivityId>,
 }
 
 async fn controlled_session_runs(
@@ -654,6 +755,12 @@ async fn controlled_session_runs(
     }
     let view = agent.inspect(&entry.run_id).await?;
     let created_at_unix_ms = entry.created_at_unix_ms;
+    let updated_at_unix_ms = entry.updated_at_unix_ms;
+    let history_anchor =
+        AgentSessionHistoryAnchor::from_extensions(&agent.run_extensions(&entry.run_id).await?)
+            .map_err(|error| {
+                ApiError::internal("invalid_session_history_anchor", error.to_string())
+            })?;
     let remote = RemoteRunView::new(
         state,
         Some(connector_id),
@@ -671,6 +778,8 @@ async fn controlled_session_runs(
     Ok(vec![ControlledRemoteRunView {
         run: remote,
         created_at_unix_ms,
+        updated_at_unix_ms,
+        after_activity_id: history_anchor.map(|anchor| anchor.after_activity_id),
     }])
 }
 
@@ -987,6 +1096,8 @@ struct StartAgentRunRequest {
     run_id: String,
     input: String,
     #[serde(default)]
+    after_activity_id: Option<String>,
+    #[serde(default)]
     attachments: Vec<RemoteArtifactInput>,
 }
 
@@ -1018,6 +1129,13 @@ async fn start_agent_run(
     let connector_id = AgentConnectorId::new(request.connector_id);
     let session_id = AgentSessionId::new(request.session_id);
     let run_id = RunId::new(request.run_id);
+    let history_anchor =
+        request
+            .after_activity_id
+            .map(|after_activity_id| AgentSessionHistoryAnchor {
+                after_activity_id: AgentSessionActivityId::new(after_activity_id),
+            });
+    let history_extensions = session_history_anchor_extensions(history_anchor.as_ref())?;
     let coordinator = state.session_coordinators.get(&connector_id, &session_id);
     let _operation_guard = coordinator.operation().lock().await;
     let agent = state.agent_directory.agent_api(&connector_id).await?;
@@ -1029,6 +1147,17 @@ async fn start_agent_run(
             return Err(ApiError::conflict(
                 "run_id_conflict",
                 "run_id was already used with different input",
+            ));
+        }
+        let existing_anchor =
+            AgentSessionHistoryAnchor::from_extensions(&agent.run_extensions(&run_id).await?)
+                .map_err(|error| {
+                    ApiError::internal("invalid_session_history_anchor", error.to_string())
+                })?;
+        if existing_anchor != history_anchor {
+            return Err(ApiError::conflict(
+                "run_id_conflict",
+                "run_id was already used with a different session history anchor",
             ));
         }
         let view = RemoteRunView::new(
@@ -1065,13 +1194,14 @@ async fn start_agent_run(
         }
         if !current.state.is_terminal() {
             let command_id = CommandId::new(format!("agent-submit-{}", run_id.as_str()));
-            let command = AgentCommandEnvelope::new(
+            let command = AgentCommandEnvelope::new_with_extensions(
                 command_id.clone(),
                 entry.run_id.clone(),
                 None,
                 AgentCommand::Steer {
                     content: input.clone(),
                 },
+                history_extensions,
             )?;
             let ack = command_run(&agent, &entry.run_id, command).await?;
             if !matches!(
@@ -1117,7 +1247,13 @@ async fn start_agent_run(
 
     let handle = state
         .agent_directory
-        .start_content(&connector_id, &session_id, Some(run_id.clone()), input)
+        .start_content_with_extensions(
+            &connector_id,
+            &session_id,
+            Some(run_id.clone()),
+            input,
+            history_extensions,
+        )
         .await?;
     spawn_run_supervisor(
         state.clone(),
@@ -1186,6 +1322,22 @@ async fn latest_session_run(
         return Ok(None);
     }
     Ok(Some(latest))
+}
+
+fn session_history_anchor_extensions(
+    anchor: Option<&AgentSessionHistoryAnchor>,
+) -> Result<Extensions, ApiError> {
+    let mut extensions = Extensions::new();
+    if let Some(anchor) = anchor {
+        anchor.insert_into(&mut extensions).map_err(|error| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_session_history_anchor",
+                error.to_string(),
+            )
+        })?;
+    }
+    Ok(extensions)
 }
 
 async fn message_content(
@@ -1364,6 +1516,11 @@ struct RemoteRunView {
     /// make progress or whether the session must continue with a fresh Run.
     #[serde(skip_serializing_if = "Option::is_none")]
     recovery: Option<RemoteRunRecoveryView>,
+    /// Host-side liveness supervision. This is intentionally separate from
+    /// Provider continuity: an attached stream can remain connected while its
+    /// native execution has stopped making progress.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    supervision: Option<RemoteRunSupervisionView>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1403,10 +1560,15 @@ impl RemoteRunView {
         } else {
             None
         };
+        let supervision = state.run_supervisors.issue(&RunSupervisorRegistry::key(
+            connector_id,
+            &view.execution.run_id,
+        ));
         Self {
             view,
             input,
             recovery,
+            supervision,
         }
     }
 }
@@ -1467,7 +1629,31 @@ async fn supervise_run(
     connector_id: Option<AgentConnectorId>,
     run_id: RunId,
 ) {
+    let key = RunSupervisorRegistry::key(connector_id.as_ref(), &run_id);
+    let policy = state.run_supervisors.policy;
     let mut failures = 0_u32;
+    let now = std::time::Instant::now();
+    let initial_age = agent
+        .catalog_runs()
+        .await
+        .ok()
+        .and_then(|runs| {
+            runs.into_iter()
+                .find(|entry| entry.run_id == run_id)
+                .map(|entry| {
+                    chrono::Utc::now()
+                        .timestamp_millis()
+                        .saturating_sub(entry.updated_at_unix_ms)
+                        .max(0) as u64
+                })
+        })
+        .map(Duration::from_millis)
+        .unwrap_or_default();
+    let mut last_progress = now
+        .checked_sub(initial_age.min(policy.inactivity_timeout))
+        .unwrap_or(now);
+    let mut watchdog_cancel_command = None;
+    let mut watchdog_stop_requested_at: Option<std::time::Instant> = None;
     loop {
         // Subscribe before inspecting so a transition committed between the
         // two operations remains observable by this supervisor.
@@ -1500,14 +1686,14 @@ async fn supervise_run(
             }
         };
         if view.state.is_terminal() {
-            state
-                .run_supervisors
-                .clear_manual(&RunSupervisorRegistry::key(connector_id.as_ref(), &run_id));
+            state.run_supervisors.clear_manual(&key);
+            state.run_supervisors.clear_issue(&key);
             return;
         }
         if view.state.status()
             == orchestral_core::agent_protocol::reference::AgentRunStatus::Unknown
         {
+            state.run_supervisors.clear_issue(&key);
             match agent.recover(&run_id).await {
                 Ok(_) => {
                     // Recovery acknowledgement is only the start of restored
@@ -1516,9 +1702,7 @@ async fn supervise_run(
                     // retaining exponential backoff prevents an unbounded
                     // continuity_lost/restored journal storm.
                     failures = failures.saturating_add(1);
-                    state
-                        .run_supervisors
-                        .clear_manual(&RunSupervisorRegistry::key(connector_id.as_ref(), &run_id));
+                    state.run_supervisors.clear_manual(&key);
                     tracing::info!(
                         connector_id = connector_id.as_ref().map(AgentConnectorId::as_str),
                         run_id = %run_id.as_str(),
@@ -1528,10 +1712,9 @@ async fn supervise_run(
                 }
                 Err(error) => {
                     if !is_retryable_agent_error(&error) {
-                        state.run_supervisors.mark_manual(
-                            RunSupervisorRegistry::key(connector_id.as_ref(), &run_id),
-                            error.to_string(),
-                        );
+                        state
+                            .run_supervisors
+                            .mark_manual(key.clone(), error.to_string());
                         tracing::info!(
                             connector_id = connector_id.as_ref().map(AgentConnectorId::as_str),
                             run_id = %run_id.as_str(),
@@ -1556,14 +1739,161 @@ async fn supervise_run(
 
         failures = 0;
         apply_remembered_approvals(&state, &agent, &run_id, &view.pending_requests).await;
+
+        if view.state.status()
+            == orchestral_core::agent_protocol::reference::AgentRunStatus::Waiting
+        {
+            // A blocking input/approval request is healthy quiescence. Its
+            // lifetime belongs to the user, not the execution watchdog.
+            last_progress = std::time::Instant::now();
+            watchdog_cancel_command = None;
+            watchdog_stop_requested_at = None;
+            state.run_supervisors.clear_issue(&key);
+        } else if view.state.status()
+            == orchestral_core::agent_protocol::reference::AgentRunStatus::Stopping
+            && watchdog_stop_requested_at.is_none()
+        {
+            state.run_supervisors.mark_issue(
+                key.clone(),
+                "interrupting",
+                "Agent stop was accepted; waiting for the Provider to confirm a terminal state"
+                    .to_owned(),
+            );
+            watchdog_stop_requested_at = Some(std::time::Instant::now());
+        } else if let Some(requested_at) = watchdog_stop_requested_at {
+            if requested_at.elapsed() >= policy.stop_grace {
+                state.run_supervisors.mark_issue(
+                    key.clone(),
+                    "stalled",
+                    format!(
+                        "Agent execution stopped making progress and did not reach a terminal state within {} seconds after the Host requested cancellation",
+                        policy.stop_grace.as_secs()
+                    ),
+                );
+            }
+        } else if last_progress.elapsed() >= policy.inactivity_timeout {
+            let reason = format!(
+                "Agent execution produced no model, Tool, output, or request progress for {} seconds; the Host watchdog requested a safe stop",
+                policy.inactivity_timeout.as_secs()
+            );
+            state
+                .run_supervisors
+                .mark_issue(key.clone(), "interrupting", reason.clone());
+            if watchdog_cancel_command.is_none() {
+                watchdog_cancel_command = match AgentCommandEnvelope::new(
+                    CommandId::new(format!(
+                        "host-stall-cancel-{}-{}",
+                        run_id.as_str(),
+                        view.last_run_seq.unwrap_or(0)
+                    )),
+                    run_id.clone(),
+                    None,
+                    AgentCommand::Cancel { reason },
+                ) {
+                    Ok(command) => Some(command),
+                    Err(error) => {
+                        state.run_supervisors.mark_issue(
+                            key.clone(),
+                            "stalled",
+                            format!("could not construct the Agent watchdog cancellation: {error}"),
+                        );
+                        return;
+                    }
+                };
+            }
+            match agent
+                .command(
+                    watchdog_cancel_command
+                        .clone()
+                        .expect("watchdog cancellation was initialized"),
+                )
+                .await
+            {
+                Ok(ack)
+                    if matches!(
+                        ack.state,
+                        CommandAckState::Accepted { .. } | CommandAckState::Applied { .. }
+                    ) =>
+                {
+                    watchdog_stop_requested_at = Some(std::time::Instant::now());
+                    tracing::warn!(
+                        connector_id = connector_id.as_ref().map(AgentConnectorId::as_str),
+                        run_id = %run_id.as_str(),
+                        inactivity_seconds = policy.inactivity_timeout.as_secs(),
+                        "Agent Run watchdog requested cancellation after execution inactivity"
+                    );
+                }
+                Ok(ack) => {
+                    state.run_supervisors.mark_issue(
+                        key.clone(),
+                        "stalled",
+                        format!(
+                            "Agent execution is stalled and its Provider did not accept the Host watchdog cancellation: {:?}",
+                            ack.state
+                        ),
+                    );
+                    return;
+                }
+                Err(error) => {
+                    failures = failures.saturating_add(1);
+                    state.run_supervisors.mark_issue(
+                        key.clone(),
+                        "stalled",
+                        format!(
+                            "Agent execution is stalled and the Host watchdog could not request cancellation: {error}"
+                        ),
+                    );
+                    tracing::warn!(
+                        connector_id = connector_id.as_ref().map(AgentConnectorId::as_str),
+                        run_id = %run_id.as_str(),
+                        %error,
+                        "Agent Run watchdog cancellation failed"
+                    );
+                    tokio::time::sleep(run_supervisor_backoff(failures)).await;
+                    continue;
+                }
+            }
+        }
+
         match tokio::time::timeout(RUN_SUPERVISOR_POLL_INTERVAL, live.recv()).await {
-            Ok(Ok(_)) | Ok(Err(broadcast::error::RecvError::Lagged(_))) | Err(_) => {}
+            Ok(Ok(event)) => {
+                if agent_control_event_is_execution_progress(&event) {
+                    last_progress = std::time::Instant::now();
+                    if watchdog_stop_requested_at.is_none() {
+                        state.run_supervisors.clear_issue(&key);
+                    }
+                }
+            }
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) | Err(_) => {}
             Ok(Err(broadcast::error::RecvError::Closed)) => {
                 failures = failures.saturating_add(1);
                 tokio::time::sleep(run_supervisor_backoff(failures)).await;
             }
         }
     }
+}
+
+fn agent_control_event_is_execution_progress(event: &AgentControlEvent) -> bool {
+    match event {
+        AgentControlEvent::Telemetry(_) => true,
+        AgentControlEvent::Durable(record) => {
+            agent_event_is_execution_progress(&record.event.payload)
+        }
+        _ => false,
+    }
+}
+
+fn agent_event_is_execution_progress(event: &AgentEvent) -> bool {
+    !matches!(
+        event,
+        AgentEvent::RunAccepted { .. }
+            | AgentEvent::ResourceBindingSkipped { .. }
+            | AgentEvent::CommandReceived { .. }
+            | AgentEvent::CommandDispositionRecorded { .. }
+            | AgentEvent::StopRequested { .. }
+            | AgentEvent::ContinuityLost { .. }
+            | AgentEvent::ContinuityRestored { .. }
+    )
 }
 
 /// Distinguishes transient supervision failures from durable contract or
@@ -1919,6 +2249,8 @@ struct TextCommandRequest {
     command_id: String,
     text: String,
     #[serde(default)]
+    after_activity_id: Option<String>,
+    #[serde(default)]
     attachments: Vec<RemoteArtifactInput>,
 }
 
@@ -1932,11 +2264,28 @@ async fn steer_run(
     let connector_id = query.connector_id.as_deref().map(AgentConnectorId::new);
     let (agent, run_id) =
         require_commandable_run(&state, query.connector_id.as_deref(), run_id).await?;
-    let command = AgentCommandEnvelope::new(
+    let supervision_key = RunSupervisorRegistry::key(connector_id.as_ref(), &run_id);
+    if let Some(issue) = state.run_supervisors.issue(&supervision_key) {
+        return Err(ApiError::conflict(
+            "agent_run_stalled",
+            format!(
+                "{}; wait for the watchdog cancellation to finish or stop the Run explicitly",
+                issue.reason
+            ),
+        ));
+    }
+    let history_anchor =
+        request
+            .after_activity_id
+            .map(|after_activity_id| AgentSessionHistoryAnchor {
+                after_activity_id: AgentSessionActivityId::new(after_activity_id),
+            });
+    let command = AgentCommandEnvelope::new_with_extensions(
         CommandId::new(request.command_id),
         run_id.clone(),
         None,
         AgentCommand::Steer { content },
+        session_history_anchor_extensions(history_anchor.as_ref())?,
     )?;
     Ok(Json(
         command_run_for_session(&state, connector_id.as_ref(), &agent, &run_id, command).await?,
@@ -2254,6 +2603,8 @@ async fn session_views(state: &RemoteApiState) -> Result<Vec<SessionView>, Agent
                 created_at_unix_ms: created,
                 updated_at_unix_ms: updated,
                 run_ids: Vec::new(),
+                cwd: state.native_session_defaults.cwd.clone(),
+                execution_profile: state.native_session_defaults.execution_profile.clone(),
             });
         session.created_at_unix_ms = session.created_at_unix_ms.min(created);
         session.updated_at_unix_ms = session.updated_at_unix_ms.max(updated);
@@ -2598,6 +2949,7 @@ impl From<ApprovalBridgeError> for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orchestral_core::agent_connector::AgentSessionExecutionProfile;
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -3055,6 +3407,7 @@ mod tests {
                 turns: vec![AgentSessionTurn {
                     turn_id: AgentSessionTurnId::new("turn-large"),
                     status: AgentSessionTurnStatus::Completed,
+                    failure: None,
                     activities: (0..60)
                         .map(|index| AgentSessionActivity {
                             activity_id: AgentSessionActivityId::new(format!("activity-{index}")),
@@ -3379,6 +3732,7 @@ mod tests {
             router(RemoteApiState {
                 agent: AgentApi::new(controller),
                 agent_directory,
+                native_session_defaults: NativeSessionDefaults::default(),
                 approvals,
                 registry,
                 gateway_authenticator: None,
@@ -3421,6 +3775,14 @@ mod tests {
             router(RemoteApiState {
                 agent: AgentApi::new(controller),
                 agent_directory,
+                native_session_defaults: NativeSessionDefaults {
+                    cwd: Some("/fixture/workspace".to_owned()),
+                    execution_profile: AgentSessionExecutionProfile {
+                        model: Some("fixture-model".to_owned()),
+                        reasoning_effort: Some("default".to_owned()),
+                        permissions: Default::default(),
+                    },
+                },
                 approvals,
                 registry,
                 gateway_authenticator,
@@ -3491,6 +3853,7 @@ mod tests {
             router(RemoteApiState {
                 agent: AgentApi::new(generic_controller),
                 agent_directory,
+                native_session_defaults: NativeSessionDefaults::default(),
                 approvals,
                 registry,
                 gateway_authenticator: None,
@@ -3521,6 +3884,7 @@ mod tests {
             router(RemoteApiState {
                 agent: AgentApi::new(controller),
                 agent_directory: Arc::new(AgentDirectory::new()),
+                native_session_defaults: NativeSessionDefaults::default(),
                 approvals,
                 registry,
                 gateway_authenticator: None,
@@ -3553,6 +3917,7 @@ mod tests {
             router(RemoteApiState {
                 agent: AgentApi::new(controller),
                 agent_directory: Arc::new(AgentDirectory::new()),
+                native_session_defaults: NativeSessionDefaults::default(),
                 approvals,
                 registry,
                 gateway_authenticator: None,
@@ -3651,6 +4016,67 @@ mod tests {
             .expect("every API response carries its log correlation id");
         uuid::Uuid::parse_str(request_id).expect("request id is a UUID");
         assert!(response.extensions().get::<ApiErrorLogCode>().is_some());
+    }
+
+    #[tokio::test]
+    async fn native_sessions_expose_the_composed_host_execution_profile() {
+        let (app, token) = test_app().await;
+        let response = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/sessions",
+                &token,
+                serde_json::json!({"session_id": "profile-session"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let created: SessionView = serde_json::from_slice(&body).unwrap();
+        assert_eq!(created.cwd.as_deref(), Some("/fixture/workspace"));
+        assert_eq!(
+            created.execution_profile,
+            AgentSessionExecutionProfile {
+                model: Some("fixture-model".to_owned()),
+                reasoning_effort: Some("default".to_owned()),
+                permissions: Default::default(),
+            }
+        );
+
+        let response = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/sessions/profile-session/runs",
+                &token,
+                serde_json::json!({
+                    "run_id": "profile-run",
+                    "input": "complete the deterministic fixture"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let response = app
+            .oneshot(authorized(
+                "GET",
+                "/sessions",
+                &token,
+                serde_json::Value::Null,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let sessions: Vec<SessionView> = serde_json::from_slice(&body).unwrap();
+        let listed = sessions
+            .iter()
+            .find(|session| session.id == "profile-session")
+            .unwrap();
+        assert_eq!(listed.cwd.as_deref(), Some("/fixture/workspace"));
+        assert_eq!(listed.execution_profile, created.execution_profile);
     }
 
     #[tokio::test]
@@ -3915,7 +4341,8 @@ mod tests {
                     "connector_id": "fixture/local",
                     "session_id": "fixture-created",
                     "run_id": "fixture-external-run",
-                    "input": "continue the existing session"
+                    "input": "continue the existing session",
+                    "after_activity_id": "fixture-visible-tail"
                 }),
             ))
             .await
@@ -3944,6 +4371,11 @@ mod tests {
             "fixture-external-run"
         );
         assert!(refreshed["controlled_runs"][0]["created_at_unix_ms"].is_i64());
+        assert!(refreshed["controlled_runs"][0]["updated_at_unix_ms"].is_i64());
+        assert_eq!(
+            refreshed["controlled_runs"][0]["after_activity_id"],
+            "fixture-visible-tail"
+        );
 
         let response = app
             .clone()
@@ -4220,6 +4652,54 @@ mod tests {
         registry.clear_manual(&key);
         assert!(registry.begin(&key));
         registry.finish(&key);
+    }
+
+    #[test]
+    fn supervision_registry_exposes_and_clears_stall_state() {
+        let registry = RunSupervisorRegistry::default();
+        let key = RunSupervisorRegistry::key(None, &RunId::new("stalled-run"));
+
+        registry.mark_issue(
+            key.clone(),
+            "interrupting",
+            "execution lease expired".to_owned(),
+        );
+        let interrupting = registry.issue(&key).expect("issue is visible");
+        assert_eq!(interrupting.state, "interrupting");
+        assert_eq!(interrupting.reason, "execution lease expired");
+
+        registry.mark_issue(key.clone(), "stalled", "stop did not converge".to_owned());
+        let stalled = registry.issue(&key).expect("updated issue is visible");
+        assert_eq!(stalled.state, "stalled");
+        assert_eq!(
+            stalled.detected_at_unix_ms,
+            interrupting.detected_at_unix_ms
+        );
+
+        registry.clear_issue(&key);
+        assert!(registry.issue(&key).is_none());
+    }
+
+    #[test]
+    fn control_plane_chatter_does_not_renew_the_execution_lease() {
+        assert!(!agent_event_is_execution_progress(
+            &AgentEvent::CommandDispositionRecorded {
+                command_id: CommandId::new("accepted-but-not-applied"),
+                outcome: ProviderCommandOutcome::Accepted,
+            }
+        ));
+        assert!(!agent_event_is_execution_progress(
+            &AgentEvent::StopRequested {
+                reason: "watchdog".to_owned(),
+            }
+        ));
+        assert!(agent_event_is_execution_progress(&AgentEvent::RunStarted));
+        assert!(agent_event_is_execution_progress(
+            &AgentEvent::RequestClosed {
+                request_id: RequestId::new("native-request"),
+                reason: "Provider completed the request".to_owned(),
+            }
+        ));
     }
 
     #[tokio::test]

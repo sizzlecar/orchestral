@@ -62,4 +62,21 @@ mod shell_layout_tests {
         assert!(metadata.contains("grid-column: 1 / -1"));
         assert!(metadata.contains("overflow-x: auto"));
     }
+
+    #[test]
+    fn notices_stay_compact_and_override_the_global_button_size() {
+        let toast = rule(".toast");
+        assert!(toast.contains("width: fit-content"));
+        assert!(toast.contains("max-width: min(100%, 400px)"));
+        assert!(toast.contains("box-shadow: var(--shadow-sm)"));
+
+        let dismiss = rule(".toast__dismiss");
+        assert!(dismiss.contains("min-width: 32px"));
+        assert!(dismiss.contains("min-height: 32px"));
+        assert!(dismiss.contains("background: transparent"));
+
+        let warning = rule(".toast--warning");
+        assert!(warning.contains("--toast-tone: var(--warning)"));
+        assert!(!warning.contains("var(--warning-soft)"));
+    }
 }

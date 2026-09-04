@@ -14,7 +14,8 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 
 use crate::agent_protocol::wire::{
-    AgentRunSpec, AgentSessionId, Content, PendingRequest, ProviderBindingRef, RunId,
+    AgentFailure, AgentRunSpec, AgentSessionId, Content, Extensions, PendingRequest,
+    ProviderBindingRef, RunId,
 };
 
 macro_rules! string_id {
@@ -63,6 +64,51 @@ pub const SESSION_SET_PERMISSIONS_ACTION: &str = "session.set_permissions";
 /// Concrete adapters translate the action id and arguments to their native
 /// protocol; consumers must not place provider wire method names here.
 pub const SESSION_ACTION_RUN_EXTENSION: &str = "orchestral.dev/session-action";
+/// Provider-neutral causal boundary for merging a Host-controlled input into
+/// a connector-owned, independently paginated session transcript.
+pub const SESSION_HISTORY_ANCHOR_EXTENSION: &str = "orchestral.dev/session-history-anchor";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSessionHistoryAnchor {
+    /// The new input happened after this connector-issued activity identity.
+    /// Consumers must treat the identity as opaque.
+    pub after_activity_id: AgentSessionActivityId,
+}
+
+impl AgentSessionHistoryAnchor {
+    pub fn insert_into(&self, extensions: &mut Extensions) -> Result<(), AgentConnectorError> {
+        if self.after_activity_id.is_empty() {
+            return Err(AgentConnectorError::invalid(
+                "session history anchor activity id must not be empty",
+            ));
+        }
+        let value = serde_json::to_value(self).map_err(|error| {
+            AgentConnectorError::protocol(format!(
+                "could not encode session history anchor: {error}"
+            ))
+        })?;
+        extensions.insert(SESSION_HISTORY_ANCHOR_EXTENSION.to_owned(), value);
+        Ok(())
+    }
+
+    pub fn from_extensions(extensions: &Extensions) -> Result<Option<Self>, AgentConnectorError> {
+        let Some(value) = extensions.get(SESSION_HISTORY_ANCHOR_EXTENSION) else {
+            return Ok(None);
+        };
+        let anchor: Self = serde_json::from_value(value.clone()).map_err(|error| {
+            AgentConnectorError::invalid(format!(
+                "invalid session history anchor extension: {error}"
+            ))
+        })?;
+        if anchor.after_activity_id.is_empty() {
+            return Err(AgentConnectorError::invalid(
+                "session history anchor extension has an empty activity id",
+            ));
+        }
+        Ok(Some(anchor))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -431,6 +477,11 @@ impl AgentSessionActivity {
 pub struct AgentSessionTurn {
     pub turn_id: AgentSessionTurnId,
     pub status: AgentSessionTurnStatus,
+    /// Provider-neutral terminal failure for this native turn. Connectors map
+    /// their native error into the same shape used by Host-controlled Runs so
+    /// consumers never need provider-specific error parsing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<AgentFailure>,
     #[serde(default)]
     pub activities: Vec<AgentSessionActivity>,
 }
@@ -441,6 +492,11 @@ impl AgentSessionTurn {
             return Err(AgentConnectorError::protocol(
                 "session turn id must not be empty",
             ));
+        }
+        if let Some(failure) = &self.failure {
+            failure
+                .validate_integrity()
+                .map_err(|error| AgentConnectorError::protocol(error.to_string()))?;
         }
         let mut activity_ids = BTreeSet::new();
         for activity in &self.activities {
@@ -485,6 +541,11 @@ pub enum AgentSessionChangeKind {
     TurnStatus {
         turn_id: AgentSessionTurnId,
         status: AgentSessionTurnStatus,
+        /// Present when the terminal status is `failed`. A new active or
+        /// successful terminal status carries `None` and clears stale UI
+        /// failure state from the preceding turn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure: Option<AgentFailure>,
     },
     RefreshRequired {
         reason: String,
@@ -944,6 +1005,7 @@ pub fn paginate_session_detail(
             Some(AgentSessionTurn {
                 turn_id: turn.turn_id.clone(),
                 status: turn.status,
+                failure: turn.failure.clone(),
                 activities: turn.activities[selected_start..selected_end].to_vec(),
             })
         })
@@ -1074,6 +1136,7 @@ mod tests {
             turns: vec![AgentSessionTurn {
                 turn_id: AgentSessionTurnId::new("turn-1"),
                 status: AgentSessionTurnStatus::Completed,
+                failure: None,
                 activities,
             }],
             pending_requests: Vec::new(),
@@ -1130,5 +1193,23 @@ mod tests {
             .pointer_mut("/arguments/target")
             .unwrap() = Value::String("commit".to_owned());
         assert!(tampered.validate_integrity().is_err());
+    }
+
+    #[test]
+    fn session_history_anchor_round_trips_without_provider_knowledge() {
+        let anchor = AgentSessionHistoryAnchor {
+            after_activity_id: AgentSessionActivityId::new("opaque-activity-42"),
+        };
+        let mut extensions = crate::agent_protocol::wire::Extensions::new();
+        anchor.insert_into(&mut extensions).unwrap();
+
+        assert_eq!(
+            AgentSessionHistoryAnchor::from_extensions(&extensions).unwrap(),
+            Some(anchor)
+        );
+        assert_eq!(
+            extensions[SESSION_HISTORY_ANCHOR_EXTENSION]["after_activity_id"],
+            "opaque-activity-42"
+        );
     }
 }

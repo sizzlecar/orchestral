@@ -1866,6 +1866,28 @@ svg {
   color: var(--danger);
 }
 
+.run-failure {
+  display: grid;
+  width: min(100%, 820px);
+  gap: 3px;
+  padding: 10px 12px;
+  margin: 0 auto 22px;
+  border: 1px solid color-mix(in srgb, var(--danger) 20%, var(--line));
+  border-left: 2px solid color-mix(in srgb, var(--danger) 70%, var(--line));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--danger-soft) 42%, var(--surface-muted));
+  color: var(--ink-soft);
+  font-size: 11px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.run-failure strong {
+  color: var(--danger);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
 .pending-panel {
   position: relative;
   z-index: 6;
@@ -2693,28 +2715,37 @@ svg {
 }
 
 .toast {
+  --toast-tone: var(--muted);
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 28px;
-  align-items: start;
-  gap: 8px;
-  width: min(100%, 460px);
-  max-width: min(100%, 460px);
-  max-height: min(30dvh, 180px);
-  padding: 10px 9px 10px 13px;
-  border: 1px solid var(--line-strong);
-  border-radius: 11px;
-  background: var(--surface);
-  box-shadow: var(--shadow-md);
-  color: var(--ink);
+  grid-template-columns: 6px minmax(0, 1fr) 32px;
+  align-items: center;
+  gap: 9px;
+  width: fit-content;
+  max-width: min(100%, 400px);
+  max-height: min(24dvh, 144px);
+  padding: 7px 6px 7px 11px;
+  border: 1px solid color-mix(in srgb, var(--toast-tone) 22%, var(--line));
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--surface) 95%, var(--toast-tone));
+  box-shadow: var(--shadow-sm);
+  color: var(--ink-soft);
   font-size: 11px;
-  line-height: 1.45;
+  line-height: 1.5;
   pointer-events: auto;
   animation: toast-in 180ms ease-out both;
 }
 
+.toast::before {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--toast-tone);
+  content: "";
+}
+
 .toast__message {
   min-width: 0;
-  max-height: min(24dvh, 138px);
+  max-height: min(18dvh, 108px);
   overflow: auto;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
@@ -2723,37 +2754,36 @@ svg {
 .toast__dismiss {
   display: grid;
   place-items: center;
-  width: 28px;
-  height: 28px;
+  width: 32px;
+  min-width: 32px;
+  height: 32px;
+  min-height: 32px;
   padding: 0;
-  border-radius: 8px;
-  color: currentColor;
-  font-size: 18px;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 16px;
   line-height: 1;
 }
 
+.toast__dismiss:active {
+  background: var(--surface-strong);
+}
+
 .toast.is-error {
-  border-color: color-mix(in srgb, var(--danger) 38%, var(--line));
-  background: var(--danger-soft);
-  color: var(--danger);
+  --toast-tone: var(--danger);
 }
 
 .toast--error {
-  border-color: color-mix(in srgb, var(--danger) 38%, var(--line));
-  background: var(--danger-soft);
-  color: var(--danger);
+  --toast-tone: var(--danger);
 }
 
 .toast--success {
-  border-color: color-mix(in srgb, var(--success) 34%, var(--line));
-  background: var(--success-soft);
-  color: var(--success);
+  --toast-tone: var(--success);
 }
 
 .toast--warning {
-  border-color: color-mix(in srgb, var(--warning) 38%, var(--line));
-  background: var(--warning-soft);
-  color: var(--warning);
+  --toast-tone: var(--warning);
 }
 
 @keyframes toast-in {

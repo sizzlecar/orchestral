@@ -17,7 +17,7 @@ use orchestral_core::agent_connector::{
 use orchestral_core::agent_protocol::spi::{
     AgentJournalStore, AgentProvider, InMemoryAgentJournalStore,
 };
-use orchestral_core::agent_protocol::wire::{AgentSessionId, RunId};
+use orchestral_core::agent_protocol::wire::{AgentSessionId, Extensions, RunId};
 use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio::sync::RwLock;
@@ -320,6 +320,27 @@ impl AgentDirectory {
         run_id: Option<RunId>,
         input: Vec<orchestral_core::agent_protocol::wire::Content>,
     ) -> Result<AgentRunHandle, AgentDirectoryError> {
+        self.start_content_with_extensions(
+            connector_id,
+            session_id,
+            run_id,
+            input,
+            Extensions::new(),
+        )
+        .await
+    }
+
+    /// Starts a Run with digest-bound, namespaced Host metadata. The directory
+    /// keeps this provider-neutral and forwards the immutable extensions
+    /// through the shared Agent Protocol controller.
+    pub async fn start_content_with_extensions(
+        &self,
+        connector_id: &AgentConnectorId,
+        session_id: &AgentSessionId,
+        run_id: Option<RunId>,
+        input: Vec<orchestral_core::agent_protocol::wire::Content>,
+        extensions: Extensions,
+    ) -> Result<AgentRunHandle, AgentDirectoryError> {
         self.read_session_page(
             connector_id,
             session_id,
@@ -331,7 +352,10 @@ impl AgentDirectory {
         .await?;
         let entry = self.entry(connector_id).await?;
         entry.api.create_session(Some(session_id.clone())).await?;
-        Ok(entry.api.start_content(session_id, run_id, input).await?)
+        Ok(entry
+            .api
+            .start_content_with_extensions(session_id, run_id, input, extensions)
+            .await?)
     }
 
     pub async fn agent_api(

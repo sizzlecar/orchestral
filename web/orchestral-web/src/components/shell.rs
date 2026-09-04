@@ -13,8 +13,8 @@ use crate::model::{
     SessionView,
 };
 use crate::state::{
-    timeline_blocks_for_session, AppState, AuthStatus, LoadStatus, RunState, TimelineBlock,
-    TimelineItem,
+    is_terminal, timeline_blocks_for_session, AppState, AuthStatus, LoadStatus, RunState,
+    TimelineBlock, TimelineItem,
 };
 
 const SIDEBAR_SESSIONS_PER_PAGE: usize = 10;
@@ -97,6 +97,25 @@ pub fn Workspace() -> Element {
         .unwrap_or_else(|| "Orchestral".to_owned());
     let session_metadata = selected.as_ref().map(session_metadata).unwrap_or_default();
     let run = state.current_run().cloned();
+    let native_session_state = selected.as_ref().and_then(|session| {
+        session
+            .connector_id
+            .as_ref()
+            .and_then(|_| session.state.clone())
+    });
+    let native_session_updated_at = selected.as_ref().and_then(|session| {
+        session
+            .connector_id
+            .as_ref()
+            .map(|_| session.updated_at_unix_ms)
+    });
+    let native_turn_status = selected.as_ref().and_then(|session| {
+        let history_id = session.history_run_id()?;
+        state
+            .runs
+            .get(&history_id)
+            .and_then(|history| history.history_latest_turn_status.clone())
+    });
     let has_session_actions = state
         .selected_connector()
         .is_some_and(|connector| !connector.actions.is_empty());
@@ -372,7 +391,12 @@ pub fn Workspace() -> Element {
                                     "操作"
                                 }
                             }
-                            RunStatusBadge { run }
+                            RunStatusBadge {
+                                run,
+                                native_session_state,
+                                native_session_updated_at,
+                                native_turn_status,
+                            }
                         }
                         if !session_metadata.is_empty() {
                             div { class: "conversation-header__meta", aria_label: "Agent 会话配置",
@@ -416,7 +440,12 @@ pub fn Workspace() -> Element {
 }
 
 #[component]
-fn RunStatusBadge(run: Option<RunState>) -> Element {
+fn RunStatusBadge(
+    run: Option<RunState>,
+    native_session_state: Option<String>,
+    native_session_updated_at: Option<i64>,
+    native_turn_status: Option<String>,
+) -> Element {
     let mut now = use_signal(js_sys::Date::now);
     use_future(move || async move {
         loop {
@@ -424,7 +453,13 @@ fn RunStatusBadge(run: Option<RunState>) -> Element {
             now.set(js_sys::Date::now());
         }
     });
-    let status = run_label(run.as_ref(), now());
+    let status = session_run_label(
+        run.as_ref(),
+        native_session_state.as_deref(),
+        native_session_updated_at,
+        native_turn_status.as_deref(),
+        now(),
+    );
 
     rsx! {
         output { class: "run-status", "data-state": status.1,
@@ -475,8 +510,15 @@ fn Composer() -> Element {
         .filter(|run| run.recovery_is_manual())
         .map(|run| run.recovery_allows_new_run());
     let recoverable = state.recoverable_run().is_some();
-    let input_disabled =
-        !state.connection.online || state.auth.status != AuthStatus::Authenticated || recoverable;
+    let supervision = state
+        .current_run()
+        .and_then(|run| run.supervision.as_ref())
+        .cloned();
+    let supervision_blocked = supervision.is_some();
+    let input_disabled = !state.connection.online
+        || state.auth.status != AuthStatus::Authenticated
+        || recoverable
+        || supervision_blocked;
     let control_disabled = state.ui.composer_busy
         || !state.connection.online
         || state.auth.status != AuthStatus::Authenticated;
@@ -485,7 +527,9 @@ fn Composer() -> Element {
         .active_run()
         .is_some_and(|run| run.status == "stopping");
     drop(state);
-    let placeholder = if manual_recovery == Some(true) {
+    let placeholder = if supervision_blocked {
+        "任务已停滞，Host 正在安全终止…"
+    } else if manual_recovery == Some(true) {
         "上次任务已中断，可发送新消息继续…"
     } else if manual_recovery == Some(false) {
         "该任务需要在 Host 端人工恢复…"
@@ -496,16 +540,18 @@ fn Composer() -> Element {
     } else {
         "告诉 Orchestral 你想完成什么…"
     };
-    let hint = if manual_recovery == Some(true) {
-        "上次任务不会自动重试；本次发送将创建新任务"
+    let hint = if let Some(supervision) = supervision {
+        supervision.reason
+    } else if manual_recovery == Some(true) {
+        "上次任务不会自动重试；本次发送将创建新任务".to_owned()
     } else if manual_recovery == Some(false) {
-        "自动恢复已停止，不会重复执行"
+        "自动恢复已停止，不会重复执行".to_owned()
     } else if recoverable {
-        "正在自动恢复 Agent 状态，期间不会重复执行"
+        "正在自动恢复 Agent 状态，期间不会重复执行".to_owned()
     } else if active {
-        "当前发送会引导正在运行的任务"
+        "当前发送会引导正在运行的任务".to_owned()
     } else {
-        "Enter 发送 · Shift + Enter 换行"
+        "Enter 发送 · Shift + Enter 换行".to_owned()
     };
 
     rsx! {
@@ -862,6 +908,7 @@ fn session_metadata(session: &SessionView) -> Vec<(&'static str, String)> {
 
 fn reasoning_effort_label(effort: &str) -> String {
     match effort {
+        "default" => "默认".to_owned(),
         "low" => "低".to_owned(),
         "medium" => "中".to_owned(),
         "high" => "高".to_owned(),
@@ -918,6 +965,12 @@ fn run_label(run: Option<&RunState>, now: f64) -> (String, &'static str) {
         .map(|started| ((now - started).max(0.0) / 1_000.0) as u64)
         .map(|seconds| format!(" · {}:{:02}", seconds / 60, seconds % 60))
         .unwrap_or_default();
+    if let Some(supervision) = &run.supervision {
+        return match supervision.state.as_str() {
+            "interrupting" => ("无进展，正在安全终止".to_owned(), "warning"),
+            _ => ("任务已停滞".to_owned(), "error"),
+        };
+    }
     match run.status.as_str() {
         "submitting" => (format!("发送中{elapsed}"), "working"),
         "accepted" => (format!("已接收，等待 Agent 开始{elapsed}"), "working"),
@@ -933,6 +986,52 @@ fn run_label(run: Option<&RunState>, now: f64) -> (String, &'static str) {
         "unknown" => ("正在自动恢复".to_owned(), "warning"),
         _ => ("状态待确认".to_owned(), "warning"),
     }
+}
+
+/// Chooses the status of a connector-owned Session without changing which
+/// concrete Run receives controls. A terminal Host mirror may be older than a
+/// newer native turn, so native state owns the badge once no controlled Run is
+/// active. The mirror remains in the timeline as durable failure evidence.
+fn session_run_label(
+    run: Option<&RunState>,
+    native_session_state: Option<&str>,
+    native_session_updated_at: Option<i64>,
+    native_turn_status: Option<&str>,
+    now: f64,
+) -> (String, &'static str) {
+    if run.is_some_and(|run| !is_terminal(&run.status)) {
+        return run_label(run, now);
+    }
+
+    match native_session_state {
+        Some("active" | "busy_elsewhere") => return ("Working".to_owned(), "working"),
+        Some("waiting_input" | "waiting_approval") => {
+            return ("Waiting".to_owned(), "waiting");
+        }
+        _ => {}
+    }
+
+    let native_turn_is_newer = run.is_none_or(|run| {
+        run.history_latest_turn_status.is_some()
+            || native_session_updated_at
+                .zip(run.updated_at_unix_ms)
+                .is_some_and(|(native_updated_at, controlled_updated_at)| {
+                    native_updated_at > controlled_updated_at
+                })
+    });
+    if native_turn_is_newer {
+        match native_turn_status {
+            Some("pending") => return ("已接收，等待 Agent 开始".to_owned(), "working"),
+            Some("active" | "running" | "in_progress") => {
+                return ("Working".to_owned(), "working");
+            }
+            Some("completed") => return ("完成".to_owned(), "complete"),
+            Some("interrupted") => return ("未完整结束".to_owned(), "warning"),
+            Some("failed") => return ("失败".to_owned(), "error"),
+            _ => {}
+        }
+    }
+    run_label(run, now)
 }
 
 #[cfg(test)]
@@ -997,6 +1096,8 @@ mod tests {
                 ("权限", "工作区可写 · 网络受限 · 按需审批".to_owned()),
             ]
         );
+        view.execution_profile.reasoning_effort = Some("default".to_owned());
+        assert_eq!(session_metadata(&view)[2], ("推理", "默认".to_owned()));
         assert!(session_metadata(&session("empty", Some("other/local"), 1)).is_empty());
     }
 
@@ -1208,5 +1309,84 @@ mod tests {
             reason: Some("unsafe boundary".to_owned()),
         });
         assert_eq!(run_label(Some(&run), 0.0).0, "自动恢复已停止");
+    }
+
+    #[test]
+    fn newer_native_turn_owns_badge_over_stale_controlled_failure() {
+        let mut state = AppState::new(true);
+        state.sessions.selected_id = Some("codex/local\0thread-1".to_owned());
+
+        for (session_state, turn_status, expected_label, expected_tone) in [
+            ("active", "active", "Working", "working"),
+            ("idle", "completed", "完成", "complete"),
+        ] {
+            let detail: AgentSessionDetail = serde_json::from_value(serde_json::json!({
+                "summary": {
+                    "connector_id": "codex/local",
+                    "session_id": "thread-1",
+                    "state": session_state,
+                    "updated_at_unix_ms": 3000
+                },
+                "turns": [{
+                    "turn_id": "native-newer",
+                    "status": turn_status,
+                    "activities": []
+                }],
+                "controlled_runs": [{
+                    "created_at_unix_ms": 1000,
+                    "updated_at_unix_ms": 2000,
+                    "execution": {"session_id": "thread-1", "run_id": "controlled-old"},
+                    "state": {"state": "terminal", "terminal": {"type": "failed"}},
+                    "last_run_seq": 3,
+                    "input": [{"body": {"kind": "inline", "value": "old input"}}]
+                }]
+            }))
+            .unwrap();
+            state.project_agent_session(detail);
+
+            let session = state.selected_session().expect("session is selected");
+            let current_run = state.current_run().expect("controlled Run remains visible");
+            assert_eq!(current_run.id, "controlled-old");
+            assert_eq!(current_run.status, "failed");
+
+            let history_id = session.history_run_id().expect("native history Run");
+            let history = state
+                .runs
+                .get(&history_id)
+                .expect("projected native history");
+            assert_eq!(history.status, "delivered");
+            assert_eq!(
+                history.history_latest_turn_status.as_deref(),
+                Some(turn_status)
+            );
+            assert_eq!(
+                session_run_label(
+                    Some(current_run),
+                    session.state.as_deref(),
+                    Some(session.updated_at_unix_ms),
+                    history.history_latest_turn_status.as_deref(),
+                    0.0,
+                ),
+                (expected_label.to_owned(), expected_tone)
+            );
+        }
+    }
+
+    #[test]
+    fn newer_controlled_failure_is_not_hidden_by_older_native_completion() {
+        let mut run = RunState::new("controlled-new", Some("thread-1".to_owned()));
+        run.status = "failed".to_owned();
+        run.updated_at_unix_ms = Some(3_000);
+
+        assert_eq!(
+            session_run_label(
+                Some(&run),
+                Some("idle"),
+                Some(2_000),
+                Some("completed"),
+                0.0,
+            ),
+            ("失败".to_owned(), "error")
+        );
     }
 }

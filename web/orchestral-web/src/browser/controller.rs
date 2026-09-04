@@ -8,7 +8,9 @@ use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
 use wasm_bindgen::{closure::Closure, JsValue};
 
-use crate::browser::api::{AgentSessionObservation, ApiClient, ApiCredential, ApiError};
+use crate::browser::api::{
+    AgentInputRequest, AgentSessionObservation, ApiClient, ApiCredential, ApiError,
+};
 use crate::browser::{platform, storage};
 use crate::model::{
     AgentConnectorView, AgentSessionActionStatusView, AgentSessionChangeKindView,
@@ -319,8 +321,11 @@ impl AppController {
                                 connector_id,
                                 &entry.session_id,
                                 run_id,
-                                &entry.input,
-                                &entry.attachments,
+                                AgentInputRequest {
+                                    text: &entry.input,
+                                    attachments: &entry.attachments,
+                                    after_activity_id: entry.native_anchor_id.as_deref(),
+                                },
                             )
                             .await
                     }
@@ -342,9 +347,12 @@ impl AppController {
                             &token,
                             run_id,
                             command_id,
-                            &entry.input,
                             entry.connector_id.as_deref(),
-                            &entry.attachments,
+                            AgentInputRequest {
+                                text: &entry.input,
+                                attachments: &entry.attachments,
+                                after_activity_id: entry.native_anchor_id.as_deref(),
+                            },
                         )
                         .await
                 }
@@ -1328,7 +1336,7 @@ impl AppController {
                     optimistic_message_id.clone(),
                     display_input.clone(),
                     platform::now(),
-                    native_anchor_id,
+                    native_anchor_id.clone(),
                 );
             self.state.write().ui.timeline_scrolled_away = false;
             spawn(async move {
@@ -1341,9 +1349,12 @@ impl AppController {
                     &token,
                     &run_id,
                     &command_id,
-                    &input,
                     session.connector_id.as_deref(),
-                    &attachments,
+                    AgentInputRequest {
+                        text: &input,
+                        attachments: &attachments,
+                        after_activity_id: native_anchor_id.as_deref(),
+                    },
                 )
                 .await
             {
@@ -1447,8 +1458,11 @@ impl AppController {
                         connector_id,
                         &session.id,
                         &run_id,
-                        &input,
-                        &attachments,
+                        AgentInputRequest {
+                            text: &input,
+                            attachments: &attachments,
+                            after_activity_id: native_anchor_id.as_deref(),
+                        },
                     )
                     .await
             }
@@ -1534,7 +1548,7 @@ impl AppController {
                 let presented = presented_api_error(&error);
                 if ambiguous {
                     self.notice(
-                        "发送结果暂时未知，已保存在 Outbox 并将在重连后核对",
+                        "网络连接不稳定。消息已保存，重连后会自动确认发送状态",
                         "warning",
                     );
                 } else {
@@ -1951,21 +1965,18 @@ impl AppController {
             return Ok(());
         }
 
-        let follow_timeline = platform::timeline_is_near_end();
         let current = self.state.read().clone();
+        let follow_timeline = !current.ui.timeline_scrolled_away;
         let mut next = current.clone();
-        let tail_before = next.selected_timeline_tail_key();
-        next.apply_agent_session_change(change);
+        let timeline_before = next.selected_timeline_content();
+        next.apply_agent_session_change(change, platform::now() as i64);
         mark_observation_healthy(&mut next, "live");
-        let tail_appended = tail_before != next.selected_timeline_tail_key();
+        let timeline_changed = timeline_before != next.selected_timeline_content();
         if next != current {
             self.state.set(next);
         }
-        if tail_appended && follow_timeline {
-            spawn(async move {
-                TimeoutFuture::new(0).await;
-                platform::scroll_timeline_to_end();
-            });
+        if timeline_changed && follow_timeline {
+            self.follow_timeline_after_render();
         }
         Ok(())
     }
@@ -2050,21 +2061,18 @@ impl AppController {
         {
             return Ok(());
         }
-        let follow_timeline = platform::timeline_is_near_end();
         let current = self.state.read().clone();
+        let follow_timeline = !current.ui.timeline_scrolled_away;
         let mut next = current.clone();
-        let tail_before = next.selected_timeline_tail_key();
+        let timeline_before = next.selected_timeline_content();
         next.project_agent_session(detail);
         mark_observation_healthy(&mut next, "live");
-        let tail_appended = tail_before != next.selected_timeline_tail_key();
+        let timeline_changed = timeline_before != next.selected_timeline_content();
         if next != current {
             self.state.set(next);
         }
-        if tail_appended && follow_timeline {
-            spawn(async move {
-                TimeoutFuture::new(0).await;
-                platform::scroll_timeline_to_end();
-            });
+        if timeline_changed && follow_timeline {
+            self.follow_timeline_after_render();
         }
         Ok(())
     }
@@ -2145,24 +2153,21 @@ impl AppController {
                 }) => {
                     etag = next_etag;
                     let next_session_state = detail.summary.state.clone();
-                    let follow_timeline = platform::timeline_is_near_end();
                     let current = self.state.read().clone();
                     if !agent_observation_is_current(&current, &target) {
                         return;
                     }
+                    let follow_timeline = !current.ui.timeline_scrolled_away;
                     let mut next = current.clone();
-                    let tail_before = next.selected_timeline_tail_key();
+                    let timeline_before = next.selected_timeline_content();
                     next.project_agent_session(*detail);
                     mark_observation_healthy(&mut next, "observing");
-                    let tail_appended = tail_before != next.selected_timeline_tail_key();
+                    let timeline_changed = timeline_before != next.selected_timeline_content();
                     if next != current {
                         self.state.set(next);
                     }
-                    if tail_appended && follow_timeline {
-                        spawn(async move {
-                            TimeoutFuture::new(0).await;
-                            platform::scroll_timeline_to_end();
-                        });
+                    if timeline_changed && follow_timeline {
+                        self.follow_timeline_after_render();
                     }
                     session_state = next_session_state;
                     consecutive_errors = 0;
@@ -2360,8 +2365,13 @@ impl AppController {
         if *self.stream_generation.read() != generation {
             return;
         }
-        let follow_timeline = platform::timeline_is_near_end();
-        let tail_before = self.state.read().selected_timeline_tail_key();
+        let (follow_timeline, timeline_before) = {
+            let state = self.state.read();
+            (
+                !state.ui.timeline_scrolled_away,
+                state.selected_timeline_content(),
+            )
+        };
         let mut timeline_changed = false;
         let mut resolve_recovery = false;
         match event {
@@ -2412,13 +2422,10 @@ impl AppController {
                 self.state.write().connection.stream = "live".to_owned();
             }
         }
-        let tail_appended =
-            timeline_changed && tail_before != self.state.read().selected_timeline_tail_key();
-        if tail_appended && follow_timeline {
-            spawn(async move {
-                TimeoutFuture::new(0).await;
-                platform::scroll_timeline_to_end();
-            });
+        let visible_timeline_changed =
+            timeline_changed && timeline_before != self.state.read().selected_timeline_content();
+        if visible_timeline_changed && follow_timeline {
+            self.follow_timeline_after_render();
         }
         if resolve_recovery {
             let controller = self;
@@ -2549,6 +2556,15 @@ impl AppController {
         if state.ui.timeline_scrolled_away != scrolled_away {
             state.ui.timeline_scrolled_away = scrolled_away;
         }
+    }
+
+    fn follow_timeline_after_render(self) {
+        spawn(async move {
+            TimeoutFuture::new(0).await;
+            if !self.state.read().ui.timeline_scrolled_away {
+                platform::scroll_timeline_to_end();
+            }
+        });
     }
 
     pub fn jump_timeline_to_latest(mut self) {

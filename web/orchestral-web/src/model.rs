@@ -46,6 +46,7 @@ pub struct OutboxEntry {
     pub session_id: String,
     pub input: String,
     pub attachments: Vec<UploadedArtifact>,
+    #[serde(default)]
     pub native_anchor_id: Option<String>,
     pub created_at_unix_ms: i64,
     pub operation: OutboxOperation,
@@ -281,6 +282,8 @@ pub struct AgentSessionTurn {
     pub turn_id: String,
     pub status: String,
     #[serde(default)]
+    pub failure: Option<Value>,
+    #[serde(default)]
     pub activities: Vec<AgentSessionActivity>,
 }
 
@@ -316,6 +319,8 @@ pub enum AgentSessionChangeKindView {
     TurnStatus {
         turn_id: String,
         status: String,
+        #[serde(default)]
+        failure: Option<Value>,
     },
     RefreshRequired {
         reason: String,

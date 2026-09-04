@@ -8,8 +8,8 @@ use crate::presentation::{
     operation_is_failure, operation_is_running,
 };
 use crate::state::{
-    timeline_blocks_for_session, timeline_run_ids_for_session, CommandActivity, TimelineBlock,
-    TimelineItem, ToolActivity,
+    latest_session_run_issue, timeline_blocks_for_session, CommandActivity, SessionRunIssue,
+    TimelineBlock, TimelineItem, ToolActivity,
 };
 
 #[component]
@@ -20,18 +20,15 @@ pub fn ConversationTimeline() -> Element {
         .selected_session()
         .is_some_and(|session| state.ui.loading_session.as_deref() == Some(session.key().as_str()));
     let scrolled_away = state.ui.timeline_scrolled_away;
-    let (blocks, runs) = state
+    let (blocks, latest_issue) = state
         .selected_session()
         .map(|session| {
             let blocks = timeline_blocks_for_session(&state, session)
                 .into_iter()
                 .map(|entry| (entry.key(), entry))
                 .collect::<Vec<_>>();
-            let runs = timeline_run_ids_for_session(&state, session)
-                .iter()
-                .filter_map(|run_id| state.runs.get(run_id).cloned())
-                .collect::<Vec<_>>();
-            (blocks, runs)
+            let latest_issue = latest_session_run_issue(&state, session);
+            (blocks, latest_issue)
         })
         .unwrap_or_default();
     let empty = blocks.is_empty();
@@ -90,11 +87,17 @@ pub fn ConversationTimeline() -> Element {
                             block: entry.block
                         }
                     }
-                    for run in runs {
-                        if let Some(failure) = run.failure.as_ref() {
-                            RunFailure { value: failure.clone() }
-                        } else if let Some(error) = run.error.as_ref() {
-                            div { class: "run-failure", "{error}" }
+                    if let Some(issue) = latest_issue {
+                        match issue {
+                            SessionRunIssue::Failure(failure) => rsx! {
+                                RunFailure { value: failure }
+                            },
+                            SessionRunIssue::ControlError(error) => rsx! {
+                                div { class: "run-failure", role: "alert",
+                                    strong { "运行失败" }
+                                    span { "{error}" }
+                                }
+                            },
                         }
                     }
                 }
@@ -501,7 +504,7 @@ fn RunFailure(value: Value) -> Element {
     let code = string_field(&value, "code");
     let message = string_field(&value, "message");
     rsx! {
-        div { class: "run-failure",
+        div { class: "run-failure", role: "alert",
             strong { "{code}" }
             span { "{message}" }
         }

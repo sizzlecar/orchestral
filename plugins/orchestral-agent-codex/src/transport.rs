@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as SyncMutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -31,6 +31,10 @@ use tokio_tungstenite::{client_async_with_config, WebSocketStream};
 // refreshes never depend on receiving a whole rollout in one frame.
 const DEFAULT_MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_DAEMON_START_TIMEOUT: Duration = Duration::from_secs(5);
+// Each active session gets an independent bounded queue. A busy Codex thread
+// must never evict control or completion notifications for another thread.
+const SESSION_NOTIFICATION_CAPACITY: usize = 1_024;
+const GLOBAL_NOTIFICATION_CAPACITY: usize = 256;
 
 /// Selects how the connector reaches Codex's app-server control plane.
 ///
@@ -259,10 +263,102 @@ pub(crate) enum CodexTransportEvent {
     Disconnected { reason: String },
 }
 
+struct NotificationRouter {
+    global: broadcast::Sender<CodexTransportEvent>,
+    sessions: SyncMutex<HashMap<String, broadcast::Sender<CodexTransportEvent>>>,
+}
+
+impl NotificationRouter {
+    fn new() -> Self {
+        let (global, _) = broadcast::channel(GLOBAL_NOTIFICATION_CAPACITY);
+        Self {
+            global,
+            sessions: SyncMutex::new(HashMap::new()),
+        }
+    }
+
+    #[cfg(test)]
+    fn subscribe(&self) -> broadcast::Receiver<CodexTransportEvent> {
+        self.global.subscribe()
+    }
+
+    fn subscribe_session(&self, session_id: &str) -> broadcast::Receiver<CodexTransportEvent> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        sessions.retain(|_, sender| sender.receiver_count() > 0);
+        sessions
+            .entry(session_id.to_owned())
+            .or_insert_with(|| broadcast::channel(SESSION_NOTIFICATION_CAPACITY).0)
+            .subscribe()
+    }
+
+    fn publish(&self, message: Value) {
+        let event = CodexTransportEvent::Message(message);
+        if self.global.receiver_count() > 0 {
+            let _ = self.global.send(event.clone());
+        }
+
+        let session_id = match &event {
+            CodexTransportEvent::Message(message) => notification_session_id(message),
+            CodexTransportEvent::Disconnected { .. } => None,
+        };
+        let senders = {
+            let sessions = self
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match session_id {
+                Some(session_id) => sessions
+                    .get(session_id)
+                    .filter(|sender| sender.receiver_count() > 0)
+                    .cloned()
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                // Preserve compatibility for rare app-server notifications
+                // without a threadId. Normal turn traffic is session-scoped.
+                None => sessions
+                    .values()
+                    .filter(|sender| sender.receiver_count() > 0)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            }
+        };
+        for sender in senders {
+            let _ = sender.send(event.clone());
+        }
+    }
+
+    fn disconnect(&self, reason: String) {
+        let event = CodexTransportEvent::Disconnected { reason };
+        if self.global.receiver_count() > 0 {
+            let _ = self.global.send(event.clone());
+        }
+        let senders = {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            sessions
+                .drain()
+                .map(|(_, sender)| sender)
+                .collect::<Vec<_>>()
+        };
+        for sender in senders {
+            let _ = sender.send(event.clone());
+        }
+    }
+}
+
+fn notification_session_id(message: &Value) -> Option<&str> {
+    message.pointer("/params/threadId").and_then(Value::as_str)
+}
+
 pub struct CodexRpcClient {
     writer: Arc<Mutex<DynWriter>>,
     pending: Pending,
-    notifications: broadcast::Sender<CodexTransportEvent>,
+    notifications: Arc<NotificationRouter>,
     connected: Arc<AtomicBool>,
     next_id: Mutex<u64>,
     request_timeout: Duration,
@@ -431,7 +527,7 @@ impl CodexRpcClient {
         W: AsyncWrite + Send + Unpin + 'static,
     {
         let pending = Arc::new(Mutex::new(HashMap::new()));
-        let (notifications, _) = broadcast::channel(256);
+        let notifications = Arc::new(NotificationRouter::new());
         let connected = Arc::new(AtomicBool::new(true));
         let writer: Arc<Mutex<DynWriter>> = Arc::new(Mutex::new(Box::new(JsonLineWriter {
             inner: Box::new(writer),
@@ -439,7 +535,7 @@ impl CodexRpcClient {
         let client = Arc::new(Self {
             writer,
             pending: Arc::clone(&pending),
-            notifications: notifications.clone(),
+            notifications: Arc::clone(&notifications),
             connected: Arc::clone(&connected),
             next_id: Mutex::new(1),
             request_timeout,
@@ -463,14 +559,14 @@ impl CodexRpcClient {
     ) -> Arc<Self> {
         let (sink, stream) = websocket.split();
         let pending = Arc::new(Mutex::new(HashMap::new()));
-        let (notifications, _) = broadcast::channel(256);
+        let notifications = Arc::new(NotificationRouter::new());
         let connected = Arc::new(AtomicBool::new(true));
         let writer: Arc<Mutex<DynWriter>> =
             Arc::new(Mutex::new(Box::new(WebSocketWriter { inner: sink })));
         let client = Arc::new(Self {
             writer: Arc::clone(&writer),
             pending: Arc::clone(&pending),
-            notifications: notifications.clone(),
+            notifications: Arc::clone(&notifications),
             connected: Arc::clone(&connected),
             next_id: Mutex::new(1),
             request_timeout,
@@ -487,8 +583,16 @@ impl CodexRpcClient {
         client
     }
 
+    #[cfg(test)]
     pub(crate) fn subscribe(&self) -> broadcast::Receiver<CodexTransportEvent> {
         self.notifications.subscribe()
+    }
+
+    pub(crate) fn subscribe_session(
+        &self,
+        session_id: &str,
+    ) -> broadcast::Receiver<CodexTransportEvent> {
+        self.notifications.subscribe_session(session_id)
     }
 
     pub(crate) fn is_connected(&self) -> bool {
@@ -552,7 +656,7 @@ impl CodexRpcClient {
 async fn read_loop<R>(
     mut reader: R,
     pending: Pending,
-    notifications: broadcast::Sender<CodexTransportEvent>,
+    notifications: Arc<NotificationRouter>,
     connected: Arc<AtomicBool>,
     max_frame_bytes: usize,
 ) where
@@ -578,7 +682,7 @@ async fn websocket_read_loop(
     mut stream: SplitStream<WebSocketStream<UnixStream>>,
     writer: Arc<Mutex<DynWriter>>,
     pending: Pending,
-    notifications: broadcast::Sender<CodexTransportEvent>,
+    notifications: Arc<NotificationRouter>,
     connected: Arc<AtomicBool>,
     max_frame_bytes: usize,
 ) {
@@ -627,11 +731,7 @@ async fn websocket_read_loop(
     finish_disconnect(disconnect_reason, &pending, &notifications, &connected).await;
 }
 
-async fn route_message(
-    message: Value,
-    pending: &Pending,
-    notifications: &broadcast::Sender<CodexTransportEvent>,
-) {
+async fn route_message(message: Value, pending: &Pending, notifications: &NotificationRouter) {
     if let Some(id) = message.get("id") {
         if message.get("method").is_none() {
             let key = id_key(id);
@@ -655,13 +755,13 @@ async fn route_message(
             }
         }
     }
-    let _ = notifications.send(CodexTransportEvent::Message(message));
+    notifications.publish(message);
 }
 
 async fn finish_disconnect(
     disconnect_reason: String,
     pending: &Pending,
-    notifications: &broadcast::Sender<CodexTransportEvent>,
+    notifications: &NotificationRouter,
     connected: &Arc<AtomicBool>,
 ) {
     if !connected.swap(false, Ordering::AcqRel) {
@@ -676,9 +776,7 @@ async fn finish_disconnect(
             disconnect_reason.clone(),
         )));
     }
-    let _ = notifications.send(CodexTransportEvent::Disconnected {
-        reason: disconnect_reason,
-    });
+    notifications.disconnect(disconnect_reason);
 }
 
 async fn read_frame<R>(
@@ -778,6 +876,61 @@ mod tests {
             },
             json!("turn/started")
         );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn isolates_session_queues_before_unrelated_notification_floods() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (_server_read, mut server_write) = tokio::io::split(server_io);
+        let client = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let mut watched = client.subscribe_session("thread-watched");
+
+        let server = tokio::spawn(async move {
+            for index in 0..(SESSION_NOTIFICATION_CAPACITY * 4) {
+                let message = json!({
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "threadId": "thread-noisy",
+                        "turnId": "turn-noisy",
+                        "delta": index.to_string()
+                    }
+                });
+                server_write
+                    .write_all(format!("{message}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            let watched_message = json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-watched",
+                    "turnId": "turn-watched",
+                    "turn": {"id": "turn-watched", "status": "completed"}
+                }
+            });
+            server_write
+                .write_all(format!("{watched_message}\n").as_bytes())
+                .await
+                .unwrap();
+        });
+
+        let event = timeout(Duration::from_secs(2), watched.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event,
+            CodexTransportEvent::Message(message)
+                if message.pointer("/params/threadId").and_then(Value::as_str)
+                    == Some("thread-watched")
+        ));
         server.await.unwrap();
     }
 

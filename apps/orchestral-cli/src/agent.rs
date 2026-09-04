@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context};
 use orchestral_agent_journal_fs::FileAgentJournalStore;
 use orchestral_blob_fs::FileBlobStore;
+use orchestral_core::agent_connector::AgentSessionExecutionProfile;
 use orchestral_core::agent_protocol::{
     reference::AgentRunStatus,
     spi::{AgentJournalStore, InMemoryAgentJournalStore},
@@ -173,6 +174,8 @@ pub struct AgentHost {
     pub process_supervisor: Arc<ProcessSupervisor>,
     pub backend_name: String,
     pub model: String,
+    pub workspace_root: PathBuf,
+    pub execution_profile: AgentSessionExecutionProfile,
     pub(crate) skill_manager: SkillManager,
     controller: Arc<AgentController>,
     resources: Vec<ResourceBinding>,
@@ -382,7 +385,13 @@ pub async fn build_agent_host(options: &AgentRunOptions) -> anyhow::Result<Agent
         approvals: approval_broker,
         process_supervisor,
         backend_name: backend.name,
-        model,
+        model: model.clone(),
+        workspace_root: workspaces.primary.clone(),
+        execution_profile: AgentSessionExecutionProfile {
+            model: Some(model),
+            reasoning_effort: Some("default".to_owned()),
+            permissions: Default::default(),
+        },
         skill_manager,
         controller,
         resources,
