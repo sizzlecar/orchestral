@@ -2074,13 +2074,11 @@ pub fn timeline_blocks_for_session(
         })
         .flatten()
         .collect::<Vec<_>>();
-    controlled.sort_by(|left, right| {
-        left.0
-            .partial_cmp(&right.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.1.cmp(&right.1))
-            .then_with(|| left.2.cmp(&right.2))
-    });
+    // `session.run_ids` and each Run's presentation order are the causal Host
+    // order. Durable steer events intentionally have no browser timestamp, so
+    // sorting timestamps first would move those commands ahead of their own
+    // initial input whenever several segments share one native boundary.
+    controlled.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.2.cmp(&right.2)));
 
     for (started_at, _, _segment_index, run_id, native_anchor_id, steering, mut items) in controlled
     {
@@ -2110,6 +2108,14 @@ pub fn timeline_blocks_for_session(
                     .position(|item| timeline_item_native_id(item) == Some(activity_id))
             })
             .map(|index| index.saturating_add(1));
+        // A page with an older cursor is, by contract, the latest suffix of
+        // the ordered native transcript. An opaque anchor that is no longer
+        // in that suffix belongs before it; appending at the live edge would
+        // invert the Host input and the native work it triggered.
+        let before_bounded_history = native_anchor_id
+            .as_ref()
+            .filter(|_| history.history_next_cursor.is_some())
+            .map(|_| 0);
         let insertion = if !steering {
             // A terminal Host mirror contains the same assistant response as
             // its native turn. That response is a stronger structural anchor
@@ -2118,6 +2124,7 @@ pub fn timeline_blocks_for_session(
             // newer native turn is already visible.
             explicit_insertion
                 .or(response_turn_start)
+                .or(before_bounded_history)
                 .or_else(time_insertion)
                 // A currently active provider turn may already contain the
                 // controlled response while its user item fell off the bounded
@@ -2128,6 +2135,7 @@ pub fn timeline_blocks_for_session(
             // Each steer captures the native edge visible at submission.
             // Time remains only a legacy fallback for pre-anchor state.
             explicit_insertion
+                .or(before_bounded_history)
                 .or_else(time_insertion)
                 .unwrap_or(history_items.len())
         };
@@ -3492,6 +3500,110 @@ mod tests {
                 ("assistant".to_owned(), "older response".to_owned()),
                 ("user".to_owned(), "what is wrong?".to_owned()),
                 ("assistant".to_owned(), "later response".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn off_page_history_anchors_keep_durable_steers_before_the_native_suffix() {
+        let detail: AgentSessionDetail = serde_json::from_value(serde_json::json!({
+            "summary": {
+                "connector_id": "fixture/local",
+                "session_id": "bounded-thread",
+                "updated_at_unix_ms": 20_000,
+                "state": "active"
+            },
+            "turns": [{
+                "turn_id": "active-turn",
+                "status": "in_progress",
+                "activities": [
+                    {
+                        "activity_id": "native-reply-in-latest-suffix",
+                        "kind": "agent_message",
+                        "status": "completed",
+                        "content": [{"body": {"kind": "inline", "value": "current progress"}}]
+                    },
+                    {
+                        "activity_id": "native-work-after-reply",
+                        "kind": "command",
+                        "status": "completed",
+                        "title": "continuing work"
+                    }
+                ]
+            }],
+            "pending_requests": [],
+            "next_cursor": "next-older-page",
+            "controlled_runs": [{
+                "created_at_unix_ms": 10_000,
+                "after_activity_id": "initial-anchor-on-older-page",
+                "execution": {
+                    "session_id": "bounded-thread",
+                    "run_id": "controlled-run"
+                },
+                "state": {"state": "running"},
+                "last_run_seq": 4,
+                "input": [{"body": {"kind": "inline", "value": "initial request"}}]
+            }]
+        }))
+        .unwrap();
+        let mut state = AppState::new(true);
+        state.project_agent_session(detail);
+
+        let run = state.runs.get_mut("controlled-run").unwrap();
+        for (sequence, event_id, command_id, text, anchor) in [
+            (
+                1,
+                "first-command-event",
+                "first-command",
+                "continue the work",
+                "first-anchor-on-older-page",
+            ),
+            (
+                2,
+                "second-command-event",
+                "second-command",
+                "show progress",
+                "second-anchor-on-older-page",
+            ),
+        ] {
+            run.project_durable(
+                &record(
+                    sequence,
+                    event_id,
+                    serde_json::json!({
+                        "type": "command_received",
+                        "command": {
+                            "command_id": command_id,
+                            "payload": {
+                                "type": "steer",
+                                "content": content(text)
+                            },
+                            "extensions": {
+                                "orchestral.dev/session-history-anchor": {
+                                    "after_activity_id": anchor
+                                }
+                            }
+                        }
+                    }),
+                ),
+                20_000.0,
+            );
+        }
+
+        let messages = timeline_blocks_for_session(&state, &state.sessions.items[0])
+            .into_iter()
+            .filter_map(|entry| match entry.block {
+                TimelineBlock::Entry(TimelineItem::Message(message)) => Some(message.text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages,
+            [
+                "initial request",
+                "continue the work",
+                "show progress",
+                "current progress"
             ]
         );
     }
