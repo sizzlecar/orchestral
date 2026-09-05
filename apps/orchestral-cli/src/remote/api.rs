@@ -47,6 +47,12 @@ const RUN_SUPERVISOR_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const RUN_SUPERVISOR_MAX_BACKOFF: Duration = Duration::from_secs(5);
 const DEFAULT_RUN_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const DEFAULT_RUN_STOP_GRACE: Duration = Duration::from_secs(30);
+/// Host-controlled Runs are a durable live-history overlay while a Provider's
+/// native transcript index catches up. Keep a bounded causal suffix instead
+/// of only the newest Run: one native turn can legitimately remain active
+/// across many Host Runs, and dropping the intervening mirrors creates a
+/// visible hole after a browser reload.
+const CONTROLLED_SESSION_RUN_LIMIT: usize = 100;
 const REQUEST_ID_HEADER: &str = "x-request-id";
 
 #[derive(Debug, Clone, Copy)]
@@ -698,10 +704,10 @@ async fn get_agent_session(
 struct RemoteAgentSessionDetail {
     #[serde(flatten)]
     detail: orchestral_core::agent_connector::AgentSessionDetail,
-    /// Latest Host-controlled Run for this native session. The connector
-    /// transcript alone cannot preserve this identity across a browser reload,
-    /// yet commands must target the existing Run instead of starting a second
-    /// controller for the same connector-owned session.
+    /// Bounded causal suffix of Host-controlled Runs for this native session.
+    /// A Provider transcript can lag an active native turn, so these durable
+    /// mirrors preserve the intervening conversation as well as the identity
+    /// of the latest Run that can still be controlled.
     controlled_runs: Vec<ControlledRemoteRunView>,
     /// Canonical Host-side event cursor captured before the native snapshot
     /// read. Clients resume from this point and receive any concurrent changes
@@ -740,47 +746,50 @@ async fn controlled_session_runs(
         .into_iter()
         .filter(|entry| entry.session_id == *session_id)
         .collect::<Vec<_>>();
-    catalog.sort_by_key(|entry| {
-        std::cmp::Reverse((entry.updated_at_unix_ms, entry.created_at_unix_ms))
+    catalog.sort_by(|left, right| {
+        left.created_at_unix_ms
+            .cmp(&right.created_at_unix_ms)
+            .then_with(|| left.run_id.cmp(&right.run_id))
     });
-    let Some(entry) = catalog.into_iter().next() else {
-        return Ok(Vec::new());
-    };
-    // Native session history is authoritative and must remain readable after
-    // a connector capability upgrade. A controlled Run registered against an
-    // older descriptor is supplementary history; the current controller
-    // cannot safely rehydrate it, so omit it instead of failing the session.
-    if !agent.can_control_run(&entry.run_id).await? {
-        return Ok(Vec::new());
-    }
-    let view = agent.inspect(&entry.run_id).await?;
-    let created_at_unix_ms = entry.created_at_unix_ms;
-    let updated_at_unix_ms = entry.updated_at_unix_ms;
-    let history_anchor =
-        AgentSessionHistoryAnchor::from_extensions(&agent.run_extensions(&entry.run_id).await?)
-            .map_err(|error| {
-                ApiError::internal("invalid_session_history_anchor", error.to_string())
-            })?;
-    let remote = RemoteRunView::new(
-        state,
-        Some(connector_id),
-        view,
-        agent.initial_input(&entry.run_id).await?,
-    );
-    if !remote.view.state.is_terminal() {
-        spawn_run_supervisor(
-            state.clone(),
-            agent.clone(),
-            Some(connector_id.clone()),
-            entry.run_id,
+    let suffix_start = catalog.len().saturating_sub(CONTROLLED_SESSION_RUN_LIMIT);
+    let mut controlled = Vec::with_capacity(catalog.len() - suffix_start);
+    for entry in catalog.into_iter().skip(suffix_start) {
+        // Native session history is authoritative and must remain readable
+        // after a connector capability upgrade. A controlled Run registered
+        // against an older descriptor is supplementary history; the current
+        // controller cannot safely rehydrate it, so omit only that Run instead
+        // of failing or discarding the rest of the causal suffix.
+        if !agent.can_control_run(&entry.run_id).await? {
+            continue;
+        }
+        let view = agent.inspect(&entry.run_id).await?;
+        let history_anchor =
+            AgentSessionHistoryAnchor::from_extensions(&agent.run_extensions(&entry.run_id).await?)
+                .map_err(|error| {
+                    ApiError::internal("invalid_session_history_anchor", error.to_string())
+                })?;
+        let remote = RemoteRunView::new(
+            state,
+            Some(connector_id),
+            view,
+            agent.initial_input(&entry.run_id).await?,
         );
+        if !remote.view.state.is_terminal() {
+            spawn_run_supervisor(
+                state.clone(),
+                agent.clone(),
+                Some(connector_id.clone()),
+                entry.run_id,
+            );
+        }
+        controlled.push(ControlledRemoteRunView {
+            run: remote,
+            created_at_unix_ms: entry.created_at_unix_ms,
+            updated_at_unix_ms: entry.updated_at_unix_ms,
+            after_activity_id: history_anchor.map(|anchor| anchor.after_activity_id),
+        });
     }
-    Ok(vec![ControlledRemoteRunView {
-        run: remote,
-        created_at_unix_ms,
-        updated_at_unix_ms,
-        after_activity_id: history_anchor.map(|anchor| anchor.after_activity_id),
-    }])
+    Ok(controlled)
 }
 
 #[derive(Debug, Deserialize)]
@@ -4458,6 +4467,48 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(event_types.contains(&"continuity_lost"));
         assert!(event_types.contains(&"continuity_restored"));
+
+        let response = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/agent-runs",
+                &token,
+                serde_json::json!({
+                    "connector_id": "fixture/local",
+                    "session_id": "fixture-created",
+                    "run_id": "fixture-external-run-2",
+                    "input": "continue once more",
+                    "after_activity_id": "fixture-newer-tail"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let response = app
+            .oneshot(authorized(
+                "GET",
+                "/agent-session?connector_id=fixture%2Flocal&session_id=fixture-created&limit=100",
+                &token,
+                serde_json::Value::Null,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let refreshed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let controlled_run_ids = refreshed["controlled_runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|run| run["execution"]["run_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            controlled_run_ids,
+            ["fixture-external-run", "fixture-external-run-2"],
+            "a stale native transcript must not collapse the durable Host suffix to one Run"
+        );
     }
 
     #[tokio::test]

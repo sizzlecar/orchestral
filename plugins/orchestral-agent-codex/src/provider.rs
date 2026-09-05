@@ -3803,7 +3803,7 @@ fn belongs_to_run(message: &Value, session_id: &AgentSessionId, turn_id: &str) -
     params
         .get("threadId")
         .and_then(Value::as_str)
-        .is_none_or(|id| id == session_id.as_str())
+        .is_some_and(|id| id == session_id.as_str())
         && params
             .get("turnId")
             .and_then(Value::as_str)
@@ -3930,6 +3930,27 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
+
+    #[test]
+    fn run_notification_requires_an_explicit_matching_thread() {
+        let session_id = AgentSessionId::new("thread-owned");
+
+        assert!(belongs_to_run(
+            &json!({"params": {"threadId": "thread-owned", "turnId": "turn-owned"}}),
+            &session_id,
+            "turn-owned"
+        ));
+        assert!(!belongs_to_run(
+            &json!({"params": {"turnId": "turn-owned"}}),
+            &session_id,
+            "turn-owned"
+        ));
+        assert!(!belongs_to_run(
+            &json!({"params": {"threadId": "thread-other", "turnId": "turn-owned"}}),
+            &session_id,
+            "turn-owned"
+        ));
+    }
 
     struct StaticImageBlobStore {
         id: String,

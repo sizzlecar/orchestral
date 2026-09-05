@@ -316,13 +316,11 @@ impl NotificationRouter {
                     .cloned()
                     .into_iter()
                     .collect::<Vec<_>>(),
-                // Preserve compatibility for rare app-server notifications
-                // without a threadId. Normal turn traffic is session-scoped.
-                None => sessions
-                    .values()
-                    .filter(|sender| sender.receiver_count() > 0)
-                    .cloned()
-                    .collect::<Vec<_>>(),
+                // An unscoped notification remains available to the global
+                // observer, but it cannot be attributed safely to any one
+                // session. Broadcasting it here lets one Provider session
+                // consume another session's message or approval.
+                None => Vec::new(),
             }
         };
         for sender in senders {
@@ -932,6 +930,33 @@ mod tests {
                     == Some("thread-watched")
         ));
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unscoped_notifications_never_enter_session_queues() {
+        let router = NotificationRouter::new();
+        let mut global = router.subscribe();
+        let mut first = router.subscribe_session("thread-first");
+        let mut second = router.subscribe_session("thread-second");
+        let message = json!({
+            "method": "item/commandExecution/requestApproval",
+            "params": {"itemId": "unattributed-command"}
+        });
+
+        router.publish(message.clone());
+
+        assert!(matches!(
+            global.try_recv(),
+            Ok(CodexTransportEvent::Message(received)) if received == message
+        ));
+        assert!(matches!(
+            first.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            second.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]

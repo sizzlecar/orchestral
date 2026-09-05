@@ -3419,6 +3419,85 @@ mod tests {
     }
 
     #[test]
+    fn stale_native_history_preserves_the_ordered_controlled_run_suffix() {
+        let detail: AgentSessionDetail = serde_json::from_value(serde_json::json!({
+            "summary": {
+                "connector_id": "fixture/local",
+                "session_id": "thread-with-stale-index",
+                "updated_at_unix_ms": 30,
+                "state": "active"
+            },
+            "turns": [{
+                "turn_id": "stale-native-turn",
+                "status": "active",
+                "activities": [{
+                    "activity_id": "stale-native-edge",
+                    "kind": "agent_message",
+                    "status": "completed",
+                    "content": [{"body": {"kind": "inline", "value": "indexed response"}}]
+                }]
+            }],
+            "next_cursor": "older-native-page",
+            "pending_requests": [],
+            "controlled_runs": [
+                {
+                    "created_at_unix_ms": 10,
+                    "after_activity_id": "stale-native-edge",
+                    "execution": {
+                        "session_id": "thread-with-stale-index",
+                        "run_id": "controlled-older"
+                    },
+                    "state": {"state": "terminal", "terminal": {"type": "completed"}},
+                    "last_run_seq": 4,
+                    "input": [{"body": {"kind": "inline", "value": "first missing input"}}]
+                },
+                {
+                    "created_at_unix_ms": 20,
+                    "after_activity_id": "stale-native-edge",
+                    "execution": {
+                        "session_id": "thread-with-stale-index",
+                        "run_id": "controlled-newer"
+                    },
+                    "state": {"state": "running"},
+                    "last_run_seq": 2,
+                    "input": [{"body": {"kind": "inline", "value": "second missing input"}}]
+                }
+            ]
+        }))
+        .unwrap();
+        let mut state = AppState::new(true);
+
+        state.project_agent_session(detail);
+        state.sessions.selected_id = Some("fixture/local\0thread-with-stale-index".to_owned());
+
+        let session = state.sessions.items.first().unwrap();
+        assert_eq!(
+            session.run_ids,
+            [
+                "agent-history:fixture/local:thread-with-stale-index",
+                "controlled-older",
+                "controlled-newer"
+            ]
+        );
+        let messages = timeline_blocks_for_session(&state, session)
+            .into_iter()
+            .filter_map(|entry| match entry.block {
+                TimelineBlock::Entry(TimelineItem::Message(message)) => Some(message.text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages,
+            [
+                "indexed response",
+                "first missing input",
+                "second missing input"
+            ]
+        );
+        assert_eq!(state.active_run().unwrap().id, "controlled-newer");
+    }
+
+    #[test]
     fn bounded_native_page_places_each_controlled_steer_before_its_later_response() {
         let created_at = 1_788_303_954_016_u64;
         let steer_at = created_at + 4_000;
