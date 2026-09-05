@@ -26,7 +26,7 @@ const inputRequest = {
   payload: { type: "input", prompt: content("请选择下一步要检查的模块") },
 };
 let nativePending = [approval],
-  hostPending = [inputRequest],
+  hostPending = [inputRequest, approval],
   sequence = 20,
   approvalAttempts = 0,
   calls = [],
@@ -51,6 +51,13 @@ let records = [
     },
   },
 ];
+records.push({
+  event: {
+    run_seq: 4,
+    event_id: "native-approval-mirror",
+    payload: { type: "request_opened", request: approval },
+  },
+});
 const summary = (id) => ({
   connector_id: "fixture/local",
   session_id: id,
@@ -200,10 +207,11 @@ const server = http.createServer(async (req, res) => {
       if (approvalAttempts === 1)
         return json(
           res,
-          { code: "approval_retry", message: "审批暂未成功，请重试" },
+          { code: "approval_unavailable", message: "审批暂未成功，请重试" },
           409,
         );
       nativePending = [];
+      hostPending = hostPending.filter(request => request.request_id !== approval.request_id);
       return json(res, { resolved: true });
     }
     if (route === "/agent-session/requests/native-input/input") {
@@ -362,6 +370,8 @@ const server = http.createServer(async (req, res) => {
       .filter({ hasText: "保存你要求的修改" });
     await card.getByRole("button", { name: "允许一次" }).click();
     await card.locator("[role=alert]").waitFor();
+    assert.equal(approvalAttempts, 1, "mirrored approval must use the native session endpoint");
+    assert.equal(await page.getByText("该审批已由其他客户端处理", { exact: true }).count(), 0);
     assert.equal(
       await card.getByRole("button", { name: "允许一次" }).isEnabled(),
       true,

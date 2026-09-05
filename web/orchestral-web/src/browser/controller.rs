@@ -1706,7 +1706,7 @@ impl AppController {
                         .write()
                         .remove_pending_request(&run_id, &request_id);
                 }
-                self.notice("该请求已由其他客户端处理", "info");
+                self.notice("该请求已不再等待回复，未提交本次操作", "info");
                 if session_target.is_none() {
                     self.refresh_run(&run_id).await;
                 }
@@ -1801,7 +1801,7 @@ impl AppController {
                         .write()
                         .remove_pending_request(&run_id, &request_id);
                 }
-                self.notice("该审批已由其他客户端处理", "info");
+                self.notice("该审批已不再等待处理，未提交本次操作", "info");
                 if session_target.is_none() {
                     self.refresh_run(&run_id).await;
                 }
@@ -2880,11 +2880,7 @@ fn check_ack(ack: &Value, operation: &str) -> Result<String, ApiError> {
 }
 
 fn is_stale_request_error(error: &ApiError) -> bool {
-    error.status == 409
-        && matches!(
-            error.code.as_str(),
-            "request_not_pending" | "approval_unavailable"
-        )
+    error.status == 409 && error.code == "request_not_pending"
 }
 
 fn value_as_id(value: &Value) -> Option<String> {
@@ -3164,9 +3160,19 @@ mod tests {
 
     #[test]
     fn only_authoritative_stale_request_conflicts_remove_cards() {
-        for code in ["request_not_pending", "approval_unavailable"] {
-            assert!(is_stale_request_error(&ApiError {
-                message: "stale".to_owned(),
+        assert!(is_stale_request_error(&ApiError {
+            message: "stale".to_owned(),
+            status: 409,
+            code: "request_not_pending".to_owned(),
+            details: None,
+        }));
+        for code in [
+            "approval_unavailable",
+            "approval_binding_unavailable",
+            "session_approval_unavailable",
+        ] {
+            assert!(!is_stale_request_error(&ApiError {
+                message: "approval failed".to_owned(),
                 status: 409,
                 code: code.to_owned(),
                 details: None,

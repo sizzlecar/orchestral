@@ -3110,10 +3110,14 @@ impl From<orchestral_core::agent_protocol::wire::AgentProtocolError> for ApiErro
 impl From<ApprovalBridgeError> for ApiError {
     fn from(error: ApprovalBridgeError) -> Self {
         match error {
-            ApprovalBridgeError::RequestNotFound(_)
-            | ApprovalBridgeError::SessionScopeUnavailable(_) => {
-                Self::conflict("approval_unavailable", error.to_string())
-            }
+            ApprovalBridgeError::RequestNotFound(_) => Self::conflict(
+                "approval_binding_unavailable",
+                "此入口缺少该审批的授权信息，本次操作未执行。请刷新会话后重试",
+            ),
+            ApprovalBridgeError::SessionScopeUnavailable(_) => Self::conflict(
+                "session_approval_unavailable",
+                "此审批不支持本会话允许，请选择允许一次或拒绝",
+            ),
             _ => Self::internal("approval_bridge_failed", error.to_string()),
         }
     }

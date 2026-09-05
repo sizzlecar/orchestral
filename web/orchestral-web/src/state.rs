@@ -1697,22 +1697,33 @@ impl AppState {
             .or_else(|| self.current_run())
     }
 
-    /// Union all pending requests in the selected session. Prefer a Host Run
-    /// command target when the native subscription mirrors the same request.
+    /// Union pending requests without losing their resolution route. A native
+    /// request mirrored in a Host Run still belongs to the connector; it has
+    /// no Generic Tool approval binding in the Host broker.
     pub fn pending_requests(&self) -> Vec<(&RunState, &Value)> {
         let Some(session) = self.selected_session() else {
             return Vec::new();
         };
         let history_id = session.history_run_id();
+        let native = history_id.as_ref().and_then(|id| self.runs.get(id));
+        let native_can_resolve = self.connectors.items.iter().any(|connector| {
+            session.connector_id.as_deref() == Some(connector.connector_id.as_str())
+                && connector.capabilities.resolve_requests
+        });
         let mut seen = BTreeSet::new();
-        session
-            .run_ids
-            .iter()
-            .rev()
-            .filter(|id| Some(*id) != history_id.as_ref())
-            .filter_map(|id| self.runs.get(id))
-            .filter(|run| !is_terminal(&run.status))
-            .chain(history_id.as_ref().and_then(|id| self.runs.get(id)))
+        native
+            .filter(|_| native_can_resolve)
+            .into_iter()
+            .chain(
+                session
+                    .run_ids
+                    .iter()
+                    .rev()
+                    .filter(|id| Some(*id) != history_id.as_ref())
+                    .filter_map(|id| self.runs.get(id))
+                    .filter(|run| !is_terminal(&run.status)),
+            )
+            .chain(native.filter(|_| !native_can_resolve))
             .flat_map(|run| run.pending.iter().map(move |request| (run, request)))
             .filter(|(_, request)| {
                 request
@@ -5504,6 +5515,11 @@ mod tests {
     #[test]
     fn pending_panel_unions_native_and_controlled_requests_by_identity() {
         let mut state = AppState::new(true);
+        state.connectors.items = serde_json::from_value(serde_json::json!([{
+            "connector_id": "fixture/local", "display_name": "Fixture", "agent_family": "fixture",
+            "capabilities": {"list": true, "read": true, "create": false, "resolve_requests": true}
+        }]))
+        .unwrap();
         state.project_agent_session(agent_detail_at(1, "message", "hello"));
         let session = &mut state.sessions.items[0];
         state.sessions.selected_id = Some(session.key());
@@ -5524,8 +5540,10 @@ mod tests {
         run.pending = vec![duplicate];
         let requests = state.pending_requests();
         assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].0.id, "controlled");
+        assert_eq!(requests[0].0.id, "agent-history:fixture/local:thread-1");
         assert_eq!(requests[1].1["request_id"], "child-input");
+        state.connectors.items[0].capabilities.resolve_requests = false;
+        assert_eq!(state.pending_requests()[0].0.id, "controlled");
     }
 
     #[test]
