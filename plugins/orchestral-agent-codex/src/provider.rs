@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
+use futures_util::future::BoxFuture;
 use futures_util::stream::{self, StreamExt};
 use orchestral_core::agent_connector::{
     AgentConnectorError, AgentSessionActionInvocation, AgentSessionRequestResolution,
@@ -365,7 +366,7 @@ impl CodexConnector {
             Some("completed" | "failed") | Some("interrupted")
                 if external_turn_is_terminal(&turn) =>
             {
-                restore_direct_turn(&connected.rpc, run, &turn_id, &turn).await;
+                restore_direct_turn(&connected.rpc, run, &turn_id, &turn).await?;
             }
             status => {
                 return Err(protocol_error(
@@ -2638,11 +2639,11 @@ async fn direct_turn_is_active(
         if latest.get("status").and_then(Value::as_str) == Some("inProgress") {
             return Ok(true);
         }
-        restore_direct_turn(rpc, run, &turn_id, &latest).await;
+        restore_direct_turn(rpc, run, &turn_id, &latest).await?;
         return Ok(false);
     }
     if latest_id == Some(turn_id.as_str()) && external_turn_is_terminal(&latest) {
-        restore_direct_turn(rpc, run, &turn_id, &latest).await;
+        restore_direct_turn(rpc, run, &turn_id, &latest).await?;
     } else {
         // Reconcile the exact target before rejecting the command. This also
         // closes a Direct Run when a newer native turn proves it was
@@ -2705,7 +2706,7 @@ async fn reconcile_bound_direct_turn(
     match turn.get("status").and_then(Value::as_str) {
         Some("inProgress") => Ok(false),
         Some("completed" | "failed") => {
-            restore_direct_turn(rpc, run, turn_id, &turn).await;
+            restore_direct_turn(rpc, run, turn_id, &turn).await?;
             Ok(true)
         }
         // `turn/interrupt` is an authoritative mutation acknowledged by the
@@ -2715,7 +2716,7 @@ async fn reconcile_bound_direct_turn(
         // therefore sufficient to converge; without that causal evidence the
         // conservative external-owner rule still applies.
         Some("interrupted") if direct_turn_is_terminal_for_run(run, &turn) => {
-            restore_direct_turn(rpc, run, turn_id, &turn).await;
+            restore_direct_turn(rpc, run, turn_id, &turn).await?;
             Ok(true)
         }
         Some("interrupted") => {
@@ -2744,16 +2745,24 @@ async fn restore_direct_turn(
     run: &Arc<CodexRun>,
     turn_id: &str,
     turn: &Value,
-) {
-    if let Ok(items) =
-        load_external_turn_items(rpc, run.execution.session_id.as_str(), turn_id).await
-    {
-        let detailed = json!({"items": items});
-        observe_external_turn_items(run, &detailed);
-        restore_final_response(run, &detailed);
+) -> Result<(), AgentProtocolError> {
+    match load_external_turn_items(rpc, run.execution.session_id.as_str(), turn_id).await {
+        Ok(items) => {
+            let detailed = json!({"items": items});
+            observe_external_turn_items(run, &detailed);
+            restore_final_response(run, &detailed);
+        }
+        // Recovery cannot claim complete delivery from possibly partial live
+        // deltas when its authoritative output read failed. Failed/cancelled
+        // turns may still converge from their terminal status alone.
+        Err(error) if turn.get("status").and_then(Value::as_str) == Some("completed") => {
+            return Err(error);
+        }
+        Err(_) => {}
     }
     restore_final_response(run, turn);
     finish_run(run, Some(turn));
+    Ok(())
 }
 
 async fn monitor_native_run(
@@ -2762,25 +2771,36 @@ async fn monitor_native_run(
     turn_id: String,
     mut notifications: broadcast::Receiver<CodexTransportEvent>,
 ) {
-    let mut poll = tokio::time::interval(DIRECT_RUN_POLL_INTERVAL);
-    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // `interval` fires immediately. Notifications own the hot path; polling
-    // starts only after one complete interval.
-    poll.tick().await;
+    let poll = tokio::time::sleep(DIRECT_RUN_POLL_INTERVAL);
+    tokio::pin!(poll);
+    let mut reconciliation: Option<BoxFuture<'_, Result<bool, AgentProtocolError>>> = None;
+    let mut had_notification_gap = false;
     loop {
+        // Native history can take seconds to read on a long session. Keep
+        // draining live output/approvals while that read is pending, with at
+        // most one reconciliation in flight. This future belongs to the
+        // monitor, so a live terminal event also cancels the obsolete read.
         let received = tokio::select! {
-            received = notifications.recv() => Some(received),
-            _ = poll.tick() => None,
-        };
-        let Some(received) = received else {
-            match reconcile_bound_direct_turn(&rpc, &run, &turn_id).await {
-                Ok(true) => return,
-                Ok(false) => continue,
-                Err(error) => {
-                    run.detached.store(true, Ordering::SeqCst);
-                    let _ = run.critical_sender.send(Err(error));
-                    return;
+            biased;
+            result = async { reconciliation.as_mut().unwrap().await }, if reconciliation.is_some() => {
+                reconciliation = None;
+                // Schedule from completion, not the previous start: a slow
+                // read must never create a backlog of immediately due polls.
+                poll.as_mut().reset(tokio::time::Instant::now() + DIRECT_RUN_POLL_INTERVAL);
+                match result {
+                    Ok(true) => return,
+                    Ok(false) => continue,
+                    Err(error) => {
+                        run.detached.store(true, Ordering::SeqCst);
+                        let _ = run.critical_sender.send(Err(error));
+                        return;
+                    }
                 }
+            }
+            received = notifications.recv() => received,
+            _ = &mut poll, if reconciliation.is_none() => {
+                reconciliation = Some(Box::pin(reconcile_bound_direct_turn(&rpc, &run, &turn_id)));
+                continue;
             }
         };
         let message = match received {
@@ -2794,6 +2814,7 @@ async fn monitor_native_run(
                 return;
             }
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                had_notification_gap = true;
                 // Notifications are an optimization; exact native history is
                 // the authority. A bounded subscriber gap must not poison the
                 // Host Run or disable future steering. Reconcile immediately
@@ -2804,15 +2825,12 @@ async fn monitor_native_run(
                     skipped,
                     "reconciling Codex Run after a notification gap"
                 );
-                match reconcile_bound_direct_turn(&rpc, &run, &turn_id).await {
-                    Ok(true) => return,
-                    Ok(false) => continue,
-                    Err(error) => {
-                        run.detached.store(true, Ordering::SeqCst);
-                        let _ = run.critical_sender.send(Err(error));
-                        return;
-                    }
+                // Multiple gaps during a read share the same reconciliation.
+                if reconciliation.is_none() {
+                    reconciliation =
+                        Some(Box::pin(reconcile_bound_direct_turn(&rpc, &run, &turn_id)));
                 }
+                continue;
             }
             Err(broadcast::error::RecvError::Closed) => {
                 run.detached.store(true, Ordering::SeqCst);
@@ -2826,6 +2844,10 @@ async fn monitor_native_run(
         if !belongs_to_run(&message, &run.execution.session_id, &turn_id) {
             continue;
         }
+        // Live notifications own the hot path. Poll only after this turn has
+        // gone quiet; unrelated turns cannot postpone the fallback.
+        poll.as_mut()
+            .reset(tokio::time::Instant::now() + DIRECT_RUN_POLL_INTERVAL);
         run.direct_history_misses.store(0, Ordering::SeqCst);
         let method = message
             .get("method")
@@ -2858,7 +2880,23 @@ async fn monitor_native_run(
                 respond_dynamic_tool(&rpc, &run, &message).await;
             }
             "turn/completed" => {
-                finish_run(&run, message.pointer("/params/turn"));
+                let turn = message.pointer("/params/turn");
+                if had_notification_gap {
+                    // The live terminal notification can overtake a slow
+                    // history read. Do not commit a partial output assembled
+                    // from the surviving deltas; restore this exact turn first.
+                    drop(reconciliation);
+                    if let Some(turn) = turn {
+                        if let Err(error) = restore_direct_turn(&rpc, &run, &turn_id, turn).await {
+                            run.detached.store(true, Ordering::SeqCst);
+                            let _ = run.critical_sender.send(Err(error));
+                        }
+                    } else {
+                        finish_run(&run, None);
+                    }
+                } else {
+                    finish_run(&run, turn);
+                }
                 return;
             }
             _ => {}
@@ -7271,6 +7309,257 @@ mod tests {
                     if delivery.final_response == Content::text("recovered by polling")
             )
         }));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn slow_history_does_not_block_output_approval_or_terminal_notifications() {
+        let (client_io, server_io) = duplex(64 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, _server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(10),
+            64 * 1024,
+        );
+        let run = test_run("thread-slow", "run-slow");
+        establish_turn(&run, "turn-slow");
+        let (sender, notifications) = broadcast::channel(64);
+        let task = tokio::spawn(monitor_native_run(
+            rpc,
+            run.clone(),
+            "turn-slow".to_owned(),
+            notifications,
+        ));
+        let mut lines = BufReader::new(server_read).lines();
+        let history = timeout(Duration::from_secs(1), next_request(&mut lines))
+            .await
+            .unwrap();
+        assert_eq!(history["method"], "thread/turns/list");
+        // Leave history unanswered for the entire test, while publishing more
+        // output than the production notification buffer could retain.
+        sender.send(CodexTransportEvent::Message(json!({
+            "id": 42, "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "thread-slow", "turnId": "turn-slow", "itemId": "approval", "command": "fixture"}
+        }))).unwrap();
+        timeout(Duration::from_secs(1), async {
+            while !lock(&run.pending).contains_key(&RequestId::new("codex-approval")) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("approval must open before the history response");
+        for batch in 1..=128 {
+            for _ in 0..16 {
+                sender
+                    .send(CodexTransportEvent::Message(json!({
+                        "method": "item/agentMessage/delta",
+                        "params": {"threadId": "thread-slow", "turnId": "turn-slow", "delta": "x"}
+                    })))
+                    .unwrap();
+            }
+            timeout(Duration::from_secs(1), async {
+                while lock(&run.final_response).len() < batch * 16 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("live output must drain during the history read");
+        }
+        sender
+            .send(CodexTransportEvent::Message(json!({
+                "method": "serverRequest/resolved",
+                "params": {"threadId": "thread-slow", "turnId": "turn-slow", "requestId": 42}
+            })))
+            .unwrap();
+        sender.send(CodexTransportEvent::Message(json!({
+            "method": "turn/completed",
+            "params": {"threadId": "thread-slow", "turn": {"id": "turn-slow", "status": "completed"}}
+        }))).unwrap();
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(run.terminal.load(Ordering::SeqCst));
+        assert!(!run.detached.load(Ordering::SeqCst));
+        assert!(lock(&run.pending).is_empty());
+        assert_eq!(lock(&run.final_response).len(), 2048);
+        assert_eq!(
+            lock(&run.durable)
+                .iter()
+                .filter(|draft| matches!(draft.payload, AgentEvent::DeliveryCommitted { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn direct_monitor_polls_only_when_quiet_and_waits_after_a_slow_read() {
+        use futures_util::FutureExt;
+        let (client_io, server_io) = duplex(64 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(10),
+            64 * 1024,
+        );
+        let run = test_run("thread-quiet", "run-quiet");
+        establish_turn(&run, "turn-quiet");
+        let (sender, notifications) = broadcast::channel(64);
+        let task = tokio::spawn(monitor_native_run(
+            rpc,
+            run.clone(),
+            "turn-quiet".to_owned(),
+            notifications,
+        ));
+        let mut lines = BufReader::new(server_read).lines();
+        tokio::task::yield_now().await;
+        for _ in 0..10 {
+            tokio::time::advance(DIRECT_RUN_POLL_INTERVAL / 2).await;
+            sender
+                .send(CodexTransportEvent::Message(json!({
+                    "method": "item/agentMessage/delta",
+                    "params": {"threadId": "thread-quiet", "turnId": "turn-quiet", "delta": "x"}
+                })))
+                .unwrap();
+            tokio::task::yield_now().await;
+            assert!(
+                lines.next_line().now_or_never().is_none(),
+                "active output must not trigger history reads"
+            );
+        }
+        tokio::time::advance(DIRECT_RUN_POLL_INTERVAL).await;
+        let history = next_request(&mut lines).await;
+        assert_eq!(history["method"], "thread/turns/list");
+        tokio::time::advance(DIRECT_RUN_POLL_INTERVAL * 10).await;
+        assert!(
+            lines.next_line().now_or_never().is_none(),
+            "at most one history read may be in flight"
+        );
+        server_write_result(
+            &mut server_write,
+            &history,
+            json!({
+                "data": [{"id": "turn-quiet", "status": "inProgress"}], "nextCursor": null
+            }),
+        )
+        .await;
+        let loaded = next_request(&mut lines).await;
+        assert_eq!(loaded["method"], "thread/read");
+        server_write_result(&mut server_write, &loaded, json!({
+            "thread": {"id": "thread-quiet", "turns": [{"id": "turn-quiet", "status": "inProgress"}]}
+        })).await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(DIRECT_RUN_POLL_INTERVAL / 2).await;
+        assert!(
+            lines.next_line().now_or_never().is_none(),
+            "slow reads must not leave an overdue poll"
+        );
+        tokio::time::advance(DIRECT_RUN_POLL_INTERVAL).await;
+        assert_eq!(
+            next_request(&mut lines).await["method"],
+            "thread/turns/list"
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn terminal_after_a_gap_restores_full_output_before_committing() {
+        let (client_io, server_io) = duplex(64 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(10),
+            64 * 1024,
+        );
+        let run = test_run("thread-final-gap", "run-final-gap");
+        establish_turn(&run, "turn-final-gap");
+        let (sender, notifications) = broadcast::channel(2);
+        for delta in ["missing", "surviving", "output"] {
+            sender.send(CodexTransportEvent::Message(json!({
+                "method": "item/agentMessage/delta",
+                "params": {"threadId": "thread-final-gap", "turnId": "turn-final-gap", "delta": delta}
+            }))).unwrap();
+        }
+        let task = tokio::spawn(monitor_native_run(
+            rpc,
+            run.clone(),
+            "turn-final-gap".to_owned(),
+            notifications,
+        ));
+        let mut lines = BufReader::new(server_read).lines();
+        let history = timeout(Duration::from_secs(1), next_request(&mut lines))
+            .await
+            .unwrap();
+        assert_eq!(history["method"], "thread/turns/list");
+        sender.send(CodexTransportEvent::Message(json!({
+            "method": "turn/completed",
+            "params": {"threadId": "thread-final-gap", "turn": {"id": "turn-final-gap", "status": "completed"}}
+        }))).unwrap();
+        let items = timeout(Duration::from_secs(1), next_request(&mut lines))
+            .await
+            .unwrap();
+        assert_eq!(items["method"], "thread/items/list");
+        assert_eq!(items["params"]["turnId"], "turn-final-gap");
+        assert!(!run.terminal.load(Ordering::SeqCst));
+        server_write_result(&mut server_write, &items, json!({
+            "data": [{"item": {"id": "answer", "type": "agentMessage", "text": "complete authoritative output"}}], "nextCursor": null
+        })).await;
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let durable = lock(&run.durable);
+        let deliveries = durable
+            .iter()
+            .filter_map(|draft| match &draft.payload {
+                AgentEvent::DeliveryCommitted { delivery } => Some(delivery),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(
+            deliveries[0].final_response,
+            Content::text("complete authoritative output")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_final_history_read_does_not_commit_partial_delivery() {
+        let (client_io, server_io) = duplex(64 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc =
+            CodexRpcClient::from_io(client_read, client_write, Duration::from_secs(1), 64 * 1024);
+        let run = test_run("thread-final-error", "run-final-error");
+        establish_turn(&run, "turn-final-error");
+        *lock(&run.final_response) = "partial".to_owned();
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            let items = next_request(&mut lines).await;
+            assert_eq!(items["method"], "thread/items/list");
+            server_write_error(&mut server_write, &items, "history unavailable").await;
+        });
+        assert!(restore_direct_turn(
+            &rpc,
+            &run,
+            "turn-final-error",
+            &json!({"id": "turn-final-error", "status": "completed"})
+        )
+        .await
+        .is_err());
+        assert!(!run.terminal.load(Ordering::SeqCst));
+        assert!(!lock(&run.durable)
+            .iter()
+            .any(|draft| matches!(draft.payload, AgentEvent::DeliveryCommitted { .. })));
         server.await.unwrap();
     }
 

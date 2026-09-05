@@ -27,4 +27,4 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 orchestral-runtime = { workspace = true }
 tempfile = "3"
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

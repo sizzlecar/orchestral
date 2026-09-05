@@ -204,7 +204,24 @@ pub enum CodexTransportError {
 }
 
 type RpcReply = Result<Value, CodexTransportError>;
-type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<RpcReply>>>>;
+type Pending = Arc<SyncMutex<HashMap<String, oneshot::Sender<RpcReply>>>>;
+
+// Read-only reconciliation may be cancelled as soon as a live terminal
+// notification arrives. Remove its reply slot even if the daemon never
+// responds; no async lock or detached cleanup task is needed in Drop.
+struct PendingRequest {
+    pending: Pending,
+    key: String,
+}
+
+impl Drop for PendingRequest {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.key);
+    }
+}
 
 #[async_trait]
 trait RpcWriter: Send {
@@ -217,18 +234,45 @@ trait RpcWriter: Send {
 
 struct JsonLineWriter {
     inner: Box<dyn AsyncWrite + Send + Unpin>,
+    pending_frame: Vec<u8>,
+    written: usize,
+}
+
+impl JsonLineWriter {
+    async fn flush_pending(&mut self) -> Result<(), CodexTransportError> {
+        if self.pending_frame.is_empty() {
+            return Ok(());
+        }
+        // Keep progress in the writer, not in a write_all future. Cancelling
+        // an RPC halfway through a line must not corrupt the next command.
+        while self.written < self.pending_frame.len() {
+            let written = self
+                .inner
+                .write(&self.pending_frame[self.written..])
+                .await
+                .map_err(CodexTransportError::Io)?;
+            if written == 0 {
+                return Err(CodexTransportError::Io(
+                    std::io::ErrorKind::WriteZero.into(),
+                ));
+            }
+            self.written += written;
+        }
+        self.inner.flush().await.map_err(CodexTransportError::Io)?;
+        self.pending_frame.clear();
+        self.written = 0;
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl RpcWriter for JsonLineWriter {
     async fn send_json(&mut self, message: &Value) -> Result<(), CodexTransportError> {
+        self.flush_pending().await?;
         let mut bytes = serde_json::to_vec(message).map_err(CodexTransportError::InvalidJson)?;
         bytes.push(b'\n');
-        self.inner
-            .write_all(&bytes)
-            .await
-            .map_err(CodexTransportError::Io)?;
-        self.inner.flush().await.map_err(CodexTransportError::Io)
+        self.pending_frame = bytes;
+        self.flush_pending().await
     }
 }
 
@@ -554,11 +598,13 @@ impl CodexRpcClient {
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
     {
-        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let pending = Arc::new(SyncMutex::new(HashMap::new()));
         let notifications = Arc::new(NotificationRouter::new());
         let connected = Arc::new(AtomicBool::new(true));
         let writer: Arc<Mutex<DynWriter>> = Arc::new(Mutex::new(Box::new(JsonLineWriter {
             inner: Box::new(writer),
+            pending_frame: Vec::new(),
+            written: 0,
         })));
         let client = Arc::new(Self {
             writer,
@@ -586,7 +632,7 @@ impl CodexRpcClient {
         max_frame_bytes: usize,
     ) -> Arc<Self> {
         let (sink, stream) = websocket.split();
-        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let pending = Arc::new(SyncMutex::new(HashMap::new()));
         let notifications = Arc::new(NotificationRouter::new());
         let connected = Arc::new(AtomicBool::new(true));
         let writer: Arc<Mutex<DynWriter>> =
@@ -640,6 +686,11 @@ impl CodexRpcClient {
     }
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, CodexTransportError> {
+        let started = std::time::Instant::now();
+        let session_id = params
+            .get("threadId")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         let id = {
             let mut next = self.next_id.lock().await;
             let id = *next;
@@ -648,23 +699,40 @@ impl CodexRpcClient {
         };
         let key = id.to_string();
         let (sender, receiver) = oneshot::channel();
-        self.pending.lock().await.insert(key.clone(), sender);
-        if let Err(error) = self
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key.clone(), sender);
+        let _pending_request = PendingRequest {
+            pending: Arc::clone(&self.pending),
+            key,
+        };
+        let written = self
             .write(&json!({"method": method, "id": id, "params": params}))
-            .await
-        {
-            self.pending.lock().await.remove(&key);
-            return Err(error);
+            .await;
+        let write_ms = started.elapsed().as_millis() as u64;
+        let result = match written {
+            Err(error) => Err(error),
+            Ok(()) => match timeout(self.request_timeout, receiver).await {
+                Ok(Ok(reply)) => reply,
+                Ok(Err(_)) => Err(CodexTransportError::Closed),
+                Err(_) => Err(CodexTransportError::Timeout),
+            },
+        };
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        if elapsed_ms >= 1_000 {
+            // Log identities and timings only, never prompts or RPC bodies.
+            tracing::warn!(
+                rpc_method = method,
+                rpc_id = id,
+                session_id = session_id.as_deref().unwrap_or("-"),
+                elapsed_ms,
+                write_ms,
+                succeeded = result.is_ok(),
+                "slow Codex RPC request"
+            );
         }
-        match timeout(self.request_timeout, receiver).await {
-            Ok(Ok(Ok(result))) => Ok(result),
-            Ok(Ok(Err(error))) => Err(error),
-            Ok(Err(_)) => Err(CodexTransportError::Closed),
-            Err(_) => {
-                self.pending.lock().await.remove(&key);
-                Err(CodexTransportError::Timeout)
-            }
-        }
+        result
     }
 
     pub async fn notify(&self, method: &str, params: Value) -> Result<(), CodexTransportError> {
@@ -767,7 +835,11 @@ async fn route_message(message: Value, pending: &Pending, notifications: &Notifi
     if let Some(id) = message.get("id") {
         if message.get("method").is_none() {
             let key = id_key(id);
-            if let Some(sender) = pending.lock().await.remove(&key) {
+            let sender = pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&key);
+            if let Some(sender) = sender {
                 let reply = if let Some(error) = message.get("error") {
                     Err(CodexTransportError::Rpc(
                         error
@@ -783,8 +855,9 @@ async fn route_message(message: Value, pending: &Pending, notifications: &Notifi
                         .ok_or(CodexTransportError::MissingResult)
                 };
                 let _ = sender.send(reply);
-                return;
             }
+            // Late replies to cancelled/timed-out calls are not notifications.
+            return;
         }
     }
     notifications.publish(message);
@@ -800,7 +873,9 @@ async fn finish_disconnect(
         return;
     }
     let senders = {
-        let mut guard = pending.lock().await;
+        let mut guard = pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.drain().map(|(_, sender)| sender).collect::<Vec<_>>()
     };
     for sender in senders {
@@ -863,6 +938,93 @@ mod tests {
     use tokio::net::UnixListener;
     #[cfg(unix)]
     use tokio_tungstenite::accept_async;
+
+    #[tokio::test]
+    async fn cancelling_a_partial_write_keeps_following_requests_framed() {
+        use tokio::io::AsyncReadExt;
+        let (client_io, server_io) = duplex(8);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (mut server_read, _server_write) = tokio::io::split(server_io);
+        let client = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(10),
+            16 * 1024,
+        );
+        let requester = client.clone();
+        let task = tokio::spawn(async move {
+            requester
+                .request("thread/turns/list", json!({"threadId": "x".repeat(128)}))
+                .await
+        });
+        let mut prefix = [0; 8];
+        server_read.read_exact(&mut prefix).await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(client.pending.lock().unwrap().is_empty());
+        let following = tokio::spawn(async move { client.notify("initialized", json!({})).await });
+        let mut lines = BufReader::new(server_read).lines();
+        let suffix = timeout(Duration::from_secs(1), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let first: Value = serde_json::from_str(&format!(
+            "{}{suffix}",
+            std::str::from_utf8(&prefix).unwrap()
+        ))
+        .unwrap();
+        assert_eq!(first["method"], "thread/turns/list");
+        assert_eq!(first["params"]["threadId"], "x".repeat(128));
+        let next = timeout(Duration::from_secs(1), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&next).unwrap()["method"],
+            "initialized"
+        );
+        following.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_requests_release_reply_slots_and_discard_late_responses() {
+        let (client_io, server_io) = duplex(16 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let client = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(10),
+            16 * 1024,
+        );
+        let mut notifications = client.subscribe();
+        let requester = client.clone();
+        let task =
+            tokio::spawn(async move { requester.request("thread/turns/list", json!({})).await });
+        let mut lines = BufReader::new(server_read).lines();
+        let request: Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(client.pending.lock().unwrap().len(), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(client.pending.lock().unwrap().is_empty());
+        let late = json!({"id": request["id"], "result": {"data": []}});
+        server_write
+            .write_all(
+                format!("{late}\n{{\"method\":\"turn/started\",\"params\":{{}}}}\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        let event = timeout(Duration::from_secs(1), notifications.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(event, CodexTransportEvent::Message(value) if value["method"] == "turn/started")
+        );
+    }
 
     #[tokio::test]
     async fn correlates_out_of_order_replies_and_keeps_notifications() {

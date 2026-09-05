@@ -263,6 +263,13 @@ rg 'HTTP request completed.*route=/api/v1/agent-session ' "$host_log" | tail -n 
 请求时应同时保留 `request_id`、`route`、`session_id`、`run_id` 和 `cf_ray`，方便串联 Host、
 Tunnel 和 Worker 日志。
 
+Codex 原生 RPC 超过 1 秒会记录 `slow Codex RPC request`，包含 `rpc_method`、`rpc_id`、
+`elapsed_ms`、`write_ms` 和 `succeeded`，不记录请求正文。`write_ms` 包含本机发送锁等待及
+写入耗时；总耗时减去它是等待原生响应的时间。HTTP 请求内的 RPC 会继承 `request_id`，
+可据此区分请求慢在 Host 发送还是 Codex 响应。Run 通知缺口日志中的 `skipped` 统计实时
+通知，不等同于丢失的聊天消息条数。历史校准与实时通知交替推进，每个 Run 最多一项校准
+在途，通知安静后才轮询；通知有缺口时，完整输出恢复成功后才能提交最终交付。
+
 ### Cloudflare Tunnel 日志
 
 ```text
