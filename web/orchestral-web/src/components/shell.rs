@@ -503,7 +503,42 @@ fn Composer() -> Element {
     let mut attachments = use_signal(Vec::<crate::model::UploadedArtifact>::new);
     let mut uploads_in_flight = use_signal(|| 0_usize);
     let mut upload_error = use_signal(|| None::<String>);
+    let mut saved_drafts =
+        use_signal(BTreeMap::<String, (String, Vec<crate::model::UploadedArtifact>)>::new);
+    let mut draft_session = use_signal(|| {
+        controller
+            .state
+            .read()
+            .sessions
+            .selected_id
+            .clone()
+            .unwrap_or_default()
+    });
+    use_effect(move || {
+        let selected = controller
+            .state
+            .read()
+            .sessions
+            .selected_id
+            .clone()
+            .unwrap_or_default();
+        let previous = draft_session.peek().clone();
+        if selected != previous {
+            saved_drafts
+                .write()
+                .insert(previous, (draft.peek().clone(), attachments.peek().clone()));
+            let (text, files) = saved_drafts.write().remove(&selected).unwrap_or_default();
+            draft.set(text);
+            attachments.set(files);
+            draft_session.set(selected);
+            upload_error.set(None);
+        }
+    });
     let state = controller.state.read();
+    let sending = state.ui.composer_busy;
+    let confirming = state.ui.outbox_flushing;
+    let online = state.connection.online;
+    let pending_count = state.pending_requests().len();
     let active = state.active_run().is_some();
     let manual_recovery = state
         .current_run()
@@ -522,12 +557,15 @@ fn Composer() -> Element {
     let control_disabled = state.ui.composer_busy
         || !state.connection.online
         || state.auth.status != AuthStatus::Authenticated;
-    let action_disabled = control_disabled || input_disabled || uploads_in_flight() > 0;
+    let action_disabled =
+        control_disabled || input_disabled || confirming || uploads_in_flight() > 0;
     let stopping = state
         .active_run()
         .is_some_and(|run| run.status == "stopping");
     drop(state);
-    let placeholder = if supervision_blocked {
+    let placeholder = if !online {
+        "离线时也可以先写好草稿…"
+    } else if supervision_blocked {
         "任务已停滞，Host 正在安全终止…"
     } else if manual_recovery == Some(true) {
         "上次任务已中断，可发送新消息继续…"
@@ -536,11 +574,19 @@ fn Composer() -> Element {
     } else if recoverable {
         "正在自动恢复，恢复后可继续…"
     } else if active {
-        "补充指令（steer）…"
+        "补充说明或调整方向…"
     } else {
         "告诉 Orchestral 你想完成什么…"
     };
-    let hint = if let Some(supervision) = supervision {
+    let hint = if sending {
+        "正在发送，请稍候…".to_owned()
+    } else if !online {
+        "当前离线，草稿会保留；恢复连接后可发送".to_owned()
+    } else if confirming {
+        "正在确认上一条消息的发送状态，可以继续编辑草稿".to_owned()
+    } else if pending_count > 0 {
+        format!("有 {pending_count} 项待处理，请在上方回复或批准")
+    } else if let Some(supervision) = supervision {
         supervision.reason
     } else if manual_recovery == Some(true) {
         "上次任务不会自动重试；本次发送将创建新任务".to_owned()
@@ -552,6 +598,42 @@ fn Composer() -> Element {
         "当前发送会引导正在运行的任务".to_owned()
     } else {
         "Enter 发送 · Shift + Enter 换行".to_owned()
+    };
+
+    let mut send_draft = move || {
+        if action_disabled {
+            return;
+        }
+        let text = draft();
+        let selected = attachments();
+        let submission_session = draft_session();
+        if text.trim().is_empty() && selected.is_empty() {
+            return;
+        }
+        upload_error.set(None);
+        // Commit the composer locally before the Host resolves R2
+        // content and starts the Agent. That remote acknowledgement
+        // can take seconds and must not make the UI look frozen.
+        draft.set(String::new());
+        attachments.set(Vec::new());
+        spawn(async move {
+            if !controller.submit(text.clone(), selected.clone()).await {
+                if draft_session() != submission_session {
+                    saved_drafts
+                        .write()
+                        .insert(submission_session, (text, selected));
+                    return;
+                }
+                // Restore a definitively rejected submission only
+                // when no newer draft would be overwritten.
+                if draft().is_empty() {
+                    draft.set(text);
+                }
+                if attachments().is_empty() {
+                    attachments.set(selected);
+                }
+            }
+        });
     };
 
     rsx! {
@@ -594,34 +676,14 @@ fn Composer() -> Element {
                 class: "composer-form",
                 onsubmit: move |event| {
                     event.prevent_default();
-                    let text = draft();
-                    let selected = attachments();
-                    if text.trim().is_empty() && selected.is_empty() { return; }
-                    upload_error.set(None);
-                    // Commit the composer locally before the Host resolves R2
-                    // content and starts the Agent. That remote acknowledgement
-                    // can take seconds and must not make the UI look frozen.
-                    draft.set(String::new());
-                    attachments.set(Vec::new());
-                    spawn(async move {
-                        if !controller.submit(text.clone(), selected.clone()).await {
-                            // Restore a definitively rejected submission only
-                            // when no newer draft would be overwritten.
-                            if draft().is_empty() {
-                                draft.set(text);
-                            }
-                            if attachments().is_empty() {
-                                attachments.set(selected);
-                            }
-                        }
-                    });
+                    send_draft();
                 },
                 input {
                     id: "composer-file-input",
                     class: "composer-file-input",
                     r#type: "file",
                     multiple: true,
-                    disabled: input_disabled || uploads_in_flight() > 0,
+                    disabled: action_disabled,
                     onchange: move |event| {
                         let files = event.files();
                         if files.is_empty() { return; }
@@ -631,9 +693,13 @@ fn Composer() -> Element {
                             upload_error.set(Some("每条消息最多 10 个附件".to_owned()));
                         }
                         for file in files.into_iter().take(available) {
+                            let upload_session = draft_session();
                             uploads_in_flight += 1;
                             spawn(async move {
                                 match controller.upload_artifact(file).await {
+                                    Ok(artifact) if draft_session() != upload_session => {
+                                        saved_drafts.write().entry(upload_session).or_default().1.push(artifact);
+                                    }
                                     Ok(artifact) => {
                                         if !attachments
                                             .read()
@@ -662,7 +728,8 @@ fn Composer() -> Element {
                     rows: "1",
                     maxlength: "20000",
                     value: draft,
-                    disabled: input_disabled,
+                    disabled: sending,
+                    aria_label: "消息草稿",
                     placeholder,
                     autocomplete: "off",
                     autocapitalize: "sentences",
@@ -670,24 +737,9 @@ fn Composer() -> Element {
                     enterkeyhint: "send",
                     oninput: move |event| draft.set(event.value()),
                     onkeydown: move |event| {
-                        if event.key() == Key::Enter && !event.modifiers().shift() {
+                        if event.key() == Key::Enter && !event.modifiers().shift() && !event.is_composing() {
                             event.prevent_default();
-                            let text = draft();
-                            let selected = attachments();
-                            if text.trim().is_empty() && selected.is_empty() { return; }
-                            upload_error.set(None);
-                            draft.set(String::new());
-                            attachments.set(Vec::new());
-                            spawn(async move {
-                                if !controller.submit(text.clone(), selected.clone()).await {
-                                    if draft().is_empty() {
-                                        draft.set(text);
-                                    }
-                                    if attachments().is_empty() {
-                                        attachments.set(selected);
-                                    }
-                                }
-                            });
+                            send_draft();
                         }
                     }
                 }
@@ -696,15 +748,16 @@ fn Composer() -> Element {
                         button {
                             class: "cancel-button",
                             r#type: "button",
-                            disabled: action_disabled,
+                            disabled: control_disabled,
                             onclick: move |_| {
                                 spawn(async move { controller.cancel().await });
                             },
                             "停止"
                         }
                     }
-                    button { class: "send-button", r#type: "submit", disabled: action_disabled,
-                        span { "发送" }
+                    button { class: "send-button", r#type: "submit", disabled: action_disabled || (draft.read().trim().is_empty() && attachments.read().is_empty()),
+                        aria_label: if sending { "正在发送" } else { "发送消息" },
+                        span { if sending { "发送中" } else { "发送" } }
                     }
                 }
             }

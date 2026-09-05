@@ -1890,13 +1890,29 @@ svg {
 
 .pending-panel {
   position: relative;
+  display: flex;
+  flex-direction: column;
   z-index: 6;
+  min-height: 0;
   max-height: min(46dvh, 390px);
-  padding: 8px max(12px, env(safe-area-inset-right)) 0 max(12px, env(safe-area-inset-left));
+  background: var(--page-raised);
+}
+
+.pending-panel__header {
+  flex: none;
+  padding: 8px max(14px, env(safe-area-inset-right)) 8px max(14px, env(safe-area-inset-left));
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.pending-panel__body {
+  min-height: 0;
+  padding: 0 max(12px, env(safe-area-inset-right)) 12px max(12px, env(safe-area-inset-left));
   overflow-x: hidden;
   overflow-y: auto;
-  background: linear-gradient(to bottom, transparent, var(--page-raised) 12px);
   overscroll-behavior: contain;
+  scroll-padding-block: 12px;
 }
 
 .pending-card {
@@ -1914,6 +1930,15 @@ svg {
 .pending-card--approval {
   border-color: color-mix(in srgb, var(--warning) 24%, var(--line-strong));
   box-shadow: 0 8px 26px rgb(8 10 15 / 14%);
+}
+
+.pending-card + .pending-card {
+  margin-top: 8px;
+}
+
+.pending-card__error {
+  color: var(--danger);
+  overflow-wrap: anywhere;
 }
 
 .pending-card__title {
@@ -1955,6 +1980,7 @@ svg {
 
 .pending-card__scope-row {
   display: flex;
+  flex-wrap: wrap;
   gap: 5px;
   margin-top: 9px;
   overflow-x: auto;
@@ -2080,7 +2106,7 @@ svg {
   resize: vertical;
   background: var(--surface);
   color: var(--ink);
-  font-size: 12px;
+  font-size: 16px;
   line-height: 1.5;
   -webkit-user-select: text;
   user-select: text;
@@ -2108,7 +2134,7 @@ svg {
 .pending-card__primary,
 .pending-card__secondary,
 .pending-card__danger {
-  min-height: 42px;
+  min-height: 44px;
   padding: 0 14px;
   border: 1px solid var(--line-strong);
   border-radius: 10px;
@@ -3014,8 +3040,7 @@ svg {
 
 @media (max-width: 379px) {
   .mobile-brand span,
-  .run-status span:last-child,
-  .composer-hint {
+  .run-status span:last-child {
     display: none;
   }
 
@@ -3057,3 +3082,9 @@ svg {
     border: 1px solid ButtonText;
   }
 }
+
+/* Keep the composer readable without mobile input zoom. */
+.composer-form textarea { font-size: 16px; }
+.send-button { width: auto; min-width: 56px; padding: 0 10px; }
+.composer-hint { font-size: 11px; line-height: 1.5; justify-content: center; }
+.message__meta { font-size: 11px; }

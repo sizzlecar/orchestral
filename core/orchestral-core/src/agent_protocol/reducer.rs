@@ -273,8 +273,15 @@ impl AgentRunReducer {
         }
     }
 
-    /// Projects a public acknowledgement from durable command facts without
-    /// exposing the reducer's internal command ledger.
+    /// Returns the immutable envelope associated with a durable command id.
+    pub fn recorded_command(&self, command_id: &CommandId) -> Option<&AgentCommandEnvelope> {
+        self.snapshot
+            .commands
+            .get(command_id)
+            .map(|record| &record.command)
+    }
+
+    /// Projects the durable disposition of a previously received command.
     pub fn command_ack(
         &self,
         command_id: &CommandId,

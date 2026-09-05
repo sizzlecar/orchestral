@@ -35,6 +35,11 @@ pub struct ApiError {
 }
 
 impl ApiError {
+    /// The Host or proxy may have committed a submission before this failure.
+    pub fn retryable_submission(&self) -> bool {
+        matches!(self.status, 0 | 408 | 425 | 429 | 500..=599)
+    }
+
     fn transport(error: impl std::fmt::Display) -> Self {
         Self {
             message: error.to_string(),
@@ -580,19 +585,36 @@ impl ApiClient {
                                 code: "invalid_session_change".to_owned(),
                                 details: None,
                             })?;
+                        if change.sequence == 0
+                            && matches!(
+                                change.change,
+                                AgentSessionChangeKindView::RefreshRequired { .. }
+                            )
+                        {
+                            return Err(ApiError {
+                                message: "Host session stream restarted".to_owned(),
+                                status: 0,
+                                code: "session_sequence_reset".to_owned(),
+                                details: None,
+                            });
+                        }
                         match sequence_guard.observe(change.sequence) {
                             SessionSequenceDisposition::Apply => on_change(change).await?,
                             SessionSequenceDisposition::IgnoreDuplicate => {}
                             SessionSequenceDisposition::RefreshSnapshot => {
                                 on_change(AgentSessionChangeView {
-                                    connector_id: change.connector_id,
-                                    session_id: change.session_id,
+                                    connector_id: change.connector_id.clone(),
+                                    session_id: change.session_id.clone(),
                                     sequence: change.sequence,
                                     change: AgentSessionChangeKindView::RefreshRequired {
                                         reason: "browser_sequence_gap".to_owned(),
                                     },
                                 })
                                 .await?;
+                                // Preserve the event that exposed the gap too.
+                                // The snapshot and this live suffix reconcile
+                                // by sequence, regardless of response order.
+                                on_change(change).await?;
                             }
                         }
                     }
@@ -626,22 +648,19 @@ impl ApiClient {
         path: &str,
         credential: &ApiCredential,
     ) -> Result<T, ApiError> {
-        self.get_with_abort(path, credential, None).await
-    }
-
-    async fn get_with_abort<T: DeserializeOwned>(
-        &self,
-        path: &str,
-        credential: &ApiCredential,
-        signal: Option<&web_sys::AbortSignal>,
-    ) -> Result<T, ApiError> {
-        let request = Request::get(&format!("{API_BASE}{path}")).abort_signal(signal);
-        let response = self
-            .authenticated(request, credential)
-            .send()
-            .await
-            .map_err(ApiError::transport)?;
-        decode(response).await
+        let controller = web_sys::AbortController::new()
+            .map_err(|error| ApiError::transport(js_message(&error)))?;
+        let request =
+            Request::get(&format!("{API_BASE}{path}")).abort_signal(Some(&controller.signal()));
+        request_with_deadline(&controller, async {
+            let response = self
+                .authenticated(request, credential)
+                .send()
+                .await
+                .map_err(ApiError::transport)?;
+            decode(response).await
+        })
+        .await
     }
 
     async fn post<T: DeserializeOwned, B: Serialize + ?Sized>(
@@ -650,12 +669,21 @@ impl ApiClient {
         credential: &ApiCredential,
         body: &B,
     ) -> Result<T, ApiError> {
+        let controller = web_sys::AbortController::new()
+            .map_err(|error| ApiError::transport(js_message(&error)))?;
         let request = self
-            .authenticated(Request::post(&format!("{API_BASE}{path}")), credential)
+            .authenticated(
+                Request::post(&format!("{API_BASE}{path}"))
+                    .abort_signal(Some(&controller.signal())),
+                credential,
+            )
             .json(body)
             .map_err(ApiError::transport)?;
-        let response = request.send().await.map_err(ApiError::transport)?;
-        decode(response).await
+        request_with_deadline(&controller, async {
+            let response = request.send().await.map_err(ApiError::transport)?;
+            decode(response).await
+        })
+        .await
     }
 
     async fn post_public<T: DeserializeOwned, B: Serialize + ?Sized>(
@@ -768,4 +796,26 @@ fn js_message(value: &JsValue) -> String {
     value
         .as_string()
         .unwrap_or_else(|| "The live connection was interrupted".to_owned())
+}
+
+/// Bound the entire HTTP response, including its body. Mobile fetches can
+/// remain pending after suspend without emitting an online/offline event.
+async fn request_with_deadline<T>(
+    controller: &web_sys::AbortController,
+    request: impl Future<Output = Result<T, ApiError>>,
+) -> Result<T, ApiError> {
+    let deadline = gloo_timers::future::TimeoutFuture::new(30_000);
+    futures_util::pin_mut!(request, deadline);
+    match futures_util::future::select(request, deadline).await {
+        futures_util::future::Either::Left((result, _)) => result,
+        futures_util::future::Either::Right(_) => {
+            controller.abort();
+            Err(ApiError {
+                status: 0,
+                code: "request_timeout".to_owned(),
+                message: "请求超时，请稍后重试".to_owned(),
+                details: None,
+            })
+        }
+    }
 }

@@ -386,6 +386,17 @@ impl AgentController {
         command.verify_digest()?;
         let slot = self.run_slot(&command.run_id).await?;
         let mut entry = slot.entry.lock().await;
+        if entry
+            .reducer
+            .recorded_command(&command.command_id)
+            .is_some_and(|recorded| recorded != &command)
+        {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::DuplicateConflict,
+                "command_id was already used with a different immutable command",
+            )
+            .into());
+        }
         if let Ok(ack) = entry.reducer.command_ack(&command.command_id, true) {
             return Ok(ack);
         }
@@ -437,6 +448,37 @@ impl AgentController {
             },
         )?;
         self.command(command).await
+    }
+
+    /// Reads immutable command identity without recovering or attaching native
+    /// work. Session-level retries use this even after the target Run ends.
+    pub async fn recorded_command(
+        &self,
+        run_id: &RunId,
+        command_id: &CommandId,
+    ) -> Result<Option<AgentCommandEnvelope>, AgentControlError> {
+        if let Some(slot) = self.runs.read().await.get(run_id).cloned() {
+            return Ok(slot
+                .entry
+                .lock()
+                .await
+                .reducer
+                .recorded_command(command_id)
+                .cloned());
+        }
+        let Some(stored) = self.journal_store.load_run(run_id).await? else {
+            return Ok(None);
+        };
+        stored.validate_shape()?;
+        Ok(stored
+            .records
+            .into_iter()
+            .find_map(|record| match record.event.payload {
+                AgentEvent::CommandReceived { command } if &command.command_id == command_id => {
+                    Some(command)
+                }
+                _ => None,
+            }))
     }
 
     pub async fn command_ack(

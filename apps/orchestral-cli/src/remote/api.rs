@@ -1161,6 +1161,12 @@ async fn start_agent_run(
     // A retry of the same browser operation is a pure read. This also keeps a
     // response lost after start from being reinterpreted as a steer on retry.
     if agent.has_run(&run_id).await? {
+        if agent.inspect(&run_id).await?.execution.session_id != session_id {
+            return Err(ApiError::conflict(
+                "run_id_conflict",
+                "run_id belongs to another session",
+            ));
+        }
         if agent.initial_input(&run_id).await? != input {
             return Err(ApiError::conflict(
                 "run_id_conflict",
@@ -1198,6 +1204,71 @@ async fn start_agent_run(
                 run_id,
                 operation: "replayed",
                 command_id: None,
+                view,
+            }),
+        ));
+    }
+
+    // A session submission may have become a command on an earlier Run.
+    // Resolve that durable identity before consulting the current active Run;
+    // otherwise a retry after completion would execute the same input again.
+    let submission_command_id = CommandId::new(format!("agent-submit-{}", run_id.as_str()));
+    for entry in agent
+        .catalog_runs()
+        .await?
+        .into_iter()
+        .filter(|entry| entry.session_id == session_id)
+    {
+        let Some(recorded) = agent
+            .recorded_command(&entry.run_id, &submission_command_id)
+            .await?
+        else {
+            continue;
+        };
+        let expected = AgentCommandEnvelope::new_with_extensions(
+            submission_command_id.clone(),
+            entry.run_id.clone(),
+            None,
+            AgentCommand::Steer {
+                content: input.clone(),
+            },
+            history_extensions.clone(),
+        )?;
+        if recorded != expected {
+            return Err(ApiError::conflict(
+                "run_id_conflict",
+                "session submission identity was already used with different input or metadata",
+            ));
+        }
+        if !agent.can_control_run(&entry.run_id).await? {
+            return Err(ApiError::conflict(
+                "submission_contract_changed",
+                "this submission belongs to an earlier Agent contract and cannot be resubmitted",
+            ));
+        }
+        let ack = command_run(&agent, &entry.run_id, expected).await?;
+        if !matches!(
+            ack.state,
+            CommandAckState::Accepted { .. } | CommandAckState::Applied { .. }
+        ) {
+            return Err(ApiError::conflict(
+                "agent_session_command_rejected",
+                "the original session submission was rejected",
+            ));
+        }
+        let view = RemoteRunView::new(
+            &state,
+            Some(&connector_id),
+            agent.inspect(&entry.run_id).await?,
+            agent.initial_input(&entry.run_id).await?,
+        );
+        return Ok((
+            StatusCode::OK,
+            Json(StartAgentRunResponse {
+                connector_id,
+                run_id: entry.run_id,
+                operation: "steered",
+                command_id: Some(submission_command_id),
                 view,
             }),
         ));
@@ -3180,6 +3251,7 @@ mod tests {
 
     struct HoldingProvider {
         inner: Arc<dyn AgentProvider>,
+        finish: Arc<tokio::sync::Notify>,
     }
 
     struct UnrecoverableDisconnectProvider {
@@ -3342,11 +3414,32 @@ mod tests {
             &self,
             request: orchestral_core::agent_protocol::wire::AgentStartRequest,
         ) -> Result<AgentStart, AgentStartError> {
+            let run_id = request.run.spec.run_id.clone();
+            let finish = self.finish.clone();
             let started = self.inner.start(request).await?;
+            let terminal = stream::once(async move {
+                finish.notified().await;
+                Ok(AgentProviderStreamItem::Event(Box::new(AgentEventDraft {
+                    event_id: orchestral_core::agent_protocol::wire::AgentEventId::new(format!(
+                        "fixture-finished-{run_id}"
+                    )),
+                    run_id,
+                    causation_id: None,
+                    source_fingerprint: None,
+                    payload: AgentEvent::RunFailed {
+                        failure: orchestral_core::agent_protocol::wire::AgentFailure {
+                            code: "fixture_finished".to_owned(),
+                            message: "controlled fixture completed".to_owned(),
+                            retryable: false,
+                            details: Value::Null,
+                        },
+                    },
+                })))
+            });
             Ok(AgentStart {
                 execution: started.execution,
                 admission: started.admission,
-                stream: started.stream.take(1).chain(stream::pending()).boxed(),
+                stream: started.stream.take(1).chain(terminal).boxed(),
             })
         }
 
@@ -3805,6 +3898,12 @@ mod tests {
     }
 
     async fn holding_agent_app() -> (Router, String) {
+        let (app, token, _) = completable_agent_app().await;
+        (app, token)
+    }
+
+    async fn completable_agent_app() -> (Router, String, Arc<tokio::sync::Notify>) {
+        let finish = Arc::new(tokio::sync::Notify::new());
         let factory = ScriptedStatelessFactory::conformant().unwrap();
         let descriptor = factory.descriptor();
         let scenario = ProviderScenario::standard(&descriptor).unwrap();
@@ -3824,6 +3923,7 @@ mod tests {
         let external_factory = SessionfulRecoverFactory::new().unwrap();
         let external_scenario = ProviderScenario::standard(&external_factory.descriptor()).unwrap();
         let external_provider = Arc::new(HoldingProvider {
+            finish: finish.clone(),
             inner: external_factory.create(external_scenario, TestProbes::default()),
         });
         let agent_directory = Arc::new(AgentDirectory::new());
@@ -3845,6 +3945,7 @@ mod tests {
                 artifact_blob_store: None,
             }),
             claim.token,
+            finish,
         )
     }
 
@@ -5190,5 +5291,108 @@ mod tests {
         assert!(text.contains("event: durable"));
         assert!(!text.contains("id: 1\n"));
         assert!(!text.contains("id: 2\n"));
+    }
+
+    #[tokio::test]
+    async fn redirected_submission_retry_keeps_its_original_run_after_completion() {
+        let (app, token, finish) = completable_agent_app().await;
+        let submit = |id: &str, input: &str, session: &str| {
+            authorized(
+                "POST",
+                "/agent-runs",
+                &token,
+                json!({"connector_id": "fixture/local", "session_id": session, "run_id": id, "input": input}),
+            )
+        };
+        assert_eq!(
+            app.clone()
+                .oneshot(submit("first", "start", "fixture-session"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(submit("second", "follow up", "fixture-session"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(submit("second", "changed", "fixture-session"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(submit("first", "start", "other-session"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        finish.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let response = app
+                    .clone()
+                    .oneshot(authorized(
+                        "GET",
+                        "/runs/first?connector_id=fixture%2Flocal",
+                        &token,
+                        Value::Null,
+                    ))
+                    .await
+                    .unwrap();
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                let view: Value = serde_json::from_slice(&body).unwrap();
+                if view["state"]["state"] == "terminal" {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first Run should reach a terminal state");
+        // Create a newer Run before retrying the lost response.
+        assert_eq!(
+            app.clone()
+                .oneshot(submit("third", "new turn", "fixture-session"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        let retry = app
+            .clone()
+            .oneshot(submit("second", "follow up", "fixture-session"))
+            .await
+            .unwrap();
+        assert_eq!(retry.status(), StatusCode::OK);
+        let body = retry.into_body().collect().await.unwrap().to_bytes();
+        let response: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response["run_id"], "first");
+        assert_eq!(response["command_id"], "agent-submit-second");
+        let events = app
+            .oneshot(authorized(
+                "GET",
+                "/runs/third/events?connector_id=fixture%2Flocal&after=0",
+                &token,
+                Value::Null,
+            ))
+            .await
+            .unwrap();
+        let body = events.into_body().collect().await.unwrap().to_bytes();
+        let events: Value = serde_json::from_slice(&body).unwrap();
+        assert!(!events["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|record| record["event"]["payload"]["type"] == "command_received"));
     }
 }

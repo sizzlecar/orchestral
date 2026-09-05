@@ -80,6 +80,8 @@ pub struct SessionsState {
     /// Last canonically applied Host event sequence for each external Agent
     /// session, keyed by `SessionView::key()`.
     pub stream_cursors: BTreeMap<String, u64>,
+    /// Bounded live suffix used to rebase snapshots read concurrently with SSE.
+    pub recent_changes: BTreeMap<String, Vec<AgentSessionChangeView>>,
     pub error: Option<String>,
 }
 
@@ -315,7 +317,7 @@ impl RunState {
             .get("last_run_seq")
             .and_then(Value::as_u64)
             .unwrap_or_default();
-        if view_cursor < self.cursor {
+        if view_cursor < self.cursor.max(self.server_cursor) {
             return;
         }
         if let Some(updated_at) = view
@@ -422,7 +424,9 @@ impl RunState {
     /// connector may still be waiting in its native queue, so `RunStarted`
     /// remains the sole authority that advances this state to `running`.
     pub fn record_accepted_input(&mut self, input: String, now: f64) {
-        self.status = "accepted".to_owned();
+        if matches!(self.status.as_str(), "loading" | "submitting") {
+            self.status = "accepted".to_owned();
+        }
         self.started_at.get_or_insert(now);
         self.confirm_initial_input(input, Some(now as i64), None);
     }
@@ -510,6 +514,10 @@ impl RunState {
         now: f64,
         native_anchor_id: Option<String>,
     ) {
+        // The durable event can arrive before the HTTP acknowledgement.
+        if self.messages.iter().any(|message| message.id == id) {
+            return;
+        }
         let order = self.next_order();
         self.messages.push(Message {
             id,
@@ -560,6 +568,18 @@ impl RunState {
             return;
         }
 
+        // Replay still builds the transcript, but must not roll back control
+        // state already authenticated by a newer snapshot.
+        let ahead_view = self
+            .view
+            .as_ref()
+            .filter(|view| {
+                view.get("last_run_seq")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default()
+                    >= sequence
+            })
+            .cloned();
         self.cursor = sequence;
         self.server_cursor = self.server_cursor.max(sequence);
         self.updated_at_unix_ms = Some(self.updated_at_unix_ms.unwrap_or_default().max(now as i64));
@@ -747,6 +767,9 @@ impl RunState {
                 self.recovery = None;
             }
             _ => {}
+        }
+        if let Some(view) = ahead_view {
+            self.apply_view(view, now);
         }
     }
 
@@ -1041,6 +1064,7 @@ pub struct UiState {
     pub new_session_open: bool,
     pub session_actions_open: bool,
     pub composer_busy: bool,
+    pub outbox_flushing: bool,
     /// The reader deliberately left the live edge. New events remain locally
     /// merged but do not steal their scroll position; the UI exposes an
     /// explicit jump-to-latest control instead.
@@ -1050,6 +1074,7 @@ pub struct UiState {
     pub loading_session: Option<String>,
     /// Pending request actions in flight, keyed as `run_id:request_id`.
     pub resolving_requests: BTreeSet<String>,
+    pub request_errors: BTreeMap<String, String>,
     pub installing: bool,
     pub install_available: bool,
     pub notice: Option<Notice>,
@@ -1081,6 +1106,7 @@ impl UiState {
     pub fn set_request_resolving(&mut self, run_id: &str, request_id: &str, resolving: bool) {
         let key = Self::request_action_key(run_id, request_id);
         if resolving {
+            self.request_errors.remove(&key);
             self.resolving_requests.insert(key);
         } else {
             self.resolving_requests.remove(&key);
@@ -1165,6 +1191,64 @@ impl AppState {
             .find(|session| session.key() == selected)
     }
 
+    /// Applies HTTP acceptance for both immediate submission and durable
+    /// Outbox replay. A provisional Run may have been redirected to a command
+    /// on an existing Run by the Host's session coordinator.
+    pub fn accept_submission(
+        &mut self,
+        session_key: &str,
+        provisional_id: &str,
+        response: &Value,
+        input: String,
+        native_anchor_id: Option<String>,
+        now: f64,
+    ) -> Option<String> {
+        let actual_id = response
+            .get("run_id")
+            .and_then(value_id)
+            .unwrap_or_else(|| provisional_id.to_owned());
+        let session = self
+            .sessions
+            .items
+            .iter_mut()
+            .find(|session| session.key() == session_key)?;
+        if actual_id != provisional_id {
+            session.run_ids.retain(|id| id != provisional_id);
+            self.runs.remove(provisional_id);
+            self.run_order.retain(|id| id != provisional_id);
+        }
+        if !session.run_ids.contains(&actual_id) {
+            session.run_ids.push(actual_id.clone());
+        }
+        session.updated_at_unix_ms = session.updated_at_unix_ms.max(now as i64);
+        let session_id = session.id.clone();
+        let connector_id = session.connector_id.clone();
+        let run = self.ensure_run_source(&actual_id, Some(session_id), connector_id);
+        match response
+            .get("operation")
+            .and_then(Value::as_str)
+            .unwrap_or("started")
+        {
+            "steered" => {
+                if let Some(command_id) = response.get("command_id").and_then(value_id) {
+                    run.optimistic_steer(
+                        format!("steer-{command_id}"),
+                        input,
+                        now,
+                        native_anchor_id,
+                    );
+                }
+            }
+            "replayed" => {}
+            _ => run.record_accepted_input(input, now),
+        }
+        if let Some(view) = response.get("view") {
+            run.apply_view(view.clone(), now);
+        }
+        self.reconcile_request_actions(&actual_id);
+        Some(actual_id)
+    }
+
     /// Activates a session that the Host has just created. A new Agent
     /// session has no persisted transcript yet, so presenting it must not
     /// inherit an older selection's loading state or imply that history is
@@ -1218,6 +1302,7 @@ impl AppState {
         let connector_id = detail.summary.connector_id.clone();
         let session_id = detail.summary.session_id.clone();
         let session_key = format!("{connector_id}\0{session_id}");
+        let mut replay = Vec::new();
         if let Some(cursor) = detail.stream_cursor {
             // A full reconciliation may race an incremental SSE mutation. An
             // older snapshot must never replace a newer browser projection or
@@ -1229,9 +1314,29 @@ impl AppState {
                 .get(&session_key)
                 .is_some_and(|current| *current > cursor)
             {
-                return false;
+                replay = self
+                    .sessions
+                    .recent_changes
+                    .get(&session_key)
+                    .into_iter()
+                    .flatten()
+                    .filter(|change| change.sequence > cursor)
+                    .cloned()
+                    .collect();
+                let current = self.sessions.stream_cursors[&session_key];
+                if replay.first().map(|change| change.sequence) != cursor.checked_add(1)
+                    || replay.last().map(|change| change.sequence) != Some(current)
+                    || replay
+                        .windows(2)
+                        .any(|pair| pair[0].sequence.checked_add(1) != Some(pair[1].sequence))
+                {
+                    return false;
+                }
             }
-            self.sessions.stream_cursors.insert(session_key, cursor);
+            self.sessions
+                .stream_cursors
+                .insert(session_key.clone(), cursor);
+            self.sessions.recent_changes.remove(&session_key);
         }
         let timeline_before = self.agent_session_timeline_snapshot(&connector_id, &session_id);
         let run_id = format!("agent-history:{connector_id}:{session_id}");
@@ -1329,6 +1434,9 @@ impl AppState {
                 session.state = Some(waiting_state.to_owned());
             }
         }
+        for change in replay {
+            self.apply_agent_session_change(change, projection_time as i64);
+        }
         timeline_before
             != self.agent_session_timeline_snapshot(&connector_id, &detail.summary.session_id)
     }
@@ -1341,6 +1449,27 @@ impl AppState {
         change: AgentSessionChangeView,
         observed_at_unix_ms: i64,
     ) -> bool {
+        if matches!(
+            change.change,
+            AgentSessionChangeKindView::RefreshRequired { .. }
+        ) {
+            return false;
+        }
+        let session_key = format!("{}\0{}", change.connector_id, change.session_id);
+        if change.sequence > 0
+            && self
+                .sessions
+                .stream_cursors
+                .get(&session_key)
+                .is_some_and(|cursor| change.sequence <= *cursor)
+        {
+            return false;
+        }
+        let recent = self.sessions.recent_changes.entry(session_key).or_default();
+        recent.push(change.clone());
+        if recent.len() > 256 {
+            recent.remove(0);
+        }
         let connector_id = change.connector_id;
         let session_id = change.session_id;
         let sequence = change.sequence;
@@ -1561,21 +1690,36 @@ impl AppState {
     }
 
     pub fn pending_run(&self) -> Option<&RunState> {
-        if let Some(active) = self
-            .active_run()
-            .filter(|run| run.status != "unknown" && !run.pending.is_empty())
-        {
-            return Some(active);
-        }
-        let session = self.selected_session()?;
-        if let Some(history) = session
-            .history_run_id()
-            .and_then(|run_id| self.runs.get(&run_id))
-            .filter(|run| !run.pending.is_empty())
-        {
-            return Some(history);
-        }
-        self.current_run()
+        self.pending_requests()
+            .first()
+            .map(|(run, _)| *run)
+            .or_else(|| self.current_run())
+    }
+
+    /// Union all pending requests in the selected session. Prefer a Host Run
+    /// command target when the native subscription mirrors the same request.
+    pub fn pending_requests(&self) -> Vec<(&RunState, &Value)> {
+        let Some(session) = self.selected_session() else {
+            return Vec::new();
+        };
+        let history_id = session.history_run_id();
+        let mut seen = BTreeSet::new();
+        session
+            .run_ids
+            .iter()
+            .rev()
+            .filter(|id| Some(*id) != history_id.as_ref())
+            .filter_map(|id| self.runs.get(id))
+            .filter(|run| !is_terminal(&run.status))
+            .chain(history_id.as_ref().and_then(|id| self.runs.get(id)))
+            .flat_map(|run| run.pending.iter().map(move |request| (run, request)))
+            .filter(|(_, request)| {
+                request
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| seen.insert(id))
+            })
+            .collect()
     }
 
     pub fn recoverable_run(&self) -> Option<&RunState> {
@@ -1601,6 +1745,9 @@ impl AppState {
         self.ui
             .resolving_requests
             .retain(|key| !key.starts_with(&prefix) || pending.contains(key));
+        self.ui
+            .request_errors
+            .retain(|key, _| !key.starts_with(&prefix) || pending.contains(key));
     }
 
     pub fn remove_pending_request(&mut self, run_id: &str, request_id: &str) -> bool {
@@ -1615,6 +1762,9 @@ impl AppState {
             run.pending.len() != before
         });
         self.ui.set_request_resolving(run_id, request_id, false);
+        self.ui
+            .request_errors
+            .remove(&UiState::request_action_key(run_id, request_id));
         removed
     }
 
@@ -1749,57 +1899,34 @@ fn project_latest_agent_history(run: &mut RunState, turns: Vec<crate::model::Age
         return;
     }
 
-    // Once pagination starts, older cached pages stay present. Refresh the
-    // overlapping live edge in place and append only genuinely new ids.
-    let existing_orders = run
+    // The incoming page owns the order of its complete suffix. Preserve the
+    // cached prefix before its first overlap, then rebuild the suffix. Merely
+    // assigning new items the next order placed missing middle items after
+    // their replies whenever SSE and pagination arrived in different orders.
+    let mut existing = run
         .messages
-        .iter()
-        .map(|message| (message.id.clone(), message.order))
-        .chain(
-            run.activities
-                .iter()
-                .map(|activity| (activity.id.clone(), activity.order)),
-        )
-        .collect::<BTreeMap<_, _>>();
-    let existing_client_orders = run
-        .messages
-        .iter()
-        .filter_map(|message| {
-            message
-                .client_id
-                .as_ref()
-                .map(|client_id| (client_id.clone(), message.order))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let replaced_ids = incoming_ids.clone();
-    run.messages.retain(|message| {
-        !replaced_ids.contains(&message.id)
-            && message
-                .client_id
-                .as_ref()
-                .is_none_or(|client_id| !incoming_client_ids.contains(client_id))
+        .drain(..)
+        .map(AgentHistoryItem::Message)
+        .chain(run.activities.drain(..).map(AgentHistoryItem::Activity))
+        .collect::<Vec<_>>();
+    existing.sort_by_key(|item| match item {
+        AgentHistoryItem::Message(message) => message.order,
+        AgentHistoryItem::Activity(activity) => activity.order,
     });
-    run.activities
-        .retain(|activity| !replaced_ids.contains(&activity.id));
-    run.presentation_cursor = run
-        .messages
+    let overlap = existing
         .iter()
-        .map(|message| message.order)
-        .chain(run.activities.iter().map(|activity| activity.order))
-        .max()
-        .unwrap_or_default();
-
-    for item in &mut incoming {
-        if let Some(order) = existing_orders.get(item.id()).or_else(|| {
-            item.client_id()
-                .and_then(|client_id| existing_client_orders.get(client_id))
-        }) {
-            item.set_order(*order);
-        } else {
-            item.set_order(run.next_order());
-        }
-    }
-    for item in incoming {
+        .position(|item| {
+            incoming_ids.contains(item.id())
+                || item
+                    .client_id()
+                    .is_some_and(|id| incoming_client_ids.contains(id))
+        })
+        .unwrap_or(existing.len());
+    existing.truncate(overlap);
+    existing.extend(incoming);
+    run.presentation_cursor = 0;
+    for mut item in existing {
+        item.set_order(run.next_order());
         match item {
             AgentHistoryItem::Message(message) => run.messages.push(message),
             AgentHistoryItem::Activity(activity) => run.activities.push(activity),
@@ -4967,6 +5094,7 @@ mod tests {
         assert_eq!(state.selected_timeline_content(), stable_timeline);
 
         let mut edited = user_change;
+        edited.sequence = 2;
         if let AgentSessionChangeKindView::ActivityUpsert { activity, .. } = &mut edited.change {
             activity.content = content("hello edited").as_array().unwrap().clone();
         }
@@ -4977,7 +5105,7 @@ mod tests {
         let assistant_change: AgentSessionChangeView = serde_json::from_value(serde_json::json!({
             "connector_id": "codex/local",
             "session_id": "thread-live",
-            "sequence": 2,
+            "sequence": 3,
             "change": {
                 "type": "activity_upsert",
                 "turn_id": "turn-1",
@@ -4997,7 +5125,7 @@ mod tests {
         let completed_change: AgentSessionChangeView = serde_json::from_value(serde_json::json!({
             "connector_id": "codex/local",
             "session_id": "thread-live",
-            "sequence": 3,
+            "sequence": 4,
             "change": {
                 "type": "turn_status",
                 "turn_id": "turn-1",
@@ -5312,5 +5440,156 @@ mod tests {
         assert_eq!(ui.notice.as_ref().map(|notice| notice.id), Some(2));
         assert!(ui.dismiss_notice(2));
         assert!(ui.notice.is_none());
+    }
+
+    #[test]
+    fn newer_run_snapshot_survives_stale_reads_and_older_journal_replay() {
+        let mut run = RunState::new("run-sync".to_owned(), None);
+        let approval = serde_json::json!({"request_id": "approve", "blocking": true,
+            "payload": {"type": "approval", "reason": "write"}});
+        run.apply_view(
+            serde_json::json!({"last_run_seq": 10, "state": {"state": "waiting"},
+            "pending_requests": [approval.clone()]}),
+            10.0,
+        );
+        run.apply_view(
+            serde_json::json!({"last_run_seq": 5, "state": {"state": "running"},
+            "pending_requests": []}),
+            11.0,
+        );
+        assert_eq!(run.status, "waiting");
+        assert_eq!(run.pending, vec![approval.clone()]);
+        run.project_durable(
+            &record(1, "started", serde_json::json!({"type": "run_started"})),
+            12.0,
+        );
+        assert_eq!(
+            run.cursor, 1,
+            "historical replay still advances the transcript"
+        );
+        assert_eq!(run.status, "waiting");
+        assert_eq!(run.pending, vec![approval]);
+        run.project_durable(
+            &record(
+                2,
+                "closed",
+                serde_json::json!({"type": "request_closed", "request_id": "approve"}),
+            ),
+            13.0,
+        );
+        assert_eq!(
+            run.pending.len(),
+            1,
+            "old close cannot hide a newer pending snapshot"
+        );
+    }
+
+    #[test]
+    fn steer_http_ack_after_durable_event_does_not_duplicate_the_message() {
+        let mut run = RunState::new("run-sync".to_owned(), None);
+        run.project_durable(&record(1, "command", serde_json::json!({"type": "command_received",
+            "command": {"command_id": "submit-1", "payload": {"type": "steer", "content": content("continue")}}
+        })), 1.0);
+        let before = run.messages.clone();
+        run.optimistic_steer(
+            "steer-submit-1".to_owned(),
+            "continue".to_owned(),
+            2.0,
+            None,
+        );
+        assert_eq!(run.messages, before);
+    }
+
+    #[test]
+    fn pending_panel_unions_native_and_controlled_requests_by_identity() {
+        let mut state = AppState::new(true);
+        state.project_agent_session(agent_detail_at(1, "message", "hello"));
+        let session = &mut state.sessions.items[0];
+        state.sessions.selected_id = Some(session.key());
+        session.run_ids.push("controlled".to_owned());
+        let duplicate = serde_json::json!({"request_id": "same", "payload": {"type": "approval"}});
+        let native = serde_json::json!({"request_id": "child-input", "payload": {"type": "input"}});
+        state
+            .runs
+            .get_mut("agent-history:fixture/local:thread-1")
+            .unwrap()
+            .pending = vec![duplicate.clone(), native];
+        let run = state.ensure_run_source(
+            "controlled",
+            Some("thread-1".to_owned()),
+            Some("fixture/local".to_owned()),
+        );
+        run.status = "waiting".to_owned();
+        run.pending = vec![duplicate];
+        let requests = state.pending_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].0.id, "controlled");
+        assert_eq!(requests[1].1["request_id"], "child-input");
+    }
+
+    #[test]
+    fn snapshot_rebases_live_suffix_without_losing_a_pending_request() {
+        let mut state = AppState::new(true);
+        state.project_agent_session(agent_detail_at(10, "old", "old"));
+        let change: AgentSessionChangeView = serde_json::from_value(serde_json::json!({
+            "connector_id": "fixture/local", "session_id": "thread-1", "sequence": 11,
+            "change": {"type": "activity_upsert", "turn_id": "turn-1", "turn_status": "active",
+                "activity": {"activity_id": "live", "kind": "agent_message", "status": "completed", "content": content("live")}}
+        })).unwrap();
+        state.apply_agent_session_change(change.clone(), 11);
+        let mut snapshot = agent_detail_at(10, "old", "old");
+        snapshot.pending_requests =
+            vec![serde_json::json!({"request_id": "approval", "payload": {"type": "approval"}})];
+        state.project_agent_session(snapshot);
+        let history = &state.runs["agent-history:fixture/local:thread-1"];
+        assert_eq!(history.pending.len(), 1);
+        assert_eq!(
+            history
+                .messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            ["old", "live"]
+        );
+        assert_eq!(state.sessions.stream_cursors["fixture/local\0thread-1"], 11);
+        let before = state.clone();
+        state.apply_agent_session_change(change, 12);
+        assert_eq!(
+            state, before,
+            "replayed SSE events cannot mutate the live edge again"
+        );
+    }
+
+    #[test]
+    fn paginated_snapshot_inserts_missing_middle_items_in_native_order() {
+        let mut state = AppState::new(true);
+        let mut first = agent_detail_at(1, "a", "A");
+        let c = agent_detail_at(1, "c", "C")
+            .turns
+            .remove(0)
+            .activities
+            .remove(0);
+        first.turns[0].activities.push(c.clone());
+        state.project_agent_session(first);
+        state.prepend_agent_session_history(agent_detail_at(0, "prefix", "older"));
+        let mut latest = agent_detail_at(2, "a", "A");
+        latest.turns[0].activities.push(
+            agent_detail_at(2, "b", "B")
+                .turns
+                .remove(0)
+                .activities
+                .remove(0),
+        );
+        latest.turns[0].activities.push(c);
+        state.project_agent_session(latest);
+        let history = &state.runs["agent-history:fixture/local:thread-1"];
+        let messages = timeline_for_run(history)
+            .into_iter()
+            .filter_map(|item| match item {
+                TimelineItem::Message(message) => Some(message.text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(messages, ["older", "A", "B", "C"]);
     }
 }

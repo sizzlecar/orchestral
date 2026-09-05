@@ -7,29 +7,36 @@ use crate::state::{content_text, RunState};
 #[component]
 pub fn PendingPanel() -> Element {
     let controller = consume_context::<AppController>();
-    let (run, can_resolve) = {
+    let requests = {
         let state = controller.state.read();
-        let run = state.pending_run().cloned();
-        let can_resolve = run.as_ref().is_none_or(|run| {
-            !run.id.starts_with("agent-history:")
-                || state
-                    .connectors
-                    .items
-                    .iter()
-                    .find(|connector| {
-                        run.connector_id.as_deref() == Some(connector.connector_id.as_str())
-                    })
-                    .is_some_and(|connector| connector.capabilities.resolve_requests)
-        });
-        (run, can_resolve)
+        state
+            .pending_requests()
+            .into_iter()
+            .map(|(run, request)| {
+                let can_resolve = !run.id.starts_with("agent-history:")
+                    || state
+                        .connectors
+                        .items
+                        .iter()
+                        .find(|connector| {
+                            run.connector_id.as_deref() == Some(connector.connector_id.as_str())
+                        })
+                        .is_some_and(|connector| connector.capabilities.resolve_requests);
+                (run.clone(), request.clone(), can_resolve)
+            })
+            .collect::<Vec<_>>()
     };
-    let Some(run) = run.filter(|run| !run.pending.is_empty()) else {
+    if requests.is_empty() {
         return rsx! {};
-    };
+    }
+    let count = requests.len();
     rsx! {
-        section { class: "pending-panel", aria_label: "待处理请求", aria_live: "assertive",
-            for request in run.pending.clone() {
-                PendingCard { key: "{request_id(&request)}", run: run.clone(), request, can_resolve }
+        section { class: "pending-panel", aria_label: "待处理请求", aria_live: "polite",
+            div { class: "pending-panel__header", role: "status", "需要你处理 · {count} 项" }
+            div { class: "pending-panel__body", tabindex: "0", aria_label: "待处理请求列表",
+                for (run, request, can_resolve) in requests {
+                    PendingCard { key: "{run.id}:{request_id(&request)}", run, request, can_resolve }
+                }
             }
         }
     }
@@ -38,6 +45,7 @@ pub fn PendingPanel() -> Element {
 #[component]
 fn PendingCard(run: RunState, request: Value, can_resolve: bool) -> Element {
     let controller = consume_context::<AppController>();
+    let mut response = use_signal(String::new);
     let payload = request.get("payload").cloned().unwrap_or(Value::Null);
     let kind = payload
         .get("type")
@@ -50,6 +58,13 @@ fn PendingCard(run: RunState, request: Value, can_resolve: bool) -> Element {
         .read()
         .ui
         .request_is_resolving(&run_id, &request_id);
+    let request_error = controller
+        .state
+        .read()
+        .ui
+        .request_errors
+        .get(&format!("{run_id}:{request_id}"))
+        .cloned();
     if !can_resolve {
         return rsx! {
             article { class: "pending-card",
@@ -61,12 +76,14 @@ fn PendingCard(run: RunState, request: Value, can_resolve: bool) -> Element {
     }
     match kind {
         "input" => {
-            let mut response = use_signal(String::new);
             let prompt = request_prompt(&request);
             let submit_run = run_id.clone();
             let submit_request = request_id.clone();
             rsx! {
                 article { class: "pending-card", "data-request-id": request_id, "data-state": if resolving { "resolving" } else { "pending" },
+                    if let Some(error) = request_error.clone() {
+                        p { class: "pending-card__error", role: "alert", "{error} · 可以重试" }
+                    }
                     form {
                         class: "pending-card__form",
                         onsubmit: move |event| {
@@ -92,7 +109,7 @@ fn PendingCard(run: RunState, request: Value, can_resolve: bool) -> Element {
                             value: response,
                             oninput: move |event| response.set(event.value())
                         }
-                        button { class: "pending-card__primary", r#type: "submit", disabled: resolving,
+                        button { class: "pending-card__primary", r#type: "submit", disabled: resolving || response.read().trim().is_empty(),
                             if resolving { "处理中…" } else { "继续" }
                         }
                     }
@@ -122,7 +139,7 @@ fn PendingCard(run: RunState, request: Value, can_resolve: bool) -> Element {
                     }
                     if !scopes.is_empty() {
                         div { class: "pending-card__scope-row", aria_label: "请求的权限范围",
-                            for scope in scopes.into_iter().take(4) {
+                            for scope in scopes {
                                 span { class: "pending-card__scope-chip", "{approval_scope_label(scope.as_str().unwrap_or_default())}" }
                             }
                         }
@@ -134,6 +151,9 @@ fn PendingCard(run: RunState, request: Value, can_resolve: bool) -> Element {
                             span { class: "pending-card__details-chevron", aria_hidden: "true" }
                         }
                         pre { class: "pending-card__operation", tabindex: "0", "{operation}" }
+                    }
+                    if let Some(error) = request_error.clone() {
+                        p { class: "pending-card__error", role: "alert", "{error} · 可以重试" }
                     }
                     div { class: "pending-card__actions",
                         ApprovalButton {

@@ -198,6 +198,14 @@
         "command_id": {
           "$ref": "#/$defs/CommandId"
         },
+        "extensions": {
+          "description": "Digest-bound Host metadata. Concrete Provider wire details do not\nbelong here; cross-cutting session/control semantics use namespaced\nextensions instead.",
+          "type": "object",
+          "additionalProperties": false,
+          "patternProperties": {
+            "^[^/][^/]*/[\\s\\S]+$": true
+          }
+        },
         "payload": {
           "$ref": "#/$defs/AgentCommand"
         },

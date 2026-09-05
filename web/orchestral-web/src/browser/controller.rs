@@ -297,17 +297,34 @@ impl AppController {
     }
 
     async fn flush_outbox(mut self) {
-        if !platform::is_online() {
+        if self.state.read().ui.outbox_flushing || self.state.read().ui.composer_busy {
             return;
         }
+        self.state.write().ui.outbox_flushing = true;
+        while platform::is_online()
+            && platform::is_document_visible()
+            && self.token.read().is_some()
+        {
+            if !self.flush_outbox_pass().await {
+                break;
+            }
+            TimeoutFuture::new(3_000).await;
+        }
+        self.state.write().ui.outbox_flushing = false;
+    }
+
+    async fn flush_outbox_pass(mut self) -> bool {
+        if !platform::is_online() {
+            return false;
+        }
         let Some(token) = self.token.read().clone() else {
-            return;
+            return false;
         };
         let entries = match storage::load_outbox().await {
             Ok(entries) => entries,
             Err(error) => {
                 self.notice(&format!("无法读取本地 Outbox：{error}"), "warning");
-                return;
+                return false;
             }
         };
         let mut delivered = false;
@@ -366,6 +383,21 @@ impl AppController {
                             continue;
                         }
                     }
+                    if let OutboxOperation::Start { run_id } = &entry.operation {
+                        let session_key = entry
+                            .connector_id
+                            .as_ref()
+                            .map(|connector| format!("{connector}\0{}", entry.session_id))
+                            .unwrap_or_else(|| entry.session_id.clone());
+                        self.state.write().accept_submission(
+                            &session_key,
+                            run_id,
+                            &response,
+                            optimistic_artifact_message(&entry.input, &entry.attachments),
+                            entry.native_anchor_id.clone(),
+                            platform::now(),
+                        );
+                    }
                     match storage::delete_outbox(&entry.id).await {
                         Ok(()) => delivered = true,
                         Err(error) => self.notice(
@@ -376,12 +408,12 @@ impl AppController {
                 }
                 Err(error) if error.status == 401 => {
                     self.clear_auth(Some(error.message)).await;
-                    return;
+                    return false;
                 }
-                Err(error) if error.status == 0 => {
+                Err(error) if error.retryable_submission() => {
                     let mut state = self.state.write();
-                    state.connection.error = Some("Outbox 等待网络恢复后重试".to_owned());
-                    return;
+                    state.connection.error = Some("消息已保存，正在确认发送状态".to_owned());
+                    return true;
                 }
                 Err(error) => {
                     // A definitive HTTP rejection cannot become successful by
@@ -389,6 +421,15 @@ impl AppController {
                     // the user's original composer draft in the immediate
                     // path, and retire this failed durable operation.
                     let _ = storage::delete_outbox(&entry.id).await;
+                    if let OutboxOperation::Start { run_id } = &entry.operation {
+                        let mut state = self.state.write();
+                        let run = state.ensure_run_source(
+                            run_id,
+                            Some(entry.session_id.clone()),
+                            entry.connector_id.clone(),
+                        );
+                        run.reject_optimistic_start(presented_api_error(&error), platform::now());
+                    }
                     self.notice(&presented_api_error(&error), "error");
                 }
             }
@@ -396,6 +437,7 @@ impl AppController {
         if delivered {
             self.refresh_sessions(true).await;
         }
+        false
     }
 
     pub async fn refresh_devices(mut self) {
@@ -536,12 +578,14 @@ impl AppController {
                 {
                     let mut state = self.state.write();
                     let stream_cursors = std::mem::take(&mut state.sessions.stream_cursors);
+                    let recent_changes = std::mem::take(&mut state.sessions.recent_changes);
                     state.sessions = SessionsState {
                         status: LoadStatus::Ready,
                         items: sessions,
                         selected_id: selected_id.clone(),
                         connector_pages,
                         stream_cursors,
+                        recent_changes,
                         error: None,
                     };
                 }
@@ -834,8 +878,16 @@ impl AppController {
                 }
             }
         }
-        let run_ids = session
-            .run_ids
+        let current_run_ids = self
+            .state
+            .read()
+            .sessions
+            .items
+            .iter()
+            .find(|item| item.key() == session_key)
+            .map(|item| item.run_ids.clone())
+            .unwrap_or_default();
+        let run_ids = current_run_ids
             .iter()
             .filter(|run_id| !run_id.starts_with("agent-history:"))
             .filter(|run_id| {
@@ -843,7 +895,7 @@ impl AppController {
                     .read()
                     .runs
                     .get(*run_id)
-                    .is_none_or(|run| run.view.is_none() || !is_terminal(&run.status))
+                    .is_none_or(|run| run.view.is_none() || run.cursor < run.server_cursor)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -1263,7 +1315,10 @@ impl AppController {
     /// case the optimistic message stays visible and the draft may clear.
     pub async fn submit(mut self, text: String, attachments: Vec<UploadedArtifact>) -> bool {
         let input = text.trim().to_owned();
-        if (input.is_empty() && attachments.is_empty()) || self.state.read().ui.composer_busy {
+        if (input.is_empty() && attachments.is_empty())
+            || self.state.read().ui.composer_busy
+            || self.state.read().ui.outbox_flushing
+        {
             return false;
         }
         let display_input = optimistic_artifact_message(&input, &attachments);
@@ -1297,7 +1352,7 @@ impl AppController {
         let native_anchor_id = self.state.read().selected_native_tail_id();
 
         let active_run_id = { self.state.read().active_run().map(|run| run.id.clone()) };
-        if let Some(run_id) = active_run_id {
+        if let Some(run_id) = active_run_id.filter(|_| session.connector_id.is_none()) {
             let command_id = match platform::new_uuid() {
                 Ok(command_id) => command_id,
                 Err(error) => {
@@ -1387,7 +1442,7 @@ impl AppController {
                     // have accepted this exact command id. Keep that local
                     // message for later reconciliation, while definitive
                     // rejections remove it immediately.
-                    let ambiguous = error.status == 0;
+                    let ambiguous = error.retryable_submission();
                     if !ambiguous {
                         if let Some(run) = self.state.write().runs.get_mut(&run_id) {
                             run.messages
@@ -1400,6 +1455,9 @@ impl AppController {
                 }
             };
             self.set_busy(false);
+            spawn(async move {
+                self.flush_outbox().await;
+            });
             return accepted;
         }
 
@@ -1474,53 +1532,18 @@ impl AppController {
         };
         let accepted = match start {
             Ok(response) => {
-                let actual_run_id = response
-                    .get("run_id")
-                    .and_then(value_as_id)
-                    .unwrap_or_else(|| run_id.clone());
-                let operation = response
-                    .get("operation")
-                    .and_then(Value::as_str)
-                    .unwrap_or("started");
-                let command_id = response.get("command_id").and_then(value_as_id);
-                if actual_run_id != run_id {
-                    let mut state = self.state.write();
-                    // Another tab may have won the session operation and the
-                    // Host atomically converted this stale "start" into a
-                    // steer on the existing Run. Never replace that Run with
-                    // this tab's provisional local projection.
-                    state.runs.remove(&run_id);
-                    state.run_order.retain(|item| item != &run_id);
-                }
-                let mut updated = session.clone();
-                updated.updated_at_unix_ms = platform::now() as i64;
-                if !updated.run_ids.iter().any(|id| id == &actual_run_id) {
-                    updated.run_ids.push(actual_run_id.clone());
-                }
-                let still_selected = self.state.read().sessions.selected_id.as_deref()
-                    == Some(operation_session_key.as_str());
-                self.upsert_session(updated, still_selected);
-                {
-                    let mut state = self.state.write();
-                    let run = state.ensure_run_source(
-                        &actual_run_id,
-                        Some(session.id.clone()),
-                        session.connector_id.clone(),
-                    );
-                    match operation {
-                        "steered" => run.optimistic_steer(
-                            format!("steer-{}", command_id.as_deref().unwrap_or(run_id.as_str())),
-                            display_input,
-                            platform::now(),
-                            native_anchor_id,
-                        ),
-                        "replayed" => {}
-                        _ => run.record_accepted_input(display_input, platform::now()),
-                    }
-                    if let Some(view) = response.get("view") {
-                        run.apply_view(view.clone(), platform::now());
-                    }
-                }
+                let actual_run_id = self
+                    .state
+                    .write()
+                    .accept_submission(
+                        &operation_session_key,
+                        &run_id,
+                        &response,
+                        display_input,
+                        native_anchor_id,
+                        platform::now(),
+                    )
+                    .unwrap_or(run_id.clone());
                 // The Host acknowledgement is the composer commit point.
                 // Snapshot reconciliation, transport replacement and Outbox
                 // cleanup are follow-up work and must not keep accepted text
@@ -1544,7 +1567,7 @@ impl AppController {
                 true
             }
             Err(error) => {
-                let ambiguous = error.status == 0;
+                let ambiguous = error.retryable_submission();
                 let presented = presented_api_error(&error);
                 if ambiguous {
                     self.notice(
@@ -1571,6 +1594,9 @@ impl AppController {
             }
         };
         self.set_busy(false);
+        spawn(async move {
+            self.flush_outbox().await;
+        });
         accepted
     }
 
@@ -1659,6 +1685,11 @@ impl AppController {
                         .write()
                         .ui
                         .set_request_resolving(&run_id, &request_id, false);
+                    self.state
+                        .write()
+                        .ui
+                        .request_errors
+                        .insert(format!("{run_id}:{request_id}"), error.message.clone());
                     self.notice(&error.message, "error");
                 } else {
                     self.refresh_run(&run_id).await;
@@ -1686,6 +1717,11 @@ impl AppController {
                     .write()
                     .ui
                     .set_request_resolving(&run_id, &request_id, false);
+                self.state
+                    .write()
+                    .ui
+                    .request_errors
+                    .insert(format!("{run_id}:{request_id}"), error.message.clone());
                 self.handle_api_error(error).await;
             }
         }
@@ -1744,6 +1780,11 @@ impl AppController {
                         .write()
                         .ui
                         .set_request_resolving(&run_id, &request_id, false);
+                    self.state
+                        .write()
+                        .ui
+                        .request_errors
+                        .insert(format!("{run_id}:{request_id}"), error.message.clone());
                     self.notice(&error.message, "error");
                 } else {
                     self.refresh_run(&run_id).await;
@@ -1771,6 +1812,11 @@ impl AppController {
                     .write()
                     .ui
                     .set_request_resolving(&run_id, &request_id, false);
+                self.state
+                    .write()
+                    .ui
+                    .request_errors
+                    .insert(format!("{run_id}:{request_id}"), error.message.clone());
                 self.handle_api_error(error).await;
             }
         }
@@ -1947,6 +1993,23 @@ impl AppController {
                 return;
             }
             match result {
+                Err(error) if error.code == "session_sequence_reset" => {
+                    // Cancel old reconciliation workers as well as the SSE
+                    // feed before accepting snapshots from a new Host epoch.
+                    self.stop_agent_session_observer();
+                    self.state
+                        .write()
+                        .sessions
+                        .stream_cursors
+                        .remove(&target.session_key);
+                    self.state
+                        .write()
+                        .sessions
+                        .recent_changes
+                        .remove(&target.session_key);
+                    self.load_session(target.session_key).await;
+                    return;
+                }
                 Err(error) if error.status == 501 => {
                     self.follow_agent_session_polling_observer(
                         target,
@@ -2443,7 +2506,7 @@ impl AppController {
                         state.connection.last_connected_at = Some(platform::now());
                         let run = state.ensure_run(run_id, None);
                         run.project_durable(&record, platform::now());
-                        let terminal = is_terminal(&run.status);
+                        let terminal = is_terminal(&run.status) && run.cursor >= run.server_cursor;
                         resolve_recovery = run.status == "unknown" && !run.recovery_is_manual();
                         state.reconcile_request_actions(run_id);
                         terminal
@@ -2568,6 +2631,18 @@ impl AppController {
             spawn(async move { refresh.load_workspace().await });
         }) {
             listeners.push(listener);
+        }
+        for event_name in ["pageshow", "visibilitychange"] {
+            if let Ok(listener) = platform::add_window_listener(event_name, move |_| {
+                if platform::is_document_visible() && platform::is_online() {
+                    self.resume_live_transport_for_selection(0);
+                    spawn(async move {
+                        self.flush_outbox().await;
+                    });
+                }
+            }) {
+                listeners.push(listener);
+            }
         }
         if let Ok(listener) = platform::add_window_listener("offline", move |_| {
             let mut controller = self;

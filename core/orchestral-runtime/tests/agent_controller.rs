@@ -762,3 +762,60 @@ async fn sdk_returns_unknown_as_a_recoverable_turn_boundary() {
     assert_eq!(turn.status(), AgentRunStatus::Unknown);
     assert!(!turn.is_waiting());
 }
+
+#[tokio::test]
+async fn command_retries_bind_the_complete_envelope_and_survive_controller_restart() {
+    let factory = SessionfulRecoverFactory::new().unwrap();
+    let mut scenario = ProviderScenario::standard(&factory.descriptor()).unwrap();
+    scenario.immediate_events.truncate(1);
+    let provider = Arc::new(CommandThenDisconnectProvider {
+        inner: factory.create(scenario.clone(), TestProbes::default()),
+        disconnect: Arc::new(Notify::new()),
+    });
+    let journal = Arc::new(InMemoryAgentJournalStore::default());
+    let binding = ProviderBindingRef::new("command-identity-test");
+    let controller = Arc::new(
+        AgentController::with_journal_store(provider.clone(), binding.clone(), journal.clone())
+            .unwrap(),
+    );
+    let execution = controller.start(scenario.start_request.run).await.unwrap();
+    let command = AgentCommandEnvelope::new(
+        CommandId::new("immutable-command"),
+        execution.run_id.clone(),
+        None,
+        AgentCommand::Steer {
+            content: vec![Content::text("first content")],
+        },
+    )
+    .unwrap();
+    controller.command(command.clone()).await.unwrap();
+    assert!(controller.command(command.clone()).await.unwrap().duplicate);
+    let changed = AgentCommandEnvelope::new(
+        command.command_id.clone(),
+        execution.run_id.clone(),
+        None,
+        AgentCommand::Steer {
+            content: vec![Content::text("changed content")],
+        },
+    )
+    .unwrap();
+    let error = controller
+        .command(changed)
+        .await
+        .expect_err("changed input must not reuse an acknowledgement");
+    assert!(matches!(
+        error,
+        orchestral_runtime::AgentControlError::Protocol(AgentProtocolError {
+            code: AgentProtocolErrorCode::DuplicateConflict,
+            ..
+        })
+    ));
+    let replacement = AgentController::with_journal_store(provider, binding, journal).unwrap();
+    assert_eq!(
+        replacement
+            .recorded_command(&execution.run_id, &command.command_id)
+            .await
+            .unwrap(),
+        Some(command)
+    );
+}

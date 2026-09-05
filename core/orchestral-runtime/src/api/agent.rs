@@ -7,8 +7,8 @@ use std::sync::Arc;
 use orchestral_core::agent_connector::AgentSessionActionInvocation;
 use orchestral_core::agent_protocol::spi::AgentRunCatalogEntry;
 use orchestral_core::agent_protocol::wire::{
-    AgentCommandEnvelope, AgentJournalRecord, AgentRunView, AgentSessionId, CommandAck, Content,
-    Extensions, ResourceBinding, RunId,
+    AgentCommandEnvelope, AgentJournalRecord, AgentRunView, AgentSessionId, CommandAck, CommandId,
+    Content, Extensions, ResourceBinding, RunId,
 };
 use tokio::sync::broadcast;
 use tokio::sync::RwLock;
@@ -173,6 +173,15 @@ impl AgentApi {
         run_id: &RunId,
     ) -> Result<broadcast::Receiver<AgentControlEvent>, AgentSdkError> {
         Ok(self.controller.subscribe(run_id).await?)
+    }
+
+    /// Looks up a durable command without starting or recovering native work.
+    pub async fn recorded_command(
+        &self,
+        run_id: &RunId,
+        command_id: &CommandId,
+    ) -> Result<Option<AgentCommandEnvelope>, AgentSdkError> {
+        Ok(self.controller.recorded_command(run_id, command_id).await?)
     }
 
     pub async fn command(
