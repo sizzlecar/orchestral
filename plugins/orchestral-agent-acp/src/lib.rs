@@ -276,6 +276,7 @@ impl AgentConnector for AcpConnector {
                 list: true,
                 read: true,
                 create: true,
+                resolve_requests: false,
             },
             creation: Some(AgentSessionCreationDescriptor {
                 accepts_cwd: true,

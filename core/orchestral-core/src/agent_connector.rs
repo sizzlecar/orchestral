@@ -14,8 +14,8 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 
 use crate::agent_protocol::wire::{
-    AgentFailure, AgentRunSpec, AgentSessionId, Content, Extensions, PendingRequest,
-    ProviderBindingRef, RunId,
+    AgentFailure, AgentRunSpec, AgentSessionId, ApprovalDecision, Content, Extensions,
+    PendingRequest, PendingRequestKind, ProviderBindingRef, RequestId, RunId,
 };
 
 macro_rules! string_id {
@@ -185,6 +185,10 @@ pub struct AgentSessionCapabilities {
     pub list: bool,
     pub read: bool,
     pub create: bool,
+    /// Whether provider-native requests exposed by session observation can be
+    /// resolved through the connector without owning a Host Run.
+    #[serde(default)]
+    pub resolve_requests: bool,
 }
 
 impl AgentSessionCapabilities {
@@ -193,6 +197,7 @@ impl AgentSessionCapabilities {
             list: true,
             read: true,
             create: false,
+            resolve_requests: false,
         }
     }
 }
@@ -524,6 +529,54 @@ pub struct AgentSessionDetail {
     pub next_cursor: Option<String>,
 }
 
+/// User response to a provider-native request observed at session scope.
+///
+/// Run-owned requests continue to use the durable Agent Protocol command
+/// path. This smaller connector contract covers requests created by another
+/// native client, where no Orchestral Run identity exists.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AgentSessionRequestResolution {
+    Input { content: Vec<Content> },
+    Approval { decision: ApprovalDecision },
+    ExternalResult { result: Vec<Content> },
+}
+
+impl AgentSessionRequestResolution {
+    pub const fn kind(&self) -> PendingRequestKind {
+        match self {
+            Self::Input { .. } => PendingRequestKind::Input,
+            Self::Approval { .. } => PendingRequestKind::Approval,
+            Self::ExternalResult { .. } => PendingRequestKind::ExternalAction,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), AgentConnectorError> {
+        let content = match self {
+            Self::Input { content } | Self::ExternalResult { result: content } => content,
+            Self::Approval { .. } => return Ok(()),
+        };
+        if content.is_empty() {
+            return Err(AgentConnectorError::invalid(
+                "session request response content must not be empty",
+            ));
+        }
+        for item in content {
+            item.validate_integrity()
+                .map_err(|error| AgentConnectorError::invalid(error.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveAgentSessionRequest {
+    pub session_id: AgentSessionId,
+    pub request_id: RequestId,
+    pub response: AgentSessionRequestResolution,
+}
+
 /// Provider-neutral incremental mutation for a connector-owned session.
 ///
 /// Connectors should emit stable activity identities whenever the native
@@ -546,6 +599,12 @@ pub enum AgentSessionChangeKind {
         /// failure state from the preceding turn.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         failure: Option<AgentFailure>,
+    },
+    PendingRequestUpsert {
+        request: PendingRequest,
+    },
+    PendingRequestClosed {
+        request_id: RequestId,
     },
     RefreshRequired {
         reason: String,
@@ -942,6 +1001,15 @@ pub trait AgentConnector: Send + Sync {
     ) -> Result<AgentSessionActionOutcome, AgentConnectorError> {
         Err(AgentConnectorError::unsupported(
             "connector does not support session actions",
+        ))
+    }
+
+    async fn resolve_request(
+        &self,
+        _request: ResolveAgentSessionRequest,
+    ) -> Result<(), AgentConnectorError> {
+        Err(AgentConnectorError::unsupported(
+            "connector does not support resolving provider-native session requests",
         ))
     }
 }

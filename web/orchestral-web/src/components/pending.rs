@@ -7,21 +7,36 @@ use crate::state::{content_text, RunState};
 #[component]
 pub fn PendingPanel() -> Element {
     let controller = consume_context::<AppController>();
-    let run = controller.state.read().pending_run().cloned();
+    let (run, can_resolve) = {
+        let state = controller.state.read();
+        let run = state.pending_run().cloned();
+        let can_resolve = run.as_ref().is_none_or(|run| {
+            !run.id.starts_with("agent-history:")
+                || state
+                    .connectors
+                    .items
+                    .iter()
+                    .find(|connector| {
+                        run.connector_id.as_deref() == Some(connector.connector_id.as_str())
+                    })
+                    .is_some_and(|connector| connector.capabilities.resolve_requests)
+        });
+        (run, can_resolve)
+    };
     let Some(run) = run.filter(|run| !run.pending.is_empty()) else {
         return rsx! {};
     };
     rsx! {
         section { class: "pending-panel", aria_label: "待处理请求", aria_live: "assertive",
             for request in run.pending.clone() {
-                PendingCard { key: "{request_id(&request)}", run: run.clone(), request }
+                PendingCard { key: "{request_id(&request)}", run: run.clone(), request, can_resolve }
             }
         }
     }
 }
 
 #[component]
-fn PendingCard(run: RunState, request: Value) -> Element {
+fn PendingCard(run: RunState, request: Value, can_resolve: bool) -> Element {
     let controller = consume_context::<AppController>();
     let payload = request.get("payload").cloned().unwrap_or(Value::Null);
     let kind = payload
@@ -35,6 +50,15 @@ fn PendingCard(run: RunState, request: Value) -> Element {
         .read()
         .ui
         .request_is_resolving(&run_id, &request_id);
+    if !can_resolve {
+        return rsx! {
+            article { class: "pending-card",
+                span { class: "pending-card__badge", "外部操作" }
+                h2 { "需要在主机上继续" }
+                p { "当前 Agent 只能展示这项请求，尚未提供远程处理能力。" }
+            }
+        };
+    }
     match kind {
         "input" => {
             let mut response = use_signal(String::new);

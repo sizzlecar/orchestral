@@ -1617,25 +1617,44 @@ impl AppController {
             }
             state.ui.set_request_resolving(&run_id, &request_id, true);
         }
-        let connector_id = self
+        let (connector_id, session_target) = self
             .state
             .read()
             .runs
             .get(&run_id)
-            .and_then(|run| run.connector_id.clone());
-        match self
-            .api
-            .resolve_input(
-                &token,
-                &run_id,
-                &request_id,
-                text.trim(),
-                connector_id.as_deref(),
-            )
-            .await
-        {
+            .map(|run| {
+                let connector_id = run.connector_id.clone();
+                let session_target = run_id
+                    .starts_with("agent-history:")
+                    .then(|| Some((connector_id.clone()?, run.session_id.clone()?)))
+                    .flatten();
+                (connector_id, session_target)
+            })
+            .unwrap_or_default();
+        let result = if let Some((connector_id, session_id)) = session_target.as_ref() {
+            self.api
+                .resolve_session_input(&token, connector_id, session_id, &request_id, text.trim())
+                .await
+        } else {
+            self.api
+                .resolve_input(
+                    &token,
+                    &run_id,
+                    &request_id,
+                    text.trim(),
+                    connector_id.as_deref(),
+                )
+                .await
+        };
+        match result {
             Ok(ack) => {
-                if let Err(error) = check_ack(&ack, "回复") {
+                if let Some((connector_id, session_id)) = session_target.as_ref() {
+                    self.state.write().remove_session_pending_request(
+                        connector_id,
+                        session_id,
+                        &request_id,
+                    );
+                } else if let Err(error) = check_ack(&ack, "回复") {
                     self.state
                         .write()
                         .ui
@@ -1646,11 +1665,21 @@ impl AppController {
                 }
             }
             Err(error) if is_stale_request_error(&error) => {
-                self.state
-                    .write()
-                    .remove_pending_request(&run_id, &request_id);
+                if let Some((connector_id, session_id)) = session_target.as_ref() {
+                    self.state.write().remove_session_pending_request(
+                        connector_id,
+                        session_id,
+                        &request_id,
+                    );
+                } else {
+                    self.state
+                        .write()
+                        .remove_pending_request(&run_id, &request_id);
+                }
                 self.notice("该请求已由其他客户端处理", "info");
-                self.refresh_run(&run_id).await;
+                if session_target.is_none() {
+                    self.refresh_run(&run_id).await;
+                }
             }
             Err(error) => {
                 self.state
@@ -1673,25 +1702,44 @@ impl AppController {
             }
             state.ui.set_request_resolving(&run_id, &request_id, true);
         }
-        let connector_id = self
+        let (connector_id, session_target) = self
             .state
             .read()
             .runs
             .get(&run_id)
-            .and_then(|run| run.connector_id.clone());
-        match self
-            .api
-            .resolve_approval(
-                &token,
-                &run_id,
-                &request_id,
-                &decision,
-                connector_id.as_deref(),
-            )
-            .await
-        {
+            .map(|run| {
+                let connector_id = run.connector_id.clone();
+                let session_target = run_id
+                    .starts_with("agent-history:")
+                    .then(|| Some((connector_id.clone()?, run.session_id.clone()?)))
+                    .flatten();
+                (connector_id, session_target)
+            })
+            .unwrap_or_default();
+        let result = if let Some((connector_id, session_id)) = session_target.as_ref() {
+            self.api
+                .resolve_session_approval(&token, connector_id, session_id, &request_id, &decision)
+                .await
+        } else {
+            self.api
+                .resolve_approval(
+                    &token,
+                    &run_id,
+                    &request_id,
+                    &decision,
+                    connector_id.as_deref(),
+                )
+                .await
+        };
+        match result {
             Ok(ack) => {
-                if let Err(error) = check_ack(&ack, "批准") {
+                if let Some((connector_id, session_id)) = session_target.as_ref() {
+                    self.state.write().remove_session_pending_request(
+                        connector_id,
+                        session_id,
+                        &request_id,
+                    );
+                } else if let Err(error) = check_ack(&ack, "批准") {
                     self.state
                         .write()
                         .ui
@@ -1702,11 +1750,21 @@ impl AppController {
                 }
             }
             Err(error) if is_stale_request_error(&error) => {
-                self.state
-                    .write()
-                    .remove_pending_request(&run_id, &request_id);
+                if let Some((connector_id, session_id)) = session_target.as_ref() {
+                    self.state.write().remove_session_pending_request(
+                        connector_id,
+                        session_id,
+                        &request_id,
+                    );
+                } else {
+                    self.state
+                        .write()
+                        .remove_pending_request(&run_id, &request_id);
+                }
                 self.notice("该审批已由其他客户端处理", "info");
-                self.refresh_run(&run_id).await;
+                if session_target.is_none() {
+                    self.refresh_run(&run_id).await;
+                }
             }
             Err(error) => {
                 self.state

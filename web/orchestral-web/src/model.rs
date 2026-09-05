@@ -123,6 +123,8 @@ pub struct AgentSessionCapabilitiesView {
     pub list: bool,
     pub read: bool,
     pub create: bool,
+    #[serde(default)]
+    pub resolve_requests: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -321,6 +323,12 @@ pub enum AgentSessionChangeKindView {
         status: String,
         #[serde(default)]
         failure: Option<Value>,
+    },
+    PendingRequestUpsert {
+        request: Value,
+    },
+    PendingRequestClosed {
+        request_id: String,
     },
     RefreshRequired {
         reason: String,

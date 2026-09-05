@@ -1067,6 +1067,7 @@ mod tests {
                 list: true,
                 read: true,
                 create: true,
+                resolve_requests: false,
             },
             creation: None,
             actions: Vec::new(),

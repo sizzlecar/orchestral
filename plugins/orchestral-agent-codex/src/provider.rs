@@ -10,7 +10,8 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use futures_util::stream::{self, StreamExt};
 use orchestral_core::agent_connector::{
-    AgentSessionActionInvocation, SESSION_COMPACT_ACTION, SESSION_REVIEW_ACTION,
+    AgentConnectorError, AgentSessionActionInvocation, AgentSessionRequestResolution,
+    SESSION_COMPACT_ACTION, SESSION_REVIEW_ACTION,
 };
 use orchestral_core::agent_protocol::spi::{
     AgentProvider, AgentProviderStream, AgentRecovery, AgentRecoveryRequest, AgentStart,
@@ -174,10 +175,21 @@ enum DispatchClaim {
 }
 
 #[derive(Clone)]
-struct NativePendingRequest {
+pub(super) struct NativePendingRequest {
     rpc_id: Value,
+    method: String,
     kind: PendingRequestKind,
     params: Value,
+}
+
+impl NativePendingRequest {
+    pub(super) fn rpc_id(&self) -> &Value {
+        &self.rpc_id
+    }
+
+    pub(super) fn kind(&self) -> PendingRequestKind {
+        self.kind.clone()
+    }
 }
 
 fn new_codex_run(
@@ -505,8 +517,11 @@ impl CodexConnector {
         let active_turn_id = match resumed_thread.as_ref() {
             Some(thread) => active_turn_id(thread).map(str::to_owned),
             None => match latest_native_turn(&connected.rpc, &session_id).await {
-                Ok(turn) => turn.as_ref().and_then(active_turn_id_from_turn),
-                Err(_) => None,
+                Ok(Some(turn)) => {
+                    let turn = prefer_loaded_terminal_turn(&connected.rpc, &session_id, turn).await;
+                    active_turn_id_from_turn(&turn)
+                }
+                Ok(None) | Err(_) => None,
             },
         };
         if let Some(turn_id) = active_turn_id {
@@ -2304,6 +2319,34 @@ async fn find_loaded_thread_turn(
         .cloned())
 }
 
+/// Resolves the split-brain edge between Codex's durable turn index and its
+/// loaded thread snapshot.
+///
+/// The paginated index can retain `inProgress` after the loaded thread has
+/// committed the exact turn. A loaded terminal copy is strictly newer and
+/// therefore wins. All side-effecting and reconciliation paths use this one
+/// rule so a stale index cannot make a completed turn commandable again.
+async fn prefer_loaded_terminal_turn(
+    rpc: &CodexRpcClient,
+    session_id: &AgentSessionId,
+    indexed: Value,
+) -> Value {
+    if indexed.get("status").and_then(Value::as_str) != Some("inProgress") {
+        return indexed;
+    }
+    let Some(turn_id) = indexed
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|turn_id| !turn_id.is_empty())
+    else {
+        return indexed;
+    };
+    match find_loaded_thread_turn(rpc, session_id.as_str(), turn_id).await {
+        Ok(Some(loaded)) if external_turn_is_terminal(&loaded) => loaded,
+        Ok(_) | Err(_) => indexed,
+    }
+}
+
 async fn find_loaded_thread_item(
     rpc: &CodexRpcClient,
     thread_id: &str,
@@ -2591,7 +2634,12 @@ async fn direct_turn_is_active(
     if latest_id == Some(turn_id.as_str())
         && latest.get("status").and_then(Value::as_str) == Some("inProgress")
     {
-        return Ok(true);
+        let latest = prefer_loaded_terminal_turn(rpc, &run.execution.session_id, latest).await;
+        if latest.get("status").and_then(Value::as_str) == Some("inProgress") {
+            return Ok(true);
+        }
+        restore_direct_turn(rpc, run, &turn_id, &latest).await;
+        return Ok(false);
     }
     if latest_id == Some(turn_id.as_str()) && external_turn_is_terminal(&latest) {
         restore_direct_turn(rpc, run, &turn_id, &latest).await;
@@ -2617,7 +2665,7 @@ async fn reconcile_bound_direct_turn(
         .map_err(transport_to_protocol)?;
     let turn = match latest.as_ref() {
         Some(latest) if latest.get("id").and_then(Value::as_str) == Some(turn_id) => {
-            Some(latest.clone())
+            Some(prefer_loaded_terminal_turn(rpc, &run.execution.session_id, latest.clone()).await)
         }
         _ => {
             find_native_turn_or_loaded(rpc, &run.execution.session_id, turn_id, "notLoaded").await?
@@ -2797,7 +2845,9 @@ async fn monitor_native_run(
                 }
             }
             "item/completed" => handle_completed_item(&run, message.pointer("/params/item")),
-            "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+            "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "item/permissions/requestApproval" => {
                 open_native_request(&run, &message, PendingRequestKind::Approval);
             }
             "item/tool/requestUserInput" => {
@@ -3134,9 +3184,36 @@ fn publish_tool(
 }
 
 fn open_native_request(run: &Arc<CodexRun>, message: &Value, kind: PendingRequestKind) {
-    let Some(rpc_id) = message.get("id").cloned() else {
+    let Some((request, native)) = normalize_native_request(message, kind) else {
         return;
     };
+    let request_id = request.request_id.clone();
+    lock(&run.pending).insert(request_id.clone(), native);
+    publish_event(
+        run,
+        AgentEventDraft {
+            event_id: AgentEventId::new(format!(
+                "codex-{}-request-{}",
+                run.execution.run_id.as_str(),
+                request_id.as_str()
+            )),
+            run_id: run.execution.run_id.clone(),
+            causation_id: None,
+            source_fingerprint: None,
+            payload: AgentEvent::RequestOpened { request },
+        },
+    );
+}
+
+/// Converts one Codex server request into the provider-neutral public request
+/// plus the opaque native response handle. Session observation and Run
+/// execution deliberately share this translation so they cannot disagree on
+/// identity, kind, scope, or presentation.
+pub(super) fn normalize_native_request(
+    message: &Value,
+    kind: PendingRequestKind,
+) -> Option<(PendingRequest, NativePendingRequest)> {
+    let rpc_id = message.get("id").cloned()?;
     let params = message.get("params").cloned().unwrap_or(Value::Null);
     let native_key = params
         .get("approvalId")
@@ -3166,36 +3243,26 @@ fn open_native_request(run: &Arc<CodexRun>, message: &Value, kind: PendingReques
             prompt: vec![Content::text(input_prompt(&params))],
             input_schema: None,
         },
-        _ => return,
+        _ => return None,
     };
-    lock(&run.pending).insert(
-        request_id.clone(),
+    let request = PendingRequest {
+        request_id,
+        blocking: true,
+        payload,
+    };
+    Some((
+        request,
         NativePendingRequest {
             rpc_id,
+            method: message
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
             kind,
             params,
         },
-    );
-    publish_event(
-        run,
-        AgentEventDraft {
-            event_id: AgentEventId::new(format!(
-                "codex-{}-request-{}",
-                run.execution.run_id.as_str(),
-                request_id.as_str()
-            )),
-            run_id: run.execution.run_id.clone(),
-            causation_id: None,
-            source_fingerprint: None,
-            payload: AgentEvent::RequestOpened {
-                request: PendingRequest {
-                    request_id,
-                    blocking: true,
-                    payload,
-                },
-            },
-        },
-    );
+    ))
 }
 
 fn close_native_request(run: &Arc<CodexRun>, message: &Value) {
@@ -3585,40 +3652,15 @@ fn stream_for(run: &Arc<CodexRun>) -> AgentProviderStream {
     replay.chain(live).boxed()
 }
 
-fn native_resolution(
+pub(super) fn native_resolution(
     native: &NativePendingRequest,
     resolution: &RequestResolution,
 ) -> Result<Value, AgentProtocolError> {
     match resolution {
         RequestResolution::Approval { decision, .. } => {
-            let decision = match decision {
-                ApprovalDecision::Allow => "accept",
-                ApprovalDecision::Deny => "decline",
-                _ => {
-                    return Err(AgentProtocolError::new(
-                        AgentProtocolErrorCode::Unsupported,
-                        "Codex adapter does not support this approval decision",
-                    ));
-                }
-            };
-            Ok(json!({ "decision": decision }))
+            native_approval_resolution(native, *decision)
         }
-        RequestResolution::Input { content } => {
-            let answer = content_text(content)?;
-            let questions = native
-                .params
-                .get("questions")
-                .and_then(Value::as_array)
-                .map(Vec::as_slice)
-                .unwrap_or_default();
-            let mut answers = serde_json::Map::new();
-            for question in questions {
-                if let Some(id) = question.get("id").and_then(Value::as_str) {
-                    answers.insert(id.to_owned(), json!({"answers": [answer.clone()]}));
-                }
-            }
-            Ok(json!({"answers": answers}))
-        }
+        RequestResolution::Input { content } => native_input_resolution(native, content),
         RequestResolution::ExternalResult { .. } => Err(AgentProtocolError::new(
             AgentProtocolErrorCode::RequestTypeMismatch,
             "Codex dynamic tool results are not declared by this adapter",
@@ -3628,6 +3670,81 @@ fn native_resolution(
             "Codex adapter does not support this request resolution",
         )),
     }
+}
+
+pub(super) fn native_session_resolution(
+    native: &NativePendingRequest,
+    resolution: &AgentSessionRequestResolution,
+) -> Result<Value, AgentConnectorError> {
+    let result = match resolution {
+        AgentSessionRequestResolution::Approval { decision } => {
+            native_approval_resolution(native, *decision)
+        }
+        AgentSessionRequestResolution::Input { content } => {
+            native_input_resolution(native, content)
+        }
+        AgentSessionRequestResolution::ExternalResult { .. } => Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::RequestTypeMismatch,
+            "Codex dynamic tool results are not declared by this adapter",
+        )),
+    };
+    result.map_err(|error| AgentConnectorError::invalid(error.to_string()))
+}
+
+fn native_approval_resolution(
+    native: &NativePendingRequest,
+    decision: ApprovalDecision,
+) -> Result<Value, AgentProtocolError> {
+    if native.method == "item/permissions/requestApproval" {
+        let permissions = match decision {
+            ApprovalDecision::Allow => native
+                .params
+                .get("permissions")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+            ApprovalDecision::Deny => json!({}),
+            _ => {
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::Unsupported,
+                    "Codex adapter does not support this approval decision",
+                ));
+            }
+        };
+        // The session SPI deliberately exposes only one-shot approval, so the
+        // native permission grant is bounded to the current turn.
+        return Ok(json!({"permissions": permissions, "scope": "turn"}));
+    }
+    let decision = match decision {
+        ApprovalDecision::Allow => "accept",
+        ApprovalDecision::Deny => "decline",
+        _ => {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::Unsupported,
+                "Codex adapter does not support this approval decision",
+            ));
+        }
+    };
+    Ok(json!({ "decision": decision }))
+}
+
+fn native_input_resolution(
+    native: &NativePendingRequest,
+    content: &[Content],
+) -> Result<Value, AgentProtocolError> {
+    let answer = content_text(content)?;
+    let questions = native
+        .params
+        .get("questions")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut answers = serde_json::Map::new();
+    for question in questions {
+        if let Some(id) = question.get("id").and_then(Value::as_str) {
+            answers.insert(id.to_owned(), json!({"answers": [answer.clone()]}));
+        }
+    }
+    Ok(json!({"answers": answers}))
 }
 
 impl CodexConnector {
@@ -3834,6 +3951,18 @@ fn approval_scopes(method: Option<&str>, params: &Value) -> Vec<String> {
     let mut scopes = vec!["process".to_owned()];
     if method == Some("item/fileChange/requestApproval") {
         scopes.push("filesystem_write".to_owned());
+    }
+    if method == Some("item/permissions/requestApproval") {
+        if params.pointer("/permissions/network").is_some()
+            || params.pointer("/permissions/networkAccess").is_some()
+        {
+            scopes.push("network".to_owned());
+        }
+        if params.pointer("/permissions/fileSystem").is_some()
+            || params.pointer("/permissions/filesystem").is_some()
+        {
+            scopes.push("filesystem_write".to_owned());
+        }
     }
     if params.get("networkApprovalContext").is_some() {
         scopes.push("network".to_owned());
@@ -4804,6 +4933,18 @@ mod tests {
                     "data": [{"id": "turn-live", "status": "inProgress", "items": []}],
                     "nextCursor": null
                 }),
+            )
+            .await;
+
+            let loaded_turn = next_request(&mut lines).await;
+            assert_eq!(loaded_turn["method"], "thread/read");
+            server_write_result(
+                &mut server_write,
+                &loaded_turn,
+                json!({"thread": {
+                    "id": "thread-live",
+                    "turns": [{"id": "turn-live", "status": "inProgress", "items": []}]
+                }}),
             )
             .await;
 
@@ -6345,6 +6486,7 @@ mod tests {
     fn approval_mapping_never_grants_session_scope_implicitly() {
         let native = NativePendingRequest {
             rpc_id: json!(1),
+            method: "item/commandExecution/requestApproval".to_owned(),
             kind: PendingRequestKind::Approval,
             params: json!({}),
         };
@@ -6359,6 +6501,49 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, json!({"decision": "accept"}));
+    }
+
+    #[test]
+    fn permission_approval_uses_the_typed_0153_response_contract() {
+        let native = NativePendingRequest {
+            rpc_id: json!(2),
+            method: "item/permissions/requestApproval".to_owned(),
+            kind: PendingRequestKind::Approval,
+            params: json!({
+                "permissions": {
+                    "fileSystem": {"write": ["/tmp"]},
+                    "network": {"enabled": true}
+                }
+            }),
+        };
+        assert_eq!(
+            native_resolution(
+                &native,
+                &RequestResolution::Approval {
+                    decision: ApprovalDecision::Allow,
+                    grant_ref: None,
+                },
+            )
+            .unwrap(),
+            json!({
+                "permissions": {
+                    "fileSystem": {"write": ["/tmp"]},
+                    "network": {"enabled": true}
+                },
+                "scope": "turn"
+            })
+        );
+        assert_eq!(
+            native_resolution(
+                &native,
+                &RequestResolution::Approval {
+                    decision: ApprovalDecision::Deny,
+                    grant_ref: None,
+                },
+            )
+            .unwrap(),
+            json!({"permissions": {}, "scope": "turn"})
+        );
     }
 
     #[tokio::test]
@@ -6758,6 +6943,17 @@ mod tests {
                 }),
             )
             .await;
+            let steer_loaded = next_request(&mut lines).await;
+            assert_eq!(steer_loaded["method"], "thread/read");
+            server_write_result(
+                &mut server_write,
+                &steer_loaded,
+                json!({"thread": {
+                    "id": "thread-2",
+                    "turns": [{"id": "turn-2", "status": "inProgress", "items": []}]
+                }}),
+            )
+            .await;
             let steer = next_request(&mut lines).await;
             assert_eq!(steer["method"], "turn/steer");
             assert_eq!(steer["params"]["expectedTurnId"], "turn-2");
@@ -6784,6 +6980,17 @@ mod tests {
                     "data": [{"id": "turn-2", "status": "inProgress"}],
                     "nextCursor": null
                 }),
+            )
+            .await;
+            let cancel_loaded = next_request(&mut lines).await;
+            assert_eq!(cancel_loaded["method"], "thread/read");
+            server_write_result(
+                &mut server_write,
+                &cancel_loaded,
+                json!({"thread": {
+                    "id": "thread-2",
+                    "turns": [{"id": "turn-2", "status": "inProgress", "items": []}]
+                }}),
             )
             .await;
             let cancel = next_request(&mut lines).await;
@@ -7120,6 +7327,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn loaded_terminal_turn_overrides_a_stale_active_history_index() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let run = test_run("thread-stale-active", "run-stale-active");
+        establish_turn(&run, "turn-stale-active");
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            let latest = next_request(&mut lines).await;
+            assert_eq!(latest["method"], "thread/turns/list");
+            server_write_result(
+                &mut server_write,
+                &latest,
+                json!({
+                    "data": [{"id": "turn-stale-active", "status": "inProgress"}],
+                    "nextCursor": null
+                }),
+            )
+            .await;
+
+            let loaded = next_request(&mut lines).await;
+            assert_eq!(loaded["method"], "thread/read");
+            server_write_result(
+                &mut server_write,
+                &loaded,
+                json!({
+                    "thread": {
+                        "id": "thread-stale-active",
+                        "turns": [{
+                            "id": "turn-stale-active",
+                            "status": "completed",
+                            "completedAt": 1,
+                            "items": []
+                        }]
+                    }
+                }),
+            )
+            .await;
+
+            let items = next_request(&mut lines).await;
+            assert_eq!(items["method"], "thread/items/list");
+            server_write_result(
+                &mut server_write,
+                &items,
+                json!({
+                    "data": [{
+                        "turnId": "turn-stale-active",
+                        "item": {
+                            "id": "agent-stale-active",
+                            "type": "agentMessage",
+                            "status": "completed",
+                            "text": "completed in the loaded snapshot"
+                        }
+                    }],
+                    "nextCursor": null
+                }),
+            )
+            .await;
+        });
+
+        assert!(reconcile_bound_direct_turn(&rpc, &run, "turn-stale-active")
+            .await
+            .unwrap());
+        assert!(run.terminal.load(Ordering::SeqCst));
+        assert!(lock(&run.durable).iter().any(|event| {
+            matches!(
+                &event.payload,
+                AgentEvent::DeliveryCommitted { delivery }
+                    if delivery.final_response
+                        == Content::text("completed in the loaded snapshot")
+            )
+        }));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn host_controller_accepts_codex_event_sequence() {
         let (client_io, server_io) = duplex(1024 * 1024);
         let (client_read, client_write) = tokio::io::split(client_io);
@@ -7231,6 +7520,17 @@ mod tests {
                     "data": [{"id": "turn-cancel", "status": "inProgress"}],
                     "nextCursor": null
                 }),
+            )
+            .await;
+            let loaded = next_request(&mut lines).await;
+            assert_eq!(loaded["method"], "thread/read");
+            server_write_result(
+                &mut server_write,
+                &loaded,
+                json!({"thread": {
+                    "id": "thread-cancel",
+                    "turns": [{"id": "turn-cancel", "status": "inProgress", "items": []}]
+                }}),
             )
             .await;
             let interrupt = next_request(&mut lines).await;
@@ -7542,6 +7842,133 @@ mod tests {
                 break;
             }
         }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_active_index_starts_a_new_turn_instead_of_steering_a_completed_turn() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let mut connector = CodexConnector::with_client(rpc, "codex/test");
+        connector.config.allow_deferred_queue = false;
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            let resume = next_request(&mut lines).await;
+            server_write_error(
+                &mut server_write,
+                &resume,
+                "thread thread-stale already has an active writer",
+            )
+            .await;
+
+            let loaded = next_request(&mut lines).await;
+            assert_eq!(loaded["method"], "thread/loaded/list");
+            server_write_result(
+                &mut server_write,
+                &loaded,
+                json!({"data": ["thread-stale"], "nextCursor": null}),
+            )
+            .await;
+
+            let indexed = next_request(&mut lines).await;
+            assert_eq!(indexed["method"], "thread/turns/list");
+            server_write_result(
+                &mut server_write,
+                &indexed,
+                json!({
+                    "data": [{"id": "turn-old", "status": "inProgress", "items": []}],
+                    "nextCursor": null
+                }),
+            )
+            .await;
+
+            let edge = next_request(&mut lines).await;
+            assert_eq!(edge["method"], "thread/read");
+            server_write_result(
+                &mut server_write,
+                &edge,
+                json!({"thread": {
+                    "id": "thread-stale",
+                    "turns": [{"id": "turn-old", "status": "completed", "items": []}]
+                }}),
+            )
+            .await;
+
+            let start = next_request(&mut lines).await;
+            assert_eq!(start["method"], "turn/start");
+            assert_eq!(start["params"]["threadId"], "thread-stale");
+            server_write_result(
+                &mut server_write,
+                &start,
+                json!({"turn": {"id": "turn-new", "status": "inProgress", "items": []}}),
+            )
+            .await;
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n{}\n",
+                        json!({
+                            "method": "item/completed",
+                            "params": {
+                                "threadId": "thread-stale",
+                                "turnId": "turn-new",
+                                "item": {
+                                    "id": "message-new",
+                                    "type": "agentMessage",
+                                    "text": "new turn completed"
+                                }
+                            }
+                        }),
+                        json!({
+                            "method": "turn/completed",
+                            "params": {
+                                "threadId": "thread-stale",
+                                "turn": {
+                                    "id": "turn-new",
+                                    "status": "completed",
+                                    "items": [{
+                                        "id": "message-new",
+                                        "type": "agentMessage",
+                                        "text": "new turn completed"
+                                    }]
+                                }
+                            }
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+
+        let mut stream = connector
+            .start(start_request("thread-stale", "run-after-stale"))
+            .await
+            .expect("a stale active index must not capture the new input")
+            .stream;
+        let mut delivery = None;
+        while let Some(item) = timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("new turn stream timed out")
+        {
+            if let AgentProviderStreamItem::Event(event) = item.unwrap() {
+                if let AgentEvent::DeliveryCommitted { delivery: value } = event.payload {
+                    delivery = Some(value);
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            delivery.expect("new turn must complete").final_response,
+            Content::text("new turn completed")
+        );
         server.await.unwrap();
     }
 

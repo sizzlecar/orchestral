@@ -15,8 +15,8 @@ use axum::{Json, Router};
 use orchestral_core::agent_connector::{
     AgentConnectorId, AgentSessionActionId, AgentSessionActionOutcome, AgentSessionActivityId,
     AgentSessionChange, AgentSessionHistoryAnchor, AgentSessionListQuery, AgentSessionPage,
-    AgentSessionReadQuery, AgentSessionSummary, CreateAgentSessionRequest,
-    InvokeAgentSessionActionRequest,
+    AgentSessionReadQuery, AgentSessionRequestResolution, AgentSessionSummary,
+    CreateAgentSessionRequest, InvokeAgentSessionActionRequest, ResolveAgentSessionRequest,
 };
 use orchestral_core::agent_protocol::spi::AgentStartError;
 use orchestral_core::agent_protocol::wire::{
@@ -32,6 +32,7 @@ use orchestral_runtime::{
     ApprovalBridgeError, InMemoryHostApprovalBroker,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use tracing::Instrument;
 
@@ -357,6 +358,14 @@ pub fn router(state: RemoteApiState) -> Router {
         .route("/agent-session", get(get_agent_session))
         .route("/agent-session/stream", get(agent_session_stream))
         .route("/agent-session/actions", post(invoke_agent_session_action))
+        .route(
+            "/agent-session/requests/{request_id}/input",
+            post(resolve_agent_session_input),
+        )
+        .route(
+            "/agent-session/requests/{request_id}/approval",
+            post(resolve_agent_session_approval),
+        )
         .route("/agent-runs", post(start_agent_run))
         .route("/runs/{run_id}", get(inspect_run))
         .route("/runs/{run_id}/events", get(run_events))
@@ -2361,6 +2370,39 @@ async fn resolve_input(
     ))
 }
 
+async fn resolve_agent_session_input(
+    State(state): State<RemoteApiState>,
+    Path(request_id): Path<String>,
+    Query(query): Query<AgentSessionQuery>,
+    Json(request): Json<AgentSessionTextRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let content = message_content(&state, &request.text, &request.attachments).await?;
+    state
+        .agent_directory
+        .resolve_request(
+            &AgentConnectorId::new(query.connector_id),
+            ResolveAgentSessionRequest {
+                session_id: AgentSessionId::new(query.session_id),
+                request_id: RequestId::new(request_id),
+                response: AgentSessionRequestResolution::Input { content },
+            },
+        )
+        .await?;
+    Ok(Json(json!({"resolved": true})))
+}
+
+/// A provider-native session request is not a Host Run command, so it has no
+/// command id or history anchor. Keep its wire contract separate from
+/// `TextCommandRequest`; reusing the Run DTO made the PWA's valid `{text}`
+/// response fail JSON extraction before it reached the connector SPI.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentSessionTextRequest {
+    text: String,
+    #[serde(default)]
+    attachments: Vec<RemoteArtifactInput>,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ApprovalChoice {
@@ -2373,6 +2415,12 @@ enum ApprovalChoice {
 #[serde(deny_unknown_fields)]
 struct ApprovalRequest {
     command_id: String,
+    decision: ApprovalChoice,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentSessionApprovalRequest {
     decision: ApprovalChoice,
 }
 
@@ -2434,6 +2482,36 @@ async fn resolve_approval(
     Ok(Json(
         command_run_for_session(&state, connector_id.as_ref(), &agent, &run_id, command).await?,
     ))
+}
+
+async fn resolve_agent_session_approval(
+    State(state): State<RemoteApiState>,
+    Path(request_id): Path<String>,
+    Query(query): Query<AgentSessionQuery>,
+    Json(request): Json<AgentSessionApprovalRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let decision = match request.decision {
+        ApprovalChoice::Deny => ApprovalDecision::Deny,
+        ApprovalChoice::AllowOnce => ApprovalDecision::Allow,
+        ApprovalChoice::AllowSession => {
+            return Err(ApiError::conflict(
+                "session_approval_unavailable",
+                "provider-native session requests do not declare a remembered approval scope",
+            ));
+        }
+    };
+    state
+        .agent_directory
+        .resolve_request(
+            &AgentConnectorId::new(query.connector_id),
+            ResolveAgentSessionRequest {
+                session_id: AgentSessionId::new(query.session_id),
+                request_id: RequestId::new(request_id),
+                response: AgentSessionRequestResolution::Approval { decision },
+            },
+        )
+        .await?;
+    Ok(Json(json!({"resolved": true})))
 }
 
 async fn require_run(
@@ -3003,6 +3081,22 @@ mod tests {
     use orchestral_runtime::{AgentApprovalBridge, AgentController};
     use tokio::sync::broadcast;
     use tower::ServiceExt;
+
+    #[test]
+    fn provider_native_request_bodies_do_not_require_run_command_identity() {
+        let input: AgentSessionTextRequest = serde_json::from_value(serde_json::json!({
+            "text": "continue"
+        }))
+        .unwrap();
+        assert_eq!(input.text, "continue");
+        assert!(input.attachments.is_empty());
+
+        let approval: AgentSessionApprovalRequest = serde_json::from_value(serde_json::json!({
+            "decision": "allow_once"
+        }))
+        .unwrap();
+        assert!(matches!(approval.decision, ApprovalChoice::AllowOnce));
+    }
 
     #[test]
     fn supervision_retries_only_retryable_agent_failures() {

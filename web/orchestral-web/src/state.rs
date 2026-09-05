@@ -1239,6 +1239,7 @@ impl AppState {
         let latest_turn_status = detail.turns.last().map(|turn| turn.status.clone());
         let latest_turn_failure = detail.turns.last().and_then(|turn| turn.failure.clone());
         let controlled_runs = detail.controlled_runs.clone();
+        let pending_session_state = waiting_state_for_requests(&detail.pending_requests);
         let controlled_run_ids = controlled_runs
             .iter()
             .filter_map(controlled_run_id)
@@ -1320,6 +1321,14 @@ impl AppState {
             .apply_view(view, projection_time);
             self.reconcile_request_actions(&controlled_run_id);
         }
+        if let Some(waiting_state) = pending_session_state {
+            if let Some(session) = self.sessions.items.iter_mut().find(|session| {
+                session.id == detail.summary.session_id
+                    && session.connector_id.as_deref() == Some(detail.summary.connector_id.as_str())
+            }) {
+                session.state = Some(waiting_state.to_owned());
+            }
+        }
         timeline_before
             != self.agent_session_timeline_snapshot(&connector_id, &detail.summary.session_id)
     }
@@ -1340,6 +1349,42 @@ impl AppState {
 
         match change.change {
             AgentSessionChangeKindView::RefreshRequired { .. } => return false,
+            AgentSessionChangeKindView::PendingRequestUpsert { request } => {
+                if let Some(session) = self.sessions.items.iter_mut().find(|session| {
+                    session.id == session_id
+                        && session.connector_id.as_deref() == Some(connector_id.as_str())
+                }) {
+                    session.state = Some(waiting_state_for_request(&request).to_owned());
+                    session.updated_at_unix_ms =
+                        session.updated_at_unix_ms.max(observed_at_unix_ms);
+                }
+                let run = self.ensure_run_source(
+                    &run_id,
+                    Some(session_id.clone()),
+                    Some(connector_id.clone()),
+                );
+                let request_id = request
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                run.pending.retain(|candidate| {
+                    request_id.as_ref().is_none_or(|request_id| {
+                        candidate.get("request_id").and_then(Value::as_str) != Some(request_id)
+                    })
+                });
+                run.pending.push(request);
+                self.reconcile_request_actions(&run_id);
+            }
+            AgentSessionChangeKindView::PendingRequestClosed { request_id } => {
+                self.remove_session_pending_request(&connector_id, &session_id, &request_id);
+                if let Some(session) = self.sessions.items.iter_mut().find(|session| {
+                    session.id == session_id
+                        && session.connector_id.as_deref() == Some(connector_id.as_str())
+                }) {
+                    session.updated_at_unix_ms =
+                        session.updated_at_unix_ms.max(observed_at_unix_ms);
+                }
+            }
             AgentSessionChangeKindView::TurnStatus {
                 status, failure, ..
             } => {
@@ -1572,6 +1617,54 @@ impl AppState {
         self.ui.set_request_resolving(run_id, request_id, false);
         removed
     }
+
+    /// Converges one logical session request across its provider-history and
+    /// optional Host Run projections. This is used both by SSE close events
+    /// and by the successful HTTP response, so a lost/reordered close event
+    /// cannot leave a duplicate approval card behind.
+    pub fn remove_session_pending_request(
+        &mut self,
+        connector_id: &str,
+        session_id: &str,
+        request_id: &str,
+    ) -> bool {
+        let affected_runs = self
+            .runs
+            .iter()
+            .filter(|(_, run)| {
+                run.session_id.as_deref() == Some(session_id)
+                    && run.connector_id.as_deref() == Some(connector_id)
+            })
+            .map(|(run_id, _)| run_id.clone())
+            .collect::<Vec<_>>();
+        let mut removed = false;
+        for affected_run_id in affected_runs {
+            removed |= self.remove_pending_request(&affected_run_id, request_id);
+        }
+        let remaining_state = self
+            .runs
+            .values()
+            .filter(|run| {
+                run.session_id.as_deref() == Some(session_id)
+                    && run.connector_id.as_deref() == Some(connector_id)
+            })
+            .flat_map(|run| run.pending.iter())
+            .map(waiting_state_for_request)
+            .min_by_key(|state| usize::from(*state != "waiting_approval"));
+        if let Some(session) = self.sessions.items.iter_mut().find(|session| {
+            session.id == session_id && session.connector_id.as_deref() == Some(connector_id)
+        }) {
+            if let Some(remaining_state) = remaining_state {
+                session.state = Some(remaining_state.to_owned());
+            } else if matches!(
+                session.state.as_deref(),
+                Some("waiting_input" | "waiting_approval")
+            ) {
+                session.state = Some("active".to_owned());
+            }
+        }
+        removed
+    }
 }
 
 #[derive(Debug)]
@@ -1719,6 +1812,20 @@ fn session_state_for_turn_status(status: &str) -> &'static str {
         "pending" | "active" => "active",
         _ => "idle",
     }
+}
+
+fn waiting_state_for_request(request: &Value) -> &'static str {
+    match request.pointer("/payload/type").and_then(Value::as_str) {
+        Some("approval") => "waiting_approval",
+        _ => "waiting_input",
+    }
+}
+
+fn waiting_state_for_requests(requests: &[Value]) -> Option<&'static str> {
+    requests
+        .iter()
+        .map(waiting_state_for_request)
+        .min_by_key(|state| usize::from(*state != "waiting_approval"))
 }
 
 fn append_agent_history(
@@ -4915,6 +5022,111 @@ mod tests {
     }
 
     #[test]
+    fn live_session_request_changes_open_deduplicate_and_close_the_pending_panel() {
+        let detail: AgentSessionDetail = serde_json::from_value(serde_json::json!({
+            "summary": {
+                "connector_id": "fixture/local",
+                "session_id": "thread-request",
+                "state": "active"
+            },
+            "turns": [],
+            "pending_requests": []
+        }))
+        .unwrap();
+        let mut state = AppState::new(true);
+        state.project_agent_session(detail);
+        state.sessions.selected_id = Some("fixture/local\0thread-request".to_owned());
+        let opened: AgentSessionChangeView = serde_json::from_value(serde_json::json!({
+            "connector_id": "fixture/local",
+            "session_id": "thread-request",
+            "sequence": 1,
+            "change": {
+                "type": "pending_request_upsert",
+                "request": {
+                    "request_id": "approval-1",
+                    "blocking": true,
+                    "payload": {"type": "approval", "reason": "write a file"}
+                }
+            }
+        }))
+        .unwrap();
+
+        assert!(!state.apply_agent_session_change(opened.clone(), 2_000));
+        assert!(!state.apply_agent_session_change(opened, 2_000));
+        let history_id = "agent-history:fixture/local:thread-request";
+        assert_eq!(state.runs[history_id].pending.len(), 1);
+        assert_eq!(state.pending_run().unwrap().id, history_id);
+        assert_eq!(
+            state.selected_session().unwrap().state.as_deref(),
+            Some("waiting_approval")
+        );
+
+        let input_opened: AgentSessionChangeView = serde_json::from_value(serde_json::json!({
+            "connector_id": "fixture/local",
+            "session_id": "thread-request",
+            "sequence": 2,
+            "change": {
+                "type": "pending_request_upsert",
+                "request": {
+                    "request_id": "input-1",
+                    "blocking": true,
+                    "payload": {"type": "input", "prompt": []}
+                }
+            }
+        }))
+        .unwrap();
+        state.apply_agent_session_change(input_opened, 2_500);
+        assert_eq!(state.runs[history_id].pending.len(), 2);
+        state
+            .ensure_run_source(
+                "controlled-request-run",
+                Some("thread-request".to_owned()),
+                Some("fixture/local".to_owned()),
+            )
+            .pending
+            .push(serde_json::json!({
+                "request_id": "approval-1",
+                "blocking": true,
+                "payload": {"type": "approval", "reason": "write a file"}
+            }));
+
+        let closed: AgentSessionChangeView = serde_json::from_value(serde_json::json!({
+            "connector_id": "fixture/local",
+            "session_id": "thread-request",
+            "sequence": 3,
+            "change": {
+                "type": "pending_request_closed",
+                "request_id": "approval-1"
+            }
+        }))
+        .unwrap();
+        assert!(!state.apply_agent_session_change(closed, 3_000));
+        assert_eq!(state.runs[history_id].pending.len(), 1);
+        assert!(state.runs["controlled-request-run"].pending.is_empty());
+        assert_eq!(
+            state.selected_session().unwrap().state.as_deref(),
+            Some("waiting_input")
+        );
+
+        let input_closed: AgentSessionChangeView = serde_json::from_value(serde_json::json!({
+            "connector_id": "fixture/local",
+            "session_id": "thread-request",
+            "sequence": 4,
+            "change": {
+                "type": "pending_request_closed",
+                "request_id": "input-1"
+            }
+        }))
+        .unwrap();
+        assert!(!state.apply_agent_session_change(input_closed, 4_000));
+        assert!(state.runs[history_id].pending.is_empty());
+        assert_eq!(
+            state.selected_session().unwrap().state.as_deref(),
+            Some("active")
+        );
+    }
+
+    #[test]
     fn authoritative_agent_snapshot_drops_stale_controlled_run_and_exposes_pending() {
         let history_id = "agent-history:codex/local:thread-1";
         let mut state = AppState::new(true);
@@ -4945,10 +5157,13 @@ mod tests {
                 "title": "Fresh title",
                 "preview": "Fresh preview",
                 "updated_at_unix_ms": 42,
-                "state": "waiting_approval"
+                "state": "active"
             },
             "turns": [],
-            "pending_requests": [{"request_id": "approval-1"}],
+            "pending_requests": [{
+                "request_id": "approval-1",
+                "payload": {"type": "approval"}
+            }],
             "next_cursor": null
         }))
         .unwrap();

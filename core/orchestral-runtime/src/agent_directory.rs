@@ -12,7 +12,7 @@ use orchestral_core::agent_connector::{
     AgentConnectorId, AgentSessionActionExecution, AgentSessionActionInvocation,
     AgentSessionActionOutcome, AgentSessionActionStatus, AgentSessionChange, AgentSessionDetail,
     AgentSessionListQuery, AgentSessionPage, AgentSessionReadQuery, AgentSessionSummary,
-    CreateAgentSessionRequest, InvokeAgentSessionActionRequest,
+    CreateAgentSessionRequest, InvokeAgentSessionActionRequest, ResolveAgentSessionRequest,
 };
 use orchestral_core::agent_protocol::spi::{
     AgentJournalStore, AgentProvider, InMemoryAgentJournalStore,
@@ -176,6 +176,30 @@ impl AgentDirectory {
             .connector
             .subscribe_session_changes(session_id)
             .await?)
+    }
+
+    pub async fn resolve_request(
+        &self,
+        connector_id: &AgentConnectorId,
+        request: ResolveAgentSessionRequest,
+    ) -> Result<(), AgentDirectoryError> {
+        if request.session_id.is_empty() || request.request_id.is_empty() {
+            return Err(AgentConnectorError::invalid(
+                "session request resolution requires session and request identities",
+            )
+            .into());
+        }
+        request.response.validate()?;
+        let entry = self.entry(connector_id).await?;
+        self.verify_descriptor(&entry)?;
+        if !entry.descriptor.capabilities.resolve_requests {
+            return Err(AgentConnectorError::unsupported(
+                "connector does not declare provider-native request resolution",
+            )
+            .into());
+        }
+        entry.connector.resolve_request(request).await?;
+        Ok(())
     }
 
     pub async fn create_session(

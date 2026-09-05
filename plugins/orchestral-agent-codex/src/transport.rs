@@ -35,6 +35,7 @@ const DEFAULT_DAEMON_START_TIMEOUT: Duration = Duration::from_secs(5);
 // must never evict control or completion notifications for another thread.
 const SESSION_NOTIFICATION_CAPACITY: usize = 1_024;
 const GLOBAL_NOTIFICATION_CAPACITY: usize = 256;
+const REQUEST_NOTIFICATION_CAPACITY: usize = 128;
 
 /// Selects how the connector reaches Codex's app-server control plane.
 ///
@@ -265,14 +266,17 @@ pub(crate) enum CodexTransportEvent {
 
 struct NotificationRouter {
     global: broadcast::Sender<CodexTransportEvent>,
+    requests: broadcast::Sender<CodexTransportEvent>,
     sessions: SyncMutex<HashMap<String, broadcast::Sender<CodexTransportEvent>>>,
 }
 
 impl NotificationRouter {
     fn new() -> Self {
         let (global, _) = broadcast::channel(GLOBAL_NOTIFICATION_CAPACITY);
+        let (requests, _) = broadcast::channel(REQUEST_NOTIFICATION_CAPACITY);
         Self {
             global,
+            requests,
             sessions: SyncMutex::new(HashMap::new()),
         }
     }
@@ -294,10 +298,17 @@ impl NotificationRouter {
             .subscribe()
     }
 
+    fn subscribe_requests(&self) -> broadcast::Receiver<CodexTransportEvent> {
+        self.requests.subscribe()
+    }
+
     fn publish(&self, message: Value) {
         let event = CodexTransportEvent::Message(message);
         if self.global.receiver_count() > 0 {
             let _ = self.global.send(event.clone());
+        }
+        if is_request_lifecycle_message(&event) && self.requests.receiver_count() > 0 {
+            let _ = self.requests.send(event.clone());
         }
 
         let session_id = match &event {
@@ -333,6 +344,9 @@ impl NotificationRouter {
         if self.global.receiver_count() > 0 {
             let _ = self.global.send(event.clone());
         }
+        if self.requests.receiver_count() > 0 {
+            let _ = self.requests.send(event.clone());
+        }
         let senders = {
             let mut sessions = self
                 .sessions
@@ -347,6 +361,22 @@ impl NotificationRouter {
             let _ = sender.send(event.clone());
         }
     }
+}
+
+fn is_request_lifecycle_message(event: &CodexTransportEvent) -> bool {
+    let CodexTransportEvent::Message(message) = event else {
+        return false;
+    };
+    matches!(
+        message.get("method").and_then(Value::as_str),
+        Some(
+            "item/commandExecution/requestApproval"
+                | "item/fileChange/requestApproval"
+                | "item/permissions/requestApproval"
+                | "item/tool/requestUserInput"
+                | "serverRequest/resolved"
+        )
+    )
 }
 
 fn notification_session_id(message: &Value) -> Option<&str> {
@@ -591,6 +621,10 @@ impl CodexRpcClient {
         session_id: &str,
     ) -> broadcast::Receiver<CodexTransportEvent> {
         self.notifications.subscribe_session(session_id)
+    }
+
+    pub(crate) fn subscribe_requests(&self) -> broadcast::Receiver<CodexTransportEvent> {
+        self.notifications.subscribe_requests()
     }
 
     pub(crate) fn is_connected(&self) -> bool {
@@ -936,6 +970,7 @@ mod tests {
     async fn unscoped_notifications_never_enter_session_queues() {
         let router = NotificationRouter::new();
         let mut global = router.subscribe();
+        let mut requests = router.subscribe_requests();
         let mut first = router.subscribe_session("thread-first");
         let mut second = router.subscribe_session("thread-second");
         let message = json!({
@@ -947,6 +982,10 @@ mod tests {
 
         assert!(matches!(
             global.try_recv(),
+            Ok(CodexTransportEvent::Message(received)) if received == message
+        ));
+        assert!(matches!(
+            requests.try_recv(),
             Ok(CodexTransportEvent::Message(received)) if received == message
         ));
         assert!(matches!(

@@ -27,10 +27,13 @@ use orchestral_core::agent_connector::{
     AgentSessionCreationDescriptor, AgentSessionDetail, AgentSessionExecutionProfile,
     AgentSessionListQuery, AgentSessionPage, AgentSessionPermissions, AgentSessionReadQuery,
     AgentSessionSummary, AgentSessionTurnId, AgentSessionTurnStatus, CreateAgentSessionRequest,
-    InvokeAgentSessionActionRequest, SESSION_COMPACT_ACTION, SESSION_FORK_ACTION,
-    SESSION_RENAME_ACTION, SESSION_REVIEW_ACTION, SESSION_SET_PERMISSIONS_ACTION,
+    InvokeAgentSessionActionRequest, ResolveAgentSessionRequest, SESSION_COMPACT_ACTION,
+    SESSION_FORK_ACTION, SESSION_RENAME_ACTION, SESSION_REVIEW_ACTION,
+    SESSION_SET_PERMISSIONS_ACTION,
 };
-use orchestral_core::agent_protocol::wire::{AgentSessionId, ProviderBindingRef};
+use orchestral_core::agent_protocol::wire::{
+    AgentSessionId, PendingRequest, PendingRequestKind, ProviderBindingRef, RequestId,
+};
 use orchestral_core::io::{ArtifactPublisher, ArtifactResolver, BlobStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -92,6 +95,13 @@ struct ConnectedClient {
     user_agent: String,
 }
 
+#[derive(Clone)]
+struct SessionPendingRequest {
+    request: PendingRequest,
+    native: provider::NativePendingRequest,
+    resolved: bool,
+}
+
 /// Long-lived local Codex connector. By default it attaches to Codex's shared
 /// app-server daemon; UI subscribers never own native Codex connections.
 pub struct CodexConnector {
@@ -104,6 +114,9 @@ pub struct CodexConnector {
     client: AsyncMutex<Option<Arc<ConnectedClient>>>,
     limits: NormalizationLimits,
     provider_state: StdMutex<provider::ProviderState>,
+    session_pending_requests:
+        Arc<StdMutex<BTreeMap<String, BTreeMap<RequestId, SessionPendingRequest>>>>,
+    session_ancestor_cache: Arc<AsyncMutex<BTreeMap<String, Vec<String>>>>,
     session_execution_profiles: Arc<StdMutex<BTreeMap<String, AgentSessionExecutionProfile>>>,
     session_list_cache: StdMutex<BTreeMap<SessionListCacheKey, SessionListCacheEntry>>,
     session_list_cache_path: Option<PathBuf>,
@@ -125,6 +138,8 @@ impl CodexConnector {
             client: AsyncMutex::new(None),
             limits: NormalizationLimits::default(),
             provider_state: StdMutex::new(provider::ProviderState::default()),
+            session_pending_requests: Arc::new(StdMutex::new(BTreeMap::new())),
+            session_ancestor_cache: Arc::new(AsyncMutex::new(BTreeMap::new())),
             session_execution_profiles: Arc::new(StdMutex::new(BTreeMap::new())),
             session_list_cache: StdMutex::new(BTreeMap::new()),
             session_list_cache_path: None,
@@ -187,11 +202,23 @@ impl CodexConnector {
         if let Some(client) = client.as_ref().filter(|client| client.rpc.is_connected()) {
             return Ok(Arc::clone(client));
         }
+        let replacing_disconnected_client = client.is_some();
         *client = None;
         self.provider_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .reset_connection_state();
+        if replacing_disconnected_client {
+            // Native request ids are JSON-RPC connection capabilities, not
+            // durable history. Never retain an approval card whose response
+            // handle belonged to a dead transport. A fresh notification can
+            // repopulate it after reconnect if the provider reissues it.
+            self.session_pending_requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+            self.session_ancestor_cache.lock().await.clear();
+        }
         #[cfg(test)]
         if let Some(connected) = self
             .reconnect_clients
@@ -662,6 +689,8 @@ impl CodexConnector {
             }))),
             limits: NormalizationLimits::default(),
             provider_state: StdMutex::new(provider::ProviderState::default()),
+            session_pending_requests: Arc::new(StdMutex::new(BTreeMap::new())),
+            session_ancestor_cache: Arc::new(AsyncMutex::new(BTreeMap::new())),
             session_execution_profiles: Arc::new(StdMutex::new(BTreeMap::new())),
             session_list_cache: StdMutex::new(BTreeMap::new()),
             session_list_cache_path: None,
@@ -690,6 +719,8 @@ impl CodexConnector {
             }))),
             limits: NormalizationLimits::default(),
             provider_state: StdMutex::new(provider::ProviderState::default()),
+            session_pending_requests: Arc::new(StdMutex::new(BTreeMap::new())),
+            session_ancestor_cache: Arc::new(AsyncMutex::new(BTreeMap::new())),
             session_execution_profiles: Arc::new(StdMutex::new(BTreeMap::new())),
             session_list_cache: StdMutex::new(BTreeMap::new()),
             session_list_cache_path: None,
@@ -719,6 +750,7 @@ impl AgentConnector for CodexConnector {
             display_name: "Codex".to_owned(),
             capabilities: AgentSessionCapabilities {
                 create: true,
+                resolve_requests: true,
                 ..AgentSessionCapabilities::discoverable()
             },
             creation: Some(AgentSessionCreationDescriptor {
@@ -858,6 +890,16 @@ impl AgentConnector for CodexConnector {
             .await?;
         if live_edge {
             page.turns.extend(deferred_turns?);
+            page.pending_requests = self
+                .session_pending_requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(session_id.as_str())
+                .into_iter()
+                .flat_map(BTreeMap::values)
+                .filter(|pending| !pending.resolved)
+                .map(|pending| pending.request.clone())
+                .collect();
         }
         page.validate_for(&self.describe().connector_id)?;
         Ok(page)
@@ -874,6 +916,7 @@ impl AgentConnector for CodexConnector {
         // Subscribe to transport notifications before attaching so events
         // emitted during the metadata-only resume cannot be lost.
         let mut native = client.rpc.subscribe_session(session_id.as_str());
+        let mut related_requests = client.rpc.subscribe_requests();
         let had_execution_profile = self
             .session_execution_profiles
             .lock()
@@ -928,6 +971,9 @@ impl AgentConnector for CodexConnector {
         let artifact_blob_store = self.artifact_blob_store.clone();
         let generated_artifacts = self.generated_artifacts.clone();
         let session_execution_profiles = Arc::clone(&self.session_execution_profiles);
+        let session_pending_requests = Arc::clone(&self.session_pending_requests);
+        let session_ancestor_cache = Arc::clone(&self.session_ancestor_cache);
+        let rpc = Arc::clone(&client.rpc);
         let (changes, receiver) = broadcast::channel(64);
         let learned_execution_profile = !had_execution_profile
             && self
@@ -948,11 +994,34 @@ impl AgentConnector for CodexConnector {
         }
         tokio::spawn(async move {
             let mut sequence = initial_sequence;
+            let mut related_requests_open = true;
             loop {
-                match native.recv().await {
-                    Ok(CodexTransportEvent::Message(message))
-                        if is_session_change_notification(&message, &watched_session_id) =>
-                    {
+                let (received, from_related_requests) = tokio::select! {
+                    received = native.recv() => (received, false),
+                    received = related_requests.recv(), if related_requests_open => (received, true),
+                };
+                match received {
+                    Ok(CodexTransportEvent::Message(message)) => {
+                        let exact = is_session_change_notification(&message, &watched_session_id);
+                        // Exact request messages are present in both queues;
+                        // the session queue owns that copy. The low-volume
+                        // request queue is only for explicitly related child
+                        // sessions, never for cwd- or process-wide broadcast.
+                        if from_related_requests && exact {
+                            continue;
+                        }
+                        let related = from_related_requests
+                            && route_related_session_request(
+                                &rpc,
+                                &message,
+                                &watched_session_id,
+                                &session_pending_requests,
+                                &session_ancestor_cache,
+                            )
+                            .await;
+                        if !exact && !related {
+                            continue;
+                        }
                         if message.get("method").and_then(Value::as_str)
                             == Some("thread/settings/updated")
                         {
@@ -964,7 +1033,12 @@ impl AgentConnector for CodexConnector {
                                     .unwrap_or(&message),
                             );
                         }
-                        let mut change = native_session_change(&message, &limits);
+                        let mut change = native_session_change(
+                            &message,
+                            &limits,
+                            &session_pending_requests,
+                            &watched_session_id,
+                        );
                         generated_artifacts
                             .enrich_change(
                                 artifact_blob_store.as_ref(),
@@ -986,7 +1060,16 @@ impl AgentConnector for CodexConnector {
                             return;
                         }
                     }
-                    Ok(CodexTransportEvent::Message(_)) => {}
+                    Ok(CodexTransportEvent::Disconnected { .. })
+                    | Err(broadcast::error::RecvError::Closed)
+                        if from_related_requests =>
+                    {
+                        // Both feeds receive disconnect independently. Drain
+                        // the exact session feed first so already-queued
+                        // terminal/activity events cannot be overtaken by the
+                        // auxiliary child-request feed.
+                        related_requests_open = false;
+                    }
                     Ok(CodexTransportEvent::Disconnected { .. })
                     | Err(broadcast::error::RecvError::Closed) => return,
                     Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -1009,6 +1092,61 @@ impl AgentConnector for CodexConnector {
             }
         });
         Ok(receiver)
+    }
+
+    async fn resolve_request(
+        &self,
+        request: ResolveAgentSessionRequest,
+    ) -> Result<(), AgentConnectorError> {
+        request.response.validate()?;
+        let pending = self
+            .session_pending_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(request.session_id.as_str())
+            .and_then(|requests| requests.get(&request.request_id))
+            .filter(|pending| !pending.resolved)
+            .cloned()
+            .ok_or_else(|| {
+                AgentConnectorError::new(
+                    AgentConnectorErrorCode::NotFound,
+                    "provider-native session request is no longer pending",
+                    false,
+                )
+            })?;
+        if pending.native.kind() != request.response.kind() {
+            return Err(AgentConnectorError::new(
+                AgentConnectorErrorCode::InvalidRequest,
+                "session request response kind does not match the pending request",
+                false,
+            ));
+        }
+        let response = provider::native_session_resolution(&pending.native, &request.response)?;
+        let client = self.client().await?;
+        client
+            .rpc
+            .respond(pending.native.rpc_id().clone(), response)
+            .await
+            .map_err(connector_transport_error)?;
+
+        // Hide the request from immediate snapshots while retaining its RPC
+        // identity until `serverRequest/resolved` closes it for every live
+        // observer. A retry now converges as already resolved.
+        let mut sessions = self
+            .session_pending_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(requests) = sessions.get_mut(request.session_id.as_str()) {
+            let same_request = requests
+                .get(&request.request_id)
+                .is_some_and(|current| current.native.rpc_id() == pending.native.rpc_id());
+            if same_request {
+                if let Some(current) = requests.get_mut(&request.request_id) {
+                    current.resolved = true;
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn create_session(
@@ -1630,16 +1768,193 @@ fn is_session_change_notification(message: &Value, session_id: &AgentSessionId) 
                     | "turn/started"
                     | "item/completed"
                     | "turn/completed"
+                    | "item/commandExecution/requestApproval"
+                    | "item/fileChange/requestApproval"
+                    | "item/permissions/requestApproval"
+                    | "item/tool/requestUserInput"
                     | "serverRequest/resolved"
             )
         )
 }
 
-fn native_session_change(message: &Value, limits: &NormalizationLimits) -> AgentSessionChangeKind {
+async fn route_related_session_request(
+    rpc: &CodexRpcClient,
+    message: &Value,
+    watched_session_id: &AgentSessionId,
+    pending_requests: &Arc<StdMutex<BTreeMap<String, BTreeMap<RequestId, SessionPendingRequest>>>>,
+    ancestor_cache: &Arc<AsyncMutex<BTreeMap<String, Vec<String>>>>,
+) -> bool {
+    let method = message.get("method").and_then(Value::as_str);
+    if method == Some("serverRequest/resolved") {
+        let Some(native_request_id) = message.pointer("/params/requestId") else {
+            return false;
+        };
+        return pending_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(watched_session_id.as_str())
+            .is_some_and(|requests| {
+                requests
+                    .values()
+                    .any(|pending| pending.native.rpc_id() == native_request_id)
+            });
+    }
+    if !matches!(
+        method,
+        Some(
+            "item/commandExecution/requestApproval"
+                | "item/fileChange/requestApproval"
+                | "item/permissions/requestApproval"
+                | "item/tool/requestUserInput"
+        )
+    ) {
+        return false;
+    }
+    let Some(mut current) = message
+        .pointer("/params/threadId")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return false;
+    };
+    let child_session_id = current.clone();
+    let mut cache = ancestor_cache.lock().await;
+    if let Some(ancestors) = cache.get(&child_session_id) {
+        return ancestors
+            .iter()
+            .any(|ancestor| ancestor == watched_session_id.as_str());
+    }
+    let mut seen = BTreeSet::new();
+    let mut ancestors = Vec::new();
+    for _ in 0..16 {
+        if !seen.insert(current.clone()) {
+            cache.insert(child_session_id, Vec::new());
+            return false;
+        }
+        let result = match rpc
+            .request(
+                "thread/read",
+                json!({"threadId": current.as_str(), "includeTurns": false}),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::debug!(
+                    child_session_id = %current,
+                    root_session_id = %watched_session_id,
+                    %error,
+                    "could not verify native child session ownership for a request"
+                );
+                return false;
+            }
+        };
+        let Some(thread) = result.get("thread") else {
+            cache.insert(child_session_id, Vec::new());
+            return false;
+        };
+        let Some(parent) = native_parent_thread_id(thread) else {
+            cache.insert(child_session_id, ancestors);
+            return false;
+        };
+        ancestors.push(parent.to_owned());
+        if parent == watched_session_id.as_str() {
+            cache.insert(child_session_id, ancestors);
+            return true;
+        }
+        current = parent.to_owned();
+    }
+    cache.insert(child_session_id, Vec::new());
+    false
+}
+
+fn native_parent_thread_id(thread: &Value) -> Option<&str> {
+    thread
+        .get("parentThreadId")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            thread
+                .pointer("/source/subAgent/thread_spawn/parent_thread_id")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            thread
+                .pointer("/source/subagent/thread_spawn/parent_thread_id")
+                .and_then(Value::as_str)
+        })
+}
+
+fn native_session_change(
+    message: &Value,
+    limits: &NormalizationLimits,
+    pending_requests: &Arc<StdMutex<BTreeMap<String, BTreeMap<RequestId, SessionPendingRequest>>>>,
+    session_id: &AgentSessionId,
+) -> AgentSessionChangeKind {
     let method = message
         .get("method")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
+    let request_kind = match method {
+        "item/commandExecution/requestApproval"
+        | "item/fileChange/requestApproval"
+        | "item/permissions/requestApproval" => Some(PendingRequestKind::Approval),
+        "item/tool/requestUserInput" => Some(PendingRequestKind::Input),
+        _ => None,
+    };
+    if let Some(kind) = request_kind {
+        let Some((request, native)) = provider::normalize_native_request(message, kind) else {
+            return AgentSessionChangeKind::RefreshRequired {
+                reason: "native_request_without_identity".to_owned(),
+            };
+        };
+        pending_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(session_id.as_str().to_owned())
+            .or_default()
+            .insert(
+                request.request_id.clone(),
+                SessionPendingRequest {
+                    request: request.clone(),
+                    native,
+                    resolved: false,
+                },
+            );
+        return AgentSessionChangeKind::PendingRequestUpsert { request };
+    }
+    if method == "serverRequest/resolved" {
+        let Some(native_request_id) = message.pointer("/params/requestId") else {
+            return AgentSessionChangeKind::RefreshRequired {
+                reason: "native_request_resolution_without_identity".to_owned(),
+            };
+        };
+        let request_id = {
+            let mut sessions = pending_requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let request_id = sessions.get(session_id.as_str()).and_then(|requests| {
+                requests
+                    .iter()
+                    .find(|(_, pending)| pending.native.rpc_id() == native_request_id)
+                    .map(|(request_id, _)| request_id.clone())
+            });
+            if let Some(request_id) = request_id.as_ref() {
+                if let Some(requests) = sessions.get_mut(session_id.as_str()) {
+                    requests.remove(request_id);
+                    if requests.is_empty() {
+                        sessions.remove(session_id.as_str());
+                    }
+                }
+            }
+            request_id
+        };
+        return request_id.map_or_else(
+            || AgentSessionChangeKind::RefreshRequired {
+                reason: "native_request_resolved_by_another_client".to_owned(),
+            },
+            |request_id| AgentSessionChangeKind::PendingRequestClosed { request_id },
+        );
+    }
     // Item notifications carry `turnId`; current Codex turn notifications
     // carry the full turn and identify it at `turn.id`. Accept both protocol
     // generations so a terminal event is never downgraded to a blind refresh.
@@ -1696,8 +2011,8 @@ mod tests {
     use chrono::Utc;
     use futures_util::StreamExt;
     use orchestral_core::agent_connector::{
-        AgentSessionReadQuery, AgentSessionState, CreateAgentSessionRequest,
-        InvokeAgentSessionActionRequest,
+        AgentSessionReadQuery, AgentSessionRequestResolution, AgentSessionState,
+        CreateAgentSessionRequest, InvokeAgentSessionActionRequest,
     };
     use orchestral_core::agent_protocol::wire::{
         AgentEvent, AgentProviderStreamItem, AgentRunEnvelope, AgentStartRequest, Content,
@@ -2250,6 +2565,194 @@ mod tests {
             } if failure.code == "codex_response_stream_connection_failed"
                 && failure.message == "proxy connection failed with status 502"
                 && failure.retryable
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_native_permission_approval_is_visible_and_resolvable_by_session() {
+        let (client_io, server_io) = duplex(128 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let connector = CodexConnector::with_client(rpc, "codex/0.153.1");
+        let server = tokio::spawn(async move {
+            let mut requests = BufReader::new(server_read).lines();
+            let resume = read_request(&mut requests).await;
+            assert_eq!(resume["method"], "thread/resume");
+            write_result(
+                &mut server_write,
+                &resume,
+                json!({"thread": thread("thread-approval", Value::Null)}),
+            )
+            .await;
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({
+                            "id": 77,
+                            "method": "item/permissions/requestApproval",
+                            "params": {
+                                "threadId": "thread-approval",
+                                "turnId": "turn-approval",
+                                "itemId": "permission-1",
+                                "reason": "Allow access outside the workspace",
+                                "permissions": {"fileSystem": {"write": ["/tmp"]}}
+                            }
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let response = read_request(&mut requests).await;
+            assert_eq!(response["id"], 77);
+            assert_eq!(
+                response["result"],
+                json!({
+                    "permissions": {"fileSystem": {"write": ["/tmp"]}},
+                    "scope": "turn"
+                })
+            );
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({
+                            "method": "serverRequest/resolved",
+                            "params": {"threadId": "thread-approval", "requestId": 77}
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+
+        let session_id = AgentSessionId::new("thread-approval");
+        let mut changes = connector
+            .subscribe_session_changes(&session_id)
+            .await
+            .unwrap();
+        let opened = tokio::time::timeout(Duration::from_secs(1), changes.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let request_id = match opened.change {
+            AgentSessionChangeKind::PendingRequestUpsert { request } => {
+                assert_eq!(request.request_id.as_str(), "codex-permission-1");
+                assert!(matches!(
+                    request.payload,
+                    orchestral_core::agent_protocol::wire::PendingRequestPayload::Approval { .. }
+                ));
+                request.request_id
+            }
+            change => panic!("expected pending request upsert, got {change:?}"),
+        };
+
+        connector
+            .resolve_request(ResolveAgentSessionRequest {
+                session_id,
+                request_id: request_id.clone(),
+                response: AgentSessionRequestResolution::Approval {
+                    decision: orchestral_core::agent_protocol::wire::ApprovalDecision::Allow,
+                },
+            })
+            .await
+            .unwrap();
+        let closed = tokio::time::timeout(Duration::from_secs(1), changes.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            closed.change,
+            AgentSessionChangeKind::PendingRequestClosed { request_id: closed_id }
+                if closed_id == request_id
+        ));
+        assert!(connector
+            .session_pending_requests
+            .lock()
+            .unwrap()
+            .get("thread-approval")
+            .is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn descendant_approval_routes_to_its_explicit_ancestor_only() {
+        let (client_io, server_io) = duplex(128 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        let connector = CodexConnector::with_client(rpc, "codex/0.153.1");
+        let server = tokio::spawn(async move {
+            let mut requests = BufReader::new(server_read).lines();
+            let resume = read_request(&mut requests).await;
+            write_result(
+                &mut server_write,
+                &resume,
+                json!({"thread": thread("thread-root", Value::Null)}),
+            )
+            .await;
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({
+                            "id": 88,
+                            "method": "item/fileChange/requestApproval",
+                            "params": {
+                                "threadId": "thread-child",
+                                "turnId": "turn-child",
+                                "itemId": "file-change-1",
+                                "reason": "Update a generated file"
+                            }
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let ancestry = read_request(&mut requests).await;
+            assert_eq!(ancestry["method"], "thread/read");
+            assert_eq!(ancestry["params"]["threadId"], "thread-child");
+            write_result(
+                &mut server_write,
+                &ancestry,
+                json!({
+                    "thread": {
+                        "id": "thread-child",
+                        "parentThreadId": "thread-root"
+                    }
+                }),
+            )
+            .await;
+        });
+
+        let mut changes = connector
+            .subscribe_session_changes(&AgentSessionId::new("thread-root"))
+            .await
+            .unwrap();
+        let opened = tokio::time::timeout(Duration::from_secs(1), changes.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            opened.change,
+            AgentSessionChangeKind::PendingRequestUpsert { request }
+                if request.request_id.as_str() == "codex-file-change-1"
         ));
         server.await.unwrap();
     }

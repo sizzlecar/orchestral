@@ -430,6 +430,48 @@ impl ApiClient {
         .await
     }
 
+    pub async fn resolve_session_input(
+        &self,
+        credential: &ApiCredential,
+        connector_id: &str,
+        session_id: &str,
+        request_id: &str,
+        text: &str,
+    ) -> Result<Value, ApiError> {
+        self.command(
+            credential,
+            &format!(
+                "/agent-session/requests/{}/input?connector_id={}&session_id={}",
+                encode(request_id),
+                encode(connector_id),
+                encode(session_id)
+            ),
+            json!({ "text": text }),
+        )
+        .await
+    }
+
+    pub async fn resolve_session_approval(
+        &self,
+        credential: &ApiCredential,
+        connector_id: &str,
+        session_id: &str,
+        request_id: &str,
+        decision: &str,
+    ) -> Result<Value, ApiError> {
+        self.command(
+            credential,
+            &format!(
+                "/agent-session/requests/{}/approval?connector_id={}&session_id={}",
+                encode(request_id),
+                encode(connector_id),
+                encode(session_id)
+            ),
+            json!({ "decision": decision }),
+        )
+        .await
+    }
+
     pub async fn stream<F>(
         &self,
         credential: &ApiCredential,
