@@ -57,21 +57,16 @@ self.addEventListener("activate", (event) => {
         }));
         await self.clients.claim();
 
-        // Never reload a visible conversation during deployment. Hidden
-        // clients may update immediately; visible clients apply the update
-        // when the page next enters the background.
+        // Let the app preserve drafts and finish in-flight actions before the
+        // user applies an update. Backgrounding is not permission to navigate.
         if (upgrading) {
             const windows = await self.clients.matchAll({
                 type: "window",
                 includeUncontrolled: true,
             });
-            await Promise.all(windows.map((client) => {
-                if (client.visibilityState !== "visible" && "navigate" in client) {
-                    return client.navigate(client.url);
-                }
+            for (const client of windows) {
                 client.postMessage({ type: "ORCHESTRAL_UPDATE_READY" });
-                return Promise.resolve();
-            }));
+            }
         }
     })());
 });
@@ -83,7 +78,9 @@ self.addEventListener("fetch", (event) => {
     if (url.origin !== self.location.origin) return;
 
     if (isSensitive(request, url)) {
-        event.respondWith(fetch(request, { cache: "no-store" }));
+        // API clients and Host responses already require no-store. Let the
+        // browser own live response bodies: proxying endless SSE through an
+        // active worker can keep the next installed worker from activating.
         return;
     }
 

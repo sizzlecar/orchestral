@@ -12,6 +12,11 @@ const CSS: Asset = asset!("/assets/styles.css");
 
 #[component]
 pub fn App() -> Element {
+    use_hook(|| {
+        std::panic::set_hook(Box::new(|info| {
+            web_sys::console::error_1(&format!("Orchestral browser error: {info}").into());
+        }));
+    });
     let state = use_signal(|| AppState::new(platform::is_online()));
     let token = use_signal(|| None::<ApiCredential>);
     let pairing_secret = use_signal(platform::take_pairing_secret);
@@ -39,6 +44,13 @@ pub fn App() -> Element {
         )
     });
     let _listeners = use_hook(move || Rc::new(controller.window_listeners()));
+    use_future(move || async move {
+        let _ = platform::register_service_worker(move || {
+            let mut state = state;
+            state.write().ui.update_available = true;
+        })
+        .await;
+    });
     use_future(move || async move { controller.bootstrap().await });
 
     let status = state.read().auth.status.clone();

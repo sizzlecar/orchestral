@@ -46,6 +46,7 @@ wasm-streams = { version = "0.6", optional = true }
 version = "0.3"
 optional = true
 features = [
+    "console",
     "AbortController",
     "AbortSignal",
     "Clipboard",
@@ -81,6 +82,8 @@ features = [
     "RequestMode",
     "Response",
     "ServiceWorkerContainer",
+    "ServiceWorker",
+    "ServiceWorkerState",
     "ServiceWorkerRegistration",
     "Storage",
     "VisibilityState",

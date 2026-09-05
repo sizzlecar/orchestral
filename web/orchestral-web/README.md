@@ -39,6 +39,7 @@ After rebuilding, run from the repository root with Node.js, Chrome, and
 ```sh
 node scripts/pwa_browser_smoke.cjs
 PWA_SMOKE_WIDTH=320 node scripts/pwa_browser_smoke.cjs
+PWA_SMOKE_SW=1 node scripts/pwa_browser_smoke.cjs
 ```
 
 Set `NODE_PATH` if Playwright is installed outside the repository, or
@@ -48,6 +49,9 @@ port. It checks ambiguous submission retry, stable identity, message ordering,
 approval visibility and retry, per-session drafts, IME Enter, offline editing,
 and mobile layout. Screenshots are written to `target/pwa-smoke/`.
 
-The fixture never connects to a real Host or model. Service workers are disabled
-for this smoke so it always tests the bundle just built; installed PWA updates
-and device-specific suspend/resume still need device testing.
+The fixture never connects to a real Host or model. By default service workers
+are disabled so the smoke tests the bundle just built. `PWA_SMOKE_SW=1` enables
+the real worker, simulates a release while the page stays open, and checks
+foreground update detection, the explicit refresh action, and preservation of
+drafts in multiple sessions. Device-specific suspend/resume still needs device
+testing.

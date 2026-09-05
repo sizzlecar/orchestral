@@ -7,6 +7,9 @@ const { chromium } = require("playwright");
 const dist = path.join(process.cwd(), "web/orchestral-web/dist");
 const width = Number(process.env.PWA_SMOKE_WIDTH || 390);
 const now = Date.now();
+const testWorker = process.env.PWA_SMOKE_SW === "1";
+let workerRevision = 0;
+const workerRequests = [];
 const content = (text) => [{ body: { kind: "inline", value: text } }];
 const approval = {
   request_id: "native-approval",
@@ -188,6 +191,11 @@ const server = http.createServer(async (req, res) => {
       });
     }
     if (route === "/agent-session/requests/native-approval/approval") {
+      assert.deepEqual(
+        Object.keys(body),
+        ["decision"],
+        "native approval is not a Run command",
+      );
       approvalAttempts++;
       if (approvalAttempts === 1)
         return json(
@@ -196,6 +204,17 @@ const server = http.createServer(async (req, res) => {
           409,
         );
       nativePending = [];
+      return json(res, { resolved: true });
+    }
+    if (route === "/agent-session/requests/native-input/input") {
+      assert.deepEqual(
+        Object.keys(body),
+        ["text"],
+        "native input is not a Run command",
+      );
+      nativePending = nativePending.filter(
+        (request) => request.request_id !== "native-input",
+      );
       return json(res, { resolved: true });
     }
     if (route === "/runs/owner/requests/host-input/input") {
@@ -210,6 +229,17 @@ const server = http.createServer(async (req, res) => {
   if (!file.startsWith(dist) || !fs.existsSync(file)) {
     res.writeHead(404);
     return res.end("missing");
+  }
+  if (requested === "/sw.js") {
+    workerRequests.push(workerRevision);
+    let worker = fs.readFileSync(file, "utf8");
+    if (workerRevision)
+      worker = worker.replace(/BUILD_ID="([^"]+)"/, 'BUILD_ID="$1-smoke-new"');
+    res.writeHead(200, {
+      "content-type": "text/javascript",
+      "cache-control": "no-store",
+    });
+    return res.end(worker);
   }
   const type =
     {
@@ -234,11 +264,15 @@ const server = http.createServer(async (req, res) => {
     deviceScaleFactor: 1,
     isMobile: true,
     hasTouch: true,
-    serviceWorkers: "block",
+    serviceWorkers: testWorker ? "allow" : "block",
   });
   const page = await context.newPage();
   let errors = [];
-  page.on("pageerror", (e) => errors.push(e.message));
+  page.on("pageerror", (e) => errors.push(e.stack || e.message));
+  page.on("console", (message) => {
+    if (message.type() === "error")
+      console.error("Browser console:", message.text());
+  });
   page.setDefaultTimeout(12000);
   const openSession = async (title) => {
     await page.getByRole("button", { name: "打开会话列表" }).click();
@@ -371,6 +405,19 @@ const server = http.createServer(async (req, res) => {
     });
     await card.getByRole("button", { name: "允许一次" }).click();
     await card.waitFor({ state: "detached" });
+    nativePending.push({
+      request_id: "native-input",
+      blocking: true,
+      payload: { type: "input", prompt: content("补充输入回归") },
+    });
+    await openSession("另一个会话");
+    await openSession("同步验证会话");
+    const nativeInput = page.locator('[data-request-id="native-input"]');
+    await nativeInput.getByRole("textbox").fill("继续检查");
+    await nativeInput
+      .getByRole("button", { name: "继续", exact: true })
+      .click();
+    await nativeInput.waitFor({ state: "detached" });
     await context.setOffline(true);
     await input.fill("离线草稿");
     assert.equal(await input.isEnabled(), true);
@@ -381,6 +428,54 @@ const server = http.createServer(async (req, res) => {
       true,
     );
     await context.setOffline(false);
+    await page.waitForFunction(
+      () =>
+        !document
+          .querySelector(".composer-hint")
+          .textContent.includes("当前离线"),
+    );
+    if (testWorker) {
+      await page.waitForFunction(async () => {
+        const registration = await navigator.serviceWorker.getRegistration();
+        return registration?.active && navigator.serviceWorker.controller;
+      });
+      await input.fill("升级后保留的草稿");
+      workerRevision = 1;
+      // Exercise the real foreground update check, including worker install,
+      // cache activation, client notification and the app's explicit update UI.
+      await page.evaluate(() =>
+        document.dispatchEvent(
+          new Event("visibilitychange", { bubbles: true }),
+        ),
+      );
+      const update = page.getByRole("button", {
+        name: "刷新更新",
+        exact: true,
+      });
+      await update.waitFor();
+      assert.equal(
+        await input.inputValue(),
+        "升级后保留的草稿",
+        "update discovery preserves active draft",
+      );
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: "domcontentloaded" }),
+        update.click(),
+      ]);
+      await openSession("同步验证会话");
+      assert.equal(
+        await input.inputValue(),
+        "升级后保留的草稿",
+        "draft survives update reload",
+      );
+      await openSession("另一个会话");
+      assert.equal(
+        await input.inputValue(),
+        "会话 B 草稿",
+        "other session draft survives update reload",
+      );
+      await openSession("同步验证会话");
+    }
     assert.deepEqual(errors, [], "no browser runtime exceptions");
     console.log(
       JSON.stringify({
@@ -398,6 +493,14 @@ const server = http.createServer(async (req, res) => {
           "single message projection",
           "approval failure and retry",
           "offline draft",
+          "native input payload",
+          ...(testWorker
+            ? [
+                "worker update discovery",
+                "explicit update action",
+                "drafts survive reload",
+              ]
+            : []),
         ],
         httpSubmissions: calls.length,
         effects: effects.size,
@@ -412,6 +515,22 @@ const server = http.createServer(async (req, res) => {
     });
     console.error(error);
     console.error("Browser errors:", errors);
+    console.error("Worker requests:", workerRequests);
+    if (testWorker)
+      console.error(
+        "Worker state:",
+        await page.evaluate(async () => {
+          const r = await navigator.serviceWorker.getRegistration();
+          return {
+            visible: document.visibilityState,
+            online: navigator.onLine,
+            caches: await caches.keys(),
+            active: r?.active?.state,
+            waiting: r?.waiting?.state,
+            installing: r?.installing?.state,
+          };
+        }),
+      );
     console.error((await page.locator("body").innerText()).slice(-4000));
     process.exitCode = 1;
   } finally {

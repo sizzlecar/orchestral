@@ -162,7 +162,6 @@ impl AppController {
     }
 
     pub async fn bootstrap(mut self) {
-        let _ = platform::register_service_worker().await;
         platform::apply_theme(&self.preferences.read().theme);
         if self.pairing_secret.read().is_some() {
             self.claim_pairing().await;

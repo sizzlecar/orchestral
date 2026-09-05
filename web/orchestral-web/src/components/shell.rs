@@ -4,6 +4,7 @@ use dioxus::prelude::*;
 use gloo_timers::future::TimeoutFuture;
 
 use crate::browser::controller::AppController;
+use crate::browser::{platform, storage};
 use crate::components::pending::PendingPanel;
 use crate::components::session_control::{NewSessionPanel, SessionActionsPanel};
 use crate::components::settings::SettingsPanel;
@@ -499,12 +500,21 @@ fn ConnectionStatus() -> Element {
 #[component]
 fn Composer() -> Element {
     let controller = consume_context::<AppController>();
-    let mut draft = use_signal(String::new);
-    let mut attachments = use_signal(Vec::<crate::model::UploadedArtifact>::new);
+    let initial_session = controller
+        .state
+        .read()
+        .sessions
+        .selected_id
+        .clone()
+        .unwrap_or_default();
+    let mut restored = use_hook(storage::load_drafts);
+    let (initial_text, initial_files) = restored.remove(&initial_session).unwrap_or_default();
+    let mut draft = use_signal(|| initial_text);
+    let mut attachments = use_signal(|| initial_files);
     let mut uploads_in_flight = use_signal(|| 0_usize);
     let mut upload_error = use_signal(|| None::<String>);
-    let mut saved_drafts =
-        use_signal(BTreeMap::<String, (String, Vec<crate::model::UploadedArtifact>)>::new);
+    let mut saved_drafts = use_signal(|| restored);
+    let mut draft_save_error = use_signal(|| None::<String>);
     let mut draft_session = use_signal(|| {
         controller
             .state
@@ -534,7 +544,19 @@ fn Composer() -> Element {
             upload_error.set(None);
         }
     });
+    use_effect(move || {
+        let mut drafts = saved_drafts.read().clone();
+        drafts.insert(draft_session(), (draft(), attachments()));
+        drafts.retain(|_, (text, files)| !text.is_empty() || !files.is_empty());
+        let error = storage::save_drafts(&drafts)
+            .err()
+            .filter(|_| !drafts.is_empty());
+        if *draft_save_error.peek() != error {
+            draft_save_error.set(error);
+        }
+    });
     let state = controller.state.read();
+    let update_available = state.ui.update_available;
     let sending = state.ui.composer_busy;
     let confirming = state.ui.outbox_flushing;
     let online = state.connection.online;
@@ -638,6 +660,22 @@ fn Composer() -> Element {
 
     rsx! {
         div { class: "composer-dock",
+            if update_available {
+                div { class: "update-notice", role: "status",
+                    span {
+                        if let Some(error) = draft_save_error() { "{error}" }
+                        else { "新版本已就绪，草稿会保留" }
+                    }
+                    button {
+                        r#type: "button",
+                        disabled: sending || confirming || uploads_in_flight() > 0 || !online || draft_save_error().is_some(),
+                        onclick: move |_| {
+                            if let Err(error) = platform::reload() { controller.notice(&error, "error"); }
+                        },
+                        "刷新更新"
+                    }
+                }
+            }
             if !attachments().is_empty() || uploads_in_flight() > 0 || upload_error().is_some() {
                 div { class: "composer-attachments", aria_live: "polite",
                     for (index, attachment) in attachments().iter().enumerate() {

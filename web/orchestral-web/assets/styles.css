@@ -2186,6 +2186,30 @@ svg {
   transition: border-color 140ms ease, box-shadow 140ms ease;
 }
 
+.update-notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: min(100%, 820px);
+  margin: 0 auto 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.update-notice button {
+  flex: none;
+  min-height: 44px;
+  padding: 0 12px;
+  border-radius: 10px;
+  background: var(--accent-strong);
+  color: white;
+}
+
 .composer-form:focus-within {
   border-color: color-mix(in srgb, var(--accent) 64%, var(--line));
   box-shadow: var(--shadow-md), var(--shadow-focus);

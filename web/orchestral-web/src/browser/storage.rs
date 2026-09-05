@@ -1,8 +1,10 @@
+use std::collections::BTreeMap;
+
 use rexie::{ObjectStore, Rexie, TransactionMode};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsValue;
 
-use crate::model::OutboxEntry;
+use crate::model::{OutboxEntry, UploadedArtifact};
 
 const DATABASE_NAME: &str = "orchestral-pwa";
 const DATABASE_VERSION: u32 = 2;
@@ -10,6 +12,28 @@ const SECRETS_STORE: &str = "secrets";
 const OUTBOX_STORE: &str = "outbox";
 const TOKEN_KEY: &str = "device-token";
 const PREFERENCES_KEY: &str = "orchestral.preferences.v1";
+const DRAFTS_KEY: &str = "orchestral.drafts.v1";
+
+pub type ComposerDrafts = BTreeMap<String, (String, Vec<UploadedArtifact>)>;
+
+/// Drafts survive refresh in this tab without being shared with another tab.
+pub fn load_drafts() -> ComposerDrafts {
+    web_sys::window()
+        .and_then(|window| window.session_storage().ok().flatten())
+        .and_then(|storage| storage.get_item(DRAFTS_KEY).ok().flatten())
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_drafts(drafts: &ComposerDrafts) -> Result<(), String> {
+    let storage = web_sys::window()
+        .and_then(|window| window.session_storage().ok().flatten())
+        .ok_or_else(|| "浏览器无法保存草稿，请先复制草稿再刷新".to_owned())?;
+    let value = serde_json::to_string(drafts).map_err(|error| error.to_string())?;
+    storage
+        .set_item(DRAFTS_KEY, &value)
+        .map_err(|_| "草稿保存失败，请先复制草稿再刷新".to_owned())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Preferences {

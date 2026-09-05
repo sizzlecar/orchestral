@@ -443,15 +443,15 @@ impl ApiClient {
         request_id: &str,
         text: &str,
     ) -> Result<Value, ApiError> {
-        self.command(
-            credential,
+        self.post(
             &format!(
                 "/agent-session/requests/{}/input?connector_id={}&session_id={}",
                 encode(request_id),
                 encode(connector_id),
                 encode(session_id)
             ),
-            json!({ "text": text }),
+            credential,
+            &json!({ "text": text }),
         )
         .await
     }
@@ -464,15 +464,15 @@ impl ApiClient {
         request_id: &str,
         decision: &str,
     ) -> Result<Value, ApiError> {
-        self.command(
-            credential,
+        self.post(
             &format!(
                 "/agent-session/requests/{}/approval?connector_id={}&session_id={}",
                 encode(request_id),
                 encode(connector_id),
                 encode(session_id)
             ),
-            json!({ "decision": decision }),
+            credential,
+            &json!({ "decision": decision }),
         )
         .await
     }

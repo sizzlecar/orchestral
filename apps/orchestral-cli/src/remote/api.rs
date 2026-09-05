@@ -2462,14 +2462,17 @@ async fn resolve_agent_session_input(
     Ok(Json(json!({"resolved": true})))
 }
 
-/// A provider-native session request is not a Host Run command, so it has no
-/// command id or history anchor. Keep its wire contract separate from
+/// A provider-native session request is not a Host Run command. A redundant
+/// command_id is tolerated for already-open PWA clients, but has no command
+/// ledger semantics. Keep this wire contract separate from
 /// `TextCommandRequest`; reusing the Run DTO made the PWA's valid `{text}`
 /// response fail JSON extraction before it reached the connector SPI.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentSessionTextRequest {
     text: String,
+    #[serde(default, rename = "command_id")]
+    _legacy_command_id: Option<String>,
     #[serde(default)]
     attachments: Vec<RemoteArtifactInput>,
 }
@@ -2493,6 +2496,8 @@ struct ApprovalRequest {
 #[serde(deny_unknown_fields)]
 struct AgentSessionApprovalRequest {
     decision: ApprovalChoice,
+    #[serde(default, rename = "command_id")]
+    _legacy_command_id: Option<String>,
 }
 
 async fn resolve_approval(
@@ -2590,6 +2595,15 @@ async fn require_run(
     connector_id: Option<&str>,
     run_id: String,
 ) -> Result<(AgentApi, RunId), ApiError> {
+    // Old PWA builds routed a native history projection to Run control. This
+    // identity was never an executable Run: require the session endpoint and
+    // give those clients an actionable message instead of a misleading 404.
+    if run_id.starts_with("agent-history:") {
+        return Err(ApiError::conflict(
+            "client_update_required",
+            "此页面版本过旧，请刷新页面后重新处理审批或回复；当前操作尚未执行",
+        ));
+    }
     let agent = match connector_id {
         Some(connector_id) => {
             state
@@ -2601,6 +2615,7 @@ async fn require_run(
     };
     let run_id = RunId::new(run_id);
     if !agent.has_run(&run_id).await? {
+        tracing::warn!(%run_id, connector_id, "requested Agent Run was not found");
         return Err(ApiError::not_found("run_not_found", "run was not found"));
     }
     spawn_run_supervisor(
@@ -3169,6 +3184,61 @@ mod tests {
         assert!(matches!(approval.decision, ApprovalChoice::AllowOnce));
     }
 
+    #[tokio::test]
+    async fn native_request_http_accepts_current_and_already_open_pwa_bodies() {
+        let (app, token) = test_app().await;
+        for legacy in [false, true] {
+            for (kind, mut body) in [
+                ("approval", json!({"decision": "allow_once"})),
+                ("approval", json!({"decision": "deny"})),
+                ("input", json!({"text": "continue"})),
+            ] {
+                if legacy {
+                    body["command_id"] = json!("old-browser-command");
+                }
+                let response = app.clone().oneshot(authorized(
+                    "POST",
+                    &format!("/agent-session/requests/native-{kind}/{kind}?connector_id=fixture%2Flocal&session_id=fixture-session"),
+                    &token,
+                    body,
+                )).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{kind}, legacy={legacy}");
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&body).unwrap(),
+                    json!({"resolved": true})
+                );
+            }
+        }
+        // Compatibility is restricted to redundant command metadata; native
+        // requests still cannot grant remembered session permissions.
+        let response = app.clone().oneshot(authorized(
+            "POST", "/agent-session/requests/native-approval/approval?connector_id=fixture%2Flocal&session_id=fixture-session",
+            &token, json!({"decision": "allow_session", "command_id": "legacy"}),
+        )).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let response = app.oneshot(authorized(
+            "POST", "/agent-session/requests/native-approval/approval?connector_id=fixture%2Flocal&session_id=fixture-session",
+            &token, json!({"decision": "allow_once", "grant_ref": "unexpected"}),
+        )).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn history_projection_control_reports_client_update_required() {
+        let (app, token) = test_app().await;
+        let response = app.oneshot(authorized(
+            "POST", "/runs/agent-history%3Afixture%2Flocal%3Afixture-session/requests/native-approval/approval?connector_id=fixture%2Flocal",
+            &token, json!({"command_id": "old-page", "decision": "allow_once"}),
+        )).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["code"],
+            "client_update_required"
+        );
+    }
+
     #[test]
     fn supervision_retries_only_retryable_agent_failures() {
         let permanent =
@@ -3536,6 +3606,7 @@ mod tests {
                 display_name: "Fixture Agent".to_owned(),
                 capabilities: AgentSessionCapabilities {
                     create: true,
+                    resolve_requests: true,
                     ..AgentSessionCapabilities::discoverable()
                 },
                 creation: None,
@@ -3645,6 +3716,15 @@ mod tests {
                 content: Vec::new(),
                 details: serde_json::Value::Null,
             })
+        }
+
+        async fn resolve_request(
+            &self,
+            request: ResolveAgentSessionRequest,
+        ) -> Result<(), AgentConnectorError> {
+            self.read_session(&request.session_id).await?;
+            request.response.validate()?;
+            Ok(())
         }
     }
 

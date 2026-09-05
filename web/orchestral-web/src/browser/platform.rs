@@ -223,7 +223,8 @@ pub async fn copy_text(text: &str) -> Result<(), String> {
         .map_err(js_error)
 }
 
-pub async fn register_service_worker() -> Result<(), String> {
+pub async fn register_service_worker(on_update: impl Fn() + 'static) -> Result<(), String> {
+    let on_update: Rc<dyn Fn()> = Rc::new(on_update);
     let navigator = window()?.navigator();
     let Some(service_workers) = optional_browser_capability::<web_sys::ServiceWorkerContainer>(
         navigator.as_ref(),
@@ -235,34 +236,48 @@ pub async fn register_service_worker() -> Result<(), String> {
         // only offline/install support is unavailable there.
         return Ok(());
     };
-    let update_pending = Rc::new(Cell::new(false));
-    let pending_from_worker = update_pending.clone();
-    let on_worker_message =
-        Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
-            let data = Reflect::get(event.as_ref(), &JsValue::from_str("data")).ok();
-            let kind = data.as_ref().and_then(|data| {
-                Reflect::get(data, &JsValue::from_str("type"))
-                    .ok()
-                    .and_then(|value| value.as_string())
-            });
-            if kind.as_deref() == Some("ORCHESTRAL_UPDATE_READY") {
-                pending_from_worker.set(true);
-                if !is_document_visible() {
-                    let _ =
-                        window().and_then(|window| window.location().reload().map_err(js_error));
-                }
-            }
+    let on_message_update = on_update.clone();
+    let on_worker_message = ui_event_callback(move |event: web_sys::Event| {
+        let data = Reflect::get(event.as_ref(), &JsValue::from_str("data")).ok();
+        let kind = data.as_ref().and_then(|data| {
+            Reflect::get(data, &JsValue::from_str("type"))
+                .ok()
+                .and_then(|value| value.as_string())
         });
+        if kind.as_deref() == Some("ORCHESTRAL_UPDATE_READY") {
+            on_message_update();
+        }
+    });
     service_workers
         .add_event_listener_with_callback("message", on_worker_message.as_ref().unchecked_ref())
         .map_err(js_error)?;
     on_worker_message.forget();
 
+    let registration = JsFuture::from(service_workers.register("./sw.js"))
+        .await
+        .map_err(js_error)?
+        .dyn_into::<web_sys::ServiceWorkerRegistration>()
+        .map_err(js_error)?;
+    if registration.waiting().is_some() {
+        on_update();
+    }
+    observe_installing_worker(&registration, &service_workers, on_update.clone())?;
+    let observed_registration = registration.clone();
+    let on_update_found = ui_event_callback(move |_| {
+        let _ =
+            observe_installing_worker(&observed_registration, &service_workers, on_update.clone());
+    });
+    registration
+        .add_event_listener_with_callback("updatefound", on_update_found.as_ref().unchecked_ref())
+        .map_err(js_error)?;
+    on_update_found.forget();
+    let checking = Rc::new(Cell::new(false));
     if let Some(document) = web_sys::window().and_then(|window| window.document()) {
-        let pending_on_visibility = update_pending;
+        let registration = registration.clone();
+        let checking = checking.clone();
         let on_visibility = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
-            if pending_on_visibility.get() && !is_document_visible() {
-                let _ = window().and_then(|window| window.location().reload().map_err(js_error));
+            if is_document_visible() && is_online() {
+                check_worker_update(registration.clone(), checking.clone());
             }
         });
         document
@@ -273,11 +288,57 @@ pub async fn register_service_worker() -> Result<(), String> {
             .map_err(js_error)?;
         on_visibility.forget();
     }
+    // A long-lived PWA may never navigate or register again. Explicitly check
+    // so browser update throttling cannot leave an active client on old code.
+    wasm_bindgen_futures::spawn_local(async move {
+        loop {
+            gloo_timers::future::TimeoutFuture::new(60_000).await;
+            if is_document_visible() && is_online() {
+                check_worker_update(registration.clone(), checking.clone());
+            }
+        }
+    });
+    Ok(())
+}
 
-    JsFuture::from(service_workers.register("./sw.js"))
-        .await
-        .map(|_| ())
-        .map_err(js_error)
+fn check_worker_update(registration: web_sys::ServiceWorkerRegistration, checking: Rc<Cell<bool>>) {
+    if checking.replace(true) {
+        return;
+    }
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Ok(update) = registration.update() {
+            let _ = JsFuture::from(update).await;
+        }
+        checking.set(false);
+    });
+}
+
+fn observe_installing_worker(
+    registration: &web_sys::ServiceWorkerRegistration,
+    container: &web_sys::ServiceWorkerContainer,
+    on_update: Rc<dyn Fn()>,
+) -> Result<(), String> {
+    let Some(worker) = registration.installing() else {
+        return Ok(());
+    };
+    let observed = worker.clone();
+    let container = container.clone();
+    let on_state = ui_event_callback(move |_| {
+        if observed.state() == web_sys::ServiceWorkerState::Installed
+            && container.controller().is_some()
+        {
+            on_update();
+        }
+    });
+    worker
+        .add_event_listener_with_callback("statechange", on_state.as_ref().unchecked_ref())
+        .map_err(js_error)?;
+    on_state.forget();
+    Ok(())
+}
+
+pub fn reload() -> Result<(), String> {
+    window()?.location().reload().map_err(js_error)
 }
 
 fn optional_browser_capability<T>(owner: &JsValue, name: &str) -> Result<Option<T>, String>
@@ -306,11 +367,24 @@ pub fn add_window_listener(
     name: &str,
     callback: impl FnMut(web_sys::Event) + 'static,
 ) -> Result<Closure<dyn FnMut(web_sys::Event)>, String> {
-    let closure = Closure::wrap(Box::new(callback) as Box<dyn FnMut(web_sys::Event)>);
+    let closure = ui_event_callback(callback);
     window()?
         .add_event_listener_with_callback(name, closure.as_ref().unchecked_ref())
         .map_err(js_error)?;
     Ok(closure)
+}
+
+/// Native browser callbacks run outside Dioxus rendering. Restore both the
+/// runtime and the owning scope before signal updates or spawning UI tasks.
+/// A runtime guard alone leaves `spawn` without an owner after online/resume.
+fn ui_event_callback(
+    mut callback: impl FnMut(web_sys::Event) + 'static,
+) -> Closure<dyn FnMut(web_sys::Event)> {
+    let runtime = dioxus::dioxus_core::Runtime::current();
+    let scope = runtime.current_scope_id();
+    Closure::wrap(Box::new(move |event| {
+        runtime.in_scope(scope, || callback(event));
+    }) as Box<dyn FnMut(web_sys::Event)>)
 }
 
 pub fn js_error(value: JsValue) -> String {

@@ -1065,6 +1065,7 @@ pub struct UiState {
     pub session_actions_open: bool,
     pub composer_busy: bool,
     pub outbox_flushing: bool,
+    pub update_available: bool,
     /// The reader deliberately left the live edge. New events remain locally
     /// merged but do not steal their scroll position; the UI exposes an
     /// explicit jump-to-latest control instead.
