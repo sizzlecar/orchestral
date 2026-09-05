@@ -257,6 +257,61 @@ impl CodexConnector {
         Ok(self.enrich_summary(summary))
     }
 
+    async fn pending_session_requests(
+        &self,
+        client: &ConnectedClient,
+        session_id: &AgentSessionId,
+    ) -> BTreeMap<RequestId, SessionPendingRequest> {
+        // A browser can attach after the Run received a replayed approval.
+        // Subscribe-time caches cannot recover that handle; use the shared
+        // connection's current request snapshot as the authority instead.
+        let mut pending = BTreeMap::new();
+        for message in client.rpc.pending_server_requests() {
+            let exact = message.pointer("/params/threadId").and_then(Value::as_str)
+                == Some(session_id.as_str());
+            if !exact
+                && !route_related_session_request(
+                    &client.rpc,
+                    &message,
+                    session_id,
+                    &self.session_pending_requests,
+                    &self.session_ancestor_cache,
+                )
+                .await
+            {
+                continue;
+            }
+            let kind = if message.get("method").and_then(Value::as_str)
+                == Some("item/tool/requestUserInput")
+            {
+                PendingRequestKind::Input
+            } else {
+                PendingRequestKind::Approval
+            };
+            if let Some((request, native)) = provider::normalize_native_request(&message, kind) {
+                if client.rpc.server_request_is_pending(native.rpc_id()) {
+                    pending.insert(
+                        request.request_id.clone(),
+                        SessionPendingRequest {
+                            request,
+                            native,
+                            resolved: false,
+                        },
+                    );
+                }
+            }
+        }
+        // Keep resolved identities until their close notification reaches all
+        // session observers. They do not authorize responses or enter snapshots.
+        self.session_pending_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(session_id.as_str().to_owned())
+            .or_default()
+            .extend(pending.clone());
+        pending
+    }
+
     fn remember_execution_profile(&self, session_id: &AgentSessionId, value: &Value) {
         remember_execution_profile(&self.session_execution_profiles, session_id, value);
     }
@@ -891,14 +946,10 @@ impl AgentConnector for CodexConnector {
         if live_edge {
             page.turns.extend(deferred_turns?);
             page.pending_requests = self
-                .session_pending_requests
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(session_id.as_str())
-                .into_iter()
-                .flat_map(BTreeMap::values)
-                .filter(|pending| !pending.resolved)
-                .map(|pending| pending.request.clone())
+                .pending_session_requests(&client, session_id)
+                .await
+                .into_values()
+                .map(|pending| pending.request)
                 .collect();
         }
         page.validate_for(&self.describe().connector_id)?;
@@ -1099,14 +1150,11 @@ impl AgentConnector for CodexConnector {
         request: ResolveAgentSessionRequest,
     ) -> Result<(), AgentConnectorError> {
         request.response.validate()?;
+        let client = self.client().await?;
         let pending = self
-            .session_pending_requests
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(request.session_id.as_str())
-            .and_then(|requests| requests.get(&request.request_id))
-            .filter(|pending| !pending.resolved)
-            .cloned()
+            .pending_session_requests(&client, &request.session_id)
+            .await
+            .remove(&request.request_id)
             .ok_or_else(|| {
                 AgentConnectorError::new(
                     AgentConnectorErrorCode::NotFound,
@@ -1122,7 +1170,6 @@ impl AgentConnector for CodexConnector {
             ));
         }
         let response = provider::native_session_resolution(&pending.native, &request.response)?;
-        let client = self.client().await?;
         client
             .rpc
             .respond(pending.native.rpc_id().clone(), response)
@@ -2566,6 +2613,129 @@ mod tests {
                 && failure.message == "proxy connection failed with status 502"
                 && failure.retryable
         ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn late_session_read_recovers_approval_without_a_session_observer() {
+        let (client_io, server_io) = duplex(128 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc = CodexRpcClient::from_io(
+            client_read,
+            client_write,
+            Duration::from_secs(1),
+            1024 * 1024,
+        );
+        // This transport receiver only synchronizes the test; it never fills
+        // the connector's browser/session cache.
+        let mut received = rpc.subscribe_session("thread-late");
+        let connector = CodexConnector::with_client(rpc, "codex/0.153.1");
+        let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut requests = BufReader::new(server_read).lines();
+            server_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({
+                            "id": 81,
+                            "method": "item/commandExecution/requestApproval",
+                            "params": {
+                                "threadId": "thread-late", "turnId": "turn-late",
+                                "itemId": "command-late", "command": "inspect-workspace"
+                            }
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut responses = 0;
+            loop {
+                let line = tokio::select! {
+                    _ = &mut finished_rx => break,
+                    line = requests.next_line() => line.unwrap().unwrap(),
+                };
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let result = match request["method"].as_str() {
+                    Some("thread/read") => json!({
+                        "thread": thread(request["params"]["threadId"].as_str().unwrap(), Value::Null)
+                    }),
+                    Some("thread/items/list" | "thread/queue/list") => {
+                        json!({"data": [], "nextCursor": null})
+                    }
+                    None => {
+                        assert_eq!(request["id"], 81);
+                        assert_eq!(request["result"], json!({"decision": "accept"}));
+                        responses += 1;
+                        continue;
+                    }
+                    method => panic!("unexpected method {method:?}"),
+                };
+                write_result(&mut server_write, &request, result).await;
+            }
+            assert_eq!(responses, 1);
+        });
+        tokio::time::timeout(Duration::from_secs(1), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(connector
+            .session_pending_requests
+            .lock()
+            .unwrap()
+            .is_empty());
+        let session_id = AgentSessionId::new("thread-late");
+        let request_id = RequestId::new("codex-command-late");
+        let resolution = |session_id| ResolveAgentSessionRequest {
+            session_id,
+            request_id: request_id.clone(),
+            response: AgentSessionRequestResolution::Approval {
+                decision: orchestral_core::agent_protocol::wire::ApprovalDecision::Allow,
+            },
+        };
+        let foreign = connector
+            .resolve_request(resolution(AgentSessionId::new("thread-other")))
+            .await
+            .unwrap_err();
+        assert_eq!(foreign.code, AgentConnectorErrorCode::NotFound);
+        let page = connector.read_session(&session_id).await.unwrap();
+        assert_eq!(page.pending_requests.len(), 1);
+        assert_eq!(page.pending_requests[0].request_id, request_id);
+        connector
+            .resolve_request(resolution(session_id.clone()))
+            .await
+            .unwrap();
+        // The server deliberately sends no resolved event yet. Immediate reads
+        // and retries must still converge without sending a duplicate response.
+        assert!(connector
+            .read_session(&session_id)
+            .await
+            .unwrap()
+            .pending_requests
+            .is_empty());
+        assert_eq!(
+            connector
+                .resolve_request(resolution(session_id.clone()))
+                .await
+                .unwrap_err()
+                .code,
+            AgentConnectorErrorCode::NotFound
+        );
+        let closed = native_session_change(
+            &json!({"method": "serverRequest/resolved", "params": {
+                "threadId": "thread-late", "requestId": 81
+            }}),
+            &NormalizationLimits::default(),
+            &connector.session_pending_requests,
+            &session_id,
+        );
+        assert!(
+            matches!(closed, AgentSessionChangeKind::PendingRequestClosed { request_id: closed_id }
+            if closed_id == request_id)
+        );
+        finished_tx.send(()).unwrap();
         server.await.unwrap();
     }
 

@@ -312,6 +312,9 @@ struct NotificationRouter {
     global: broadcast::Sender<CodexTransportEvent>,
     requests: broadcast::Sender<CodexTransportEvent>,
     sessions: SyncMutex<HashMap<String, broadcast::Sender<CodexTransportEvent>>>,
+    // JSON-RPC response handles belong to this connection, independently of
+    // whether a Run or a browser session currently subscribes to its events.
+    pending_requests: SyncMutex<HashMap<String, Value>>,
 }
 
 impl NotificationRouter {
@@ -322,6 +325,7 @@ impl NotificationRouter {
             global,
             requests,
             sessions: SyncMutex::new(HashMap::new()),
+            pending_requests: SyncMutex::new(HashMap::new()),
         }
     }
 
@@ -347,6 +351,7 @@ impl NotificationRouter {
     }
 
     fn publish(&self, message: Value) {
+        self.record_request_lifecycle(&message);
         let event = CodexTransportEvent::Message(message);
         if self.global.receiver_count() > 0 {
             let _ = self.global.send(event.clone());
@@ -384,6 +389,10 @@ impl NotificationRouter {
     }
 
     fn disconnect(&self, reason: String) {
+        self.pending_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         let event = CodexTransportEvent::Disconnected { reason };
         if self.global.receiver_count() > 0 {
             let _ = self.global.send(event.clone());
@@ -403,6 +412,54 @@ impl NotificationRouter {
         };
         for sender in senders {
             let _ = sender.send(event.clone());
+        }
+    }
+
+    fn record_request_lifecycle(&self, message: &Value) {
+        let mut pending = self
+            .pending_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match message.get("method").and_then(Value::as_str) {
+            Some(
+                "item/commandExecution/requestApproval"
+                | "item/fileChange/requestApproval"
+                | "item/permissions/requestApproval"
+                | "item/tool/requestUserInput",
+            ) => {
+                if let Some(id) = message
+                    .get("id")
+                    .filter(|_| notification_session_id(message).is_some())
+                {
+                    pending.insert(id.to_string(), message.clone());
+                }
+            }
+            Some("serverRequest/resolved") => {
+                if let Some(id) = message.pointer("/params/requestId") {
+                    let key = id.to_string();
+                    let matching = pending.get(&key).is_some_and(|request| {
+                        notification_session_id(message).is_none()
+                            || notification_session_id(message) == notification_session_id(request)
+                    });
+                    if matching {
+                        pending.remove(&key);
+                    }
+                }
+            }
+            Some("turn/completed") => {
+                let session = notification_session_id(message);
+                let turn = message
+                    .pointer("/params/turnId")
+                    .or_else(|| message.pointer("/params/turn/id"))
+                    .and_then(Value::as_str);
+                if session.is_some() && turn.is_some() {
+                    pending.retain(|_, request| {
+                        notification_session_id(request) != session
+                            || request.pointer("/params/turnId").and_then(Value::as_str) != turn
+                    });
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -682,7 +739,42 @@ impl CodexRpcClient {
         id: Value,
         result: Value,
     ) -> Result<(), CodexTransportError> {
-        self.write(&json!({"id": id, "result": result})).await
+        let key = id.to_string();
+        let original = self
+            .notifications
+            .pending_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .cloned();
+        self.write(&json!({"id": id, "result": result})).await?;
+        let mut pending = self
+            .notifications
+            .pending_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending.get(&key) == original.as_ref() {
+            pending.remove(&key);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn pending_server_requests(&self) -> Vec<Value> {
+        self.notifications
+            .pending_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn server_request_is_pending(&self, id: &Value) -> bool {
+        self.notifications
+            .pending_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&id.to_string())
     }
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, CodexTransportError> {
@@ -940,6 +1032,48 @@ mod tests {
     use tokio::net::UnixListener;
     #[cfg(unix)]
     use tokio_tungstenite::accept_async;
+
+    #[test]
+    fn pending_server_requests_survive_late_subscribers_and_follow_native_lifecycle() {
+        let router = NotificationRouter::new();
+        for (id, session, turn) in [
+            (json!(7), "thread-a", "turn-a"),
+            (json!("7"), "thread-b", "turn-b"),
+            (json!(8), "thread-a", "turn-next"),
+        ] {
+            router.publish(json!({
+                "id": id,
+                "method": "item/commandExecution/requestApproval",
+                "params": {"threadId": session, "turnId": turn, "itemId": turn}
+            }));
+        }
+        for _ in 0..SESSION_NOTIFICATION_CAPACITY * 2 {
+            router.publish(json!({
+                "method": "item/agentMessage/delta",
+                "params": {"threadId": "thread-a", "delta": "text"}
+            }));
+        }
+        assert_eq!(router.pending_requests.lock().unwrap().len(), 3);
+        router.publish(json!({
+            "method": "serverRequest/resolved",
+            "params": {"threadId": "thread-b", "requestId": 7}
+        }));
+        assert_eq!(router.pending_requests.lock().unwrap().len(), 3);
+        router.publish(json!({
+            "method": "turn/completed",
+            "params": {"threadId": "thread-a", "turn": {"id": "turn-a"}}
+        }));
+        assert_eq!(router.pending_requests.lock().unwrap().len(), 2);
+        router.publish(json!({
+            "method": "serverRequest/resolved",
+            "params": {"threadId": "thread-b", "requestId": "7"}
+        }));
+        let remaining = router.pending_requests.lock().unwrap().clone();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining["8"]["params"]["turnId"], "turn-next");
+        router.disconnect("connection closed".to_owned());
+        assert!(router.pending_requests.lock().unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn cancelling_a_partial_write_keeps_following_requests_framed() {
