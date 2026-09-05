@@ -687,6 +687,7 @@ impl CodexRpcClient {
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, CodexTransportError> {
         let started = std::time::Instant::now();
+        let include_turns = params.get("includeTurns").and_then(Value::as_bool);
         let session_id = params
             .get("threadId")
             .and_then(Value::as_str)
@@ -726,6 +727,7 @@ impl CodexRpcClient {
                 rpc_method = method,
                 rpc_id = id,
                 session_id = session_id.as_deref().unwrap_or("-"),
+                include_turns,
                 elapsed_ms,
                 write_ms,
                 succeeded = result.is_ok(),

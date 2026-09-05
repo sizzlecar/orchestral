@@ -2348,6 +2348,40 @@ async fn prefer_loaded_terminal_turn(
     }
 }
 
+/// Polling only needs to discover completion. A metadata read exposes the
+/// loaded thread's live status without parsing/serializing every rollout item.
+/// Keep the full snapshot check for idle/unknown status, where the history
+/// index may still incorrectly report inProgress. Command preflight continues
+/// to use the stronger exact-turn check above.
+async fn prefer_loaded_terminal_turn_for_poll(
+    rpc: &CodexRpcClient,
+    session_id: &AgentSessionId,
+    indexed: Value,
+) -> Value {
+    if indexed.get("status").and_then(Value::as_str) != Some("inProgress") {
+        return indexed;
+    }
+    if let Ok(summary) = rpc
+        .request(
+            "thread/read",
+            json!({
+                "threadId": session_id.as_str(), "includeTurns": false
+            }),
+        )
+        .await
+    {
+        if summary.pointer("/thread/id").and_then(Value::as_str) == Some(session_id.as_str())
+            && summary
+                .pointer("/thread/status/type")
+                .and_then(Value::as_str)
+                == Some("active")
+        {
+            return indexed;
+        }
+    }
+    prefer_loaded_terminal_turn(rpc, session_id, indexed).await
+}
+
 async fn find_loaded_thread_item(
     rpc: &CodexRpcClient,
     thread_id: &str,
@@ -2665,9 +2699,10 @@ async fn reconcile_bound_direct_turn(
         .await
         .map_err(transport_to_protocol)?;
     let turn = match latest.as_ref() {
-        Some(latest) if latest.get("id").and_then(Value::as_str) == Some(turn_id) => {
-            Some(prefer_loaded_terminal_turn(rpc, &run.execution.session_id, latest.clone()).await)
-        }
+        Some(latest) if latest.get("id").and_then(Value::as_str) == Some(turn_id) => Some(
+            prefer_loaded_terminal_turn_for_poll(rpc, &run.execution.session_id, latest.clone())
+                .await,
+        ),
         _ => {
             find_native_turn_or_loaded(rpc, &run.execution.session_id, turn_id, "notLoaded").await?
         }
@@ -7449,9 +7484,15 @@ mod tests {
         .await;
         let loaded = next_request(&mut lines).await;
         assert_eq!(loaded["method"], "thread/read");
-        server_write_result(&mut server_write, &loaded, json!({
-            "thread": {"id": "thread-quiet", "turns": [{"id": "turn-quiet", "status": "inProgress"}]}
-        })).await;
+        server_write_result(
+            &mut server_write,
+            &loaded,
+            json!({
+                "thread": {"id": "thread-quiet", "status": {"type": "active"}}
+            }),
+        )
+        .await;
+        assert_eq!(loaded["params"]["includeTurns"], false);
         for _ in 0..4 {
             tokio::task::yield_now().await;
         }
@@ -7616,6 +7657,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn polling_keeps_full_history_checks_for_unknown_or_mismatched_live_status() {
+        for summary in [
+            json!({"thread": {"id": "thread-status", "status": {"type": "notLoaded"}}}),
+            json!({"thread": {"id": "another-thread", "status": {"type": "active"}}}),
+        ] {
+            let (client_io, server_io) = duplex(64 * 1024);
+            let (client_read, client_write) = tokio::io::split(client_io);
+            let (server_read, mut server_write) = tokio::io::split(server_io);
+            let rpc = CodexRpcClient::from_io(
+                client_read,
+                client_write,
+                Duration::from_secs(1),
+                64 * 1024,
+            );
+            let server = tokio::spawn(async move {
+                let mut lines = BufReader::new(server_read).lines();
+                let metadata = next_request(&mut lines).await;
+                assert_eq!(metadata["params"]["includeTurns"], false);
+                server_write_result(&mut server_write, &metadata, summary).await;
+                let full = next_request(&mut lines).await;
+                assert_eq!(full["params"]["includeTurns"], true);
+                server_write_result(&mut server_write, &full, json!({
+                    "thread": {"id": "thread-status", "turns": [{"id": "turn-status", "status": "completed"}]}
+                })).await;
+            });
+            let turn = prefer_loaded_terminal_turn_for_poll(
+                &rpc,
+                &AgentSessionId::new("thread-status"),
+                json!({"id": "turn-status", "status": "inProgress"}),
+            )
+            .await;
+            assert_eq!(turn["status"], "completed");
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn loaded_terminal_turn_overrides_a_stale_active_history_index() {
         let (client_io, server_io) = duplex(1024 * 1024);
         let (client_read, client_write) = tokio::io::split(client_io);
@@ -7642,8 +7720,21 @@ mod tests {
             )
             .await;
 
+            let summary = next_request(&mut lines).await;
+            assert_eq!(summary["method"], "thread/read");
+            assert_eq!(summary["params"]["includeTurns"], false);
+            server_write_result(
+                &mut server_write,
+                &summary,
+                json!({
+                    "thread": {"id": "thread-stale-active", "status": {"type": "idle"}}
+                }),
+            )
+            .await;
+
             let loaded = next_request(&mut lines).await;
             assert_eq!(loaded["method"], "thread/read");
+            assert_eq!(loaded["params"]["includeTurns"], true);
             server_write_result(
                 &mut server_write,
                 &loaded,
