@@ -40,6 +40,8 @@ After rebuilding, run from the repository root with Node.js, Chrome, and
 node scripts/pwa_browser_smoke.cjs
 PWA_SMOKE_WIDTH=320 node scripts/pwa_browser_smoke.cjs
 PWA_SMOKE_SW=1 node scripts/pwa_browser_smoke.cjs
+PWA_SMOKE_SW=1 node scripts/pwa_image_message_smoke.cjs
+PWA_SMOKE_SW=1 PWA_SMOKE_WIDTH=320 node scripts/pwa_image_message_smoke.cjs
 ```
 
 Set `NODE_PATH` if Playwright is installed outside the repository, or
@@ -48,6 +50,13 @@ the real release bundle with an isolated HTTP fixture on a random loopback
 port. It checks ambiguous submission retry, stable identity, message ordering,
 approval visibility and retry, per-session drafts, IME Enter, offline editing,
 and mobile layout. Screenshots are written to `target/pwa-smoke/`.
+
+The image-message smoke uploads real image bytes and reconciles the local
+preview, HTTP acknowledgement, durable input event, refreshed signed attachment
+links, and native transcript echo. It verifies one bubble per submission,
+distinct identities for intentionally repeated content, and working drawer
+interaction after sending and refreshing the session. Duplicate timeline keys
+previously caused a Dioxus `invalid key` panic that disabled page interaction.
 
 The fixture never connects to a real Host or model. By default service workers
 are disabled so the smoke tests the bundle just built. `PWA_SMOKE_SW=1` enables

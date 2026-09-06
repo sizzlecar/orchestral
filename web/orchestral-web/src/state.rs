@@ -428,7 +428,16 @@ impl RunState {
             self.status = "accepted".to_owned();
         }
         self.started_at.get_or_insert(now);
-        self.confirm_initial_input(input, Some(now as i64), None);
+        // An event or snapshot can arrive before the HTTP acknowledgement.
+        // Keep that authoritative content instead of reverting to the local
+        // attachment preview carried by the acknowledgement callback.
+        if !self
+            .messages
+            .iter()
+            .any(|message| message.role == "user" && !message.steering && !message.optimistic)
+        {
+            self.confirm_initial_input(input, Some(now as i64), None);
+        }
     }
 
     /// Projects a start request before the network round trip completes.
@@ -481,16 +490,17 @@ impl RunState {
             .iter_mut()
             .find(|message| message.role == "user" && !message.steering)
         {
-            if message.optimistic || message.text == input {
-                message.text = input;
-                message.order = INITIAL_INPUT_ORDER;
-                message.occurred_at_unix_ms = message.occurred_at_unix_ms.or(occurred_at_unix_ms);
-                if message.native_anchor_id.is_none() {
-                    message.native_anchor_id = history_anchor_id;
-                }
-                message.optimistic = false;
-                return;
+            // A Run owns exactly one initial input. Its local preview,
+            // durable content and signed attachment URLs need not match.
+            // Updating this slot also keeps keyed timeline children unique.
+            message.text = input;
+            message.order = INITIAL_INPUT_ORDER;
+            message.occurred_at_unix_ms = message.occurred_at_unix_ms.or(occurred_at_unix_ms);
+            if message.native_anchor_id.is_none() {
+                message.native_anchor_id = history_anchor_id;
             }
+            message.optimistic = false;
+            return;
         }
         self.messages.push(Message {
             id: format!("initial-input-{}", self.id),
@@ -595,19 +605,12 @@ impl RunState {
             }
             "input_committed" => {
                 let text = contents_text(payload.get("content"));
-                // `start_run` acceptance confirms the optimistic input before
-                // this durable event is fetched. Match the stable initial
-                // projection as well as the still-optimistic form so the
-                // authoritative event replaces it instead of creating a
-                // second, unanchored user message.
-                let prior_index = self.messages.iter().position(|message| {
-                    message.role == "user"
-                        && !message.steering
-                        && (message.optimistic
-                            || message.id == format!("optimistic-input-{}", self.id)
-                            || message.id == format!("initial-input-{}", self.id)
-                            || message.text == text)
-                });
+                // Reconcile by the Run's initial-input identity, independent
+                // of attachment rendering and HTTP/event arrival order.
+                let prior_index = self
+                    .messages
+                    .iter()
+                    .position(|message| message.role == "user" && !message.steering);
                 let prior_order = prior_index.map(|index| self.messages[index].order);
                 let prior_native_anchor =
                     prior_index.and_then(|index| self.messages[index].native_anchor_id.clone());
@@ -4113,6 +4116,68 @@ mod tests {
             run.messages[1].native_anchor_id.as_deref(),
             Some("visible-tail-before-steer")
         );
+    }
+
+    #[test]
+    fn image_input_reconciles_by_run_identity_across_ack_event_and_signed_views() {
+        let optimistic = "look at this\n\n[附件：photo.png](/api/v1/attachments/image)";
+        let mut artifact_input = content("look at this\n\n附件（内容已由 Host 按 SHA-256 校验）");
+        artifact_input.as_array_mut().unwrap().push(serde_json::json!({
+            "media_type": "image/png",
+            "body": {"kind": "artifact", "value": {"artifact_ref": "image", "digest": "digest"}},
+        }));
+        let input_event = record(
+            1,
+            "image-input",
+            serde_json::json!({
+                "type": "input_committed", "content": artifact_input,
+            }),
+        );
+
+        for event_before_ack in [false, true] {
+            let mut run = RunState::new("image-run", Some("session".to_owned()));
+            run.optimistic_start_input(
+                optimistic.to_owned(),
+                1_000.0,
+                Some("native-tail".to_owned()),
+            );
+            if event_before_ack {
+                run.project_durable(&input_event, 1_100.0);
+            }
+            run.record_accepted_input(optimistic.to_owned(), 1_200.0);
+            if event_before_ack {
+                assert_eq!(run.messages[0].text, contents_text(Some(&artifact_input)));
+            }
+            for revision in 1..=3 {
+                let mut signed_input = artifact_input.clone();
+                signed_input[1]["access"] = serde_json::json!({
+                    "uri": format!("https://files.example/image?signature={revision}")
+                });
+                let view = serde_json::json!({
+                    "execution": {"run_id": "image-run", "session_id": "session"},
+                    "state": {"state": "running"},
+                    "last_run_seq": 2,
+                    "input": signed_input,
+                    "after_activity_id": "native-tail",
+                });
+                run.apply_view(view.clone(), 1_300.0);
+                run.project_durable(&input_event, 1_400.0);
+                run.project_durable(
+                    &record(2, "started", serde_json::json!({"type": "run_started"})),
+                    1_500.0,
+                );
+                run.apply_view(view, 1_600.0);
+
+                assert_eq!(run.messages.len(), 1, "one Run has one initial input; event_before_ack={event_before_ack}, revision={revision}");
+                let message = &run.messages[0];
+                assert_eq!(message.id, "image-input");
+                assert_eq!(message.native_anchor_id.as_deref(), Some("native-tail"));
+                assert_eq!(message.occurred_at_unix_ms, Some(1_000));
+                assert_eq!(message.order, INITIAL_INPUT_ORDER);
+                assert!(!message.optimistic);
+                assert!(message.text.contains(&format!("signature={revision}")));
+            }
+        }
     }
 
     #[test]
