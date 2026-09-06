@@ -31,6 +31,11 @@ const AGENT_OBSERVER_MAX_BACKOFF_MS: u32 = 30_000;
 const AGENT_RECONCILE_DEBOUNCE_MS: u32 = 120;
 const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 
+struct RequestResolutionRoute {
+    connector_id: Option<String>,
+    session_target: Option<(String, String)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AgentSessionObservationTarget {
     session_key: String,
@@ -1631,6 +1636,73 @@ impl AppController {
         self.set_busy(false);
     }
 
+    async fn request_resolution_route(
+        self,
+        token: &ApiCredential,
+        run_id: &str,
+        request_id: &str,
+    ) -> Result<RequestResolutionRoute, ApiError> {
+        let context_error = || ApiError {
+            status: 0,
+            code: "request_context_unavailable".to_owned(),
+            message: "暂时无法确认此请求的所属会话，请稍后重试".to_owned(),
+            details: None,
+        };
+        let (connector_id, session_id, can_resolve) = {
+            let state = self.state.read();
+            let run = state.runs.get(run_id).ok_or_else(context_error)?;
+            let can_resolve = match run.connector_id.as_ref() {
+                Some(id) => {
+                    state
+                        .connectors
+                        .items
+                        .iter()
+                        .find(|connector| &connector.connector_id == id)
+                        .ok_or_else(context_error)?
+                        .capabilities
+                        .resolve_requests
+                }
+                None => false,
+            };
+            (
+                run.connector_id.clone(),
+                run.session_id.clone(),
+                can_resolve,
+            )
+        };
+        let mut route = RequestResolutionRoute {
+            connector_id,
+            session_target: None,
+        };
+        if !can_resolve {
+            return Ok(route);
+        }
+        let connector_id = route.connector_id.as_ref().ok_or_else(context_error)?;
+        let session_id = session_id.ok_or_else(context_error)?;
+        // Run events can precede the session projection, including after SSE
+        // reconnect. Resolve ownership against a fresh authoritative snapshot,
+        // not the projection that happened to render this card. A failed read
+        // must leave the action retryable instead of guessing a Host route.
+        let detail = self
+            .api
+            .agent_session(token, connector_id, &session_id, None, 1)
+            .await?;
+        if detail.summary.connector_id != *connector_id || detail.summary.session_id != session_id {
+            return Err(context_error());
+        }
+        if detail
+            .pending_requests
+            .iter()
+            .any(|pending| pending.get("request_id").and_then(Value::as_str) == Some(request_id))
+            || run_id.starts_with("agent-history:")
+        {
+            // A native card stays on its own endpoint even if it just closed;
+            // the connector will reject its stale handle without a Host grant.
+            route.session_target = Some((connector_id.clone(), session_id));
+        }
+        Ok(route)
+    }
+
     pub async fn resolve_input(mut self, run_id: String, request_id: String, text: String) {
         let Some(token) = self.token.read().clone() else {
             return;
@@ -1642,20 +1714,28 @@ impl AppController {
             }
             state.ui.set_request_resolving(&run_id, &request_id, true);
         }
-        let (connector_id, session_target) = self
-            .state
-            .read()
-            .runs
-            .get(&run_id)
-            .map(|run| {
-                let connector_id = run.connector_id.clone();
-                let session_target = run_id
-                    .starts_with("agent-history:")
-                    .then(|| Some((connector_id.clone()?, run.session_id.clone()?)))
-                    .flatten();
-                (connector_id, session_target)
-            })
-            .unwrap_or_default();
+        let RequestResolutionRoute {
+            connector_id,
+            session_target,
+        } = match self
+            .request_resolution_route(&token, &run_id, &request_id)
+            .await
+        {
+            Ok(route) => route,
+            Err(error) => {
+                self.state
+                    .write()
+                    .ui
+                    .set_request_resolving(&run_id, &request_id, false);
+                self.state
+                    .write()
+                    .ui
+                    .request_errors
+                    .insert(format!("{run_id}:{request_id}"), error.message.clone());
+                self.handle_api_error(error).await;
+                return;
+            }
+        };
         let result = if let Some((connector_id, session_id)) = session_target.as_ref() {
             self.api
                 .resolve_session_input(&token, connector_id, session_id, &request_id, text.trim())
@@ -1737,20 +1817,28 @@ impl AppController {
             }
             state.ui.set_request_resolving(&run_id, &request_id, true);
         }
-        let (connector_id, session_target) = self
-            .state
-            .read()
-            .runs
-            .get(&run_id)
-            .map(|run| {
-                let connector_id = run.connector_id.clone();
-                let session_target = run_id
-                    .starts_with("agent-history:")
-                    .then(|| Some((connector_id.clone()?, run.session_id.clone()?)))
-                    .flatten();
-                (connector_id, session_target)
-            })
-            .unwrap_or_default();
+        let RequestResolutionRoute {
+            connector_id,
+            session_target,
+        } = match self
+            .request_resolution_route(&token, &run_id, &request_id)
+            .await
+        {
+            Ok(route) => route,
+            Err(error) => {
+                self.state
+                    .write()
+                    .ui
+                    .set_request_resolving(&run_id, &request_id, false);
+                self.state
+                    .write()
+                    .ui
+                    .request_errors
+                    .insert(format!("{run_id}:{request_id}"), error.message.clone());
+                self.handle_api_error(error).await;
+                return;
+            }
+        };
         let result = if let Some((connector_id, session_id)) = session_target.as_ref() {
             self.api
                 .resolve_session_approval(&token, connector_id, session_id, &request_id, &decision)

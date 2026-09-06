@@ -519,7 +519,9 @@ impl CodexConnector {
             Some(thread) => active_turn_id(thread).map(str::to_owned),
             None => match latest_native_turn(&connected.rpc, &session_id).await {
                 Ok(Some(turn)) => {
-                    let turn = prefer_loaded_terminal_turn(&connected.rpc, &session_id, turn).await;
+                    let turn =
+                        prefer_loaded_terminal_turn_if_idle(&connected.rpc, &session_id, turn)
+                            .await;
                     active_turn_id_from_turn(&turn)
                 }
                 Ok(None) | Err(_) => None,
@@ -1356,7 +1358,7 @@ impl AgentProvider for CodexConnector {
                 AgentCommand::Steer { .. } | AgentCommand::Cancel { .. }
             )
         {
-            match direct_turn_is_active(&connected.rpc, &run).await {
+            match direct_turn_is_active(&connected.rpc, &run, &command.payload).await {
                 Ok(true) => {}
                 Ok(false) => {
                     return Ok(record_command_disposition(
@@ -1387,7 +1389,7 @@ impl AgentProvider for CodexConnector {
                 }
             }
         }
-        apply_native_command(
+        let outcome = apply_native_command(
             &connected.rpc,
             &run,
             &command,
@@ -1395,11 +1397,7 @@ impl AgentProvider for CodexConnector {
             self.artifact_blob_store.as_deref(),
         )
         .await?;
-        Ok(record_command_disposition(
-            &run,
-            &command,
-            ProviderCommandOutcome::Accepted,
-        ))
+        Ok(record_command_disposition(&run, &command, outcome))
     }
 
     async fn recover(
@@ -1645,7 +1643,7 @@ async fn apply_native_command(
     command: &AgentCommandEnvelope,
     artifact_resolver: Option<&dyn ArtifactResolver>,
     artifact_blob_store: Option<&dyn BlobStore>,
-) -> Result<(), AgentProtocolError> {
+) -> Result<ProviderCommandOutcome, AgentProtocolError> {
     let route = { lock(&run.route).clone() };
     if let Some(NativeRunRoute::ExternalQueue {
         queued_submission_id,
@@ -1660,7 +1658,8 @@ async fn apply_native_command(
             queued_submission_id.as_deref(),
             phase,
         )
-        .await;
+        .await
+        .map(|()| ProviderCommandOutcome::Accepted);
     }
     let thread_id = run.execution.session_id.as_str();
     let turn_id = lock(&run.turn_id).clone().ok_or_else(|| {
@@ -1680,8 +1679,23 @@ async fn apply_native_command(
                     "input": codex_content(content, artifact_resolver, artifact_blob_store).await?
                 }),
             )
-            .await
-            .map_err(transport_to_protocol)?;
+            .await;
+            let result = match result {
+                Ok(result) => result,
+                Err(CodexTransportError::Rpc(message))
+                    if message == "no active turn to steer"
+                        || message.starts_with("expected active turn id `") =>
+                {
+                    // These native validation errors occur before dispatch.
+                    // Persist a rejection so retrying this command cannot
+                    // later steer a different turn or leave an ambiguous ack.
+                    return Ok(ProviderCommandOutcome::Rejected {
+                        code: AgentProtocolErrorCode::InvalidTransition,
+                        message,
+                    });
+                }
+                Err(error) => return Err(transport_to_protocol(error)),
+            };
             if result.get("turnId").and_then(Value::as_str) != Some(turn_id.as_str()) {
                 return Err(AgentProtocolError::new(
                     AgentProtocolErrorCode::InvalidTransition,
@@ -1754,7 +1768,7 @@ async fn apply_native_command(
             ));
         }
     }
-    Ok(())
+    Ok(ProviderCommandOutcome::Accepted)
 }
 
 fn record_command_disposition(
@@ -2326,7 +2340,8 @@ async fn find_loaded_thread_turn(
 /// The paginated index can retain `inProgress` after the loaded thread has
 /// committed the exact turn. A loaded terminal copy is strictly newer and
 /// therefore wins. All side-effecting and reconciliation paths use this one
-/// rule so a stale index cannot make a completed turn commandable again.
+/// rule when checking completion. Steer also has Codex's atomic expectedTurnId
+/// guard, allowing its active preflight to avoid a full history read.
 async fn prefer_loaded_terminal_turn(
     rpc: &CodexRpcClient,
     session_id: &AgentSessionId,
@@ -2348,12 +2363,11 @@ async fn prefer_loaded_terminal_turn(
     }
 }
 
-/// Polling only needs to discover completion. A metadata read exposes the
-/// loaded thread's live status without parsing/serializing every rollout item.
-/// Keep the full snapshot check for idle/unknown status, where the history
-/// index may still incorrectly report inProgress. Command preflight continues
-/// to use the stronger exact-turn check above.
-async fn prefer_loaded_terminal_turn_for_poll(
+/// A metadata read exposes live thread status without parsing/serializing all
+/// rollout items. Polling and expectedTurnId-guarded steer can use an active
+/// result; idle/unknown status still requires the full check for stale indexes.
+/// Interrupt does not have that atomic native guard and must not use this path.
+async fn prefer_loaded_terminal_turn_if_idle(
     rpc: &CodexRpcClient,
     session_id: &AgentSessionId,
     indexed: Value,
@@ -2652,6 +2666,7 @@ fn direct_turn_is_terminal_for_run(run: &CodexRun, turn: &Value) -> bool {
 async fn direct_turn_is_active(
     rpc: &CodexRpcClient,
     run: &Arc<CodexRun>,
+    command: &AgentCommand,
 ) -> Result<bool, AgentProtocolError> {
     let turn_id = lock(&run.turn_id).clone().ok_or_else(|| {
         AgentProtocolError::new(
@@ -2669,7 +2684,14 @@ async fn direct_turn_is_active(
     if latest_id == Some(turn_id.as_str())
         && latest.get("status").and_then(Value::as_str) == Some("inProgress")
     {
-        let latest = prefer_loaded_terminal_turn(rpc, &run.execution.session_id, latest).await;
+        // Steer atomically checks expectedTurnId in Codex. An active metadata
+        // snapshot is enough here; interrupt lacks that native guard and keeps
+        // the exact loaded-turn check before dispatch.
+        let latest = if matches!(command, AgentCommand::Steer { .. }) {
+            prefer_loaded_terminal_turn_if_idle(rpc, &run.execution.session_id, latest).await
+        } else {
+            prefer_loaded_terminal_turn(rpc, &run.execution.session_id, latest).await
+        };
         if latest.get("status").and_then(Value::as_str) == Some("inProgress") {
             return Ok(true);
         }
@@ -2700,7 +2722,7 @@ async fn reconcile_bound_direct_turn(
         .map_err(transport_to_protocol)?;
     let turn = match latest.as_ref() {
         Some(latest) if latest.get("id").and_then(Value::as_str) == Some(turn_id) => Some(
-            prefer_loaded_terminal_turn_for_poll(rpc, &run.execution.session_id, latest.clone())
+            prefer_loaded_terminal_turn_if_idle(rpc, &run.execution.session_id, latest.clone())
                 .await,
         ),
         _ => {
@@ -5011,12 +5033,13 @@ mod tests {
 
             let loaded_turn = next_request(&mut lines).await;
             assert_eq!(loaded_turn["method"], "thread/read");
+            assert_eq!(loaded_turn["params"]["includeTurns"], false);
             server_write_result(
                 &mut server_write,
                 &loaded_turn,
                 json!({"thread": {
                     "id": "thread-live",
-                    "turns": [{"id": "turn-live", "status": "inProgress", "items": []}]
+                    "status": {"type": "active"}
                 }}),
             )
             .await;
@@ -7018,12 +7041,13 @@ mod tests {
             .await;
             let steer_loaded = next_request(&mut lines).await;
             assert_eq!(steer_loaded["method"], "thread/read");
+            assert_eq!(steer_loaded["params"]["includeTurns"], false);
             server_write_result(
                 &mut server_write,
                 &steer_loaded,
                 json!({"thread": {
                     "id": "thread-2",
-                    "turns": [{"id": "turn-2", "status": "inProgress", "items": []}]
+                    "status": {"type": "active"}
                 }}),
             )
             .await;
@@ -7057,6 +7081,7 @@ mod tests {
             .await;
             let cancel_loaded = next_request(&mut lines).await;
             assert_eq!(cancel_loaded["method"], "thread/read");
+            assert_eq!(cancel_loaded["params"]["includeTurns"], true);
             server_write_result(
                 &mut server_write,
                 &cancel_loaded,
@@ -7161,6 +7186,89 @@ mod tests {
                 break;
             }
         }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn guarded_steer_keeps_the_bound_turn_when_the_native_active_turn_changes() {
+        let (client_io, server_io) = duplex(64 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc =
+            CodexRpcClient::from_io(client_read, client_write, Duration::from_secs(1), 64 * 1024);
+        let connector = CodexConnector::with_client(rpc, "codex/test");
+        let run = test_run("thread-guard", "run-guard");
+        *lock(&run.route) = Some(NativeRunRoute::Direct);
+        *lock(&run.turn_id) = Some("turn-original".to_owned());
+        connector
+            .provider_state()
+            .runs
+            .insert(run.execution.run_id.clone(), Arc::clone(&run));
+        let (finished_tx, finished_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            let indexed = next_request(&mut lines).await;
+            assert_eq!(indexed["method"], "thread/turns/list");
+            server_write_result(
+                &mut server_write,
+                &indexed,
+                json!({
+                    "data": [{"id": "turn-original", "status": "inProgress"}], "nextCursor": null
+                }),
+            )
+            .await;
+            let metadata = next_request(&mut lines).await;
+            assert_eq!(metadata["method"], "thread/read");
+            assert_eq!(metadata["params"]["includeTurns"], false);
+            server_write_result(
+                &mut server_write,
+                &metadata,
+                json!({
+                    "thread": {"id": "thread-guard", "status": {"type": "active"}}
+                }),
+            )
+            .await;
+            // A later turn became active while the durable index still named
+            // the original turn. The native compare-and-steer must reject it.
+            let steer = next_request(&mut lines).await;
+            assert_eq!(steer["method"], "turn/steer");
+            assert_eq!(steer["params"]["expectedTurnId"], "turn-original");
+            server_write_error(
+                &mut server_write,
+                &steer,
+                "expected active turn id `turn-original` but found `turn-newer`",
+            )
+            .await;
+            tokio::select! {
+                _ = finished_rx => {},
+                extra = lines.next_line() => panic!("must not retarget or restart rejected input: {extra:?}"),
+            }
+        });
+        let command = AgentCommandEnvelope::new(
+            CommandId::new("guarded-steer"),
+            run.execution.run_id.clone(),
+            None,
+            AgentCommand::Steer {
+                content: vec![Content::text("continue the original task")],
+            },
+        )
+        .unwrap();
+        let disposition = connector
+            .command(&run.execution, command.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            disposition.outcome,
+            ProviderCommandOutcome::Rejected {
+                code: AgentProtocolErrorCode::InvalidTransition,
+                ..
+            }
+        ));
+        assert_eq!(lock(&run.turn_id).as_deref(), Some("turn-original"));
+        let duplicate = connector.command(&run.execution, command).await.unwrap();
+        assert!(duplicate.duplicate);
+        assert_eq!(duplicate.outcome, disposition.outcome);
+        finished_tx.send(()).unwrap();
         server.await.unwrap();
     }
 
@@ -7682,7 +7790,7 @@ mod tests {
                     "thread": {"id": "thread-status", "turns": [{"id": "turn-status", "status": "completed"}]}
                 })).await;
             });
-            let turn = prefer_loaded_terminal_turn_for_poll(
+            let turn = prefer_loaded_terminal_turn_if_idle(
                 &rpc,
                 &AgentSessionId::new("thread-status"),
                 json!({"id": "turn-status", "status": "inProgress"}),
@@ -8269,8 +8377,18 @@ mod tests {
             )
             .await;
 
+            let metadata = next_request(&mut lines).await;
+            assert_eq!(metadata["method"], "thread/read");
+            assert_eq!(metadata["params"]["includeTurns"], false);
+            server_write_result(
+                &mut server_write,
+                &metadata,
+                json!({"thread": {"id": "thread-stale", "status": {"type": "idle"}}}),
+            )
+            .await;
             let edge = next_request(&mut lines).await;
             assert_eq!(edge["method"], "thread/read");
+            assert_eq!(edge["params"]["includeTurns"], true);
             server_write_result(
                 &mut server_write,
                 &edge,

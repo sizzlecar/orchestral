@@ -26,6 +26,9 @@ const inputRequest = {
   payload: { type: "input", prompt: content("请选择下一步要检查的模块") },
 };
 let nativePending = [approval],
+  exposeNativePending = false,
+  requestRouteReads = 0,
+  failNextRequestRouteRead = false,
   hostPending = [inputRequest, approval],
   sequence = 20,
   approvalAttempts = 0,
@@ -91,7 +94,7 @@ const history = (id) => ({
       })),
     },
   ],
-  pending_requests: id === "a" ? nativePending : [],
+  pending_requests: id === "a" && exposeNativePending ? nativePending : [],
   controlled_runs:
     id === "a"
       ? [
@@ -136,8 +139,16 @@ const server = http.createServer(async (req, res) => {
       ]);
     if (route === "/agent-sessions")
       return json(res, { sessions: [summary("a"), summary("b")] });
-    if (route === "/agent-session")
+    if (route === "/agent-session") {
+      if (url.searchParams.get("limit") === "1") {
+        requestRouteReads++;
+        if (failNextRequestRouteRead) {
+          failNextRequestRouteRead = false;
+          return json(res, {code: "agent_provider_unavailable", message: "暂时无法确认请求，请重试"}, 503);
+        }
+      }
       return json(res, history(url.searchParams.get("session_id")));
+    }
     if (route === "/runs/owner") return json(res, view());
     if (route === "/runs/owner/events")
       return json(res, {
@@ -368,8 +379,21 @@ const server = http.createServer(async (req, res) => {
     const card = page
       .locator(".pending-card")
       .filter({ hasText: "保存你要求的修改" });
+    // The browser only knows the Run mirror. The request now exists in the
+    // server snapshot, but no session event/refresh announces it to the page.
+    exposeNativePending = true;
+    failNextRequestRouteRead = true;
     await card.getByRole("button", { name: "允许一次" }).click();
     await card.locator("[role=alert]").waitFor();
+    assert.equal(approvalAttempts, 0, "failed ownership read must not submit any approval");
+    assert.ok(requestRouteReads > 0, "a Run card must resolve current request ownership");
+    const readsBeforeRetry = requestRouteReads;
+    await Promise.all([
+      page.waitForResponse(response => response.url().includes("/agent-session/requests/native-approval/approval")),
+      card.getByRole("button", { name: "允许一次" }).click(),
+    ]);
+    await card.locator("[role=alert]").waitFor();
+    assert.ok(requestRouteReads > readsBeforeRetry, "retry must resolve ownership again");
     assert.equal(approvalAttempts, 1, "mirrored approval must use the native session endpoint");
     assert.equal(await page.getByText("该审批已由其他客户端处理", { exact: true }).count(), 0);
     assert.equal(

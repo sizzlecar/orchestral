@@ -269,8 +269,16 @@ Codex 原生 RPC 超过 1 秒会记录 `slow Codex RPC request`，包含 `rpc_me
 可据此区分请求慢在 Host 发送还是 Codex 响应。Run 通知缺口日志中的 `skipped` 统计实时
 通知，不等同于丢失的聊天消息条数。历史校准与实时通知交替推进，每个 Run 最多一项校准
 在途，通知安静后才轮询。轮询先读取会话元数据，运行中不反复读取完整历史；空闲或状态
-未知时保留完整历史校准，命令发送前仍核验精确 turn。`include_turns` 区分元数据与完整
-历史请求。通知有缺口时，完整输出恢复成功后才能提交最终交付。
+未知时保留完整历史校准。运行中发送补充消息也先读取元数据，并由 Codex 的
+`expectedTurnId` 原子校验目标 turn；停止命令保留完整快照校验，因为原生 interrupt
+没有相同的目标校验。`include_turns` 区分元数据与完整历史请求。通知有缺口时，完整输出
+恢复成功后才能提交最终交付。
+
+审批或回复卡片可能先从 Run 事件到达，随后才出现在会话投影中。PWA 在提交前读取该
+connector/session 的最新待处理请求（历史页限制为 1），确认原生请求后使用会话接口。
+确认失败时保留卡片供重试，不发送猜测的操作。Host Tool 审批继续使用 Host 的授权绑定。
+`approval_binding_unavailable` 表示 Host 入口缺少绑定，不能解释成其他客户端已批准；
+`request_not_pending` 才表示请求已不再等待处理。
 
 ### Cloudflare Tunnel 日志
 
