@@ -1251,9 +1251,12 @@ async fn start_agent_run(
             ack.state,
             CommandAckState::Accepted { .. } | CommandAckState::Applied { .. }
         ) {
+            if rejected_steer_can_start_run(&agent, &entry.run_id, &ack.state).await? {
+                continue;
+            }
             return Err(ApiError::conflict(
                 "agent_session_command_rejected",
-                "the original session submission was rejected",
+                rejected_session_message(&ack.state),
             ));
         }
         let view = RemoteRunView::new(
@@ -1274,63 +1277,71 @@ async fn start_agent_run(
         ));
     }
 
-    if let Some(entry) = latest_session_run(&agent, &session_id).await? {
-        let mut current = agent.inspect(&entry.run_id).await?;
-        if current.state.status()
-            == orchestral_core::agent_protocol::reference::AgentRunStatus::Unknown
-        {
-            current = agent.recover(&entry.run_id).await?;
-        }
-        if !current.state.is_terminal() {
-            let command_id = CommandId::new(format!("agent-submit-{}", run_id.as_str()));
-            let command = AgentCommandEnvelope::new_with_extensions(
-                command_id.clone(),
-                entry.run_id.clone(),
-                None,
-                AgentCommand::Steer {
-                    content: input.clone(),
-                },
-                history_extensions,
-            )?;
-            let ack = command_run(&agent, &entry.run_id, command).await?;
-            if !matches!(
-                ack.state,
-                CommandAckState::Accepted { .. } | CommandAckState::Applied { .. }
-            ) {
-                return Err(ApiError::conflict(
-                    "agent_session_command_rejected",
-                    "the active Agent Run did not accept this session message",
+    'steer: {
+        if let Some(entry) = latest_session_run(&agent, &session_id).await? {
+            let mut current = agent.inspect(&entry.run_id).await?;
+            if current.state.status()
+                == orchestral_core::agent_protocol::reference::AgentRunStatus::Unknown
+            {
+                current = agent.recover(&entry.run_id).await?;
+            }
+            if !current.state.is_terminal() {
+                let command_id = CommandId::new(format!("agent-submit-{}", run_id.as_str()));
+                let command = AgentCommandEnvelope::new_with_extensions(
+                    command_id.clone(),
+                    entry.run_id.clone(),
+                    None,
+                    AgentCommand::Steer {
+                        content: input.clone(),
+                    },
+                    history_extensions.clone(),
+                )?;
+                let ack = command_run(&agent, &entry.run_id, command).await?;
+                if !matches!(
+                    ack.state,
+                    CommandAckState::Accepted { .. } | CommandAckState::Applied { .. }
+                ) {
+                    // The provider may discover completion while checking this
+                    // command. Its explicit rejection proves this input was not
+                    // dispatched; only a reconciled terminal Run permits a new Run.
+                    if rejected_steer_can_start_run(&agent, &entry.run_id, &ack.state).await? {
+                        break 'steer;
+                    }
+                    return Err(ApiError::conflict(
+                        "agent_session_command_rejected",
+                        rejected_session_message(&ack.state),
+                    ));
+                }
+                let view = RemoteRunView::new(
+                    &state,
+                    Some(&connector_id),
+                    agent.inspect(&entry.run_id).await?,
+                    agent.initial_input(&entry.run_id).await?,
+                );
+                spawn_run_supervisor(
+                    state.clone(),
+                    agent,
+                    Some(connector_id.clone()),
+                    entry.run_id.clone(),
+                );
+                log_agent_input_accepted(
+                    &connector_id,
+                    &session_id,
+                    &entry.run_id,
+                    "steered",
+                    Some(&command_id),
+                );
+                return Ok((
+                    StatusCode::OK,
+                    Json(StartAgentRunResponse {
+                        connector_id,
+                        run_id: entry.run_id,
+                        operation: "steered",
+                        command_id: Some(command_id),
+                        view,
+                    }),
                 ));
             }
-            let view = RemoteRunView::new(
-                &state,
-                Some(&connector_id),
-                agent.inspect(&entry.run_id).await?,
-                agent.initial_input(&entry.run_id).await?,
-            );
-            spawn_run_supervisor(
-                state.clone(),
-                agent,
-                Some(connector_id.clone()),
-                entry.run_id.clone(),
-            );
-            log_agent_input_accepted(
-                &connector_id,
-                &session_id,
-                &entry.run_id,
-                "steered",
-                Some(&command_id),
-            );
-            return Ok((
-                StatusCode::OK,
-                Json(StartAgentRunResponse {
-                    connector_id,
-                    run_id: entry.run_id,
-                    operation: "steered",
-                    command_id: Some(command_id),
-                    view,
-                }),
-            ));
         }
     }
 
@@ -1367,6 +1378,31 @@ async fn start_agent_run(
             view,
         }),
     ))
+}
+
+async fn rejected_steer_can_start_run(
+    agent: &AgentApi,
+    run_id: &RunId,
+    ack: &CommandAckState,
+) -> Result<bool, ApiError> {
+    use orchestral_core::agent_protocol::wire::AgentProtocolErrorCode;
+    if !matches!(
+        ack,
+        CommandAckState::Rejected {
+            code: AgentProtocolErrorCode::TerminalRun | AgentProtocolErrorCode::InvalidTransition,
+            ..
+        }
+    ) {
+        return Ok(false);
+    }
+    Ok(agent.inspect(run_id).await?.state.is_terminal())
+}
+
+fn rejected_session_message(ack: &CommandAckState) -> String {
+    match ack {
+        CommandAckState::Rejected { message, .. } => message.clone(),
+        _ => "the active Agent Run did not accept this session message".to_owned(),
+    }
 }
 
 fn log_agent_input_accepted(
@@ -3326,6 +3362,7 @@ mod tests {
     struct HoldingProvider {
         inner: Arc<dyn AgentProvider>,
         finish: Arc<tokio::sync::Notify>,
+        rejection: Option<AgentProtocolErrorCode>,
     }
 
     struct UnrecoverableDisconnectProvider {
@@ -3525,7 +3562,15 @@ mod tests {
             Ok(ProviderCommandDisposition {
                 command_id: command.command_id,
                 run_id: command.run_id,
-                outcome: ProviderCommandOutcome::Accepted,
+                outcome: self
+                    .rejection
+                    .clone()
+                    .map_or(ProviderCommandOutcome::Accepted, |code| {
+                        ProviderCommandOutcome::Rejected {
+                            code,
+                            message: "fixture command was not dispatched".to_owned(),
+                        }
+                    }),
                 duplicate: false,
             })
         }
@@ -3987,6 +4032,12 @@ mod tests {
     }
 
     async fn completable_agent_app() -> (Router, String, Arc<tokio::sync::Notify>) {
+        completable_agent_app_with_rejection(None).await
+    }
+
+    async fn completable_agent_app_with_rejection(
+        rejection: Option<AgentProtocolErrorCode>,
+    ) -> (Router, String, Arc<tokio::sync::Notify>) {
         let finish = Arc::new(tokio::sync::Notify::new());
         let factory = ScriptedStatelessFactory::conformant().unwrap();
         let descriptor = factory.descriptor();
@@ -4008,6 +4059,7 @@ mod tests {
         let external_scenario = ProviderScenario::standard(&external_factory.descriptor()).unwrap();
         let external_provider = Arc::new(HoldingProvider {
             finish: finish.clone(),
+            rejection,
             inner: external_factory.create(external_scenario, TestProbes::default()),
         });
         let agent_directory = Arc::new(AgentDirectory::new());
@@ -4365,6 +4417,83 @@ mod tests {
             .unwrap();
         assert_eq!(listed.cwd.as_deref(), Some("/fixture/workspace"));
         assert_eq!(listed.execution_profile, created.execution_profile);
+    }
+
+    #[tokio::test]
+    async fn rejected_session_submission_restarts_only_after_confirmed_completion() {
+        for code in [
+            AgentProtocolErrorCode::InvalidTransition,
+            AgentProtocolErrorCode::TerminalRun,
+            AgentProtocolErrorCode::Unsupported,
+        ] {
+            let (app, token, finish) =
+                completable_agent_app_with_rejection(Some(code.clone())).await;
+            let request = |id: &str| {
+                authorized(
+                    "POST",
+                    "/agent-runs",
+                    &token,
+                    serde_json::json!({
+                        "connector_id": "fixture/local",
+                        "session_id": "fixture-session",
+                        "run_id": id,
+                        "input": format!("input for {id}")
+                    }),
+                )
+            };
+            let first = app.clone().oneshot(request("first")).await.unwrap();
+            assert_eq!(first.status(), StatusCode::CREATED);
+            let rejected = app.clone().oneshot(request("next")).await.unwrap();
+            assert_eq!(rejected.status(), StatusCode::CONFLICT);
+            let body = rejected.into_body().collect().await.unwrap().to_bytes();
+            let error: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(error["message"], "fixture command was not dispatched");
+
+            // Even a TerminalRun rejection is insufficient while the durable
+            // Run is active. Repeating the operation must not dispatch anew.
+            let retry = app.clone().oneshot(request("next")).await.unwrap();
+            assert_eq!(retry.status(), StatusCode::CONFLICT);
+            finish.notify_one();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let response = app
+                        .clone()
+                        .oneshot(authorized(
+                            "GET",
+                            "/runs/first?connector_id=fixture%2Flocal",
+                            &token,
+                            Value::Null,
+                        ))
+                        .await
+                        .unwrap();
+                    let body = response.into_body().collect().await.unwrap().to_bytes();
+                    let view: Value = serde_json::from_slice(&body).unwrap();
+                    if view["state"]["state"] == "terminal" {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("fixture must commit its terminal state");
+
+            let retry = app.clone().oneshot(request("next")).await.unwrap();
+            if code == AgentProtocolErrorCode::Unsupported {
+                assert_eq!(retry.status(), StatusCode::CONFLICT);
+                continue;
+            }
+            assert_eq!(retry.status(), StatusCode::CREATED);
+            let body = retry.into_body().collect().await.unwrap().to_bytes();
+            let result: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(result["run_id"], "next");
+            assert_eq!(result["operation"], "started");
+            let duplicate = app.clone().oneshot(request("next")).await.unwrap();
+            assert_eq!(duplicate.status(), StatusCode::OK);
+            let body = duplicate.into_body().collect().await.unwrap().to_bytes();
+            let result: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(result["operation"], "replayed");
+            assert_eq!(result["run_id"], "next");
+        }
     }
 
     #[tokio::test]
