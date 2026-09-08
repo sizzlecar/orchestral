@@ -782,6 +782,7 @@ fn composer_placeholder(phase: UiPhase) -> &'static str {
         UiPhase::WaitingApproval => "Press a to allow or d to deny",
         UiPhase::Cancelling => "Stopping the current run…",
         UiPhase::Failed => "Ask Orchestral to retry another way…",
+        UiPhase::Incomplete => "Continue from the recorded progress…",
         _ => "Ask Orchestral to do anything…",
     }
 }
@@ -977,7 +978,9 @@ fn phase_style(phase: UiPhase) -> Style {
     match phase {
         UiPhase::Idle | UiPhase::Completed => Style::new().fg(Color::Green),
         UiPhase::Running | UiPhase::WaitingInput | UiPhase::WaitingApproval => ACCENT,
-        UiPhase::Cancelling | UiPhase::Cancelled => Style::new().fg(Color::Yellow),
+        UiPhase::Cancelling | UiPhase::Cancelled | UiPhase::Incomplete => {
+            Style::new().fg(Color::Yellow)
+        }
         UiPhase::Failed => ERROR,
     }
 }
@@ -990,6 +993,7 @@ fn phase_badge(phase: UiPhase) -> (&'static str, &'static str) {
         UiPhase::WaitingApproval => ("!", "approval"),
         UiPhase::Cancelling => ("◌", "stopping"),
         UiPhase::Completed => ("✓", "done"),
+        UiPhase::Incomplete => ("○", "incomplete"),
         UiPhase::Failed => ("×", "failed"),
         UiPhase::Cancelled => ("■", "cancelled"),
     }

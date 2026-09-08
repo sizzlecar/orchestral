@@ -28,6 +28,7 @@ use orchestral_core::config::{
 use orchestral_core::io::BlobStore;
 use orchestral_core::mcp_protocol::{McpServerId, McpTransportFactory};
 use orchestral_core::model_protocol::ModelBackend;
+use orchestral_core::session_history::{SessionHistory, SessionOrigin};
 use orchestral_core::skill_protocol::SKILL_CATALOG_RESOURCE_KIND_V1;
 use orchestral_core::tool_effect::{InMemoryToolEffectJournalStore, ToolEffectJournalStore};
 use orchestral_core::tool_protocol::{
@@ -45,6 +46,7 @@ use orchestral_model_gemini::{
 };
 use orchestral_model_openai::{OpenAiCompatibleBackend, OpenAiCompatibleConfig};
 use orchestral_runtime::api::AgentApi;
+use orchestral_runtime::session_history::JournalSessionHistory;
 use orchestral_runtime::tools::{
     guarded_apply_patch_descriptor, guarded_artifact_read_descriptor, guarded_file_read_descriptor,
     guarded_file_search_descriptor, guarded_file_write_descriptor, guarded_text_search_descriptor,
@@ -176,6 +178,8 @@ pub struct AgentHost {
     pub model: String,
     pub workspace_root: PathBuf,
     pub execution_profile: AgentSessionExecutionProfile,
+    pub session_history: JournalSessionHistory,
+    session_origin: SessionOrigin,
     pub(crate) skill_manager: SkillManager,
     controller: Arc<AgentController>,
     resources: Vec<ResourceBinding>,
@@ -184,7 +188,9 @@ pub struct AgentHost {
 
 impl AgentHost {
     pub fn client(&self, session_id: AgentSessionId) -> AgentClient {
-        AgentClient::new(self.controller.clone(), session_id).with_resources(self.resources.clone())
+        AgentClient::new(self.controller.clone(), session_id)
+            .with_resources(self.resources.clone())
+            .with_default_extensions(self.session_origin.extensions())
     }
 
     pub async fn shutdown(&self) {
@@ -216,6 +222,18 @@ pub async fn build_agent_host(options: &AgentRunOptions) -> anyhow::Result<Agent
     )?;
 
     let mut agent_config = GenericAgentConfig::new("orchestral/internal", "generic-agent");
+    agent_config.model_retry = config.agent.model_retry.clone();
+    {
+        use orchestral_core::project_instructions::ProjectInstructionSource;
+        use orchestral_project_instructions_fs::FileProjectInstructionSource;
+        let source = FileProjectInstructionSource::new(config.agent.project_instructions.clone())?;
+        agent_config.project_instructions = source
+            .snapshot(&workspaces.root_strings().into_iter().collect::<Vec<_>>())
+            .context("load project instruction snapshot")?;
+        for document in &agent_config.project_instructions {
+            tracing::info!(source = %document.source, scope = %document.scope, "loaded project instructions");
+        }
+    }
     agent_config.stream_buffer = config.agent.stream_buffer;
     agent_config.continuation = ContinuationPolicy {
         max_model_steps: config.agent.max_model_steps,
@@ -263,7 +281,7 @@ pub async fn build_agent_host(options: &AgentRunOptions) -> anyhow::Result<Agent
         "filesystem" | "fs" => {
             let root = config.journal.root_dir.as_str();
             let store = Arc::new(
-                FileAgentJournalStore::open(root)
+                FileAgentJournalStore::open_single_writer(root)
                     .with_context(|| format!("open Agent Journal at '{root}'"))?,
             );
             CliJournalStores {
@@ -275,6 +293,11 @@ pub async fn build_agent_host(options: &AgentRunOptions) -> anyhow::Result<Agent
         }
         backend => bail!("unsupported Agent Journal backend for CLI: {backend}"),
     };
+    let session_history = JournalSessionHistory::new(
+        run_journal.clone(),
+        session_journal.clone(),
+        ProviderBindingRef::new(crate::local_sessions::GENERIC_BINDING),
+    );
     let mcp_configs = if options.no_mcp {
         Vec::new()
     } else {
@@ -379,7 +402,17 @@ pub async fn build_agent_host(options: &AgentRunOptions) -> anyhow::Result<Agent
             mode: ResourceBindingMode::Snapshot,
         });
     }
-    let api = AgentApi::with_resources(controller.clone(), resources.clone());
+    let session_origin = SessionOrigin {
+        workspace: workspaces.primary.to_string_lossy().into_owned(),
+        additional_workspaces: workspaces
+            .additional
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect(),
+        model: model.clone(),
+    };
+    let api = AgentApi::with_resources(controller.clone(), resources.clone())
+        .with_default_extensions(session_origin.extensions());
     Ok(AgentHost {
         api,
         approvals: approval_broker,
@@ -393,6 +426,8 @@ pub async fn build_agent_host(options: &AgentRunOptions) -> anyhow::Result<Agent
             permissions: Default::default(),
         },
         skill_manager,
+        session_history,
+        session_origin,
         controller,
         resources,
         mcp_registry,
@@ -407,7 +442,7 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
             .clone()
             .unwrap_or_else(|| unique_id("cli-session", 0)),
     );
-    let client = host.client(session_id);
+    let client = host.client(session_id.clone());
 
     let entry_mode = select_entry_mode(
         options.input,
@@ -415,6 +450,16 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
         io::stdout().is_terminal(),
     )?;
     let result = async {
+        let history = host.session_history.read(&session_id).await?;
+        if let Some(history) = &history {
+            crate::local_sessions::validate_workspace(history, &host.session_origin.workspace)?;
+            eprintln!(
+                "Resuming session {} · {}",
+                session_id, history.summary.title
+            );
+        }
+        let resumed = resume_unfinished(&client, history.as_ref()).await?;
+        let history = host.session_history.read(&session_id).await?;
         match entry_mode {
             EntryMode::HeadlessPrompt(input) => {
                 eprintln!(
@@ -422,7 +467,16 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
                     host.backend_name, host.model
                 );
                 let mut lines = BufReader::new(tokio::io::stdin()).lines();
-                run_turn(&client, &host.approvals, 1, input, &mut lines, false).await
+                run_turn(
+                    &client,
+                    &host.approvals,
+                    1,
+                    input,
+                    &mut lines,
+                    false,
+                    resumed,
+                )
+                .await
             }
             EntryMode::HeadlessPipe => {
                 eprintln!(
@@ -438,7 +492,16 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
                     bail!("stdin pipe did not contain an Agent prompt")
                 }
                 let mut lines = BufReader::new(tokio::io::stdin()).lines();
-                run_turn(&client, &host.approvals, 1, input, &mut lines, false).await
+                run_turn(
+                    &client,
+                    &host.approvals,
+                    1,
+                    input,
+                    &mut lines,
+                    false,
+                    resumed,
+                )
+                .await
             }
             EntryMode::Tui => {
                 crate::tui::run_tui(
@@ -447,6 +510,10 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
                     host.process_supervisor.clone(),
                     host.model.clone(),
                     host.skill_manager.clone(),
+                    crate::tui::TuiResume {
+                        history,
+                        run: resumed,
+                    },
                 )
                 .await
             }
@@ -455,6 +522,29 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
     .await;
     host.shutdown().await;
     result
+}
+
+async fn resume_unfinished(
+    client: &AgentClient,
+    history: Option<&SessionHistory>,
+) -> anyhow::Result<Option<orchestral_runtime::AgentRunHandle>> {
+    let Some(history) = history else {
+        return Ok(None);
+    };
+    if history.summary.unfinished_run_ids.len() > 1 {
+        bail!("session has multiple unfinished executions; cannot select one for continuation");
+    }
+    let mut resumed = None;
+    for run_id in &history.summary.unfinished_run_ids {
+        let handle = client
+            .resume_run(run_id)
+            .await
+            .with_context(|| format!("reconcile unfinished Run {run_id}"))?;
+        if !handle.inspect().await?.state.is_terminal() {
+            resumed = Some(handle);
+        }
+    }
+    Ok(resumed)
 }
 
 fn build_cli_tool_runtime(
@@ -1368,6 +1458,63 @@ fn build_model_backend(
     }
 }
 
+async fn start_or_continue_turn(
+    client: &AgentClient,
+    resumed: Option<orchestral_runtime::AgentRunHandle>,
+    input: String,
+    turn: u64,
+) -> anyhow::Result<orchestral_runtime::AgentRunHandle> {
+    if let Some(handle) = resumed {
+        let view = handle.inspect().await?;
+        if !view.state.is_terminal() {
+            let ack = if let Some(request) = view
+                .pending_requests
+                .iter()
+                .find(|request| matches!(request.payload, PendingRequestPayload::Input { .. }))
+            {
+                handle
+                    .resolve_input_text(request.request_id.clone(), input.clone())
+                    .await
+            } else {
+                handle.steer_text(input.clone()).await
+            };
+            match ack {
+                Ok(ack)
+                    if matches!(
+                        ack.state,
+                        CommandAckState::Accepted { .. } | CommandAckState::Applied { .. }
+                    ) =>
+                {
+                    return Ok(handle)
+                }
+                Ok(ack) => {
+                    if !matches!(
+                        ack.state,
+                        CommandAckState::Rejected { .. } | CommandAckState::Unsupported { .. }
+                    ) || !handle.inspect().await?.state.is_terminal()
+                    {
+                        bail!(
+                            "resumed Run did not accept the follow-up input: {:?}",
+                            ack.state
+                        );
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+            // A recovered Run can finish while input is offered. Only an
+            // explicit rejection permits a new Run; an uncertain command
+            // result must never cause duplicate input.
+        }
+    }
+    client
+        .start_with_run_id(
+            RunId::new(unique_id("cli-run", turn)),
+            vec![Content::text(input)],
+        )
+        .await
+        .context("start Agent Run")
+}
+
 async fn run_turn(
     client: &AgentClient,
     approval_broker: &Arc<InMemoryHostApprovalBroker>,
@@ -1375,12 +1522,10 @@ async fn run_turn(
     input: String,
     lines: &mut tokio::io::Lines<BufReader<tokio::io::Stdin>>,
     accept_unsolicited_stdin: bool,
+    resumed: Option<orchestral_runtime::AgentRunHandle>,
 ) -> anyhow::Result<()> {
-    let run_id = RunId::new(unique_id("cli-run", turn));
-    let handle = client
-        .start_with_run_id(run_id.clone(), vec![Content::text(input)])
-        .await
-        .context("start Agent Run")?;
+    let handle = start_or_continue_turn(client, resumed, input, turn).await?;
+    let run_id = handle.run_id().clone();
     let mut events = handle.subscribe().await.context("subscribe to Agent Run")?;
     let mut handled_requests = BTreeSet::new();
     let mut stdin_open = true;

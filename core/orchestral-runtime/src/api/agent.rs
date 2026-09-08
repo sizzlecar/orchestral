@@ -19,6 +19,7 @@ use crate::{AgentClient, AgentControlEvent, AgentController, AgentRunHandle, Age
 pub struct AgentApi {
     controller: Arc<AgentController>,
     default_resources: Arc<Vec<ResourceBinding>>,
+    default_extensions: Arc<Extensions>,
     sessions: Arc<RwLock<BTreeMap<AgentSessionId, AgentClient>>>,
 }
 
@@ -37,8 +38,15 @@ impl AgentApi {
         Self {
             controller,
             default_resources: Arc::new(default_resources),
+            default_extensions: Arc::new(Extensions::new()),
             sessions: Arc::new(RwLock::new(BTreeMap::new())),
         }
+    }
+
+    /// Sets Host metadata inherited by sessions subsequently created here.
+    pub fn with_default_extensions(mut self, extensions: Extensions) -> Self {
+        self.default_extensions = Arc::new(extensions);
+        self
     }
 
     pub async fn create_session(
@@ -60,6 +68,7 @@ impl AgentApi {
             .or_insert_with(|| {
                 AgentClient::new(self.controller.clone(), session_id.clone())
                     .with_resources(self.default_resources.as_ref().clone())
+                    .with_default_extensions(self.default_extensions.as_ref().clone())
             });
         Ok(session_id)
     }

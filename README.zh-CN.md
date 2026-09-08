@@ -96,6 +96,74 @@ project 必须能从凭据或 `GOOGLE_CLOUD_PROJECT` 解析。
 `--session-id` 为多轮对话提供稳定、持久的 Session 身份；`--no-mcp` 和 `--no-skills`
 可分别关闭两套扩展面。
 
+内置 Agent 的历史会话可以直接查找和恢复：
+
+```bash
+orchestral sessions list                         # 当前工作区，最近更新在前
+orchestral sessions list --search parser         # 按标题或 Session ID 搜索
+orchestral sessions list --all --limit 20 --json  # 所有工作区，含旧会话
+orchestral sessions show SESSION_ID              # 查看原始对话与工具结果
+orchestral resume SESSION_ID                     # 在终端中回放历史并继续交互
+orchestral resume --last                         # 当前工作区的最近会话
+orchestral resume --last "继续验证刚才的修改"      # 单轮续接，也支持 stdin 管道
+```
+
+`sessions list/show` 默认读取内置 Agent；外部 Codex 会话使用 `--connector codex`。
+列表支持 `--cursor` 翻页，查询无需模型凭据，也不启动模型、工具或恢复执行。会话目录由
+Run/Session 日志重建；压缩影响模型上下文，TUI 仍回放原始对话。工具结果在 TUI 中显示
+有界摘录，完整内容可通过 `sessions show SESSION_ID --json` 查看。
+
+新 Run 记录工作区和模型来源。`--last` 只选择当前工作区，按 ID 恢复其他工作区时会提示
+使用对应 `-C`；来源元数据不会自动扩大工具权限。没有来源元数据的旧会话仍可通过
+`--all` 找到并按 ID 恢复，但不会被 `--last` 自动选中。恢复已完成的会话后，新输入创建新
+Run；未完成的 Run 先由 Controller 按现有 checkpoint 合同恢复，等待输入或审批时继续
+原交互，未观察到结果的模型尝试收束为 `Incomplete`，已提交工具效果不会重复执行。
+无法确认的效果保留 `UnknownEffect`；恢复身份不兼容时明确报错，不另起 Run 掩盖问题。
+同一文件日志目录同时只允许一个 Host 写入，浏览命令可以并行只读访问。
+
+内置 Agent 自动复用现有项目指令。对 `-C` 和每个 `--add-dir` 工作区，从最近的 Git 根目录
+到所选目录逐层发现；Git worktree 的 `.git` 文件同样支持，非 Git 目录只检查所选目录。
+每层采用第一个非空文件：`AGENTS.override.md` → `AGENTS.md` → `CLAUDE.md`，祖先规则在前，
+具体目录规则在后。重叠工作区共享的来源只加载一次，每份指令保留来源和目录作用域。
+默认不会扫描无关子目录或导入其他 Agent 的全局个人配置；可用 `--add-dir` 选择额外目录。
+指令是 Host 启动时的固定快照，压缩与重试继续使用该快照；重启 Host 后重新加载。
+恢复旧 Run 时，如果指令内容发生变化，恢复身份校验会拒绝继续该 Run。
+项目指令不会扩大 Host 授权。同目录的 `AGENTS.md → CLAUDE.md` 符号链接可复用；越出来源
+目录的链接、非 UTF-8 或超出总字节上限的指令会明确报错，避免
+静默丢失项目规则。
+
+模型在返回任何事件之前遇到可重试的限流或临时不可用错误时，会在当前模型步骤内自动退避
+重试，默认最多 3 次；CLI/TUI 会显示等待进度，取消和 Steer 可立即打断等待。已经出现文字、
+工具调用或用量事件的模型请求不自动重发，已经执行的工具也不会因模型重试而重新执行。
+配置了 Run 累计 Token/费用上限时，只自动重试明确的限流拒绝，避免把未观察到用量的请求
+重复计费而绕过预算。进程重启后的不确定模型调用仍按原恢复合同处理。
+
+可在配置中关闭发现、扩展兼容文件名或调整重试：
+
+```yaml
+agent:
+  project_instructions:
+    enabled: true
+    max_bytes: 65536
+    fallback_filenames: [CLAUDE.md, TEAM_GUIDE.md]
+  model_retry:
+    max_retries: 3 # 0 表示禁用自动重试
+    base_delay_ms: 500
+    max_delay_ms: 8000
+```
+
+无需凭据的 CLI/PTY E2E 覆盖规则优先级、作用域、快照、重试、取消、Steer 和工具去重：
+
+```bash
+cargo test -p orchestral-cli --test agent_live_e2e
+```
+
+真实模型的项目指令 coding 验收使用已有 Vertex 凭据，明确启用后会产生模型费用：
+
+```bash
+cargo test -p orchestral-cli --test agent_live_e2e live_agent_uses_existing_project_instructions_for_coding -- --ignored --test-threads=1
+```
+
 ## 手机控制 PWA
 
 `orchestral serve` 会启动与 TUI 相同的 Agent Host，并提供内置、可安装的移动 Web App。

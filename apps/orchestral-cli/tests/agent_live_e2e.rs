@@ -29,6 +29,13 @@ const SESSION_APPROVAL_PROMPT: &str = "Approve? [y] once / [a] this session / [N
 static LIVE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static LOCAL_E2E_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+#[path = "agent_live_e2e/model_retry.rs"]
+mod model_retry;
+#[path = "agent_live_e2e/project_instructions.rs"]
+mod project_instructions;
+#[path = "agent_live_e2e/session_history.rs"]
+mod session_history;
+
 struct TestWorkspace {
     root: PathBuf,
 }
@@ -1770,6 +1777,7 @@ fn user_registered_stdio_mcp_is_automatically_loaded_and_called() {
     let (network_endpoint, network_server) = spawn_fixture_http_server(vec![Box::new(|request| {
         assert_eq!(request.body, json!({"probe": "seekee-like-sidecar"}));
         FixtureHttpResponse {
+            status: "200 OK",
             content_type: "text/plain",
             body: MCP_RESULT_MARKER.as_bytes().to_vec(),
         }
@@ -3070,6 +3078,7 @@ struct CapturedHttpRequest {
 }
 
 struct FixtureHttpResponse {
+    status: &'static str,
     content_type: &'static str,
     body: Vec<u8>,
 }
@@ -3176,7 +3185,8 @@ fn read_http_fixture_chunk(stream: &mut TcpStream, buffer: &mut [u8], deadline: 
 
 fn write_http_fixture_response(stream: &mut TcpStream, response: FixtureHttpResponse) {
     let headers = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        response.status,
         response.content_type,
         response.body.len()
     );
@@ -3239,6 +3249,7 @@ fn mcp_sse_response(request: &CapturedHttpRequest, result: Value) -> FixtureHttp
 
 fn json_response(body: Value) -> FixtureHttpResponse {
     FixtureHttpResponse {
+        status: "200 OK",
         content_type: "application/json",
         body: serde_json::to_vec(&body).expect("serialize HTTP fixture JSON"),
     }
@@ -3246,6 +3257,7 @@ fn json_response(body: Value) -> FixtureHttpResponse {
 
 fn sse_response(body: String) -> FixtureHttpResponse {
     FixtureHttpResponse {
+        status: "200 OK",
         content_type: "text/event-stream",
         body: body.into_bytes(),
     }

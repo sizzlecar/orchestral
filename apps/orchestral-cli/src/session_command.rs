@@ -27,9 +27,9 @@ pub(crate) struct SessionsCommand {
 enum SessionsSubcommand {
     /// List locally available Agent integrations.
     Agents(OutputArgs),
-    /// List persisted sessions owned by an Agent.
+    /// List built-in sessions; use --connector codex for native Codex history.
     List(ListArgs),
-    /// Read one persisted Agent session and its ordered activity history.
+    /// Read a built-in session; use --connector codex for native Codex history.
     Show(SessionArgs),
     /// Create a new native Agent session.
     Create(CreateArgs),
@@ -69,6 +69,9 @@ struct ListArgs {
     cursor: Option<String>,
     #[arg(long)]
     search: Option<String>,
+    /// Include all workspaces and legacy sessions without workspace metadata.
+    #[arg(long)]
+    all: bool,
     #[arg(long)]
     json: bool,
 }
@@ -154,7 +157,27 @@ struct ActionArgs {
 }
 
 impl SessionsCommand {
-    pub(crate) async fn run(self, default_cwd: Option<PathBuf>) -> anyhow::Result<()> {
+    pub(crate) async fn run(
+        self,
+        config: Option<PathBuf>,
+        default_cwd: Option<PathBuf>,
+    ) -> anyhow::Result<()> {
+        let builtin = match &self.command {
+            SessionsSubcommand::List(args) => args
+                .connector
+                .connector
+                .as_deref()
+                .is_none_or(|id| id == "generic"),
+            SessionsSubcommand::Show(args) => args
+                .connector
+                .connector
+                .as_deref()
+                .is_none_or(|id| id == "generic"),
+            _ => false,
+        };
+        if builtin {
+            return self.run_builtin(config, default_cwd).await;
+        }
         let journal_access = if self.command.requires_control_writer() {
             AgentJournalAccess::SingleWriter
         } else {
@@ -164,6 +187,98 @@ impl SessionsCommand {
         let stdout = std::io::stdout();
         self.run_with_directory(directory, default_cwd, &mut stdout.lock())
             .await
+    }
+
+    async fn run_builtin(
+        self,
+        config: Option<PathBuf>,
+        cwd: Option<PathBuf>,
+    ) -> anyhow::Result<()> {
+        use orchestral_core::session_history::SessionHistoryQuery;
+        let catalog = crate::local_sessions::open_history(config)?;
+        let stdout = std::io::stdout();
+        let mut output = stdout.lock();
+        match self.command {
+            SessionsSubcommand::List(args) => {
+                let sessions = catalog
+                    .list(&SessionHistoryQuery {
+                        workspace: if args.all {
+                            None
+                        } else {
+                            Some(crate::local_sessions::workspace(cwd.as_deref())?)
+                        },
+                        search: args.search,
+                    })
+                    .await?;
+                let offset = args
+                    .cursor
+                    .as_deref()
+                    .map(|cursor| {
+                        cursor
+                            .strip_prefix("generic:")
+                            .context("invalid built-in session cursor")?
+                            .parse::<usize>()
+                            .context("invalid built-in session cursor")
+                    })
+                    .transpose()?
+                    .unwrap_or(0);
+                let total = sessions.len();
+                let page = sessions
+                    .into_iter()
+                    .skip(offset)
+                    .take(args.limit as usize)
+                    .collect::<Vec<_>>();
+                let next = offset.saturating_add(page.len());
+                let next_cursor = (next < total).then(|| format!("generic:{next}"));
+                if args.json {
+                    write_json(
+                        &mut output,
+                        &json!({"sessions": page, "next_cursor": next_cursor}),
+                    )?;
+                } else {
+                    writeln!(output, "Session\tState\tUpdated\tTitle\tWorkspace")?;
+                    for session in page {
+                        writeln!(
+                            output,
+                            "{}\t{}\t{}\t{}\t{}",
+                            session.session_id,
+                            json_name(&session.status)?,
+                            session.updated_at_unix_ms,
+                            session.title,
+                            session
+                                .origin
+                                .as_ref()
+                                .map(|origin| origin.workspace.as_str())
+                                .unwrap_or("unknown (legacy)")
+                        )?;
+                    }
+                    if let Some(cursor) = next_cursor {
+                        writeln!(output, "Next cursor: {cursor}")?;
+                    }
+                }
+                Ok(())
+            }
+            SessionsSubcommand::Show(args) => {
+                let id = AgentSessionId::new(args.session_id);
+                let history = catalog
+                    .read(&id)
+                    .await?
+                    .with_context(|| format!("built-in Agent session not found: {id}"))?;
+                if args.json {
+                    write_json(&mut output, &history)
+                } else {
+                    writeln!(output, "{} · {}", id, history.summary.title)?;
+                    for entry in crate::tui::history_entries(&history) {
+                        writeln!(output, "\n{:?}: {}", entry.role, entry.text)?;
+                        for detail in entry.tool_details {
+                            writeln!(output, "  {}", detail.text)?;
+                        }
+                    }
+                    Ok(())
+                }
+            }
+            _ => unreachable!("only built-in browse commands are routed here"),
+        }
     }
 
     async fn run_with_directory(
@@ -673,6 +788,7 @@ mod tests {
                 limit: 25,
                 cursor: None,
                 search: None,
+                all: false,
                 json: true,
             }),
             SessionsSubcommand::Show(SessionArgs {
@@ -704,6 +820,7 @@ mod tests {
                 limit: 50,
                 cursor: None,
                 search: None,
+                all: false,
                 json: true,
             }),
         }

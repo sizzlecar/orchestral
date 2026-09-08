@@ -72,7 +72,7 @@ fn merge_model_overrides(requested: &ModelOverrides, automatic: &ModelOverrides)
     }
 }
 
-fn resolve_runtime_config_path(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+pub(crate) fn resolve_runtime_config_path(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     if let Some(path) = explicit {
         if !path.exists() {
             bail!("config file not found: {}", path.display());
@@ -212,6 +212,14 @@ agent:
   history_limit: 128
   max_context_tokens: 131072
   reserved_output_tokens: 4096
+  project_instructions:
+    enabled: true
+    max_bytes: 65536
+    fallback_filenames: [CLAUDE.md]
+  model_retry:
+    max_retries: 3
+    base_delay_ms: 500
+    max_delay_ms: 8000
   compaction:
     enabled: true
     minimum_source_records: 32

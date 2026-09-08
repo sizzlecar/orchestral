@@ -5,11 +5,13 @@
 
 mod activity;
 mod app;
+mod history;
 mod render;
 mod state;
 mod terminal;
 
-pub(crate) use app::run_tui;
+pub(crate) use app::{run_tui, TuiResume};
+pub(crate) use history::history_entries;
 pub(crate) use render::render;
 #[cfg(test)]
 pub(crate) use state::TranscriptEntry;

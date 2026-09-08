@@ -3,6 +3,7 @@
 mod config;
 
 pub(crate) use config::prepare_runtime_config_path;
+pub(crate) use config::resolve_runtime_config_path;
 
 const GENERATED_CONFIG_DIR: &str = ".orchestral/generated";
 const GENERATED_CONFIG_FILE: &str = "default.agent.yaml";

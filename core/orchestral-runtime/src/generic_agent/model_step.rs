@@ -228,14 +228,16 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                 }
                 continue 'model_rounds;
             }
-            result = inner.backend.start(model_request.clone(), model_cancellation.clone()) => result,
+            result = super::model_retry::start_model_with_retry(
+                &inner, &request, round, &model_request, model_cancellation.clone(),
+            ) => result,
         } {
             Ok(stream) => stream,
             Err(error) => {
                 if cancellation.is_cancelled() {
                     emit_cancel(&inner, &request, &user_message);
                 } else {
-                    emit_failure(&inner, &request, &user_message, model_failure(error));
+                    emit_failure(&inner, &request, &user_message, error);
                 }
                 return;
             }

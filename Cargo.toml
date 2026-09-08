@@ -15,6 +15,7 @@ members = [
     "plugins/orchestral-model-gemini",
     "plugins/orchestral-model-openai",
     "plugins/orchestral-mcp-streamable-http",
+    "plugins/orchestral-project-instructions-fs",
 
     # Apps
     "apps/orchestral-cli",

@@ -13,6 +13,7 @@ pub(crate) enum UiPhase {
     WaitingApproval,
     Cancelling,
     Completed,
+    Incomplete,
     Failed,
     Cancelled,
 }
@@ -21,7 +22,7 @@ impl UiPhase {
     fn accepts_new_run(self) -> bool {
         matches!(
             self,
-            Self::Idle | Self::Completed | Self::Failed | Self::Cancelled
+            Self::Idle | Self::Completed | Self::Incomplete | Self::Failed | Self::Cancelled
         )
     }
 }
@@ -218,6 +219,9 @@ pub(crate) enum UiMsg {
     Failed {
         message: String,
     },
+    Incomplete {
+        message: String,
+    },
     Cancelled {
         reason: String,
     },
@@ -367,6 +371,11 @@ impl UiState {
     }
 
     fn settle_tools(&mut self, state: ToolActivityState) {
+        if let Some(run_id) = &self.run_id {
+            let notice_id = format!("history-unfinished-{run_id}");
+            self.transcript
+                .retain(|entry| entry.id.as_deref() != Some(notice_id.as_str()));
+        }
         for projection in self.activity_reducer.settle(state) {
             self.upsert_tool(projection);
         }
@@ -596,6 +605,19 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             state.last_tick = None;
             state.run_id = None;
             state.phase = UiPhase::Completed;
+        }
+        UiMsg::Incomplete { message } => {
+            state.settle_tools(ToolActivityState::Failed);
+            state.transcript.push(TranscriptEntry::system(format!(
+                "Run incomplete: {message}"
+            )));
+            state.clear_stream();
+            state.pending = None;
+            state.working_detail = None;
+            state.active_processes.clear();
+            state.last_tick = None;
+            state.run_id = None;
+            state.phase = UiPhase::Incomplete;
         }
         UiMsg::Failed { message } => {
             state.settle_tools(ToolActivityState::Failed);

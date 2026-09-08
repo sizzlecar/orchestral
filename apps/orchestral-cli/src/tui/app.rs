@@ -28,18 +28,63 @@ const RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
 const ANIMATION_INTERVAL: Duration = Duration::from_millis(200);
 static COMMAND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+pub(crate) struct TuiResume {
+    pub history: Option<orchestral_core::session_history::SessionHistory>,
+    pub run: Option<AgentRunHandle>,
+}
+
 pub(crate) async fn run_tui(
     client: AgentClient,
     approval_broker: Arc<InMemoryHostApprovalBroker>,
     process_supervisor: Arc<ProcessSupervisor>,
     model: String,
     skill_manager: SkillManager,
+    resume: TuiResume,
 ) -> Result<()> {
     let mut terminal = TerminalSession::enter().context("enter TUI terminal mode")?;
     let mut input = EventStream::new();
     let (agent_tx, mut agent_rx) = mpsc::unbounded_channel();
     let mut active = None;
     let mut state = UiState::new(client.session_id().as_str(), model);
+    if let Some(history) = &resume.history {
+        state.transcript = super::history_entries(history);
+        state
+            .transcript
+            .push(super::state::TranscriptEntry::system(format!(
+                "Resumed session {}",
+                history.summary.session_id
+            )));
+    }
+    if let Some(handle) = resume.run {
+        let last_run_seq = resume
+            .history
+            .as_ref()
+            .and_then(|history| {
+                history
+                    .runs
+                    .iter()
+                    .find(|run| run.registration.run_id() == handle.run_id())
+            })
+            .map(|run| run.last_run_seq())
+            .unwrap_or(0);
+        let observer = observe_run(&handle, agent_tx.clone()).await?;
+        update(
+            &mut state,
+            UiMsg::RunStarted {
+                run_id: handle.run_id().as_str().to_owned(),
+            },
+        );
+        active = Some(ActiveRun {
+            handle,
+            observer,
+            last_run_seq,
+            delta_order: 0,
+            auto_resolved_approvals: BTreeSet::new(),
+        });
+        if reconcile_active(&mut active, &mut state, &approval_broker).await? {
+            stop_active(&mut active);
+        }
+    }
     let mut reconcile_tick = tokio::time::interval(RECONCILE_INTERVAL);
     reconcile_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut animation_tick = tokio::time::interval(ANIMATION_INTERVAL);
@@ -699,7 +744,7 @@ fn project_durable(state: &mut UiState, record: &AgentJournalRecord) -> bool {
                 Some(partial) => format!("{reason:?}\nPartial output: {partial}"),
                 None => format!("{reason:?}"),
             };
-            update(state, UiMsg::Failed { message });
+            update(state, UiMsg::Incomplete { message });
             return true;
         }
         AgentEvent::RunFailed { failure } => {
@@ -795,7 +840,7 @@ fn project_terminal_view(
         ),
         AgentTerminalState::Incomplete { reason } => update(
             state,
-            UiMsg::Failed {
+            UiMsg::Incomplete {
                 message: partial
                     .and_then(|partial| partial.response.as_ref())
                     .map(|content| {

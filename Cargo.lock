@@ -3190,6 +3190,7 @@ dependencies = [
  "orchestral-mcp-streamable-http",
  "orchestral-model-gemini",
  "orchestral-model-openai",
+ "orchestral-project-instructions-fs",
  "orchestral-runtime",
  "portable-pty",
  "qrcode",
@@ -3305,6 +3306,14 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "orchestral-project-instructions-fs"
+version = "0.2.0"
+dependencies = [
+ "cap-std",
+ "orchestral-core",
 ]
 
 [[package]]

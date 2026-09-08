@@ -101,6 +101,90 @@ override for a service-account JSON key; a Vertex project must resolve from the 
 `--session-id` gives multiple turns a stable durable Session identity; `--no-mcp` and
 `--no-skills` disable those planes.
 
+Find and resume built-in Agent conversations:
+
+```bash
+orchestral sessions list                         # Current workspace, most recent first
+orchestral sessions list --search parser         # Search titles or Session IDs
+orchestral sessions list --all --limit 20 --json  # All workspaces, including legacy sessions
+orchestral sessions show SESSION_ID              # Original conversation and Tool results
+orchestral resume SESSION_ID                     # Restore history in the interactive terminal
+orchestral resume --last                         # Most recent session in this workspace
+orchestral resume --last "Continue verification"  # Headless follow-up; stdin pipes also work
+```
+
+`sessions list/show` default to the built-in Agent; select external Codex history
+with `--connector codex`. Lists support `--cursor` pagination. Browsing needs no
+model credentials and starts no model, Tool, or recovery execution. Discovery is
+rebuilt from Run/Session journals. Context compaction does not replace the original
+TUI transcript; Tool results have bounded display excerpts, with full records
+available through `sessions show SESSION_ID --json`.
+
+New Runs record workspace and model provenance. `--last` selects only the current
+workspace; resuming another workspace by ID reports the required `-C`. Provenance
+never grants Tool permissions. Legacy sessions without metadata remain available
+through `--all` and explicit IDs, and are excluded from automatic `--last` selection.
+After a completed conversation, new input creates a new Run. Unfinished Runs first
+use the Controller's existing checkpoint recovery contract: pending input and
+approval remain interactive, unobserved model attempts become `Incomplete`, and
+committed Tool effects are not repeated. Uncertain effects remain `UnknownEffect`;
+incompatible recovery identities fail explicitly. Each filesystem journal permits
+one Host writer, while read-only browsing can run concurrently.
+
+The built-in Agent reuses existing project instructions. For `-C` and each
+`--add-dir`, it discovers documents along the path from the nearest Git root to
+the selected directory. Git worktree `.git` files are supported; outside Git,
+only the selected directory is checked. Each directory contributes its first
+nonempty file in this order: `AGENTS.override.md`, `AGENTS.md`, `CLAUDE.md`.
+Ancestor instructions precede more specific ones; shared sources are deduplicated
+across overlapping workspaces. Every document retains its source and directory
+scope. Unrelated descendants and other agents' global profiles are not imported
+automatically; select additional directories with `--add-dir`.
+
+Instructions are a Host-startup snapshot, retained through compaction and model
+retries. Restart the Host to reload changes. Recovery rejects an old Run if its
+instruction snapshot has changed. Instructions cannot grant tool permissions.
+Same-directory aliases such as `AGENTS.md -> CLAUDE.md` work; escaping symlinks,
+invalid UTF-8, and oversized documents produce explicit errors rather than
+silently dropping project rules.
+
+Transient model failures before the first model event automatically retry within
+the current model step, with exponential backoff and at most three retries by
+default. CLI/TUI progress shows the wait, which cancellation and Steer can
+interrupt. Requests that already produced text, tool calls, or usage are not
+automatically reissued; model retries never repeat previously executed tools.
+With explicit cumulative Run token/cost limits, only rate-limit rejections retry,
+since unobserved transport failures may have consumed unaccounted usage.
+Uncertain model attempts after process loss retain the existing recovery contract.
+
+Configure discovery, compatibility filenames, and retries as follows:
+
+```yaml
+agent:
+  project_instructions:
+    enabled: true
+    max_bytes: 65536
+    fallback_filenames: [CLAUDE.md, TEAM_GUIDE.md]
+  model_retry:
+    max_retries: 3 # 0 disables automatic retries
+    base_delay_ms: 500
+    max_delay_ms: 8000
+```
+
+Credential-free CLI/PTY E2E tests cover instruction precedence, scope, snapshots,
+retries, cancellation, Steer, and preservation of tool effects:
+
+```bash
+cargo test -p orchestral-cli --test agent_live_e2e
+```
+
+The opt-in live coding test checks both existing instruction filenames using
+Vertex credentials and spends real model quota:
+
+```bash
+cargo test -p orchestral-cli --test agent_live_e2e live_agent_uses_existing_project_instructions_for_coding -- --ignored --test-threads=1
+```
+
 ## Mobile control PWA
 
 `orchestral serve` starts the same Agent Host used by the TUI and serves an embedded,

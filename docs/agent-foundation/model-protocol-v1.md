@@ -32,6 +32,22 @@ ModelDescriptor
 6. Adapter 的 token meter identity 进入 Generic Agent config digest，恢复时不能静默更换。
 7. Run 级 token/cost 由 Generic Agent 累计；Adapter 只执行 Host 给出的本次请求上限。
 
+## Generic Agent 的请求重试
+
+Host 可通过 `agent.model_retry` 配置有限退避，默认最多重试 3 次。重试发生在同一个逻辑
+模型步骤内，保留 request ID 和消息快照，不重复提交 Session 输入或执行已完成的 Tool。
+Adapter 继续负责将厂商错误归一化为 `ModelError`，无需理解重试次数或 Run 状态。
+
+- 仅 `retryable = true` 的 `RateLimited` / `Unavailable` 可以重试；首次事件之前的空流
+  按临时不可用处理。任何已观察事件（包括 Usage 或 ToolCallStart）都会关闭自动重试窗口。
+- 取消、Steer 和 Run deadline 可以打断请求或退避等待；被丢弃的尝试会取消底层 stream。
+- Run 设置累计 token/cost 上限时，只自动重试明确的限流拒绝。其他未观察到用量的失败
+  请求可能已消耗额度，不能通过自动重试绕过累计预算。
+- 每次退避前持久化 `GenericCheckpointEvent::ModelRetryScheduled`。它必须关联当前
+  `ModelAttemptOpen`，重试序号从 1 连续递增，不产生第二个顶层终态。
+- 该 checkpoint 只记录调度事实，不授权进程重启后重发请求。恢复仍将未闭合模型尝试
+  收束为 `RunIncomplete(Interrupted)`；重试策略和项目指令快照均进入恢复配置摘要。
+
 ## 最小 Adapter
 
 ```rust

@@ -88,6 +88,10 @@ fn default_environment() -> String {
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     #[serde(default)]
+    pub project_instructions: crate::project_instructions::ProjectInstructionsConfig,
+    #[serde(default)]
+    pub model_retry: crate::model_retry::ModelRetryPolicy,
+    #[serde(default)]
     pub backend: Option<String>,
     #[serde(default)]
     pub model_profile: Option<String>,
@@ -118,6 +122,8 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
+            project_instructions: Default::default(),
+            model_retry: Default::default(),
             backend: None,
             model_profile: None,
             model: None,

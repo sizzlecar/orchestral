@@ -26,6 +26,7 @@ pub struct AgentClient {
     controller: Arc<AgentController>,
     session_id: AgentSessionId,
     resources: Arc<Vec<ResourceBinding>>,
+    default_extensions: Arc<Extensions>,
     next_run: Arc<AtomicU64>,
 }
 
@@ -35,6 +36,7 @@ impl AgentClient {
             controller,
             session_id,
             resources: Arc::new(Vec::new()),
+            default_extensions: Arc::new(Extensions::new()),
             next_run: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -46,6 +48,48 @@ impl AgentClient {
 
     pub fn session_id(&self) -> &AgentSessionId {
         &self.session_id
+    }
+
+    /// Binds Host metadata to every new Run. Per-Run values cannot replace a
+    /// conflicting Host value. Extensions are descriptive, not Tool grants.
+    pub fn with_default_extensions(mut self, extensions: Extensions) -> Self {
+        self.default_extensions = Arc::new(extensions);
+        self
+    }
+
+    /// Reattaches a durable Run in this Session through the Controller's
+    /// existing recovery contract. Never starts a replacement Run.
+    pub async fn resume_run(&self, run_id: &RunId) -> Result<AgentRunHandle, AgentSdkError> {
+        let mut view = self.controller.inspect(run_id).await?;
+        if view.execution.session_id != self.session_id {
+            return Err(AgentSdkError::InvalidInput(
+                "Run belongs to another Session".to_owned(),
+            ));
+        }
+        if matches!(
+            view.state,
+            orchestral_core::agent_protocol::wire::AgentRunState::Unknown { .. }
+        ) {
+            view = self.controller.recover(run_id).await?;
+        }
+        Ok(AgentRunHandle {
+            controller: self.controller.clone(),
+            run_id: run_id.clone(),
+            execution: view.execution,
+        })
+    }
+
+    fn merged_extensions(&self, extensions: Extensions) -> Result<Extensions, AgentSdkError> {
+        let mut merged = self.default_extensions.as_ref().clone();
+        for (key, value) in extensions {
+            if merged.get(&key).is_some_and(|existing| existing != &value) {
+                return Err(AgentSdkError::InvalidInput(format!(
+                    "Run extension conflicts with Host metadata: {key}"
+                )));
+            }
+            merged.insert(key, value);
+        }
+        Ok(merged)
     }
 
     pub fn controller(&self) -> &Arc<AgentController> {
@@ -96,7 +140,7 @@ impl AgentClient {
             input,
         )?;
         run.spec.resources = self.resources.as_ref().clone();
-        run.spec.extensions = extensions;
+        run.spec.extensions = self.merged_extensions(extensions)?;
         let run = AgentRunEnvelope::seal(run.spec)?;
         let execution = self.controller.start(run).await?;
         Ok(AgentRunHandle {
@@ -128,6 +172,7 @@ impl AgentClient {
         action
             .insert_into(&mut run.spec)
             .map_err(|error| AgentSdkError::InvalidInput(error.to_string()))?;
+        run.spec.extensions = self.merged_extensions(run.spec.extensions)?;
         let run = AgentRunEnvelope::seal(run.spec)?;
         let execution = self.controller.start(run).await?;
         Ok(AgentRunHandle {
