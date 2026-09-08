@@ -131,6 +131,19 @@ committed Tool effects are not repeated. Uncertain effects remain `UnknownEffect
 incompatible recovery identities fail explicitly. Each filesystem journal permits
 one Host writer, while read-only browsing can run concurrently.
 
+Long conversations retain their original records through repeated compaction.
+The compactor follows journal references back to original exchanges, avoiding
+repeated summarization of lossy summaries. A follow-up can restore the most
+recent compacted user request verbatim within the history/token budget. Bounded
+summaries retain typed failure outcomes; successful Tool execution alone is not
+evidence that the task has been verified.
+
+The built-in `session_read` Tool lets the Agent search its own original Session
+history, then read exact JSON fields or paginated chunks. It cannot select another
+Session, and uses the same Host grants, cancellation and effect journal as other
+Tools. See [Session Context and Recall](docs/agent-foundation/session-context-v1.md)
+for snapshot cursors, SDK registration and recovery compatibility.
+
 The built-in Agent reuses existing project instructions. For `-C` and each
 `--add-dir`, it discovers documents along the path from the nearest Git root to
 the selected directory. Git worktree `.git` files are supported; outside Git,

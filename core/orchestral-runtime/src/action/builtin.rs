@@ -10,6 +10,8 @@ mod guarded_patch;
 mod guarded_pty;
 #[path = "builtin/guarded_search.rs"]
 mod guarded_search;
+#[path = "builtin/guarded_session.rs"]
+mod guarded_session;
 #[path = "builtin/patch_parser.rs"]
 mod patch_parser;
 #[path = "builtin/support.rs"]
@@ -41,3 +43,4 @@ pub use self::guarded_search::{
     guarded_file_search_descriptor, guarded_text_search_descriptor, GuardedFileSearchExecutor,
     GuardedTextSearchExecutor,
 };
+pub use self::guarded_session::{guarded_session_read_descriptor, GuardedSessionReadExecutor};

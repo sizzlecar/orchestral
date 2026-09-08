@@ -121,11 +121,20 @@ Run；未完成的 Run 先由 Controller 按现有 checkpoint 合同恢复，等
 无法确认的效果保留 `UnknownEffect`；恢复身份不兼容时明确报错，不另起 Run 掩盖问题。
 同一文件日志目录同时只允许一个 Host 写入，浏览命令可以并行只读访问。
 
+长会话多次压缩时，runtime 会沿日志引用重新读取原始记录，避免反复压缩旧摘要。
+跨 Run 续聊会在历史条数和 token 预算内优先恢复最近一条被压缩的用户输入；有界摘要
+保留类型化的工具失败状态，但工具执行成功不等于任务已通过验证。
+
+内置 `session_read` 工具允许 Agent 搜索当前会话的原始记录，再按 JSON 字段或分块读取
+完整结果。它不能选择其他会话，且沿用 Host 权限、取消和 Tool Effect 日志。
+来源、分页与恢复兼容性详见 [Session Context and Recall](docs/agent-foundation/session-context-v1.md)。
+
 内置 Agent 自动复用现有项目指令。对 `-C` 和每个 `--add-dir` 工作区，从最近的 Git 根目录
 到所选目录逐层发现；Git worktree 的 `.git` 文件同样支持，非 Git 目录只检查所选目录。
 每层采用第一个非空文件：`AGENTS.override.md` → `AGENTS.md` → `CLAUDE.md`，祖先规则在前，
 具体目录规则在后。重叠工作区共享的来源只加载一次，每份指令保留来源和目录作用域。
 默认不会扫描无关子目录或导入其他 Agent 的全局个人配置；可用 `--add-dir` 选择额外目录。
+
 指令是 Host 启动时的固定快照，压缩与重试继续使用该快照；重启 Host 后重新加载。
 恢复旧 Run 时，如果指令内容发生变化，恢复身份校验会拒绝继续该 Run。
 项目指令不会扩大 Host 授权。同目录的 `AGENTS.md → CLAUDE.md` 符号链接可复用；越出来源

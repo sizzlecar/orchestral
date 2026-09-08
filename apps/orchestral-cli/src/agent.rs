@@ -49,11 +49,12 @@ use orchestral_runtime::api::AgentApi;
 use orchestral_runtime::session_history::JournalSessionHistory;
 use orchestral_runtime::tools::{
     guarded_apply_patch_descriptor, guarded_artifact_read_descriptor, guarded_file_read_descriptor,
-    guarded_file_search_descriptor, guarded_file_write_descriptor, guarded_text_search_descriptor,
-    workspace_exec_command_descriptor, workspace_write_stdin_descriptor,
-    CommandEnvironmentSnapshot, GuardedApplyPatchExecutor, GuardedArtifactReadExecutor,
-    GuardedExecCommandExecutor, GuardedFileReadExecutor, GuardedFileSearchExecutor,
-    GuardedFileWriteExecutor, GuardedTextSearchExecutor, GuardedWriteStdinExecutor,
+    guarded_file_search_descriptor, guarded_file_write_descriptor, guarded_session_read_descriptor,
+    guarded_text_search_descriptor, workspace_exec_command_descriptor,
+    workspace_write_stdin_descriptor, CommandEnvironmentSnapshot, GuardedApplyPatchExecutor,
+    GuardedArtifactReadExecutor, GuardedExecCommandExecutor, GuardedFileReadExecutor,
+    GuardedFileSearchExecutor, GuardedFileWriteExecutor, GuardedSessionReadExecutor,
+    GuardedTextSearchExecutor, GuardedWriteStdinExecutor,
 };
 use orchestral_runtime::{
     AgentClient, AgentControlEvent, AgentController, ContinuationPolicy,
@@ -322,6 +323,26 @@ pub async fn build_agent_host(options: &AgentRunOptions) -> anyhow::Result<Agent
         artifact_store,
         &workspaces,
     )?;
+    // Session identity is resolved from the registered invoking Run, never
+    // from model arguments or a filesystem path supplied by the model.
+    let mut recall_bounds = run_grant.bounds.clone();
+    recall_bounds.allowed_effects = BTreeSet::from([EffectScope::SessionRead]);
+    recall_bounds.process = ProcessPolicy::default();
+    recall_bounds.filesystem = FilesystemPolicy::default();
+    recall_bounds.network = NetworkPolicy::default();
+    recall_bounds.environment = EnvironmentPolicy::default();
+    recall_bounds.allowed_credentials.clear();
+    tool_runtime
+        .register(
+            guarded_session_read_descriptor(ToolRestriction {
+                bounds: recall_bounds,
+            }),
+            Arc::new(GuardedSessionReadExecutor::new(
+                run_journal.clone(),
+                session_journal.clone(),
+            )),
+        )
+        .context("register guarded session_read Tool")?;
     let mcp_registry = McpToolsAdapterRegistry::register(
         tool_runtime.as_ref(),
         mcp_configs,
@@ -587,6 +608,7 @@ fn build_cli_tool_runtime(
         EffectScope::FilesystemRead,
         EffectScope::FilesystemWrite,
         EffectScope::ArtifactRead,
+        EffectScope::SessionRead,
     ]);
     if exec_enabled {
         allowed_effects.extend([

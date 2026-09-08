@@ -50,3 +50,10 @@ let result = runtime.invoke(
 
 完整构造见 `core/orchestral-runtime/tests/tool_runtime.rs`；Generic Agent 接线见
 `generic_agent_executes_model_tools_only_through_the_guarded_runtime`。
+
+## Session 历史读取
+
+`EffectScope::SessionRead` 是独立的只读能力，不隐含 filesystem、network 或其他 Session
+访问权限。内置 `session_read` 从 Host registration 解析调用 Run 所属 Session，支持
+原始记录搜索、固定前缀分页和精确字段分块读取，仍经过上述统一执行路径。
+详见 [Session Context and Recall v1](./session-context-v1.md)。

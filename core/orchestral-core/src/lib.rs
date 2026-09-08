@@ -21,6 +21,7 @@ pub mod model_retry;
 pub mod normalizer;
 pub mod project_instructions;
 pub mod session_history;
+pub mod session_recall;
 pub mod skill_protocol;
 pub mod spi;
 pub mod tool_effect;

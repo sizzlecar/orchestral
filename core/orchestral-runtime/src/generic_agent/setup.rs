@@ -248,6 +248,7 @@ pub(super) fn generic_config_digest(
         "agent_id": config.agent_id,
         "system_prompt": config.system_prompt,
         "project_instructions": config.project_instructions,
+        "context_projection_contract": "original-user-anchor/v2",
         "model_retry": config.model_retry,
         "model_descriptor": model_descriptor,
         "token_meter": token_meter,
@@ -284,7 +285,7 @@ pub(super) fn bind_session_compaction_config_digest(
     summarizer: &SessionSummarizerDescriptor,
 ) -> Result<Digest, AgentProtocolError> {
     let value = serde_json::json!({
-        "contract": "generic-agent-session-compaction/v1",
+        "contract": "generic-agent-session-compaction/v2",
         "base_config_digest": base_config_digest,
         "policy": policy,
         "summarizer": summarizer,

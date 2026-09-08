@@ -2727,7 +2727,9 @@ impl ModelBackend for CompactionAwareModel {
             1 => {
                 assert!(serialized.contains("durable compaction summary marker"));
                 assert!(serialized.contains("second question"));
-                assert!(!serialized.contains("raw first question"));
+                // The most recent compacted user request is preserved as an
+                // original User message when the follow-up budget permits it.
+                assert!(serialized.contains("raw first question"));
                 assert!(!serialized.contains("raw first answer"));
                 "second answer"
             }

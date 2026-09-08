@@ -29,6 +29,8 @@ const SESSION_APPROVAL_PROMPT: &str = "Approve? [y] once / [a] this session / [N
 static LIVE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static LOCAL_E2E_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+#[path = "agent_live_e2e/context_reliability.rs"]
+mod context_reliability;
 #[path = "agent_live_e2e/model_retry.rs"]
 mod model_retry;
 #[path = "agent_live_e2e/project_instructions.rs"]
@@ -502,6 +504,7 @@ fn local_cli_creates_and_verifies_a_file_with_exec_disabled() {
                     "file_search",
                     "file_write",
                     "orchestral_request_input",
+                    "session_read",
                     "text_search"
                 ]
             );
