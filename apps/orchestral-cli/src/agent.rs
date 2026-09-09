@@ -618,6 +618,22 @@ fn build_cli_tool_runtime(
 ) -> anyhow::Result<CliToolComposition> {
     let workspace_roots = workspaces.root_strings();
     let exec_host = configured_exec_host(config)?;
+    let max_output_bytes = usize::try_from(config.tools.max_output_bytes).unwrap_or(usize::MAX);
+    let process_supervisor = Arc::new(
+        if exec_host.is_some() {
+            ProcessSupervisor::new_with_runtime_temp_root(
+                max_output_bytes,
+                command_runtime_temp_root(&workspace_roots)?,
+            )
+        } else {
+            ProcessSupervisor::new(max_output_bytes)
+        }
+        .context("create run-scoped process supervisor")?,
+    );
+    let runtime_temp_root = process_supervisor
+        .runtime_temp_root()
+        .to_string_lossy()
+        .into_owned();
     let exec_programs = exec_host
         .as_ref()
         .map(|host| BTreeSet::from([host.shell.to_string_lossy().into_owned()]))
@@ -694,6 +710,10 @@ fn build_cli_tool_runtime(
     readable_roots.extend(mcp_readable_roots.iter().cloned());
     let mut writable_roots = workspace_roots.clone();
     writable_roots.extend(mcp_writable_roots.iter().cloned());
+    if exec_enabled {
+        readable_roots.insert(runtime_temp_root.clone());
+        writable_roots.insert(runtime_temp_root.clone());
+    }
     let mcp_restriction = ToolRestriction {
         bounds: ToolPolicyBounds {
             allowed_effects: mcp_effects.clone(),
@@ -814,6 +834,14 @@ fn build_cli_tool_runtime(
     };
     exec_bounds.process.transport = TransportLaunchPolicy::default();
     exec_bounds.filesystem = workspace_bounds.filesystem.clone();
+    exec_bounds
+        .filesystem
+        .readable_roots
+        .insert(runtime_temp_root.clone());
+    exec_bounds
+        .filesystem
+        .writable_roots
+        .insert(runtime_temp_root);
     exec_bounds.network = NetworkPolicy {
         allowed_targets: exec_host
             .as_ref()
@@ -928,12 +956,6 @@ fn build_cli_tool_runtime(
             ),
         )
         .context("register guarded apply_patch Tool")?;
-    let process_supervisor = Arc::new(
-        ProcessSupervisor::new(
-            usize::try_from(config.tools.max_output_bytes).unwrap_or(usize::MAX),
-        )
-        .context("create run-scoped process supervisor")?,
-    );
     if let Some(exec_host) = exec_host {
         runtime
             .register(
@@ -971,6 +993,23 @@ fn build_cli_tool_runtime(
         approval_broker,
         process_supervisor,
     })
+}
+
+fn command_runtime_temp_root(workspace_roots: &BTreeSet<String>) -> anyhow::Result<PathBuf> {
+    // Leave room for tools that create Unix sockets below TMPDIR. The macOS
+    // per-user OS temp prefix alone can consume much of sockaddr_un.sun_path.
+    let mut candidates = Vec::new();
+    #[cfg(unix)]
+    candidates.extend([PathBuf::from("/tmp"), PathBuf::from("/var/tmp")]);
+    candidates.push(std::env::temp_dir());
+    let parent = candidates
+        .into_iter()
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .find(|path| path.is_dir() && !workspace_roots.iter().any(|root| path.starts_with(root)))
+        .context("no OS temporary directory is available outside the workspace roots")?;
+    let identity =
+        orchestral_core::agent_protocol::wire::Digest::sha256(serde_json::to_vec(workspace_roots)?);
+    Ok(parent.join(format!("orch-{}", &identity.as_str()[..24])))
 }
 
 fn build_cli_blob_store(config: &OrchestralConfig) -> anyhow::Result<Arc<dyn BlobStore>> {
@@ -1922,6 +1961,32 @@ mod entry_mode_tests {
     use std::path::PathBuf;
 
     use super::{select_entry_mode, unique_id, CliWorkspaceSet, EntryMode};
+
+    #[cfg(unix)]
+    #[test]
+    fn command_temp_root_is_stable_external_and_short_enough_for_unix_sockets() {
+        let workspace = std::env::temp_dir().join(unique_id("temp-root-workspace", 0));
+        std::fs::create_dir(&workspace).unwrap();
+        let workspace = std::fs::canonicalize(workspace).unwrap();
+        let roots = std::collections::BTreeSet::from([workspace.to_string_lossy().into_owned()]);
+        let path = super::command_runtime_temp_root(&roots).unwrap();
+        assert_eq!(path, super::command_runtime_temp_root(&roots).unwrap());
+        assert!(!path.starts_with(&workspace));
+        let manager =
+            orchestral_runtime::ProcessSupervisor::new_with_runtime_temp_root(1024, &path).unwrap();
+        // Reserve one opaque Run component and one child tool's temp directory.
+        let child = manager
+            .runtime_temp_root()
+            .join("a".repeat(32))
+            .join(".tmpabcdef");
+        std::fs::create_dir_all(&child).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(child.join("control.sock"))
+            .expect("Host prefix must leave room for a Run and child tool's Unix socket");
+        drop(listener);
+        drop(manager);
+        std::fs::remove_dir_all(path).unwrap();
+        std::fs::remove_dir(workspace).unwrap();
+    }
 
     #[test]
     fn explicit_prompt_is_always_headless() {

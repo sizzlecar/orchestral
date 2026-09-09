@@ -1162,7 +1162,66 @@ async fn terminate_child_tree(
 ) -> io::Result<ExitStatus> {
     terminate_process_group(process_group_id);
     let _ = child.start_kill();
-    child.wait().await
+    let status = child.wait().await?;
+    #[cfg(unix)]
+    if let Some(group) = process_group_id.filter(|id| *id <= i32::MAX as u32) {
+        // The leader may have exited before its pipe-holding descendants.
+        // SIGKILL delivery and orphan reaping are asynchronous; waiting only
+        // for the leader can report cleanup before the group has disappeared.
+        // Keep this within the guarded runtime's 250 ms cancellation grace.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        loop {
+            if !process_group_exists(group as i32)? {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "terminated process group has not been reaped",
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+    Ok(status)
+}
+
+#[cfg(target_os = "macos")]
+fn process_group_exists(group: i32) -> io::Result<bool> {
+    // Darwin's group signal lookup skips zombies, while kill(pid, 0) still
+    // finds them. proc_listpids includes the zombie list, so cancellation can
+    // wait for actual reaping instead of treating an unsignalable group as gone.
+    const PROC_PGRP_ONLY: u32 = 2;
+    let mut member: libc::pid_t = 0;
+    // SAFETY: the buffer is writable for the supplied size. One matching PID
+    // is sufficient for an existence check; no process receives a signal.
+    let bytes = unsafe {
+        libc::proc_listpids(
+            PROC_PGRP_ONLY,
+            group as u32,
+            (&mut member as *mut libc::pid_t).cast(),
+            std::mem::size_of_val(&member) as libc::c_int,
+        )
+    };
+    if bytes < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(bytes > 0)
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn process_group_exists(group: i32) -> io::Result<bool> {
+    // SAFETY: signal 0 only observes the child-owned process group.
+    if unsafe { libc::kill(-group, 0) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
 }
 
 #[cfg(unix)]
@@ -1180,6 +1239,33 @@ fn terminate_process_group(_process_group_id: Option<u32>) {}
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn process_group_stays_present_until_its_zombie_is_reaped() {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        // SAFETY: siginfo_t is an output buffer. WNOWAIT observes only this
+        // child, retaining its zombie until Child::wait reaps it below.
+        let observed = unsafe {
+            let mut info = std::mem::zeroed::<libc::siginfo_t>();
+            libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT)
+        };
+        let present = super::process_group_exists(pid as i32);
+        let reaped = child.wait();
+        assert_eq!(observed, 0);
+        assert!(reaped.is_ok());
+        assert!(
+            present.unwrap(),
+            "an unreaped child still owns its process identity"
+        );
+        assert!(!super::process_group_exists(pid as i32).unwrap());
+    }
+
     use super::*;
 
     fn current_executable() -> String {

@@ -932,9 +932,9 @@ fn local_cli_reads_patches_and_runs_a_guarded_verification() {
                 "exec_command",
                 json!({
                     "cmd": concat!(
-                        "cargo test --offline --quiet >.orchestral/tmp/verification.log 2>&1\n",
+                        "cargo test --offline --quiet >\"$TMPDIR/verification.log\" 2>&1\n",
                         "command_status=$?\n",
-                        "cat .orchestral/tmp/verification.log\n",
+                        "cat \"$TMPDIR/verification.log\"\n",
                         "exit \"$command_status\""
                     ),
                     "yield_time_ms": 30_000

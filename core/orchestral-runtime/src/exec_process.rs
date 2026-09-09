@@ -23,6 +23,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::pty_process::{PtyProcessId, PtyProcessManager, PtyReadOptions, PtySpawnSpec};
 
+mod runtime_temp;
+use runtime_temp::{RuntimeTempDirectory, RuntimeTempRoot};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ExecSessionId(u64);
 
@@ -123,6 +126,8 @@ struct ManagedSession {
     started: Instant,
     tty: bool,
     operation: ToolOperationPlan,
+    // Keep scratch files until this process and its exit watcher release them.
+    _runtime_temp: Option<Arc<RuntimeTempDirectory>>,
 }
 
 use lifecycle::SessionLifecycle;
@@ -363,10 +368,29 @@ pub struct ProcessSupervisor {
     pty: Arc<PtyProcessManager>,
     max_output_bytes: usize,
     events: broadcast::Sender<ExecSessionEvent>,
+    runtime_temp_root: Arc<RuntimeTempRoot>,
+    runtime_temps: Mutex<BTreeMap<RunId, Arc<RuntimeTempDirectory>>>,
 }
 
 impl ProcessSupervisor {
     pub fn new(max_output_bytes: usize) -> Result<Self, ExecProcessError> {
+        Self::with_temp_root(max_output_bytes, RuntimeTempRoot::temporary()?)
+    }
+
+    /// Use a stable, private Host directory so execution policy identities can
+    /// survive Host restart. The root must be outside all workspace roots.
+    /// Its parent must already exist; Run children are exclusively created.
+    pub fn new_with_runtime_temp_root(
+        max_output_bytes: usize,
+        root: impl AsRef<std::path::Path>,
+    ) -> Result<Self, ExecProcessError> {
+        Self::with_temp_root(max_output_bytes, RuntimeTempRoot::open(root.as_ref())?)
+    }
+
+    fn with_temp_root(
+        max_output_bytes: usize,
+        runtime_temp_root: RuntimeTempRoot,
+    ) -> Result<Self, ExecProcessError> {
         if max_output_bytes == 0 {
             return Err(ExecProcessError::Invalid(
                 "exec output limit must be positive".to_owned(),
@@ -381,7 +405,48 @@ impl ProcessSupervisor {
             pty: Arc::new(pty),
             max_output_bytes,
             events,
+            runtime_temp_root: Arc::new(runtime_temp_root),
+            runtime_temps: Mutex::new(BTreeMap::new()),
         })
+    }
+
+    /// Host policy and exec Tool restrictions must explicitly grant read/write
+    /// access to this root. Each dispatched sandbox receives only its Run child.
+    pub fn runtime_temp_root(&self) -> &std::path::Path {
+        self.runtime_temp_root.path()
+    }
+
+    pub(crate) fn runtime_temp_path(&self, run_id: &RunId) -> PathBuf {
+        self.runtime_temp_root.run_path(run_id)
+    }
+
+    pub(crate) fn prepare_runtime_temp(
+        self: &Arc<Self>,
+        run_id: &RunId,
+        run_cancellation: CancellationToken,
+    ) -> Result<PathBuf, ExecProcessError> {
+        if run_cancellation.is_cancelled() {
+            return Err(ExecProcessError::Cancelled);
+        }
+        let mut directories = self
+            .runtime_temps
+            .lock()
+            .map_err(|_| ExecProcessError::Unavailable)?;
+        if let Some(directory) = directories.get(run_id) {
+            return Ok(directory.path().to_owned());
+        }
+        let directory = self.runtime_temp_root.create_run(run_id)?;
+        let path = directory.path().to_owned();
+        directories.insert(run_id.clone(), directory);
+        let manager = Arc::downgrade(self);
+        let run_id = run_id.clone();
+        tokio::spawn(async move {
+            run_cancellation.cancelled().await;
+            if let Some(manager) = manager.upgrade() {
+                let _ = manager.close_run(&run_id).await;
+            }
+        });
+        Ok(path)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<ExecSessionEvent> {
@@ -423,6 +488,12 @@ impl ProcessSupervisor {
             started,
             tty: spec.tty,
             operation: spec.operation,
+            _runtime_temp: self
+                .runtime_temps
+                .lock()
+                .map_err(|_| ExecProcessError::Unavailable)?
+                .get(&spec.run_id)
+                .cloned(),
         };
         let key = (spec.run_id, session_id);
         self.sessions
@@ -609,6 +680,10 @@ impl ProcessSupervisor {
             transition_session(&self.events, &key, &session, ExecSessionStatus::Terminated)?;
             self.terminate_session(run_id, session).await;
         }
+        self.runtime_temps
+            .lock()
+            .map_err(|_| ExecProcessError::Unavailable)?
+            .remove(run_id);
         Ok(count)
     }
 
