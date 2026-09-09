@@ -28,6 +28,12 @@ pub fn load_providers_config(path: &Path) -> Result<ProvidersConfig, ConfigError
 }
 
 fn validate_config(config: &OrchestralConfig) -> Result<(), ConfigError> {
+    if let Err(error) = config.agent.project_instructions.validate() {
+        return invalid(error.to_string());
+    }
+    if let Err(error) = config.agent.model_retry.validate() {
+        return invalid(error.to_string());
+    }
     if config.version != 1 {
         return invalid("version must be 1");
     }

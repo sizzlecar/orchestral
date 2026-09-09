@@ -13,6 +13,7 @@ pub mod generic_agent_checkpoint;
 mod in_memory_blob;
 pub mod pty_process;
 pub mod session_context;
+pub mod session_history;
 pub mod skill;
 pub mod tool_runtime;
 pub mod tools;
@@ -28,6 +29,7 @@ pub use exec_process::{
 };
 pub use generic_agent::{
     ContinuationPolicy, GenericAgentConfig, InternalGenericAgentProvider, ModelCostPolicy,
+    ModelRetryPolicy,
 };
 pub use generic_agent_checkpoint::{
     replay_generic_agent_checkpoint, AppendGenericCheckpointOutcome, CommandCheckpoint,

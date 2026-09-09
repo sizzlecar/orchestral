@@ -221,6 +221,16 @@ pub enum GenericCheckpointEvent {
         request_id: ModelRequestId,
         observation: GenericModelObservation,
     },
+    /// A retry within an open logical attempt, before any model event was
+    /// observed. Recovery still treats an open attempt as interrupted; this
+    /// fact does not authorize replaying a model request after process loss.
+    ModelRetryScheduled {
+        round: u64,
+        request_id: ModelRequestId,
+        retry_number: u32,
+        delay_ms: u64,
+        error: orchestral_core::model_protocol::ModelError,
+    },
     /// Written before entering the Workflow DAG executor. Once present, a
     /// missing durable Workflow output is intentionally outcome-unknown and
     /// must never be reconstructed by rerunning the DAG.
@@ -245,6 +255,30 @@ pub enum GenericCheckpointEvent {
 impl GenericCheckpointEvent {
     fn validate(&self, run_id: &RunId) -> Result<(), GenericCheckpointError> {
         match self {
+            Self::ModelRetryScheduled {
+                round,
+                request_id,
+                retry_number,
+                delay_ms,
+                error,
+            } => {
+                if *round == 0
+                    || request_id.is_empty()
+                    || *retry_number == 0
+                    || *delay_ms == 0
+                    || !error.retryable
+                    || !matches!(
+                        error.code,
+                        orchestral_core::model_protocol::ModelErrorCode::RateLimited
+                            | orchestral_core::model_protocol::ModelErrorCode::Unavailable
+                    )
+                {
+                    return Err(GenericCheckpointError::InvalidData(
+                        "model retry requires an attempt identity, delay, and transient error"
+                            .to_owned(),
+                    ));
+                }
+            }
             Self::LoopBoundaryCommitted {
                 next_model_round,
                 supporting_event_ids,
@@ -560,6 +594,7 @@ pub fn replay_generic_agent_checkpoint(
     let mut provider_event_digests = BTreeMap::<AgentEventId, Digest>::new();
     let mut commands = BTreeMap::<CommandId, CommandCheckpoint>::new();
     let mut checkpoint_ids = BTreeMap::<GenericCheckpointEventId, Digest>::new();
+    let mut last_retry_number = 0_u32;
 
     for (index, record) in run.records.iter().enumerate() {
         record.validate()?;
@@ -587,6 +622,24 @@ pub fn replay_generic_agent_checkpoint(
         }
 
         match &record.payload {
+            GenericCheckpointEvent::ModelRetryScheduled {
+                round,
+                request_id,
+                retry_number,
+                ..
+            } => {
+                if !matches!(&phase, GenericCheckpointPhase::ModelAttemptOpen {
+                    round: open_round, request_id: open_request_id, ..
+                } if round == open_round && request_id == open_request_id)
+                    || last_retry_number.checked_add(1) != Some(*retry_number)
+                {
+                    return Err(GenericCheckpointError::InvalidData(
+                        "model retry must advance the retry sequence of its open attempt"
+                            .to_owned(),
+                    ));
+                }
+                last_retry_number = *retry_number;
+            }
             GenericCheckpointEvent::LoopBoundaryCommitted {
                 next_model_round,
                 usage,
@@ -637,6 +690,7 @@ pub fn replay_generic_agent_checkpoint(
                     request_id: request_id.clone(),
                     request_digest: request_digest.clone(),
                 };
+                last_retry_number = 0;
             }
             GenericCheckpointEvent::ModelAttemptObserved {
                 round,
@@ -1020,6 +1074,82 @@ mod tests {
         let mut trace = context_trace();
         trace.used_input_tokens = trace.input_budget_tokens + 1;
         assert!(trace.validate().is_err());
+    }
+
+    #[test]
+    fn retry_checkpoints_must_match_an_open_attempt_and_advance_in_order() {
+        use orchestral_core::model_protocol::{ModelError, ModelErrorCode};
+        let store = InMemoryGenericAgentCheckpointStore::default();
+        let registration = registration();
+        let run_id = registration.run_id().clone();
+        store.create_run(registration).unwrap();
+        store.append(&run_id, 0, boundary(&run_id, 1)).unwrap();
+        let retry = |number, request_id: &str| GenericCheckpointDraft {
+            event_id: GenericCheckpointEventId::new(format!("retry-{number}-{request_id}")),
+            run_id: run_id.clone(),
+            payload: GenericCheckpointEvent::ModelRetryScheduled {
+                round: 1,
+                request_id: ModelRequestId::new(request_id),
+                retry_number: number,
+                delay_ms: 1,
+                error: ModelError::new(ModelErrorCode::Unavailable, "temporary")
+                    .with_retryable(true),
+            },
+        };
+        assert!(store.append(&run_id, 1, retry(1, "model-1")).is_err());
+        store
+            .append(
+                &run_id,
+                1,
+                GenericCheckpointDraft {
+                    event_id: GenericCheckpointEventId::new("attempt-1"),
+                    run_id: run_id.clone(),
+                    payload: GenericCheckpointEvent::ModelAttemptStarted {
+                        round: 1,
+                        request_id: ModelRequestId::new("model-1"),
+                        request_digest: Digest::sha256("request"),
+                        max_output_tokens: None,
+                        context: context_trace(),
+                    },
+                },
+            )
+            .unwrap();
+        assert!(store.append(&run_id, 2, retry(2, "model-1")).is_err());
+        assert!(store
+            .append(&run_id, 2, retry(1, "different-model"))
+            .is_err());
+        store.append(&run_id, 2, retry(1, "model-1")).unwrap();
+        assert!(matches!(
+            store
+                .load_run(&run_id)
+                .unwrap()
+                .unwrap()
+                .validate()
+                .unwrap()
+                .phase,
+            GenericCheckpointPhase::ModelAttemptOpen { .. }
+        ));
+        store
+            .append(
+                &run_id,
+                3,
+                GenericCheckpointDraft {
+                    event_id: GenericCheckpointEventId::new("observed-1"),
+                    run_id: run_id.clone(),
+                    payload: GenericCheckpointEvent::ModelAttemptObserved {
+                        round: 1,
+                        request_id: ModelRequestId::new("model-1"),
+                        observation: GenericModelObservation {
+                            finish_reason: ModelFinishReason::Stop,
+                            response: "done".to_owned(),
+                            usage: None,
+                            tool_calls: vec![],
+                        },
+                    },
+                },
+            )
+            .unwrap();
+        assert!(store.append(&run_id, 4, retry(2, "model-1")).is_err());
     }
 
     #[test]

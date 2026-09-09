@@ -2727,7 +2727,9 @@ impl ModelBackend for CompactionAwareModel {
             1 => {
                 assert!(serialized.contains("durable compaction summary marker"));
                 assert!(serialized.contains("second question"));
-                assert!(!serialized.contains("raw first question"));
+                // The most recent compacted user request is preserved as an
+                // original User message when the follow-up budget permits it.
+                assert!(serialized.contains("raw first question"));
                 assert!(!serialized.contains("raw first answer"));
                 "second answer"
             }
@@ -6923,6 +6925,66 @@ async fn sdk_and_api_share_the_same_agent_event_semantics() {
     assert_eq!(event_types(&sdk_events), event_types(&api_events));
     assert_eq!(sdk_turn.status(), api_turn.status());
     assert_eq!(sdk_turn.final_text(), api_turn.final_text());
+}
+
+#[tokio::test]
+async fn sdk_and_api_preserve_host_session_origin_and_reject_conflicting_run_metadata() {
+    use orchestral_core::session_history::{SessionOrigin, SESSION_ORIGIN_EXTENSION};
+    let provider = Arc::new(
+        InternalGenericAgentProvider::new(
+            Arc::new(ScriptedModel),
+            GenericAgentConfig::new("internal-provider", "generic-agent"),
+        )
+        .unwrap(),
+    );
+    let controller = Arc::new(
+        AgentController::new(provider, ProviderBindingRef::new("metadata-binding")).unwrap(),
+    );
+    let origin = SessionOrigin {
+        workspace: "/workspace/project".to_owned(),
+        additional_workspaces: vec![],
+        model: "host-model".to_owned(),
+    };
+    let client = AgentClient::new(controller.clone(), AgentSessionId::new("metadata-session"))
+        .with_default_extensions(origin.extensions());
+    let rejected = client
+        .start_with_run_id_and_extensions(
+            RunId::new("conflicting-run"),
+            vec![Content::text("hello")],
+            BTreeMap::from([(
+                SESSION_ORIGIN_EXTENSION.to_owned(),
+                json!({"workspace": "/different"}),
+            )]),
+        )
+        .await;
+    assert!(rejected.is_err());
+    assert!(controller.catalog_runs().await.unwrap().is_empty());
+    let turn = client.run_text("hello").await.unwrap();
+    assert_eq!(
+        SessionOrigin::from_extensions(&controller.run_extensions(&turn.run_id).await.unwrap())
+            .unwrap(),
+        Some(origin.clone())
+    );
+    let before = controller.events(&turn.run_id, 0).await.unwrap();
+    let resumed = client.resume_run(&turn.run_id).await.unwrap();
+    assert_eq!(resumed.run_id(), &turn.run_id);
+    assert_eq!(controller.events(&turn.run_id, 0).await.unwrap(), before);
+    assert!(
+        AgentClient::new(controller.clone(), AgentSessionId::new("other-session"))
+            .resume_run(&turn.run_id)
+            .await
+            .is_err()
+    );
+
+    let api = AgentApi::new(controller).with_default_extensions(origin.extensions());
+    let id = api.create_session(None).await.unwrap();
+    let handle = api.start_text(&id, None, "hello from API").await.unwrap();
+    handle.wait_until_blocked().await.unwrap();
+    assert_eq!(
+        SessionOrigin::from_extensions(&api.run_extensions(handle.run_id()).await.unwrap())
+            .unwrap(),
+        Some(origin)
+    );
 }
 
 fn test_unix_ms() -> i64 {

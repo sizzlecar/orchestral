@@ -2163,7 +2163,24 @@ impl TimelineItem {
 
 pub fn timeline_for_run(run: &RunState) -> Vec<TimelineItem> {
     let mut items = Vec::new();
-    items.extend(run.messages.iter().cloned().map(TimelineItem::Message));
+    items.extend(
+        run.messages
+            .iter()
+            .filter(|message| {
+                // A rejected steer is retained as a failed command, not as a
+                // delivered user message. A later successful retry may have
+                // identical text but owns its own accepted identity.
+                !message.steering
+                    || message.id.strip_prefix("steer-").is_none_or(|id| {
+                        !run.commands.iter().any(|command| {
+                            command.id == id
+                                && matches!(command.state.as_str(), "rejected" | "unsupported")
+                        })
+                    })
+            })
+            .cloned()
+            .map(TimelineItem::Message),
+    );
     items.extend(
         run.streamed_outputs
             .values()
@@ -5559,6 +5576,52 @@ mod tests {
             1,
             "old close cannot hide a newer pending snapshot"
         );
+    }
+
+    #[test]
+    fn rejected_steer_keeps_failure_without_duplicating_successful_retry() {
+        for outcome in ["rejected", "unsupported"] {
+            let mut run = RunState::new("run-retry".to_owned(), None);
+            for (sequence, id) in [(1, "first"), (3, "retry")] {
+                run.project_durable(
+                    &record(
+                        sequence,
+                        id,
+                        serde_json::json!({
+                            "type": "command_received", "command": {
+                                "command_id": id,
+                                "payload": {"type": "steer", "content": content("continue")}
+                            }
+                        }),
+                    ),
+                    sequence as f64,
+                );
+                run.project_durable(
+                    &record(
+                        sequence + 1,
+                        &format!("{id}-outcome"),
+                        serde_json::json!({
+                            "type": "command_disposition_recorded", "command_id": id,
+                            "outcome": {"outcome": if id == "first" { outcome } else { "accepted" }}
+                        }),
+                    ),
+                    (sequence + 1) as f64,
+                );
+            }
+            let timeline = timeline_for_run(&run);
+            let messages = timeline
+                .iter()
+                .filter_map(|item| match item {
+                    TimelineItem::Message(message) => Some(message.id.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(messages, vec!["steer-retry"]);
+            assert!(timeline.iter().any(|item| matches!(item,
+                TimelineItem::Command(command) if command.id == "first" && command.state == outcome
+            )));
+            assert_eq!(run.messages.len(), 2, "durable evidence remains intact");
+        }
     }
 
     #[test]

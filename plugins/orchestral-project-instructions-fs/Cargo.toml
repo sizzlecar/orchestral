@@ -1,0 +1,11 @@
+[package]
+name = "orchestral-project-instructions-fs"
+description = "Filesystem project instruction discovery for Orchestral"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+orchestral-core = { workspace = true }
+cap-std = "4.0.2"

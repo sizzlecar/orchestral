@@ -58,6 +58,7 @@ pub(crate) struct SkillManager {
     workspace: PathBuf,
     globally_enabled: bool,
     skills: Arc<Vec<SkillDescriptor>>,
+    enabled_sources: Arc<std::collections::BTreeSet<String>>,
 }
 
 impl SkillManager {
@@ -66,6 +67,7 @@ impl SkillManager {
         workspace: PathBuf,
         globally_enabled: bool,
         discovered: Option<&SkillRuntime>,
+        effective: Option<&SkillRuntime>,
     ) -> Self {
         Self {
             preferences_path,
@@ -76,7 +78,27 @@ impl SkillManager {
                     .map(|runtime| runtime.catalog().skills.clone())
                     .unwrap_or_default(),
             ),
+            enabled_sources: Arc::new(
+                effective
+                    .into_iter()
+                    .flat_map(|runtime| {
+                        runtime
+                            .catalog()
+                            .skills
+                            .iter()
+                            .map(|skill| skill.source.locator.clone())
+                    })
+                    .collect(),
+            ),
         }
+    }
+
+    pub(crate) fn enabled_in_process(&self, path: &str) -> bool {
+        self.enabled_sources.contains(path)
+    }
+
+    pub(crate) fn globally_enabled(&self) -> bool {
+        self.globally_enabled
     }
 
     pub(crate) fn statuses(&self) -> anyhow::Result<Vec<SkillStatus>> {
@@ -254,12 +276,6 @@ pub(crate) fn build_skill_setup(
 
     let preferences_path = user_skill_preferences_path()?;
     let globally_enabled = config.skills.enabled && !disabled_for_process;
-    let manager = SkillManager::new(
-        preferences_path.clone(),
-        workspace.to_path_buf(),
-        globally_enabled,
-        discovered.as_ref(),
-    );
     let effective = if globally_enabled {
         let disabled = load_skill_preferences(&preferences_path)?.disabled_sources();
         discovered
@@ -271,6 +287,13 @@ pub(crate) fn build_skill_setup(
     } else {
         None
     };
+    let manager = SkillManager::new(
+        preferences_path,
+        workspace.to_path_buf(),
+        globally_enabled,
+        discovered.as_ref(),
+        effective.as_deref(),
+    );
     Ok((effective, manager))
 }
 
@@ -347,12 +370,21 @@ mod tests {
         )
         .unwrap();
         let preferences_path = root.join("config/skills.json");
-        let manager =
-            SkillManager::new(preferences_path.clone(), root.clone(), true, Some(&runtime));
+        let manager = SkillManager::new(
+            preferences_path.clone(),
+            root.clone(),
+            true,
+            Some(&runtime),
+            Some(&runtime),
+        );
 
         let changed = manager.set_enabled("demo", false).unwrap();
 
         assert!(!changed.enabled);
+        assert!(
+            manager.enabled_in_process(&changed.path),
+            "preference changes cannot alter the running catalog"
+        );
         assert!(!manager.statuses().unwrap()[0].enabled);
         let preferences = load_skill_preferences(&preferences_path).unwrap();
         assert_eq!(preferences.disabled_sources().len(), 1);
@@ -380,6 +412,7 @@ mod tests {
             root.join("config/skills.json"),
             root.clone(),
             true,
+            Some(&runtime),
             Some(&runtime),
         );
 

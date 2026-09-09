@@ -72,9 +72,28 @@ cargo run -p orchestral-cli --
 | `printf '修复这个 bug' \| orchestral` | Headless 单轮 |
 
 Headless stdout 只输出最终 Delivery，进度和错误进入 stderr，适合管道消费。TUI 中 Enter
-发送消息或 Steer，Shift/Alt+Enter 换行，`a`/`d` 处理审批，Ctrl-C 取消当前 Run，
-PageUp/PageDown 或鼠标滚轮滚动，Esc 退出；支持 paste、resize、中文与 emoji。
-`completed` 只表示当前 Turn 已收敛并提交输出，不表示用户的外部目标已经被独立证明完成。
+发送消息、Steer 或回答当前问题；Ctrl+J 换行（终端支持时也可用 Shift+Enter）。上下键先移动
+多行光标，再访问本会话输入历史，返回时恢复草稿。粘贴支持中文、组合字符与 emoji；超过
+20 行显示有界预览，Ctrl+P 展开。
+
+F1 / Ctrl+] 打开命令并保留草稿。`/` 发现命令，`//` 发送以斜杠开头的普通文本。`@` 补全
+工作区路径，排除忽略目录和构建输出；选择路径不会读取文件正文。候选面板打开时会后台刷新，
+包含新建、重命名后的文件。空闲时可通过 `/model`、
+`/new`、`/resume` 切换配置中的模型或会话；草稿在当前进程内按会话保留。`/resume` 面板中的
+“Current session details” 查看实际存储位置和已报告用量。`/context` 区分当前或最近一轮的
+技能加载记录，并展示进程加载的规则来源和会话压缩记录。没有依据的上下文占用显示 `—`。
+
+Ctrl+O 在对话中展开工具记录；PgUp/PgDn 阅读历史或当前面板，End 跟随新输出。保留终端原生
+文本选择；存在本地剪贴板工具时，`/copy` 复制最近的已提交回答。`/`、F1 和 `/help` 提供统一
+操作菜单，其中包含快捷键说明和外观设置；`NO_COLOR` 禁用样式。`/skills` 搜索工作区发现的
+技能，Enter 查看完整说明和来源，空格切换启用偏好；待重启的修改与当前进程状态分别显示。
+浏览技能不会加载模型指令，也不会写入对话。
+
+Esc/Ctrl+C 优先关闭当前面板，否则中断活动 Run。空闲时 Ctrl+C 清空草稿；输入为空时
+Ctrl+D 退出，或使用 `/quit` 停止并退出。审批须用 `a`/`d`，或先用方向键明确选择再按 Enter。
+`replied` 表示回答已投递，不代表外部目标已被独立验证。等待回答时，`/` 开头的文字也作为
+回答提交；需要命令时使用 F1。回答和审批提交后等待确认，期间不重复发送。
+问题结束后恢复之前的草稿；先编辑或移动光标再发送，避免多按一次 Enter 意外提交旧草稿。
 
 CLI 依次发现 `.orchestral/config.yaml`、`.orchestral/config.yml`、
 `configs/orchestral.cli.yaml`、`orchestral.yaml`；都不存在时会生成
@@ -95,6 +114,83 @@ project 必须能从凭据或 `GOOGLE_CLOUD_PROJECT` 解析。
 
 `--session-id` 为多轮对话提供稳定、持久的 Session 身份；`--no-mcp` 和 `--no-skills`
 可分别关闭两套扩展面。
+
+内置 Agent 的历史会话可以直接查找和恢复：
+
+```bash
+orchestral sessions list                         # 当前工作区，最近更新在前
+orchestral sessions list --search parser         # 按标题或 Session ID 搜索
+orchestral sessions list --all --limit 20 --json  # 所有工作区，含旧会话
+orchestral sessions show SESSION_ID              # 查看原始对话与工具结果
+orchestral resume SESSION_ID                     # 在终端中回放历史并继续交互
+orchestral resume --last                         # 当前工作区的最近会话
+orchestral resume --last "继续验证刚才的修改"      # 单轮续接，也支持 stdin 管道
+```
+
+`sessions list/show` 默认读取内置 Agent；外部 Codex 会话使用 `--connector codex`。
+列表支持 `--cursor` 翻页，查询无需模型凭据，也不启动模型、工具或恢复执行。会话目录由
+Run/Session 日志重建；压缩影响模型上下文，TUI 仍回放原始对话。工具结果在 TUI 中显示
+有界摘录，完整内容可通过 `sessions show SESSION_ID --json` 查看。
+
+新 Run 记录工作区和模型来源。`--last` 只选择当前工作区，按 ID 恢复其他工作区时会提示
+使用对应 `-C`；来源元数据不会自动扩大工具权限。没有来源元数据的旧会话仍可通过
+`--all` 找到并按 ID 恢复，但不会被 `--last` 自动选中。恢复已完成的会话后，新输入创建新
+Run；未完成的 Run 先由 Controller 按现有 checkpoint 合同恢复，等待输入或审批时继续
+原交互，未观察到结果的模型尝试收束为 `Incomplete`，已提交工具效果不会重复执行。
+无法确认的效果保留 `UnknownEffect`；恢复身份不兼容时明确报错，不另起 Run 掩盖问题。
+同一文件日志目录同时只允许一个 Host 写入，浏览命令可以并行只读访问。
+
+长会话多次压缩时，runtime 会沿日志引用重新读取原始记录，避免反复压缩旧摘要。
+跨 Run 续聊会在历史条数和 token 预算内优先恢复最近一条被压缩的用户输入；有界摘要
+保留类型化的工具失败状态，但工具执行成功不等于任务已通过验证。
+
+内置 `session_read` 工具允许 Agent 搜索当前会话的原始记录，再按 JSON 字段或分块读取
+完整结果。它不能选择其他会话，且沿用 Host 权限、取消和 Tool Effect 日志。
+来源、分页与恢复兼容性详见 [Session Context and Recall](docs/agent-foundation/session-context-v1.md)。
+
+内置 Agent 自动复用现有项目指令。对 `-C` 和每个 `--add-dir` 工作区，从最近的 Git 根目录
+到所选目录逐层发现；Git worktree 的 `.git` 文件同样支持，非 Git 目录只检查所选目录。
+每层采用第一个非空文件：`AGENTS.override.md` → `AGENTS.md` → `CLAUDE.md`，祖先规则在前，
+具体目录规则在后。重叠工作区共享的来源只加载一次，每份指令保留来源和目录作用域。
+默认不会扫描无关子目录或导入其他 Agent 的全局个人配置；可用 `--add-dir` 选择额外目录。
+
+指令是 Host 启动时的固定快照，压缩与重试继续使用该快照；重启 Host 后重新加载。
+恢复旧 Run 时，如果指令内容发生变化，恢复身份校验会拒绝继续该 Run。
+项目指令不会扩大 Host 授权。同目录的 `AGENTS.md → CLAUDE.md` 符号链接可复用；越出来源
+目录的链接、非 UTF-8 或超出总字节上限的指令会明确报错，避免
+静默丢失项目规则。
+
+模型在返回任何事件之前遇到可重试的限流或临时不可用错误时，会在当前模型步骤内自动退避
+重试，默认最多 3 次；CLI/TUI 会显示等待进度，取消和 Steer 可立即打断等待。已经出现文字、
+工具调用或用量事件的模型请求不自动重发，已经执行的工具也不会因模型重试而重新执行。
+配置了 Run 累计 Token/费用上限时，只自动重试明确的限流拒绝，避免把未观察到用量的请求
+重复计费而绕过预算。进程重启后的不确定模型调用仍按原恢复合同处理。
+
+可在配置中关闭发现、扩展兼容文件名或调整重试：
+
+```yaml
+agent:
+  project_instructions:
+    enabled: true
+    max_bytes: 65536
+    fallback_filenames: [CLAUDE.md, TEAM_GUIDE.md]
+  model_retry:
+    max_retries: 3 # 0 表示禁用自动重试
+    base_delay_ms: 500
+    max_delay_ms: 8000
+```
+
+无需凭据的 CLI/PTY E2E 覆盖规则优先级、作用域、快照、重试、取消、Steer 和工具去重：
+
+```bash
+cargo test -p orchestral-cli --test agent_live_e2e
+```
+
+真实模型的项目指令 coding 验收使用已有 Vertex 凭据，明确启用后会产生模型费用：
+
+```bash
+cargo test -p orchestral-cli --test agent_live_e2e live_agent_uses_existing_project_instructions_for_coding -- --ignored --test-threads=1
+```
 
 ## 手机控制 PWA
 

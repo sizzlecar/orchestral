@@ -29,6 +29,17 @@ const SESSION_APPROVAL_PROMPT: &str = "Approve? [y] once / [a] this session / [N
 static LIVE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static LOCAL_E2E_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+#[path = "agent_live_e2e/context_reliability.rs"]
+mod context_reliability;
+#[path = "agent_live_e2e/model_retry.rs"]
+mod model_retry;
+#[path = "agent_live_e2e/project_instructions.rs"]
+mod project_instructions;
+#[path = "agent_live_e2e/session_history.rs"]
+mod session_history;
+#[path = "agent_live_e2e/tui_experience.rs"]
+mod tui_experience;
+
 struct TestWorkspace {
     root: PathBuf,
 }
@@ -354,7 +365,7 @@ fn tui_pty_resolves_input_and_approval_then_cancels_another_run() {
     tui.wait_for_text("INPUT_REQUEST_MARKER_7319", LOCAL_PROCESS_TIMEOUT);
     tui.send_paste("runtime-core");
     tui.wait_for_text("INPUT_RESOLVED_OK", LOCAL_PROCESS_TIMEOUT);
-    tui.wait_for_text_count("✓ done", 1, LOCAL_PROCESS_TIMEOUT);
+    tui.wait_for_text_count("○ replied", 1, LOCAL_PROCESS_TIMEOUT);
 
     tui.send_paste("start the approval flow");
     tui.wait_for_text("Effects:", LOCAL_PROCESS_TIMEOUT);
@@ -366,22 +377,18 @@ fn tui_pty_resolves_input_and_approval_then_cancels_another_run() {
     thread::sleep(Duration::from_millis(1_100));
     tui.send(b"\x1b[A\r");
     tui.wait_for_text("APPROVAL_RESOLVED_OK", LOCAL_PROCESS_TIMEOUT);
-    tui.wait_for_text_count("✓ done", 2, LOCAL_PROCESS_TIMEOUT);
+    tui.wait_for_text_count("○ replied", 2, LOCAL_PROCESS_TIMEOUT);
+    tui.wait_for_screen(|s| s.contains("Ran 1 command"), LOCAL_PROCESS_TIMEOUT);
 
     tui.send_paste("start the cancellation flow");
     tui.wait_for_text("CANCEL_REQUEST_MARKER_4827", LOCAL_PROCESS_TIMEOUT);
     tui.send(&[0x03]);
     tui.wait_for_text("cancelled", LOCAL_PROCESS_TIMEOUT);
-    tui.send(&[0x1b]);
+    tui.send(&[0x04]);
     tui.wait_for_text("\u{1b}[?1049l", LOCAL_PROCESS_TIMEOUT);
 
     let output = tui.finish(LOCAL_PROCESS_TIMEOUT);
     assert!(output.status.success(), "{}", output.text());
-    assert!(
-        output.text().contains("Running 1 command"),
-        "{}",
-        output.text()
-    );
     assert!(output.text().contains("Working"), "{}", output.text());
     assert!(
         output.text().contains("ctrl+c to interrupt"),
@@ -420,7 +427,7 @@ fn tui_pty_restores_terminal_after_agent_failure() {
     tui.wait_for_text("\u{1b}[?2004h", LOCAL_PROCESS_TIMEOUT);
     tui.send_paste("trigger the fixture failure");
     tui.wait_for_text("tool_not_found", LOCAL_PROCESS_TIMEOUT);
-    tui.send(&[0x1b]);
+    tui.send(&[0x04]);
     tui.wait_for_text("\u{1b}[?1049l", LOCAL_PROCESS_TIMEOUT);
 
     let output = tui.finish(LOCAL_PROCESS_TIMEOUT);
@@ -495,6 +502,7 @@ fn local_cli_creates_and_verifies_a_file_with_exec_disabled() {
                     "file_search",
                     "file_write",
                     "orchestral_request_input",
+                    "session_read",
                     "text_search"
                 ]
             );
@@ -1722,7 +1730,11 @@ fn mcp_user_registry_add_list_get_remove_round_trip() {
     assert!(listed.status.success(), "{}", listed.stderr_text());
     let registry: serde_json::Value =
         serde_json::from_str(&listed.stdout_text()).expect("list emits registry JSON");
-    assert_eq!(registry["mcpServers"]["fixture"]["command"], "/bin/echo");
+    let executable = fs::canonicalize("/bin/echo").expect("resolve registered executable");
+    assert_eq!(
+        registry["mcpServers"]["fixture"]["command"],
+        executable.to_string_lossy().as_ref()
+    );
     assert_eq!(
         registry["mcpServers"]["fixture"]["allowUnrestrictedNetwork"],
         true
@@ -1770,6 +1782,7 @@ fn user_registered_stdio_mcp_is_automatically_loaded_and_called() {
     let (network_endpoint, network_server) = spawn_fixture_http_server(vec![Box::new(|request| {
         assert_eq!(request.body, json!({"probe": "seekee-like-sidecar"}));
         FixtureHttpResponse {
+            status: "200 OK",
             content_type: "text/plain",
             body: MCP_RESULT_MARKER.as_bytes().to_vec(),
         }
@@ -1800,6 +1813,10 @@ done
         .arg("add")
         .arg("localfixture")
         .arg("--required")
+        // Child-process permission does not expose executable directories in
+        // the Linux filesystem sandbox. Declare the fixture's curl dependency.
+        .arg("--read")
+        .arg("/usr/bin")
         .arg("--")
         .arg("/bin/sh")
         .arg("-c")
@@ -1863,7 +1880,12 @@ done
         &model_requests[0].body,
         "mcp__localfixture__lookup_marker"
     ));
-    assert!(model_request_text(&model_requests[1].body).contains(MCP_RESULT_MARKER));
+    let context = model_request_text(&model_requests[1].body);
+    assert!(
+        context.contains(MCP_RESULT_MARKER),
+        "MCP result missing from model context: {context}\nstderr: {}",
+        output.stderr_text()
+    );
 
     let records = session_records(&workspace);
     let exchanges = tool_exchanges(&records);
@@ -2438,6 +2460,11 @@ fn local_tui_command(
 }
 
 struct PtyHarness {
+    started: Instant,
+    recording: Option<Vec<serde_json::Value>>,
+    max_size: (u16, u16),
+    screen: vt100::Parser,
+    screen_frames: Vec<String>,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn PtyChild + Send + Sync>,
     writer: Option<Box<dyn Write + Send>>,
@@ -2511,6 +2538,11 @@ impl PtyHarness {
         let (updates, receiver) = mpsc::channel();
         let reader = thread::spawn(move || read_pty_with_updates(reader, updates));
         Self {
+            started: Instant::now(),
+            recording: std::env::var_os("ORCHESTRAL_TUI_ARTIFACT_DIR").map(|_| Vec::new()),
+            max_size: (80, 24),
+            screen: vt100::Parser::new(24, 80, 0),
+            screen_frames: Vec::new(),
             master: pair.master,
             child,
             writer: Some(writer),
@@ -2520,7 +2552,9 @@ impl PtyHarness {
         }
     }
 
-    fn resize(&self, cols: u16, rows: u16) {
+    fn resize(&mut self, cols: u16, rows: u16) {
+        self.max_size = (self.max_size.0.max(cols), self.max_size.1.max(rows));
+        self.screen.screen_mut().set_size(rows, cols);
         self.master
             .resize(PtySize {
                 rows,
@@ -2537,6 +2571,44 @@ impl PtyHarness {
         writer.flush().expect("flush TUI input");
     }
 
+    fn receive(&mut self, bytes: Vec<u8>) {
+        self.screen.process(&bytes[self.latest.len()..]);
+        self.latest = bytes;
+        let contents = self.screen.screen().contents();
+        if self.screen_frames.last() != Some(&contents) {
+            self.screen_frames.push(contents);
+            if let Some(recording) = &mut self.recording {
+                // Full emulator frames preserve UTF-8 even when PTY reads split a character.
+                let formatted = self.screen.screen().contents_formatted();
+                recording.push(json!([
+                    self.started.elapsed().as_secs_f64(),
+                    "o",
+                    format!("\u{1b}[2J\u{1b}[H{}", String::from_utf8_lossy(&formatted))
+                ]));
+            }
+        }
+    }
+
+    #[track_caller]
+    fn wait_for_screen(&mut self, predicate: impl Fn(&str) -> bool, timeout: Duration) -> String {
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            let contents = self.screen.screen().contents();
+            if predicate(&contents) {
+                return contents;
+            }
+            match self.updates.recv_timeout(Duration::from_millis(50)) {
+                Ok(bytes) => self.receive(bytes),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        panic!(
+            "TUI screen condition failed:\n{}",
+            self.screen.screen().contents()
+        );
+    }
+
     fn send_paste(&mut self, text: &str) {
         self.send(format!("\x1b[200~{text}\x1b[201~\r").as_bytes());
     }
@@ -2550,11 +2622,12 @@ impl PtyHarness {
         while started.elapsed() < timeout {
             if String::from_utf8_lossy(&self.latest[offset.min(self.latest.len())..])
                 .contains(marker)
+                || (self.latest.len() > offset && self.screen.screen().contents().contains(marker))
             {
                 return;
             }
             match self.updates.recv_timeout(Duration::from_millis(100)) {
-                Ok(bytes) => self.latest = bytes,
+                Ok(bytes) => self.receive(bytes),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
@@ -2574,15 +2647,27 @@ impl PtyHarness {
     fn wait_for_text_count(&mut self, marker: &str, count: usize, timeout: Duration) {
         let started = Instant::now();
         while started.elapsed() < timeout {
+            let mut previous = 0usize;
+            let appearances = self
+                .screen_frames
+                .iter()
+                .map(|frame| {
+                    let current = frame.matches(marker).count();
+                    let added = current.saturating_sub(previous);
+                    previous = current;
+                    added
+                })
+                .sum::<usize>();
             if String::from_utf8_lossy(&self.latest)
                 .matches(marker)
                 .count()
                 >= count
+                || appearances >= count
             {
                 return;
             }
             match self.updates.recv_timeout(Duration::from_millis(100)) {
-                Ok(bytes) => self.latest = bytes,
+                Ok(bytes) => self.receive(bytes),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
@@ -2614,9 +2699,29 @@ impl PtyHarness {
                 );
             }
             if let Ok(bytes) = self.updates.recv_timeout(Duration::from_millis(50)) {
-                self.latest = bytes;
+                self.receive(bytes);
             }
         };
+        if let (Some(directory), Some(recording)) = (
+            std::env::var_os("ORCHESTRAL_TUI_ARTIFACT_DIR"),
+            &self.recording,
+        ) {
+            let directory = PathBuf::from(directory);
+            fs::create_dir_all(&directory).unwrap();
+            let name = thread::current().name().unwrap_or("tui").replace("::", "-");
+            let mut cast = serde_json::to_string(&json!({"version": 2, "width": self.max_size.0, "height": self.max_size.1, "title": name})).unwrap();
+            for event in recording {
+                cast.push('\n');
+                cast.push_str(&event.to_string());
+            }
+            cast.push('\n');
+            fs::write(directory.join(format!("{name}.cast")), cast).unwrap();
+            fs::write(
+                directory.join(format!("{name}.txt")),
+                self.screen_frames.join("\n\n--- frame ---\n\n"),
+            )
+            .unwrap();
+        }
         drop(self.master);
         let bytes = self.reader.join().expect("join TUI PTY reader");
         PtyOutput { status, bytes }
@@ -3070,6 +3175,7 @@ struct CapturedHttpRequest {
 }
 
 struct FixtureHttpResponse {
+    status: &'static str,
     content_type: &'static str,
     body: Vec<u8>,
 }
@@ -3176,7 +3282,8 @@ fn read_http_fixture_chunk(stream: &mut TcpStream, buffer: &mut [u8], deadline: 
 
 fn write_http_fixture_response(stream: &mut TcpStream, response: FixtureHttpResponse) {
     let headers = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        response.status,
         response.content_type,
         response.body.len()
     );
@@ -3239,6 +3346,7 @@ fn mcp_sse_response(request: &CapturedHttpRequest, result: Value) -> FixtureHttp
 
 fn json_response(body: Value) -> FixtureHttpResponse {
     FixtureHttpResponse {
+        status: "200 OK",
         content_type: "application/json",
         body: serde_json::to_vec(&body).expect("serialize HTTP fixture JSON"),
     }
@@ -3246,6 +3354,7 @@ fn json_response(body: Value) -> FixtureHttpResponse {
 
 fn sse_response(body: String) -> FixtureHttpResponse {
     FixtureHttpResponse {
+        status: "200 OK",
         content_type: "text/event-stream",
         body: body.into_bytes(),
     }

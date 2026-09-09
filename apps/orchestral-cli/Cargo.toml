@@ -25,6 +25,7 @@ orchestral-blob-fs = { path = "../../plugins/orchestral-blob-fs" }
 orchestral-model-gemini = { workspace = true }
 orchestral-model-openai = { workspace = true }
 orchestral-mcp-streamable-http = { path = "../../plugins/orchestral-mcp-streamable-http" }
+orchestral-project-instructions-fs = { path = "../../plugins/orchestral-project-instructions-fs" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -49,10 +50,14 @@ async-stream = "0.3"
 qrcode = { version = "0.14", default-features = false }
 include_dir = "0.7"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29", "unstable-rendered-line-info"] }
-crossterm = { version = "0.29", features = ["event-stream", "bracketed-paste"] }
+# Level-triggered TTY polling preserves pending input when resize and input arrive together.
+crossterm = { version = "0.29", features = ["event-stream", "bracketed-paste", "use-dev-tty"] }
 unicode-width = "0.2"
+unicode-segmentation = "1.13"
+vte = "0.15"
 reqwest = { workspace = true }
 jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
+ignore = "0.4"
 
 [dev-dependencies]
 async-trait = { workspace = true }
@@ -61,3 +66,4 @@ portable-pty = "0.9"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 orchestral-agent-protocol-testkit = { path = "../../testing/orchestral-agent-protocol-testkit" }
+vt100 = "0.16"

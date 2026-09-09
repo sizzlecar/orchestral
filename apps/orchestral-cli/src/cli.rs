@@ -65,6 +65,8 @@ enum CliCommand {
     Skills(crate::skill_command::SkillsCommand),
     /// Discover and control sessions owned by installed Agents.
     Sessions(crate::session_command::SessionsCommand),
+    /// Reopen a built-in Agent conversation, optionally with a follow-up prompt.
+    Resume(crate::local_sessions::ResumeCommand),
     /// Run the local Host gateway and mobile PWA control surface.
     Serve(crate::remote::ServeCommand),
 }
@@ -102,7 +104,8 @@ impl Cli {
         match self.command {
             Some(CliCommand::Mcp(command)) => command.run().await,
             Some(CliCommand::Skills(command)) => command.run(options.config, options.cwd),
-            Some(CliCommand::Sessions(command)) => command.run(options.cwd).await,
+            Some(CliCommand::Sessions(command)) => command.run(options.config, options.cwd).await,
+            Some(CliCommand::Resume(command)) => command.run(options).await,
             Some(CliCommand::Serve(command)) => crate::remote::serve(command, options).await,
             None => crate::agent::run(options).await,
         }
@@ -150,7 +153,7 @@ mod tests {
                 .get_subcommands()
                 .map(clap::Command::get_name)
                 .collect::<Vec<_>>(),
-            ["mcp", "skills", "sessions", "serve"]
+            ["mcp", "skills", "sessions", "resume", "serve"]
         );
     }
 

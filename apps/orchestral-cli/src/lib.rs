@@ -5,6 +5,7 @@ mod agent_connectors;
 mod cli;
 mod envfile;
 mod google_auth;
+mod local_sessions;
 mod mcp_command;
 mod mcp_config;
 pub mod remote;

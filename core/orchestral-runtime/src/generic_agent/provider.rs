@@ -248,6 +248,20 @@ impl InternalGenericAgentProvider {
             ));
         }
         config.continuation.validate()?;
+        config
+            .model_retry
+            .validate()
+            .map_err(model_protocol_error)?;
+        if config.project_instructions.iter().any(|document| {
+            document.source.trim().is_empty()
+                || document.scope.trim().is_empty()
+                || document.content.trim().is_empty()
+        }) {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidSpec,
+                "project instructions require a source, directory scope, and nonempty content",
+            ));
+        }
         if config.stream_buffer == 0
             || config.history_limit == 0
             || config.max_context_tokens == 0

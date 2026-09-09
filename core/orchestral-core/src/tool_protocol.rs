@@ -98,6 +98,9 @@ pub enum EffectScope {
     FilesystemRead,
     FilesystemWrite,
     ArtifactRead,
+    /// Read original records of the invoking Run's own Session. The Host
+    /// derives Session identity; model arguments cannot select another one.
+    SessionRead,
     EnvironmentRead,
     SecretRead,
     ExternalSideEffect,
@@ -901,6 +904,7 @@ impl EffectiveToolPolicy {
                     _ => false,
                 },
                 EffectScope::ArtifactRead
+                | EffectScope::SessionRead
                 | EffectScope::ExternalSideEffect
                 | EffectScope::HostExecution => true,
             }
@@ -1908,12 +1912,13 @@ mod tests {
     }
 
     fn generated_bounds(seed: &mut u64) -> ToolPolicyBounds {
-        const EFFECTS: [EffectScope; 9] = [
+        const EFFECTS: [EffectScope; 10] = [
             EffectScope::Process,
             EffectScope::Network,
             EffectScope::FilesystemRead,
             EffectScope::FilesystemWrite,
             EffectScope::ArtifactRead,
+            EffectScope::SessionRead,
             EffectScope::EnvironmentRead,
             EffectScope::SecretRead,
             EffectScope::ExternalSideEffect,

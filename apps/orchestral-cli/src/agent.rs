@@ -17,8 +17,8 @@ use orchestral_core::agent_protocol::{
         AgentCommand, AgentCommandEnvelope, AgentRunState, AgentSessionId, AgentTelemetry,
         AgentTerminalState, ApprovalDecision, BindingRequirement, CommandAckState, CommandId,
         Content, ContentBody, Digest, PendingRequest, PendingRequestPayload, ProviderBindingRef,
-        RequestResolution, ResourceBinding, ResourceBindingId, ResourceBindingMode, ResourceKind,
-        ResourceRef, ResourceRevision, RunId,
+        RequestId, RequestResolution, ResourceBinding, ResourceBindingId, ResourceBindingMode,
+        ResourceKind, ResourceRef, ResourceRevision, RunId,
     },
 };
 use orchestral_core::agent_session::{AgentSessionJournalStore, InMemoryAgentSessionJournalStore};
@@ -28,6 +28,7 @@ use orchestral_core::config::{
 use orchestral_core::io::BlobStore;
 use orchestral_core::mcp_protocol::{McpServerId, McpTransportFactory};
 use orchestral_core::model_protocol::ModelBackend;
+use orchestral_core::session_history::{SessionHistory, SessionOrigin};
 use orchestral_core::skill_protocol::SKILL_CATALOG_RESOURCE_KIND_V1;
 use orchestral_core::tool_effect::{InMemoryToolEffectJournalStore, ToolEffectJournalStore};
 use orchestral_core::tool_protocol::{
@@ -45,13 +46,15 @@ use orchestral_model_gemini::{
 };
 use orchestral_model_openai::{OpenAiCompatibleBackend, OpenAiCompatibleConfig};
 use orchestral_runtime::api::AgentApi;
+use orchestral_runtime::session_history::JournalSessionHistory;
 use orchestral_runtime::tools::{
     guarded_apply_patch_descriptor, guarded_artifact_read_descriptor, guarded_file_read_descriptor,
-    guarded_file_search_descriptor, guarded_file_write_descriptor, guarded_text_search_descriptor,
-    workspace_exec_command_descriptor, workspace_write_stdin_descriptor,
-    CommandEnvironmentSnapshot, GuardedApplyPatchExecutor, GuardedArtifactReadExecutor,
-    GuardedExecCommandExecutor, GuardedFileReadExecutor, GuardedFileSearchExecutor,
-    GuardedFileWriteExecutor, GuardedTextSearchExecutor, GuardedWriteStdinExecutor,
+    guarded_file_search_descriptor, guarded_file_write_descriptor, guarded_session_read_descriptor,
+    guarded_text_search_descriptor, workspace_exec_command_descriptor,
+    workspace_write_stdin_descriptor, CommandEnvironmentSnapshot, GuardedApplyPatchExecutor,
+    GuardedArtifactReadExecutor, GuardedExecCommandExecutor, GuardedFileReadExecutor,
+    GuardedFileSearchExecutor, GuardedFileWriteExecutor, GuardedSessionReadExecutor,
+    GuardedTextSearchExecutor, GuardedWriteStdinExecutor,
 };
 use orchestral_runtime::{
     AgentClient, AgentControlEvent, AgentController, ContinuationPolicy,
@@ -143,6 +146,7 @@ enum EntryMode {
     Tui,
 }
 
+#[derive(Clone)]
 struct CliJournalStores {
     run: Arc<dyn AgentJournalStore>,
     session: Arc<dyn AgentSessionJournalStore>,
@@ -168,7 +172,18 @@ struct CliToolComposition {
     process_supervisor: Arc<ProcessSupervisor>,
 }
 
+#[derive(Clone)]
+pub(crate) struct HostMetadata {
+    pub workspaces: Vec<PathBuf>,
+    pub journal_location: String,
+    pub context: String,
+    pub context_budget: u64,
+    pub models: Vec<ModelProfile>,
+}
+
 pub struct AgentHost {
+    pub(crate) metadata: HostMetadata,
+    journals: CliJournalStores,
     pub api: AgentApi,
     pub approvals: Arc<InMemoryHostApprovalBroker>,
     pub process_supervisor: Arc<ProcessSupervisor>,
@@ -176,6 +191,8 @@ pub struct AgentHost {
     pub model: String,
     pub workspace_root: PathBuf,
     pub execution_profile: AgentSessionExecutionProfile,
+    pub session_history: JournalSessionHistory,
+    session_origin: SessionOrigin,
     pub(crate) skill_manager: SkillManager,
     controller: Arc<AgentController>,
     resources: Vec<ResourceBinding>,
@@ -184,7 +201,15 @@ pub struct AgentHost {
 
 impl AgentHost {
     pub fn client(&self, session_id: AgentSessionId) -> AgentClient {
-        AgentClient::new(self.controller.clone(), session_id).with_resources(self.resources.clone())
+        AgentClient::new(self.controller.clone(), session_id)
+            .with_resources(self.resources.clone())
+            .with_default_extensions(self.session_origin.extensions())
+    }
+
+    pub(crate) async fn reconfigure(&self, options: &AgentRunOptions) -> anyhow::Result<Self> {
+        let mut next = build_agent_host_with_journals(options, Some(self.journals.clone())).await?;
+        next.metadata.journal_location = self.metadata.journal_location.clone();
+        Ok(next)
     }
 
     pub async fn shutdown(&self) {
@@ -193,6 +218,13 @@ impl AgentHost {
 }
 
 pub async fn build_agent_host(options: &AgentRunOptions) -> anyhow::Result<AgentHost> {
+    build_agent_host_with_journals(options, None).await
+}
+
+async fn build_agent_host_with_journals(
+    options: &AgentRunOptions,
+    shared: Option<CliJournalStores>,
+) -> anyhow::Result<AgentHost> {
     let workspaces = CliWorkspaceSet::resolve(options.cwd.as_deref(), &options.add_dirs)?;
     let config_path = prepare_runtime_config_path(
         options.config.clone(),
@@ -216,6 +248,18 @@ pub async fn build_agent_host(options: &AgentRunOptions) -> anyhow::Result<Agent
     )?;
 
     let mut agent_config = GenericAgentConfig::new("orchestral/internal", "generic-agent");
+    agent_config.model_retry = config.agent.model_retry.clone();
+    {
+        use orchestral_core::project_instructions::ProjectInstructionSource;
+        use orchestral_project_instructions_fs::FileProjectInstructionSource;
+        let source = FileProjectInstructionSource::new(config.agent.project_instructions.clone())?;
+        agent_config.project_instructions = source
+            .snapshot(&workspaces.root_strings().into_iter().collect::<Vec<_>>())
+            .context("load project instruction snapshot")?;
+        for document in &agent_config.project_instructions {
+            tracing::info!(source = %document.source, scope = %document.scope, "loaded project instructions");
+        }
+    }
     agent_config.stream_buffer = config.agent.stream_buffer;
     agent_config.continuation = ContinuationPolicy {
         max_model_steps: config.agent.max_model_steps,
@@ -248,33 +292,53 @@ pub async fn build_agent_host(options: &AgentRunOptions) -> anyhow::Result<Agent
         workspaces.primary.display(),
         workspace_context
     ));
+    let journals = if let Some(shared) = shared {
+        shared
+    } else {
+        match config.journal.backend.as_str() {
+            "memory" => CliJournalStores {
+                run: Arc::new(InMemoryAgentJournalStore::default()),
+                session: Arc::new(InMemoryAgentSessionJournalStore::default()),
+                effect: Arc::new(InMemoryToolEffectJournalStore::default()),
+                checkpoint: Arc::new(InMemoryGenericAgentCheckpointStore::default()),
+            },
+            "filesystem" | "fs" => {
+                let root = config.journal.root_dir.as_str();
+                let store = Arc::new(
+                    FileAgentJournalStore::open_single_writer(root)
+                        .with_context(|| format!("open Agent Journal at '{root}'"))?,
+                );
+                CliJournalStores {
+                    run: store.clone(),
+                    session: store.clone(),
+                    effect: store.clone(),
+                    checkpoint: store,
+                }
+            }
+            backend => bail!("unsupported Agent Journal backend for CLI: {backend}"),
+        }
+    };
     let CliJournalStores {
         run: run_journal,
         session: session_journal,
         effect: effect_journal,
         checkpoint: generic_checkpoint_journal,
-    } = match config.journal.backend.as_str() {
-        "memory" => CliJournalStores {
-            run: Arc::new(InMemoryAgentJournalStore::default()),
-            session: Arc::new(InMemoryAgentSessionJournalStore::default()),
-            effect: Arc::new(InMemoryToolEffectJournalStore::default()),
-            checkpoint: Arc::new(InMemoryGenericAgentCheckpointStore::default()),
-        },
-        "filesystem" | "fs" => {
-            let root = config.journal.root_dir.as_str();
-            let store = Arc::new(
-                FileAgentJournalStore::open(root)
-                    .with_context(|| format!("open Agent Journal at '{root}'"))?,
-            );
-            CliJournalStores {
-                run: store.clone(),
-                session: store.clone(),
-                effect: store.clone(),
-                checkpoint: store,
-            }
-        }
-        backend => bail!("unsupported Agent Journal backend for CLI: {backend}"),
+    } = journals.clone();
+    let metadata = HostMetadata {
+        context_budget: config.agent.max_context_tokens,
+        workspaces: std::iter::once(workspaces.primary.clone()).chain(workspaces.additional.clone()).collect(),
+        journal_location: if config.journal.backend == "memory" { "In memory (this process only)".to_owned() } else { std::fs::canonicalize(&config.journal.root_dir)?.display().to_string() },
+        context: format!("Context budget: {} tokens\nReserved output: {} tokens\nCompaction: {}\n\nLoaded project instructions (Host snapshot):\n{}",
+            config.agent.max_context_tokens, config.agent.reserved_output_tokens,
+            if config.agent.compaction.enabled { "automatic" } else { "disabled" },
+            agent_config.project_instructions.iter().map(|doc| format!("{}\n  Scope: {}", doc.source, doc.scope)).collect::<Vec<_>>().join("\n")),
+        models: config.providers.models.clone(),
     };
+    let session_history = JournalSessionHistory::new(
+        run_journal.clone(),
+        session_journal.clone(),
+        ProviderBindingRef::new(crate::local_sessions::GENERIC_BINDING),
+    );
     let mcp_configs = if options.no_mcp {
         Vec::new()
     } else {
@@ -299,6 +363,26 @@ pub async fn build_agent_host(options: &AgentRunOptions) -> anyhow::Result<Agent
         artifact_store,
         &workspaces,
     )?;
+    // Session identity is resolved from the registered invoking Run, never
+    // from model arguments or a filesystem path supplied by the model.
+    let mut recall_bounds = run_grant.bounds.clone();
+    recall_bounds.allowed_effects = BTreeSet::from([EffectScope::SessionRead]);
+    recall_bounds.process = ProcessPolicy::default();
+    recall_bounds.filesystem = FilesystemPolicy::default();
+    recall_bounds.network = NetworkPolicy::default();
+    recall_bounds.environment = EnvironmentPolicy::default();
+    recall_bounds.allowed_credentials.clear();
+    tool_runtime
+        .register(
+            guarded_session_read_descriptor(ToolRestriction {
+                bounds: recall_bounds,
+            }),
+            Arc::new(GuardedSessionReadExecutor::new(
+                run_journal.clone(),
+                session_journal.clone(),
+            )),
+        )
+        .context("register guarded session_read Tool")?;
     let mcp_registry = McpToolsAdapterRegistry::register(
         tool_runtime.as_ref(),
         mcp_configs,
@@ -379,8 +463,20 @@ pub async fn build_agent_host(options: &AgentRunOptions) -> anyhow::Result<Agent
             mode: ResourceBindingMode::Snapshot,
         });
     }
-    let api = AgentApi::with_resources(controller.clone(), resources.clone());
+    let session_origin = SessionOrigin {
+        workspace: workspaces.primary.to_string_lossy().into_owned(),
+        additional_workspaces: workspaces
+            .additional
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect(),
+        model: model.clone(),
+    };
+    let api = AgentApi::with_resources(controller.clone(), resources.clone())
+        .with_default_extensions(session_origin.extensions());
     Ok(AgentHost {
+        metadata,
+        journals,
         api,
         approvals: approval_broker,
         process_supervisor,
@@ -393,6 +489,8 @@ pub async fn build_agent_host(options: &AgentRunOptions) -> anyhow::Result<Agent
             permissions: Default::default(),
         },
         skill_manager,
+        session_history,
+        session_origin,
         controller,
         resources,
         mcp_registry,
@@ -400,14 +498,15 @@ pub async fn build_agent_host(options: &AgentRunOptions) -> anyhow::Result<Agent
 }
 
 pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
-    let host = build_agent_host(&options).await?;
+    let mut host = Arc::new(build_agent_host(&options).await?);
+    let tui_options = options.clone();
     let session_id = AgentSessionId::new(
         options
             .session_id
             .clone()
             .unwrap_or_else(|| unique_id("cli-session", 0)),
     );
-    let client = host.client(session_id);
+    let client = host.client(session_id.clone());
 
     let entry_mode = select_entry_mode(
         options.input,
@@ -415,6 +514,16 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
         io::stdout().is_terminal(),
     )?;
     let result = async {
+        let history = host.session_history.read(&session_id).await?;
+        if let Some(history) = &history {
+            crate::local_sessions::validate_workspace(history, &host.session_origin.workspace)?;
+            eprintln!(
+                "Resuming session {} · {}",
+                session_id, history.summary.title
+            );
+        }
+        let resumed = resume_unfinished(&client, history.as_ref()).await?;
+        let history = host.session_history.read(&session_id).await?;
         match entry_mode {
             EntryMode::HeadlessPrompt(input) => {
                 eprintln!(
@@ -422,7 +531,16 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
                     host.backend_name, host.model
                 );
                 let mut lines = BufReader::new(tokio::io::stdin()).lines();
-                run_turn(&client, &host.approvals, 1, input, &mut lines, false).await
+                run_turn(
+                    &client,
+                    &host.approvals,
+                    1,
+                    input,
+                    &mut lines,
+                    false,
+                    resumed,
+                )
+                .await
             }
             EntryMode::HeadlessPipe => {
                 eprintln!(
@@ -438,15 +556,26 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
                     bail!("stdin pipe did not contain an Agent prompt")
                 }
                 let mut lines = BufReader::new(tokio::io::stdin()).lines();
-                run_turn(&client, &host.approvals, 1, input, &mut lines, false).await
+                run_turn(
+                    &client,
+                    &host.approvals,
+                    1,
+                    input,
+                    &mut lines,
+                    false,
+                    resumed,
+                )
+                .await
             }
             EntryMode::Tui => {
                 crate::tui::run_tui(
                     client,
-                    host.approvals.clone(),
-                    host.process_supervisor.clone(),
-                    host.model.clone(),
-                    host.skill_manager.clone(),
+                    &mut host,
+                    tui_options,
+                    crate::tui::TuiResume {
+                        history,
+                        run: resumed,
+                    },
                 )
                 .await
             }
@@ -455,6 +584,29 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
     .await;
     host.shutdown().await;
     result
+}
+
+pub(crate) async fn resume_unfinished(
+    client: &AgentClient,
+    history: Option<&SessionHistory>,
+) -> anyhow::Result<Option<orchestral_runtime::AgentRunHandle>> {
+    let Some(history) = history else {
+        return Ok(None);
+    };
+    if history.summary.unfinished_run_ids.len() > 1 {
+        bail!("session has multiple unfinished executions; cannot select one for continuation");
+    }
+    let mut resumed = None;
+    for run_id in &history.summary.unfinished_run_ids {
+        let handle = client
+            .resume_run(run_id)
+            .await
+            .with_context(|| format!("reconcile unfinished Run {run_id}"))?;
+        if !handle.inspect().await?.state.is_terminal() {
+            resumed = Some(handle);
+        }
+    }
+    Ok(resumed)
 }
 
 fn build_cli_tool_runtime(
@@ -497,6 +649,7 @@ fn build_cli_tool_runtime(
         EffectScope::FilesystemRead,
         EffectScope::FilesystemWrite,
         EffectScope::ArtifactRead,
+        EffectScope::SessionRead,
     ]);
     if exec_enabled {
         allowed_effects.extend([
@@ -1368,6 +1521,65 @@ fn build_model_backend(
     }
 }
 
+async fn start_or_continue_turn(
+    client: &AgentClient,
+    resumed: Option<orchestral_runtime::AgentRunHandle>,
+    input: String,
+    turn: u64,
+) -> anyhow::Result<(orchestral_runtime::AgentRunHandle, Option<RequestId>)> {
+    if let Some(handle) = resumed {
+        let view = handle.inspect().await?;
+        if !view.state.is_terminal() {
+            let submitted_request = view
+                .pending_requests
+                .iter()
+                .find(|request| matches!(request.payload, PendingRequestPayload::Input { .. }))
+                .map(|request| request.request_id.clone());
+            let ack = if let Some(request_id) = &submitted_request {
+                handle
+                    .resolve_input_text(request_id.clone(), input.clone())
+                    .await
+            } else {
+                handle.steer_text(input.clone()).await
+            };
+            match ack {
+                Ok(ack)
+                    if matches!(
+                        ack.state,
+                        CommandAckState::Accepted { .. } | CommandAckState::Applied { .. }
+                    ) =>
+                {
+                    return Ok((handle, submitted_request))
+                }
+                Ok(ack) => {
+                    if !matches!(
+                        ack.state,
+                        CommandAckState::Rejected { .. } | CommandAckState::Unsupported { .. }
+                    ) || !handle.inspect().await?.state.is_terminal()
+                    {
+                        bail!(
+                            "resumed Run did not accept the follow-up input: {:?}",
+                            ack.state
+                        );
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+            // A recovered Run can finish while input is offered. Only an
+            // explicit rejection permits a new Run; an uncertain command
+            // result must never cause duplicate input.
+        }
+    }
+    client
+        .start_with_run_id(
+            RunId::new(unique_id("cli-run", turn)),
+            vec![Content::text(input)],
+        )
+        .await
+        .context("start Agent Run")
+        .map(|handle| (handle, None))
+}
+
 async fn run_turn(
     client: &AgentClient,
     approval_broker: &Arc<InMemoryHostApprovalBroker>,
@@ -1375,14 +1587,15 @@ async fn run_turn(
     input: String,
     lines: &mut tokio::io::Lines<BufReader<tokio::io::Stdin>>,
     accept_unsolicited_stdin: bool,
+    resumed: Option<orchestral_runtime::AgentRunHandle>,
 ) -> anyhow::Result<()> {
-    let run_id = RunId::new(unique_id("cli-run", turn));
-    let handle = client
-        .start_with_run_id(run_id.clone(), vec![Content::text(input)])
-        .await
-        .context("start Agent Run")?;
+    let (handle, submitted_request) = start_or_continue_turn(client, resumed, input, turn).await?;
+    let run_id = handle.run_id().clone();
     let mut events = handle.subscribe().await.context("subscribe to Agent Run")?;
-    let mut handled_requests = BTreeSet::new();
+    // Accepted input may precede the durable RequestResolved projection. Treat
+    // the initial resume answer like later answers, instead of prompting again
+    // (and cancelling on closed stdin) while that same command is being applied.
+    let mut handled_requests = submitted_request.into_iter().collect::<BTreeSet<_>>();
     let mut stdin_open = true;
     let view = loop {
         let view = handle.inspect().await.context("inspect Agent Run")?;

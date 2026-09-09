@@ -26,6 +26,7 @@ node_modules/
 .env.local
 .venv/
 /credential.json
+/DEPLOYMENT.md
 
 /docs/*
 !/docs/agent-foundation/

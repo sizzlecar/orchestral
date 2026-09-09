@@ -14,46 +14,128 @@ use orchestral_core::agent_protocol::wire::{
 };
 use orchestral_runtime::{
     AgentClient, AgentControlEvent, AgentRunHandle, ExecSessionEvent, ExecSessionStatus,
-    InMemoryHostApprovalBroker, ProcessSupervisor,
+    InMemoryHostApprovalBroker,
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
+use super::services::Tasks as ServiceTasks;
 use super::terminal::TerminalSession;
-use super::{render, update, ApprovalChoice, UiEffect, UiMsg, UiPhase, UiState};
-use crate::skill_command::SkillManager;
+use super::{
+    render_cached, update, ApprovalChoice, RenderCache, UiEffect, UiMsg, UiPhase, UiState,
+};
 
 const RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
 const ANIMATION_INTERVAL: Duration = Duration::from_millis(200);
+const FILE_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 static COMMAND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+pub(crate) struct TuiResume {
+    pub history: Option<orchestral_core::session_history::SessionHistory>,
+    pub run: Option<AgentRunHandle>,
+}
+
 pub(crate) async fn run_tui(
-    client: AgentClient,
-    approval_broker: Arc<InMemoryHostApprovalBroker>,
-    process_supervisor: Arc<ProcessSupervisor>,
-    model: String,
-    skill_manager: SkillManager,
+    mut client: AgentClient,
+    host: &mut Arc<crate::agent::AgentHost>,
+    mut options: crate::agent::AgentRunOptions,
+    resume: TuiResume,
 ) -> Result<()> {
+    let mut approval_broker = host.approvals.clone();
+    let mut process_supervisor = host.process_supervisor.clone();
     let mut terminal = TerminalSession::enter().context("enter TUI terminal mode")?;
     let mut input = EventStream::new();
     let (agent_tx, mut agent_rx) = mpsc::unbounded_channel();
     let mut active = None;
-    let mut state = UiState::new(client.session_id().as_str(), model);
+    let mut state = UiState::new(client.session_id().as_str(), host.model.clone());
+    state.project = host
+        .workspace_root
+        .file_name()
+        .unwrap_or(host.workspace_root.as_os_str())
+        .to_string_lossy()
+        .into_owned();
+    state.context_budget = Some(host.metadata.context_budget);
+    state.color_enabled = std::env::var_os("NO_COLOR").is_none();
+    let mut drafts = std::collections::BTreeMap::new();
+    let (service_tx, mut service_rx) = mpsc::unbounded_channel();
+    let mut service_tasks = ServiceTasks::new(service_tx);
+    let (files_tx, mut files_rx) = mpsc::unbounded_channel();
+    let mut file_index = super::files::FileIndex::new(host.metadata.workspaces.clone(), files_tx);
+    file_index.refresh();
+    let mut file_completion_open = false;
+    let mut file_refresh_tick = tokio::time::interval(FILE_REFRESH_INTERVAL);
+    file_refresh_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    if let Some(history) = &resume.history {
+        state.session_title = history.summary.title.clone();
+        state.transcript = super::history_entries(history);
+        for entry in &state.transcript {
+            if entry.role == super::state::TranscriptRole::User {
+                state.input_history.push(&entry.text);
+            }
+        }
+        state
+            .transcript
+            .push(super::state::TranscriptEntry::system(format!(
+                "Resumed session {}",
+                history.summary.session_id
+            )));
+    }
+    if let Some(handle) = resume.run {
+        let last_run_seq = resume
+            .history
+            .as_ref()
+            .and_then(|history| {
+                history
+                    .runs
+                    .iter()
+                    .find(|run| run.registration.run_id() == handle.run_id())
+            })
+            .map(|run| run.last_run_seq())
+            .unwrap_or(0);
+        let observer = observe_run(&handle, agent_tx.clone()).await?;
+        update(
+            &mut state,
+            UiMsg::RunStarted {
+                run_id: handle.run_id().as_str().to_owned(),
+            },
+        );
+        active = Some(ActiveRun {
+            handle,
+            observer,
+            last_run_seq,
+            delta_order: 0,
+            auto_resolved_approvals: BTreeSet::new(),
+        });
+        if reconcile_active(&mut active, &mut state, &approval_broker).await? {
+            stop_active(&mut active);
+        }
+    }
     let mut reconcile_tick = tokio::time::interval(RECONCILE_INTERVAL);
     reconcile_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut animation_tick = tokio::time::interval(ANIMATION_INTERVAL);
     animation_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut process_events = process_supervisor.subscribe();
     let mut process_events_open = true;
+    let mut cache = RenderCache::default();
     let mut needs_redraw = true;
     let mut quit = false;
 
     while !quit {
+        let had_active_run = active.is_some();
         if needs_redraw {
+            let mut anchor = state.viewport.anchor.clone();
+            let mut size = state.terminal_size;
             terminal
-                .draw(|frame| render(frame, &state))
+                .draw(|frame| {
+                    size = (frame.area().width, frame.area().height);
+                    anchor = render_cached(frame, &state, &mut cache);
+                })
                 .context("render TUI")?;
+            state.terminal_size = size;
+            state.viewport.anchor = anchor;
+            state.viewport.movement = 0;
+            state.transcript_dirty_from = state.transcript.len();
             needs_redraw = false;
         }
         tokio::select! {
@@ -64,7 +146,27 @@ pub(crate) async fn run_tui(
                     terminal.resize().context("resize TUI")?;
                 }
                 if let Some(message) = terminal_event_message(event, &state) {
+                    if matches!(message, UiMsg::ToggleHelp | UiMsg::Quit) {
+                        service_tasks.cancel_read(&mut state);
+                    } else if state.menu.is_none() && matches!(message, UiMsg::Escape | UiMsg::Cancel)
+                        && service_tasks.cancel_read(&mut state) {
+                        needs_redraw = true;
+                        continue;
+                    }
+                    if matches!(message, UiMsg::Submit) && state.menu.is_none() {
+                        if let Err(error) = super::menu::validate_references(&state.references, &state.composer) {
+                            state.ui_notice = Some(error.to_string()); needs_redraw = true; continue;
+                        }
+                    }
                     let effects = update(&mut state, message);
+                    let mut execution = Vec::new();
+                    for effect in effects {
+                        if matches!(&effect, UiEffect::MenuChoice { kind: super::menu::MenuKind::Commands, value } if value == "/quit") {
+                            service_tasks.cancel_read(&mut state);
+                            execution.extend(update(&mut state, UiMsg::Quit));
+                        } else if !service_tasks.dispatch(&effect, host.clone(), options.clone(), &mut state) { execution.push(effect); }
+                    }
+                    let effects = execution;
                     quit = execute_effects(
                         effects,
                         &client,
@@ -72,8 +174,66 @@ pub(crate) async fn run_tui(
                         &agent_tx,
                         &mut active,
                         &mut state,
-                        &skill_manager,
                     ).await?;
+                }
+                needs_redraw = true;
+            }
+            Some(files) = files_rx.recv() => {
+                file_index.received();
+                update(&mut state, UiMsg::FilesLoaded(files));
+                needs_redraw = true;
+            }
+            _ = file_refresh_tick.tick(), if file_completion_open => {
+                file_index.refresh();
+            }
+            Some((generation, result)) = service_rx.recv() => {
+                if !service_tasks.accept(generation) { continue; }
+                state.host_busy = false;
+                state.ui_notice = None;
+                match result {
+                    Err(error) => state.ui_notice = Some(error),
+                    Ok(super::services::Response::Menu(menu)) => { update(&mut state, UiMsg::OpenMenu(menu)); }
+                    Ok(super::services::Response::Notice(message)) => state.ui_notice = Some(message),
+                    Ok(super::services::Response::Model { host: next, options: next_options }) => {
+                        let old = std::mem::replace(host, next);
+                        service_tasks.cleanup.push(tokio::spawn(async move { old.shutdown().await; }));
+                        options = next_options;
+                        client = host.client(orchestral_core::agent_protocol::wire::AgentSessionId::new(&state.session_id));
+                        approval_broker = host.approvals.clone();
+                        process_supervisor = host.process_supervisor.clone();
+                        process_events = process_supervisor.subscribe();
+                        process_events_open = true;
+                        state.model = host.model.clone();
+                        state.context_budget = Some(host.metadata.context_budget);
+                        state.ui_notice = Some("Model selected for the next request".to_owned());
+                    }
+                    Ok(super::services::Response::Session { client: next, history, run }) => {
+                        drafts.insert(state.session_id.clone(), (state.composer.clone(), state.composer_cursor, state.references.clone()));
+                        let mut next_state = UiState::new(next.session_id().as_str(), host.model.clone());
+                        next_state.terminal_size = state.terminal_size;
+                        next_state.exit_requested = state.exit_requested;
+                        next_state.context_budget = Some(host.metadata.context_budget);
+                        next_state.project = state.project.clone();
+                        next_state.files = state.files.clone(); next_state.files_loaded = state.files_loaded;
+                        next_state.theme = state.theme.clone(); next_state.color_enabled = state.color_enabled;
+                        if let Some((text, cursor, references)) = drafts.remove(next.session_id().as_str()) {
+                            next_state.composer = text; next_state.composer_cursor = cursor; next_state.references = references;
+                        }
+                        if let Some(history) = &history {
+                            next_state.session_title = history.summary.title.clone();
+                            next_state.transcript = super::history_entries(history);
+                            for entry in &next_state.transcript { if entry.role == super::state::TranscriptRole::User { next_state.input_history.push(&entry.text); } }
+                            next_state.ui_notice = Some(format!("Resumed · {:?}", history.summary.status));
+                        }
+                        state = next_state; client = next;
+                        if let Some(handle) = run {
+                            let last_run_seq = history.as_ref().and_then(|h| h.runs.iter().find(|r| r.registration.run_id() == handle.run_id())).map_or(0, |r| r.last_run_seq());
+                            let observer = observe_run(&handle, agent_tx.clone()).await?;
+                            update(&mut state, UiMsg::RunStarted { run_id: handle.run_id().as_str().to_owned() });
+                            active = Some(ActiveRun { handle, observer, last_run_seq, delta_order: 0, auto_resolved_approvals: BTreeSet::new() });
+                            if reconcile_active(&mut active, &mut state, &approval_broker).await? { stop_active(&mut active); }
+                        }
+                    }
                 }
                 needs_redraw = true;
             }
@@ -125,10 +285,31 @@ pub(crate) async fn run_tui(
                 }
             }
         }
+        let completing_files = super::interaction::file_completion_active(&state);
+        if (completing_files && !file_completion_open) || (had_active_run && active.is_none()) {
+            file_index.refresh();
+            file_refresh_tick.reset();
+        }
+        file_completion_open = completing_files;
+        if state.exit_requested && active.is_some() && state.phase != UiPhase::Cancelling {
+            let effects = update(&mut state, UiMsg::Quit);
+            quit |= execute_effects(
+                effects,
+                &client,
+                &approval_broker,
+                &agent_tx,
+                &mut active,
+                &mut state,
+            )
+            .await?;
+        }
+        quit |= state.exit_requested && active.is_none() && !state.host_busy;
     }
 
     stop_active(&mut active);
-    terminal.restore().context("restore terminal after TUI")
+    terminal.restore().context("restore terminal after TUI")?;
+    service_tasks.finish().await;
+    Ok(())
 }
 
 fn project_process_event(state: &mut UiState, event: ExecSessionEvent) {
@@ -176,14 +357,69 @@ fn terminal_event_message(event: Event, state: &UiState) -> Option<UiMsg> {
 }
 
 fn key_message(key: KeyEvent, state: &UiState) -> Option<UiMsg> {
+    use super::editor::Edit;
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return None;
+    }
+    if key.code == KeyCode::F(1)
+        || (key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char(']' | '5')))
+    {
+        return Some(UiMsg::ToggleHelp);
+    }
+    if key.kind == KeyEventKind::Repeat && key.code == KeyCode::Enter {
+        return None;
+    }
+    if state.menu.is_some() {
+        return match key.code {
+            KeyCode::Esc => Some(UiMsg::Escape),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(UiMsg::Cancel)
+            }
+            KeyCode::Up => Some(UiMsg::SelectCandidate { up: true }),
+            KeyCode::Down => Some(UiMsg::SelectCandidate { up: false }),
+            KeyCode::PageUp => Some(UiMsg::ScrollUp(5)),
+            KeyCode::PageDown => Some(UiMsg::ScrollDown(5)),
+            KeyCode::Enter => Some(UiMsg::Submit),
+            KeyCode::Backspace => Some(UiMsg::Backspace),
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                Some(UiMsg::InsertText(c.to_string()))
+            }
+            _ => None,
+        };
+    }
+    if key.kind == KeyEventKind::Repeat && matches!(key.code, KeyCode::Enter) {
         return None;
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
-            KeyCode::Char('c') | KeyCode::Char('C') => Some(UiMsg::Cancel),
-            KeyCode::Char('a') | KeyCode::Char('A') => Some(UiMsg::MoveCursorStart),
-            KeyCode::Char('e') | KeyCode::Char('E') => Some(UiMsg::MoveCursorEnd),
+            KeyCode::Char('c' | 'C') => Some(UiMsg::Cancel),
+            KeyCode::Char('d' | 'D') if state.composer.is_empty() && state.run_id.is_none() => {
+                Some(UiMsg::Quit)
+            }
+            KeyCode::Char('d' | 'D') => Some(UiMsg::Delete),
+            KeyCode::Char('a' | 'A') => Some(UiMsg::MoveCursorStart),
+            KeyCode::Char('e' | 'E') => Some(UiMsg::MoveCursorEnd),
+            KeyCode::Char('j' | 'J') => Some(UiMsg::InsertText("\n".to_owned())),
+            KeyCode::Char('w' | 'W') => Some(UiMsg::Edit(Edit::DeleteWord)),
+            KeyCode::Char('u' | 'U') => Some(UiMsg::Edit(Edit::DeleteToStart)),
+            KeyCode::Char('k' | 'K') => Some(UiMsg::Edit(Edit::DeleteToEnd)),
+            KeyCode::Char('p' | 'P') => Some(UiMsg::ToggleInput),
+            KeyCode::Char('o' | 'O') => Some(UiMsg::ToggleTools),
+            KeyCode::Left => Some(UiMsg::Edit(Edit::WordLeft)),
+            KeyCode::Right => Some(UiMsg::Edit(Edit::WordRight)),
+            _ => None,
+        };
+    }
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        return match key.code {
+            KeyCode::Char('b') | KeyCode::Left => Some(UiMsg::Edit(Edit::WordLeft)),
+            KeyCode::Char('f') | KeyCode::Right => Some(UiMsg::Edit(Edit::WordRight)),
+            KeyCode::Backspace => Some(UiMsg::Edit(Edit::DeleteWord)),
             _ => None,
         };
     }
@@ -196,11 +432,11 @@ fn key_message(key: KeyEvent, state: &UiState) -> Option<UiMsg> {
             })
         );
         return match key.code {
-            KeyCode::Char('a') | KeyCode::Char('A') => Some(UiMsg::Approval(ApprovalChoice::Allow)),
-            KeyCode::Char('s') | KeyCode::Char('S') if session_available => {
+            KeyCode::Char('a' | 'A') => Some(UiMsg::Approval(ApprovalChoice::Allow)),
+            KeyCode::Char('s' | 'S') if session_available => {
                 Some(UiMsg::Approval(ApprovalChoice::AllowSession))
             }
-            KeyCode::Char('d') | KeyCode::Char('D') => Some(UiMsg::Approval(ApprovalChoice::Deny)),
+            KeyCode::Char('d' | 'D') => Some(UiMsg::Approval(ApprovalChoice::Deny)),
             KeyCode::Up => Some(UiMsg::SelectApproval(previous_approval_choice(
                 state.approval_choice,
                 session_available,
@@ -209,20 +445,19 @@ fn key_message(key: KeyEvent, state: &UiState) -> Option<UiMsg> {
                 state.approval_choice,
                 session_available,
             ))),
-            KeyCode::Enter => Some(UiMsg::Approval(state.approval_choice)),
-            KeyCode::Esc => Some(UiMsg::Quit),
+            KeyCode::Enter if state.approval_selected => {
+                Some(UiMsg::Approval(state.approval_choice))
+            }
+            KeyCode::Esc => Some(UiMsg::Escape),
             KeyCode::PageUp => Some(UiMsg::ScrollUp(5)),
             KeyCode::PageDown => Some(UiMsg::ScrollDown(5)),
+            KeyCode::End => Some(UiMsg::FollowOutput),
             _ => None,
         };
     }
     match key.code {
-        KeyCode::Esc => Some(UiMsg::Quit),
-        KeyCode::Enter
-            if key
-                .modifiers
-                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
-        {
+        KeyCode::Esc => Some(UiMsg::Escape),
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
             Some(UiMsg::InsertText("\n".to_owned()))
         }
         KeyCode::Enter => Some(UiMsg::Submit),
@@ -231,10 +466,12 @@ fn key_message(key: KeyEvent, state: &UiState) -> Option<UiMsg> {
         KeyCode::Left => Some(UiMsg::MoveCursorLeft),
         KeyCode::Right => Some(UiMsg::MoveCursorRight),
         KeyCode::Home => Some(UiMsg::MoveCursorStart),
-        KeyCode::End => Some(UiMsg::MoveCursorEnd),
-        KeyCode::PageUp | KeyCode::Up => Some(UiMsg::ScrollUp(5)),
-        KeyCode::PageDown | KeyCode::Down => Some(UiMsg::ScrollDown(5)),
-        KeyCode::Tab => Some(UiMsg::InsertText("    ".to_owned())),
+        KeyCode::End => Some(UiMsg::FollowOutput),
+        KeyCode::PageUp => Some(UiMsg::ScrollUp(5)),
+        KeyCode::PageDown => Some(UiMsg::ScrollDown(5)),
+        KeyCode::Up => Some(UiMsg::History { up: true }),
+        KeyCode::Down => Some(UiMsg::History { up: false }),
+        KeyCode::Tab => Some(UiMsg::Complete),
         KeyCode::Char(character) => Some(UiMsg::InsertText(character.to_string())),
         _ => None,
     }
@@ -264,26 +501,20 @@ async fn execute_effects(
     agent_tx: &mpsc::UnboundedSender<ForwardedAgentEvent>,
     active: &mut Option<ActiveRun>,
     state: &mut UiState,
-    skill_manager: &SkillManager,
 ) -> Result<bool> {
     for effect in effects {
         match effect {
-            UiEffect::ManageSkills { arguments } => {
-                let id = format!(
-                    "skill-command-{}",
-                    COMMAND_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-                );
-                match skill_manager.execute_tui(&arguments) {
-                    Ok(message) => notice(state, id, message, false),
-                    Err(error) => notice(state, id, error.to_string(), true),
-                }
+            UiEffect::HostCommand { .. }
+            | UiEffect::MenuChoice { .. }
+            | UiEffect::LocalAction { .. } => {
+                unreachable!("Host commands are dispatched before execution")
             }
             UiEffect::StartRun { input } => {
                 if active.is_some() {
                     notice(state, "start-active", "A Run is already active", true);
                     continue;
                 }
-                match client.start_text(input).await {
+                match client.start_text(input.clone()).await {
                     Ok(handle) => {
                         let run_id = handle.run_id().as_str().to_owned();
                         match observe_run(&handle, agent_tx.clone()).await {
@@ -317,15 +548,29 @@ async fn execute_effects(
                                 message: format!("could not start Run: {error}"),
                             },
                         );
+                        restore_submission(state, &input);
                     }
                 }
             }
             UiEffect::Steer { run_id, input } => {
                 if let Some(run) = matching_active(active, &run_id, state) {
-                    match run.handle.steer_text(input).await {
-                        Ok(ack) => project_ack(state, ack, "steer"),
-                        Err(error) => notice(state, "steer-error", error.to_string(), true),
+                    match run.handle.steer_text(input.clone()).await {
+                        Ok(ack) => {
+                            if !matches!(
+                                ack.state,
+                                CommandAckState::Accepted { .. } | CommandAckState::Applied { .. }
+                            ) {
+                                restore_submission(state, &input);
+                            }
+                            project_ack(state, ack, "steer");
+                        }
+                        Err(error) => {
+                            restore_submission(state, &input);
+                            notice(state, "steer-error", error.to_string(), true);
+                        }
                     }
+                } else {
+                    restore_submission(state, &input);
                 }
             }
             UiEffect::ResolveInput {
@@ -336,12 +581,19 @@ async fn execute_effects(
                 if let Some(run) = matching_active(active, &run_id, state) {
                     match run
                         .handle
-                        .resolve_input_text(RequestId::new(request_id), value)
+                        .resolve_input_text(RequestId::new(&request_id), value.clone())
                         .await
                     {
-                        Ok(ack) => project_ack(state, ack, "input"),
-                        Err(error) => notice(state, "input-error", error.to_string(), true),
+                        Ok(ack) => {
+                            project_request_ack(state, &request_id, ack, "input");
+                        }
+                        Err(error) => {
+                            update(state, UiMsg::RequestSubmissionFailed { request_id });
+                            notice(state, "input-error", error.to_string(), true);
+                        }
                     }
+                } else {
+                    update(state, UiMsg::RequestSubmissionFailed { request_id });
                 }
             }
             UiEffect::ResolveApproval {
@@ -365,6 +617,12 @@ async fn execute_effects(
                                     grant_ref: Some(grant_ref),
                                 },
                                 Err(error) => {
+                                    update(
+                                        state,
+                                        UiMsg::RequestSubmissionFailed {
+                                            request_id: request_id.as_str().to_owned(),
+                                        },
+                                    );
                                     notice(state, "approval-error", error.to_string(), true);
                                     continue;
                                 }
@@ -378,16 +636,24 @@ async fn execute_effects(
                     let command = AgentCommandEnvelope::new(
                         next_command_id("approval"),
                         run.handle.run_id().clone(),
-                        Some(request_id),
+                        Some(request_id.clone()),
                         AgentCommand::ResolveRequest { response },
                     )
                     .context("build TUI approval command")?;
                     match run.handle.command(command).await {
-                        Ok(ack) => project_ack(state, ack, "approval"),
+                        Ok(ack) => project_request_ack(state, request_id.as_str(), ack, "approval"),
                         Err(error) => {
+                            update(
+                                state,
+                                UiMsg::RequestSubmissionFailed {
+                                    request_id: request_id.as_str().to_owned(),
+                                },
+                            );
                             notice(state, "approval-command-error", error.to_string(), true)
                         }
                     }
+                } else {
+                    update(state, UiMsg::RequestSubmissionFailed { request_id });
                 }
             }
             UiEffect::CancelRun { run_id } => {
@@ -699,7 +965,7 @@ fn project_durable(state: &mut UiState, record: &AgentJournalRecord) -> bool {
                 Some(partial) => format!("{reason:?}\nPartial output: {partial}"),
                 None => format!("{reason:?}"),
             };
-            update(state, UiMsg::Failed { message });
+            update(state, UiMsg::Incomplete { message });
             return true;
         }
         AgentEvent::RunFailed { failure } => {
@@ -795,7 +1061,7 @@ fn project_terminal_view(
         ),
         AgentTerminalState::Incomplete { reason } => update(
             state,
-            UiMsg::Failed {
+            UiMsg::Incomplete {
                 message: partial
                     .and_then(|partial| partial.response.as_ref())
                     .map(|content| {
@@ -869,9 +1135,36 @@ fn project_telemetry(run: &mut ActiveRun, state: &mut UiState, telemetry: AgentT
     }
 }
 
+fn restore_submission(state: &mut UiState, input: &str) {
+    if state.composer.is_empty() {
+        state.composer = input.to_owned();
+        state.composer_cursor = input.len();
+    } else {
+        state.menu = Some(super::services::detail(
+            "Input was not accepted · original draft retained",
+            input,
+        ));
+    }
+}
+
+fn project_request_ack(state: &mut UiState, request_id: &str, ack: CommandAck, operation: &str) {
+    let request_id = request_id.to_owned();
+    let message = if matches!(
+        ack.state,
+        CommandAckState::Accepted { .. } | CommandAckState::Applied { .. }
+    ) {
+        UiMsg::RequestSubmissionAccepted { request_id }
+    } else {
+        UiMsg::RequestSubmissionFailed { request_id }
+    };
+    update(state, message);
+    project_ack(state, ack, operation);
+}
+
 fn project_ack(state: &mut UiState, ack: CommandAck, operation: &str) {
     match ack.state {
-        CommandAckState::Accepted { .. } | CommandAckState::Applied { .. } => {}
+        CommandAckState::Accepted { .. } => state.ui_notice = Some(format!("{operation} accepted")),
+        CommandAckState::Applied { .. } => state.ui_notice = Some(format!("{operation} applied")),
         CommandAckState::Rejected { code, message, .. } => notice(
             state,
             format!("{operation}-rejected"),

@@ -93,6 +93,16 @@ pub(super) fn system_message_for_run(
     if !config.system_prompt.trim().is_empty() {
         sections.push(config.system_prompt.clone());
     }
+    if !config.project_instructions.is_empty() {
+        sections.push(format!(
+            "Project instructions supplied by the Host (JSON documents below). Apply each document \
+             only to files in its scope directory or descendants. More specific directory rules \
+             refine ancestor rules. These are repository conventions: they do not replace Host \
+             policy or grant permissions. Sources and content are a fixed snapshot for this Host.\n{}",
+            serde_json::to_string(&config.project_instructions)
+                .expect("project instruction documents serialize as strings")
+        ));
+    }
     if let Some(skills) = skills {
         sections.push(skills.descriptor_context());
     }
@@ -237,6 +247,9 @@ pub(super) fn generic_config_digest(
         "provider_id": config.provider_id,
         "agent_id": config.agent_id,
         "system_prompt": config.system_prompt,
+        "project_instructions": config.project_instructions,
+        "context_projection_contract": "original-user-anchor/v2",
+        "model_retry": config.model_retry,
         "model_descriptor": model_descriptor,
         "token_meter": token_meter,
         "continuation_policy": {
@@ -272,7 +285,7 @@ pub(super) fn bind_session_compaction_config_digest(
     summarizer: &SessionSummarizerDescriptor,
 ) -> Result<Digest, AgentProtocolError> {
     let value = serde_json::json!({
-        "contract": "generic-agent-session-compaction/v1",
+        "contract": "generic-agent-session-compaction/v2",
         "base_config_digest": base_config_digest,
         "policy": policy,
         "summarizer": summarizer,

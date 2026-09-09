@@ -42,6 +42,8 @@ use orchestral_core::model_protocol::{
     ModelMessage, ModelRequest, ModelRequestId, ModelRole, ModelToolCallId, ModelToolDefinition,
     ModelUsage,
 };
+pub use orchestral_core::model_retry::ModelRetryPolicy;
+use orchestral_core::project_instructions::ProjectInstruction;
 use orchestral_core::skill_protocol::SkillLoad;
 use orchestral_core::tool_protocol::{
     ApprovalBinding, ApprovalCapability, RunToolGrant, ToolCallId, ToolInvocation, ToolOutcome,
@@ -166,6 +168,10 @@ pub struct GenericAgentConfig {
     pub provider_id: AgentProviderId,
     pub agent_id: AgentId,
     pub system_prompt: String,
+    /// Host-lifetime instruction snapshot, included in the recovery identity.
+    pub project_instructions: Vec<ProjectInstruction>,
+    /// Retries before the first model event; never replays tool execution.
+    pub model_retry: ModelRetryPolicy,
     pub stream_buffer: usize,
     pub continuation: ContinuationPolicy,
     pub history_limit: usize,
@@ -247,6 +253,8 @@ impl GenericAgentConfig {
             )
             .to_owned(),
             stream_buffer: 128,
+            project_instructions: Vec::new(),
+            model_retry: ModelRetryPolicy::default(),
             continuation: ContinuationPolicy::default(),
             history_limit: 128,
             max_context_tokens: 128 * 1024,
@@ -474,6 +482,7 @@ mod recovery_projection;
 use recovery_projection::*;
 mod context;
 use context::*;
+mod model_retry;
 mod model_step;
 use model_step::*;
 mod tool_step;
