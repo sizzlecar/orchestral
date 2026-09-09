@@ -67,7 +67,10 @@ the selected provider's API key (`GOOGLE_API_KEY`, `OPENAI_API_KEY`,
 Supported model prefixes are `google/`, `openai/`, `openrouter/`, and `deepseek/`.
 For container access through a host proxy, pass a reachable container-side URL
 using `--ae HTTPS_PROXY=http://host.docker.internal:PORT`; host loopback addresses
-do not refer to the host from inside a container.
+do not refer to the host from inside a container. Standard `HTTP_PROXY`,
+`HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` variables, including lowercase forms,
+are forwarded to the CLI and its commands. This does not configure Harbor's
+image downloads or the verifier's environment.
 
 To use a pinned local checkout of official tasks, replace `-d` with
 `-p /absolute/path/to/terminal-bench-2` and keep the same `-i` filter. Record its
@@ -81,8 +84,11 @@ tests, or scoring rules between agents.
 - `agent.input_requests_enabled: false` removes the input-request capability
   and tool. Unsolicited input calls fail without opening a pending request.
   Interactive applications retain the default `true` setting.
-- Commands may request escalation beyond Orchestral's inner workspace sandbox.
-  The adapter approves those operations inside the disposable Docker container.
+- `tools.exec.sandboxed_execution_enabled: false` exposes only explicit approved
+  command execution; official images do not need a nested bubblewrap sandbox.
+  Each command still supplies an escalation request and justification, and the
+  native Host checks an exact approval capability before execution. The adapter
+  supplies approval inside the disposable Docker container.
   This adapter accepts Docker environments only. Do not expose host workspace
   mounts or the Docker socket to benchmark containers.
 - MCP and skills are disabled. Task-provided MCP/skills are rejected, rather
@@ -100,8 +106,10 @@ tests, or scoring rules between agents.
   A nonzero CLI exit remains an execution error, independent of verifier reward.
   Harbor also preserves logs when the agent times out.
 - Token totals count each committed model request once, even when it emits
-  several tool calls. Missing usage and unknown cost remain unknown. Interrupted,
-  uncommitted provider requests are not included in those totals.
+  several tool calls. Gemini input includes server-side tool input and output
+  includes thinking tokens; cached prompt tokens are not counted twice. Missing
+  usage and unknown cost remain unknown. Interrupted, uncommitted provider
+  requests are not included in those totals.
 
 Small subsets validate integration; they are not full Terminal-Bench scores.
 Separate reference failures, agent execution errors, incorrect solutions, and

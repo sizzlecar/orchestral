@@ -23,10 +23,10 @@ pub use self::guarded::{
 };
 pub use self::guarded_artifact::{guarded_artifact_read_descriptor, GuardedArtifactReadExecutor};
 pub use self::guarded_exec::{
-    guarded_exec_command_descriptor, guarded_write_stdin_descriptor,
-    workspace_exec_command_descriptor, workspace_write_stdin_descriptor,
-    CommandEnvironmentSnapshot, GuardedExecCommandExecutor, GuardedWriteStdinExecutor,
-    GUARDED_EXEC_SANDBOX_PROFILE,
+    approved_host_exec_command_descriptor, guarded_exec_command_descriptor,
+    guarded_write_stdin_descriptor, workspace_exec_command_descriptor,
+    workspace_write_stdin_descriptor, CommandEnvironmentSnapshot, GuardedExecCommandExecutor,
+    GuardedWriteStdinExecutor, GUARDED_EXEC_SANDBOX_PROFILE,
 };
 pub use self::guarded_patch::{
     guarded_apply_patch_descriptor, guarded_file_write_descriptor, GuardedApplyPatchExecutor,

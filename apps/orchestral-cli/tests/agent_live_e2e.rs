@@ -1635,6 +1635,76 @@ fn local_cli_routes_structured_host_execution_through_the_approval_prompt() {
 }
 
 #[test]
+fn local_cli_preserves_command_proxies_without_inheriting_unlisted_secrets() {
+    let _guard = local_e2e_guard();
+    const PROXY: &str = "http://proxy-fixture.invalid:8080";
+    const BYPASS: &str = "127.0.0.1,localhost,proxy-bypass.invalid";
+    const SECRET: &str = "PRIVATE_PROVIDER_CREDENTIAL_5482";
+    let workspace = TestWorkspace::new("command-proxy");
+    let (endpoint, server) = spawn_fixture_http_server(vec![
+        Box::new(|_| {
+            openai_tool_response(
+                "inspect-command-environment",
+                "exec_command",
+                json!({
+                    "cmd": "env",
+                    "sandbox_permissions": "require_escalated",
+                    "justification": "Inspect the requested command environment",
+                    "yield_time_ms": 1000
+                }),
+            )
+        }),
+        Box::new(|request| {
+            let context = model_request_text(&request.body);
+            for name in [
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+            ] {
+                assert!(context.contains(&format!("{name}={PROXY}")), "{context}");
+            }
+            for name in ["NO_PROXY", "no_proxy"] {
+                assert!(context.contains(&format!("{name}={BYPASS}")), "{context}");
+            }
+            assert!(
+                !context.contains(SECRET),
+                "unlisted secret reached the model"
+            );
+            openai_text_response("COMMAND_PROXY_OK")
+        }),
+    ]);
+    workspace.configure_local_openai(&endpoint);
+    let mut command = local_default_agent_command(
+        &workspace,
+        "command-proxy",
+        "Inspect the command environment.",
+        true,
+        true,
+    );
+    for name in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        command.env(name, PROXY);
+    }
+    command
+        .env("NO_PROXY", BYPASS)
+        .env("no_proxy", BYPASS)
+        .env("UNLISTED_PROVIDER_KEY", SECRET);
+    let output = run_with_approval(command, true, LOCAL_PROCESS_TIMEOUT);
+    assert!(output.status.success(), "{}", output.stderr_text());
+    assert_eq!(output.stdout_text().trim(), "COMMAND_PROXY_OK");
+    assert_eq!(server.join().expect("join proxy model server").len(), 2);
+}
+
+#[test]
 fn local_cli_host_execution_ceiling_denies_without_prompt_or_spawn() {
     let _guard = local_e2e_guard();
     const FINAL_MARKER: &str = "HOST_EXECUTION_CEILING_OK";

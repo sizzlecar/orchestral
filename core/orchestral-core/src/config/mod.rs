@@ -229,7 +229,7 @@ fn default_tool_output_bytes() -> u64 {
 /// Unified command execution. The Host resolves one command shell; child
 /// process safety is enforced by the effect sandbox rather than a model-facing
 /// executable allowlist.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecToolConfig {
     #[serde(default)]
@@ -241,11 +241,29 @@ pub struct ExecToolConfig {
     /// disabled by default in the library configuration.
     #[serde(default)]
     pub allow_host_execution: bool,
+    /// Exposes the default workspace sandbox. Hosts that provide their own
+    /// isolation may disable this path and offer only explicitly requested,
+    /// approved Host execution. This does not grant approval by itself and
+    /// requires `allow_host_execution` when command execution is enabled.
+    #[serde(default = "default_true")]
+    pub sandboxed_execution_enabled: bool,
     /// Exact `host:port` destinations available inside the default sandbox.
     /// Empty denies sandboxed network access. Approved Host execution, when
     /// explicitly enabled above, carries its own unrestricted network scope.
     #[serde(default)]
     pub network_targets: Vec<String>,
+}
+
+impl Default for ExecToolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            shell: None,
+            allow_host_execution: false,
+            sandboxed_execution_enabled: true,
+            network_targets: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

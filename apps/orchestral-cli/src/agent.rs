@@ -48,13 +48,14 @@ use orchestral_model_openai::{OpenAiCompatibleBackend, OpenAiCompatibleConfig};
 use orchestral_runtime::api::AgentApi;
 use orchestral_runtime::session_history::JournalSessionHistory;
 use orchestral_runtime::tools::{
-    guarded_apply_patch_descriptor, guarded_artifact_read_descriptor, guarded_file_read_descriptor,
-    guarded_file_search_descriptor, guarded_file_write_descriptor, guarded_session_read_descriptor,
-    guarded_text_search_descriptor, workspace_exec_command_descriptor,
-    workspace_write_stdin_descriptor, CommandEnvironmentSnapshot, GuardedApplyPatchExecutor,
-    GuardedArtifactReadExecutor, GuardedExecCommandExecutor, GuardedFileReadExecutor,
-    GuardedFileSearchExecutor, GuardedFileWriteExecutor, GuardedSessionReadExecutor,
-    GuardedTextSearchExecutor, GuardedWriteStdinExecutor,
+    approved_host_exec_command_descriptor, guarded_apply_patch_descriptor,
+    guarded_artifact_read_descriptor, guarded_file_read_descriptor, guarded_file_search_descriptor,
+    guarded_file_write_descriptor, guarded_session_read_descriptor, guarded_text_search_descriptor,
+    workspace_exec_command_descriptor, workspace_write_stdin_descriptor,
+    CommandEnvironmentSnapshot, GuardedApplyPatchExecutor, GuardedArtifactReadExecutor,
+    GuardedExecCommandExecutor, GuardedFileReadExecutor, GuardedFileSearchExecutor,
+    GuardedFileWriteExecutor, GuardedSessionReadExecutor, GuardedTextSearchExecutor,
+    GuardedWriteStdinExecutor,
 };
 use orchestral_runtime::{
     AgentClient, AgentControlEvent, AgentController, ContinuationPolicy,
@@ -958,11 +959,17 @@ fn build_cli_tool_runtime(
         )
         .context("register guarded apply_patch Tool")?;
     if let Some(exec_host) = exec_host {
+        let restriction = ToolRestriction {
+            bounds: exec_bounds.clone(),
+        };
+        let descriptor = if config.tools.exec.sandboxed_execution_enabled {
+            workspace_exec_command_descriptor(restriction)
+        } else {
+            approved_host_exec_command_descriptor(restriction)
+        };
         runtime
             .register(
-                workspace_exec_command_descriptor(ToolRestriction {
-                    bounds: exec_bounds.clone(),
-                }),
+                descriptor,
                 Arc::new(
                     GuardedExecCommandExecutor::new(
                         process_supervisor.clone(),
@@ -972,7 +979,10 @@ fn build_cli_tool_runtime(
                         exec_host.environment,
                     )
                     .map_err(anyhow::Error::msg)
-                    .context("configure guarded exec_command Tool")?,
+                    .context("configure guarded exec_command Tool")?
+                    .with_sandboxed_execution_enabled(
+                        config.tools.exec.sandboxed_execution_enabled,
+                    ),
                 ),
             )
             .context("register guarded exec_command Tool")?;
@@ -1029,6 +1039,9 @@ fn configured_exec_host(config: &OrchestralConfig) -> anyhow::Result<Option<CliE
     if !config.tools.exec.enabled {
         return Ok(None);
     }
+    if !config.tools.exec.sandboxed_execution_enabled && !config.tools.exec.allow_host_execution {
+        bail!("tools.exec.sandboxed_execution_enabled=false requires tools.exec.allow_host_execution=true; command approval is still required");
+    }
     let configured = config
         .tools
         .exec
@@ -1061,6 +1074,14 @@ fn configured_exec_host(config: &OrchestralConfig) -> anyhow::Result<Option<CliE
         "GIT_CONFIG_GLOBAL",
         "GIT_CONFIG_SYSTEM",
         "GIT_CONFIG_NOSYSTEM",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -1962,6 +1983,21 @@ mod entry_mode_tests {
     use std::path::PathBuf;
 
     use super::{select_entry_mode, unique_id, CliWorkspaceSet, EntryMode};
+
+    #[cfg(unix)]
+    #[test]
+    fn disabling_sandboxed_execution_requires_a_host_execution_ceiling() {
+        let mut config = orchestral_core::config::OrchestralConfig::default();
+        config.tools.exec.enabled = true;
+        config.tools.exec.sandboxed_execution_enabled = false;
+        let error = super::configured_exec_host(&config)
+            .err()
+            .expect("invalid Host policy");
+        assert!(error.to_string().contains("allow_host_execution=true"));
+        config.tools.exec.allow_host_execution = true;
+        config.tools.exec.shell = Some("/bin/sh".to_owned());
+        assert!(super::configured_exec_host(&config).unwrap().is_some());
+    }
 
     #[cfg(unix)]
     #[test]
