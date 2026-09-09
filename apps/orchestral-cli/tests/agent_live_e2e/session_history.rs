@@ -122,7 +122,7 @@ fn legacy_sessions_without_metadata_remain_readable_and_explicitly_resumable() {
     tui.wait_for_text("LEGACY_ASSISTANT_HISTORY", LOCAL_PROCESS_TIMEOUT);
     tui.send_paste("Continue the legacy conversation");
     tui.wait_for_text("LEGACY_SESSION_CONTINUED", LOCAL_PROCESS_TIMEOUT);
-    tui.wait_for_text("✓ done", LOCAL_PROCESS_TIMEOUT);
+    tui.wait_for_text("○ replied", LOCAL_PROCESS_TIMEOUT);
     exit_tui(tui);
     assert_eq!(server.join().unwrap().len(), 1);
     assert_eq!(
@@ -190,7 +190,7 @@ fn resume_tui(workspace: &TestWorkspace, session: &str, system: Option<&str>) ->
 }
 
 fn exit_tui(mut tui: PtyHarness) {
-    tui.send(&[0x1b]);
+    tui.send(&[0x04]);
     tui.wait_for_text("\u{1b}[?1049l", Duration::from_secs(5));
     let output = tui.finish(Duration::from_secs(5));
     assert!(output.status.success(), "{}", output.text());
@@ -387,7 +387,7 @@ fn tui_resume_replays_user_tool_and_assistant_history_without_repeating_file_eff
     );
     tui.send_paste("Continue reviewing the note");
     tui.wait_for_text("NOTE_REVIEW_FINISHED", LOCAL_PROCESS_TIMEOUT);
-    tui.wait_for_text("✓ done", LOCAL_PROCESS_TIMEOUT);
+    tui.wait_for_text("○ replied", LOCAL_PROCESS_TIMEOUT);
     exit_tui(tui);
     assert_eq!(server.join().unwrap().len(), 3);
     assert_eq!(
@@ -462,7 +462,7 @@ fn interrupted_session_reconciles_open_model_attempt_and_continues_without_repea
     resumed.wait_for_text("Run incomplete", LOCAL_PROCESS_TIMEOUT);
     resumed.send_paste("Continue from the completed document");
     resumed.wait_for_text("INTERRUPTED_SESSION_CONTINUED", LOCAL_PROCESS_TIMEOUT);
-    resumed.wait_for_text("✓ done", LOCAL_PROCESS_TIMEOUT);
+    resumed.wait_for_text("○ replied", LOCAL_PROCESS_TIMEOUT);
     exit_tui(resumed);
     assert_eq!(server.join().unwrap().len(), 3);
     assert_eq!(

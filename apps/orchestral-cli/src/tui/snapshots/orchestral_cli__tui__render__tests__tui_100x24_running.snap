@@ -2,17 +2,17 @@
 source: apps/orchestral-cli/src/tui/render.rs
 expression: "render_to_string(&state, 100, 24)"
 ---
-  Orchestral  ·  gemini-2.5-flash                                                        ● running
+  Orchestral  workspace / session-running                                                ● running
   › 阅读核心代码，说明执行链路并给出证据。
 
-  ✓ Read 1 file
-    └ Read core/orchestral-core/src/agent_protocol/types.rs
-  • Running 1 command
-    └ rg -n "ToolActivity" core apps
-  ✓ Edited 1 file
-    └ Update apps/orchestral-cli/src/tui/activity.rs
-        - let visible = false;
-        + let visible = true;
+    ✓ Read 1 file
+      └ Read core/orchestral-core/src/agent_protocol/types.rs
+    • Running 1 command
+      └ rg -n "ToolActivity" core apps
+    ✓ Edited 1 file
+      └ Update apps/orchestral-cli/src/tui/activity.rs
+          - let visible = false;
+          + let visible = true;
 
   • 我正在核对模型循环与工具执行边界。▌
 
@@ -22,7 +22,7 @@ expression: "render_to_string(&state, 100, 24)"
 
 
   ⠸ Working (1m 12s · ctrl+c to interrupt) · 1 background terminal running
-
+────────────────────────────────────────────────────────────────────────────────────────────────────
   › Add guidance while Orchestral works…
 
-  enter steer  ·  ctrl+c interrupt                                   pgup/pgdn scroll  ·  esc quit
+  gemini-2.5-flash · context: —    enter steer · ctrl+c stop

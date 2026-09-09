@@ -37,6 +37,8 @@ mod model_retry;
 mod project_instructions;
 #[path = "agent_live_e2e/session_history.rs"]
 mod session_history;
+#[path = "agent_live_e2e/tui_experience.rs"]
+mod tui_experience;
 
 struct TestWorkspace {
     root: PathBuf,
@@ -363,7 +365,7 @@ fn tui_pty_resolves_input_and_approval_then_cancels_another_run() {
     tui.wait_for_text("INPUT_REQUEST_MARKER_7319", LOCAL_PROCESS_TIMEOUT);
     tui.send_paste("runtime-core");
     tui.wait_for_text("INPUT_RESOLVED_OK", LOCAL_PROCESS_TIMEOUT);
-    tui.wait_for_text_count("✓ done", 1, LOCAL_PROCESS_TIMEOUT);
+    tui.wait_for_text_count("○ replied", 1, LOCAL_PROCESS_TIMEOUT);
 
     tui.send_paste("start the approval flow");
     tui.wait_for_text("Effects:", LOCAL_PROCESS_TIMEOUT);
@@ -375,22 +377,18 @@ fn tui_pty_resolves_input_and_approval_then_cancels_another_run() {
     thread::sleep(Duration::from_millis(1_100));
     tui.send(b"\x1b[A\r");
     tui.wait_for_text("APPROVAL_RESOLVED_OK", LOCAL_PROCESS_TIMEOUT);
-    tui.wait_for_text_count("✓ done", 2, LOCAL_PROCESS_TIMEOUT);
+    tui.wait_for_text_count("○ replied", 2, LOCAL_PROCESS_TIMEOUT);
+    tui.wait_for_screen(|s| s.contains("Ran 1 command"), LOCAL_PROCESS_TIMEOUT);
 
     tui.send_paste("start the cancellation flow");
     tui.wait_for_text("CANCEL_REQUEST_MARKER_4827", LOCAL_PROCESS_TIMEOUT);
     tui.send(&[0x03]);
     tui.wait_for_text("cancelled", LOCAL_PROCESS_TIMEOUT);
-    tui.send(&[0x1b]);
+    tui.send(&[0x04]);
     tui.wait_for_text("\u{1b}[?1049l", LOCAL_PROCESS_TIMEOUT);
 
     let output = tui.finish(LOCAL_PROCESS_TIMEOUT);
     assert!(output.status.success(), "{}", output.text());
-    assert!(
-        output.text().contains("Running 1 command"),
-        "{}",
-        output.text()
-    );
     assert!(output.text().contains("Working"), "{}", output.text());
     assert!(
         output.text().contains("ctrl+c to interrupt"),
@@ -429,7 +427,7 @@ fn tui_pty_restores_terminal_after_agent_failure() {
     tui.wait_for_text("\u{1b}[?2004h", LOCAL_PROCESS_TIMEOUT);
     tui.send_paste("trigger the fixture failure");
     tui.wait_for_text("tool_not_found", LOCAL_PROCESS_TIMEOUT);
-    tui.send(&[0x1b]);
+    tui.send(&[0x04]);
     tui.wait_for_text("\u{1b}[?1049l", LOCAL_PROCESS_TIMEOUT);
 
     let output = tui.finish(LOCAL_PROCESS_TIMEOUT);
@@ -2449,6 +2447,11 @@ fn local_tui_command(
 }
 
 struct PtyHarness {
+    started: Instant,
+    recording: Option<Vec<serde_json::Value>>,
+    max_size: (u16, u16),
+    screen: vt100::Parser,
+    screen_frames: Vec<String>,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn PtyChild + Send + Sync>,
     writer: Option<Box<dyn Write + Send>>,
@@ -2522,6 +2525,11 @@ impl PtyHarness {
         let (updates, receiver) = mpsc::channel();
         let reader = thread::spawn(move || read_pty_with_updates(reader, updates));
         Self {
+            started: Instant::now(),
+            recording: std::env::var_os("ORCHESTRAL_TUI_ARTIFACT_DIR").map(|_| Vec::new()),
+            max_size: (80, 24),
+            screen: vt100::Parser::new(24, 80, 0),
+            screen_frames: Vec::new(),
             master: pair.master,
             child,
             writer: Some(writer),
@@ -2531,7 +2539,9 @@ impl PtyHarness {
         }
     }
 
-    fn resize(&self, cols: u16, rows: u16) {
+    fn resize(&mut self, cols: u16, rows: u16) {
+        self.max_size = (self.max_size.0.max(cols), self.max_size.1.max(rows));
+        self.screen.screen_mut().set_size(rows, cols);
         self.master
             .resize(PtySize {
                 rows,
@@ -2548,6 +2558,44 @@ impl PtyHarness {
         writer.flush().expect("flush TUI input");
     }
 
+    fn receive(&mut self, bytes: Vec<u8>) {
+        self.screen.process(&bytes[self.latest.len()..]);
+        self.latest = bytes;
+        let contents = self.screen.screen().contents();
+        if self.screen_frames.last() != Some(&contents) {
+            self.screen_frames.push(contents);
+            if let Some(recording) = &mut self.recording {
+                // Full emulator frames preserve UTF-8 even when PTY reads split a character.
+                let formatted = self.screen.screen().contents_formatted();
+                recording.push(json!([
+                    self.started.elapsed().as_secs_f64(),
+                    "o",
+                    format!("\u{1b}[2J\u{1b}[H{}", String::from_utf8_lossy(&formatted))
+                ]));
+            }
+        }
+    }
+
+    #[track_caller]
+    fn wait_for_screen(&mut self, predicate: impl Fn(&str) -> bool, timeout: Duration) -> String {
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            let contents = self.screen.screen().contents();
+            if predicate(&contents) {
+                return contents;
+            }
+            match self.updates.recv_timeout(Duration::from_millis(50)) {
+                Ok(bytes) => self.receive(bytes),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        panic!(
+            "TUI screen condition failed:\n{}",
+            self.screen.screen().contents()
+        );
+    }
+
     fn send_paste(&mut self, text: &str) {
         self.send(format!("\x1b[200~{text}\x1b[201~\r").as_bytes());
     }
@@ -2561,11 +2609,12 @@ impl PtyHarness {
         while started.elapsed() < timeout {
             if String::from_utf8_lossy(&self.latest[offset.min(self.latest.len())..])
                 .contains(marker)
+                || (self.latest.len() > offset && self.screen.screen().contents().contains(marker))
             {
                 return;
             }
             match self.updates.recv_timeout(Duration::from_millis(100)) {
-                Ok(bytes) => self.latest = bytes,
+                Ok(bytes) => self.receive(bytes),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
@@ -2585,15 +2634,27 @@ impl PtyHarness {
     fn wait_for_text_count(&mut self, marker: &str, count: usize, timeout: Duration) {
         let started = Instant::now();
         while started.elapsed() < timeout {
+            let mut previous = 0usize;
+            let appearances = self
+                .screen_frames
+                .iter()
+                .map(|frame| {
+                    let current = frame.matches(marker).count();
+                    let added = current.saturating_sub(previous);
+                    previous = current;
+                    added
+                })
+                .sum::<usize>();
             if String::from_utf8_lossy(&self.latest)
                 .matches(marker)
                 .count()
                 >= count
+                || appearances >= count
             {
                 return;
             }
             match self.updates.recv_timeout(Duration::from_millis(100)) {
-                Ok(bytes) => self.latest = bytes,
+                Ok(bytes) => self.receive(bytes),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
@@ -2625,9 +2686,29 @@ impl PtyHarness {
                 );
             }
             if let Ok(bytes) = self.updates.recv_timeout(Duration::from_millis(50)) {
-                self.latest = bytes;
+                self.receive(bytes);
             }
         };
+        if let (Some(directory), Some(recording)) = (
+            std::env::var_os("ORCHESTRAL_TUI_ARTIFACT_DIR"),
+            &self.recording,
+        ) {
+            let directory = PathBuf::from(directory);
+            fs::create_dir_all(&directory).unwrap();
+            let name = thread::current().name().unwrap_or("tui").replace("::", "-");
+            let mut cast = serde_json::to_string(&json!({"version": 2, "width": self.max_size.0, "height": self.max_size.1, "title": name})).unwrap();
+            for event in recording {
+                cast.push('\n');
+                cast.push_str(&event.to_string());
+            }
+            cast.push('\n');
+            fs::write(directory.join(format!("{name}.cast")), cast).unwrap();
+            fs::write(
+                directory.join(format!("{name}.txt")),
+                self.screen_frames.join("\n\n--- frame ---\n\n"),
+            )
+            .unwrap();
+        }
         drop(self.master);
         let bytes = self.reader.join().expect("join TUI PTY reader");
         PtyOutput { status, bytes }

@@ -74,11 +74,35 @@ deterministic:
 | `printf 'fix the bug' \| orchestral` | One-turn Headless |
 
 Headless stdout contains only the final Delivery, so it is safe to pipe into another command;
-progress and errors use stderr. In the TUI, Enter sends or steers, Shift/Alt+Enter inserts a
-newline, `a`/`d` resolves an approval, Ctrl-C cancels the active Run, PageUp/PageDown or the mouse
-wheel scrolls, and Esc exits. Paste, resize, CJK, and emoji are supported.
-`completed` means that the current turn settled and committed its output; it is not an independent
-claim that the user's external goal was achieved.
+progress and errors use stderr. In the TUI, Enter sends, steers, or answers the current question.
+Ctrl+J inserts a newline (Shift+Enter also works in supporting terminals). Up/Down edits lines,
+then navigates session input history while preserving your draft. Paste supports CJK, combining
+characters, and emoji; input over 20 lines shows a bounded preview with Ctrl+P to expand.
+
+F1 or Ctrl+] opens commands without replacing your draft. `/` discovers commands; `//` sends a
+literal leading slash. `@` completes workspace paths, with ignored/build directories excluded;
+selecting a path does not read its contents. Candidates refresh in the background while the
+file menu is open, including newly created and renamed files. `/model`, `/new`, and `/resume` switch configured
+models or sessions while idle; session drafts survive switching within the current process.
+The `/resume` panel includes “Current session details” for storage and reported usage.
+`/context` scopes skill load records to the current or latest request and shows instruction
+sources loaded for the process and session compaction records. Unknown context usage remains `—`.
+
+Ctrl+O expands tool records in the conversation; PgUp/PgDn reads history or the focused panel,
+and End follows new output. Native terminal text selection is retained; `/copy` copies the last
+committed answer when a local clipboard utility is available. `/`, F1 and `/help` expose the
+same action menu, including keyboard shortcuts and appearance settings; `NO_COLOR` disables styling.
+`/skills` searches discovered workspace skills. Enter opens full descriptions and sources; Space
+toggles enablement preferences, with pending restart changes distinguished from the current process.
+Browsing skills neither loads model instructions nor adds conversation entries.
+
+Esc/Ctrl+C closes the focused panel first, otherwise interrupts an active Run. While idle,
+Ctrl+C clears a draft and Ctrl+D exits with empty input; `/quit` stops work and exits. Approvals
+require `a`/`d` or an explicit arrow selection before Enter. `replied` means output was delivered;
+it does not independently verify the user's goal. Waiting questions accept literal `/` answers;
+use F1 to access commands without submitting an answer. Submitted answers and approvals wait
+for confirmation before another response is allowed. When a question ends, its previous draft
+is restored; edit it or move the cursor before sending so an extra Enter cannot send it accidentally.
 
 The CLI discovers `.orchestral/config.yaml`, `.orchestral/config.yml`,
 `configs/orchestral.cli.yaml`, then `orchestral.yaml`; if none exists it creates

@@ -152,25 +152,27 @@ fn repeated_pressure_compaction_and_process_restart_recall_original_outcomes_wit
 #[test]
 fn killed_tui_recovers_compacted_run_and_applies_new_input_without_repeating_effects() {
     let _guard = local_e2e_guard();
-    let workspace = TestWorkspace::new("context-pressure-recovery");
-    configure_pressure(&workspace);
-    let mut handlers: Vec<FixtureHttpHandler> = vec![Box::new(|_| {
-        openai_tool_response(
-            "progress",
-            "file_write",
-            json!({"path": "progress.txt", "mode": "create", "content": "inspection started\n"}),
-        )
-    })];
-    for i in 0..5 {
-        handlers.push(Box::new(move |_| {
+    // Exercise the kill/accepted-answer boundary with independent processes.
+    for _ in 0..3 {
+        let workspace = TestWorkspace::new("context-pressure-recovery");
+        configure_pressure(&workspace);
+        let mut handlers: Vec<FixtureHttpHandler> = vec![Box::new(|_| {
             openai_tool_response(
-                &format!("inspect-{i}"),
-                "file_read",
-                json!({"path": "dataset.txt"}),
+                "progress",
+                "file_write",
+                json!({"path": "progress.txt", "mode": "create", "content": "inspection started\n"}),
             )
-        }));
-    }
-    handlers.extend([
+        })];
+        for i in 0..5 {
+            handlers.push(Box::new(move |_| {
+                openai_tool_response(
+                    &format!("inspect-{i}"),
+                    "file_read",
+                    json!({"path": "dataset.txt"}),
+                )
+            }));
+        }
+        handlers.extend([
         Box::new(|request: &CapturedHttpRequest| {
             assert!(model_request_text(&request.body).contains("UNTRUSTED earlier transcript"));
             openai_tool_response("clarify", "orchestral_request_input", json!({"prompt": "Which output encoding should be preserved?"}))
@@ -192,52 +194,57 @@ fn killed_tui_recovers_compacted_run_and_applies_new_input_without_repeating_eff
             openai_text_response("COMPACTED_RUN_RECOVERED")
         }),
     ]);
-    let (endpoint, server) = spawn_fixture_http_server(handlers);
-    workspace.configure_local_openai(&endpoint);
-    let system = "Work on the user's task.";
-    let mut tui = PtyHarness::spawn(local_tui_command(&workspace, "pressure-recovery", system));
-    tui.wait_for_text("\u{1b}[?2004h", LOCAL_PROCESS_TIMEOUT);
-    tui.send_paste("Inspect records and record progress once; preserve stable_api.");
-    tui.wait_for_text("Input requested", LOCAL_PROCESS_TIMEOUT);
-    let before = session_records(&workspace);
-    assert!(payload_count(&before, "active_run_compaction_committed") >= 2);
-    tui.child.kill().unwrap();
-    tui.finish(Duration::from_secs(5));
-    let mut command = base_command(&workspace);
-    command.env("OPENAI_API_KEY", "fixture-key").args([
-        "--backend",
-        "openai",
-        "--model",
-        "fixture-model",
-        "--temperature",
-        "0",
-        "--system-prompt",
-        system,
-        "resume",
-        "pressure-recovery",
-        "Keep output UTF-8 and inspect prior progress.",
-    ]);
-    let resumed = run_to_completion(command, LOCAL_PROCESS_TIMEOUT);
-    assert!(resumed.status.success(), "{}", resumed.stderr_text());
-    assert!(resumed.stdout_text().contains("COMPACTED_RUN_RECOVERED"));
-    assert_eq!(server.join().unwrap().len(), 10);
-    assert_eq!(journal_files(&workspace, "run-").len(), 1);
-    let after = session_records(&workspace);
-    assert_eq!(&after[..before.len()], before.as_slice());
-    let exchanges = tool_exchanges(&after);
-    assert_eq!(
-        exchanges
-            .iter()
-            .filter(|exchange| tool_name(exchange) == Some("file_write"))
-            .count(),
-        1
-    );
-    assert_eq!(
-        exchanges
-            .iter()
-            .filter(|exchange| tool_name(exchange) == Some("orchestral_request_input"))
-            .count(),
-        1
-    );
-    assert_eq!(run_payload_count(&workspace, "delivery_committed"), 1);
+        let (endpoint, server) = spawn_fixture_http_server(handlers);
+        workspace.configure_local_openai(&endpoint);
+        let system = "Work on the user's task.";
+        let mut tui = PtyHarness::spawn(local_tui_command(&workspace, "pressure-recovery", system));
+        tui.wait_for_text("\u{1b}[?2004h", LOCAL_PROCESS_TIMEOUT);
+        tui.send_paste("Inspect records and record progress once; preserve stable_api.");
+        tui.wait_for_text("Input requested", LOCAL_PROCESS_TIMEOUT);
+        let before = session_records(&workspace);
+        assert!(payload_count(&before, "active_run_compaction_committed") >= 2);
+        tui.child.kill().unwrap();
+        tui.finish(Duration::from_secs(5));
+        let mut command = base_command(&workspace);
+        command.env("OPENAI_API_KEY", "fixture-key").args([
+            "--backend",
+            "openai",
+            "--model",
+            "fixture-model",
+            "--temperature",
+            "0",
+            "--system-prompt",
+            system,
+            "resume",
+            "pressure-recovery",
+            "Keep output UTF-8 and inspect prior progress.",
+        ]);
+        let resumed = run_to_completion(command, LOCAL_PROCESS_TIMEOUT);
+        assert!(resumed.status.success(), "{}", resumed.stderr_text());
+        assert!(
+            !resumed.stderr_text().contains("Input required:"),
+            "an already accepted resume answer must not prompt again"
+        );
+        assert!(resumed.stdout_text().contains("COMPACTED_RUN_RECOVERED"));
+        assert_eq!(server.join().unwrap().len(), 10);
+        assert_eq!(journal_files(&workspace, "run-").len(), 1);
+        let after = session_records(&workspace);
+        assert_eq!(&after[..before.len()], before.as_slice());
+        let exchanges = tool_exchanges(&after);
+        assert_eq!(
+            exchanges
+                .iter()
+                .filter(|exchange| tool_name(exchange) == Some("file_write"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            exchanges
+                .iter()
+                .filter(|exchange| tool_name(exchange) == Some("orchestral_request_input"))
+                .count(),
+            1
+        );
+        assert_eq!(run_payload_count(&workspace, "delivery_committed"), 1);
+    }
 }

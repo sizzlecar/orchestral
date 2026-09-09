@@ -72,9 +72,28 @@ cargo run -p orchestral-cli --
 | `printf '修复这个 bug' \| orchestral` | Headless 单轮 |
 
 Headless stdout 只输出最终 Delivery，进度和错误进入 stderr，适合管道消费。TUI 中 Enter
-发送消息或 Steer，Shift/Alt+Enter 换行，`a`/`d` 处理审批，Ctrl-C 取消当前 Run，
-PageUp/PageDown 或鼠标滚轮滚动，Esc 退出；支持 paste、resize、中文与 emoji。
-`completed` 只表示当前 Turn 已收敛并提交输出，不表示用户的外部目标已经被独立证明完成。
+发送消息、Steer 或回答当前问题；Ctrl+J 换行（终端支持时也可用 Shift+Enter）。上下键先移动
+多行光标，再访问本会话输入历史，返回时恢复草稿。粘贴支持中文、组合字符与 emoji；超过
+20 行显示有界预览，Ctrl+P 展开。
+
+F1 / Ctrl+] 打开命令并保留草稿。`/` 发现命令，`//` 发送以斜杠开头的普通文本。`@` 补全
+工作区路径，排除忽略目录和构建输出；选择路径不会读取文件正文。候选面板打开时会后台刷新，
+包含新建、重命名后的文件。空闲时可通过 `/model`、
+`/new`、`/resume` 切换配置中的模型或会话；草稿在当前进程内按会话保留。`/resume` 面板中的
+“Current session details” 查看实际存储位置和已报告用量。`/context` 区分当前或最近一轮的
+技能加载记录，并展示进程加载的规则来源和会话压缩记录。没有依据的上下文占用显示 `—`。
+
+Ctrl+O 在对话中展开工具记录；PgUp/PgDn 阅读历史或当前面板，End 跟随新输出。保留终端原生
+文本选择；存在本地剪贴板工具时，`/copy` 复制最近的已提交回答。`/`、F1 和 `/help` 提供统一
+操作菜单，其中包含快捷键说明和外观设置；`NO_COLOR` 禁用样式。`/skills` 搜索工作区发现的
+技能，Enter 查看完整说明和来源，空格切换启用偏好；待重启的修改与当前进程状态分别显示。
+浏览技能不会加载模型指令，也不会写入对话。
+
+Esc/Ctrl+C 优先关闭当前面板，否则中断活动 Run。空闲时 Ctrl+C 清空草稿；输入为空时
+Ctrl+D 退出，或使用 `/quit` 停止并退出。审批须用 `a`/`d`，或先用方向键明确选择再按 Enter。
+`replied` 表示回答已投递，不代表外部目标已被独立验证。等待回答时，`/` 开头的文字也作为
+回答提交；需要命令时使用 F1。回答和审批提交后等待确认，期间不重复发送。
+问题结束后恢复之前的草稿；先编辑或移动光标再发送，避免多按一次 Enter 意外提交旧草稿。
 
 CLI 依次发现 `.orchestral/config.yaml`、`.orchestral/config.yml`、
 `configs/orchestral.cli.yaml`、`orchestral.yaml`；都不存在时会生成

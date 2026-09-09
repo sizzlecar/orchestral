@@ -226,7 +226,7 @@ fn tui_can_cancel_during_model_retry_backoff() {
     tui.wait_for_text("retry 1/3", LOCAL_PROCESS_TIMEOUT);
     tui.send(&[0x03]);
     tui.wait_for_text("cancelled", Duration::from_secs(5));
-    tui.send(&[0x1b]);
+    tui.send(&[0x04]);
     tui.wait_for_text("\u{1b}[?1049l", Duration::from_secs(5));
     let output = tui.finish(Duration::from_secs(5));
     assert!(output.status.success(), "{}", output.text());
@@ -262,8 +262,8 @@ fn tui_steer_interrupts_retry_backoff_and_rebuilds_the_model_context() {
     tui.wait_for_text("retry 1/3", LOCAL_PROCESS_TIMEOUT);
     tui.send_paste("Focus on the parser first.");
     tui.wait_for_text("STEER_AFTER_RETRY_OK", Duration::from_secs(5));
-    tui.wait_for_text("✓ done", Duration::from_secs(5));
-    tui.send(&[0x1b]);
+    tui.wait_for_text("○ replied", Duration::from_secs(5));
+    tui.send(&[0x04]);
     tui.wait_for_text("\u{1b}[?1049l", Duration::from_secs(5));
     let output = tui.finish(Duration::from_secs(5));
     assert!(output.status.success(), "{}", output.text());

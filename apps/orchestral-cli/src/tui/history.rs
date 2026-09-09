@@ -25,12 +25,19 @@ pub(crate) fn history_entries(history: &SessionHistory) -> Vec<TranscriptEntry> 
                 &run.registration.run().spec.input,
             )));
         }
+        let mut initial_input = !records
+            .iter()
+            .any(|record| matches!(record.payload, AgentSessionEvent::RunInputCommitted { .. }));
         let mut final_recorded = false;
         for record in records {
             let entry_id = format!("history-{}", record.event_id);
             match &record.payload {
                 AgentSessionEvent::RunInputCommitted { message } => {
-                    entries.push(TranscriptEntry::user(model_text(message)))
+                    let mut entry = TranscriptEntry::user(model_text(message));
+                    entry.continuation = initial_input;
+                    entry.id = Some(entry_id);
+                    initial_input = true;
+                    entries.push(entry)
                 }
                 AgentSessionEvent::RunOutputCommitted { message, .. } => {
                     entries.push(TranscriptEntry::assistant(entry_id, model_text(message)));
@@ -57,6 +64,7 @@ pub(crate) fn history_entries(history: &SessionHistory) -> Vec<TranscriptEntry> 
                         excerpt.push_str("\n… (full result retained in session journal)");
                     }
                     entries.push(TranscriptEntry {
+                        continuation: false,
                         id: Some(entry_id),
                         role: TranscriptRole::Tool,
                         text: names,

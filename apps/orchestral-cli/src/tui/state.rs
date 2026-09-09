@@ -4,6 +4,9 @@ use std::time::{Duration, Instant};
 use orchestral_core::agent_protocol::wire::{ToolActivityEvidence, ToolActivityState};
 
 use super::activity::{ActivityDetail, ActivityProjection, ActivityReducer, ActivityStatus};
+use super::editor::{self, Edit, InputHistory};
+use super::menu::{Choice, FileReference, Menu, MenuKind};
+use super::viewport::Viewport;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UiPhase {
@@ -38,6 +41,7 @@ pub(crate) enum TranscriptRole {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TranscriptEntry {
+    pub continuation: bool,
     pub id: Option<String>,
     pub role: TranscriptRole,
     pub text: String,
@@ -48,6 +52,7 @@ pub(crate) struct TranscriptEntry {
 impl TranscriptEntry {
     pub(crate) fn user(text: impl Into<String>) -> Self {
         Self {
+            continuation: false,
             id: None,
             role: TranscriptRole::User,
             text: text.into(),
@@ -58,6 +63,7 @@ impl TranscriptEntry {
 
     pub(crate) fn assistant(id: impl Into<String>, text: impl Into<String>) -> Self {
         Self {
+            continuation: false,
             id: Some(id.into()),
             role: TranscriptRole::Assistant,
             text: text.into(),
@@ -68,6 +74,7 @@ impl TranscriptEntry {
 
     pub(crate) fn system(text: impl Into<String>) -> Self {
         Self {
+            continuation: false,
             id: None,
             role: TranscriptRole::System,
             text: text.into(),
@@ -78,6 +85,7 @@ impl TranscriptEntry {
 
     pub(crate) fn error(id: impl Into<String>, text: impl Into<String>) -> Self {
         Self {
+            continuation: false,
             id: Some(id.into()),
             role: TranscriptRole::Error,
             text: text.into(),
@@ -116,9 +124,40 @@ pub(crate) enum ApprovalChoice {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum RequestSubmission {
+    Answer { request_id: String, value: String },
+    Approval { request_id: String },
+    Accepted { request_id: String },
+}
+
+impl RequestSubmission {
+    fn request_id(&self) -> &str {
+        match self {
+            Self::Answer { request_id, .. }
+            | Self::Approval { request_id }
+            | Self::Accepted { request_id } => request_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerOrigin {
+    Edited,
+    RestoredQuestionDraft,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UiEffect {
-    ManageSkills {
-        arguments: String,
+    HostCommand {
+        command: String,
+    },
+    MenuChoice {
+        kind: MenuKind,
+        value: String,
+    },
+    LocalAction {
+        action: super::menu::LocalAction,
+        return_to: Option<Box<super::menu::Menu>>,
     },
     StartRun {
         input: String,
@@ -145,6 +184,12 @@ pub(crate) enum UiEffect {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UiMsg {
+    OpenMenu(Menu),
+    FilesLoaded(Vec<Choice>),
+    Complete,
+    SelectCandidate {
+        up: bool,
+    },
     InsertText(String),
     Backspace,
     Delete,
@@ -152,6 +197,15 @@ pub(crate) enum UiMsg {
     MoveCursorRight,
     MoveCursorStart,
     MoveCursorEnd,
+    Edit(Edit),
+    History {
+        up: bool,
+    },
+    Escape,
+    ToggleHelp,
+    ToggleTools,
+    ToggleInput,
+    FollowOutput,
     Submit,
     SelectApproval(ApprovalChoice),
     Approval(ApprovalChoice),
@@ -207,6 +261,12 @@ pub(crate) enum UiMsg {
     RequestResolved {
         request_id: String,
     },
+    RequestSubmissionAccepted {
+        request_id: String,
+    },
+    RequestSubmissionFailed {
+        request_id: String,
+    },
     Stopping,
     Notice {
         id: String,
@@ -230,7 +290,11 @@ pub(crate) enum UiMsg {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UiState {
     pub session_id: String,
+    pub project: String,
+    pub session_title: String,
     pub model: String,
+    pub context_budget: Option<u64>,
+    pub terminal_size: (u16, u16),
     pub phase: UiPhase,
     pub run_id: Option<String>,
     pub transcript: Vec<TranscriptEntry>,
@@ -238,10 +302,31 @@ pub(crate) struct UiState {
     pub composer_cursor: usize,
     pub pending: Option<PendingOverlay>,
     pub approval_choice: ApprovalChoice,
-    pub scroll_back: usize,
+    pub viewport: Viewport,
+    pub tools_expanded: bool,
+    pub ui_notice: Option<String>,
+    pub exit_requested: bool,
+    pub approval_selected: bool,
+    pub input_history: InputHistory,
+    pub menu: Option<Menu>,
+    pub files: std::sync::Arc<Vec<Choice>>,
+    pub files_loaded: bool,
+    pub references: Vec<FileReference>,
+    pub completion_selected: usize,
+    pub completion_dismissed: bool,
+    pub theme: String,
+    pub color_enabled: bool,
+    pub host_busy: bool,
+    pub suspended_draft: Option<(String, usize)>,
+    pub transcript_revision: u64,
+    pub transcript_dirty_from: usize,
+    pub input_expanded: bool,
     pub working_detail: Option<String>,
     pub working_elapsed: Duration,
     pub animation_frame: u64,
+    request_submission: Option<RequestSubmission>,
+    resolved_requests: BTreeSet<String>,
+    composer_origin: ComposerOrigin,
     stream_output_id: Option<String>,
     stream_chunks: BTreeMap<u64, String>,
     seen_delta_ids: BTreeSet<String>,
@@ -252,9 +337,14 @@ pub(crate) struct UiState {
 
 impl UiState {
     pub(crate) fn new(session_id: impl Into<String>, model: impl Into<String>) -> Self {
+        let session_id = session_id.into();
         Self {
-            session_id: session_id.into(),
+            session_title: session_id.clone(),
+            session_id,
+            project: "workspace".to_owned(),
             model: model.into(),
+            context_budget: None,
+            terminal_size: (80, 24),
             phase: UiPhase::Idle,
             run_id: None,
             transcript: Vec::new(),
@@ -262,10 +352,31 @@ impl UiState {
             composer_cursor: 0,
             pending: None,
             approval_choice: ApprovalChoice::Allow,
-            scroll_back: 0,
+            viewport: Viewport::default(),
+            tools_expanded: false,
+            ui_notice: None,
+            exit_requested: false,
+            approval_selected: false,
+            input_history: InputHistory::default(),
+            menu: None,
+            files: Default::default(),
+            files_loaded: false,
+            references: Vec::new(),
+            completion_selected: 0,
+            completion_dismissed: false,
+            theme: "terminal".to_owned(),
+            color_enabled: true,
+            host_busy: false,
+            suspended_draft: None,
+            transcript_revision: 0,
+            transcript_dirty_from: 0,
+            input_expanded: false,
             working_detail: None,
             working_elapsed: Duration::ZERO,
             animation_frame: 0,
+            request_submission: None,
+            resolved_requests: BTreeSet::new(),
+            composer_origin: ComposerOrigin::Edited,
             stream_output_id: None,
             stream_chunks: BTreeMap::new(),
             seen_delta_ids: BTreeSet::new(),
@@ -277,6 +388,68 @@ impl UiState {
 
     pub(crate) fn streamed_text(&self) -> String {
         self.stream_chunks.values().cloned().collect()
+    }
+
+    pub(crate) fn stream_key(&self) -> String {
+        self.stream_output_id
+            .as_ref()
+            .map_or_else(|| "stream".to_owned(), |id| format!("output:{id}"))
+    }
+
+    fn restore_question_draft(&mut self) {
+        if let Some((draft, cursor)) = self.suspended_draft.take() {
+            let unsent = std::mem::replace(&mut self.composer, draft);
+            self.composer_cursor = cursor;
+            self.composer_origin = ComposerOrigin::RestoredQuestionDraft;
+            if !unsent.is_empty() {
+                self.menu = Some(super::services::detail(
+                    "Unsubmitted answer · previous draft restored",
+                    unsent,
+                ));
+            }
+        }
+    }
+
+    pub(crate) fn request_submission_pending(&self) -> bool {
+        self.request_submission.is_some()
+    }
+
+    fn accept_request_submission(&mut self, request_id: &str) {
+        if self
+            .request_submission
+            .as_ref()
+            .map(RequestSubmission::request_id)
+            != Some(request_id)
+        {
+            return;
+        }
+        if let Some(RequestSubmission::Answer { value, .. }) = self.request_submission.take() {
+            let mut entry = TranscriptEntry::user(value);
+            entry.continuation = true;
+            self.transcript.push(entry);
+            self.transcript_revision = self.transcript_revision.wrapping_add(1);
+            self.viewport.follow();
+        }
+        self.request_submission = Some(RequestSubmission::Accepted {
+            request_id: request_id.to_owned(),
+        });
+    }
+
+    fn fail_request_submission(&mut self, request_id: &str) {
+        if self
+            .request_submission
+            .as_ref()
+            .map(RequestSubmission::request_id)
+            != Some(request_id)
+        {
+            return;
+        }
+        if let Some(RequestSubmission::Answer { value, .. }) = self.request_submission.take() {
+            self.composer_cursor = value.len();
+            self.composer = value;
+            self.composer_origin = ComposerOrigin::Edited;
+        }
+        self.approval_selected = false;
     }
 
     pub(crate) fn active_process_count(&self) -> usize {
@@ -293,7 +466,8 @@ impl UiState {
     }
 
     fn composer_editable(&self) -> bool {
-        !matches!(self.phase, UiPhase::WaitingApproval | UiPhase::Cancelling)
+        !self.request_submission_pending()
+            && !matches!(self.phase, UiPhase::WaitingApproval | UiPhase::Cancelling)
     }
 
     fn clear_stream(&mut self) {
@@ -307,61 +481,58 @@ impl UiState {
             return None;
         }
         let input = std::mem::take(&mut self.composer);
+        self.input_history.push(&input);
         self.composer_cursor = 0;
         Some(input)
     }
 
     fn insert_text(&mut self, text: &str) {
+        if self.composer.len().saturating_add(text.len()) > 1024 * 1024 {
+            self.ui_notice = Some("Input exceeds 1 MiB; draft preserved".to_owned());
+            return;
+        }
+        self.ui_notice = None;
         self.composer.insert_str(self.composer_cursor, text);
         self.composer_cursor += text.len();
+        editor::snap_cursor(&self.composer, &mut self.composer_cursor);
     }
 
     fn move_cursor_left(&mut self) {
-        if let Some((index, _)) = self.composer[..self.composer_cursor]
-            .char_indices()
-            .next_back()
-        {
-            self.composer_cursor = index;
-        }
+        editor::edit(&mut self.composer, &mut self.composer_cursor, Edit::Left);
     }
 
     fn move_cursor_right(&mut self) {
-        if let Some(character) = self.composer[self.composer_cursor..].chars().next() {
-            self.composer_cursor += character.len_utf8();
-        }
+        editor::edit(&mut self.composer, &mut self.composer_cursor, Edit::Right);
     }
 
     fn backspace(&mut self) {
-        let end = self.composer_cursor;
-        self.move_cursor_left();
-        if self.composer_cursor < end {
-            self.composer.drain(self.composer_cursor..end);
-        }
+        editor::edit(
+            &mut self.composer,
+            &mut self.composer_cursor,
+            Edit::Backspace,
+        );
     }
 
     fn delete(&mut self) {
-        let start = self.composer_cursor;
-        self.move_cursor_right();
-        let end = self.composer_cursor;
-        if start < end {
-            self.composer.drain(start..end);
-            self.composer_cursor = start;
-        }
+        editor::edit(&mut self.composer, &mut self.composer_cursor, Edit::Delete);
     }
 
     fn upsert_tool(&mut self, projection: ActivityProjection) {
         let id = format!("tool:{}", projection.id);
-        if let Some(entry) = self
+        if let Some((index, entry)) = self
             .transcript
             .iter_mut()
-            .find(|entry| entry.id.as_deref() == Some(id.as_str()))
+            .enumerate()
+            .find(|(_, entry)| entry.id.as_deref() == Some(id.as_str()))
         {
+            self.transcript_dirty_from = self.transcript_dirty_from.min(index);
             entry.text = projection.summary;
             entry.tool_status = Some(projection.status);
             entry.tool_details = projection.details;
             return;
         }
         self.transcript.push(TranscriptEntry {
+            continuation: false,
             id: Some(id),
             role: TranscriptRole::Tool,
             text: projection.summary,
@@ -373,8 +544,15 @@ impl UiState {
     fn settle_tools(&mut self, state: ToolActivityState) {
         if let Some(run_id) = &self.run_id {
             let notice_id = format!("history-unfinished-{run_id}");
-            self.transcript
-                .retain(|entry| entry.id.as_deref() != Some(notice_id.as_str()));
+            if let Some(index) = self
+                .transcript
+                .iter()
+                .position(|entry| entry.id.as_deref() == Some(notice_id.as_str()))
+            {
+                self.transcript_dirty_from = self.transcript_dirty_from.min(index);
+                self.transcript
+                    .retain(|entry| entry.id.as_deref() != Some(notice_id.as_str()));
+            }
         }
         for projection in self.activity_reducer.settle(state) {
             self.upsert_tool(projection);
@@ -383,17 +561,19 @@ impl UiState {
 
     fn commit_output(&mut self, output_id: String, text: String) {
         let id = format!("output:{output_id}");
-        if let Some(entry) = self
+        if let Some((index, entry)) = self
             .transcript
             .iter_mut()
-            .find(|entry| entry.id.as_deref() == Some(id.as_str()))
+            .enumerate()
+            .find(|(_, entry)| entry.id.as_deref() == Some(id.as_str()))
         {
+            self.transcript_dirty_from = self.transcript_dirty_from.min(index);
             entry.text = text;
         } else {
             self.transcript.push(TranscriptEntry::assistant(id, text));
         }
         self.clear_stream();
-        self.scroll_back = 0;
+        self.viewport.changed();
     }
 
     fn reconcile_delivery(&mut self, final_text: String) {
@@ -409,9 +589,9 @@ impl UiState {
             .find(|(index, entry)| {
                 entry.role == TranscriptRole::Assistant
                     && most_recent_user.is_none_or(|user| *index > user)
-            })
-            .map(|(_, entry)| entry);
-        if let Some(assistant) = assistant {
+            });
+        if let Some((index, assistant)) = assistant {
+            self.transcript_dirty_from = self.transcript_dirty_from.min(index);
             assistant.text = final_text;
         } else {
             self.transcript
@@ -421,15 +601,93 @@ impl UiState {
 }
 
 pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
+    state.transcript_dirty_from = state.transcript_dirty_from.min(state.transcript.len());
+    if state.menu.is_none() {
+        if matches!(msg, UiMsg::Submit)
+            && state.composer_origin == ComposerOrigin::RestoredQuestionDraft
+            && !state.composer.is_empty()
+        {
+            state.ui_notice =
+                Some("Previous draft restored; edit or move the cursor before sending".to_owned());
+            return Vec::new();
+        }
+        if state.composer_editable()
+            && matches!(
+                msg,
+                UiMsg::InsertText(_)
+                    | UiMsg::Backspace
+                    | UiMsg::Delete
+                    | UiMsg::MoveCursorLeft
+                    | UiMsg::MoveCursorRight
+                    | UiMsg::MoveCursorStart
+                    | UiMsg::MoveCursorEnd
+                    | UiMsg::Edit(_)
+                    | UiMsg::History { .. }
+                    | UiMsg::Complete
+            )
+        {
+            state.composer_origin = ComposerOrigin::Edited;
+        }
+    }
+    if matches!(
+        msg,
+        UiMsg::RunStarted { .. }
+            | UiMsg::StreamDelta { .. }
+            | UiMsg::OutputCommitted { .. }
+            | UiMsg::ToolActivity { .. }
+            | UiMsg::Completed { .. }
+            | UiMsg::Failed { .. }
+            | UiMsg::Cancelled { .. }
+            | UiMsg::Incomplete { .. }
+            | UiMsg::Notice { .. }
+            | UiMsg::Submit
+    ) {
+        state.transcript_revision = state.transcript_revision.wrapping_add(1);
+    }
+    if let Some(effects) = super::interaction::route(state, &msg) {
+        return effects;
+    }
     match msg {
+        UiMsg::OpenMenu(menu) => {
+            state.menu = Some(menu);
+        }
+        UiMsg::FilesLoaded(files) => {
+            let selected = super::interaction::completion(state)
+                .filter(|menu| menu.kind == MenuKind::Files)
+                .and_then(|menu| menu.selected().map(|choice| choice.value.clone()));
+            state.files = std::sync::Arc::new(files);
+            state.files_loaded = true;
+            if let Some(selected) = selected {
+                state.completion_selected = super::interaction::completion(state)
+                    .and_then(|menu| {
+                        menu.filtered()
+                            .iter()
+                            .position(|choice| choice.value == selected)
+                    })
+                    .unwrap_or(0);
+            }
+        }
+        UiMsg::Complete | UiMsg::SelectCandidate { .. } => {}
         UiMsg::InsertText(text) if state.composer_editable() => state.insert_text(&text),
         UiMsg::Backspace if state.composer_editable() => state.backspace(),
         UiMsg::Delete if state.composer_editable() => state.delete(),
         UiMsg::MoveCursorLeft if state.composer_editable() => state.move_cursor_left(),
         UiMsg::MoveCursorRight if state.composer_editable() => state.move_cursor_right(),
-        UiMsg::MoveCursorStart if state.composer_editable() => state.composer_cursor = 0,
+        UiMsg::MoveCursorStart if state.composer_editable() => {
+            editor::edit(&mut state.composer, &mut state.composer_cursor, Edit::Start);
+        }
         UiMsg::MoveCursorEnd if state.composer_editable() => {
-            state.composer_cursor = state.composer.len()
+            editor::edit(&mut state.composer, &mut state.composer_cursor, Edit::End);
+        }
+        UiMsg::Edit(action) if state.composer_editable() => {
+            editor::edit(&mut state.composer, &mut state.composer_cursor, action);
+        }
+        UiMsg::History { up } if state.composer_editable() => {
+            if !editor::vertical(&state.composer, &mut state.composer_cursor, up) {
+                state
+                    .input_history
+                    .navigate(&mut state.composer, &mut state.composer_cursor, up);
+            }
         }
         UiMsg::InsertText(_)
         | UiMsg::Backspace
@@ -437,17 +695,58 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
         | UiMsg::MoveCursorLeft
         | UiMsg::MoveCursorRight
         | UiMsg::MoveCursorStart
-        | UiMsg::MoveCursorEnd => {}
+        | UiMsg::MoveCursorEnd
+        | UiMsg::Edit(_)
+        | UiMsg::History { .. } => {}
         UiMsg::Submit => return submit(state),
+        UiMsg::ToggleHelp => {
+            state.menu = if state.menu.is_some() {
+                None
+            } else {
+                Some(super::services::help(state))
+            };
+        }
+        UiMsg::ToggleInput => state.input_expanded = !state.input_expanded,
+        UiMsg::ToggleTools => state.tools_expanded = !state.tools_expanded,
+        UiMsg::FollowOutput => state.viewport.follow(),
+        UiMsg::Escape => {
+            state.ui_notice = None;
+            return cancel(state);
+        }
         UiMsg::SelectApproval(choice) if state.phase == UiPhase::WaitingApproval => {
             state.approval_choice = choice;
+            state.approval_selected = true;
         }
         UiMsg::SelectApproval(_) => {}
         UiMsg::Approval(choice) => return resolve_approval(state, choice),
+        UiMsg::Cancel if state.phase.accepts_new_run() => {
+            if state.composer.is_empty() {
+                state.ui_notice = Some("Ctrl+D or /quit to exit".to_owned());
+            } else {
+                state.composer.clear();
+                state.composer_cursor = 0;
+            }
+        }
         UiMsg::Cancel => return cancel(state),
-        UiMsg::Quit => return vec![UiEffect::Quit],
-        UiMsg::ScrollUp(rows) => state.scroll_back = state.scroll_back.saturating_add(rows),
-        UiMsg::ScrollDown(rows) => state.scroll_back = state.scroll_back.saturating_sub(rows),
+        UiMsg::Quit => {
+            if state.phase.accepts_new_run() && !state.host_busy {
+                return vec![UiEffect::Quit];
+            }
+            state.exit_requested = true;
+            return cancel(state);
+        }
+        UiMsg::ScrollUp(rows) => {
+            state.viewport.movement = state
+                .viewport
+                .movement
+                .saturating_sub(rows.min(isize::MAX as usize) as isize)
+        }
+        UiMsg::ScrollDown(rows) => {
+            state.viewport.movement = state
+                .viewport
+                .movement
+                .saturating_add(rows.min(isize::MAX as usize) as isize)
+        }
         UiMsg::Tick { now } => {
             if state.run_id.is_some() {
                 if matches!(state.phase, UiPhase::Running | UiPhase::Cancelling) {
@@ -463,6 +762,8 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
         }
         UiMsg::RunStarted { run_id } => {
             if state.run_id.as_deref() != Some(run_id.as_str()) {
+                state.request_submission = None;
+                state.resolved_requests.clear();
                 state.working_elapsed = Duration::ZERO;
                 state.animation_frame = 0;
                 state.active_processes.clear();
@@ -484,7 +785,7 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             }
             if state.seen_delta_ids.insert(delta_id) {
                 state.stream_chunks.entry(order).or_insert(text);
-                state.scroll_back = 0;
+                state.viewport.changed();
             }
         }
         UiMsg::OutputCommitted { output_id, text } => state.commit_output(output_id, text),
@@ -499,6 +800,7 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
                     .activity_reducer
                     .observe(activity_id, tool_name, activity_state, evidence);
             state.upsert_tool(projection);
+            state.viewport.changed();
         }
         UiMsg::ProgressReported { summary } => state.working_detail = Some(summary),
         UiMsg::ProcessActivity {
@@ -527,6 +829,17 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             request_id,
             prompt,
         } => {
+            if state.resolved_requests.contains(&request_id) {
+                return Vec::new();
+            }
+            if state.pending.as_ref().map(PendingOverlay::request_id) != Some(request_id.as_str())
+                && state.suspended_draft.is_none()
+            {
+                state.suspended_draft =
+                    Some((std::mem::take(&mut state.composer), state.composer_cursor));
+                state.composer_cursor = 0;
+                state.composer_origin = ComposerOrigin::Edited;
+            }
             state.run_id = Some(run_id);
             state.phase = UiPhase::WaitingInput;
             state.pending = Some(PendingOverlay::Input { request_id, prompt });
@@ -537,6 +850,9 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             summary,
             session_approval_available,
         } => {
+            if state.resolved_requests.contains(&request_id) {
+                return Vec::new();
+            }
             let same_request = state.run_id.as_deref() == Some(run_id.as_str())
                 && matches!(
                     &state.pending,
@@ -550,6 +866,7 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
                     && !session_approval_available)
             {
                 state.approval_choice = ApprovalChoice::Allow;
+                state.approval_selected = false;
             }
             state.run_id = Some(run_id);
             state.phase = UiPhase::WaitingApproval;
@@ -560,10 +877,32 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             });
         }
         UiMsg::RequestResolved { request_id } => {
-            if state.pending.as_ref().map(PendingOverlay::request_id) == Some(request_id.as_str()) {
-                state.pending = None;
-                state.phase = UiPhase::Running;
+            state.accept_request_submission(&request_id);
+            state.resolved_requests.insert(request_id.clone());
+            if state
+                .request_submission
+                .as_ref()
+                .map(RequestSubmission::request_id)
+                == Some(request_id.as_str())
+            {
+                state.request_submission = None;
             }
+            if state.pending.as_ref().map(PendingOverlay::request_id) == Some(request_id.as_str()) {
+                state.restore_question_draft();
+                state.pending = None;
+                if matches!(
+                    state.phase,
+                    UiPhase::WaitingInput | UiPhase::WaitingApproval
+                ) {
+                    state.phase = UiPhase::Running;
+                }
+            }
+        }
+        UiMsg::RequestSubmissionAccepted { request_id } => {
+            state.accept_request_submission(&request_id);
+        }
+        UiMsg::RequestSubmissionFailed { request_id } => {
+            state.fail_request_submission(&request_id);
         }
         UiMsg::Stopping => {
             state.pending = None;
@@ -574,11 +913,13 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             message,
             is_error,
         } => {
-            if let Some(entry) = state
+            if let Some((index, entry)) = state
                 .transcript
                 .iter_mut()
-                .find(|entry| entry.id.as_deref() == Some(id.as_str()))
+                .enumerate()
+                .find(|(_, entry)| entry.id.as_deref() == Some(id.as_str()))
             {
+                state.transcript_dirty_from = state.transcript_dirty_from.min(index);
                 entry.text = message;
                 entry.role = if is_error {
                     TranscriptRole::Error
@@ -594,6 +935,8 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             }
         }
         UiMsg::Completed { final_text } => {
+            state.request_submission = None;
+            state.restore_question_draft();
             state.settle_tools(ToolActivityState::Succeeded);
             if let Some(final_text) = final_text {
                 state.reconcile_delivery(final_text);
@@ -607,6 +950,8 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             state.phase = UiPhase::Completed;
         }
         UiMsg::Incomplete { message } => {
+            state.request_submission = None;
+            state.restore_question_draft();
             state.settle_tools(ToolActivityState::Failed);
             state.transcript.push(TranscriptEntry::system(format!(
                 "Run incomplete: {message}"
@@ -620,6 +965,8 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             state.phase = UiPhase::Incomplete;
         }
         UiMsg::Failed { message } => {
+            state.request_submission = None;
+            state.restore_question_draft();
             state.settle_tools(ToolActivityState::Failed);
             state.transcript.push(TranscriptEntry::error(
                 "terminal-failure",
@@ -634,6 +981,8 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             state.phase = UiPhase::Failed;
         }
         UiMsg::Cancelled { reason } => {
+            state.request_submission = None;
+            state.restore_question_draft();
             state.settle_tools(ToolActivityState::Cancelled);
             state
                 .transcript
@@ -651,24 +1000,59 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
 }
 
 fn submit(state: &mut UiState) -> Vec<UiEffect> {
+    if state.request_submission_pending() {
+        state.ui_notice = Some("Response submitted; waiting for confirmation".to_owned());
+        return Vec::new();
+    }
+    if state.host_busy {
+        state.ui_notice =
+            Some("Wait for the session operation; your draft is preserved".to_owned());
+        return Vec::new();
+    }
     let command = state.composer.trim();
-    if command == "/skills" || command.starts_with("/skills ") {
-        let arguments = command
-            .strip_prefix("/skills")
-            .unwrap_or_default()
-            .trim()
-            .to_owned();
-        let input = state.take_composer().expect("non-empty command checked");
-        state.transcript.push(TranscriptEntry::user(input));
-        state.scroll_back = 0;
-        return vec![UiEffect::ManageSkills { arguments }];
+    if state.phase != UiPhase::WaitingInput
+        && command.starts_with('/')
+        && !command.starts_with("//")
+    {
+        let command = command.to_owned();
+        let name = command.split_whitespace().next().unwrap_or_default();
+        if !super::menu::COMMANDS
+            .iter()
+            .any(|(known, _, _)| *known == name)
+        {
+            state.ui_notice = Some(format!(
+                "Unknown command: {name}. Use /help; // sends a literal slash."
+            ));
+            return Vec::new();
+        }
+        state.composer.clear();
+        state.composer_cursor = 0;
+        if command == "/quit" {
+            return update(state, UiMsg::Quit);
+        }
+        return vec![UiEffect::HostCommand { command }];
+    }
+    if state.phase != UiPhase::WaitingInput && state.composer.starts_with("//") {
+        state.composer.remove(0);
+        state.composer_cursor = state.composer_cursor.saturating_sub(1);
     }
     if state.phase.accepts_new_run() {
         let Some(input) = state.take_composer() else {
             return Vec::new();
         };
+        if state.transcript.is_empty() {
+            state.session_title = input
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(60)
+                .collect();
+        }
         state.transcript.push(TranscriptEntry::user(input.clone()));
         state.activity_reducer.begin_run();
+        state.request_submission = None;
+        state.resolved_requests.clear();
         state.clear_stream();
         state.pending = None;
         state.working_detail = None;
@@ -678,7 +1062,7 @@ fn submit(state: &mut UiState) -> Vec<UiEffect> {
         state.last_tick = None;
         state.run_id = None;
         state.phase = UiPhase::Running;
-        state.scroll_back = 0;
+        state.viewport.follow();
         return vec![UiEffect::StartRun { input }];
     }
 
@@ -689,8 +1073,10 @@ fn submit(state: &mut UiState) -> Vec<UiEffect> {
         let Some(input) = state.take_composer() else {
             return Vec::new();
         };
-        state.transcript.push(TranscriptEntry::user(input.clone()));
-        state.scroll_back = 0;
+        let mut entry = TranscriptEntry::user(input.clone());
+        entry.continuation = true;
+        state.transcript.push(entry);
+        state.viewport.follow();
         return vec![UiEffect::Steer { run_id, input }];
     }
 
@@ -703,10 +1089,10 @@ fn submit(state: &mut UiState) -> Vec<UiEffect> {
         let Some(value) = state.take_composer() else {
             return Vec::new();
         };
-        state.transcript.push(TranscriptEntry::user(value.clone()));
-        state.pending = None;
-        state.phase = UiPhase::Running;
-        state.scroll_back = 0;
+        state.request_submission = Some(RequestSubmission::Answer {
+            request_id: request_id.clone(),
+            value: value.clone(),
+        });
         return vec![UiEffect::ResolveInput {
             run_id,
             request_id,
@@ -729,14 +1115,15 @@ fn resolve_approval(state: &mut UiState, choice: ApprovalChoice) -> Vec<UiEffect
     else {
         return Vec::new();
     };
-    if state.phase != UiPhase::WaitingApproval {
+    if state.phase != UiPhase::WaitingApproval || state.request_submission_pending() {
         return Vec::new();
     }
     if choice == ApprovalChoice::AllowSession && !session_approval_available {
         return Vec::new();
     }
-    state.pending = None;
-    state.phase = UiPhase::Running;
+    state.request_submission = Some(RequestSubmission::Approval {
+        request_id: request_id.clone(),
+    });
     vec![UiEffect::ResolveApproval {
         run_id,
         request_id,
@@ -754,6 +1141,7 @@ fn cancel(state: &mut UiState) -> Vec<UiEffect> {
     let Some(run_id) = state.run_id.clone() else {
         return Vec::new();
     };
+    state.restore_question_draft();
     state.pending = None;
     state.phase = UiPhase::Cancelling;
     vec![UiEffect::CancelRun { run_id }]
@@ -812,6 +1200,18 @@ mod tests {
                 value: "orchestral-runtime".to_owned(),
             }]
         );
+        update(
+            &mut state,
+            UiMsg::RequestSubmissionAccepted {
+                request_id: "input-a".to_owned(),
+            },
+        );
+        update(
+            &mut state,
+            UiMsg::RequestResolved {
+                request_id: "input-a".to_owned(),
+            },
+        );
 
         update(
             &mut state,
@@ -832,7 +1232,13 @@ mod tests {
                 choice: ApprovalChoice::Allow,
             }]
         );
-        assert_eq!(state.phase, UiPhase::Running);
+        assert_eq!(state.phase, UiPhase::WaitingApproval);
+        update(
+            &mut state,
+            UiMsg::RequestResolved {
+                request_id: "approval-a".to_owned(),
+            },
+        );
         update(
             &mut state,
             UiMsg::WaitingApproval {
@@ -849,6 +1255,12 @@ mod tests {
                 request_id: "approval-b".to_owned(),
                 choice: ApprovalChoice::Deny,
             }]
+        );
+        update(
+            &mut state,
+            UiMsg::RequestResolved {
+                request_id: "approval-b".to_owned(),
+            },
         );
         update(
             &mut state,
@@ -913,12 +1325,12 @@ mod tests {
 
         assert_eq!(
             type_and_submit(&mut state, "/skills disable xlsx"),
-            vec![UiEffect::ManageSkills {
-                arguments: "disable xlsx".to_owned()
+            vec![UiEffect::HostCommand {
+                command: "/skills disable xlsx".to_owned()
             }]
         );
         assert_eq!(state.phase, UiPhase::Idle);
-        assert_eq!(state.transcript.len(), 1);
+        assert!(state.transcript.is_empty());
 
         update(
             &mut state,
@@ -928,8 +1340,8 @@ mod tests {
         );
         assert_eq!(
             type_and_submit(&mut state, "/skills list"),
-            vec![UiEffect::ManageSkills {
-                arguments: "list".to_owned()
+            vec![UiEffect::HostCommand {
+                command: "/skills list".to_owned()
             }]
         );
         assert_eq!(state.phase, UiPhase::Running);

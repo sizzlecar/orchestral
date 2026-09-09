@@ -1,7 +1,7 @@
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
@@ -10,31 +10,58 @@ use super::state::{
     ApprovalChoice, PendingOverlay, TranscriptEntry, TranscriptRole, UiPhase, UiState,
 };
 
+use super::viewport::{self, Anchor, Row};
+
 const MUTED: Style = Style::new().fg(Color::DarkGray);
 const ACCENT: Style = Style::new().fg(Color::Cyan);
 const USER: Style = Style::new().fg(Color::LightCyan);
-const ASSISTANT: Style = Style::new().fg(Color::White);
+const ASSISTANT: Style = Style::new();
 const ERROR: Style = Style::new().fg(Color::LightRed);
 const SUCCESS: Style = Style::new().fg(Color::Green);
 const CONTENT_PADDING: u16 = 2;
 const WORKING_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-pub(crate) fn render(frame: &mut Frame<'_>, state: &UiState) {
+#[derive(Default)]
+pub(crate) struct RenderCache {
+    key: Option<(String, u16, bool)>,
+    revision: u64,
+    offsets: Vec<usize>,
+    committed_rows: usize,
+    rows: Vec<Row>,
+}
+
+#[cfg(test)]
+pub(crate) fn render(frame: &mut Frame<'_>, state: &UiState) -> Option<Anchor> {
+    render_cached(frame, state, &mut RenderCache::default())
+}
+
+pub(crate) fn render_cached(
+    frame: &mut Frame<'_>,
+    state: &UiState,
+    cache: &mut RenderCache,
+) -> Option<Anchor> {
     let area = frame.area();
     if area.width < 20 || area.height < 6 {
         frame.render_widget(
             Paragraph::new("Orchestral needs at least 20×6").style(ERROR),
             area,
         );
-        return;
+        return state.viewport.anchor.clone();
     }
 
     let status_height = u16::from(shows_working_status(state.phase));
-    let pending_height = pending_height(state, area.width);
+    let completion = super::interaction::completion(state);
+    let menu = state.menu.as_ref().or(completion.as_ref());
+    let pending_height = if menu.is_some() {
+        (area.height / 2).clamp(3, 10)
+    } else {
+        pending_height(state, area.width)
+    };
     let reserved = 2_u16
         .saturating_add(status_height)
         .saturating_add(pending_height);
     let composer_height = composer_height(state, area.width)
+        .min((area.height / if state.input_expanded { 2 } else { 3 }).max(2))
         .min(area.height.saturating_sub(reserved).saturating_sub(1));
     let rows = Layout::vertical([
         Constraint::Length(1),
@@ -47,13 +74,117 @@ pub(crate) fn render(frame: &mut Frame<'_>, state: &UiState) {
     .split(area);
 
     render_header(frame, rows[0], state);
-    render_transcript(frame, rows[1], state);
+    let anchor = render_transcript(frame, rows[1], state, cache);
     render_working_status(frame, rows[2], state);
-    if let Some(pending) = &state.pending {
+    if let Some(menu) = menu {
+        render_menu(frame, rows[3], menu);
+    } else if let Some(pending) = &state.pending {
         render_pending(frame, rows[3], pending, state.approval_choice);
     }
     render_composer(frame, rows[4], state);
     render_footer(frame, rows[5], state);
+    apply_theme(frame, state);
+    anchor
+}
+
+fn apply_theme(frame: &mut Frame<'_>, state: &UiState) {
+    for cell in &mut frame.buffer_mut().content {
+        let safe = super::text::plain(cell.symbol());
+        if let std::borrow::Cow::Owned(safe) = safe {
+            cell.set_symbol(&safe);
+        }
+        if !state.color_enabled {
+            cell.set_style(Style::reset());
+        } else if state.theme == "light" {
+            cell.bg = Color::White;
+            if cell.fg == Color::DarkGray {
+                cell.fg = Color::Rgb(75, 85, 99);
+            }
+            if cell.fg == Color::Reset {
+                cell.fg = Color::Black;
+            }
+            if cell.fg == Color::LightCyan {
+                cell.fg = Color::Blue;
+            }
+            if cell.fg == Color::Cyan {
+                cell.fg = Color::Rgb(0, 95, 115);
+            }
+            if cell.fg == Color::LightRed {
+                cell.fg = Color::Red;
+            }
+        } else if state.theme == "dark" {
+            cell.bg = Color::Black;
+            if cell.fg == Color::DarkGray {
+                cell.fg = Color::Rgb(166, 173, 186);
+            }
+            if cell.fg == Color::Reset {
+                cell.fg = Color::White;
+            }
+        } else if cell.fg == Color::DarkGray {
+            // The terminal owns the foreground/background pair. ANSI bright-black
+            // is often almost indistinguishable from a user's background.
+            cell.fg = Color::Reset;
+        }
+    }
+}
+
+fn render_menu(frame: &mut Frame<'_>, area: Rect, menu: &super::menu::Menu) {
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(MUTED)
+        .padding(Padding::horizontal(CONTENT_PADDING));
+    let inner = block.inner(area);
+    let mut lines = vec![Line::styled(
+        compact_label(&menu.title, inner.width as usize),
+        ACCENT.add_modifier(Modifier::BOLD),
+    )];
+    if let Some(detail) = &menu.detail {
+        let rows = viewport::wrap(
+            "detail",
+            super::text::plain(detail)
+                .lines()
+                .map(|line| Line::raw(line.to_owned()))
+                .collect(),
+            inner.width.max(1) as usize,
+        );
+        let height = inner.height.saturating_sub(1) as usize;
+        let top = menu.selected.min(rows.len().saturating_sub(height));
+        lines.extend(rows.into_iter().skip(top).take(height).map(|row| row.text));
+    } else {
+        lines.push(Line::styled(
+            compact_label(&format!("Filter: {}", menu.query), inner.width as usize),
+            MUTED,
+        ));
+        let choices = menu.filtered();
+        let count = (inner.height.saturating_sub(2) as usize / 2).max(1);
+        let start = menu.selected.saturating_sub(count - 1);
+        if choices.is_empty() {
+            lines.push(Line::styled("No matches", MUTED));
+        }
+        for (index, choice) in choices.iter().enumerate().skip(start).take(count) {
+            let selected = index == menu.selected;
+            lines.push(Line::styled(
+                format!(
+                    "{} {}",
+                    if selected { "›" } else { " " },
+                    compact_label(&choice.label, inner.width.saturating_sub(2) as usize)
+                ),
+                if selected {
+                    ACCENT.add_modifier(Modifier::BOLD)
+                } else {
+                    ASSISTANT
+                },
+            ));
+            lines.push(Line::styled(
+                format!(
+                    "  {}",
+                    compact_label(&choice.description, inner.width.saturating_sub(2) as usize)
+                ),
+                MUTED,
+            ));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
@@ -75,10 +206,16 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     }
     let columns =
         Layout::horizontal([Constraint::Percentage(72), Constraint::Percentage(28)]).split(area);
+    let label_width = columns[0].width.saturating_sub(17) as usize;
+    let project = compact_label(&state.project, label_width / 3);
+    let title = compact_label(
+        &state.session_title,
+        label_width.saturating_sub(project.width()),
+    );
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("  Orchestral", ACCENT.add_modifier(Modifier::BOLD)),
-            Span::styled(format!("  ·  {}", state.model), MUTED),
+            Span::styled(format!("  {project} / {title}"), MUTED),
         ])),
         columns[0],
     );
@@ -90,44 +227,102 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     );
 }
 
-fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
-    let block = Block::default().padding(Padding::horizontal(CONTENT_PADDING));
-    let inner = block.inner(area);
-    let lines = transcript_lines(state, inner.width.max(1));
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-    let wrapped = paragraph.line_count(inner.width.max(1));
-    let max_scroll = wrapped.saturating_sub(inner.height as usize) as u16;
-    let back = u16::try_from(state.scroll_back)
-        .unwrap_or(u16::MAX)
-        .min(max_scroll);
-    let scroll = max_scroll.saturating_sub(back);
-    frame.render_widget(paragraph.block(block).scroll((scroll, 0)), area);
+fn compact_label(text: &str, width: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    let text = super::text::plain(text);
+    if text.width() <= width {
+        return text.into_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut result = String::new();
+    for grapheme in text.graphemes(true) {
+        if result.width() + grapheme.width() >= width {
+            break;
+        }
+        result.push_str(grapheme);
+    }
+    result.push('…');
+    result
 }
 
-fn transcript_lines(state: &UiState, width: u16) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    if state.transcript.is_empty() && state.streamed_text().is_empty() {
-        lines.push(Line::from(Span::styled(
-            "Ask for an outcome. Orchestral can inspect, act, and verify.",
-            MUTED,
-        )));
+fn render_transcript(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &UiState,
+    cache: &mut RenderCache,
+) -> Option<Anchor> {
+    let block = Block::default().padding(Padding::horizontal(CONTENT_PADDING));
+    let inner = block.inner(area);
+    let width = inner.width.max(1);
+    let key = (state.session_id.clone(), width, state.tools_expanded);
+    if cache.key.as_ref() != Some(&key) {
+        *cache = RenderCache {
+            key: Some(key),
+            revision: state.transcript_revision.wrapping_sub(1),
+            ..Default::default()
+        };
     }
-    let mut previous_role = None;
-    for entry in &state.transcript {
-        if previous_role.is_some_and(|previous| should_separate(previous, entry.role)) {
-            lines.push(Line::default());
+    if cache.revision != state.transcript_revision {
+        cache.rows.truncate(cache.committed_rows);
+        let from = state
+            .transcript_dirty_from
+            .min(cache.offsets.len())
+            .min(state.transcript.len());
+        let row = cache.offsets.get(from).copied().unwrap_or(cache.rows.len());
+        cache.rows.truncate(row);
+        cache.offsets.truncate(from);
+        for (index, entry) in state.transcript.iter().enumerate().skip(from) {
+            cache.offsets.push(cache.rows.len());
+            let mut lines = Vec::new();
+            if index > 0 && should_separate(state.transcript[index - 1].role, entry.role) {
+                lines.push(Line::default());
+            }
+            push_entry_lines(&mut lines, entry, width, state.tools_expanded);
+            cache.rows.extend(viewport::wrap(
+                entry.id.clone().unwrap_or_else(|| format!("entry-{index}")),
+                lines,
+                width as usize,
+            ));
         }
-        push_entry_lines(&mut lines, entry, width);
-        previous_role = Some(entry.role);
-    }
-    let stream = state.streamed_text();
-    if !stream.is_empty() {
-        if !lines.is_empty() {
-            lines.push(Line::default());
+        cache.committed_rows = cache.rows.len();
+        let stream = state.streamed_text();
+        if !stream.is_empty() {
+            let mut lines = Vec::new();
+            if !cache.rows.is_empty() {
+                lines.push(Line::default());
+            }
+            push_markdown(&mut lines, "• ", &stream, ASSISTANT, true, width);
+            cache
+                .rows
+                .extend(viewport::wrap(state.stream_key(), lines, width as usize));
+        } else if cache.rows.is_empty() {
+            cache.rows.extend(viewport::wrap(
+                "welcome",
+                vec![Line::styled(
+                    "Describe your task. F1 for help · /skills for project skills.",
+                    MUTED,
+                )],
+                width as usize,
+            ));
         }
-        push_markdown(&mut lines, "• ", &stream, ASSISTANT, true, width);
+        cache.revision = state.transcript_revision;
     }
-    lines
+    let rows = &cache.rows;
+    let (top, anchor) = viewport::window(rows, inner.height as usize, &state.viewport);
+    frame.render_widget(
+        Paragraph::new(
+            rows.iter()
+                .skip(top)
+                .take(inner.height as usize)
+                .map(|row| row.text.clone())
+                .collect::<Vec<_>>(),
+        )
+        .block(block),
+        area,
+    );
+    anchor
 }
 
 fn should_separate(previous: TranscriptRole, current: TranscriptRole) -> bool {
@@ -137,9 +332,19 @@ fn should_separate(previous: TranscriptRole, current: TranscriptRole) -> bool {
     )
 }
 
-fn push_entry_lines(lines: &mut Vec<Line<'static>>, entry: &TranscriptEntry, width: u16) {
+fn push_entry_lines(
+    lines: &mut Vec<Line<'static>>,
+    entry: &TranscriptEntry,
+    width: u16,
+    expanded: bool,
+) {
     match entry.role {
-        TranscriptRole::User => push_plain(lines, "› ", &entry.text, USER),
+        TranscriptRole::User => push_plain(
+            lines,
+            if entry.continuation { "  ↳ " } else { "› " },
+            &entry.text,
+            USER,
+        ),
         TranscriptRole::Assistant => {
             push_markdown(lines, "• ", &entry.text, ASSISTANT, false, width)
         }
@@ -147,20 +352,38 @@ fn push_entry_lines(lines: &mut Vec<Line<'static>>, entry: &TranscriptEntry, wid
         TranscriptRole::Error => push_plain(lines, "■ ", &entry.text, ERROR),
         TranscriptRole::Tool => {
             let (symbol, style) = match entry.tool_status {
-                Some(ActivityStatus::Running) => ("• ", ACCENT),
-                Some(ActivityStatus::Succeeded) => ("✓ ", SUCCESS),
-                Some(ActivityStatus::Failed) => ("× ", ERROR),
-                Some(ActivityStatus::Cancelled) => ("■ ", Style::new().fg(Color::Yellow)),
-                None => ("· ", MUTED),
+                Some(ActivityStatus::Running) => ("  • ", ACCENT),
+                Some(ActivityStatus::Succeeded) => ("  ✓ ", MUTED),
+                Some(ActivityStatus::Failed) => ("  × ", ERROR),
+                Some(ActivityStatus::Cancelled) => ("  ■ ", Style::new().fg(Color::Yellow)),
+                None => ("  · ", MUTED),
             };
             push_status_text(lines, symbol, &entry.text, style);
-            push_activity_details(lines, &entry.tool_details);
+            let limit = if expanded {
+                usize::MAX
+            } else if entry.tool_status == Some(ActivityStatus::Failed) {
+                8
+            } else {
+                3
+            };
+            let visible = entry.tool_details.len().min(limit);
+            push_activity_details(lines, &entry.tool_details[..visible]);
+            if visible < entry.tool_details.len() {
+                lines.push(Line::styled(
+                    format!(
+                        "      … {} more detail lines · ctrl+o expand",
+                        entry.tool_details.len() - visible
+                    ),
+                    MUTED,
+                ));
+            }
         }
     }
 }
 
 fn push_plain(lines: &mut Vec<Line<'static>>, prefix: &str, text: &str, style: Style) {
     let indent = " ".repeat(UnicodeWidthStr::width(prefix));
+    let text = super::text::plain(text);
     for (index, part) in text.split('\n').enumerate() {
         let current_prefix = if index == 0 { prefix } else { &indent };
         lines.push(Line::from(vec![
@@ -175,6 +398,7 @@ fn push_plain(lines: &mut Vec<Line<'static>>, prefix: &str, text: &str, style: S
 
 fn push_status_text(lines: &mut Vec<Line<'static>>, prefix: &str, text: &str, style: Style) {
     let indent = " ".repeat(UnicodeWidthStr::width(prefix));
+    let text = super::text::plain(text);
     for (index, part) in text.split('\n').enumerate() {
         lines.push(Line::from(vec![
             Span::styled(
@@ -193,9 +417,9 @@ fn push_status_text(lines: &mut Vec<Line<'static>>, prefix: &str, text: &str, st
 fn push_activity_details(lines: &mut Vec<Line<'static>>, details: &[ActivityDetail]) {
     for detail in details {
         let prefix = if detail.depth == 0 {
-            "  └ "
+            "    └ "
         } else {
-            "      "
+            "        "
         };
         let style = match detail.style {
             ActivityDetailStyle::Primary => ASSISTANT.add_modifier(Modifier::BOLD),
@@ -206,7 +430,7 @@ fn push_activity_details(lines: &mut Vec<Line<'static>>, details: &[ActivityDeta
         };
         lines.push(Line::from(vec![
             Span::styled(prefix.to_owned(), MUTED),
-            Span::styled(detail.text.clone(), style),
+            Span::styled(super::text::plain(&detail.text).into_owned(), style),
         ]));
     }
 }
@@ -224,6 +448,7 @@ fn push_markdown(
     let mut in_code_block = false;
     let start_len = lines.len();
 
+    let text = super::text::plain(text);
     let source_lines = text.split('\n').collect::<Vec<_>>();
     let mut index = 0;
     while index < source_lines.len() {
@@ -612,8 +837,26 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     if area.height == 0 {
         return;
     }
-    let block = Block::default().padding(Padding::new(CONTENT_PADDING, CONTENT_PADDING, 1, 1));
+    let line_count = state.composer.lines().count();
+    let title = if line_count > 20 {
+        format!(
+            " {line_count} lines · ctrl+p {} ",
+            if state.input_expanded {
+                "collapse"
+            } else {
+                "expand"
+            }
+        )
+    } else {
+        String::new()
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::TOP)
+        .border_style(MUTED)
+        .padding(Padding::new(CONTENT_PADDING, CONTENT_PADDING, 0, 0));
     let inner = block.inner(area);
+    frame.render_widget(block, area);
     let prompt_width = 2_u16.min(inner.width);
     let prompt_area = Rect {
         width: prompt_width,
@@ -638,7 +881,11 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     if state.composer.is_empty() {
         frame.render_widget(
             Paragraph::new(Text::from(Line::from(Span::styled(
-                composer_placeholder(state.phase),
+                if state.request_submission_pending() {
+                    "Response submitted; waiting for confirmation…"
+                } else {
+                    composer_placeholder(state.phase)
+                },
                 MUTED.add_modifier(Modifier::ITALIC),
             )))),
             content_area,
@@ -667,7 +914,9 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         );
     }
 
-    if !matches!(state.phase, UiPhase::WaitingApproval | UiPhase::Cancelling)
+    if state.menu.is_none()
+        && !state.request_submission_pending()
+        && !matches!(state.phase, UiPhase::WaitingApproval | UiPhase::Cancelling)
         && content_area.width > 0
         && content_area.height > 0
     {
@@ -788,39 +1037,51 @@ fn composer_placeholder(phase: UiPhase) -> &'static str {
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
-    let active = matches!(
-        state.phase,
-        UiPhase::Running | UiPhase::WaitingInput | UiPhase::WaitingApproval | UiPhase::Cancelling
-    );
-    if area.width < 64 {
-        let shortcuts = match state.phase {
-            UiPhase::WaitingApproval => "  ↑/↓ select · enter confirm · a/d · esc quit",
-            UiPhase::WaitingInput => "  enter reply · ctrl+c stop · esc quit",
-            UiPhase::Running => "  enter steer · ctrl+c stop · esc quit",
-            UiPhase::Cancelling => "  stopping current run… · esc quit",
-            _ if active => "  ctrl+c stop · esc quit",
-            _ => "  enter send · esc quit",
-        };
-        frame.render_widget(Paragraph::new(shortcuts).style(MUTED), area);
-        return;
-    }
-    let columns =
-        Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)]).split(area);
-    let left = match state.phase {
-        UiPhase::WaitingApproval => "  ↑/↓ select  ·  enter confirm  ·  a/d shortcut",
-        UiPhase::WaitingInput => "  enter reply  ·  ctrl+c interrupt",
-        UiPhase::Running => "  enter steer  ·  ctrl+c interrupt",
-        UiPhase::Cancelling => "  stopping current run…",
-        _ if active => "  ctrl+c interrupt",
-        _ => "  enter send  ·  shift+enter newline",
+    let hint = if state
+        .menu
+        .as_ref()
+        .is_some_and(|menu| menu.toggle.is_some())
+    {
+        "space toggle · ↑↓ read · esc back"
+    } else if state
+        .menu
+        .as_ref()
+        .is_some_and(|menu| menu.detail.is_some())
+    {
+        "↑↓ read · esc back"
+    } else if state.menu.is_some() {
+        "↑↓ select · enter open · esc return"
+    } else if state.request_submission_pending() {
+        "response submitted · ctrl+c stop"
+    } else if state.viewport.anchor.is_some() {
+        if state.viewport.unread {
+            "new output · end to follow"
+        } else {
+            "history · end to follow"
+        }
+    } else {
+        match state.phase {
+            UiPhase::WaitingApproval => "↑↓ select · a/d · enter confirm",
+            UiPhase::WaitingInput => "enter answer · ctrl+c stop",
+            UiPhase::Running => "enter steer · ctrl+c stop",
+            UiPhase::Cancelling => "stopping…",
+            _ => "enter send · / commands · f1 help",
+        }
     };
-    frame.render_widget(Paragraph::new(left).style(MUTED), columns[0]);
-    frame.render_widget(
-        Paragraph::new("pgup/pgdn scroll  ·  esc quit  ")
-            .style(MUTED)
-            .alignment(Alignment::Right),
-        columns[1],
-    );
+    let text = if let Some(notice) = &state.ui_notice {
+        format!("  {notice}")
+    } else if area.width < 64 {
+        format!("  {hint}")
+    } else {
+        let context = state
+            .context_budget
+            .map_or_else(|| "—".to_owned(), |budget| format!("—/{budget}"));
+        format!(
+            "  {} · context: {context}    {hint}",
+            super::text::plain(&state.model)
+        )
+    };
+    frame.render_widget(Paragraph::new(text).style(MUTED), area);
 }
 
 fn render_pending(
@@ -992,7 +1253,7 @@ fn phase_badge(phase: UiPhase) -> (&'static str, &'static str) {
         UiPhase::WaitingInput => ("?", "input"),
         UiPhase::WaitingApproval => ("!", "approval"),
         UiPhase::Cancelling => ("◌", "stopping"),
-        UiPhase::Completed => ("✓", "done"),
+        UiPhase::Completed => ("○", "replied"),
         UiPhase::Incomplete => ("○", "incomplete"),
         UiPhase::Failed => ("×", "failed"),
         UiPhase::Cancelled => ("■", "cancelled"),
@@ -1128,11 +1389,13 @@ mod tests {
         let backend = TestBackend::new(30, 12);
         let mut terminal = Terminal::new(backend).expect("create TestBackend terminal");
         terminal
-            .draw(|frame| render(frame, &state))
+            .draw(|frame| {
+                render(frame, &state);
+            })
             .expect("render long CJK composer");
 
         let cursor = terminal.backend().cursor_position();
-        assert_eq!(cursor.y, 9, "cursor should follow the last wrapped row");
+        assert_eq!(cursor.y, 10, "cursor should stay above the footer");
         assert_eq!(
             terminal.backend().buffer()[(cursor.x.saturating_sub(2), cursor.y)].symbol(),
             "末",
@@ -1400,7 +1663,9 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("create TestBackend terminal");
         terminal
-            .draw(|frame| render(frame, state))
+            .draw(|frame| {
+                render(frame, state);
+            })
             .expect("render TUI snapshot");
         let buffer = terminal.backend().buffer();
         let mut output = String::new();
