@@ -1730,7 +1730,11 @@ fn mcp_user_registry_add_list_get_remove_round_trip() {
     assert!(listed.status.success(), "{}", listed.stderr_text());
     let registry: serde_json::Value =
         serde_json::from_str(&listed.stdout_text()).expect("list emits registry JSON");
-    assert_eq!(registry["mcpServers"]["fixture"]["command"], "/bin/echo");
+    let executable = fs::canonicalize("/bin/echo").expect("resolve registered executable");
+    assert_eq!(
+        registry["mcpServers"]["fixture"]["command"],
+        executable.to_string_lossy().as_ref()
+    );
     assert_eq!(
         registry["mcpServers"]["fixture"]["allowUnrestrictedNetwork"],
         true
@@ -1809,6 +1813,10 @@ done
         .arg("add")
         .arg("localfixture")
         .arg("--required")
+        // Child-process permission does not expose executable directories in
+        // the Linux filesystem sandbox. Declare the fixture's curl dependency.
+        .arg("--read")
+        .arg("/usr/bin")
         .arg("--")
         .arg("/bin/sh")
         .arg("-c")
@@ -1872,7 +1880,12 @@ done
         &model_requests[0].body,
         "mcp__localfixture__lookup_marker"
     ));
-    assert!(model_request_text(&model_requests[1].body).contains(MCP_RESULT_MARKER));
+    let context = model_request_text(&model_requests[1].body);
+    assert!(
+        context.contains(MCP_RESULT_MARKER),
+        "MCP result missing from model context: {context}\nstderr: {}",
+        output.stderr_text()
+    );
 
     let records = session_records(&workspace);
     let exchanges = tool_exchanges(&records);
