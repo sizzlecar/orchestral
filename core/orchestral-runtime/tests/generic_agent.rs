@@ -824,6 +824,51 @@ struct ToolLoopModel {
     rounds: AtomicUsize,
 }
 
+struct SteerAwareToolModel(ToolLoopModel);
+
+#[async_trait]
+impl ModelBackend for SteerAwareToolModel {
+    fn descriptor(&self) -> ModelDescriptor {
+        self.0.descriptor()
+    }
+
+    async fn start(
+        &self,
+        request: ModelRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ModelStream, ModelError> {
+        if self.0.rounds.load(Ordering::SeqCst) > 0 {
+            assert!(request.messages.iter().any(|message| {
+                message.role == ModelRole::User && message.content.iter().any(|content| {
+                    matches!(content, ModelContent::Text { text } if text == "continue with the new instruction")
+                })
+            }));
+        }
+        self.0.start(request, cancellation).await
+    }
+}
+
+struct YieldingEcho {
+    started: Notify,
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl GuardedToolExecutor for YieldingEcho {
+    async fn execute(&self, execution: GuardedToolExecution) -> ToolOutcome {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.started.notify_one();
+        execution.yield_requested.cancelled().await;
+        assert!(
+            !execution.cancellation.is_cancelled(),
+            "Steer must not cancel dispatched effects"
+        );
+        ToolOutcome::Completed {
+            output: json!({ "result": execution.invocation.arguments["value"] }).into(),
+        }
+    }
+}
+
 struct LongToolLoopModel {
     rounds: AtomicUsize,
     tool_rounds: usize,
@@ -7518,6 +7563,83 @@ async fn one_hundred_steers_are_committed_in_order_without_crossing_the_run() {
         })
         .collect::<Vec<_>>();
     assert_eq!(checkpointed_steers, committed);
+}
+
+#[tokio::test]
+async fn steer_yields_a_dispatched_tool_and_commits_its_observation_without_replay() {
+    let bounds = ToolPolicyBounds {
+        approval: ApprovalPolicy::NotRequired,
+        max_timeout_ms: Some(10_000),
+        max_output_bytes: Some(1024),
+        ..ToolPolicyBounds::default()
+    };
+    let tool = Arc::new(YieldingEcho {
+        started: Notify::new(),
+        calls: AtomicUsize::new(0),
+    });
+    let runtime = durable_direct_runtime(
+        &bounds,
+        Arc::new(InMemoryToolEffectJournalStore::default()),
+        tool.clone(),
+    );
+    let model = Arc::new(SteerAwareToolModel(ToolLoopModel {
+        rounds: AtomicUsize::new(0),
+    }));
+    let provider = Arc::new(
+        InternalGenericAgentProvider::new_with_tools(
+            model.clone(),
+            GenericAgentConfig::new("internal-provider", "generic-agent"),
+            runtime.clone(),
+            RunToolGrant {
+                bounds: bounds.clone(),
+            },
+        )
+        .unwrap(),
+    );
+    let controller =
+        Arc::new(AgentController::new(provider, ProviderBindingRef::new("yield-binding")).unwrap());
+    let client = AgentClient::new(controller.clone(), AgentSessionId::new("yield-session"));
+    let handle = client
+        .start_with_run_id(RunId::new("yield-run"), vec![Content::text("use echo")])
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), tool.started.notified())
+        .await
+        .unwrap();
+    handle
+        .steer_text("continue with the new instruction")
+        .await
+        .unwrap();
+    let view = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        controller.wait_for_terminal(handle.run_id()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(view.state.status(), AgentRunStatus::Delivered);
+    assert_eq!(model.0.rounds.load(Ordering::SeqCst), 2);
+    let replay = runtime
+        .invoke(
+            ToolInvocation {
+                run_id: handle.run_id().clone(),
+                call_id: ToolCallId::new("echo-call"),
+                tool_id: ToolId::new("test/echo"),
+                arguments: json!({ "value": "hello" }),
+            },
+            RunToolGrant { bounds },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(
+        replay,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Completed { .. },
+            cached: true
+        }
+    ));
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

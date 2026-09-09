@@ -626,6 +626,7 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                         content: assistant_content,
                     };
 
+                    let yield_requested = CancellationToken::new();
                     let batch = execute_tool_batch(ToolBatchRequest {
                         inner: inner.clone(),
                         request: request.clone(),
@@ -635,14 +636,25 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                         model_request_id: model_request.request_id.clone(),
                         parsed_calls,
                         cancellation: cancellation.clone(),
+                        yield_requested: yield_requested.clone(),
                         tool_call_count,
                         tool_call_limit,
                         last_response: last_response.clone(),
                         total_usage: total_usage.clone(),
                         has_usage,
                         started_event_id: started_event_id.clone(),
-                    })
-                    .await;
+                    });
+                    tokio::pin!(batch);
+                    let batch = tokio::select! {
+                        result = &mut batch => result,
+                        _ = steer_updates.changed() => {
+                            // Keep the dispatched future alive so its effects
+                            // are observed and journaled. Cooperative waits
+                            // return promptly without cancelling the process.
+                            yield_requested.cancel();
+                            batch.await
+                        }
+                    };
                     let ToolBatchExecution::Completed {
                         tool_results,
                         retained_artifacts,

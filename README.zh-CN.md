@@ -240,6 +240,13 @@ MCP 调用都继续经过 Host policy 与 Effect Journal。
 捕获的环境变量、时间/输出上限、逐次审批与 Effect Journal。默认不继承完整宿主环境，并关闭
 网络；MCP stdio 的启动程序仍必须由 Host 明确配置。模型可见参数不能扩大任何权限。
 
+进程等待支持 `wait_mode: "completion"`，将输出汇总到进程退出或本次等待到期；
+`wait_mode: "output"` 则在输出短暂停顿后返回。非 TTY 命令默认使用 completion 模式，
+首次等待 10 秒，无输入的非 TTY `write_stdin` 默认等待 30 秒；TTY 会话和发送输入默认
+使用 output 模式。`yield_time_ms` 可在 Host 执行上限内调整等待时长，等待到期会返回
+会话 ID，进程继续运行。收到新的 Steer 指令时，两种等待均可提前返回当前输出，让 Agent
+处理追加指令，同时保留原进程，不终止或重跑它。
+
 启用 `skills.auto_discover` 后，CLI 会从 workspace 的 `.claude/skills`、`.codex/skills`、
 `skills` 以及显式 `skills.directories` 发现 `SKILL.md` 包。初始 Context 只包含 Skill descriptor；
 选中后由 `skill_read` 载入完整指令，相对资源从该 Skill 目录解析。MCP 与 Skill 保持独立：

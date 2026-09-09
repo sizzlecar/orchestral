@@ -16,7 +16,7 @@ use serde_json::{json, Map, Value};
 
 use crate::exec_process::{
     ExecPollResult, ExecProcessError, ExecSessionId, ExecSessionStatus, ExecSpawnSpec,
-    ProcessSupervisor,
+    ExecWaitMode, ExecWaitOptions, ProcessSupervisor,
 };
 use crate::tool_runtime::{GuardedToolExecution, GuardedToolExecutor};
 use crate::tools::shell_sandbox::{sandbox_command, SandboxNetworkAccess, ShellSandboxPolicy};
@@ -491,6 +491,10 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
             .get("tty")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let mode = match wait_mode(&execution.invocation.arguments, tty, false) {
+            Ok(mode) => mode,
+            Err(outcome) => return outcome,
+        };
         let classification = classify_command(cmd);
         let strictly_read_only = classification.read_only && !tty;
         let expected_risk = if classification.destructive {
@@ -609,11 +613,15 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
 
         let result = match self
             .manager
-            .write_and_poll(
+            .write_and_poll_with_options(
                 &execution.invocation.run_id,
                 session_id,
                 None,
-                wait,
+                ExecWaitOptions {
+                    duration: observation_window(wait, &execution),
+                    mode,
+                    yield_requested: execution.yield_requested.clone(),
+                },
                 &execution.cancellation,
             )
             .await
@@ -763,20 +771,42 @@ impl GuardedToolExecutor for GuardedWriteStdinExecutor {
             Some(_) => return rejected("exec_input_invalid", "chars must be a string"),
             None => None,
         };
+        let snapshot = match self
+            .manager
+            .snapshot(&execution.invocation.run_id, session_id)
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => return exec_error(error),
+        };
+        let mode = match wait_mode(
+            &execution.invocation.arguments,
+            snapshot.tty,
+            input.is_some_and(|value| !value.is_empty()),
+        ) {
+            Ok(mode) => mode,
+            Err(outcome) => return outcome,
+        };
         let wait = bounded_wait(
             &execution.invocation.arguments,
             bounds.max_timeout_ms,
-            5_000,
+            match mode {
+                ExecWaitMode::Output => 5_000,
+                ExecWaitMode::Completion => 30_000,
+            },
         );
         let max_output_bytes =
             output_byte_limit(&execution.invocation.arguments, bounds.max_output_bytes);
         match self
             .manager
-            .write_and_poll(
+            .write_and_poll_with_options(
                 &execution.invocation.run_id,
                 session_id,
                 input,
-                wait,
+                ExecWaitOptions {
+                    duration: observation_window(wait, &execution),
+                    mode,
+                    yield_requested: execution.yield_requested.clone(),
+                },
                 &execution.cancellation,
             )
             .await
@@ -817,7 +847,9 @@ fn build_exec_command_descriptor(mut restriction: ToolRestriction) -> ToolDescri
                 "the Host will decide whether to ask the user. Never tell the user to run ",
                 "the command manually merely because escalation is required. Short commands ",
                 "return directly; interactive or still-running commands return a session_id ",
-                "for write_stdin."
+                "for write_stdin. Non-TTY commands aggregate output until exit or the wait ",
+                "deadline; TTY commands return after an output pause. Set wait_mode to ",
+                "'completion' or 'output' to choose explicitly. A wait deadline does not kill the command."
             )
             .to_owned(),
             input_schema: json!({
@@ -827,6 +859,7 @@ fn build_exec_command_descriptor(mut restriction: ToolRestriction) -> ToolDescri
                     "cmd": { "type": "string", "minLength": 1 },
                     "workdir": { "type": "string", "minLength": 1 },
                     "tty": { "type": "boolean" },
+                    "wait_mode": wait_mode_schema(),
                     "yield_time_ms": { "type": "integer", "minimum": 1 },
                     "max_output_tokens": { "type": "integer", "minimum": 1 },
                     "sandbox_permissions": {
@@ -869,7 +902,11 @@ fn build_write_stdin_descriptor(mut restriction: ToolRestriction) -> ToolDescrip
             description: concat!(
                 "Send characters to a running exec session, or omit chars to poll for new output. ",
                 "If the process exits before input can be delivered, the call returns its final ",
-                "output and exit status instead of failing."
+                "output and exit status instead of failing. Empty non-TTY polls default to ",
+                "completion mode: aggregate output for up to 30 seconds or until exit. ",
+                "TTY sessions and input writes default to output mode for interactive responses. ",
+                "Set wait_mode explicitly to override; yield_time_ms controls the observation ",
+                "window, not the process lifetime."
             )
             .to_owned(),
             input_schema: json!({
@@ -878,6 +915,7 @@ fn build_write_stdin_descriptor(mut restriction: ToolRestriction) -> ToolDescrip
                 "properties": {
                     "session_id": { "type": "integer", "minimum": 1 },
                     "chars": { "type": "string" },
+                    "wait_mode": wait_mode_schema(),
                     "yield_time_ms": { "type": "integer", "minimum": 1 },
                     "max_output_tokens": { "type": "integer", "minimum": 1 }
                 },
@@ -1390,6 +1428,26 @@ fn shell_arguments(cmd: &str) -> Vec<String> {
     vec!["/C".to_owned(), cmd.to_owned()]
 }
 
+fn wait_mode_schema() -> Value {
+    json!({
+        "type": "string",
+        "enum": ["output", "completion"],
+        "description": "output returns after a short pause in output; completion aggregates output until exit or the wait deadline. Host input can yield either mode without terminating the process."
+    })
+}
+
+fn wait_mode(arguments: &Value, tty: bool, has_input: bool) -> Result<ExecWaitMode, ToolOutcome> {
+    match arguments.get("wait_mode") {
+        None => Ok(ExecWaitMode::for_interaction(tty, has_input)),
+        Some(Value::String(value)) if value == "output" => Ok(ExecWaitMode::Output),
+        Some(Value::String(value)) if value == "completion" => Ok(ExecWaitMode::Completion),
+        Some(_) => Err(rejected(
+            "exec_wait_mode_invalid",
+            "wait_mode must be 'output' or 'completion'",
+        )),
+    }
+}
+
 fn bounded_wait(arguments: &Value, maximum_ms: Option<u64>, default_ms: u64) -> Duration {
     let requested = arguments
         .get("yield_time_ms")
@@ -1397,6 +1455,19 @@ fn bounded_wait(arguments: &Value, maximum_ms: Option<u64>, default_ms: u64) -> 
         .unwrap_or(default_ms)
         .max(1);
     Duration::from_millis(requested.min(maximum_ms.unwrap_or(requested)))
+}
+
+fn observation_window(requested: Duration, execution: &GuardedToolExecution) -> Duration {
+    // Reserve a short interval for draining and returning the observation.
+    // Otherwise a wait equal to the Host bound races the outer tool timeout
+    // and misclassifies a still-running session as an unknown effect.
+    let remaining = execution.deadline.map(|deadline| {
+        deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .saturating_sub(Duration::from_millis(50))
+            .max(Duration::from_millis(1))
+    });
+    remaining.map_or(requested, |remaining| requested.min(remaining))
 }
 
 fn output_byte_limit(arguments: &Value, maximum_bytes: Option<u64>) -> usize {

@@ -21,7 +21,7 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{broadcast, Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
 
-use crate::pty_process::{PtyProcessId, PtyProcessManager, PtySpawnSpec};
+use crate::pty_process::{PtyProcessId, PtyProcessManager, PtyReadOptions, PtySpawnSpec};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ExecSessionId(u64);
@@ -62,6 +62,35 @@ pub struct ExecPollResult {
     pub alive: bool,
     pub exit_code: Option<i32>,
     pub wall_time_seconds: f64,
+}
+
+/// Determines whether ordinary process output ends a wait early.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecWaitMode {
+    /// Return after a short pause in output, suitable for interactive prompts.
+    Output,
+    /// Aggregate output until exit, the wait deadline, or a Host yield request.
+    Completion,
+}
+
+impl ExecWaitMode {
+    /// Preserve prompt responsiveness for TTY sessions and delivered input.
+    pub fn for_interaction(tty: bool, has_input: bool) -> Self {
+        if tty || has_input {
+            Self::Output
+        } else {
+            Self::Completion
+        }
+    }
+}
+
+/// One observation window. Ending this window never terminates the process.
+#[derive(Debug, Clone)]
+pub struct ExecWaitOptions {
+    pub duration: Duration,
+    pub mode: ExecWaitMode,
+    /// Host request to return the current observation without cancelling work.
+    pub yield_requested: CancellationToken,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -236,9 +265,10 @@ impl PipeSession {
         &self,
         lifecycle: &SessionLifecycle,
         started_at: Instant,
-        wait: Duration,
+        options: &ExecWaitOptions,
         cancellation: &CancellationToken,
     ) -> Result<ExecPollResult, ExecProcessError> {
+        let wait = options.duration;
         let started = Instant::now();
         let settle = Duration::from_millis(50).min(wait);
         let mut observed = (u64::MAX, u64::MAX);
@@ -266,8 +296,11 @@ impl PipeSession {
             if exit_code.is_some() && ((stdout.1 && stderr.1) || last_change.elapsed() >= settle) {
                 break exit_code;
             }
-            if started.elapsed() >= wait
-                || ((stdout.2 || stderr.2) && last_change.elapsed() >= settle)
+            if options.yield_requested.is_cancelled()
+                || started.elapsed() >= wait
+                || (options.mode == ExecWaitMode::Output
+                    && (stdout.2 || stderr.2)
+                    && last_change.elapsed() >= settle)
             {
                 break exit_code;
             }
@@ -275,6 +308,7 @@ impl PipeSession {
             let pause = remaining.min(Duration::from_millis(20));
             tokio::select! {
                 _ = cancellation.cancelled() => return Err(ExecProcessError::Cancelled),
+                _ = options.yield_requested.cancelled() => {},
                 _ = self.stdout.changed.notified() => {},
                 _ = self.stderr.changed.notified() => {},
                 _ = lifecycle.changed.notified() => {},
@@ -400,6 +434,8 @@ impl ProcessSupervisor {
         Ok(session_id)
     }
 
+    /// Use output waits for TTY/input interactions and completion waits for
+    /// empty pipe observations. The duration bounds this observation only.
     pub async fn write_and_poll(
         &self,
         run_id: &RunId,
@@ -408,7 +444,32 @@ impl ProcessSupervisor {
         wait: Duration,
         cancellation: &CancellationToken,
     ) -> Result<ExecPollResult, ExecProcessError> {
-        if wait.is_zero() {
+        let tty = self.snapshot(run_id, session_id)?.tty;
+        self.write_and_poll_with_options(
+            run_id,
+            session_id,
+            input,
+            ExecWaitOptions {
+                duration: wait,
+                mode: ExecWaitMode::for_interaction(tty, input.is_some_and(|v| !v.is_empty())),
+                yield_requested: CancellationToken::new(),
+            },
+            cancellation,
+        )
+        .await
+    }
+
+    /// Observe one existing session with an explicit wait strategy. Yielding
+    /// preserves both the process and its Run-scoped authority.
+    pub async fn write_and_poll_with_options(
+        &self,
+        run_id: &RunId,
+        session_id: ExecSessionId,
+        input: Option<&str>,
+        options: ExecWaitOptions,
+        cancellation: &CancellationToken,
+    ) -> Result<ExecPollResult, ExecProcessError> {
+        if options.duration.is_zero() {
             return Err(ExecProcessError::Invalid(
                 "exec poll duration must be positive".to_owned(),
             ));
@@ -442,7 +503,7 @@ impl ProcessSupervisor {
                     }
                 }
                 process
-                    .poll(&session.lifecycle, session.started, wait, cancellation)
+                    .poll(&session.lifecycle, session.started, &options, cancellation)
                     .await?
             }
             ManagedProcess::Pty { process_id } => {
@@ -461,11 +522,19 @@ impl ProcessSupervisor {
                 let process_id = process_id.clone();
                 let cancellation = cancellation.clone();
                 let read = tokio::task::spawn_blocking(move || {
-                    pty.read(
+                    pty.read_with_options(
                         &run_id,
                         &process_id,
-                        wait,
-                        Duration::from_millis(50).min(wait),
+                        PtyReadOptions {
+                            timeout: options.duration,
+                            settle: match options.mode {
+                                ExecWaitMode::Output => {
+                                    Duration::from_millis(50).min(options.duration)
+                                }
+                                ExecWaitMode::Completion => options.duration,
+                            },
+                            yield_requested: options.yield_requested,
+                        },
                         &cancellation,
                     )
                 })

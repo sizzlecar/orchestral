@@ -9,6 +9,7 @@ pub(super) struct ToolBatchRequest {
     pub(super) model_request_id: ModelRequestId,
     pub(super) parsed_calls: Vec<(PendingModelToolCall, serde_json::Value)>,
     pub(super) cancellation: CancellationToken,
+    pub(super) yield_requested: CancellationToken,
     pub(super) tool_call_count: u64,
     pub(super) tool_call_limit: Option<u64>,
     pub(super) last_response: String,
@@ -37,6 +38,7 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
         model_request_id,
         parsed_calls,
         cancellation,
+        yield_requested,
         mut tool_call_count,
         tool_call_limit,
         last_response,
@@ -349,11 +351,12 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
         );
         let result = tools
             .runtime
-            .invoke(
+            .invoke_with_yield(
                 invocation.clone(),
                 tools.run_grant.clone(),
                 None,
                 cancellation.clone(),
+                yield_requested.clone(),
             )
             .await;
         let result = match result {
@@ -375,11 +378,12 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                     ApprovalWaitOutcome::Allowed(capability) => {
                         tools
                             .runtime
-                            .invoke(
+                            .invoke_with_yield(
                                 invocation.clone(),
                                 tools.run_grant.clone(),
                                 Some(*capability),
                                 cancellation.clone(),
+                                yield_requested.clone(),
                             )
                             .await
                     }

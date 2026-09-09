@@ -77,6 +77,15 @@ pub enum PtyProcessError {
 
 type ProcessKey = (RunId, PtyProcessId);
 
+/// Bounded observation of a PTY without changing the process lifetime.
+#[derive(Debug, Clone)]
+pub struct PtyReadOptions {
+    pub timeout: Duration,
+    pub settle: Duration,
+    /// Return buffered output when the Host needs to process new input.
+    pub yield_requested: CancellationToken,
+}
+
 struct PtyOutputBuffer {
     bytes: VecDeque<u8>,
     dropped_bytes: u64,
@@ -335,6 +344,32 @@ impl PtyProcessManager {
         settle: Duration,
         cancellation: &CancellationToken,
     ) -> Result<PtyReadResult, PtyProcessError> {
+        self.read_with_options(
+            run_id,
+            process_id,
+            PtyReadOptions {
+                timeout,
+                settle,
+                yield_requested: CancellationToken::new(),
+            },
+            cancellation,
+        )
+    }
+
+    /// Observe buffered output with an optional cooperative Host yield signal.
+    /// Yielding returns the current buffer and leaves the PTY alive.
+    pub fn read_with_options(
+        &self,
+        run_id: &RunId,
+        process_id: &PtyProcessId,
+        options: PtyReadOptions,
+        cancellation: &CancellationToken,
+    ) -> Result<PtyReadResult, PtyProcessError> {
+        let PtyReadOptions {
+            timeout,
+            settle,
+            yield_requested,
+        } = options;
         if timeout.is_zero() || settle.is_zero() {
             return Err(PtyProcessError::Invalid(
                 "PTY read timeout and settle duration must be positive".to_owned(),
@@ -360,6 +395,7 @@ impl PtyProcessManager {
                 last_change = Instant::now();
             }
             if (!buffer.bytes.is_empty() && last_change.elapsed() >= settle)
+                || yield_requested.is_cancelled()
                 || buffer.closed
                 || started.elapsed() >= timeout
             {

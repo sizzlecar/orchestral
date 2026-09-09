@@ -1164,15 +1164,7 @@ fn local_exec_runs_toolchains_and_a_child_script_without_program_enumeration() {
             let context = model_request_text(&request.body);
             assert!(context.contains("cargo 1."), "{context}");
             assert!(context.contains("Python 3."), "{context}");
-            assert!(context.contains("\"alive\":true"), "{context}");
-            openai_tool_response(
-                "toolchain-poll",
-                "write_stdin",
-                json!({ "session_id": 1, "yield_time_ms": 5000 }),
-            )
-        }),
-        Box::new(|request| {
-            let context = model_request_text(&request.body);
+            assert!(context.contains("\"alive\":false"), "{context}");
             assert!(context.contains("CHILD_SCRIPT_OK"), "{context}");
             assert!(context.contains("\"exit_code\":0"), "{context}");
             openai_text_response("UNIFIED_EXEC_TOOLCHAINS_OK")
@@ -1194,13 +1186,12 @@ fn local_exec_runs_toolchains_and_a_child_script_without_program_enumeration() {
     assert!(output.status.success(), "{}", output.stderr_text());
     assert_eq!(output.stdout_text().trim(), "UNIFIED_EXEC_TOOLCHAINS_OK");
     output.assert_no_ansi();
-    assert_eq!(model_server.join().unwrap().len(), 3);
+    assert_eq!(model_server.join().unwrap().len(), 2);
 
     let records = session_records(&workspace);
     let exchanges = tool_exchanges(&records);
-    assert_eq!(exchanges.len(), 2);
+    assert_eq!(exchanges.len(), 1);
     assert_eq!(tool_name(exchanges[0]), Some("exec_command"));
-    assert_eq!(tool_name(exchanges[1]), Some("write_stdin"));
     assert!(exchanges
         .iter()
         .all(|exchange| tool_result_is_error(exchange) == Some(false)));

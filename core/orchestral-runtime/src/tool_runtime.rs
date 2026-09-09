@@ -132,6 +132,11 @@ pub struct GuardedToolExecution {
     pub effective_policy: EffectiveToolPolicy,
     pub lease: CapabilityLease,
     pub cancellation: CancellationToken,
+    /// Cooperative request to return an observation at a safe point. This is
+    /// not cancellation and must never stop or replay an external effect.
+    pub yield_requested: CancellationToken,
+    /// Absolute Host deadline for this dispatch, including executor setup.
+    pub deadline: Option<tokio::time::Instant>,
 }
 
 /// Explicit opt-in SPI for implementations that enforce Host Tool policy.
@@ -446,6 +451,20 @@ pub trait AgentToolRuntime: Send + Sync {
         approval: Option<ApprovalCapability>,
         run_cancellation: CancellationToken,
     ) -> GuardedToolResult;
+
+    /// Invoke with a Host signal for cooperative waits. Implementations that
+    /// do not support yielding retain their normal execution semantics.
+    async fn invoke_with_yield(
+        &self,
+        invocation: ToolInvocation,
+        run_grant: RunToolGrant,
+        approval: Option<ApprovalCapability>,
+        run_cancellation: CancellationToken,
+        _yield_requested: CancellationToken,
+    ) -> GuardedToolResult {
+        self.invoke(invocation, run_grant, approval, run_cancellation)
+            .await
+    }
 }
 
 /// Structured result returned to the Agent loop.
@@ -1206,6 +1225,26 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
         approval: Option<ApprovalCapability>,
         run_cancellation: CancellationToken,
     ) -> GuardedToolResult {
+        self.invoke_with_yield(
+            invocation,
+            run_grant,
+            approval,
+            run_cancellation,
+            CancellationToken::new(),
+        )
+        .await
+    }
+
+    /// Runs the same guarded, journaled invocation while allowing an executor
+    /// to yield an observation when new Host input arrives.
+    pub async fn invoke_with_yield(
+        &self,
+        invocation: ToolInvocation,
+        run_grant: RunToolGrant,
+        approval: Option<ApprovalCapability>,
+        run_cancellation: CancellationToken,
+        yield_requested: CancellationToken,
+    ) -> GuardedToolResult {
         if let Err(error) = invocation.validate() {
             return rejected("invalid_invocation", error.message);
         }
@@ -1361,13 +1400,21 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
         {
             Ok(gate_guard) => {
                 let _gate_guard = gate_guard;
+                let deadline = effective_policy
+                    .bounds()
+                    .max_timeout_ms
+                    .map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
                 self.execute(
                     registered,
-                    invocation,
-                    operation,
-                    effective_policy,
-                    lease,
-                    execution_cancellation,
+                    GuardedToolExecution {
+                        invocation,
+                        operation,
+                        effective_policy,
+                        lease,
+                        cancellation: execution_cancellation,
+                        yield_requested,
+                        deadline,
+                    },
                 )
                 .await
             }
@@ -1859,33 +1906,29 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
     async fn execute(
         &self,
         registered: Arc<RegisteredTool>,
-        invocation: ToolInvocation,
-        operation: ToolOperationPlan,
-        effective_policy: EffectiveToolPolicy,
-        lease: CapabilityLease,
-        cancellation: CancellationToken,
+        execution: GuardedToolExecution,
     ) -> ToolOutcome {
-        if let Err(error) = lease.validate_for(&invocation, &operation, &effective_policy) {
+        if let Err(error) = execution.lease.validate_for(
+            &execution.invocation,
+            &execution.operation,
+            &execution.effective_policy,
+        ) {
             return ToolOutcome::Rejected {
                 code: "invalid_capability_lease".to_owned(),
                 message: error.message,
             };
         }
-        let timeout_ms = effective_policy.bounds().max_timeout_ms;
-        let output_invocation = invocation.clone();
-        let execution = registered.executor.execute(GuardedToolExecution {
-            invocation,
-            operation,
-            effective_policy: effective_policy.clone(),
-            lease,
-            cancellation: cancellation.clone(),
-        });
+        let effective_policy = execution.effective_policy.clone();
+        let deadline = execution.deadline;
+        let output_invocation = execution.invocation.clone();
+        let cancellation = execution.cancellation.clone();
+        let execution = registered.executor.execute(execution);
         let execution = AssertUnwindSafe(execution).catch_unwind();
         tokio::pin!(execution);
 
-        let outcome = match timeout_ms {
-            Some(timeout_ms) => {
-                let timeout = tokio::time::sleep(Duration::from_millis(timeout_ms));
+        let outcome = match deadline {
+            Some(deadline) => {
+                let timeout = tokio::time::sleep_until(deadline);
                 tokio::pin!(timeout);
                 tokio::select! {
                     _ = cancellation.cancelled() => {
@@ -1976,6 +2019,25 @@ where
         run_cancellation: CancellationToken,
     ) -> GuardedToolResult {
         GuardedToolRuntime::invoke(self, invocation, run_grant, approval, run_cancellation).await
+    }
+
+    async fn invoke_with_yield(
+        &self,
+        invocation: ToolInvocation,
+        run_grant: RunToolGrant,
+        approval: Option<ApprovalCapability>,
+        run_cancellation: CancellationToken,
+        yield_requested: CancellationToken,
+    ) -> GuardedToolResult {
+        GuardedToolRuntime::invoke_with_yield(
+            self,
+            invocation,
+            run_grant,
+            approval,
+            run_cancellation,
+            yield_requested,
+        )
+        .await
     }
 }
 
