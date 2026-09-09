@@ -114,6 +114,24 @@ impl GuardedExecCommandExecutor {
             environment,
         })
     }
+
+    fn workspace_roots(&self, roots: &BTreeSet<String>) -> Result<Vec<PathBuf>, String> {
+        let temp_root = self.manager.runtime_temp_root();
+        let roots = canonical_roots(
+            &roots
+                .iter()
+                .filter(|root| Path::new(root.as_str()) != temp_root)
+                .cloned()
+                .collect(),
+        )?;
+        if roots
+            .iter()
+            .any(|root| temp_root.starts_with(root) || root.starts_with(temp_root))
+        {
+            return Err("Host runtime temp root must be separate from workspace roots".into());
+        }
+        Ok(roots)
+    }
 }
 
 impl GuardedWriteStdinExecutor {
@@ -126,11 +144,12 @@ impl GuardedWriteStdinExecutor {
 impl GuardedToolExecutor for GuardedExecCommandExecutor {
     fn planning_contract(&self) -> Value {
         json!({
-            "contract": "orchestral.exec-command-operation-planner/v4",
+            "contract": "orchestral.exec-command-operation-planner/v5",
             "shell": self.shell,
             "runtime_readable_roots": self.runtime_readable_roots,
             "runtime_readable_files": self.runtime_readable_files,
             "environment_names": self.environment.names(),
+            "runtime_temp_root": self.manager.runtime_temp_root(),
         })
     }
 
@@ -170,9 +189,11 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
         let explicitly_requested_host_execution = requested_host_execution(&invocation.arguments)?;
         let justification =
             escalation_justification(&invocation.arguments, explicitly_requested_host_execution)?;
-        let readable_roots = canonical_roots(&effective_policy.bounds().filesystem.readable_roots)
+        let readable_roots = self
+            .workspace_roots(&effective_policy.bounds().filesystem.readable_roots)
             .map_err(|message| rejected("exec_read_root_invalid", message))?;
-        let writable_roots = canonical_roots(&effective_policy.bounds().filesystem.writable_roots)
+        let writable_roots = self
+            .workspace_roots(&effective_policy.bounds().filesystem.writable_roots)
             .map_err(|message| rejected("exec_write_root_invalid", message))?;
         if readable_roots.is_empty() || writable_roots.is_empty() {
             return Err(rejected(
@@ -305,22 +326,20 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
                     CapabilitySelector::Subtree(root.to_string_lossy().into_owned()),
                 );
             }
-            if strictly_read_only {
-                for root in &writable_roots {
-                    required_capabilities.insert_resource(
-                        EffectScope::FilesystemWrite,
-                        CapabilitySelector::Subtree(
-                            root.join(".orchestral/tmp").to_string_lossy().into_owned(),
-                        ),
-                    );
-                }
-            } else {
+            if !strictly_read_only {
                 for root in &writable_roots {
                     required_capabilities.insert_resource(
                         EffectScope::FilesystemWrite,
                         CapabilitySelector::Subtree(root.to_string_lossy().into_owned()),
                     );
                 }
+            }
+            let runtime_temp = self.manager.runtime_temp_path(&invocation.run_id);
+            for effect in [EffectScope::FilesystemRead, EffectScope::FilesystemWrite] {
+                required_capabilities.insert_resource(
+                    effect,
+                    CapabilitySelector::Subtree(runtime_temp.to_string_lossy().into_owned()),
+                );
             }
         }
         for name in &effective_policy.bounds().environment.allowed_variables {
@@ -454,12 +473,12 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
         else {
             return rejected("exec_command_missing", "cmd must be a non-empty string");
         };
-        let readable_roots = match canonical_roots(&bounds.filesystem.readable_roots) {
+        let readable_roots = match self.workspace_roots(&bounds.filesystem.readable_roots) {
             Ok(roots) if !roots.is_empty() => roots,
             Ok(_) => return rejected("exec_read_root_denied", "no readable workspace root"),
             Err(message) => return rejected("exec_read_root_invalid", message),
         };
-        let writable_roots = match canonical_roots(&bounds.filesystem.writable_roots) {
+        let writable_roots = match self.workspace_roots(&bounds.filesystem.writable_roots) {
             Ok(roots) if !roots.is_empty() => roots,
             Ok(_) => return rejected("exec_write_root_denied", "no writable workspace root"),
             Err(message) => return rejected("exec_write_root_invalid", message),
@@ -481,9 +500,12 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
             Ok(cwd) => cwd,
             Err(message) => return rejected("exec_workdir_invalid", message),
         };
-        let runtime_temp = match prepare_runtime_temp(&writable_roots) {
+        let runtime_temp = match self.manager.prepare_runtime_temp(
+            &execution.invocation.run_id,
+            execution.run_cancellation.clone(),
+        ) {
             Ok(path) => path,
-            Err(message) => return failed("exec_runtime_temp", message, false),
+            Err(error) => return exec_error(error),
         };
         let tty = execution
             .invocation
@@ -522,11 +544,12 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
                     "host-approved".to_owned(),
                 )
             } else {
-                let sandbox_writes = if strictly_read_only {
-                    vec![runtime_temp.clone()]
+                let mut sandbox_writes = if strictly_read_only {
+                    Vec::new()
                 } else {
                     writable_roots
                 };
+                sandbox_writes.push(runtime_temp.clone());
                 let network = match sandbox_network_access(execution.lease.granted()) {
                     Ok(network) => network,
                     Err(outcome) => return outcome,
@@ -603,12 +626,14 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
             Err(error) => return exec_error(error),
         };
 
-        let manager = self.manager.clone();
+        let manager = Arc::downgrade(&self.manager);
         let run_id = execution.invocation.run_id.clone();
         let cancellation = execution.cancellation.clone();
         tokio::spawn(async move {
             cancellation.cancelled().await;
-            let _ = manager.close(&run_id, session_id).await;
+            if let Some(manager) = manager.upgrade() {
+                let _ = manager.close(&run_id, session_id).await;
+            }
         });
 
         let result = match self
@@ -1379,45 +1404,6 @@ fn resolve_host_workdir(
     Ok(cwd)
 }
 
-fn prepare_runtime_temp(writable_roots: &[PathBuf]) -> Result<PathBuf, String> {
-    let root = writable_roots
-        .first()
-        .ok_or_else(|| "exec_command requires one writable root".to_owned())?;
-    let state_root = ensure_controlled_directory(root, &root.join(".orchestral"))?;
-    let directory = ensure_controlled_directory(root, &state_root.join("tmp"))?;
-    Ok(directory)
-}
-
-fn ensure_controlled_directory(root: &Path, directory: &Path) -> Result<PathBuf, String> {
-    match std::fs::symlink_metadata(directory) {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir(directory).map_err(|error| {
-                format!(
-                    "create controlled runtime directory '{}' failed: {error}",
-                    directory.display()
-                )
-            })?;
-        }
-        Err(error) => {
-            return Err(format!(
-                "inspect controlled runtime directory '{}' failed: {error}",
-                directory.display()
-            ));
-        }
-    }
-    let canonical = std::fs::canonicalize(directory).map_err(|error| {
-        format!(
-            "canonicalize controlled runtime directory '{}' failed: {error}",
-            directory.display()
-        )
-    })?;
-    if !canonical.starts_with(root) || !canonical.is_dir() {
-        return Err("controlled runtime directory escaped its writable root".to_owned());
-    }
-    Ok(canonical)
-}
-
 #[cfg(unix)]
 fn shell_arguments(cmd: &str) -> Vec<String> {
     vec!["-c".to_owned(), cmd.to_owned()]
@@ -1556,7 +1542,7 @@ fn exec_error(error: ExecProcessError) -> ToolOutcome {
 mod tests {
     use super::{
         classify_command, display_payload, guarded_exec_command_descriptor,
-        guarded_write_stdin_descriptor, prepare_runtime_temp, workspace_exec_command_descriptor,
+        guarded_write_stdin_descriptor, workspace_exec_command_descriptor,
         workspace_write_stdin_descriptor,
     };
     use orchestral_core::tool_protocol::{ApprovalPolicy, ToolPolicyBounds, ToolRestriction};
@@ -1635,41 +1621,5 @@ mod tests {
         let preview = display_payload(&payload);
         assert!(preview.contains("chars omitted"));
         assert!(preview.ends_with("rm -rf important"));
-    }
-
-    fn temporary_root(label: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "orchestral-guarded-exec-{label}-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir(&root).expect("create guarded exec test root");
-        std::fs::canonicalize(root).expect("canonical guarded exec test root")
-    }
-
-    #[test]
-    fn controlled_runtime_temp_is_created_inside_the_writable_root() {
-        let root = temporary_root("runtime-temp");
-        let directory = prepare_runtime_temp(std::slice::from_ref(&root))
-            .expect("prepare controlled runtime temp");
-        assert_eq!(directory, root.join(".orchestral/tmp"));
-        assert!(directory.is_dir());
-        std::fs::remove_dir_all(root).expect("remove guarded exec test root");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn controlled_runtime_temp_rejects_a_symlink_escape_before_writing() {
-        let root = temporary_root("runtime-temp-escape");
-        let outside = temporary_root("runtime-temp-outside");
-        std::os::unix::fs::symlink(&outside, root.join(".orchestral"))
-            .expect("create state root escape symlink");
-
-        let error = prepare_runtime_temp(std::slice::from_ref(&root))
-            .expect_err("runtime temp symlink escape must be rejected");
-        assert!(error.contains("escaped its writable root"), "{error}");
-        assert!(!outside.join("tmp").exists());
-
-        std::fs::remove_dir_all(root).expect("remove guarded exec escape root");
-        std::fs::remove_dir_all(outside).expect("remove guarded exec outside root");
     }
 }

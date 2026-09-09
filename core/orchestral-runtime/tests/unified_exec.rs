@@ -58,9 +58,10 @@ fn test_operation(summary: &str) -> ToolOperationPlan {
 }
 
 #[cfg(target_os = "macos")]
-fn bounds(workspace: &Path, shell: &Path) -> ToolPolicyBounds {
+fn bounds(workspace: &Path, shell: &Path, manager: &ProcessSupervisor) -> ToolPolicyBounds {
     let workspace = workspace.to_string_lossy().into_owned();
     let shell = shell.to_string_lossy().into_owned();
+    let temp = manager.runtime_temp_root().to_string_lossy().into_owned();
     ToolPolicyBounds {
         allowed_effects: effects(),
         approval: ApprovalPolicy::NotRequired,
@@ -77,8 +78,8 @@ fn bounds(workspace: &Path, shell: &Path) -> ToolPolicyBounds {
             transport: TransportLaunchPolicy::default(),
         },
         filesystem: FilesystemPolicy {
-            readable_roots: BTreeSet::from([workspace.clone()]),
-            writable_roots: BTreeSet::from([workspace]),
+            readable_roots: BTreeSet::from([workspace.clone(), temp.clone()]),
+            writable_roots: BTreeSet::from([workspace, temp]),
         },
         network: NetworkPolicy {
             allowed_targets: BTreeSet::new(),
@@ -312,9 +313,9 @@ async fn guarded_write_stdin_observes_an_exit_race_without_requesting_input_auth
     std::fs::create_dir_all(&parent).unwrap();
     let workspace = std::fs::canonicalize(&parent).unwrap();
     let shell = std::fs::canonicalize("/bin/sh").unwrap();
-    let bounds = bounds(&workspace, &shell);
-    let runtime = runtime(bounds.clone());
     let manager = Arc::new(ProcessSupervisor::new(16 * 1024).unwrap());
+    let bounds = bounds(&workspace, &shell, &manager);
+    let runtime = runtime(bounds.clone());
     runtime
         .register(
             workspace_write_stdin_descriptor(ToolRestriction {
@@ -532,9 +533,9 @@ async fn guarded_unified_surface_executes_children_and_continues_one_tty_session
     std::fs::create_dir_all(&parent).unwrap();
     let workspace = std::fs::canonicalize(&parent).unwrap();
     let shell = std::fs::canonicalize("/bin/sh").unwrap();
-    let bounds = bounds(&workspace, &shell);
-    let runtime = runtime(bounds.clone());
     let manager = Arc::new(ProcessSupervisor::new(16 * 1024).unwrap());
+    let bounds = bounds(&workspace, &shell, &manager);
+    let runtime = runtime(bounds.clone());
     let restriction = || ToolRestriction {
         bounds: bounds.clone(),
     };
@@ -783,10 +784,10 @@ async fn completion_observation_respects_the_host_deadline_without_losing_the_se
     std::fs::create_dir_all(&parent).unwrap();
     let workspace = std::fs::canonicalize(&parent).unwrap();
     let shell = std::fs::canonicalize("/bin/sh").unwrap();
-    let bounds = bounds(&workspace, &shell);
+    let manager = Arc::new(ProcessSupervisor::new(16 * 1024).unwrap());
+    let bounds = bounds(&workspace, &shell, &manager);
     let runtime =
         runtime(bounds.clone()).with_permission_policy(Arc::new(WorkspacePermissionPolicy));
-    let manager = Arc::new(ProcessSupervisor::new(16 * 1024).unwrap());
     runtime
         .register(
             workspace_write_stdin_descriptor(ToolRestriction {
@@ -858,10 +859,10 @@ async fn workspace_auto_run_confines_reads_and_mutations_to_the_real_sandbox() {
     std::fs::set_permissions(&fake_ls, permissions).unwrap();
 
     let shell = std::fs::canonicalize("/bin/sh").unwrap();
-    let bounds = bounds(&workspace, &shell);
+    let manager = Arc::new(ProcessSupervisor::new(16 * 1024).unwrap());
+    let bounds = bounds(&workspace, &shell, &manager);
     let runtime =
         runtime(bounds.clone()).with_permission_policy(Arc::new(WorkspacePermissionPolicy));
-    let manager = Arc::new(ProcessSupervisor::new(16 * 1024).unwrap());
     runtime
         .register(
             workspace_exec_command_descriptor(ToolRestriction {
@@ -950,7 +951,8 @@ async fn host_execution_requires_an_exact_approval_and_can_use_an_external_workd
     let workspace = std::fs::canonicalize(workspace).unwrap();
     let external = std::fs::canonicalize(external).unwrap();
     let shell = std::fs::canonicalize("/bin/sh").unwrap();
-    let bounds = bounds(&workspace, &shell);
+    let manager = Arc::new(ProcessSupervisor::new(16 * 1024).unwrap());
+    let bounds = bounds(&workspace, &shell, &manager);
     let runtime =
         runtime(bounds.clone()).with_permission_policy(Arc::new(WorkspacePermissionPolicy));
     runtime
@@ -960,7 +962,7 @@ async fn host_execution_requires_an_exact_approval_and_can_use_an_external_workd
             }),
             Arc::new(
                 GuardedExecCommandExecutor::new(
-                    Arc::new(ProcessSupervisor::new(16 * 1024).unwrap()),
+                    manager,
                     shell,
                     [PathBuf::from("/bin"), PathBuf::from("/usr/bin")],
                     [],

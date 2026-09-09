@@ -3366,6 +3366,7 @@ dependencies = [
  "serde_yaml",
  "shell-words",
  "strip-ansi-escapes",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-test",

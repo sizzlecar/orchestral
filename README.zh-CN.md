@@ -240,6 +240,12 @@ MCP 调用都继续经过 Host policy 与 Effect Journal。
 捕获的环境变量、时间/输出上限、逐次审批与 Effect Journal。默认不继承完整宿主环境，并关闭
 网络；MCP stdio 的启动程序仍必须由 Host 明确配置。模型可见参数不能扩大任何权限。
 
+命令的临时文件位于仓库外、由 Host 管理的私有目录。`TMPDIR`、`TMP`、`TEMP` 指向当前
+Run 的专用子目录，同一 Run 内可共享，沙箱不能访问其他 Run 的子目录。进程使用期间
+目录持续保留，Run 结束后回收。CLI 在重启后保持 Host 根目录身份稳定，不会静默复用
+其他 Host 或崩溃遗留的 Run 目录。SDK Host 需将 `ProcessSupervisor::runtime_temp_root()`
+加入 Host、Run 和 exec Tool 的文件系统读写授权；文件 Tool 仍只开放工作区。
+
 进程等待支持 `wait_mode: "completion"`，将输出汇总到进程退出或本次等待到期；
 `wait_mode: "output"` 则在输出短暂停顿后返回。非 TTY 命令默认使用 completion 模式，
 首次等待 10 秒，无输入的非 TTY `write_stdin` 默认等待 30 秒；TTY 会话和发送输入默认

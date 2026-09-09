@@ -132,6 +132,9 @@ pub struct GuardedToolExecution {
     pub effective_policy: EffectiveToolPolicy,
     pub lease: CapabilityLease,
     pub cancellation: CancellationToken,
+    /// Run lifetime signal. Unlike dispatch cancellation, a Tool timeout does
+    /// not cancel this token or release other Run-owned resources.
+    pub run_cancellation: CancellationToken,
     /// Cooperative request to return an observation at a safe point. This is
     /// not cancellation and must never stop or replay an external effect.
     pub yield_requested: CancellationToken,
@@ -1412,6 +1415,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
                         effective_policy,
                         lease,
                         cancellation: execution_cancellation,
+                        run_cancellation,
                         yield_requested,
                         deadline,
                     },

@@ -299,6 +299,14 @@ limits, exact approval, and effect journal. Ambient environment is not inherited
 network access is disabled by default. MCP stdio launch identities remain explicitly configured by
 the Host. Model-visible arguments cannot expand any of these permissions.
 
+Command temporary files live outside the workspace in a private Host-managed directory.
+`TMPDIR`, `TMP`, and `TEMP` point to one Run-specific child: commands in the same Run share it,
+and the sandbox cannot access another Run's child. The directory stays alive while processes
+use it and is reclaimed when the Run ends. The CLI keeps the Host root identity stable across
+restarts; existing Run directories from another Host or a crash are never silently reused.
+SDK Hosts must include `ProcessSupervisor::runtime_temp_root()` in the Host/Run/exec Tool
+filesystem read/write grants. File Tools retain their workspace-only restrictions.
+
 Process waits support `wait_mode: "completion"` to collect output until exit or the observation
 deadline, and `wait_mode: "output"` to return after a short pause in output. Non-TTY commands
 default to completion mode with an initial 10-second window; empty non-TTY `write_stdin` polls
