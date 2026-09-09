@@ -558,10 +558,7 @@ impl GeminiStreamState {
             }
         }
         if let Some(usage) = response.get("usageMetadata") {
-            let usage = ModelUsage {
-                input_tokens: usage.get("promptTokenCount").and_then(Value::as_u64),
-                output_tokens: usage.get("candidatesTokenCount").and_then(Value::as_u64),
-            };
+            let usage = parse_usage_metadata(usage);
             if self.last_usage.as_ref() != Some(&usage) {
                 self.last_usage = Some(usage.clone());
                 self.emit(ModelEvent::Usage { usage })?;
@@ -856,6 +853,23 @@ fn flatten_text(content: &[ModelContent]) -> Result<String, ModelError> {
     })
 }
 
+fn parse_usage_metadata(usage: &Value) -> ModelUsage {
+    // Gemini reports thinking output and server-side tool input separately.
+    // Cached prompt tokens are already included in promptTokenCount.
+    let combined = |primary: &str, supplemental: &str| {
+        let primary = usage.get(primary)?.as_u64()?;
+        let supplemental = match usage.get(supplemental) {
+            None => 0,
+            Some(value) => value.as_u64()?,
+        };
+        primary.checked_add(supplemental)
+    };
+    ModelUsage {
+        input_tokens: combined("promptTokenCount", "toolUsePromptTokenCount"),
+        output_tokens: combined("candidatesTokenCount", "thoughtsTokenCount"),
+    }
+}
+
 #[cfg(test)]
 fn parse_response(
     request: &ModelRequest,
@@ -954,10 +968,7 @@ fn parse_response(
             tool_count += 1;
         }
     }
-    let usage = response.get("usageMetadata").map(|usage| ModelUsage {
-        input_tokens: usage.get("promptTokenCount").and_then(Value::as_u64),
-        output_tokens: usage.get("candidatesTokenCount").and_then(Value::as_u64),
-    });
+    let usage = response.get("usageMetadata").map(parse_usage_metadata);
     if let Some(usage) = usage.as_ref() {
         payloads.push(ModelEvent::Usage {
             usage: usage.clone(),
@@ -1084,6 +1095,7 @@ fn map_http_error(status: StatusCode, body: &[u8]) -> ModelError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::TryStreamExt;
     use orchestral_core::model_protocol::{ModelRequestId, ModelToolDefinition};
     use orchestral_model_protocol_testkit::{
         ModelConformanceSuite, ModelFixtureFactory, ModelFixtureResponse, ModelFixtureScenario,
@@ -1441,6 +1453,68 @@ mod tests {
         assert_eq!(report.successful_cases(), 4_000);
         assert_eq!(report.protocol_failures(), 4_000);
         assert_eq!(report.cancellations(), 2_000);
+    }
+
+    #[tokio::test]
+    async fn usage_includes_thinking_and_tool_input_without_counting_cached_tokens_twice() {
+        for (metadata, expected_input, expected_output) in [
+            (
+                json!({"promptTokenCount": 7, "candidatesTokenCount": 2,
+                    "thoughtsTokenCount": 11, "toolUsePromptTokenCount": 3,
+                    "cachedContentTokenCount": 4, "totalTokenCount": 23}),
+                Some(10),
+                Some(13),
+            ),
+            (
+                json!({"promptTokenCount": 7, "candidatesTokenCount": 2}),
+                Some(7),
+                Some(2),
+            ),
+            (
+                json!({"promptTokenCount": 7, "thoughtsTokenCount": 11}),
+                Some(7),
+                None,
+            ),
+            (
+                json!({"candidatesTokenCount": 2, "thoughtsTokenCount": "invalid"}),
+                None,
+                None,
+            ),
+            (
+                json!({"candidatesTokenCount": u64::MAX, "thoughtsTokenCount": 1}),
+                None,
+                None,
+            ),
+        ] {
+            let response = json!({
+                "candidates": [{"content": {"parts": [{"text": "done"}]}, "finishReason": "STOP"}],
+                "usageMetadata": metadata,
+            });
+            let expected = ModelUsage {
+                input_tokens: expected_input,
+                output_tokens: expected_output,
+            };
+            let events = parse_response(&request(), &response).unwrap();
+            assert!(events.iter().any(
+                |event| matches!(&event.payload, ModelEvent::Usage { usage } if usage == &expected)
+            ));
+            let bytes = Bytes::from(format!("data: {response}\n\n"));
+            let stream = gemini_event_stream(
+                request(),
+                stream::iter([Ok::<Bytes, reqwest::Error>(bytes)]).boxed(),
+                CancellationToken::new(),
+                128,
+            );
+            let events = stream.try_collect::<Vec<_>>().await.unwrap();
+            let usage = events
+                .iter()
+                .filter_map(|event| match &event.payload {
+                    ModelEvent::Usage { usage } => Some(usage),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(usage, vec![&expected]);
+        }
     }
 
     #[test]

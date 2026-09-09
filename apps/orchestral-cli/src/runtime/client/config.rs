@@ -337,6 +337,8 @@ mod tests {
         let raw = embedded_default_config();
         let parsed: OrchestralConfig = serde_yaml::from_str(&raw).expect("strict config");
         assert!(parsed.tools.exec.enabled);
+        assert!(parsed.tools.exec.sandboxed_execution_enabled);
+        assert!(orchestral_core::config::ExecToolConfig::default().sandboxed_execution_enabled);
         assert!(!raw.contains("planner:"));
         assert!(!raw.contains("actions:"));
         assert!(!raw.contains("task:"));

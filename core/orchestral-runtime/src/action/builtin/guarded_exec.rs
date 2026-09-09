@@ -48,7 +48,6 @@ impl CommandEnvironmentSnapshot {
             values: values
                 .into_iter()
                 .filter(|(name, _)| !name.trim().is_empty())
-                .map(|(name, value)| (name.to_ascii_uppercase(), value))
                 .collect(),
         }
     }
@@ -73,6 +72,7 @@ pub struct GuardedExecCommandExecutor {
     runtime_readable_roots: Vec<PathBuf>,
     runtime_readable_files: Vec<PathBuf>,
     environment: CommandEnvironmentSnapshot,
+    sandboxed_execution_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -112,7 +112,26 @@ impl GuardedExecCommandExecutor {
             runtime_readable_roots: roots.into_iter().collect(),
             runtime_readable_files: files.into_iter().collect(),
             environment,
+            sandboxed_execution_enabled: true,
         })
+    }
+
+    /// Restrict this executor to explicit, approved Host execution when false.
+    /// No request silently escalates because the workspace sandbox is disabled.
+    pub fn with_sandboxed_execution_enabled(mut self, enabled: bool) -> Self {
+        self.sandboxed_execution_enabled = enabled;
+        self
+    }
+
+    fn requested_host_execution(&self, arguments: &Value) -> Result<bool, ToolOutcome> {
+        let requested = requested_host_execution(arguments)?;
+        if !self.sandboxed_execution_enabled && !requested {
+            return Err(rejected(
+                "exec_default_sandbox_disabled",
+                "This Host offers only approved command execution; explicitly request sandbox_permissions='require_escalated' with a justification",
+            ));
+        }
+        Ok(requested)
     }
 
     fn workspace_roots(&self, roots: &BTreeSet<String>) -> Result<Vec<PathBuf>, String> {
@@ -144,7 +163,8 @@ impl GuardedWriteStdinExecutor {
 impl GuardedToolExecutor for GuardedExecCommandExecutor {
     fn planning_contract(&self) -> Value {
         json!({
-            "contract": "orchestral.exec-command-operation-planner/v5",
+            "contract": "orchestral.exec-command-operation-planner/v6",
+            "sandboxed_execution_enabled": self.sandboxed_execution_enabled,
             "shell": self.shell,
             "runtime_readable_roots": self.runtime_readable_roots,
             "runtime_readable_files": self.runtime_readable_files,
@@ -186,7 +206,8 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
                 "cmd must be a non-empty string",
             ));
         };
-        let explicitly_requested_host_execution = requested_host_execution(&invocation.arguments)?;
+        let explicitly_requested_host_execution =
+            self.requested_host_execution(&invocation.arguments)?;
         let justification =
             escalation_justification(&invocation.arguments, explicitly_requested_host_execution)?;
         let readable_roots = self
@@ -403,7 +424,7 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
             return ToolOutcome::Cancelled;
         }
         let explicitly_requested_host_execution =
-            match requested_host_execution(&execution.invocation.arguments) {
+            match self.requested_host_execution(&execution.invocation.arguments) {
                 Ok(value) => value,
                 Err(outcome) => return outcome,
             };
@@ -848,38 +869,57 @@ impl GuardedToolExecutor for GuardedWriteStdinExecutor {
 /// Safe SDK default: every shell command requires exact Host approval.
 pub fn guarded_exec_command_descriptor(mut restriction: ToolRestriction) -> ToolDescriptor {
     restriction.bounds.approval = ApprovalPolicy::Required;
-    build_exec_command_descriptor(restriction)
+    build_exec_command_descriptor(restriction, true)
+}
+
+/// Exposes only explicit Host execution with exact approval. Pair with an
+/// executor whose `sandboxed_execution_enabled` is false. Suitable for Hosts
+/// providing their own isolation; this descriptor does not grant authority.
+pub fn approved_host_exec_command_descriptor(mut restriction: ToolRestriction) -> ToolDescriptor {
+    restriction.bounds.approval = ApprovalPolicy::Required;
+    build_exec_command_descriptor(restriction, false)
 }
 
 /// Interactive CLI profile: the workspace permission policy may auto-run an
 /// invocation only after its operation planner selected a constrained routine
 /// sandbox. Applications must opt in explicitly.
 pub fn workspace_exec_command_descriptor(restriction: ToolRestriction) -> ToolDescriptor {
-    build_exec_command_descriptor(restriction)
+    build_exec_command_descriptor(restriction, true)
 }
 
-fn build_exec_command_descriptor(mut restriction: ToolRestriction) -> ToolDescriptor {
+fn build_exec_command_descriptor(
+    mut restriction: ToolRestriction,
+    sandboxed_execution_enabled: bool,
+) -> ToolDescriptor {
     apply_exec_restriction(&mut restriction);
     let effect_scopes = restricted_exec_effects(&restriction);
     ToolDescriptor {
         tool_id: ToolId::new("orchestral/exec_command/v1"),
         model_schema: ModelToolSchema {
             name: "exec_command".to_owned(),
-            description: concat!(
-                "Run a shell command. Commands use the workspace sandbox by default. ",
-                "When that sandbox prevents an operation the user requested, retry with ",
-                "sandbox_permissions='require_escalated' and a concise justification; ",
-                "the Host will decide whether to ask the user. Never tell the user to run ",
-                "the command manually merely because escalation is required. Short commands ",
+            description: format!("{} {}", if sandboxed_execution_enabled {
+                concat!(
+                    "Run a shell command. Commands use the workspace sandbox by default. ",
+                    "When that sandbox prevents an operation the user requested, retry with ",
+                    "sandbox_permissions='require_escalated' and a concise justification; ",
+                    "the Host will decide whether to ask the user."
+                )
+            } else {
+                concat!(
+                    "Run a shell command after exact Host approval. This Host does not offer ",
+                    "the workspace sandbox. Set sandbox_permissions='require_escalated' and ",
+                    "provide a concise justification on every command."
+                )
+            }, concat!(
+                "Never tell the user to run the command manually merely because escalation is required. Short commands ",
                 "return directly; interactive or still-running commands return a session_id ",
                 "for write_stdin. Non-TTY commands aggregate output until exit or the wait ",
                 "deadline; TTY commands return after an output pause. Set wait_mode to ",
                 "'completion' or 'output' to choose explicitly. A wait deadline does not kill the command."
-            )
-            .to_owned(),
+            )),
             input_schema: json!({
                 "type": "object",
-                "required": ["cmd"],
+                "required": if sandboxed_execution_enabled { vec!["cmd"] } else { vec!["cmd", "sandbox_permissions", "justification"] },
                 "properties": {
                     "cmd": { "type": "string", "minLength": 1 },
                     "workdir": { "type": "string", "minLength": 1 },
@@ -889,7 +929,7 @@ fn build_exec_command_descriptor(mut restriction: ToolRestriction) -> ToolDescri
                     "max_output_tokens": { "type": "integer", "minimum": 1 },
                     "sandbox_permissions": {
                         "type": "string",
-                        "enum": ["use_default", "require_escalated"]
+                        "enum": if sandboxed_execution_enabled { vec!["use_default", "require_escalated"] } else { vec!["require_escalated"] }
                     },
                     "justification": { "type": "string", "minLength": 1 }
                 },

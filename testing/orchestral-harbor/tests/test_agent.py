@@ -39,6 +39,8 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(config["agent"]["input_requests_enabled"])
         self.assertFalse(config["mcp"]["enabled"])
         self.assertFalse(config["skills"]["enabled"])
+        self.assertFalse(config["tools"]["exec"]["sandboxed_execution_enabled"])
+        self.assertTrue(config["tools"]["exec"]["allow_host_execution"])
         self.assertTrue(config["journal"]["root_dir"].startswith("/logs/agent/"))
         self.assertNotIn("system_prompt", config["agent"])
 
@@ -121,6 +123,22 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         context = AgentContext()
         await self.agent.run("do the work", environment, context)
         self.assertTrue(context.is_empty())
+
+    async def test_run_passes_proxy_settings_without_unrelated_environment(self):
+        settings = {
+            "HTTPS_PROXY": "http://upper-proxy.invalid:8080",
+            "https_proxy": "http://lower-proxy.invalid:8080",
+            "ALL_PROXY": "socks5://proxy.invalid:1080",
+            "no_proxy": "localhost,127.0.0.1",
+        }
+        agent = self.make_agent(extra_env={**settings, "UNRELATED_SECRET": "private"})
+        environment = AsyncMock()
+        environment.exec.return_value.return_code = 0
+        await agent.run("do the work", environment, AgentContext())
+        forwarded = environment.exec.call_args.kwargs["env"]
+        for name, value in settings.items():
+            self.assertEqual(forwarded[name], value)
+        self.assertNotIn("UNRELATED_SECRET", forwarded)
 
     def test_usage_deduplicates_tool_batches_and_preserves_unknown_fields(self):
         journal = self.root / "logs/journal"

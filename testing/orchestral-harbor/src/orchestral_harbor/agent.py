@@ -122,7 +122,13 @@ class Orchestral(BaseInstalledAgent):
                     }
                 ],
             },
-            "tools": {"exec": {"enabled": True, "allow_host_execution": True}},
+            "tools": {
+                "exec": {
+                    "enabled": True,
+                    "allow_host_execution": True,
+                    "sandboxed_execution_enabled": False,
+                }
+            },
             "mcp": {"enabled": False},
             "skills": {"enabled": False},
             "journal": {
@@ -206,7 +212,12 @@ class Orchestral(BaseInstalledAgent):
             self.PROVIDERS[self.backend][1],
             "HTTP_PROXY",
             "HTTPS_PROXY",
+            "ALL_PROXY",
             "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
         ]
         if self.backend == "google":
             names += [
