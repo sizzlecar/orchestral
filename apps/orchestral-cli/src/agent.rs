@@ -248,6 +248,7 @@ async fn build_agent_host_with_journals(
     )?;
 
     let mut agent_config = GenericAgentConfig::new("orchestral/internal", "generic-agent");
+    agent_config.input_requests_enabled = config.agent.input_requests_enabled;
     agent_config.model_retry = config.agent.model_retry.clone();
     {
         use orchestral_core::project_instructions::ProjectInstructionSource;

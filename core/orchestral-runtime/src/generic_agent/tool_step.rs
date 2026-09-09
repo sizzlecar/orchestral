@@ -57,6 +57,19 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
             return ToolBatchExecution::Terminal;
         }
         if call.name == REQUEST_INPUT_TOOL_NAME {
+            if !inner.config.input_requests_enabled {
+                emit_failure(
+                    &inner,
+                    &request,
+                    &user_message,
+                    agent_failure(
+                        "input_requests_disabled",
+                        "the Host does not accept model-requested input in this Agent",
+                        false,
+                    ),
+                );
+                return ToolBatchExecution::Terminal;
+            }
             let prompt = match parse_input_request(arguments) {
                 Ok(prompt) => prompt,
                 Err(failure) => {

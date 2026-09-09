@@ -57,7 +57,7 @@ pub(super) fn model_definitions_for_run(
         .as_ref()
         .map(|tools| tools.model_definitions.clone())
         .unwrap_or_default();
-    if inner.backend.descriptor().capabilities.tool_calls {
+    if inner.config.input_requests_enabled && inner.backend.descriptor().capabilities.tool_calls {
         definitions.push(request_input_definition());
     }
     if skill_catalog_bound {

@@ -168,6 +168,8 @@ pub struct GenericAgentConfig {
     pub provider_id: AgentProviderId,
     pub agent_id: AgentId,
     pub system_prompt: String,
+    /// Advertise and expose input requests only when the Host can answer them.
+    pub input_requests_enabled: bool,
     /// Host-lifetime instruction snapshot, included in the recovery identity.
     pub project_instructions: Vec<ProjectInstruction>,
     /// Retries before the first model event; never replays tool execution.
@@ -253,6 +255,7 @@ impl GenericAgentConfig {
             )
             .to_owned(),
             stream_buffer: 128,
+            input_requests_enabled: true,
             project_instructions: Vec::new(),
             model_retry: ModelRetryPolicy::default(),
             continuation: ContinuationPolicy::default(),

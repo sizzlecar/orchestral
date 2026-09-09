@@ -13,6 +13,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  harbor-adapter-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+
+      - name: Test Harbor adapter without model calls
+        run: >-
+          uv run --locked --project testing/orchestral-harbor
+          python -m unittest discover -s testing/orchestral-harbor/tests -v
+
   rust-checks:
     runs-on: ubuntu-latest
     timeout-minutes: 30

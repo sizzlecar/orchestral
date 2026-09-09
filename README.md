@@ -402,6 +402,12 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 ## Coding task evaluation
 
+For standard terminal-agent tasks, the [Harbor adapter](testing/orchestral-harbor/README.md)
+runs the native CLI in isolated Docker environments with official task verifiers.
+Start with an oracle preflight before model runs; small subsets validate the integration
+and do not constitute a full benchmark score. Unattended hosts can set
+`agent.input_requests_enabled: false` to omit the input-request capability and tool.
+
 `orchestral-coding-eval` runs 20 controlled repair tasks against pinned Orchestral source.
 These are seeded regressions in a real repository, not historical issue or cross-repository
 benchmarks. Tasks cover retry policy, project instructions, Unicode editing, interaction,

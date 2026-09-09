@@ -1,0 +1,7 @@
+!*.py
+.venv/
+*.egg-info/
+jobs/
+dist/
+build/
+

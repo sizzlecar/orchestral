@@ -7713,6 +7713,136 @@ async fn model_input_request_resolves_by_request_id_and_resumes_the_same_run() {
 }
 
 #[tokio::test]
+async fn unattended_host_omits_input_capability_and_tool_and_delivers_without_waiting() {
+    struct UnattendedModel;
+
+    #[async_trait]
+    impl ModelBackend for UnattendedModel {
+        fn descriptor(&self) -> ModelDescriptor {
+            InputRequestModel {
+                rounds: AtomicUsize::new(0),
+            }
+            .descriptor()
+        }
+
+        async fn start(
+            &self,
+            request: ModelRequest,
+            cancellation: CancellationToken,
+        ) -> Result<ModelStream, ModelError> {
+            assert!(!request
+                .tools
+                .iter()
+                .any(|tool| tool.name == "orchestral_request_input"));
+            ScriptedModel.start(request, cancellation).await
+        }
+    }
+
+    let mut config = GenericAgentConfig::new("internal-provider", "generic-agent");
+    config.input_requests_enabled = false;
+    let provider =
+        Arc::new(InternalGenericAgentProvider::new(Arc::new(UnattendedModel), config).unwrap());
+    assert!(!provider
+        .describe()
+        .descriptor
+        .capabilities
+        .pending_request_kinds
+        .contains(&PendingRequestKind::Input));
+    let controller = Arc::new(
+        AgentController::new(provider, ProviderBindingRef::new("unattended-binding")).unwrap(),
+    );
+    let client = AgentClient::new(
+        controller.clone(),
+        AgentSessionId::new("unattended-session"),
+    );
+    let handle = client
+        .start_with_run_id(RunId::new("unattended-run"), vec![Content::text("hello")])
+        .await
+        .unwrap();
+    let view = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        controller.wait_for_terminal(handle.run_id()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(view.state.status(), AgentRunStatus::Delivered);
+    assert!(view.pending_requests.is_empty());
+}
+
+#[tokio::test]
+async fn unattended_host_rejects_an_unsolicited_input_call_without_opening_a_request() {
+    struct UnsolicitedInputModel(InputRequestModel);
+
+    #[async_trait]
+    impl ModelBackend for UnsolicitedInputModel {
+        fn descriptor(&self) -> ModelDescriptor {
+            self.0.descriptor()
+        }
+
+        async fn start(
+            &self,
+            mut request: ModelRequest,
+            cancellation: CancellationToken,
+        ) -> Result<ModelStream, ModelError> {
+            assert!(!request
+                .tools
+                .iter()
+                .any(|tool| tool.name == "orchestral_request_input"));
+            // Reuse the scripted response generator to simulate a backend that
+            // emits a call despite its absence from the Host's definitions.
+            request.tools.push(ModelToolDefinition {
+                name: "orchestral_request_input".to_owned(),
+                description: "fixture for an unsolicited model call".to_owned(),
+                input_schema: json!({"type": "object"}),
+            });
+            self.0.start(request, cancellation).await
+        }
+    }
+
+    let mut config = GenericAgentConfig::new("internal-provider", "generic-agent");
+    config.input_requests_enabled = false;
+    let provider = Arc::new(
+        InternalGenericAgentProvider::new(
+            Arc::new(UnsolicitedInputModel(InputRequestModel {
+                rounds: AtomicUsize::new(0),
+            })),
+            config,
+        )
+        .unwrap(),
+    );
+    let controller = Arc::new(
+        AgentController::new(provider, ProviderBindingRef::new("unsolicited-binding")).unwrap(),
+    );
+    let client = AgentClient::new(
+        controller.clone(),
+        AgentSessionId::new("unsolicited-session"),
+    );
+    let handle = client
+        .start_with_run_id(
+            RunId::new("unsolicited-run"),
+            vec![Content::text("finish unattended")],
+        )
+        .await
+        .unwrap();
+    let view = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        controller.wait_for_terminal(handle.run_id()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(view.state.status(), AgentRunStatus::Failed);
+    assert!(view.pending_requests.is_empty());
+    assert!(!handle
+        .events(0)
+        .await
+        .unwrap()
+        .iter()
+        .any(|record| matches!(record.event.payload, AgentEvent::RequestOpened { .. })));
+}
+
+#[tokio::test]
 async fn generic_agent_executes_model_tools_only_through_the_guarded_runtime() {
     let run_id = RunId::new("tool-run");
     let checkpoint_store = Arc::new(InMemoryGenericAgentCheckpointStore::default());
