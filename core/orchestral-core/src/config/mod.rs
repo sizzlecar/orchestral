@@ -87,6 +87,9 @@ fn default_environment() -> String {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
+    /// Whether the Host can answer model-requested questions during a Run.
+    #[serde(default = "default_true")]
+    pub input_requests_enabled: bool,
     #[serde(default)]
     pub project_instructions: crate::project_instructions::ProjectInstructionsConfig,
     #[serde(default)]
@@ -122,6 +125,7 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
+            input_requests_enabled: true,
             project_instructions: Default::default(),
             model_retry: Default::default(),
             backend: None,

@@ -276,7 +276,8 @@ impl InternalGenericAgentProvider {
             policy.validate()?;
         }
         let has_tools = tools.is_some();
-        let has_input_requests = model_descriptor.capabilities.tool_calls;
+        let has_input_requests =
+            config.input_requests_enabled && model_descriptor.capabilities.tool_calls;
         let has_approval = tools
             .as_ref()
             .and_then(|tools| tools.approval_bridge.as_ref())

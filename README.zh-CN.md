@@ -319,6 +319,11 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 ## 编码任务评测
 
+[Harbor 适配器](testing/orchestral-harbor/README.md) 可在独立 Docker 容器中运行原生 CLI，
+使用标准终端任务及其官方验收脚本。先运行参考答案校验环境，再调用模型；小规模任务集
+用于验证接入，不代表完整榜单成绩。无人值守的 Host 可设置
+`agent.input_requests_enabled: false`，同时关闭输入请求能力和对应工具。
+
 `orchestral-coding-eval` 提供 20 个基于固定版本 Orchestral 源码的可控修复任务。
 题目通过注入回归构造，不冒充真实历史 issue 或跨仓库基准。覆盖重试策略、项目规则、
 Unicode 编辑、交互、文件修改，以及两项分两次启动 CLI 的续聊任务；本版不覆盖功能开发、
