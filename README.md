@@ -299,6 +299,14 @@ limits, exact approval, and effect journal. Ambient environment is not inherited
 network access is disabled by default. MCP stdio launch identities remain explicitly configured by
 the Host. Model-visible arguments cannot expand any of these permissions.
 
+Process waits support `wait_mode: "completion"` to collect output until exit or the observation
+deadline, and `wait_mode: "output"` to return after a short pause in output. Non-TTY commands
+default to completion mode with an initial 10-second window; empty non-TTY `write_stdin` polls
+default to 30 seconds. TTY sessions and input writes default to output mode. `yield_time_ms`
+overrides the window within the Host execution limit; reaching that window leaves the process
+running and returns its session ID. New Steer input can yield either wait without stopping or
+replaying the process, so the Agent can consider the instruction alongside the collected output.
+
 With `skills.auto_discover: true`, the CLI discovers `SKILL.md` packages under workspace
 `.claude/skills`, `.codex/skills`, and `skills`, plus any explicit `skills.directories`. Only Skill
 descriptors enter initial Context; `skill_read` loads the selected instructions, and relative

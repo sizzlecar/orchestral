@@ -777,6 +777,62 @@ async fn guarded_unified_surface_executes_children_and_continues_one_tty_session
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
+async fn completion_observation_respects_the_host_deadline_without_losing_the_session() {
+    let parent =
+        std::env::temp_dir().join(format!("orchestral-wait-bound-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&parent).unwrap();
+    let workspace = std::fs::canonicalize(&parent).unwrap();
+    let shell = std::fs::canonicalize("/bin/sh").unwrap();
+    let bounds = bounds(&workspace, &shell);
+    let runtime =
+        runtime(bounds.clone()).with_permission_policy(Arc::new(WorkspacePermissionPolicy));
+    let manager = Arc::new(ProcessSupervisor::new(16 * 1024).unwrap());
+    runtime
+        .register(
+            workspace_write_stdin_descriptor(ToolRestriction {
+                bounds: bounds.clone(),
+            }),
+            Arc::new(GuardedWriteStdinExecutor::new(manager.clone())),
+        )
+        .unwrap();
+    let run = RunId::new("wait-bound-run");
+    let session = manager
+        .spawn(ExecSpawnSpec {
+            run_id: run.clone(),
+            program: shell.to_string_lossy().into_owned(),
+            args: vec!["-c".into(), "printf waiting; /bin/sleep 5".into()],
+            cwd: workspace,
+            environment: BTreeMap::new(),
+            tty: false,
+            backend_starts_new_session: false,
+            operation: test_operation("bounded observation"),
+        })
+        .await
+        .unwrap();
+    let result = runtime
+        .invoke(
+            invocation(
+                run.as_str(),
+                "poll",
+                "orchestral/write_stdin/v1",
+                json!({"session_id": session.get()}),
+            ),
+            RunToolGrant { bounds },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    // Always reap the test's command before asserting the result.
+    let still_running = manager.list(&run).unwrap();
+    manager.close_run(&run).await.unwrap();
+    std::fs::remove_dir_all(parent).unwrap();
+    let output = inline_output(result);
+    assert_eq!(output["alive"], true);
+    assert_eq!(still_running, [session]);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
 async fn workspace_auto_run_confines_reads_and_mutations_to_the_real_sandbox() {
     use std::os::unix::fs::PermissionsExt;
 
