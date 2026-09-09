@@ -26,6 +26,7 @@ members = [
     # Protocol conformance (external-consumer boundary)
     "testing/orchestral-agent-protocol-testkit",
     "testing/orchestral-model-protocol-testkit",
+    "testing/orchestral-coding-eval",
 ]
 
 [workspace.package]

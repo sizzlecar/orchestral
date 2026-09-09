@@ -1,0 +1,15 @@
+{
+  "name": "orchestral",
+  "model": "google/gemini-3.1-pro-preview",
+  "argv": [
+    "orchestral",
+    "--config", "{config}",
+    "--backend", "google",
+    "--model", "gemini-3.1-pro-preview",
+    "--temperature", "0",
+    "--session-id", "{session_id}",
+    "--no-mcp",
+    "--no-skills",
+    "{prompt}"
+  ]
+}
