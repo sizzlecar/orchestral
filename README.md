@@ -384,6 +384,52 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
+## Coding task evaluation
+
+`orchestral-coding-eval` runs 20 controlled repair tasks against pinned Orchestral source.
+These are seeded regressions in a real repository, not historical issue or cross-repository
+benchmarks. Tasks cover retry policy, project instructions, Unicode editing, interaction,
+file mutation, and two conversations continued in a fresh CLI process. This first suite does
+not measure feature development, forced compaction, or recovery from a killed active Run.
+
+```bash
+cargo run -p orchestral-coding-eval -- list
+cargo run -p orchestral-coding-eval -- validate --repo .
+```
+
+Validation makes no model calls: the reference must pass and the seeded version must fail a
+named assertion. Agent grading uses a separate checkout with fixed tests and checks protected
+files, existing uncommitted work, and unauthorized staging/commits. A zero-test selection,
+compiler error, or an Agent claiming success cannot satisfy verification. The verifier runs
+candidate Rust code locally; this is a correctness harness, not isolation for hostile code.
+
+For actual model runs, copy and configure
+[`orchestral.example.json`](testing/orchestral-coding-eval/agents/orchestral.example.json), including
+the executable path, provider/model, and credentials through the provider's usual environment
+or an explicit `--credential-file` argument. `{prompt}`, `{workspace}`, `{config}`, and
+`{session_id}` are substituted as literal argv values; no shell interpolation is used.
+Other agents can supply their own invocation file; those adapters are not prevalidated.
+The generated Orchestral config allows 32 model steps and 96 tool calls per Run. Agent turns
+default to a 300-second deadline (`--timeout-secs`); each verification command gets 600 seconds
+(`--verify-timeout-secs`). The generated config and binary/config digests accompany the report.
+
+```bash
+# Explicitly invokes the configured model and may incur provider charges.
+cargo run -p orchestral-coding-eval -- run --repo . \
+  --agent-config /absolute/path/eval-agent.json \
+  --task retry-backoff-cap --repetitions 1
+# Omit --task for all 20 tasks; the default is 3 repetitions per task.
+```
+
+JSON reports, prompts, patches, process logs and available session journals go to a fresh OS
+temporary directory, or `--output PATH`. Validation and actual Agent results are separate;
+unrun attempts, timeouts, constraints and infrastructure errors remain visible. Repairs
+are independently checked even after an Agent error or timeout; those attempts still
+fail the overall completion criterion. Reported
+committed-request token usage is deduplicated; unmeasured cost and human corrections are
+`null`. Workspaces/build outputs are removed after use unless `--keep-workspaces` is selected
+for candidate workspaces. Reports and acceptance records are local artifacts, not source files.
+
 ## Current boundaries
 
 - This is not yet a Goal Compiler, Task Broker, or multi-Agent scheduler.

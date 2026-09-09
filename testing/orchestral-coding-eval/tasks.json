@@ -1,0 +1,489 @@
+{
+  "version": 1,
+  "base_commit": "3cef7ef8abb644cb7ff9a8eaaaf7f14a0569a907",
+  "description": "Twenty seeded regressions in pinned Orchestral production code. This is a controlled repository repair suite, not historical issue or cross-repository coverage. Two tasks span separate CLI processes with an inspect-only first turn.",
+  "tasks": [
+    {
+      "id": "retry-backoff-cap",
+      "category": "model-policy",
+      "prompt": "Retry delays keep growing beyond the configured maximum. Restore bounded exponential backoff, including exhausted and disabled retry budgets.",
+      "inspect_first": false,
+      "mutations": [
+        {
+          "path": "core/orchestral-core/src/model_retry.rs",
+          "before": ".min(self.max_delay_ms)",
+          "after": ".min(u64::MAX)"
+        }
+      ],
+      "checks": [
+        {
+          "package": "orchestral-core",
+          "target": "lib",
+          "filter": "model_retry::tests",
+          "expected_tests": [
+            "model_retry::tests::retry_policy_is_bounded_and_only_accepts_transient_errors",
+            "model_retry::tests::invalid_delay_configuration_is_rejected"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "retry-error-classification",
+      "category": "model-policy",
+      "prompt": "The retry policy retries permanent authentication failures and fails to retry temporary unavailability. Fix classification without making all errors retryable.",
+      "inspect_first": false,
+      "mutations": [
+        {
+          "path": "core/orchestral-core/src/model_retry.rs",
+          "before": "ModelErrorCode::RateLimited | ModelErrorCode::Unavailable",
+          "after": "ModelErrorCode::RateLimited | ModelErrorCode::Authentication"
+        }
+      ],
+      "checks": [
+        {
+          "package": "orchestral-core",
+          "target": "lib",
+          "filter": "model_retry::tests",
+          "expected_tests": [
+            "model_retry::tests::retry_policy_is_bounded_and_only_accepts_transient_errors",
+            "model_retry::tests::invalid_delay_configuration_is_rejected"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "retry-invalid-configuration",
+      "category": "model-policy",
+      "prompt": "A zero base delay is accepted even though retry delays must be positive and bounded. Restore configuration validation.",
+      "inspect_first": false,
+      "mutations": [
+        {
+          "path": "core/orchestral-core/src/model_retry.rs",
+          "before": "self.base_delay_ms == 0",
+          "after": "self.base_delay_ms == u64::MAX"
+        }
+      ],
+      "checks": [
+        {
+          "package": "orchestral-core",
+          "target": "lib",
+          "filter": "model_retry::tests",
+          "expected_tests": [
+            "model_retry::tests::retry_policy_is_bounded_and_only_accepts_transient_errors",
+            "model_retry::tests::invalid_delay_configuration_is_rejected"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "instructions-path-validation",
+      "category": "instructions",
+      "prompt": "Project instruction fallback names containing a drive prefix are accepted. Reject path-like fallback names while preserving ordinary filenames.",
+      "inspect_first": false,
+      "mutations": [
+        {
+          "path": "core/orchestral-core/src/project_instructions.rs",
+          "before": "\n                || name.contains(':')",
+          "after": ""
+        }
+      ],
+      "checks": [
+        {
+          "package": "orchestral-project-instructions-fs",
+          "target": "test:discovery",
+          "filter": "fallback_names_cannot_escape_the_instruction_directory",
+          "expected_tests": [
+            "fallback_names_cannot_escape_the_instruction_directory"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "instructions-worktree-boundary",
+      "category": "instructions",
+      "prompt": "Instruction discovery loses ancestor rules in Git worktrees whose .git entry is a file. Respect both Git directories and worktree pointers without importing rules above the project.",
+      "inspect_first": false,
+      "mutations": [
+        {
+          "path": "plugins/orchestral-project-instructions-fs/src/lib.rs",
+          "before": "directory.join(\".git\").exists()",
+          "after": "directory.join(\".git\").is_dir()"
+        }
+      ],
+      "checks": [
+        {
+          "package": "orchestral-project-instructions-fs",
+          "target": "test:discovery",
+          "filter": "gitfile_boundary_excludes_parent_rules_and_empty_override_falls_back",
+          "expected_tests": [
+            "gitfile_boundary_excludes_parent_rules_and_empty_override_falls_back"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "instructions-non-git-scope",
+      "category": "instructions",
+      "prompt": "Opening a non-Git scratch directory unexpectedly imports instructions from its parent. Keep non-Git discovery scoped to the selected directory.",
+      "inspect_first": false,
+      "mutations": [
+        {
+          "path": "plugins/orchestral-project-instructions-fs/src/lib.rs",
+          "before": ".unwrap_or(&workspace)",
+          "after": ".unwrap_or_else(|| workspace.parent().unwrap_or(&workspace))"
+        }
+      ],
+      "checks": [
+        {
+          "package": "orchestral-project-instructions-fs",
+          "target": "test:discovery",
+          "filter": "non_git_workspace_does_not_inherit_unrelated_parent_instructions",
+          "expected_tests": [
+            "non_git_workspace_does_not_inherit_unrelated_parent_instructions"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "instructions-empty-override",
+      "category": "instructions",
+      "prompt": "Whitespace-only override documents suppress usable project instructions. Make discovery fall back to the next nonempty source.",
+      "inspect_first": false,
+      "mutations": [
+        {
+          "path": "plugins/orchestral-project-instructions-fs/src/lib.rs",
+          "before": "if content.trim().is_empty()",
+          "after": "if content.is_empty()"
+        }
+      ],
+      "checks": [
+        {
+          "package": "orchestral-project-instructions-fs",
+          "target": "test:discovery",
+          "filter": "gitfile_boundary_excludes_parent_rules_and_empty_override_falls_back",
+          "expected_tests": [
+            "gitfile_boundary_excludes_parent_rules_and_empty_override_falls_back"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "instructions-overlap-dedup",
+      "category": "instructions",
+      "prompt": "Overlapping selected workspaces load the same instruction sources repeatedly. Deduplicate sources and preserve ancestor-first ordering independently of selection order.",
+      "inspect_first": false,
+      "mutations": [
+        {
+          "path": "plugins/orchestral-project-instructions-fs/src/lib.rs",
+          "before": "use std::collections::BTreeSet;\n",
+          "after": ""
+        },
+        {
+          "path": "plugins/orchestral-project-instructions-fs/src/lib.rs",
+          "before": "let mut directories = BTreeSet::new();",
+          "after": "let mut directories = Vec::new();"
+        },
+        {
+          "path": "plugins/orchestral-project-instructions-fs/src/lib.rs",
+          "before": "directories.insert(directory.to_path_buf());",
+          "after": "directories.push(directory.to_path_buf());"
+        }
+      ],
+      "checks": [
+        {
+          "package": "orchestral-project-instructions-fs",
+          "target": "test:coding_eval_contract",
+          "filter": "",
+          "expected_tests": [
+            "overlapping_workspaces_load_each_source_once",
+            "aggregate_instruction_bytes_are_bounded",
+            "zero_instruction_budget_is_invalid"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "editor-grapheme-backspace",
+      "category": "unicode-editing",
+      "prompt": "Backspace can leave pieces of a combining character, flag, or emoji in the composer. Delete a complete displayed grapheme and keep the cursor valid.",
+      "inspect_first": false,
+      "mutations": [
+        {
+          "path": "apps/orchestral-cli/src/tui/editor.rs",
+          "before": ".grapheme_indices(true)\n            .next_back()",
+          "after": ".char_indices()\n            .next_back()"
+        }
+      ],
+      "checks": [
+        {
+          "package": "orchestral-cli",
+          "target": "lib",
+          "filter": "tui::editor::tests",
+          "expected_tests": [
+            "tui::editor::tests::edits_combining_marks_and_emoji_as_complete_graphemes"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "editor-grapheme-forward",
+      "category": "unicode-editing",
+      "prompt": "Forward deletion and right-arrow movement split multi-code-point graphemes. Preserve complete graphemes when moving or deleting forward.",
+      "inspect_first": false,
+      "mutations": [
+        {
+          "path": "apps/orchestral-cli/src/tui/editor.rs",
+          "before": "text[old..].graphemes(true).next().map_or(0, str::len)",
+          "after": "text[old..].chars().next().map_or(0, char::len_utf8)"
+        }
+      ],
+      "checks": [
+        {
+          "package": "orchestral-cli",
+          "target": "lib",
+          "filter": "tui::editor::tests",
+          "expected_tests": [
+            "tui::editor::tests::edits_combining_marks_and_emoji_as_complete_graphemes"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "editor-line-local-delete",
+      "category": "unicode-editing",
+      "prompt": "Deleting to the beginning of the current line also removes earlier lines. Keep line editing local to the current logical line.",
+      "inspect_first": false,
+      "mutations": [
+        {
+          "path": "apps/orchestral-cli/src/tui/editor.rs",
+          "before": "let start = || text[..old].rfind('\\n').map_or(0, |i| i + 1);",
+          "after": "let start = || 0;"
+        }
+      ],
+      "checks": [
+        {
+          "package": "orchestral-cli",
+          "target": "lib",
+          "filter": "tui::editor::tests",
+          "expected_tests": [
+            "tui::editor::tests::line_and_word_edits_preserve_other_lines"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "editor-display-column",
+      "category": "unicode-editing",
+      "prompt": "Moving vertically between lines containing CJK and emoji changes the intended display column. Use rendered width while keeping UTF-8 cursor boundaries.",
+      "inspect_first": false,
+      "mutations": [
+        {
+          "path": "apps/orchestral-cli/src/tui/editor.rs",
+          "before": "let column = text[start..*cursor].width();",
+          "after": "let column = text[start..*cursor].chars().count();"
+        }
+      ],
+      "checks": [
+        {
+          "package": "orchestral-cli",
+          "target": "lib",
+          "filter": "tui::editor::tests",
+          "expected_tests": [
+            "tui::editor::tests::vertical_motion_uses_display_columns_and_history_restores_draft"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "history-draft-cursor",
+      "category": "interaction",
+      "prompt": "Returning from input history restores the draft text but loses its cursor position. Restore both text and cursor together.",
+      "inspect_first": false,
+      "mutations": [
+        {
+          "path": "apps/orchestral-cli/src/tui/editor.rs",
+          "before": "*cursor = offset;",
+          "after": "*cursor = offset.saturating_sub(offset);"
+        }
+      ],
+      "checks": [
+        {
+          "package": "orchestral-cli",
+          "target": "lib",
+          "filter": "tui::editor::tests",
+          "expected_tests": [
+            "tui::editor::tests::vertical_motion_uses_display_columns_and_history_restores_draft"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "completion-match-ranking",
+      "category": "interaction",
+      "prompt": "File completion ranks a substring match ahead of a matching filename prefix. Restore prefix, substring, then fuzzy ordering with deterministic ties.",
+      "inspect_first": false,
+      "mutations": [
+        {
+          "path": "apps/orchestral-cli/src/tui/menu.rs",
+          "before": "return Some(0);",
+          "after": "return Some(value.len());"
+        }
+      ],
+      "checks": [
+        {
+          "package": "orchestral-cli",
+          "target": "lib",
+          "filter": "tui::menu::tests",
+          "expected_tests": [
+            "tui::menu::tests::prefix_and_exact_path_matches_precede_fuzzy_matches"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "transcript-reading-anchor",
+      "category": "interaction",
+      "prompt": "Reading history jumps to a different entry when earlier content grows or the terminal width changes. Keep the reading anchor tied to the same entry and content position.",
+      "inspect_first": false,
+      "mutations": [
+        {
+          "path": "apps/orchestral-cli/src/tui/viewport.rs",
+          "before": "row.anchor.entry == anchor.entry",
+          "after": "row.anchor.entry != anchor.entry"
+        }
+      ],
+      "checks": [
+        {
+          "package": "orchestral-cli",
+          "target": "lib",
+          "filter": "tui::viewport::tests",
+          "expected_tests": [
+            "tui::viewport::tests::anchor_survives_growth_above_and_below_and_width_changes"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "terminal-control-sanitization",
+      "category": "interaction",
+      "prompt": "Text containing ANSI control sequences can reach terminal presentation without sanitization. Keep plain Unicode text and intentional newlines/tabs while discarding terminal commands.",
+      "inspect_first": false,
+      "mutations": [
+        {
+          "path": "apps/orchestral-cli/src/tui/text.rs",
+          "before": "if !text\n        .chars()",
+          "after": "if text\n        .chars()"
+        }
+      ],
+      "checks": [
+        {
+          "package": "orchestral-cli",
+          "target": "lib",
+          "filter": "tui::text::tests",
+          "expected_tests": [
+            "tui::text::tests::control_sequences_cannot_clear_the_screen_or_change_the_clipboard"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "restored-draft-extra-enter",
+      "category": "session-continuity",
+      "prompt": "After answering a question, an extra Enter can submit a restored draft or execute a restored slash command. Require an editing or cursor action before that restored draft is submitted.",
+      "inspect_first": true,
+      "mutations": [
+        {
+          "path": "apps/orchestral-cli/src/tui/state.rs",
+          "before": "&& !state.composer.is_empty()\n        {",
+          "after": "&& state.composer.is_empty()\n        {"
+        }
+      ],
+      "checks": [
+        {
+          "package": "orchestral-cli",
+          "target": "lib",
+          "filter": "tui::regression",
+          "expected_tests": [
+            "tui::regression::submitted_answers_ignore_stale_requests_and_extra_enter_preserves_the_draft"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "approval-duplicate-submission",
+      "category": "interaction",
+      "prompt": "Repeated approval key presses can dispatch the same request more than once before journal confirmation. Suppress duplicate submissions while allowing an explicit retry after rejection.",
+      "inspect_first": false,
+      "mutations": [
+        {
+          "path": "apps/orchestral-cli/src/tui/state.rs",
+          "before": "if state.phase != UiPhase::WaitingApproval || state.request_submission_pending() {",
+          "after": "if state.phase != UiPhase::WaitingApproval {"
+        }
+      ],
+      "checks": [
+        {
+          "package": "orchestral-cli",
+          "target": "lib",
+          "filter": "tui::regression",
+          "expected_tests": [
+            "tui::regression::approvals_require_one_submission_and_a_rejection_allows_explicit_retry"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "patch-final-newline",
+      "category": "file-mutation",
+      "prompt": "Updating a file through apply_patch flips whether the file ends with a newline. Preserve the original final-newline convention across multiple hunks.",
+      "inspect_first": false,
+      "mutations": [
+        {
+          "path": "core/orchestral-runtime/src/action/builtin/patch_parser.rs",
+          "before": "if trailing_newline {",
+          "after": "if !trailing_newline {"
+        }
+      ],
+      "checks": [
+        {
+          "package": "orchestral-runtime",
+          "target": "lib",
+          "filter": "tools::builtin::patch_parser::tests",
+          "expected_tests": [
+            "tools::builtin::patch_parser::tests::applies_multiple_unique_hunks_and_preserves_final_newline"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "instruction-budget-contract",
+      "category": "cross-module",
+      "prompt": "Project instruction limits are enforced per document rather than across the full snapshot, and a zero budget is accepted. Restore the shared configuration contract and aggregate byte accounting in the filesystem adapter.",
+      "inspect_first": true,
+      "mutations": [
+        {
+          "path": "core/orchestral-core/src/project_instructions.rs",
+          "before": "if self.max_bytes == 0 || self.max_bytes == u64::MAX {",
+          "after": "if self.max_bytes == u64::MAX {"
+        },
+        {
+          "path": "plugins/orchestral-project-instructions-fs/src/lib.rs",
+          "before": "remaining -= content.len() as u64;",
+          "after": "remaining = self.config.max_bytes;"
+        }
+      ],
+      "checks": [
+        {
+          "package": "orchestral-project-instructions-fs",
+          "target": "test:coding_eval_contract",
+          "filter": "",
+          "expected_tests": [
+            "overlapping_workspaces_load_each_source_once",
+            "aggregate_instruction_bytes_are_bounded",
+            "zero_instruction_budget_is_invalid"
+          ]
+        }
+      ]
+    }
+  ]
+}

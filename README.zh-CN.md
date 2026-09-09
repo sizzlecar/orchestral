@@ -304,6 +304,46 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
+## 编码任务评测
+
+`orchestral-coding-eval` 提供 20 个基于固定版本 Orchestral 源码的可控修复任务。
+题目通过注入回归构造，不冒充真实历史 issue 或跨仓库基准。覆盖重试策略、项目规则、
+Unicode 编辑、交互、文件修改，以及两项分两次启动 CLI 的续聊任务；本版不覆盖功能开发、
+强制压缩或运行中被杀后的恢复。
+
+```bash
+cargo run -p orchestral-coding-eval -- list
+cargo run -p orchestral-coding-eval -- validate --repo .
+```
+
+`validate` 不调用模型：原版须通过、故障版须触发指定测试断言。实际评测在独立副本中使用
+固定测试判分，并检查受保护文件、用户未提交内容和未经允许的暂存/提交。零个测试、
+编译错误或 Agent 声称完成都不算通过。验证器会在本机执行候选 Rust 代码，因此这套工具
+用于正确性评测，不提供恶意代码隔离。
+
+实跑前复制并配置 [调用示例](testing/orchestral-coding-eval/agents/orchestral.example.json)，
+填写可执行文件、模型和对应凭据；凭据使用模型已有环境变量或显式 `--credential-file`。
+`{prompt}`、`{workspace}`、`{config}`、`{session_id}` 按 argv 字面量替换，不经过 shell。
+其他 Agent 可以提供自己的调用文件，但这些适配尚未经实测。
+生成的 Orchestral 配置为每个 Run 提供 32 次模型调用、96 次工具调用；每轮进程默认限时
+300 秒（`--timeout-secs`），每条验证命令限时 600 秒（`--verify-timeout-secs`）。
+配置文件及二进制、配置摘要随报告保留。
+
+```bash
+# 明确调用配置中的真实模型，可能产生模型费用。
+cargo run -p orchestral-coding-eval -- run --repo . \
+  --agent-config /absolute/path/eval-agent.json \
+  --task retry-backoff-cap --repetitions 1
+# 省略 --task 运行全部 20 项；默认每项重复 3 次。
+```
+
+JSON 结果、提示、补丁、进程日志和可用的会话日志默认保存在新的系统临时目录，也可指定
+`--output PATH`。题目校验与 Agent 成绩分别记录，未执行、超时、约束失败和基础设施错误
+不会被算成通过。已报告的持久请求用量按请求去重；未测费用和人工纠正次数保留为 `null`。
+Agent 报错或超时后仍会独立验证修复结果，但不会因此将未完成的任务计为成功。
+默认清理工作副本和构建产物，`--keep-workspaces` 可保留候选副本。评测结果和验收记录
+都是本地产物，不属于提交内容。
+
 ## 当前边界
 
 - 当前不是 Goal Compiler、Task Broker 或多 Agent Scheduler。
