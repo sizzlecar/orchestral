@@ -474,7 +474,10 @@ async fn copy_text(text: String) -> Result<()> {
         };
         let operation = async {
             let mut stdin = child.stdin.take().context("Clipboard input unavailable")?;
-            stdin.write_all(text.as_bytes()).await?;
+            stdin
+                .write_all(text.as_bytes())
+                .await
+                .context("Clipboard unavailable; select text in the terminal to copy it")?;
             drop(stdin);
             if !child.wait().await?.success() {
                 bail!("Clipboard unavailable; select text in the terminal to copy it")
