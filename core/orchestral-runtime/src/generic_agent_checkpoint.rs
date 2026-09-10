@@ -221,7 +221,7 @@ pub enum GenericCheckpointEvent {
         request_id: ModelRequestId,
         observation: GenericModelObservation,
     },
-    /// A retry within an open logical attempt, before any model event was
+    /// A retry within an open logical attempt, before any non-usage event was
     /// observed. Recovery still treats an open attempt as interrupted; this
     /// fact does not authorize replaying a model request after process loss.
     ModelRetryScheduled {
@@ -230,6 +230,10 @@ pub enum GenericCheckpointEvent {
         retry_number: u32,
         delay_ms: u64,
         error: orchestral_core::model_protocol::ModelError,
+        /// Last reported usage snapshot of the failed attempt. Missing fields
+        /// remain unknown; this does not certify the request's final cost.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observed_usage: Option<ModelUsage>,
     },
     /// Written before entering the Workflow DAG executor. Once present, a
     /// missing durable Workflow output is intentionally outcome-unknown and
@@ -261,6 +265,7 @@ impl GenericCheckpointEvent {
                 retry_number,
                 delay_ms,
                 error,
+                ..
             } => {
                 if *round == 0
                     || request_id.is_empty()
@@ -626,6 +631,7 @@ pub fn replay_generic_agent_checkpoint(
                 round,
                 request_id,
                 retry_number,
+                observed_usage,
                 ..
             } => {
                 if !matches!(&phase, GenericCheckpointPhase::ModelAttemptOpen {
@@ -639,6 +645,18 @@ pub fn replay_generic_agent_checkpoint(
                     ));
                 }
                 last_retry_number = *retry_number;
+                if let (Some(usage), GenericCheckpointPhase::ModelAttemptOpen { boundary, .. }) =
+                    (observed_usage, &mut phase)
+                {
+                    for (total, observed) in [
+                        (&mut boundary.usage.input_tokens, usage.input_tokens),
+                        (&mut boundary.usage.output_tokens, usage.output_tokens),
+                    ] {
+                        if let Some(observed) = observed {
+                            *total = Some(total.unwrap_or(0).saturating_add(observed));
+                        }
+                    }
+                }
             }
             GenericCheckpointEvent::LoopBoundaryCommitted {
                 next_model_round,
@@ -1094,8 +1112,25 @@ mod tests {
                 delay_ms: 1,
                 error: ModelError::new(ModelErrorCode::Unavailable, "temporary")
                     .with_retryable(true),
+                observed_usage: None,
             },
         };
+        // Omitting the new optional field preserves the serialized payload and
+        // digest of checkpoints written before usage-only retries existed.
+        let old_payload = serde_json::json!({
+            "type": "model_retry_scheduled",
+            "round": 1,
+            "request_id": "model-1",
+            "retry_number": 1,
+            "delay_ms": 1,
+            "error": {
+                "code": "unavailable", "message": "temporary",
+                "retryable": true, "details": null,
+            },
+        });
+        let decoded: GenericCheckpointEvent = serde_json::from_value(old_payload.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), old_payload);
+        assert_eq!(decoded, retry(1, "model-1").payload);
         assert!(store.append(&run_id, 1, retry(1, "model-1")).is_err());
         store
             .append(

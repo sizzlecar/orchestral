@@ -65,11 +65,11 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
         .config
         .continuation
         .effective_tool_calls(request.run.spec.limits.max_tool_calls);
-    let mut has_usage = total_usage.input_tokens.is_some() || total_usage.output_tokens.is_some();
-
     'model_rounds: for round in
         std::iter::successors(Some(next_model_round), |round| round.checked_add(1))
     {
+        let mut has_usage =
+            total_usage.input_tokens.is_some() || total_usage.output_tokens.is_some();
         if model_step_limit.is_some_and(|limit| round > limit) {
             emit_limit_reached(
                 &inner,
@@ -192,7 +192,7 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
             return;
         }
         let model_cancellation = cancellation.child_token();
-        let mut model_stream = match tokio::select! {
+        let started = match tokio::select! {
             _ = cancellation.cancelled() => {
                 emit_cancel(&inner, &request, &user_message);
                 return;
@@ -230,6 +230,7 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
             }
             result = super::model_retry::start_model_with_retry(
                 &inner, &request, round, &model_request, model_cancellation.clone(),
+                &mut total_usage,
             ) => result,
         } {
             Ok(stream) => stream,
@@ -243,9 +244,11 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
             }
         };
 
-        let mut expected_sequence = 1;
+        let mut model_stream = started.stream;
+        let mut expected_sequence = started.expected_sequence;
+        has_usage |= total_usage.input_tokens.is_some() || total_usage.output_tokens.is_some();
         let mut response = String::new();
-        let mut round_usage = None;
+        let mut round_usage = started.usage;
         let mut tool_calls = Vec::<PendingModelToolCall>::new();
         loop {
             let item = tokio::select! {

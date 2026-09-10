@@ -241,7 +241,7 @@ class Orchestral(BaseInstalledAgent):
         )
 
     def populate_context_post_run(self, context: AgentContext) -> None:
-        """Count committed model usage once per request, including on failure."""
+        """Count committed requests and recorded retry usage without duplicates."""
         observations = {}
         for path in sorted((self.logs_dir / "journal").glob("session-*.json")):
             for record in json.loads(path.read_text()):
@@ -253,11 +253,22 @@ class Orchestral(BaseInstalledAgent):
                     continue
                 key = (record["session_id"], record["run_id"], payload["request_id"])
                 observations.setdefault(key, payload.get("usage") or {})
+        retries = {}
+        for path in sorted((self.logs_dir / "journal").glob("generic-checkpoint-*.json")):
+            for record in json.loads(path.read_text()).get("records", []):
+                payload = record.get("payload", {})
+                if payload.get("type") != "model_retry_scheduled":
+                    continue
+                key = (record["run_id"], payload["request_id"], payload["retry_number"])
+                retries.setdefault(key, payload.get("observed_usage") or {})
         for field, target in (
             ("input_tokens", "n_input_tokens"),
             ("output_tokens", "n_output_tokens"),
         ):
-            values = [usage.get(field) for usage in observations.values()]
+            values = [
+                usage.get(field)
+                for usage in (*observations.values(), *retries.values())
+            ]
             if values and all(
                 isinstance(value, int) and not isinstance(value, bool)
                 for value in values
@@ -266,6 +277,8 @@ class Orchestral(BaseInstalledAgent):
         context.metadata = {
             **(context.metadata or {}),
             "binary_sha256": self.binary_digest,
-            "usage_scope": "committed model requests",
-            "model_requests": len(observations),
+            "usage_scope": "committed model requests and recorded retry attempts",
+            "model_requests": len(observations) + len(retries),
+            "committed_model_requests": len(observations),
+            "retried_model_requests": len(retries),
         }

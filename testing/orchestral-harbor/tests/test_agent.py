@@ -140,6 +140,38 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(forwarded[name], value)
         self.assertNotIn("UNRELATED_SECRET", forwarded)
 
+    def test_retry_usage_is_counted_once_and_missing_usage_stays_unknown(self):
+        journal = self.agent.logs_dir / "journal"
+        journal.mkdir(parents=True)
+        (journal / "session-one.json").write_text(json.dumps([{
+            "session_id": "session", "run_id": "run",
+            "payload": {"type": "run_output_committed", "request_id": "request",
+                        "usage": {"input_tokens": 10, "output_tokens": 3}},
+        }]))
+        retry = {
+            "run_id": "run",
+            "payload": {"type": "model_retry_scheduled", "request_id": "request",
+                        "retry_number": 1,
+                        "observed_usage": {"input_tokens": 5, "output_tokens": 2}},
+        }
+        path = journal / "generic-checkpoint-one.json"
+        path.write_text(json.dumps({"records": [retry, retry]}))
+        context = AgentContext()
+        self.agent.populate_context_post_run(context)
+        self.assertEqual(context.n_input_tokens, 15)
+        self.assertEqual(context.n_output_tokens, 5)
+        self.assertEqual(context.metadata["model_requests"], 2)
+        self.assertEqual(context.metadata["retried_model_requests"], 1)
+
+        # Older checkpoints and transport failures may have no usage evidence.
+        retry["payload"].pop("observed_usage")
+        path.write_text(json.dumps({"records": [retry]}))
+        context = AgentContext()
+        self.agent.populate_context_post_run(context)
+        self.assertIsNone(context.n_input_tokens)
+        self.assertIsNone(context.n_output_tokens)
+        self.assertEqual(context.metadata["model_requests"], 2)
+
     def test_usage_deduplicates_tool_batches_and_preserves_unknown_fields(self):
         journal = self.root / "logs/journal"
         journal.mkdir(parents=True)
