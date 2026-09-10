@@ -1,3 +1,4 @@
+import asyncio
 import json
 import shlex
 import subprocess
@@ -123,6 +124,31 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         context = AgentContext()
         await self.agent.run("do the work", environment, context)
         self.assertTrue(context.is_empty())
+
+    async def test_cancel_finishes_process_cleanup_before_propagating_to_harbor(self):
+        environment = AsyncMock()
+        running = asyncio.Event()
+        stopped = asyncio.Event()
+
+        async def execute(**kwargs):
+            if 'orchestral-launch' in kwargs['command']:
+                running.set()
+                await asyncio.Future()
+            stopped.set()
+            result = AsyncMock()
+            result.return_code = 0
+            return result
+
+        environment.exec.side_effect = execute
+        context = AgentContext()
+        run = asyncio.create_task(self.agent.run('do the work', environment, context))
+        await running.wait()
+        run.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await run
+        self.assertTrue(stopped.is_set())
+        self.assertTrue(context.is_empty())
+        self.assertEqual(environment.exec.await_count, 2)
 
     async def test_run_passes_proxy_settings_without_unrelated_environment(self):
         settings = {
