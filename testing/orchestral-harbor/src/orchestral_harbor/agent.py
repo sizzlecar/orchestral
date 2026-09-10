@@ -1,17 +1,21 @@
 """Native CLI adapter; Harbor alone supplies tasks, deadlines and verification."""
 
+import asyncio
 import hashlib
 import json
 import shlex
 import tempfile
 from pathlib import Path, PurePosixPath
 from typing import ClassVar
+from uuid import uuid4
 
 import yaml
 from harbor.agents.installed.base import BaseInstalledAgent
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 from harbor.models.environment_type import EnvironmentType
+
+from .process import ContainerProcess
 
 
 class Orchestral(BaseInstalledAgent):
@@ -187,7 +191,9 @@ class Orchestral(BaseInstalledAgent):
             + "\n"
         )
 
-    def command(self, instruction: str) -> str:
+    def command(
+        self, instruction: str, process: ContainerProcess | None = None
+    ) -> str:
         args = [
             str(self.ROOT / "orchestral"),
             "--config",
@@ -198,9 +204,10 @@ class Orchestral(BaseInstalledAgent):
         if self.credential_file:
             args += ["--credential-file", str(self.ROOT / "credential.json")]
         args += ["--", instruction]
+        launch = process.launch(args) if process else shlex.join(args)
         stderr = shlex.quote(str(self.environment_logs_dir / "stderr.txt"))
         return (
-            f"{shlex.join(args)} < {self.ROOT}/approvals "
+            f"{launch} < {shlex.quote(str(self.ROOT / 'approvals'))} "
             f"> {shlex.quote(str(self.environment_logs_dir / 'stdout.txt'))} "
             f"2> {stderr}; orchestral_exit=$?; "
             f'if [ "$orchestral_exit" -ne 0 ]; then tail -c 8192 {stderr} >&2; fi; '
@@ -236,9 +243,16 @@ class Orchestral(BaseInstalledAgent):
         # Use the environment's declared cwd; do not inherit the host repository.
         # Harbor 0.22 only backfills empty contexts after downloading logs.
         # Leave this empty so usage is populated on both success and timeout.
-        await self.exec_as_agent(
-            environment, self.command(instruction), env=self.provider_env()
-        )
+        process = ContainerProcess(self.ROOT / "runs" / uuid4().hex)
+        try:
+            await self.exec_as_agent(
+                environment,
+                self.command(instruction, process),
+                env=self.provider_env(),
+            )
+        except asyncio.CancelledError:
+            await process.cancel(environment)
+            raise
 
     def populate_context_post_run(self, context: AgentContext) -> None:
         """Count committed requests and recorded retry usage without duplicates."""
