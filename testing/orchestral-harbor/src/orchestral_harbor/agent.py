@@ -243,7 +243,9 @@ class Orchestral(BaseInstalledAgent):
         # Use the environment's declared cwd; do not inherit the host repository.
         # Harbor 0.22 only backfills empty contexts after downloading logs.
         # Leave this empty so usage is populated on both success and timeout.
-        process = ContainerProcess(self.ROOT / "runs" / uuid4().hex)
+        # The installed executable can be root-owned and read-only to a task's
+        # agent user. Harbor already grants that user access to its log area.
+        process = ContainerProcess(self.environment_logs_dir / "processes" / uuid4().hex)
         try:
             await self.exec_as_agent(
                 environment,

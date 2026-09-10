@@ -8,6 +8,8 @@ from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from harbor.models.agent.context import AgentContext
+from orchestral_harbor import Orchestral
 from orchestral_harbor.process import ContainerProcess
 
 
@@ -115,6 +117,45 @@ class ContainerProcessTests(unittest.IsolatedAsyncioTestCase):
         after = self.heartbeat.read_text()
         await asyncio.sleep(0.1)
         self.assertEqual(after, self.heartbeat.read_text())
+
+    @unittest.skipIf(os.geteuid() == 0, 'Requires a user subject to directory permissions')
+    async def test_agent_can_cancel_from_a_read_only_installation(self):
+        installed = self.root / 'installed'
+        installed.mkdir()
+        launcher = installed / 'orchestral'
+        import shlex
+        launcher.write_text('#!/bin/sh\nexec ' + shlex.join([
+            'python3', str(self.child), str(self.heartbeat),
+        ]) + '\n')
+        launcher.chmod(0o755)
+        (installed / 'approvals').write_text('y\n')
+        logs = self.root / 'logs'
+        logs.mkdir()
+        agent = Orchestral(
+            logs_dir=logs, binary_path='/bin/true', model_name='google/test-model',
+        )
+        agent.ROOT = PurePosixPath(installed)
+        agent.environment_logs_dir = PurePosixPath(logs)
+        installed.chmod(0o555)
+        self.addCleanup(installed.chmod, 0o755)
+        run = asyncio.create_task(agent.run('work', self.environment, AgentContext()))
+        try:
+            async with asyncio.timeout(5):
+                while not self.heartbeat.exists():
+                    if run.done():
+                        await run
+                        self.fail('Agent exited before starting')
+                    await asyncio.sleep(0.01)
+            run.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await run
+            after = self.heartbeat.read_text()
+            await asyncio.sleep(0.1)
+            self.assertEqual(after, self.heartbeat.read_text())
+        finally:
+            if not run.done():
+                run.cancel()
+            await asyncio.gather(run, return_exceptions=True)
 
     async def test_launch_preserves_literal_arguments_and_exit_status(self):
         payload = f"$(touch {self.root / 'injected'}); 'quoted'\n`echo bad`"
