@@ -15,7 +15,7 @@ use orchestral_core::agent_protocol::{
 };
 use orchestral_core::model_protocol::{
     ModelBackend, ModelDescriptor, ModelError, ModelErrorCode, ModelEvent, ModelEventId,
-    ModelFinishReason, ModelRequest, ModelStream, ModelStreamEvent, ModelUsage,
+    ModelFinishReason, ModelRequest, ModelStream, ModelStreamEvent, ModelToolCallId, ModelUsage,
 };
 use orchestral_core::project_instructions::ProjectInstruction;
 use orchestral_runtime::{
@@ -30,12 +30,18 @@ enum FailurePoint {
     EmptyStream,
     BeforeFirstEvent,
     AfterUsage,
+    AfterUsageUpdates,
+    AfterText,
+    AfterToolStart,
+    InvalidUsageSequence,
+    InvalidUsageRequest,
 }
 
 struct RetryModel {
     calls: AtomicUsize,
     point: FailurePoint,
     code: ModelErrorCode,
+    failures: usize,
 }
 
 #[async_trait]
@@ -54,7 +60,7 @@ impl ModelBackend for RetryModel {
         _: CancellationToken,
     ) -> Result<ModelStream, ModelError> {
         let error = ModelError::new(self.code.clone(), "transient failure").with_retryable(true);
-        let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+        let first = self.calls.fetch_add(1, Ordering::SeqCst) < self.failures;
         let event = |sequence, payload| {
             Ok(ModelStreamEvent {
                 request_id: request.request_id.clone(),
@@ -83,22 +89,86 @@ impl ModelBackend for RetryModel {
                     ])
                     .boxed())
                 }
+                FailurePoint::AfterUsageUpdates => {
+                    return Ok(stream::iter([
+                        event(
+                            1,
+                            ModelEvent::Usage {
+                                usage: ModelUsage {
+                                    input_tokens: Some(1),
+                                    output_tokens: Some(1),
+                                },
+                            },
+                        ),
+                        event(
+                            2,
+                            ModelEvent::Usage {
+                                usage: ModelUsage {
+                                    input_tokens: Some(4),
+                                    output_tokens: Some(5),
+                                },
+                            },
+                        ),
+                        Err(error),
+                    ])
+                    .boxed())
+                }
+                FailurePoint::AfterText | FailurePoint::AfterToolStart => {
+                    let payload = if matches!(self.point, FailurePoint::AfterText) {
+                        ModelEvent::TextDelta {
+                            delta: "partial".to_owned(),
+                        }
+                    } else {
+                        ModelEvent::ToolCallStart {
+                            call_id: ModelToolCallId::new("call"),
+                            name: "tool".to_owned(),
+                            extensions: Default::default(),
+                        }
+                    };
+                    return Ok(stream::iter([
+                        event(
+                            1,
+                            ModelEvent::Usage {
+                                usage: ModelUsage::default(),
+                            },
+                        ),
+                        event(2, payload),
+                        Err(error),
+                    ])
+                    .boxed());
+                }
+                FailurePoint::InvalidUsageSequence | FailurePoint::InvalidUsageRequest => {
+                    let mut invalid = event(
+                        1,
+                        ModelEvent::Usage {
+                            usage: ModelUsage::default(),
+                        },
+                    )
+                    .unwrap();
+                    if matches!(self.point, FailurePoint::InvalidUsageSequence) {
+                        invalid.sequence = 2;
+                    } else {
+                        invalid.request_id =
+                            orchestral_core::model_protocol::ModelRequestId::new("wrong");
+                    }
+                    return Ok(stream::iter([Ok(invalid), Err(error)]).boxed());
+                }
             }
         }
         Ok(stream::iter([
             event(
                 1,
-                ModelEvent::TextDelta {
-                    delta: "done".to_owned(),
+                ModelEvent::Usage {
+                    usage: ModelUsage {
+                        input_tokens: Some(2),
+                        output_tokens: Some(3),
+                    },
                 },
             ),
             event(
                 2,
-                ModelEvent::Usage {
-                    usage: ModelUsage {
-                        input_tokens: Some(1),
-                        output_tokens: Some(1),
-                    },
+                ModelEvent::TextDelta {
+                    delta: "done".to_owned(),
                 },
             ),
             event(
@@ -130,17 +200,23 @@ fn run() -> AgentRunEnvelope {
 }
 
 #[tokio::test]
-async fn retries_start_and_empty_stream_failures_but_stops_after_usage_is_observed() {
+async fn retries_usage_only_failures_but_never_replays_content_or_invalid_events() {
     for point in [
         FailurePoint::Start,
         FailurePoint::EmptyStream,
         FailurePoint::BeforeFirstEvent,
         FailurePoint::AfterUsage,
+        FailurePoint::AfterUsageUpdates,
+        FailurePoint::AfterText,
+        FailurePoint::AfterToolStart,
+        FailurePoint::InvalidUsageSequence,
+        FailurePoint::InvalidUsageRequest,
     ] {
         let model = Arc::new(RetryModel {
             calls: AtomicUsize::new(0),
             point,
             code: ModelErrorCode::Unavailable,
+            failures: 1,
         });
         let provider =
             Arc::new(InternalGenericAgentProvider::new(model.clone(), config()).unwrap());
@@ -154,13 +230,116 @@ async fn retries_start_and_empty_stream_failures_but_stops_after_usage_is_observ
         .await
         .unwrap()
         .unwrap();
-        if matches!(point, FailurePoint::AfterUsage) {
+        if matches!(
+            point,
+            FailurePoint::AfterText
+                | FailurePoint::AfterToolStart
+                | FailurePoint::InvalidUsageSequence
+                | FailurePoint::InvalidUsageRequest
+        ) {
             assert_eq!(view.state.status(), AgentRunStatus::Failed);
             assert_eq!(model.calls.load(Ordering::SeqCst), 1);
         } else {
             assert_eq!(view.state.status(), AgentRunStatus::Delivered);
             assert_eq!(model.calls.load(Ordering::SeqCst), 2);
         }
+    }
+}
+
+#[tokio::test]
+async fn usage_only_retries_keep_the_latest_snapshot_once_in_delivery_and_replay() {
+    let store = Arc::new(InMemoryGenericAgentCheckpointStore::default());
+    let model = Arc::new(RetryModel {
+        calls: AtomicUsize::new(0),
+        point: FailurePoint::AfterUsageUpdates,
+        code: ModelErrorCode::Unavailable,
+        failures: 2,
+    });
+    let provider = Arc::new(
+        InternalGenericAgentProvider::new(model.clone(), config())
+            .unwrap()
+            .with_checkpoint_store(store.clone())
+            .unwrap(),
+    );
+    let controller =
+        Arc::new(AgentController::new(provider, ProviderBindingRef::new("binding")).unwrap());
+    let mut request = run();
+    request.spec.limits.max_model_steps = Some(1);
+    controller
+        .start(AgentRunEnvelope::seal(request.spec).unwrap())
+        .await
+        .unwrap();
+    let view = tokio::time::timeout(
+        Duration::from_secs(2),
+        controller.wait_for_terminal(&RunId::new("run")),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(view.state.status(), AgentRunStatus::Delivered);
+    assert_eq!(model.calls.load(Ordering::SeqCst), 3);
+    let usage = view.delivery.unwrap().usage.unwrap();
+    assert_eq!(usage.input_tokens, Some(10));
+    assert_eq!(usage.output_tokens, Some(13));
+
+    let mut stored = store.load_run(&RunId::new("run")).unwrap().unwrap();
+    let observed_index = stored
+        .records
+        .iter()
+        .position(|record| {
+            matches!(
+                record.payload,
+                GenericCheckpointEvent::ModelAttemptObserved { .. }
+            )
+        })
+        .unwrap();
+    stored.records.truncate(observed_index);
+    assert!(matches!(stored.validate().unwrap().phase,
+        GenericCheckpointPhase::ModelAttemptOpen { boundary, .. }
+            if boundary.usage.input_tokens == Some(8) && boundary.usage.output_tokens == Some(10)));
+    let encoded = serde_json::to_string(&stored).unwrap();
+    let decoded: orchestral_runtime::StoredGenericAgentRun =
+        serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded.validate().unwrap(), stored.validate().unwrap());
+}
+
+#[tokio::test]
+async fn usage_only_failures_respect_retry_limits_and_strict_usage_ceilings() {
+    for (max_retries, limited, code, expected_calls) in [
+        (0, false, ModelErrorCode::Unavailable, 1),
+        (2, false, ModelErrorCode::Unavailable, 3),
+        (2, false, ModelErrorCode::Authentication, 1),
+        (2, true, ModelErrorCode::Unavailable, 1),
+        (2, true, ModelErrorCode::RateLimited, 1),
+    ] {
+        let model = Arc::new(RetryModel {
+            calls: AtomicUsize::new(0),
+            point: FailurePoint::AfterUsageUpdates,
+            code,
+            failures: usize::MAX,
+        });
+        let mut config = config();
+        config.model_retry.max_retries = max_retries;
+        let provider = Arc::new(InternalGenericAgentProvider::new(model.clone(), config).unwrap());
+        let controller =
+            Arc::new(AgentController::new(provider, ProviderBindingRef::new("binding")).unwrap());
+        let mut request = run();
+        if limited {
+            request.spec.limits.max_input_tokens = Some(100_000);
+        }
+        controller
+            .start(AgentRunEnvelope::seal(request.spec).unwrap())
+            .await
+            .unwrap();
+        let view = tokio::time::timeout(
+            Duration::from_secs(2),
+            controller.wait_for_terminal(&RunId::new("run")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(view.state.status(), AgentRunStatus::Failed);
+        assert_eq!(model.calls.load(Ordering::SeqCst), expected_calls);
     }
 }
 
@@ -172,6 +351,7 @@ async fn usage_ceiling_prevents_reissuing_an_unaccounted_request_but_allows_rate
             calls: AtomicUsize::new(0),
             point: FailurePoint::Start,
             code,
+            failures: 1,
         });
         let provider =
             Arc::new(InternalGenericAgentProvider::new(model.clone(), config()).unwrap());
@@ -206,12 +386,76 @@ async fn usage_ceiling_prevents_reissuing_an_unaccounted_request_but_allows_rate
 }
 
 #[tokio::test]
+async fn cancellation_interrupts_usage_only_retry_backoff_without_another_request() {
+    let store = Arc::new(InMemoryGenericAgentCheckpointStore::default());
+    let model = Arc::new(RetryModel {
+        calls: AtomicUsize::new(0),
+        point: FailurePoint::AfterUsage,
+        code: ModelErrorCode::Unavailable,
+        failures: 1,
+    });
+    let mut config = config();
+    config.model_retry.base_delay_ms = 60_000;
+    config.model_retry.max_delay_ms = 60_000;
+    let provider = Arc::new(
+        InternalGenericAgentProvider::new(model.clone(), config)
+            .unwrap()
+            .with_checkpoint_store(store.clone())
+            .unwrap(),
+    );
+    let controller =
+        Arc::new(AgentController::new(provider, ProviderBindingRef::new("binding")).unwrap());
+    controller.start(run()).await.unwrap();
+    let run_id = RunId::new("run");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let stored = store.load_run(&run_id).unwrap().unwrap();
+            if stored.records.iter().any(|record| {
+                matches!(
+                    record.payload,
+                    GenericCheckpointEvent::ModelRetryScheduled { .. }
+                )
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    controller
+        .cancel(&run_id, "stop during retry backoff")
+        .await
+        .unwrap();
+    let view = tokio::time::timeout(
+        Duration::from_secs(2),
+        controller.wait_for_terminal(&run_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(view.state.status(), AgentRunStatus::Cancelled);
+    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        store
+            .load_run(&run_id)
+            .unwrap()
+            .unwrap()
+            .validate()
+            .unwrap()
+            .phase,
+        GenericCheckpointPhase::Terminal
+    );
+}
+
+#[tokio::test]
 async fn recovery_of_scheduled_retry_closes_interrupted_attempt_and_rejects_changed_instructions() {
     let store = Arc::new(InMemoryGenericAgentCheckpointStore::default());
     let model = Arc::new(RetryModel {
         calls: AtomicUsize::new(0),
-        point: FailurePoint::Start,
+        point: FailurePoint::AfterUsage,
         code: ModelErrorCode::Unavailable,
+        failures: 1,
     });
     let mut config = config();
     config.model_retry.base_delay_ms = 60_000;
@@ -240,7 +484,9 @@ async fn recovery_of_scheduled_retry_closes_interrupted_attempt_and_rejects_chan
             }) {
                 assert!(matches!(
                     stored.validate().unwrap().phase,
-                    GenericCheckpointPhase::ModelAttemptOpen { .. }
+                    GenericCheckpointPhase::ModelAttemptOpen { boundary, .. }
+                        if boundary.usage.input_tokens == Some(1)
+                            && boundary.usage.output_tokens == Some(1)
                 ));
                 break;
             }

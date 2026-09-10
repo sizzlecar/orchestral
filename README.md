@@ -185,13 +185,15 @@ Same-directory aliases such as `AGENTS.md -> CLAUDE.md` work; escaping symlinks,
 invalid UTF-8, and oversized documents produce explicit errors rather than
 silently dropping project rules.
 
-Transient model failures before the first model event automatically retry within
+Transient model failures before any text, tool call, or Finish automatically retry within
 the current model step, with exponential backoff and at most three retries by
 default. CLI/TUI progress shows the wait, which cancellation and Steer can
-interrupt. Requests that already produced text, tool calls, or usage are not
-automatically reissued; model retries never repeat previously executed tools.
-With explicit cumulative Run token/cost limits, only rate-limit rejections retry,
-since unobserved transport failures may have consumed unaccounted usage.
+interrupt. A request that only reported usage can retry; its latest usage snapshot
+is retained in checkpoints and added once to the Run's reported usage. Requests
+that already produced text, tool calls, or Finish are not automatically reissued;
+model retries never repeat previously executed tools.
+With explicit cumulative Run token/cost limits, only rate-limit rejections without
+usage retry, since failed requests may have consumed more than their last reported usage.
 Uncertain model attempts after process loss retain the existing recovery contract.
 
 Configure discovery, compatibility filenames, and retries as follows:

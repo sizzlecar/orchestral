@@ -172,7 +172,7 @@ pub struct GenericAgentConfig {
     pub input_requests_enabled: bool,
     /// Host-lifetime instruction snapshot, included in the recovery identity.
     pub project_instructions: Vec<ProjectInstruction>,
-    /// Retries before the first model event; never replays tool execution.
+    /// Retries before model content or Finish; never replays tool execution.
     pub model_retry: ModelRetryPolicy,
     pub stream_buffer: usize,
     pub continuation: ContinuationPolicy,

@@ -1,8 +1,15 @@
 use super::*;
 use orchestral_core::model_protocol::ModelStream;
 
-/// Opens a logical attempt through its first event. Nothing from a failed
-/// attempt reaches the model loop, the Session journal, or the tool executor.
+pub(super) struct StartedModelStream {
+    pub(super) stream: ModelStream,
+    pub(super) expected_sequence: u64,
+    pub(super) usage: Option<ModelUsage>,
+}
+
+/// Opens a logical attempt through its first non-usage event. Usage snapshots
+/// are validated and retained without buffering an unbounded event prefix.
+/// Failed attempts cannot reach the Session journal or the tool executor.
 /// The caller races this entire future against cancellation and Steer.
 pub(super) async fn start_model_with_retry(
     inner: &GenericInner,
@@ -10,7 +17,8 @@ pub(super) async fn start_model_with_retry(
     round: u64,
     request: &ModelRequest,
     cancellation: CancellationToken,
-) -> Result<ModelStream, AgentFailure> {
+    total_usage: &mut ModelUsage,
+) -> Result<StartedModelStream, AgentFailure> {
     let mut retry_number = 0_u32;
     loop {
         if cancellation.is_cancelled() {
@@ -25,23 +33,41 @@ pub(super) async fn start_model_with_retry(
             .backend
             .start(request.clone(), attempt_cancellation)
             .await;
+        let mut usage = None;
+        let mut expected_sequence = 1;
         let error = match result {
-            Ok(mut stream) => match stream.next().await {
-                Some(Ok(first)) => {
-                    return Ok(stream::once(std::future::ready(Ok(first)))
-                        .chain(stream)
-                        .map(move |event| {
-                            let _ = &guard;
-                            event
-                        })
-                        .boxed());
+            Ok(mut stream) => loop {
+                match stream.next().await {
+                    Some(Ok(first)) => {
+                        first
+                            .validate_for(&request.request_id, expected_sequence)
+                            .map_err(model_failure)?;
+                        if let ModelEvent::Usage { usage: observed } = first.payload {
+                            usage = Some(observed);
+                            expected_sequence += 1;
+                            continue;
+                        }
+                        return Ok(StartedModelStream {
+                            stream: stream::once(std::future::ready(Ok(first)))
+                                .chain(stream)
+                                .map(move |event| {
+                                    let _ = &guard;
+                                    event
+                                })
+                                .boxed(),
+                            expected_sequence,
+                            usage,
+                        });
+                    }
+                    Some(Err(error)) => break error,
+                    None => {
+                        break ModelError::new(
+                            ModelErrorCode::Unavailable,
+                            "model stream ended before any content or Finish",
+                        )
+                        .with_retryable(true)
+                    }
                 }
-                Some(Err(error)) => error,
-                None => ModelError::new(
-                    ModelErrorCode::Unavailable,
-                    "model stream ended before its first event",
-                )
-                .with_retryable(true),
             },
             Err(error) => error,
         };
@@ -52,12 +78,19 @@ pub(super) async fn start_model_with_retry(
         };
         // An unobserved transport failure may already have consumed paid
         // tokens. Without usage evidence, retrying cannot preserve a strict
-        // cumulative usage ceiling. An explicit rate-limit rejection is safe.
+        // cumulative usage ceiling. Usage snapshots before an error may also
+        // be incomplete. Only a rate-limit rejection with no usage is safe
+        // under a strict ceiling.
         let usage_limited = run.run.spec.limits.max_input_tokens.is_some()
             || run.run.spec.limits.max_output_tokens.is_some()
             || run.run.spec.limits.max_cost.is_some();
         let delay_ms = match inner.config.model_retry.delay_ms(&error, retry_number) {
-            Some(delay) if !usage_limited || error.code == ModelErrorCode::RateLimited => delay,
+            Some(delay)
+                if !usage_limited
+                    || (error.code == ModelErrorCode::RateLimited && usage.is_none()) =>
+            {
+                delay
+            }
             _ => return Err(model_failure(error)),
         };
         let run_id = &run.run.spec.run_id;
@@ -74,8 +107,12 @@ pub(super) async fn start_model_with_retry(
                 retry_number,
                 delay_ms,
                 error: error.clone(),
+                observed_usage: usage.clone(),
             },
         )?;
+        if let Some(usage) = usage {
+            merge_usage(total_usage, usage);
+        }
         publish_telemetry(
             inner,
             run_id,

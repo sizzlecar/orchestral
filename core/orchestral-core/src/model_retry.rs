@@ -1,12 +1,13 @@
-//! Bounded policy for retrying a model attempt before any model event arrives.
+//! Bounded policy for retrying a model attempt before any content arrives.
 
 use serde::{Deserialize, Serialize};
 
 use crate::model_protocol::{ModelError, ModelErrorCode};
 
 /// Host-owned retries within one logical model step. A zero retry count disables
-/// retries. Once an attempt has produced any event, it cannot be retried by this
-/// policy: partially observed output and usage require explicit reconciliation.
+/// retries. Once an attempt has produced text, a Tool call, or Finish, it cannot
+/// be retried by this policy. Usage-only failures retain their reported usage;
+/// strict token or cost ceilings still prohibit retrying incomplete accounting.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModelRetryPolicy {
