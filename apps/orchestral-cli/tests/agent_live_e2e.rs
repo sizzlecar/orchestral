@@ -57,6 +57,17 @@ impl TestWorkspace {
         fs::create_dir_all(&root).expect("create isolated E2E workspace");
         let config = fs::read_to_string(repository_root().join("configs/orchestral.cli.yaml"))
             .expect("read canonical CLI config");
+        #[cfg(windows)]
+        let config = {
+            // Run platform fixtures under PowerShell even when the test
+            // launcher (for example OpenSSH) sets SHELL to cmd.exe.
+            let mut parsed: serde_yaml::Value = serde_yaml::from_str(&config).unwrap();
+            let shell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+                .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+            parsed["tools"]["exec"]["shell"] =
+                serde_yaml::Value::String(shell.to_string_lossy().into_owned());
+            serde_yaml::to_string(&parsed).unwrap()
+        };
         fs::write(root.join("orchestral.yaml"), config).expect("write isolated CLI config");
         Self { root }
     }
@@ -119,6 +130,7 @@ impl TestWorkspace {
         });
     }
 
+    #[cfg(unix)]
     fn configure_host_execution(&self, enabled: bool) {
         self.rewrite_config(|config| {
             let exec = config
@@ -269,14 +281,15 @@ fn missing_google_credential_is_non_zero_and_actionable() {
 #[test]
 fn terminal_model_failure_is_non_zero_and_preserves_the_reason() {
     let workspace = TestWorkspace::new("terminal-failure");
-    let config_path = workspace.path("orchestral.yaml");
-    let config = fs::read_to_string(&config_path)
-        .expect("read config")
-        .replace(
-            "kind: gemini\n      api_key_env: GOOGLE_API_KEY",
-            "kind: gemini\n      endpoint: http://127.0.0.1:1\n      api_key_env: GOOGLE_API_KEY",
-        );
-    fs::write(&config_path, config).expect("write unreachable model endpoint");
+    workspace.rewrite_config(|config| {
+        let google = config["providers"]["backends"]
+            .as_sequence_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|backend| backend["name"].as_str() == Some("google"))
+            .unwrap();
+        google["endpoint"] = serde_yaml::Value::String("http://127.0.0.1:1".into());
+    });
 
     let mut command = base_command(&workspace);
     command
@@ -331,7 +344,11 @@ fn tui_pty_resolves_input_and_approval_then_cancels_another_run() {
             openai_tool_response(
                 "approval-write",
                 "exec_command",
-                json!({ "cmd": "rm tui-approved.marker" }),
+                if cfg!(windows) {
+                    json!({ "cmd": "Remove-Item -LiteralPath tui-approved.marker", "sandbox_permissions": "require_escalated", "justification": "Delete the requested marker" })
+                } else {
+                    json!({ "cmd": "rm tui-approved.marker" })
+                },
             )
         }),
         Box::new(|request| {
@@ -735,7 +752,10 @@ fn local_cli_uses_structured_tools_across_an_added_workspace() {
     let (model_endpoint, model_server) = spawn_fixture_http_server(vec![
         Box::new(move |request| {
             let context = model_request_text(&request.body);
-            assert!(context.contains(&selector_for_context), "{context}");
+            assert!(
+                context.contains(&serde_json::to_string(&selector_for_context).unwrap()),
+                "{context}"
+            );
             for tool in ["file_search", "text_search", "file_read", "apply_patch"] {
                 assert!(
                     model_request_has_tool(&request.body, tool),
@@ -855,6 +875,7 @@ fn local_cli_uses_structured_tools_across_an_added_workspace() {
 }
 
 #[test]
+#[cfg(unix)] // Verifies unattended execution in a Unix workspace sandbox.
 fn local_cli_reads_patches_and_runs_a_guarded_verification() {
     let _guard = local_e2e_guard();
     let workspace = TestWorkspace::new("patch-and-verify");
@@ -981,6 +1002,7 @@ fn local_cli_reads_patches_and_runs_a_guarded_verification() {
 }
 
 #[test]
+#[cfg(unix)] // Uses Unix sandbox execution for Git and the verification command.
 fn local_cli_establishes_a_requested_branch_before_editing_and_verifying() {
     let _guard = local_e2e_guard();
     const BRANCH: &str = "agent/e2e-fix";
@@ -1198,6 +1220,7 @@ fn local_exec_runs_toolchains_and_a_child_script_without_program_enumeration() {
 }
 
 #[test]
+#[cfg(unix)] // The skill intentionally runs a POSIX shell script.
 fn local_cli_skill_read_injects_instructions_and_journals_load() {
     let _guard = local_e2e_guard();
     const DESCRIPTOR_MARKER: &str = "E2E skill descriptor marker";
@@ -1581,11 +1604,12 @@ fn local_cli_routes_structured_host_execution_through_the_approval_prompt() {
                 "approved-host-read",
                 "exec_command",
                 json!({
-                    "cmd": "cat evidence.txt",
+                    "cmd": if cfg!(windows) { "Get-Content -LiteralPath evidence.txt -Encoding UTF8" } else { "cat evidence.txt" },
                     "workdir": external_root,
                     "sandbox_permissions": "require_escalated",
                     "justification": "Read the external fixture explicitly requested by the user",
-                    "yield_time_ms": 1_000
+                    "yield_time_ms": 10_000,
+                    "wait_mode": "completion"
                 }),
             )
         }),
@@ -1647,10 +1671,11 @@ fn local_cli_preserves_command_proxies_without_inheriting_unlisted_secrets() {
                 "inspect-command-environment",
                 "exec_command",
                 json!({
-                    "cmd": "env",
+                    "cmd": if cfg!(windows) { "cmd.exe /d /c set" } else { "env" },
                     "sandbox_permissions": "require_escalated",
                     "justification": "Inspect the requested command environment",
-                    "yield_time_ms": 1000
+                    "yield_time_ms": 10_000,
+                    "wait_mode": "completion"
                 }),
             )
         }),
@@ -1664,10 +1689,20 @@ fn local_cli_preserves_command_proxies_without_inheriting_unlisted_secrets() {
                 "https_proxy",
                 "all_proxy",
             ] {
-                assert!(context.contains(&format!("{name}={PROXY}")), "{context}");
+                assert!(
+                    context
+                        .to_ascii_lowercase()
+                        .contains(&format!("{name}={PROXY}").to_ascii_lowercase()),
+                    "{context}"
+                );
             }
             for name in ["NO_PROXY", "no_proxy"] {
-                assert!(context.contains(&format!("{name}={BYPASS}")), "{context}");
+                assert!(
+                    context
+                        .to_ascii_lowercase()
+                        .contains(&format!("{name}={BYPASS}").to_ascii_lowercase()),
+                    "{context}"
+                );
             }
             assert!(
                 !context.contains(SECRET),
@@ -1705,6 +1740,7 @@ fn local_cli_preserves_command_proxies_without_inheriting_unlisted_secrets() {
 }
 
 #[test]
+#[cfg(unix)] // The Host retains a default sandbox while denying escalation.
 fn local_cli_host_execution_ceiling_denies_without_prompt_or_spawn() {
     let _guard = local_e2e_guard();
     const FINAL_MARKER: &str = "HOST_EXECUTION_CEILING_OK";
@@ -1777,7 +1813,11 @@ fn mcp_user_registry_add_list_get_remove_round_trip() {
         .arg("--env")
         .arg("FIXTURE_MODE=e2e")
         .arg("--")
-        .arg("/bin/echo")
+        .arg(if cfg!(windows) {
+            env!("CARGO_BIN_EXE_orchestral")
+        } else {
+            "/bin/echo"
+        })
         .arg("--stdio");
     let added = run_to_completion(add, LOCAL_PROCESS_TIMEOUT);
     assert!(added.status.success(), "{}", added.stderr_text());
@@ -1791,7 +1831,12 @@ fn mcp_user_registry_add_list_get_remove_round_trip() {
     assert!(listed.status.success(), "{}", listed.stderr_text());
     let registry: serde_json::Value =
         serde_json::from_str(&listed.stdout_text()).expect("list emits registry JSON");
-    let executable = fs::canonicalize("/bin/echo").expect("resolve registered executable");
+    let executable = fs::canonicalize(if cfg!(windows) {
+        env!("CARGO_BIN_EXE_orchestral")
+    } else {
+        "/bin/echo"
+    })
+    .expect("resolve registered executable");
     assert_eq!(
         registry["mcpServers"]["fixture"]["command"],
         executable.to_string_lossy().as_ref()
@@ -1980,7 +2025,7 @@ fn live_vertex_stream_obeys_the_terminal_contract() {
     assert!(output.status.success(), "{}", output.stderr_text());
     assert_eq!(output.stdout_text().trim(), "你好，Orchestral 👋");
     let stderr = output.stderr_text();
-    assert!(stderr.contains("Generic Agent: backend=google model="));
+    assert!(stderr.contains("Model: ") && stderr.contains("(provider: google)"));
     assert!(!stderr.contains("你好，Orchestral"));
     output.assert_no_ansi();
 
@@ -2577,7 +2622,31 @@ impl PtyOutput {
 }
 
 impl PtyHarness {
-    fn spawn(command: CommandBuilder) -> Self {
+    fn spawn(#[allow(unused_mut)] mut command: CommandBuilder) -> Self {
+        #[cfg(windows)]
+        {
+            // portable-pty refreshes base variables from the registry. Tests
+            // must inherit this process's environment, just like headless
+            // Command children, including its process-local Cargo PATH.
+            // Preserve explicit overrides and removals made by each caller.
+            let present = command
+                .iter_full_env_as_str()
+                .map(|(key, _)| key.to_ascii_lowercase())
+                .collect::<std::collections::BTreeSet<_>>();
+            let extra = command
+                .iter_extra_env_as_str()
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .collect::<Vec<_>>();
+            command.env_clear();
+            for (key, value) in std::env::vars_os() {
+                if present.contains(&key.to_string_lossy().to_ascii_lowercase()) {
+                    command.env(key, value);
+                }
+            }
+            for (key, value) in extra {
+                command.env(key, value);
+            }
+        }
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 24,
@@ -2590,7 +2659,15 @@ impl PtyHarness {
             .master
             .try_clone_reader()
             .expect("clone TUI PTY reader");
-        let writer = pair.master.take_writer().expect("take TUI PTY writer");
+        #[allow(unused_mut)]
+        let mut writer = pair.master.take_writer().expect("take TUI PTY writer");
+        #[cfg(windows)]
+        {
+            writer
+                .write_all(b"\x1b[1;1R")
+                .expect("answer ConPTY cursor inheritance query");
+            writer.flush().expect("flush cursor report");
+        }
         let child = pair
             .slave
             .spawn_command(command)
@@ -2746,6 +2823,9 @@ impl PtyHarness {
     }
 
     fn finish(mut self, timeout: Duration) -> PtyOutput {
+        // Closing ConPTY input terminates its console, even while the child
+        // is still restoring terminal state after the requested exit.
+        #[cfg(unix)]
         self.writer.take();
         let started = Instant::now();
         let status = loop {
@@ -2763,6 +2843,8 @@ impl PtyHarness {
                 self.receive(bytes);
             }
         };
+        #[cfg(windows)]
+        self.writer.take();
         if let (Some(directory), Some(recording)) = (
             std::env::var_os("ORCHESTRAL_TUI_ARTIFACT_DIR"),
             &self.recording,
@@ -2977,9 +3059,9 @@ fn standard_adc_is_available() -> bool {
 fn well_known_adc_path() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        return std::env::var_os("APPDATA")
+        std::env::var_os("APPDATA")
             .map(PathBuf::from)
-            .map(|root| root.join("gcloud/application_default_credentials.json"));
+            .map(|root| root.join("gcloud/application_default_credentials.json"))
     }
     #[cfg(not(target_os = "windows"))]
     {

@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+#[cfg(unix)]
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,12 +28,15 @@ use orchestral_core::tool_protocol::{
     ToolId, ToolIdempotency, ToolInvocation, ToolOperationPlan, ToolOperationRisk, ToolOutcome,
     ToolOutput, ToolPolicyBounds, ToolRestriction, TransportLaunchPolicy,
 };
+#[cfg(unix)]
+use orchestral_runtime::tools::{
+    guarded_shell_descriptor, GuardedShellExecutor, GUARDED_SHELL_SANDBOX_PROFILE,
+};
 use orchestral_runtime::{
     tool_permission_decision_digest,
     tools::{
-        guarded_artifact_read_descriptor, guarded_file_read_descriptor, guarded_shell_descriptor,
-        GuardedArtifactReadExecutor, GuardedFileReadExecutor, GuardedShellExecutor,
-        GUARDED_SHELL_SANDBOX_PROFILE,
+        guarded_artifact_read_descriptor, guarded_file_read_descriptor,
+        GuardedArtifactReadExecutor, GuardedFileReadExecutor,
     },
     DescriptorPermissionPolicy, GuardedToolExecution, GuardedToolExecutor, GuardedToolResult,
     GuardedToolRuntime, HookDispatchMode, HookError, HookExecutionPolicy, HookFailurePolicy,

@@ -3,8 +3,8 @@
 //! Facade crate that re-exports [`orchestral_core`] and [`orchestral_runtime`]
 //! for convenient single-dependency access.
 //!
-//! ```rust,ignore
-//! use orchestral::prelude::*;
+//! ```rust
+//! use orchestral::{AgentClient, AgentController};
 //! ```
 
 pub use orchestral_core as core;

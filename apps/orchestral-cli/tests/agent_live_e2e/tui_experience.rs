@@ -65,6 +65,7 @@ fn live_tui_repairs_rust_and_continues_after_session_selection() {
 }
 
 #[test]
+#[cfg(unix)] // This fixture supplies Unix clipboard executables and a POSIX PATH.
 fn tui_pty_long_paste_context_and_clipboard_preserve_original_content() {
     use std::os::unix::fs::PermissionsExt;
     let _guard = local_e2e_guard();
@@ -168,7 +169,8 @@ fn tui_pty_completes_paths_and_rejects_deleted_references_without_submitting() {
     let expected_path = workspace.path("规则 file.rs").canonicalize().unwrap();
     let (endpoint, server) = spawn_fixture_http_server(vec![Box::new(move |request| {
         let text = model_request_text(&request.body);
-        assert!(text.contains(expected_path.to_str().unwrap()), "{text}");
+        let reference = serde_json::to_string(&expected_path.canonicalize().unwrap()).unwrap();
+        assert!(text.contains(&reference), "{text}");
         assert!(
             !text.contains("fn example"),
             "path selection must not eagerly read contents"
@@ -289,7 +291,8 @@ fn tui_pty_refreshes_open_file_completion_after_create_rename_and_delete() {
     let expected_path = workspace.path("fresh-renamed.rs");
     let (endpoint, server) = spawn_fixture_http_server(vec![Box::new(move |request| {
         let text = model_request_text(&request.body);
-        assert!(text.contains(expected_path.to_str().unwrap()), "{text}");
+        let reference = serde_json::to_string(&expected_path.canonicalize().unwrap()).unwrap();
+        assert!(text.contains(&reference), "{text}");
         openai_text_response("FRESH_REFERENCE_ACCEPTED")
     })]);
     workspace.configure_local_openai(&endpoint);
@@ -414,7 +417,39 @@ fn tui_pty_switches_models_without_losing_memory_journal_and_resumes_session_dra
     assert_eq!(server.join().unwrap().len(), 2);
 }
 
+#[cfg(windows)]
 #[test]
+fn native_console_accepts_unicode_and_restores_terminal_on_exit() {
+    let _guard = local_e2e_guard();
+    let workspace = TestWorkspace::new("native-unicode-console");
+    let (endpoint, server) = spawn_fixture_http_server(vec![Box::new(|request| {
+        assert!(model_request_text(&request.body).contains("检查 workspace 中文"));
+        openai_text_response("NATIVE_UNICODE_ACCEPTED")
+    })]);
+    workspace.configure_local_openai(&endpoint);
+    let mut tui = PtyHarness::spawn(local_tui_command(
+        &workspace,
+        "native-unicode",
+        "Follow the user's request.",
+    ));
+    tui.wait_for_screen(
+        |screen| screen.contains("Ask Orchestral"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    tui.send("检查 workspace 中文\r".as_bytes());
+    tui.wait_for_screen(
+        |screen| screen.contains("NATIVE_UNICODE_ACCEPTED") && screen.contains("replied"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    tui.send(b"\x04");
+    let output = tui.finish(LOCAL_PROCESS_TIMEOUT);
+    assert!(output.status.success(), "{}", output.text());
+    output.assert_terminal_restored();
+    assert_eq!(server.join().unwrap().len(), 1);
+}
+
+#[test]
+#[cfg(unix)] // Exercises POSIX LF/Ctrl-J and VT bracketed-paste input bytes.
 fn tui_pty_preserves_graphemes_draft_and_focus_through_help_and_history() {
     let _guard = local_e2e_guard();
     let workspace = TestWorkspace::new("tui-editor");
@@ -599,7 +634,9 @@ fn tui_pty_skill_catalog_keeps_details_and_preferences_out_of_the_conversation()
         "report-builder",
         &format!(
             "Prepare reports. {} DESCRIPTION_END",
-            "Long description. ".repeat(80)
+            (0..80)
+                .map(|index| format!("Description detail {index:03}. "))
+                .collect::<String>()
         ),
         "PRIVATE_SKILL_INSTRUCTIONS",
     );

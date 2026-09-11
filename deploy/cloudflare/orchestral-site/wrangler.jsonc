@@ -1,0 +1,12 @@
+{
+  "name": "orchestral-site",
+  "compatibility_date": "2026-09-10",
+  "workers_dev": true,
+  "routes": [
+    { "pattern": "orch.pandaailabs.com", "custom_domain": true }
+  ],
+  "assets": {
+    "directory": "./public",
+    "not_found_handling": "404-page"
+  }
+}

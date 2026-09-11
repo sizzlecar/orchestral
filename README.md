@@ -1,68 +1,139 @@
 # Orchestral
 
-Provider-neutral runtime for running one Agent safely, durably, and interactively.
+A coding agent for your terminal and workspace. Read code, make changes, and continue the conversation with cloud models or your own OpenAI-compatible server.
 
-[中文版本](./README.zh-CN.md)
+Use the terminal UI, run a headless command, control a host from your browser, or embed the Rust SDK.
 
-> Status: the Agent Foundation is under active development. The current scope is a complete
-> single-Agent runtime contract and implementation—not goal compilation, task brokering, or
-> multi-Agent orchestration.
+[Website](https://orch.pandaailabs.com) · [中文版本](./README.zh-CN.md)
 
-## What exists today
+> The 0.3 series is a pre-1.0 Agent Foundation release. Public APIs and recovery identities
+> can change between releases. Upgrading from 0.2 requires changes to CLI invocations,
+> configuration, and SDK integrations; see the [release notes](CHANGELOG.md).
 
-- **Agent Protocol v1** — versioned Run/Session contracts, commands, durable events,
-  inspection, cancellation, recovery, and exactly one terminal projection.
-- **Generic Agent** — one provider-neutral `Model → Tool/Workflow → Model` loop shared by
-  CLI, SDK, and API surfaces.
-- **Model adapters** — OpenAI-compatible and Gemini-native protocols behind the same
-  [`ModelBackend` contract](testing/orchestral-model-protocol-testkit/README.md) and conformance
-  suite.
-- **Guarded Tool Runtime** — Host-owned policy, approval capabilities, cancellation, effect
-  journaling, artifact spill, and conservative `UnknownEffect` handling.
-- **Two distinct extension planes** — Skills add trusted instructions to Context; MCP tools
-  enter the Action plane and always pass through the guarded runtime.
-- **Optional Workflow strategy** — complex calls reuse the typed Plan normalizer, DAG, and
-  executor. A Workflow is subordinate to its Agent Run and cannot create a second terminal.
-- **Durable context** — Run, Session, Tool Effect, and Generic Agent checkpoint journals can
-  use filesystem-backed plugins and recover across process replacement.
+[Install](#install) · [Quick start](#quick-start) · [Mobile control](#mobile-control-pwa) ·
+[SDK](#sdk) · [Evaluation](#coding-task-evaluation) · [Release process](RELEASING.md)
 
-```text
-CLI / SDK / API
-      │
-      ▼
-AgentController ── Agent Protocol + durable Run journal
-      │
-      ▼
-Generic Agent ─── ModelBackend + durable Session context
-      │
-      ├── direct Tool ─────────────────────────┐
-      └── optional injected Workflow → Plan/DAG┤
-                                     ▼
-                         GuardedToolRuntime
-                           ├── built-in tools
-                           └── MCP tools (stdio / Streamable HTTP)
+## Install
+
+**v0.3.0 is in preparation.** This checkout contains the new installation and local API
+features. Binary installers become usable once the first public release is published.
+Until then, build from this checkout:
+
+```sh
+cargo install --locked --path apps/orchestral-cli
+orchestral --version
 ```
+
+The repository pins Rust 1.91.0. The executable is named `orchestral`; the web client is
+embedded, so normal builds do not require Node.js or Dioxus CLI.
+
+Once a release is available, use the installer for your platform:
+
+**macOS / Linux**
+
+```sh
+curl -fsSL https://orch.pandaailabs.com/install.sh | sh
+```
+
+**Windows PowerShell**
+
+```powershell
+irm https://orch.pandaailabs.com/install.ps1 | iex
+```
+
+The installers verify SHA-256 checksums, install into a user directory, and configure PATH.
+Run the same installer again to upgrade; your configuration and conversations are preserved.
+See [installation options, rollback and uninstall](RELEASING.md#installers).
+
+| Platform | Release archive | Command execution |
+| --- | --- | --- |
+| macOS Apple Silicon / Intel | `.tar.gz` | Native Seatbelt sandbox |
+| Linux x64, glibc 2.35+ | `.tar.gz` | Requires `bubblewrap` and unprivileged namespaces |
+| Windows x64 | `.zip` | Native commands require explicit approval; use WSL for sandboxed commands |
+
+On native Windows, use Streamable HTTP for MCP servers. Local stdio MCP requires WSL
+because its process sandbox is not implemented on native Windows.
+
+On Ubuntu, install the sandbox backend with `sudo apt-get install bubblewrap`.
+For manual or offline installation, download the archive and matching `.sha256` file from
+[GitHub Releases](https://github.com/sizzlecar/orchestral/releases). Platform validation is
+tracked in the [release checklist](docs/product/user-onboarding-release-v0.3.0.md).
 
 ## Quick start
 
-Export one configured provider key:
+Open a terminal in your project directory. For an OpenAI cloud model, set your key:
 
 ```bash
-export OPENAI_API_KEY="..."
-# or GOOGLE_API_KEY / OPENROUTER_API_KEY / DEEPSEEK_API_KEY
+export OPENAI_API_KEY="your-api-key"
 ```
+
+In PowerShell, use `$env:OPENAI_API_KEY="your-api-key"`.
 
 Run one turn:
 
 ```bash
-cargo run -p orchestral-cli -- "Summarize the public API of this repository"
+orchestral "Summarize the public API of this repository"
 ```
 
 Start a full-screen interactive Agent Session:
 
 ```bash
-cargo run -p orchestral-cli --
+orchestral
 ```
+
+### Your own OpenAI-compatible server
+
+No YAML or placeholder key is needed for a server without authentication:
+
+```sh
+orchestral --base-url http://127.0.0.1:8000/v1
+```
+
+A server root, `/v1` base, or full `/chat/completions` endpoint is accepted. If the server
+lists exactly one model, Orchestral selects it. Otherwise choose a model explicitly:
+
+```sh
+orchestral --base-url http://127.0.0.1:8000/v1 --model your-model-id
+```
+
+`OPENAI_BASE_URL` and `OPENAI_MODEL` provide the same shortcut through environment variables.
+Explicit command-line values take precedence. An explicit `--backend` or `--model-profile`
+takes precedence over the URL environment variable.
+
+Custom URLs default to **no authentication** and do not inherit your cloud key. For an
+authenticated local service or gateway, select its credential environment variable:
+
+```sh
+orchestral --base-url https://your-gateway.example/v1 --api-key-env LOCAL_MODEL_API_KEY --model your-model-id
+```
+
+Set `LOCAL_MODEL_API_KEY` in your environment first. Orchestral sends it only when explicitly
+selected. In YAML, use a provider `endpoint` with `config: { auth: none }` for a keyless service;
+the default authentication mode is `api_key`. The model needs tool-calling support to perform
+coding actions; OpenAI-compatible HTTP alone does not guarantee a model has that capability.
+
+Check configuration without starting a task, or query the model list without generating text:
+
+```sh
+orchestral doctor
+orchestral --base-url http://127.0.0.1:8000/v1 doctor --check-connection
+```
+
+`doctor --json` prints a report with credential values omitted. Plain `doctor` does not make
+network requests or create configuration files. Reuse the same connection options when
+starting a conversation.
+
+### More providers and everyday use
+
+Select another provider explicitly when needed:
+
+```bash
+export GOOGLE_API_KEY="..."
+orchestral --model-profile gemini-2.5-flash "Inspect this workspace"
+```
+
+From a source checkout, `cargo run --locked -p orchestral-cli -- "Inspect this workspace"`
+is equivalent to invoking the installed executable.
 
 The root command is the Agent entry point; there is no `agent` subcommand. Entry mode is
 deterministic:
@@ -106,12 +177,12 @@ is restored; edit it or move the cursor before sending so an extra Enter cannot 
 
 The CLI discovers `.orchestral/config.yaml`, `.orchestral/config.yml`,
 `configs/orchestral.cli.yaml`, then `orchestral.yaml`; if none exists it creates
-`.orchestral/config.yaml`. Use `--config`, `--backend`, `--model-profile`, or `--model` for
+`.orchestral/generated/default.agent.yaml`. Use `--config`, `--backend`, `--model-profile`, or `--model` for
 explicit selection. For example:
 
 ```bash
 orchestral --backend deepseek --model deepseek-chat "inspect this crate"
-orchestral --backend google --model gemini-3.1-pro-preview "inspect this crate"
+orchestral --backend google --model gemini-2.5-flash "inspect this crate"
 ```
 
 OpenAI-compatible providers use their configured key environment variable. Google supports
@@ -233,7 +304,7 @@ Skill, MCP, workspace policy, approvals, and journals remain on the Host.
 For local browser development:
 
 ```bash
-orchestral serve --pair --backend google --model gemini-3.1-pro-preview -C /path/to/workspace
+orchestral serve --pair --backend google --model gemini-2.5-flash -C /path/to/workspace
 ```
 
 For a phone, terminate HTTPS with a trusted reverse proxy or private-network relay and tell the
@@ -242,7 +313,7 @@ Host the browser-visible URL:
 ```bash
 orchestral serve --pair \
   --public-url https://agent.example.com \
-  --backend google --model gemini-3.1-pro-preview \
+  --backend google --model gemini-2.5-flash \
   -C /path/to/workspace
 ```
 
@@ -266,7 +337,7 @@ orchestral serve \
   --access-jwt-audience orchestral \
   --access-jwt-header X-Access-JWT \
   --access-jwt-required-claim email=owner@example.com \
-  --backend google --model gemini-3.1-pro-preview \
+  --backend google --model gemini-2.5-flash \
   -C /path/to/workspace
 ```
 
@@ -294,12 +365,15 @@ The model sees one structured file-mutation tool, `apply_patch`, for Add/Update/
 choose workspace roots or approval authority. `file_read`, `apply_patch`, `exec_command` /
 `write_stdin`, and MCP calls all remain behind Host policy and effect journaling.
 
-`exec_command` launches one Host-resolved shell and may run ordinary child programs and local
-toolchains inside the OS sandbox; it does not require a per-program allowlist. The actual boundary
+On macOS and Linux, `exec_command` launches one Host-resolved shell and may run ordinary child
+programs and local toolchains inside the OS sandbox; it does not require a per-program allowlist. The actual boundary
 is the Host-approved read/write roots, exact network targets, captured environment, time/output
 limits, exact approval, and effect journal. Ambient environment is not inherited wholesale and
 network access is disabled by default. MCP stdio launch identities remain explicitly configured by
 the Host. Model-visible arguments cannot expand any of these permissions.
+
+Native Windows commands run with the current user's OS permissions after exact Host approval;
+they have process supervision and output/time limits, but no filesystem or network isolation.
 
 Command temporary files live outside the workspace in a private Host-managed directory.
 `TMPDIR`, `TMP`, and `TEMP` point to one Run-specific child: commands in the same Run share it,
@@ -354,6 +428,45 @@ mcp:
 }
 ```
 
+## Architecture
+
+- **Agent Protocol v1** — versioned Run/Session contracts, commands, durable events,
+  inspection, cancellation, recovery, and exactly one terminal projection.
+- **Generic Agent** — one provider-neutral `Model → Tool/Workflow → Model` loop shared by
+  CLI, SDK, and API surfaces.
+- **Model adapters** — OpenAI-compatible and Gemini-native protocols behind the same
+  [`ModelBackend` contract](testing/orchestral-model-protocol-testkit/README.md) and conformance
+  suite.
+- **Guarded Tool Runtime** — Host-owned policy, approval capabilities, cancellation, effect
+  journaling, artifact spill, and conservative `UnknownEffect` handling.
+- **Two distinct extension planes** — Skills add trusted instructions to Context; MCP tools
+  enter the Action plane and always pass through the guarded runtime.
+- **Optional Workflow strategy** — complex calls reuse the typed Plan normalizer, DAG, and
+  executor. A Workflow is subordinate to its Agent Run and cannot create a second terminal.
+- **Durable context** — Run, Session, Tool Effect, and Generic Agent checkpoint journals can
+  use filesystem-backed plugins and recover across process replacement.
+- **Interactive clients** — a terminal UI and an embedded Dioxus/WASM mobile PWA, with
+  session history, input requests, approvals, steering, and cancellation.
+- **External Agent integration** — the application wires a Codex connector; the ACP plugin
+  is available for SDK hosts to register explicitly.
+
+```text
+CLI / SDK / API
+      │
+      ▼
+AgentController ── Agent Protocol + durable Run journal
+      │
+      ▼
+Generic Agent ─── ModelBackend + durable Session context
+      │
+      ├── direct Tool ─────────────────────────┐
+      └── optional injected Workflow → Plan/DAG┤
+                                     ▼
+                         GuardedToolRuntime
+                           ├── built-in tools
+                           └── MCP tools (stdio / Streamable HTTP)
+```
+
 ## SDK
 
 The public SDK is the Agent control plane: `AgentClient` starts Runs and `AgentRunHandle`
@@ -385,9 +498,10 @@ core/orchestral-core      Agent/Model/Tool/Skill/MCP contracts and deterministic
 core/orchestral-runtime   Agent controller, Generic Agent, context, guarded tools, Workflow bridge
 core/orchestral           facade re-exporting the public core and runtime APIs
 plugins/                  filesystem journals/blob store and concrete model adapters
-apps/orchestral-cli       conversational CLI composition root
+apps/orchestral-cli       CLI/TUI composition root and HTTP/SSE Host gateway
+web/orchestral-web        Dioxus/WASM PWA, including the embedded distribution
 examples/                 runnable Agent Session example
-testing/                  protocol conformance and property-test harnesses
+testing/                  protocol tests, coding-task evaluation, and Harbor adapter
 ```
 
 Concrete infrastructure belongs in `plugins/` and is wired by an application composition root;
@@ -396,11 +510,18 @@ core/runtime crates depend only on contracts.
 ## Development
 
 ```bash
-cargo build --workspace
-cargo test --workspace --all-targets
+cargo build --locked --workspace
+cargo test --locked --workspace --all-targets
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+bash scripts/check_workspace.sh
+bash scripts/check_agent_surface.sh
 ```
+
+CI checks Linux, macOS and Windows, SDK doctests, the WASM target, the rebuilt PWA in Chromium, and the
+Harbor adapter without model calls. Rebuild changed web sources with `scripts/build_web.sh`;
+see the [web development guide](web/orchestral-web/README.md). The
+[release process](RELEASING.md) describes packaging, upgrade checks, and optional live tests.
 
 ## Coding task evaluation
 

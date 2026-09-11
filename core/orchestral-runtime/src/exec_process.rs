@@ -202,6 +202,8 @@ struct PipeSession {
     stdout: Arc<SharedOutput>,
     stderr: Arc<SharedOutput>,
     process_group_id: Option<u32>,
+    #[cfg(windows)]
+    job: crate::windows_process_job::ProcessJob,
 }
 
 impl PipeSession {
@@ -225,6 +227,20 @@ impl PipeSession {
         let mut child = command
             .spawn()
             .map_err(|error| ExecProcessError::Io(error.to_string()))?;
+        #[cfg(windows)]
+        let job = match child
+            .raw_handle()
+            .ok_or_else(|| std::io::Error::other("child process handle unavailable"))
+            .and_then(crate::windows_process_job::ProcessJob::attach)
+        {
+            Ok(job) => job,
+            Err(error) => {
+                let _ = child.start_kill();
+                return Err(ExecProcessError::Io(format!(
+                    "could not supervise Windows process tree: {error}"
+                )));
+            }
+        };
         let process_group_id = child.id();
         let stdin = child.stdin.take();
         let stdout = child
@@ -245,6 +261,8 @@ impl PipeSession {
             stdout: stdout_buffer,
             stderr: stderr_buffer,
             process_group_id,
+            #[cfg(windows)]
+            job,
         }))
     }
 
@@ -336,6 +354,8 @@ impl PipeSession {
         self.stdin.lock().await.take();
         let mut child = self.child.lock().await;
         terminate_process_group(self.process_group_id);
+        #[cfg(windows)]
+        self.job.terminate();
         let _ = child.start_kill();
         let _ = child.wait().await;
     }

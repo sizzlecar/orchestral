@@ -5,7 +5,9 @@
 //! rename. A process crash may leave an unreferenced temporary/orphan data
 //! file, but never a committed metadata record that names incomplete bytes.
 
-use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
+use std::fs::File;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -232,6 +234,7 @@ impl BlobStore for FileBlobStore {
             remove_if_exists(&meta_path)?;
             remove_if_exists(&data_path)?;
             if existed {
+                #[cfg(unix)]
                 File::open(store.root.as_path())?.sync_all()?;
             }
             Ok(existed)
@@ -255,6 +258,7 @@ fn atomic_write(
         file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&temporary, destination)?;
+        #[cfg(unix)]
         File::open(root)?.sync_all()?;
         Ok::<(), std::io::Error>(())
     })();

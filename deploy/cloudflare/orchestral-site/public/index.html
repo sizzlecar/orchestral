@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Orchestral is an open-source coding agent for your terminal and workspace. Use cloud models or connect your own OpenAI-compatible server.">
+  <meta name="theme-color" content="#f5f4ee">
+  <title>Orchestral — Your workspace. Your models.</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/site.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="nav wrap">
+    <a class="brand" href="/" aria-label="Orchestral home"><span class="mark" aria-hidden="true">◒</span> Orchestral</a>
+    <nav aria-label="Main navigation"><a href="#install">Install</a><a href="#quickstart">Quick start</a><a href="https://github.com/sizzlecar/orchestral">GitHub <span aria-hidden="true">↗</span></a></nav>
+  </header>
+  <main id="main">
+    <section class="hero wrap">
+      <div class="hero-copy">
+        <p class="eyebrow">OPEN SOURCE · BUILT IN RUST</p>
+        <h1>Your workspace.<br>Your models.</h1>
+        <p class="intro">A coding agent for your terminal. Read code, make changes, and keep working in the same conversation — with a cloud model or your own server.</p>
+        <div class="hero-actions"><a class="button primary" href="#install">Get Orchestral <span aria-hidden="true">↓</span></a><a class="text-link" href="https://github.com/sizzlecar/orchestral">Explore the source <span aria-hidden="true">↗</span></a></div>
+        <p class="quiet">Terminal · Headless CLI · Mobile web control</p>
+      </div>
+      <div class="terminal" aria-label="Example terminal session">
+        <div class="terminal-bar"><span class="dots" aria-hidden="true">● ● ●</span><span>~/your-project</span><span>terminal</span></div>
+        <div class="terminal-body"><p><span class="prompt">$</span> orchestral</p><p class="terminal-label">ORCHESTRAL</p><p class="terminal-muted">Your project. One conversation.</p><div class="terminal-rule"></div><p><span class="prompt">›</span> Explain how requests reach the database.</p><p class="terminal-muted indent">Read the relevant files.<br>Follow the code across modules.<br>Ask a follow-up in the same session.</p><div class="terminal-rule"></div><p class="terminal-hint">/ commands &nbsp; @ files &nbsp; ctrl+c interrupt</p></div>
+        <p class="terminal-caption">Illustrative session · model responses vary</p>
+      </div>
+    </section>
+    <section class="principles wrap" aria-label="Why Orchestral">
+      <article><span class="index">01</span><h2>Choose the connection</h2><p>Use a supported cloud provider or an OpenAI-compatible endpoint on your machine or network.</p></article>
+      <article><span class="index">02</span><h2>Keep the conversation</h2><p>Return to a project, resume a session, and pick up with its recorded context and tool history.</p></article>
+      <article><span class="index">03</span><h2>Stay in control</h2><p>Inspect tool activity, answer requests, review approvals, and interrupt work from the terminal or web client.</p></article>
+    </section>
+    <section id="install" class="section wrap">
+      <div class="section-heading"><p class="eyebrow">01 / INSTALL</p><h2>A small start.</h2><p>Choose your platform. The installer uses a prebuilt binary, verifies its checksum, and installs it in your user directory.</p></div>
+      <div class="install-panel">
+        <p id="release-status" class="status" role="status"><span class="status-dot" aria-hidden="true"></span> v0.3.0 is being prepared. Use a source build until the first binary release.</p>
+        <div class="tabs" role="tablist" aria-label="Installation platform">
+          <button id="tab-unix" role="tab" aria-selected="true" aria-controls="panel-unix" tabindex="0">macOS / Linux</button>
+          <button id="tab-windows" role="tab" aria-selected="false" aria-controls="panel-windows" tabindex="-1">Windows</button>
+        </div>
+        <div id="panel-unix" role="tabpanel" aria-labelledby="tab-unix">
+          <p class="code-label">Shell · binary installer</p>
+          <div class="command"><pre><code id="install-unix">curl -fsSL https://orch.pandaailabs.com/install.sh | sh</code></pre><button class="copy" data-copy="install-unix" aria-label="Copy macOS or Linux install command">Copy</button></div>
+          <p class="platform-note">macOS Apple Silicon and Intel · Linux x64 with glibc 2.35+. Linux sandboxed commands also require <code>bubblewrap</code>.</p>
+          <a class="small-link" href="/install.sh">Read the Shell installer ↗</a>
+        </div>
+        <div id="panel-windows" role="tabpanel" aria-labelledby="tab-windows" hidden>
+          <p class="code-label">PowerShell · binary installer</p>
+          <div class="command"><pre><code id="install-windows">irm https://orch.pandaailabs.com/install.ps1 | iex</code></pre><button class="copy" data-copy="install-windows" aria-label="Copy Windows install command">Copy</button></div>
+          <p class="platform-note">Windows x64. Native shell commands require your approval. Use WSL for sandboxed commands; install with the Linux command inside WSL.</p>
+          <a class="small-link" href="/install.ps1">Read the PowerShell installer ↗</a>
+        </div>
+        <p id="installer-availability" class="availability">Binary installation becomes available when a public release is published. The scripts are available now for review.</p>
+        <details open id="source-build"><summary>Build from source</summary><p>The checkout pins its Rust toolchain. Rust and Git are required.</p><div class="command"><pre><code id="source-command">git clone https://github.com/sizzlecar/orchestral.git
+cd orchestral
+cargo install --locked --path apps/orchestral-cli</code></pre><button class="copy" data-copy="source-command" aria-label="Copy source build commands">Copy</button></div><p class="platform-note">Source builds follow the public main branch. See its README for the commands it supports.</p></details>
+      </div>
+    </section>
+    <section id="quickstart" class="section wrap quickstart">
+      <div class="section-heading"><p class="eyebrow">02 / FIRST SESSION</p><h2>Make the connection.</h2><p>Open a terminal in your project. Choose a provider, then start a conversation.</p></div>
+      <div class="guide-grid">
+        <article class="guide"><span class="tag">CLOUD API</span><h3>Bring your API key</h3><p>For OpenAI, set a key and launch Orchestral. Keys stay in your environment.</p><p class="code-label">macOS / Linux</p><div class="command"><pre><code id="cloud-unix">export OPENAI_API_KEY="your-api-key"
+orchestral</code></pre><button class="copy" data-copy="cloud-unix" aria-label="Copy Shell cloud setup">Copy</button></div><p class="code-label">PowerShell</p><div class="command"><pre><code id="cloud-windows">$env:OPENAI_API_KEY="your-api-key"
+orchestral</code></pre><button class="copy" data-copy="cloud-windows" aria-label="Copy PowerShell cloud setup">Copy</button></div></article>
+        <article class="guide"><span class="tag">LOCAL API · v0.3.0</span><h3>Point to your server</h3><p>Connect an OpenAI-compatible server. A single available model is selected automatically; with several models, choose one using <code>--model</code>.</p><div class="command"><pre><code id="local-command">orchestral --base-url http://127.0.0.1:8000/v1</code></pre><button class="copy" data-copy="local-command" aria-label="Copy local API command">Copy</button></div><p>Custom URLs default to no authentication. If your server requires a key, add <code>--api-key-env YOUR_KEY_VARIABLE</code>.</p><p class="code-label">Check the connection without generating a response</p><div class="command"><pre><code id="doctor-command">orchestral --base-url http://127.0.0.1:8000/v1 doctor --check-connection</code></pre><button class="copy" data-copy="doctor-command" aria-label="Copy connection check command">Copy</button></div></article>
+      </div>
+      <p class="footnote">The local API shortcut and connection check are part of the v0.3.0 release in preparation. Your server and model must support tool calling to perform coding actions.</p>
+    </section>
+    <section class="section wrap next-steps">
+      <div><p class="eyebrow">03 / KEEP GOING</p><h2>Start with the work.</h2></div>
+      <div class="next-grid"><a href="https://github.com/sizzlecar/orchestral#quick-start"><strong>Usage & configuration <span aria-hidden="true">↗</span></strong><span>Models, sessions, tools, and everyday commands.</span></a><a href="https://github.com/sizzlecar/orchestral#mobile-control-pwa"><strong>Mobile web control <span aria-hidden="true">↗</span></strong><span>Run your local host and pair a browser.</span></a><a href="https://github.com/sizzlecar/orchestral/releases"><strong>Releases <span aria-hidden="true">↗</span></strong><span>Published versions and downloadable assets.</span></a><a href="https://github.com/sizzlecar/orchestral/issues"><strong>Report an issue <span aria-hidden="true">↗</span></strong><span>Share your version, platform, and reproduction steps.</span></a></div>
+    </section>
+  </main>
+  <footer class="wrap"><a class="brand" href="/">Orchestral</a><p>By Panda AI Labs · Open source under MIT</p><a href="https://github.com/sizzlecar/orchestral/blob/main/README.zh-CN.md" lang="zh-CN">中文文档 ↗</a></footer>
+  <div id="copy-status" class="sr-only" role="status" aria-live="polite"></div>
+</body>
+</html>

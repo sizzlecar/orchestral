@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(target_os = "macos")]
 use std::path::{Path, PathBuf};

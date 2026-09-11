@@ -234,7 +234,7 @@ async fn build_agent_host_with_journals(
     )?;
     let config = load_config(&config_path)
         .with_context(|| format!("load Generic Agent config '{}'", config_path.display()))?;
-    let (backend, profile, model, temperature) = resolve_model(&config)?;
+    let (backend, profile, model, temperature) = resolve_model(&config).await?;
     let max_output_tokens = profile
         .as_ref()
         .and_then(|profile| profile.max_tokens)
@@ -288,6 +288,7 @@ async fn build_agent_host_with_journals(
     let workspace_context = serde_json::json!({
         "primary": workspaces.primary,
         "additional": workspaces.additional,
+        "os": std::env::consts::OS,
     });
     agent_config.system_prompt.push_str(&format!(
         "\n\n<environment_context>\n  <cwd>{}</cwd>\n  <workspace_roots>{}</workspace_roots>\n</environment_context>",
@@ -528,10 +529,7 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
         let history = host.session_history.read(&session_id).await?;
         match entry_mode {
             EntryMode::HeadlessPrompt(input) => {
-                eprintln!(
-                    "Generic Agent: backend={} model={}",
-                    host.backend_name, host.model
-                );
+                eprintln!("Model: {} (provider: {})", host.model, host.backend_name);
                 let mut lines = BufReader::new(tokio::io::stdin()).lines();
                 run_turn(
                     &client,
@@ -545,10 +543,7 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
                 .await
             }
             EntryMode::HeadlessPipe => {
-                eprintln!(
-                    "Generic Agent: backend={} model={}",
-                    host.backend_name, host.model
-                );
+                eprintln!("Model: {} (provider: {})", host.model, host.backend_name);
                 let mut input = String::new();
                 tokio::io::stdin()
                     .read_to_string(&mut input)
@@ -1009,10 +1004,13 @@ fn build_cli_tool_runtime(
 fn command_runtime_temp_root(workspace_roots: &BTreeSet<String>) -> anyhow::Result<PathBuf> {
     // Leave room for tools that create Unix sockets below TMPDIR. The macOS
     // per-user OS temp prefix alone can consume much of sockaddr_un.sun_path.
-    let mut candidates = Vec::new();
-    #[cfg(unix)]
-    candidates.extend([PathBuf::from("/tmp"), PathBuf::from("/var/tmp")]);
-    candidates.push(std::env::temp_dir());
+    let candidates = vec![
+        #[cfg(unix)]
+        PathBuf::from("/tmp"),
+        #[cfg(unix)]
+        PathBuf::from("/var/tmp"),
+        std::env::temp_dir(),
+    ];
     let parent = candidates
         .into_iter()
         .filter_map(|path| std::fs::canonicalize(path).ok())
@@ -1053,8 +1051,24 @@ fn configured_exec_host(config: &OrchestralConfig) -> anyhow::Result<Option<CliE
     } else if let Some(shell) = std::env::var_os("SHELL").filter(|shell| !shell.is_empty()) {
         PathBuf::from(resolve_host_program(&shell.to_string_lossy())?)
     } else {
-        ["/bin/zsh", "/bin/bash", "/bin/sh"]
-            .into_iter()
+        #[cfg(windows)]
+        let candidates = {
+            let mut paths = vec!["pwsh.exe".to_owned(), "powershell.exe".to_owned()];
+            if let Some(root) = std::env::var_os("SystemRoot") {
+                paths.push(
+                    PathBuf::from(root)
+                        .join("System32/WindowsPowerShell/v1.0/powershell.exe")
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            paths.push("cmd.exe".to_owned());
+            paths
+        };
+        #[cfg(not(windows))]
+        let candidates = ["/bin/zsh", "/bin/bash", "/bin/sh"];
+        candidates
+            .iter()
             .find_map(|candidate| resolve_host_program(candidate).ok())
             .map(PathBuf::from)
             .context("no command shell is available; set tools.exec.shell")?
@@ -1062,6 +1076,14 @@ fn configured_exec_host(config: &OrchestralConfig) -> anyhow::Result<Option<CliE
     let environment_names = [
         "PATH",
         "HOME",
+        "USERPROFILE",
+        "SystemRoot",
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "APPDATA",
+        "LOCALAPPDATA",
         "USER",
         "LANG",
         "LC_ALL",
@@ -1407,7 +1429,7 @@ fn host_executable_file(candidate: &Path) -> bool {
     }
 }
 
-fn resolve_model(
+async fn resolve_model(
     config: &OrchestralConfig,
 ) -> anyhow::Result<(
     orchestral_core::config::BackendSpec,
@@ -1446,8 +1468,11 @@ fn resolve_model(
         .agent
         .model
         .clone()
-        .or_else(|| profile.as_ref().map(|profile| profile.model.clone()))
-        .context("no model configured for the selected backend")?;
+        .or_else(|| profile.as_ref().map(|profile| profile.model.clone()));
+    let model = match model {
+        Some(model) => model,
+        None => crate::openai_connection::discover_single_model(&backend).await?,
+    };
     let candidate = config
         .agent
         .temperature
@@ -1544,9 +1569,7 @@ fn build_model_backend(
             Ok((backend.clone(), backend))
         }
         "openai" | "openrouter" | "deepseek" | "groq" | "xai" | "mistral" => {
-            let api_key = backend
-                .resolve_api_key()
-                .with_context(|| format!("resolve API key for backend '{}'", backend.name))?;
+            let api_key = crate::openai_connection::api_key(backend)?;
             let endpoint = backend.endpoint.clone().or_else(|| match backend.kind.as_str() {
                 "openai" => Some("https://api.openai.com/v1".to_owned()),
                 "deepseek" => Some("https://api.deepseek.com".to_owned()),

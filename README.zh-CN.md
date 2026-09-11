@@ -1,67 +1,131 @@
 # Orchestral
 
-一个 AI 中立、可安全执行、可持久恢复、可交互的单 Agent 运行时。
+在终端和工作区里使用的编程 Agent。阅读代码、修改文件、接着上次的会话继续工作，模型可以来自云端，也可以是你自己部署的 OpenAI 兼容服务。
 
-[English Version](./README.md)
+提供终端界面、无交互 CLI、浏览器远程控制，以及可嵌入应用的 Rust SDK。
 
-> 当前状态：Agent Foundation 仍在持续实现。本阶段只完成完整的单 Agent 协议与运行时，
-> 不包含 Goal Compiler、Task Broker 或多 Agent 编排。
+[官网](https://orch.pandaailabs.com) · [English](./README.md)
 
-## 当前已经具备什么
+> 0.3 系列是 1.0 之前的 Agent Foundation 版本，公共 API 和恢复身份可能随版本变化。
+> 从 0.2 升级需要调整 CLI 调用、配置和 SDK 接入，详见[版本说明](CHANGELOG.md)。
 
-- **Agent Protocol v1**：版本化 Run/Session 合同、Command、持久事件、Inspect、Cancel、
-  Recovery，以及唯一终态投影。
-- **Generic Agent**：CLI、SDK、API 共用同一套 AI 中立的
-  `Model → Tool/Workflow → Model` 循环。
-- **模型适配器**：OpenAI-compatible 与 Gemini Native 统一实现
-  [`ModelBackend` 合同](testing/orchestral-model-protocol-testkit/README.md)并通过同一
-  conformance suite。
-- **Guarded Tool Runtime**：Host 持有权限策略、审批 capability、取消、Effect Journal、
-  Artifact spill，并对 `UnknownEffect` 保守停机。
-- **两套独立扩展面**：Skill 只把受信任指令加入 Context；MCP Tool 只进入 Action Plane，
-  且必须经过统一 Guarded Runtime。
-- **可选 Workflow 策略**：复杂调用复用类型化 Plan Normalizer、DAG 和 Executor；Workflow
-  从属于 Agent Run，不能产生第二个顶层终态。
-- **持久上下文**：Run、Session、Tool Effect、Generic Agent checkpoint 都可使用文件插件，
-  并支持进程替换后的恢复。
+[安装](#安装) · [快速开始](#快速开始) · [手机控制](#手机控制-pwa) ·
+[SDK](#sdk) · [评测](#编码任务评测) · [发布流程](RELEASING.md)
 
-```text
-CLI / SDK / API
-      │
-      ▼
-AgentController ── Agent Protocol + 持久 Run Journal
-      │
-      ▼
-Generic Agent ─── ModelBackend + 持久 Session Context
-      │
-      ├── 直接 Tool ───────────────────────────┐
-      └── 可选注入的 Workflow → Plan/DAG ──────┤
-                                    ▼
-                         GuardedToolRuntime
-                           ├── 内置 Tools
-                           └── MCP Tools（stdio / Streamable HTTP）
+## 安装
+
+**v0.3.0 正在准备发布。** 当前工作区包含新的安装与本地 API 接入功能；一键安装器需要
+首个公开发布包。发布前，请从当前源码工作区安装：
+
+```sh
+cargo install --locked --path apps/orchestral-cli
+orchestral --version
 ```
+
+仓库固定使用 Rust 1.91.0，安装后的命令名是 `orchestral`。浏览器客户端已嵌入二进制，
+普通构建不需要 Node.js 或 Dioxus CLI。
+
+公开版本发布后，可使用对应平台的一键安装命令：
+
+**macOS / Linux**
+
+```sh
+curl -fsSL https://orch.pandaailabs.com/install.sh | sh
+```
+
+**Windows PowerShell**
+
+```powershell
+irm https://orch.pandaailabs.com/install.ps1 | iex
+```
+
+安装器会校验 SHA-256、安装到用户目录并配置 PATH。重复执行即可升级，已有配置与会话
+会保留。指定版本、回退及卸载方式见[安装器说明](RELEASING.md#installers)。
+
+| 平台 | 发布包 | 命令执行方式 |
+| --- | --- | --- |
+| macOS Apple Silicon / Intel | `.tar.gz` | 使用系统 Seatbelt 沙箱 |
+| Linux x64，glibc 2.35+ | `.tar.gz` | 需要 `bubblewrap`，系统须允许非特权用户命名空间 |
+| Windows x64 | `.zip` | 原生命令逐条审批后执行；需要沙箱时使用 WSL |
+
+原生 Windows 的 MCP 服务使用 Streamable HTTP；本地 stdio MCP 需要 WSL，因为原生
+Windows 尚未实现它所需的进程沙箱。
+
+Ubuntu 可执行 `sudo apt-get install bubblewrap` 安装沙箱后端。手动或离线安装时，从
+[GitHub Releases](https://github.com/sizzlecar/orchestral/releases) 下载对应归档及 `.sha256`
+文件。各平台的发布要求见[接入与发布清单](docs/product/user-onboarding-release-v0.3.0.md)。
 
 ## 快速开始
 
-导出任意一个已配置模型的密钥：
+以 OpenAI 为例，设置模型密钥：
 
 ```bash
-export OPENAI_API_KEY="..."
-# 或 GOOGLE_API_KEY / OPENROUTER_API_KEY / DEEPSEEK_API_KEY
+export OPENAI_API_KEY="your-api-key"
 ```
+
+PowerShell 中使用 `$env:OPENAI_API_KEY="your-api-key"`。
 
 执行单轮任务：
 
 ```bash
-cargo run -p orchestral-cli -- "总结这个仓库的公共 API"
+orchestral "总结这个仓库的公共 API"
 ```
 
 进入全屏交互式 Agent Session：
 
 ```bash
-cargo run -p orchestral-cli --
+orchestral
 ```
+
+### 使用自己的 OpenAI 兼容服务
+
+无鉴权服务不需要手写 YAML，也不需要占位 API Key：
+
+```sh
+orchestral --base-url http://127.0.0.1:8000/v1
+```
+
+支持服务根 URL、`/v1` 基址或完整 `/chat/completions` 地址。服务只提供一个模型时自动
+选用；有多个模型时会列出可选名称，由你明确指定：
+
+```sh
+orchestral --base-url http://127.0.0.1:8000/v1 --model your-model-id
+```
+
+也可以设置 `OPENAI_BASE_URL` 和 `OPENAI_MODEL` 环境变量。命令行参数优先；显式指定
+`--backend` 或 `--model-profile` 时，不使用 URL 环境变量。
+
+自定义 URL 默认**不发送鉴权信息**，也不会继承已有云端密钥。服务或网关需要鉴权时，
+先在环境中设置密钥，再指定它的变量名：
+
+```sh
+orchestral --base-url https://your-gateway.example/v1 --api-key-env LOCAL_MODEL_API_KEY --model your-model-id
+```
+
+在 YAML 中，无鉴权 provider 使用 `endpoint` 和 `config: { auth: none }`；默认鉴权模式
+是 `api_key`。编程操作还需要模型具备工具调用能力，仅接口兼容不代表模型一定支持。
+
+检查配置，或在不生成回答的情况下查询模型列表：
+
+```sh
+orchestral doctor
+orchestral --base-url http://127.0.0.1:8000/v1 doctor --check-connection
+```
+
+`doctor --json` 输出隐藏密钥值的诊断报告。普通 `doctor` 不发送网络请求、不创建配置
+文件。开始会话时，沿用检查时的连接参数。
+
+### 其他模型与日常操作
+
+
+也可显式选择其他模型：
+
+```bash
+export GOOGLE_API_KEY="..."
+orchestral --model-profile gemini-2.5-flash "检查这个工作区"
+```
+
+在源码仓库中也可运行 `cargo run --locked -p orchestral-cli -- "检查这个工作区"`。
 
 根命令本身就是 Agent 入口，不存在 `agent` 子命令。入口选择是确定性的：
 
@@ -97,12 +161,12 @@ Ctrl+D 退出，或使用 `/quit` 停止并退出。审批须用 `a`/`d`，或�
 
 CLI 依次发现 `.orchestral/config.yaml`、`.orchestral/config.yml`、
 `configs/orchestral.cli.yaml`、`orchestral.yaml`；都不存在时会生成
-`.orchestral/config.yaml`。可以用 `--config`、`--backend`、`--model-profile` 或
+`.orchestral/generated/default.agent.yaml`。可以用 `--config`、`--backend`、`--model-profile` 或
 `--model` 显式选择，例如：
 
 ```bash
 orchestral --backend deepseek --model deepseek-chat "检查这个 crate"
-orchestral --backend google --model gemini-3.1-pro-preview "检查这个 crate"
+orchestral --backend google --model gemini-2.5-flash "检查这个 crate"
 ```
 
 OpenAI-compatible 厂商读取配置中对应的密钥环境变量。Google 可通过 `GOOGLE_API_KEY`
@@ -203,7 +267,7 @@ Journal 都仍由 Host 持有。
 在本机浏览器开发时可直接运行：
 
 ```bash
-orchestral serve --pair --backend google --model gemini-3.1-pro-preview -C /path/to/workspace
+orchestral serve --pair --backend google --model gemini-2.5-flash -C /path/to/workspace
 ```
 
 手机访问时，应通过受信任的反向代理或私网 Relay 终止 HTTPS，并把浏览器实际访问地址告诉
@@ -212,7 +276,7 @@ Host：
 ```bash
 orchestral serve --pair \
   --public-url https://agent.example.com \
-  --backend google --model gemini-3.1-pro-preview \
+  --backend google --model gemini-2.5-flash \
   -C /path/to/workspace
 ```
 
@@ -237,10 +301,13 @@ orchestral "修复当前 workspace 中失败的项目，运行测试，并报告
 workspace root 或审批权限。`file_read`、`apply_patch`、`exec_command` / `write_stdin` 和
 MCP 调用都继续经过 Host policy 与 Effect Journal。
 
-`exec_command` 只启动 Host 解析并批准的 shell，但允许它在 OS sandbox 内运行普通子进程和
+在 macOS 和 Linux 上，`exec_command` 只启动 Host 解析并批准的 shell，但允许它在 OS sandbox 内运行普通子进程和
 本地工具链，不要求逐个配置程序白名单。真正的边界是 Host 批准的读写根目录、精确网络目标、
 捕获的环境变量、时间/输出上限、逐次审批与 Effect Journal。默认不继承完整宿主环境，并关闭
 网络；MCP stdio 的启动程序仍必须由 Host 明确配置。模型可见参数不能扩大任何权限。
+
+原生 Windows 命令在逐次审批后以当前用户的系统权限运行；具备进程管理和时间/输出限制，
+但没有文件系统或网络隔离。
 
 命令的临时文件位于仓库外、由 Host 管理的私有目录。`TMPDIR`、`TMP`、`TEMP` 指向当前
 Run 的专用子目录，同一 Run 内可共享，沙箱不能访问其他 Run 的子目录。进程使用期间
@@ -273,6 +340,44 @@ mcp:
   import_files: [.mcp.json]
 ```
 
+## 架构
+
+- **Agent Protocol v1**：版本化 Run/Session 合同、Command、持久事件、Inspect、Cancel、
+  Recovery，以及唯一终态投影。
+- **Generic Agent**：CLI、SDK、API 共用同一套 AI 中立的
+  `Model → Tool/Workflow → Model` 循环。
+- **模型适配器**：OpenAI-compatible 与 Gemini Native 统一实现
+  [`ModelBackend` 合同](testing/orchestral-model-protocol-testkit/README.md)并通过同一
+  conformance suite。
+- **Guarded Tool Runtime**：Host 持有权限策略、审批 capability、取消、Effect Journal、
+  Artifact spill，并对 `UnknownEffect` 保守停机。
+- **两套独立扩展面**：Skill 只把受信任指令加入 Context；MCP Tool 只进入 Action Plane，
+  且必须经过统一 Guarded Runtime。
+- **可选 Workflow 策略**：复杂调用复用类型化 Plan Normalizer、DAG 和 Executor；Workflow
+  从属于 Agent Run，不能产生第二个顶层终态。
+- **持久上下文**：Run、Session、Tool Effect、Generic Agent checkpoint 都可使用文件插件，
+  并支持进程替换后的恢复。
+- **交互客户端**：终端 TUI 和内嵌 Dioxus/WASM 手机 PWA，支持历史会话、提问、审批、
+  Steer 和取消。
+- **外部 Agent 接入**：应用已装配 Codex connector；SDK Host 可显式注册 ACP 插件。
+
+```text
+CLI / SDK / API
+      │
+      ▼
+AgentController ── Agent Protocol + 持久 Run Journal
+      │
+      ▼
+Generic Agent ─── ModelBackend + 持久 Session Context
+      │
+      ├── 直接 Tool ───────────────────────────┐
+      └── 可选注入的 Workflow → Plan/DAG ──────┤
+                                    ▼
+                         GuardedToolRuntime
+                           ├── 内置 Tools
+                           └── MCP Tools（stdio / Streamable HTTP）
+```
+
 ## SDK
 
 公共 SDK 就是 Agent 控制面：`AgentClient` 启动 Run，`AgentRunHandle` 提供事件订阅、
@@ -303,9 +408,10 @@ core/orchestral-core      Agent/Model/Tool/Skill/MCP 合同与确定性 Plan/DAG
 core/orchestral-runtime   Agent 控制面、Generic Agent、Context、Guarded Tool、Workflow 桥接
 core/orchestral           对外 re-export core/runtime 公共 API 的 facade
 plugins/                  文件 Journal/Blob Store 与具体模型 Adapter
-apps/orchestral-cli       对话式 CLI composition root
+apps/orchestral-cli       CLI/TUI 装配与 HTTP/SSE Host 网关
+web/orchestral-web        Dioxus/WASM PWA 及内嵌构建产物
 examples/                 可运行的 Agent Session 示例
-testing/                  协议一致性与属性测试 harness
+testing/                  协议测试、编码任务评测与 Harbor 适配器
 ```
 
 具体基础设施实现放在 `plugins/`，由应用层 composition root 装配；core/runtime 只依赖合同。
@@ -313,11 +419,18 @@ testing/                  协议一致性与属性测试 harness
 ## 开发
 
 ```bash
-cargo build --workspace
-cargo test --workspace --all-targets
+cargo build --locked --workspace
+cargo test --locked --workspace --all-targets
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+bash scripts/check_workspace.sh
+bash scripts/check_agent_surface.sh
 ```
+
+CI 覆盖 Linux、macOS、Windows、SDK 文档示例、WASM 目标、重新构建的 PWA Chromium 测试和无需
+模型调用的 Harbor 测试。修改 Web 源码后运行 `scripts/build_web.sh`，详见
+[Web 开发说明](web/orchestral-web/README.md)。打包、升级检查和可选真实模型验证见
+[发布流程](RELEASING.md)。
 
 ## 编码任务评测
 

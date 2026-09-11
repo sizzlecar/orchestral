@@ -125,8 +125,14 @@ type SharedOutput = Arc<(Mutex<PtyOutputBuffer>, Condvar)>;
 
 struct PtyProcess {
     writer: Option<Box<dyn Write + Send>>,
+    // Reader/writer clones own pipes on Windows, not the ConPTY itself.
+    #[cfg(windows)]
+    master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
+    #[cfg(unix)]
     process_group_id: Option<u32>,
+    #[cfg(windows)]
+    job: crate::windows_process_job::ProcessJob,
     output: SharedOutput,
     last_activity: Instant,
     reader_thread: Option<std::thread::JoinHandle<()>>,
@@ -159,15 +165,43 @@ impl PtyProcess {
         for (key, value) in &spec.environment {
             command.env(key, value);
         }
-        let child = pty_pair
+        #[allow(unused_mut)]
+        let mut child = pty_pair
             .slave
             .spawn_command(command)
             .map_err(|error| PtyProcessError::Io(error.to_string()))?;
+        #[cfg(unix)]
         let process_group_id = child.process_id();
-        let writer = pty_pair
+        #[cfg(windows)]
+        let job = match child
+            .as_raw_handle()
+            .ok_or_else(|| std::io::Error::other("PTY process handle unavailable"))
+            .and_then(crate::windows_process_job::ProcessJob::attach)
+        {
+            Ok(job) => job,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(PtyProcessError::Io(format!(
+                    "could not supervise Windows PTY process tree: {error}"
+                )));
+            }
+        };
+        #[allow(unused_mut)]
+        let mut writer = pty_pair
             .master
             .take_writer()
             .map_err(|error| PtyProcessError::Io(error.to_string()))?;
+        // portable-pty creates ConPTY with INHERIT_CURSOR. This new virtual
+        // terminal starts at row/column one; answer its startup cursor query
+        // before polling output, otherwise the child waits indefinitely.
+        #[cfg(windows)]
+        {
+            writer
+                .write_all(b"\x1b[1;1R")
+                .and_then(|()| writer.flush())
+                .map_err(|error| PtyProcessError::Io(error.to_string()))?;
+        }
         let mut reader = pty_pair
             .master
             .try_clone_reader()
@@ -200,8 +234,13 @@ impl PtyProcess {
         });
         Ok(Self {
             writer: Some(writer),
+            #[cfg(windows)]
+            master: Some(pty_pair.master),
             child,
+            #[cfg(unix)]
             process_group_id,
+            #[cfg(windows)]
+            job,
             output,
             last_activity: Instant::now(),
             reader_thread: Some(reader_thread),
@@ -245,6 +284,8 @@ impl PtyProcess {
 
     fn terminate(&mut self) {
         self.writer.take();
+        #[cfg(windows)]
+        self.job.terminate();
         #[cfg(unix)]
         if let Some(process_group_id) = self
             .process_group_id
@@ -258,6 +299,8 @@ impl PtyProcess {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+        #[cfg(windows)]
+        self.master.take();
         if let Some(reader_thread) = self.reader_thread.take() {
             let _ = reader_thread.join();
         }

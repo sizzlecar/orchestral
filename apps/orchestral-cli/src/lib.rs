@@ -3,11 +3,13 @@
 pub mod agent;
 mod agent_connectors;
 mod cli;
+mod doctor;
 mod envfile;
 mod google_auth;
 mod local_sessions;
 mod mcp_command;
 mod mcp_config;
+mod openai_connection;
 pub mod remote;
 mod runtime;
 mod session_command;

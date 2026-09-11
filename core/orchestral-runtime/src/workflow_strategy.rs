@@ -103,7 +103,7 @@ impl WorkflowExecutionRequest {
 /// Result of one normalized DAG execution.
 ///
 /// The caller remains the Agent Run owner and decides how to journal or expose
-/// this snapshot. The legacy `Task` type is not made authoritative here.
+/// this snapshot; it does not define a separate Run terminal state.
 #[derive(Debug)]
 pub struct WorkflowExecutionSnapshot {
     pub result: ExecutionResult,

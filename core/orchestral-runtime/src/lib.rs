@@ -17,6 +17,8 @@ pub mod session_history;
 pub mod skill;
 pub mod tool_runtime;
 pub mod tools;
+#[cfg(windows)]
+mod windows_process_job;
 pub mod workflow_strategy;
 
 pub use agent_control::{AgentControlError, AgentControlEvent, AgentController};

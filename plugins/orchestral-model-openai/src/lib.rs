@@ -1,5 +1,8 @@
 //! OpenAI-compatible HTTP adapter for the canonical Orchestral Model Protocol.
 
+mod endpoint;
+pub use endpoint::{discover_models, OpenAiEndpoint};
+
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
@@ -22,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 pub struct OpenAiCompatibleConfig {
     pub backend_id: String,
     pub endpoint: String,
+    /// Bearer credential. An empty string explicitly selects unauthenticated HTTP.
     pub api_key: String,
     pub model: String,
     pub temperature: f32,
@@ -38,7 +42,6 @@ impl OpenAiCompatibleConfig {
     pub fn validate(&self) -> Result<(), ModelError> {
         if self.backend_id.trim().is_empty()
             || self.endpoint.trim().is_empty()
-            || self.api_key.trim().is_empty()
             || self.model.trim().is_empty()
             || !(0.0..=2.0).contains(&self.temperature)
             || self.default_max_output_tokens == 0
@@ -49,16 +52,14 @@ impl OpenAiCompatibleConfig {
                 "invalid OpenAI-compatible ModelBackend configuration",
             ));
         }
+        OpenAiEndpoint::parse(&self.endpoint)?;
         Ok(())
     }
 
     fn completions_url(&self) -> String {
-        let endpoint = self.endpoint.trim_end_matches('/');
-        if endpoint.ends_with("/chat/completions") {
-            endpoint.to_owned()
-        } else {
-            format!("{endpoint}/chat/completions")
-        }
+        OpenAiEndpoint::parse(&self.endpoint)
+            .expect("configuration was validated")
+            .completions_url()
     }
 }
 
@@ -210,14 +211,14 @@ impl ModelBackend for OpenAiCompatibleBackend {
         request.validate()?;
         self.descriptor().validate()?;
         let body = self.build_request_body(&request)?;
+        let mut http_request = self.client.post(self.config.completions_url()).json(&body);
+        if !self.config.api_key.is_empty() {
+            http_request = http_request.bearer_auth(&self.config.api_key);
+        }
         let response = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(cancelled_error()),
-            response = self.client
-                .post(self.config.completions_url())
-                .bearer_auth(&self.config.api_key)
-                .json(&body)
-                .send() => response,
+            response = http_request.send() => response,
         }
         .map_err(map_transport_error)?;
         let status = response.status();
@@ -323,6 +324,7 @@ impl SseDecoder {
 #[derive(Default)]
 struct OpenAiToolCallState {
     call_id: Option<ModelToolCallId>,
+    native_call_id: Option<String>,
     name: String,
     started: bool,
     ended: bool,
@@ -440,7 +442,7 @@ impl OpenAiStreamState {
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
         {
-            let incoming = ModelToolCallId::new(id);
+            let incoming = scoped_tool_call_id(&self.request_id, id);
             if state
                 .call_id
                 .as_ref()
@@ -451,6 +453,7 @@ impl OpenAiStreamState {
                 ));
             }
             state.call_id = Some(incoming);
+            state.native_call_id = Some(id.to_owned());
         }
         if let Some(name) = fragment.pointer("/function/name").and_then(Value::as_str) {
             state.name.push_str(name);
@@ -472,12 +475,15 @@ impl OpenAiStreamState {
             None
         };
         let call_id = state.call_id.clone();
+        let native_call_id = state.native_call_id.clone();
         if let Some((call_id, name)) = start {
             self.emitted_content = true;
             self.emit(ModelEvent::ToolCallStart {
                 call_id,
                 name,
-                extensions: BTreeMap::new(),
+                extensions: native_tool_call_extensions(
+                    native_call_id.expect("started call has native identity"),
+                ),
             })?;
         }
         if let Some(delta) = arguments {
@@ -609,7 +615,53 @@ fn map_finish_reason(reason: &str) -> ModelFinishReason {
     }
 }
 
+const OPENAI_TOOL_CALL_ID_EXTENSION: &str = "openai/tool_call_id";
+
+// Some compatible servers reuse native call IDs across completions. Scope the
+// canonical identity to the logical request so distinct model steps cannot
+// collide in the Run's effect journal. Retries of that request stay identical.
+fn scoped_tool_call_id(request_id: &ModelRequestId, native_call_id: &str) -> ModelToolCallId {
+    let identity = serde_json::to_vec(&(request_id.as_str(), native_call_id))
+        .expect("tool identity strings serialize");
+    ModelToolCallId::new(format!("openai-{}", Digest::sha256(identity).as_str()))
+}
+
+fn native_tool_call_extensions(native_call_id: String) -> BTreeMap<String, Value> {
+    BTreeMap::from([(
+        OPENAI_TOOL_CALL_ID_EXTENSION.to_owned(),
+        Value::String(native_call_id),
+    )])
+}
+
 fn encode_messages(messages: &[ModelMessage]) -> Result<Vec<Value>, ModelError> {
+    // Native continuation IDs survive journaling in provider-owned metadata.
+    // Older history without this metadata already contains native IDs.
+    let mut native_ids = BTreeMap::new();
+    for message in messages {
+        for content in &message.content {
+            if let ModelContent::ToolCall {
+                call_id,
+                extensions,
+                ..
+            } = content
+            {
+                if let Some(native_id) = extensions
+                    .get(OPENAI_TOOL_CALL_ID_EXTENSION)
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                {
+                    native_ids.insert(call_id.as_str(), native_id);
+                }
+            }
+        }
+    }
+    let wire_call_id = |call_id: &ModelToolCallId| {
+        native_ids
+            .get(call_id.as_str())
+            .copied()
+            .unwrap_or(call_id.as_str())
+            .to_owned()
+    };
     let mut encoded = Vec::new();
     for message in messages {
         match message.role {
@@ -634,7 +686,7 @@ fn encode_messages(messages: &[ModelMessage]) -> Result<Vec<Value>, ModelError> 
                             arguments,
                             ..
                         } => calls.push(json!({
-                            "id": call_id.as_str(),
+                            "id": wire_call_id(call_id),
                             "type": "function",
                             "function": {
                                 "name": name,
@@ -685,7 +737,7 @@ fn encode_messages(messages: &[ModelMessage]) -> Result<Vec<Value>, ModelError> 
                     };
                     encoded.push(json!({
                         "role": "tool",
-                        "tool_call_id": call_id.as_str(),
+                        "tool_call_id": wire_call_id(call_id),
                         "content": json!({"result": result, "is_error": is_error}).to_string(),
                     }));
                 }
@@ -767,12 +819,12 @@ fn parse_response(
             .and_then(Value::as_str)
             .filter(|arguments| !arguments.is_empty())
             .unwrap_or("{}");
-        let call_id = ModelToolCallId::new(id);
+        let call_id = scoped_tool_call_id(&request.request_id, id);
         payloads.extend([
             ModelEvent::ToolCallStart {
                 call_id: call_id.clone(),
                 name: name.to_owned(),
-                extensions: BTreeMap::new(),
+                extensions: native_tool_call_extensions(id.to_owned()),
             },
             ModelEvent::ToolCallArgumentsDelta {
                 call_id: call_id.clone(),
@@ -1182,6 +1234,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reused_native_tool_ids_are_scoped_and_round_trip_through_history() {
+        let mut calls = Vec::new();
+        for request_id in ["step-1", "step-2", "step-1"] {
+            let mut request = request();
+            request.request_id = ModelRequestId::new(request_id);
+            let payload = json!({"choices": [{
+                "delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "reused-native-id",
+                    "function": {"name": "echo", "arguments": "{\"value\":1}"}
+                }]},
+                "finish_reason": "tool_calls"
+            }]});
+            let wire = format!("data: {payload}\n\ndata: [DONE]\n\n");
+            let events = openai_event_stream(
+                request,
+                stream::iter([Ok(Bytes::from(wire))]).boxed(),
+                CancellationToken::new(),
+                128,
+            )
+            .collect::<Vec<_>>()
+            .await;
+            assert!(events.iter().all(Result::is_ok));
+            let (call_id, extensions) = events
+                .into_iter()
+                .find_map(|event| match event.unwrap().payload {
+                    ModelEvent::ToolCallStart {
+                        call_id,
+                        extensions,
+                        ..
+                    } => Some((call_id, extensions)),
+                    _ => None,
+                })
+                .expect("tool call start");
+            calls.push((call_id, extensions));
+        }
+        assert_ne!(
+            calls[0].0, calls[1].0,
+            "different requests must not collide"
+        );
+        assert_eq!(calls[0], calls[2], "replaying a request keeps its identity");
+
+        let mut history = Vec::new();
+        for (call_id, extensions) in calls.into_iter().take(2) {
+            history.push(ModelMessage {
+                role: ModelRole::Assistant,
+                content: vec![ModelContent::ToolCall {
+                    call_id: call_id.clone(),
+                    name: "echo".to_owned(),
+                    arguments: json!({"value": 1}),
+                    extensions,
+                }],
+            });
+            history.push(ModelMessage {
+                role: ModelRole::Tool,
+                content: vec![ModelContent::ToolResult {
+                    call_id,
+                    result: json!({"value": 1}),
+                    is_error: false,
+                }],
+            });
+        }
+        // Continuation metadata must survive a process restart, not depend on
+        // an adapter-instance lookup table.
+        let saved = serde_json::to_vec(&history).unwrap();
+        let restored = serde_json::from_slice::<Vec<ModelMessage>>(&saved).unwrap();
+        let wire = encode_messages(&restored).unwrap();
+        for pair in wire.chunks_exact(2) {
+            assert_eq!(pair[0]["tool_calls"][0]["id"], "reused-native-id");
+            assert_eq!(pair[1]["tool_call_id"], "reused-native-id");
+        }
+    }
+
+    #[tokio::test]
     async fn fragmented_sse_preserves_parallel_tool_call_identity_and_order() {
         let request = request();
         let raw = concat!(
@@ -1224,7 +1350,14 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(starts, vec!["call-a", "call-b"]);
+        let expected = ["call-a", "call-b"].map(|id| scoped_tool_call_id(&request.request_id, id));
+        assert_eq!(
+            starts,
+            expected
+                .iter()
+                .map(ModelToolCallId::as_str)
+                .collect::<Vec<_>>()
+        );
         assert!(matches!(
             events.last().map(|event| &event.payload),
             Some(ModelEvent::Finish {

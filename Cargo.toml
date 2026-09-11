@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    # Core (Tier 1 - publishable as lib, no platform dependencies)
+    # Shared contracts, runtime, and SDK; concrete adapters live in plugins/.
     "core/orchestral-core",
     "core/orchestral-runtime",
     "core/orchestral",
@@ -30,7 +30,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/sizzlecar/orchestral"
@@ -82,14 +82,11 @@ fs2 = "0.4"
 
 # Internal crates - Core
 orchestral = { path = "core/orchestral" }
-orchestral-core = { path = "core/orchestral-core", version = "0.2.0" }
-orchestral-runtime = { path = "core/orchestral-runtime", version = "0.2.0" }
-orchestral-agent-acp = { path = "plugins/orchestral-agent-acp", version = "0.2.0" }
-orchestral-agent-codex = { path = "plugins/orchestral-agent-codex", version = "0.2.0" }
-orchestral-artifact-r2 = { path = "plugins/orchestral-artifact-r2", version = "0.2.0" }
-orchestral-model-gemini = { path = "plugins/orchestral-model-gemini", version = "0.2.0" }
-orchestral-model-openai = { path = "plugins/orchestral-model-openai", version = "0.2.0" }
+orchestral-core = { path = "core/orchestral-core", version = "0.3.0" }
+orchestral-runtime = { path = "core/orchestral-runtime", version = "0.3.0" }
+orchestral-agent-acp = { path = "plugins/orchestral-agent-acp", version = "0.3.0" }
+orchestral-agent-codex = { path = "plugins/orchestral-agent-codex", version = "0.3.0" }
+orchestral-artifact-r2 = { path = "plugins/orchestral-artifact-r2", version = "0.3.0" }
+orchestral-model-gemini = { path = "plugins/orchestral-model-gemini", version = "0.3.0" }
+orchestral-model-openai = { path = "plugins/orchestral-model-openai", version = "0.3.0" }
 orchestral-model-protocol-testkit = { path = "testing/orchestral-model-protocol-testkit" }
-
-[workspace.dependencies.tokio-test]
-version = "0.4"
