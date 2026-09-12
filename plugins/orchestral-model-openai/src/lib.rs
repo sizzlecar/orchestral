@@ -4,6 +4,8 @@ mod endpoint;
 pub use endpoint::{discover_models, OpenAiEndpoint};
 mod sampling;
 pub use sampling::OpenAiSamplingConfig;
+mod tool_result;
+pub use tool_result::OpenAiToolResultFormat;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
@@ -69,6 +71,7 @@ pub struct OpenAiCompatibleBackend {
     client: Client,
     config: OpenAiCompatibleConfig,
     sampling: OpenAiSamplingConfig,
+    tool_result_format: OpenAiToolResultFormat,
 }
 
 impl OpenAiCompatibleBackend {
@@ -83,6 +86,7 @@ impl OpenAiCompatibleBackend {
             client,
             config,
             sampling: OpenAiSamplingConfig::default(),
+            tool_result_format: OpenAiToolResultFormat::default(),
         })
     }
 
@@ -93,12 +97,19 @@ impl OpenAiCompatibleBackend {
         Ok(self)
     }
 
+    /// Select the text encoding of complete ToolResult envelopes. Canonical
+    /// messages stay unchanged; this also applies to earlier session history.
+    pub fn with_tool_result_format(mut self, format: OpenAiToolResultFormat) -> Self {
+        self.tool_result_format = format;
+        self
+    }
+
     fn build_request_body(&self, request: &ModelRequest) -> Result<Value, ModelError> {
         let mut body = Map::new();
         body.insert("model".to_owned(), Value::String(self.config.model.clone()));
         body.insert(
             "messages".to_owned(),
-            Value::Array(encode_messages(&request.messages)?),
+            Value::Array(encode_messages(&request.messages, self.tool_result_format)?),
         );
         body.insert("stream".to_owned(), Value::Bool(true));
         body.insert("stream_options".to_owned(), json!({"include_usage": true}));
@@ -188,18 +199,32 @@ const CONTEXT_ESTIMATE_BYTES_PER_TOKEN: u64 = 3;
 
 impl ModelTokenMeter for OpenAiCompatibleBackend {
     fn meter_descriptor(&self) -> ModelTokenMeterDescriptor {
-        let config = serde_json::to_vec(&(
+        let config = (
             &self.config.model,
             self.config.temperature.to_bits(),
             self.config.default_max_output_tokens,
             self.config.structured_output,
             &self.sampling,
             CONTEXT_ESTIMATE_BYTES_PER_TOKEN,
-        ))
-        .expect("OpenAI token meter scalar configuration is serializable");
+        );
+        // Keep the default JSON identity byte-for-byte compatible with v2.
+        // YAML changes the actual prompt, so recovery must bind its encoding.
+        let (strategy, version, config) = match self.tool_result_format {
+            OpenAiToolResultFormat::Json => (
+                "openai-compatible/wire-json-upper-bound",
+                "2",
+                serde_json::to_vec(&config),
+            ),
+            OpenAiToolResultFormat::Yaml => (
+                "openai-compatible/wire-json-yaml-tool-upper-bound",
+                "1",
+                serde_json::to_vec(&(config, tool_result::YAML_ENCODING_IDENTITY)),
+            ),
+        };
+        let config = config.expect("OpenAI token meter scalar configuration is serializable");
         ModelTokenMeterDescriptor {
-            strategy: "openai-compatible/wire-json-upper-bound".to_owned(),
-            version: "2".to_owned(),
+            strategy: strategy.to_owned(),
+            version: version.to_owned(),
             accounting: ModelTokenAccounting::ConservativeUpperBound,
             config_digest: Digest::sha256(config),
         }
@@ -235,6 +260,16 @@ impl ModelTokenMeter for OpenAiCompatibleBackend {
 #[async_trait]
 impl ModelBackend for OpenAiCompatibleBackend {
     fn descriptor(&self) -> ModelDescriptor {
+        let mut extensions = BTreeMap::from([(
+            "openai-compatible/model".to_owned(),
+            Value::String(self.config.model.clone()),
+        )]);
+        if self.tool_result_format == OpenAiToolResultFormat::Yaml {
+            extensions.insert(
+                "openai-compatible/tool-result-encoding".to_owned(),
+                Value::String(tool_result::YAML_ENCODING_IDENTITY.to_owned()),
+            );
+        }
         ModelDescriptor {
             backend_id: self.config.backend_id.clone(),
             capabilities: ModelCapabilities {
@@ -244,10 +279,7 @@ impl ModelBackend for OpenAiCompatibleBackend {
                 structured_output: self.config.structured_output,
                 max_context_tokens: self.config.max_context_tokens,
             },
-            extensions: BTreeMap::from([(
-                "openai-compatible/model".to_owned(),
-                Value::String(self.config.model.clone()),
-            )]),
+            extensions,
         }
     }
 
@@ -681,7 +713,10 @@ fn native_tool_call_extensions(native_call_id: String) -> BTreeMap<String, Value
     )])
 }
 
-fn encode_messages(messages: &[ModelMessage]) -> Result<Vec<Value>, ModelError> {
+fn encode_messages(
+    messages: &[ModelMessage],
+    tool_result_format: OpenAiToolResultFormat,
+) -> Result<Vec<Value>, ModelError> {
     // Native continuation IDs survive journaling in provider-owned metadata.
     // Older history without this metadata already contains native IDs.
     let mut native_ids = BTreeMap::new();
@@ -786,7 +821,7 @@ fn encode_messages(messages: &[ModelMessage]) -> Result<Vec<Value>, ModelError> 
                     encoded.push(json!({
                         "role": "tool",
                         "tool_call_id": wire_call_id(call_id),
-                        "content": json!({"result": result, "is_error": is_error}).to_string(),
+                        "content": tool_result_format.encode(result, *is_error)?,
                     }));
                 }
             }
@@ -1378,7 +1413,7 @@ mod tests {
                 }],
             },
         ];
-        let encoded = encode_messages(&messages).unwrap();
+        let encoded = encode_messages(&messages, OpenAiToolResultFormat::Json).unwrap();
         assert_eq!(encoded[0]["tool_calls"][0]["id"], "call-1");
         assert_eq!(encoded[1]["tool_call_id"], "call-1");
     }
@@ -1450,7 +1485,7 @@ mod tests {
         // an adapter-instance lookup table.
         let saved = serde_json::to_vec(&history).unwrap();
         let restored = serde_json::from_slice::<Vec<ModelMessage>>(&saved).unwrap();
-        let wire = encode_messages(&restored).unwrap();
+        let wire = encode_messages(&restored, OpenAiToolResultFormat::Json).unwrap();
         for pair in wire.chunks_exact(2) {
             assert_eq!(pair[0]["tool_calls"][0]["id"], "reused-native-id");
             assert_eq!(pair[1]["tool_call_id"], "reused-native-id");

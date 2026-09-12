@@ -45,7 +45,7 @@ use orchestral_model_gemini::{
     GeminiAuthentication, GeminiModelBackend, GeminiModelConfig, GoogleCloudAccessTokenProvider,
 };
 use orchestral_model_openai::{
-    OpenAiCompatibleBackend, OpenAiCompatibleConfig, OpenAiSamplingConfig,
+    OpenAiCompatibleBackend, OpenAiCompatibleConfig, OpenAiSamplingConfig, OpenAiToolResultFormat,
 };
 use orchestral_runtime::api::AgentApi;
 use orchestral_runtime::session_history::JournalSessionHistory;
@@ -1576,6 +1576,12 @@ fn build_model_backend(
                 .transpose()
                 .context("parse model profile config.sampling")?
                 .unwrap_or_default();
+            let tool_result_format = profile
+                .and_then(|profile| profile.config.get("tool_result_format"))
+                .map(|value| serde_json::from_value::<OpenAiToolResultFormat>(value.clone()))
+                .transpose()
+                .context("parse model profile config.tool_result_format")?
+                .unwrap_or_default();
             let api_key = crate::openai_connection::api_key(backend)?;
             let endpoint = backend.endpoint.clone().or_else(|| match backend.kind.as_str() {
                 "openai" => Some("https://api.openai.com/v1".to_owned()),
@@ -1604,7 +1610,8 @@ fn build_model_backend(
                 })
                 .context("build OpenAI-compatible ModelBackend")?
                 .with_sampling(sampling)
-                .context("configure OpenAI-compatible sampling")?,
+                .context("configure OpenAI-compatible sampling")?
+                .with_tool_result_format(tool_result_format),
             );
             Ok((backend.clone(), backend))
         }
@@ -2039,6 +2046,58 @@ mod entry_mode_tests {
                     .expect("invalid model sampling must fail before HTTP");
             assert!(format!("{error:#}").contains("sampling"));
         }
+    }
+
+    #[test]
+    fn model_profile_tool_result_format_is_explicit_and_strict() {
+        let backend = serde_json::from_value(serde_json::json!({
+            "name": "local", "kind": "openai", "endpoint": "http://127.0.0.1:1/v1",
+            "config": {"auth": "none"},
+        }))
+        .unwrap();
+        let profile = |format| {
+            serde_json::from_value(serde_json::json!({
+                "name": "local", "backend": "local", "model": "local-model",
+                "config": {"tool_result_format": format},
+            }))
+            .unwrap()
+        };
+        for format in [
+            serde_json::json!("text"),
+            serde_json::json!(true),
+            serde_json::Value::Null,
+        ] {
+            let error = super::build_model_backend(
+                &backend,
+                "local-model",
+                0.6,
+                Some(&profile(format)),
+                8,
+                None,
+            )
+            .err()
+            .expect("invalid result format must fail before HTTP");
+            assert!(format!("{error:#}").contains("tool_result_format"));
+        }
+        let (_, json_meter) = super::build_model_backend(
+            &backend,
+            "local-model",
+            0.6,
+            Some(&profile(serde_json::json!("json"))),
+            8,
+            None,
+        )
+        .unwrap();
+        let (_, yaml_meter) = super::build_model_backend(
+            &backend,
+            "local-model",
+            0.6,
+            Some(&profile(serde_json::json!("yaml"))),
+            8,
+            None,
+        )
+        .unwrap();
+        assert_ne!(json_meter.meter_descriptor(), yaml_meter.meter_descriptor());
     }
 
     #[cfg(unix)]

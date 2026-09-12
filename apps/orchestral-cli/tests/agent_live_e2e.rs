@@ -37,6 +37,8 @@ mod model_retry;
 mod project_instructions;
 #[path = "agent_live_e2e/session_history.rs"]
 mod session_history;
+#[path = "agent_live_e2e/tool_content.rs"]
+mod tool_content;
 #[path = "agent_live_e2e/tui_experience.rs"]
 mod tui_experience;
 
