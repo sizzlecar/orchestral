@@ -248,6 +248,164 @@ async fn file_edit_rejects_missing_ambiguous_and_overlapping_text_without_normal
     }
 }
 
+fn no_match_message(result: &GuardedToolResult) -> &str {
+    match result {
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Rejected { code, message },
+            ..
+        } if code == "file_edit_no_match" => message,
+        _ => panic!("expected no_match, got {result:?}"),
+    }
+}
+
+#[tokio::test]
+async fn file_edit_no_match_reports_actual_bytes_and_replays_the_saved_observation() {
+    let workspace = Workspace::new();
+    let policy = bounds(&[&workspace.0], ApprovalPolicy::NotRequired);
+    let journal = Arc::new(InMemoryToolEffectJournalStore::default());
+    let first_runtime = runtime_with_journal(&workspace, &[], &policy, journal.clone());
+    let source = "fn render() {\n    let ending = text.ends_with('\\n');\n}\n";
+    let old = source.replace("\\n", "\\\\n");
+    std::fs::write(workspace.file(), source).unwrap();
+    let first = invoke(&first_runtime, &policy, "diagnostic", args(&old, "changed")).await;
+    let message = no_match_message(&first).to_owned();
+    assert!(message.contains("No files changed"), "{message}");
+    assert!(message.contains("source line 2"), "{message}");
+    assert!(message.contains("supplied 0x5c, actual 0x6e"), "{message}");
+    assert!(message.contains("Actual source line:"), "{message}");
+    assert!(message.contains("ends_with('\\n')"), "{message}");
+    assert!(!message.contains("ends_with('\\\\n')"), "{message}");
+    assert_eq!(std::fs::read_to_string(workspace.file()).unwrap(), source);
+    assert_eq!(std::fs::read_dir(&workspace.0).unwrap().count(), 1);
+
+    // Recovery must use the original authorized observation, not read new
+    // contents to regenerate a different error for this already settled call.
+    drop(first_runtime);
+    std::fs::write(workspace.file(), "external replacement").unwrap();
+    let resumed = runtime_with_journal(&workspace, &[], &policy, journal);
+    let replay = invoke(&resumed, &policy, "diagnostic", args(&old, "changed")).await;
+    assert_eq!(no_match_message(&replay), message);
+    assert!(matches!(
+        replay,
+        GuardedToolResult::Outcome { cached: true, .. }
+    ));
+    assert_eq!(
+        std::fs::read_to_string(workspace.file()).unwrap(),
+        "external replacement"
+    );
+}
+
+#[tokio::test]
+async fn file_edit_no_match_distinguishes_line_endings_indentation_and_unicode() {
+    let workspace = Workspace::new();
+    let policy = bounds(&[&workspace.0], ApprovalPolicy::NotRequired);
+    let runtime = runtime(&workspace, &[], &policy);
+    for (index, (source, old, difference, preview)) in [
+        (
+            "fn a() {\r\n\tlet λ = 1;\r\n}\r\n",
+            "fn a() {\n\tlet λ = 1;\n}\n",
+            "supplied 0x0a, actual 0x0d",
+            "Actual source line: fn a() {⟦CR⟧⟦LF⟧",
+        ),
+        (
+            "fn a() {\n\tlet λ = 1;\n}\n",
+            "fn a() {\n    let λ = 1;\n}\n",
+            "supplied 4 spaces, 0 tabs; actual 0 spaces, 1 tabs",
+            "Actual source line: ⟦TAB⟧let λ = 1;⟦LF⟧",
+        ),
+        (
+            "fn a() {\n\tlet name = \"λ\";\n}\n",
+            "fn a() {\n\tlet name = \"μ\";\n}\n",
+            "supplied 0xbc, actual 0xbb",
+            "Actual source line: ⟦TAB⟧let name = \"λ\";⟦LF⟧",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        std::fs::write(workspace.file(), source).unwrap();
+        let result = invoke(
+            &runtime,
+            &policy,
+            &format!("bytes-{index}"),
+            args(old, "changed"),
+        )
+        .await;
+        let message = no_match_message(&result);
+        assert!(message.contains(difference), "{message}");
+        assert!(message.contains(preview), "{message}");
+        assert_eq!(std::fs::read(workspace.file()).unwrap(), source.as_bytes());
+    }
+}
+
+#[tokio::test]
+async fn file_edit_no_match_bounds_candidates_and_literal_source_previews() {
+    let workspace = Workspace::new();
+    let policy = bounds(&[&workspace.0], ApprovalPolicy::NotRequired);
+    let runtime = runtime(&workspace, &[], &policy);
+    let block = format!("header\n\u{1b}{}\n", "λ".repeat(200));
+    let source = block.repeat(5);
+    std::fs::write(workspace.file(), &source).unwrap();
+    let result = invoke(
+        &runtime,
+        &policy,
+        "bounded",
+        args("header\nwrong\n", "changed"),
+    )
+    .await;
+    let message = no_match_message(&result);
+    assert_eq!(
+        message.matches("Candidate starting at source line").count(),
+        3
+    );
+    assert!(
+        message.contains("Additional candidate locations omitted"),
+        "{message}"
+    );
+    assert!(message.contains("[truncated]"), "{message}");
+    assert!(message.contains('λ'), "{message}");
+    assert!(message.contains("Actual source line: ⟦ESC⟧λ"), "{message}");
+    assert!(
+        !message.contains('\u{1b}'),
+        "terminal controls must be escaped"
+    );
+    assert!(message.len() < 8 * 1024, "diagnostics must remain bounded");
+    assert_eq!(std::fs::read_to_string(workspace.file()).unwrap(), source);
+
+    let no_anchor = invoke(&runtime, &policy, "no-anchor", args("unrelated", "changed")).await;
+    assert!(!no_match_message(&no_anchor).contains("Candidate starting"));
+    assert_eq!(std::fs::read_to_string(workspace.file()).unwrap(), source);
+}
+
+#[tokio::test]
+async fn file_edit_no_match_does_not_disclose_source_without_read_authority() {
+    let workspace = Workspace::new();
+    let policy = bounds(&[&workspace.0], ApprovalPolicy::NotRequired);
+    let runtime = runtime(&workspace, &[], &policy);
+    let source = "header\nprivate-value-not-supplied-by-caller\n";
+    std::fs::write(workspace.file(), source).unwrap();
+    for index in 0..2 {
+        let mut grant = policy.clone();
+        if index == 0 {
+            grant.allowed_effects.remove(&EffectScope::FilesystemRead);
+        } else {
+            grant.filesystem.readable_roots.clear();
+        }
+        let result = invoke(
+            &runtime,
+            &grant,
+            &format!("no-read-{index}"),
+            args("header\nwrong\n", "changed"),
+        )
+        .await;
+        assert_rejected(&result);
+        let rendered = format!("{result:?}");
+        assert!(!rendered.contains("private-value-not-supplied-by-caller"));
+        assert!(!rendered.contains("Candidate starting"));
+    }
+    assert_eq!(std::fs::read_to_string(workspace.file()).unwrap(), source);
+}
+
 #[tokio::test]
 async fn file_edit_allows_deletion_and_unique_noop_but_not_creation() {
     let workspace = Workspace::new();

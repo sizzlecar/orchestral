@@ -212,7 +212,7 @@ fn prepare_edit(
     let start = original.find(request.old_text).ok_or_else(|| {
         MutationError::rejected(
             "file_edit_no_match",
-            "old_text does not occur exactly; read the file again and preserve its whitespace",
+            no_match_message(original, request.old_text),
         )
     })?;
     // Advance one Unicode scalar, not the whole match: overlapping occurrences
@@ -246,6 +246,140 @@ fn prepare_edit(
         after,
         permissions,
     })
+}
+
+/// Diagnostic observations only: these candidates never reach PreparedChange.
+/// The caller has already authorized both reading and writing this exact file.
+fn no_match_message(original: &str, requested: &str) -> String {
+    const MAX_LINES: usize = 8;
+    const MAX_ANCHORS: usize = 3;
+    const MAX_CANDIDATES: usize = 3;
+    let mut message = String::from(
+        "old_text does not occur exactly. No files changed. Copy exact source text from file_read or text_search; do not infer whitespace or escaping.",
+    );
+    let requested_lines: Vec<_> = requested.split_inclusive('\n').take(MAX_LINES).collect();
+    let anchors: Vec<_> = requested_lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let body = diagnostic_line_body(line).trim_start_matches([' ', '\t']);
+            (!body.is_empty()).then_some((index, body))
+        })
+        .take(MAX_ANCHORS)
+        .collect();
+    if anchors.is_empty() {
+        return message;
+    }
+    let mut candidates = Vec::new();
+    let mut omitted = false;
+    'scan: for (line_index, line) in original.split_inclusive('\n').enumerate() {
+        let body = diagnostic_line_body(line).trim_start_matches([' ', '\t']);
+        for &(anchor_index, anchor) in &anchors {
+            if body != anchor {
+                continue;
+            }
+            let Some(start) = line_index.checked_sub(anchor_index) else {
+                continue;
+            };
+            if candidates.contains(&start) {
+                continue;
+            }
+            if candidates.len() == MAX_CANDIDATES {
+                omitted = true;
+                break 'scan;
+            }
+            candidates.push(start);
+        }
+    }
+    if candidates.is_empty() {
+        return message;
+    }
+    message.push_str(
+        "\nCandidate locations below use unchanged line text, ignoring only leading ASCII spaces/tabs and the line terminator for locating an anchor. They are not complete matches or replacement instructions. Source previews preserve literal backslashes and quotes; tabs, CR, LF and ESC appear as ⟦TAB⟧, ⟦CR⟧, ⟦LF⟧ and ⟦ESC⟧, and other controls as ⟦U+XXXX⟧. These previews are not complete replacement text. Byte columns are 1-indexed UTF-8 bytes.",
+    );
+    for start in candidates {
+        let actual_lines: Vec<_> = original
+            .split_inclusive('\n')
+            .skip(start)
+            .take(requested_lines.len())
+            .collect();
+        let difference = requested_lines
+            .iter()
+            .enumerate()
+            .find_map(|(index, &sent)| {
+                let actual = actual_lines.get(index).copied().unwrap_or("");
+                let common = sent
+                    .bytes()
+                    .zip(actual.bytes())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                // A request may end partway through a source line, including just
+                // before its terminator. Extra source bytes there are not a mismatch.
+                (common != sent.len() || (sent.ends_with('\n') && common != actual.len()))
+                    .then_some((index, common, sent, actual))
+            });
+        message.push_str(&format!(
+            "\nCandidate starting at source line {}:",
+            start + 1
+        ));
+        if let Some((index, column, sent, actual)) = difference {
+            let byte = |text: &str| match text.as_bytes().get(column) {
+                Some(value) => format!("0x{value:02x}"),
+                None => "end of span".to_owned(),
+            };
+            let indentation = |text: &str| {
+                let prefix = text.bytes().take_while(|b| matches!(*b, b' ' | b'\t'));
+                let (mut spaces, mut tabs) = (0, 0);
+                for value in prefix {
+                    spaces += usize::from(value == b' ');
+                    tabs += usize::from(value == b'\t');
+                }
+                format!("{spaces} spaces, {tabs} tabs")
+            };
+            message.push_str(&format!(
+                " first difference at old_text line {}, source line {}, byte column {}: supplied {}, actual {}. Leading whitespace: supplied {}; actual {}.\nActual source line: {}",
+                index + 1, start + index + 1, column + 1, byte(sent), byte(actual),
+                indentation(sent), indentation(actual), diagnostic_preview(actual),
+            ));
+        } else {
+            message.push_str(" no difference found within the inspected lines; read more context.");
+        }
+    }
+    if omitted {
+        message.push_str("\nAdditional candidate locations omitted; no candidate was selected.");
+    }
+    if requested.split_inclusive('\n').nth(MAX_LINES).is_some() {
+        message.push_str("\nFurther old_text lines were not inspected for diagnostics.");
+    }
+    message
+}
+
+fn diagnostic_line_body(line: &str) -> &str {
+    line.strip_suffix('\n')
+        .map(|body| body.strip_suffix('\r').unwrap_or(body))
+        .unwrap_or(line)
+}
+
+fn diagnostic_preview(line: &str) -> String {
+    const MAX_CHARS: usize = 160;
+    let mut characters = line.chars();
+    let mut preview = String::new();
+    for character in characters.by_ref().take(MAX_CHARS) {
+        match character {
+            '\t' => preview.push_str("⟦TAB⟧"),
+            '\r' => preview.push_str("⟦CR⟧"),
+            '\n' => preview.push_str("⟦LF⟧"),
+            '\u{1b}' => preview.push_str("⟦ESC⟧"),
+            control if control.is_control() => {
+                preview.push_str(&format!("⟦U+{:04X}⟧", u32::from(control)));
+            }
+            literal => preview.push(literal),
+        }
+    }
+    if characters.next().is_some() {
+        preview.push_str(" [truncated]");
+    }
+    preview
 }
 
 fn finish_edit(
