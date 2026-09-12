@@ -19,6 +19,25 @@ use windows_sys::Win32::System::Threading::{
     OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
 };
 
+const POWERSHELL_COMMAND_ENTERED: &str = "ORCHESTRAL-PS-COMMAND-ENTERED";
+
+fn windows_environment(root: &Path) -> BTreeMap<String, String> {
+    // Keep the original environment unchanged apart from temporary storage.
+    // Do not inherit the runner's full environment or user profile variables.
+    let mut environment = BTreeMap::from([
+        ("SystemRoot".into(), std::env::var("SystemRoot").unwrap()),
+        ("PATH".into(), std::env::var("PATH").unwrap_or_default()),
+    ]);
+    // Guarded exec supplies Run-owned TEMP/TMP. These direct supervisor tests
+    // instead retain temporary storage under their own isolated fixture owner.
+    let temporary = root.join("process-temp");
+    std::fs::create_dir_all(&temporary).unwrap();
+    for name in ["TEMP", "TMP"] {
+        environment.insert(name.to_owned(), temporary.to_string_lossy().into_owned());
+    }
+    environment
+}
+
 fn spec(root: &Path, command: &str, tty: bool) -> ExecSpawnSpec {
     let system = std::env::var("SystemRoot").unwrap();
     let shell = Path::new(&system).join("System32/WindowsPowerShell/v1.0/powershell.exe");
@@ -28,13 +47,15 @@ fn spec(root: &Path, command: &str, tty: bool) -> ExecSpawnSpec {
         args: vec![
             "-NoProfile".into(),
             "-Command".into(),
-            format!("[Console]::OutputEncoding=[Text.Encoding]::UTF8; {command}"),
+            // A fixed stderr marker separates command entry from later cmdlet
+            // execution without leaking arguments, environment values or paths.
+            // It leaves the descendant PID on stdout unchanged.
+            format!(
+                "[Console]::Error.WriteLine('{POWERSHELL_COMMAND_ENTERED}'); [Console]::Error.Flush(); [Console]::OutputEncoding=[Text.Encoding]::UTF8; {command}"
+            ),
         ],
         cwd: root.to_path_buf(),
-        environment: BTreeMap::from([
-            ("SystemRoot".into(), system),
-            ("PATH".into(), std::env::var("PATH").unwrap_or_default()),
-        ]),
+        environment: windows_environment(root),
         tty,
         backend_starts_new_session: false,
         operation: ToolOperationPlan {
@@ -55,6 +76,7 @@ struct Stages {
     started: Instant,
     spawned_ms: Option<u128>,
     first_output_observed_ms: Option<u128>,
+    command_entered_observed_ms: Option<u128>,
     exit_observed_ms: Option<u128>,
     close_completed_ms: Option<u128>,
 }
@@ -66,6 +88,7 @@ impl Stages {
             started: Instant::now(),
             spawned_ms: None,
             first_output_observed_ms: None,
+            command_entered_observed_ms: None,
             exit_observed_ms: None,
             close_completed_ms: None,
         }
@@ -79,6 +102,13 @@ impl Stages {
         let elapsed = self.started.elapsed().as_millis();
         if !result.stdout.is_empty() || !result.stderr.is_empty() {
             self.first_output_observed_ms.get_or_insert(elapsed);
+        }
+        if result.stdout.contains(POWERSHELL_COMMAND_ENTERED)
+            || result.stderr.contains(POWERSHELL_COMMAND_ENTERED)
+        {
+            // Positive-only diagnostic: a marker split across polls may not be
+            // observed here. Absence does not prove command entry never happened.
+            self.command_entered_observed_ms.get_or_insert(elapsed);
         }
         if result.exit_code.is_some() {
             self.exit_observed_ms.get_or_insert(elapsed);
@@ -98,6 +128,7 @@ impl Drop for Stages {
                 "case":self.case,
                 "spawn_returned_ms":self.spawned_ms,
                 "first_output_observed_ms":self.first_output_observed_ms,
+                "command_entered_observed_ms":self.command_entered_observed_ms,
                 "exit_observed_ms":self.exit_observed_ms,
                 "close_completed_ms":self.close_completed_ms,
                 "elapsed_ms":self.started.elapsed().as_millis(),
