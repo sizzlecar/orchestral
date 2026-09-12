@@ -20,6 +20,8 @@ use windows_sys::Win32::System::Threading::{
 };
 
 const POWERSHELL_COMMAND_ENTERED: &str = "ORCHESTRAL-PS-COMMAND-ENTERED";
+const POWERSHELL_ENCODING_CONFIGURED: &str = "ORCHESTRAL-PS-ENCODING-CONFIGURED";
+const POWERSHELL_STDOUT_PROBE: &str = "ORCHESTRAL-PS-DIRECT-STDOUT";
 
 fn windows_environment(root: &Path) -> BTreeMap<String, String> {
     // Keep the original environment unchanged apart from temporary storage.
@@ -47,11 +49,10 @@ fn spec(root: &Path, command: &str, tty: bool) -> ExecSpawnSpec {
         args: vec![
             "-NoProfile".into(),
             "-Command".into(),
-            // A fixed stderr marker separates command entry from later cmdlet
-            // execution without leaking arguments, environment values or paths.
-            // It leaves the descendant PID on stdout unchanged.
+            // Fixed markers separate command entry, encoding setup and direct
+            // stdout from cmdlet execution. They contain no arguments or paths.
             format!(
-                "[Console]::Error.WriteLine('{POWERSHELL_COMMAND_ENTERED}'); [Console]::Error.Flush(); [Console]::OutputEncoding=[Text.Encoding]::UTF8; {command}"
+                "[Console]::Error.WriteLine('{POWERSHELL_COMMAND_ENTERED}'); [Console]::Error.Flush(); [Console]::OutputEncoding=[Text.Encoding]::UTF8; [Console]::Error.WriteLine('{POWERSHELL_ENCODING_CONFIGURED}'); [Console]::Error.Flush(); [Console]::Out.WriteLine('{POWERSHELL_STDOUT_PROBE}'); [Console]::Out.Flush(); {command}"
             ),
         ],
         cwd: root.to_path_buf(),
@@ -77,6 +78,8 @@ struct Stages {
     spawned_ms: Option<u128>,
     first_output_observed_ms: Option<u128>,
     command_entered_observed_ms: Option<u128>,
+    encoding_configured_observed_ms: Option<u128>,
+    direct_stdout_observed_ms: Option<u128>,
     exit_observed_ms: Option<u128>,
     close_completed_ms: Option<u128>,
 }
@@ -89,6 +92,8 @@ impl Stages {
             spawned_ms: None,
             first_output_observed_ms: None,
             command_entered_observed_ms: None,
+            encoding_configured_observed_ms: None,
+            direct_stdout_observed_ms: None,
             exit_observed_ms: None,
             close_completed_ms: None,
         }
@@ -103,12 +108,22 @@ impl Stages {
         if !result.stdout.is_empty() || !result.stderr.is_empty() {
             self.first_output_observed_ms.get_or_insert(elapsed);
         }
-        if result.stdout.contains(POWERSHELL_COMMAND_ENTERED)
-            || result.stderr.contains(POWERSHELL_COMMAND_ENTERED)
-        {
-            // Positive-only diagnostic: a marker split across polls may not be
-            // observed here. Absence does not prove command entry never happened.
-            self.command_entered_observed_ms.get_or_insert(elapsed);
+        // Positive-only diagnostics: a marker split across polls may not be
+        // observed here. Absence does not prove the phase never happened.
+        for (marker, observed) in [
+            (
+                POWERSHELL_COMMAND_ENTERED,
+                &mut self.command_entered_observed_ms,
+            ),
+            (
+                POWERSHELL_ENCODING_CONFIGURED,
+                &mut self.encoding_configured_observed_ms,
+            ),
+            (POWERSHELL_STDOUT_PROBE, &mut self.direct_stdout_observed_ms),
+        ] {
+            if result.stdout.contains(marker) || result.stderr.contains(marker) {
+                observed.get_or_insert(elapsed);
+            }
         }
         if result.exit_code.is_some() {
             self.exit_observed_ms.get_or_insert(elapsed);
@@ -129,6 +144,8 @@ impl Drop for Stages {
                 "spawn_returned_ms":self.spawned_ms,
                 "first_output_observed_ms":self.first_output_observed_ms,
                 "command_entered_observed_ms":self.command_entered_observed_ms,
+                "encoding_configured_observed_ms":self.encoding_configured_observed_ms,
+                "direct_stdout_observed_ms":self.direct_stdout_observed_ms,
                 "exit_observed_ms":self.exit_observed_ms,
                 "close_completed_ms":self.close_completed_ms,
                 "elapsed_ms":self.started.elapsed().as_millis(),
@@ -189,7 +206,16 @@ async fn cancelling_a_native_pipe_terminates_its_child_process() {
         .await
         .unwrap();
     stages.observe(&result);
-    let pid: u32 = result.stdout.trim().parse().expect("child PID");
+    // Remove only our exact diagnostic prefix; the complete remaining output
+    // must still parse as the actual child PID, as in the original assertion.
+    let diagnostic_prefix = format!("{POWERSHELL_STDOUT_PROBE}\r\n");
+    let pid: u32 = result
+        .stdout
+        .strip_prefix(diagnostic_prefix.as_str())
+        .unwrap_or(&result.stdout)
+        .trim()
+        .parse()
+        .expect("child PID");
     // SAFETY: OpenProcess borrows an OS PID and returns an owned wait handle.
     let child = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
     assert!(!child.is_null());
