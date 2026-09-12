@@ -437,9 +437,23 @@ impl PtyProcessManager {
                 observed_generation = buffer.generation;
                 last_change = Instant::now();
             }
+            if buffer.closed {
+                // PTY EOF can precede an observable child exit. Do not hold the
+                // output lock while inspecting the process: termination takes
+                // the process lock before closing its output buffer.
+                drop(buffer);
+                let exited = process
+                    .lock()
+                    .map_err(|_| PtyProcessError::Unavailable)?
+                    .status()?
+                    .is_some();
+                buffer = output.0.lock().map_err(|_| PtyProcessError::Unavailable)?;
+                if exited {
+                    break;
+                }
+            }
             if (!buffer.bytes.is_empty() && last_change.elapsed() >= settle)
                 || yield_requested.is_cancelled()
-                || buffer.closed
                 || started.elapsed() >= timeout
             {
                 break;
@@ -578,6 +592,67 @@ mod tests {
             manager.send(&RunId::new("another-run"), &process_id, "hello"),
             Err(PtyProcessError::NotFound(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closed_output_keeps_waiting_for_the_child_until_the_observation_deadline() {
+        let manager = PtyProcessManager::new(1024, Duration::from_secs(60)).unwrap();
+        let run_id = RunId::new("closed-output-run");
+        let process_id = PtyProcessId::new("closed-output-process").unwrap();
+        manager
+            .create(PtySpawnSpec {
+                run_id: run_id.clone(),
+                process_id: process_id.clone(),
+                program: std::fs::canonicalize("/bin/sh")
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                args: vec!["-c".to_owned(), "read reply; exit 7".to_owned()],
+                cwd: std::fs::canonicalize(".").unwrap(),
+                environment: BTreeMap::from([("PATH".to_owned(), "/usr/bin:/bin".to_owned())]),
+                rows: 24,
+                cols: 80,
+            })
+            .unwrap();
+        let process = manager.process(&run_id, &process_id).unwrap();
+        let output = process.lock().unwrap().output.clone();
+        // Drive the reader's EOF state independently of the real child. This
+        // isolates the interval before exit status is visible, without relying
+        // on the OS to schedule EOF and child reaping in a particular order.
+        output.0.lock().unwrap().closed = true;
+        assert_eq!(manager.status(&run_id, &process_id).unwrap(), None);
+
+        let deadline = Duration::from_millis(200);
+        let started = Instant::now();
+        let pending = manager
+            .read(
+                &run_id,
+                &process_id,
+                deadline,
+                deadline,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert!(started.elapsed() >= deadline, "EOF ended the wait early");
+        assert!(pending.alive);
+        assert_eq!(pending.exit_code, None);
+        assert!(pending.output.is_empty());
+        assert_eq!(manager.list(&run_id).unwrap(), vec![process_id.clone()]);
+
+        manager.send(&run_id, &process_id, "finish\n").unwrap();
+        let completed = manager
+            .read(
+                &run_id,
+                &process_id,
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert!(!completed.alive);
+        assert_eq!(completed.exit_code, Some(7));
+        manager.close(&run_id, &process_id).unwrap();
     }
 
     #[cfg(unix)]
