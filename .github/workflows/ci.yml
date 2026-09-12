@@ -83,7 +83,15 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
+      - name: Diagnose native Windows execution
+        id: windows_exec
+        if: runner.os == 'Windows'
+        run: cargo test --locked -p orchestral-runtime --test windows_exec -- --nocapture --test-threads=1
+
       - name: Test
+        # Preserve full-suite evidence even when the earlier native diagnostic fails.
+        # The failed diagnostic remains a job failure; it is never tolerated.
+        if: ${{ !cancelled() && (success() || steps.windows_exec.conclusion == 'failure') }}
         run: cargo test --locked --workspace --all-targets
 
       - name: Check SDK documentation examples
