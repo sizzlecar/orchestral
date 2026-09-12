@@ -523,6 +523,7 @@ fn local_cli_creates_and_verifies_a_file_with_exec_disabled() {
                 vec![
                     "apply_patch",
                     "artifact_read",
+                    "file_edit",
                     "file_read",
                     "file_search",
                     "file_write",
