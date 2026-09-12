@@ -44,18 +44,20 @@ use orchestral_mcp_streamable_http::{
 use orchestral_model_gemini::{
     GeminiAuthentication, GeminiModelBackend, GeminiModelConfig, GoogleCloudAccessTokenProvider,
 };
-use orchestral_model_openai::{OpenAiCompatibleBackend, OpenAiCompatibleConfig};
+use orchestral_model_openai::{
+    OpenAiCompatibleBackend, OpenAiCompatibleConfig, OpenAiSamplingConfig, OpenAiToolResultFormat,
+};
 use orchestral_runtime::api::AgentApi;
 use orchestral_runtime::session_history::JournalSessionHistory;
 use orchestral_runtime::tools::{
     approved_host_exec_command_descriptor, guarded_apply_patch_descriptor,
-    guarded_artifact_read_descriptor, guarded_file_read_descriptor, guarded_file_search_descriptor,
-    guarded_file_write_descriptor, guarded_session_read_descriptor, guarded_text_search_descriptor,
-    workspace_exec_command_descriptor, workspace_write_stdin_descriptor,
-    CommandEnvironmentSnapshot, GuardedApplyPatchExecutor, GuardedArtifactReadExecutor,
-    GuardedExecCommandExecutor, GuardedFileReadExecutor, GuardedFileSearchExecutor,
-    GuardedFileWriteExecutor, GuardedSessionReadExecutor, GuardedTextSearchExecutor,
-    GuardedWriteStdinExecutor,
+    guarded_artifact_read_descriptor, guarded_file_edit_descriptor, guarded_file_read_descriptor,
+    guarded_file_search_descriptor, guarded_file_write_descriptor, guarded_session_read_descriptor,
+    guarded_text_search_descriptor, workspace_exec_command_descriptor,
+    workspace_write_stdin_descriptor, CommandEnvironmentSnapshot, GuardedApplyPatchExecutor,
+    GuardedArtifactReadExecutor, GuardedExecCommandExecutor, GuardedFileEditExecutor,
+    GuardedFileReadExecutor, GuardedFileSearchExecutor, GuardedFileWriteExecutor,
+    GuardedSessionReadExecutor, GuardedTextSearchExecutor, GuardedWriteStdinExecutor,
 };
 use orchestral_runtime::{
     AgentClient, AgentControlEvent, AgentController, ContinuationPolicy,
@@ -83,11 +85,39 @@ pub struct AgentRunOptions {
     pub session_id: Option<String>,
     pub system_prompt: Option<String>,
     pub input: Option<String>,
+    pub input_mode: InputMode,
     pub no_mcp: bool,
     pub mcp_config: Vec<PathBuf>,
     pub no_skills: bool,
     pub cwd: Option<PathBuf>,
     pub add_dirs: Vec<PathBuf>,
+}
+
+/// Availability of follow-up user input for a local CLI run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum InputMode {
+    /// Enable follow-up input only when stdin is a terminal.
+    #[default]
+    Auto,
+    /// Allow replies on stdin; a piped initial prompt cannot share that stream.
+    Interactive,
+    /// Do not offer model-requested user input.
+    None,
+}
+
+impl InputMode {
+    fn resolve(self, entry: &EntryMode, stdin_is_terminal: bool) -> anyhow::Result<bool> {
+        match (self, entry) {
+            (Self::Interactive, EntryMode::HeadlessPipe) => bail!(
+                "--input-mode interactive cannot use stdin for both the initial prompt and replies; \
+                 pass the prompt as an argument to reserve stdin for replies"
+            ),
+            (Self::None, _) => Ok(false),
+            (Self::Interactive, _) | (Self::Auto, EntryMode::Tui) => Ok(true),
+            (Self::Auto, EntryMode::HeadlessPrompt(_)) => Ok(stdin_is_terminal),
+            (Self::Auto, EntryMode::HeadlessPipe) => Ok(false),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -198,6 +228,9 @@ pub struct AgentHost {
     controller: Arc<AgentController>,
     resources: Vec<ResourceBinding>,
     mcp_registry: McpToolsAdapterRegistry,
+    // None denotes a Host with its own input channel (for example HTTP serve).
+    // Local runs retain their resolved capability across TUI reconfiguration.
+    local_input_available: Option<bool>,
 }
 
 impl AgentHost {
@@ -208,7 +241,12 @@ impl AgentHost {
     }
 
     pub(crate) async fn reconfigure(&self, options: &AgentRunOptions) -> anyhow::Result<Self> {
-        let mut next = build_agent_host_with_journals(options, Some(self.journals.clone())).await?;
+        let mut next = build_agent_host_with_journals(
+            options,
+            Some(self.journals.clone()),
+            self.local_input_available,
+        )
+        .await?;
         next.metadata.journal_location = self.metadata.journal_location.clone();
         Ok(next)
     }
@@ -219,12 +257,13 @@ impl AgentHost {
 }
 
 pub async fn build_agent_host(options: &AgentRunOptions) -> anyhow::Result<AgentHost> {
-    build_agent_host_with_journals(options, None).await
+    build_agent_host_with_journals(options, None, None).await
 }
 
 async fn build_agent_host_with_journals(
     options: &AgentRunOptions,
     shared: Option<CliJournalStores>,
+    local_input_available: Option<bool>,
 ) -> anyhow::Result<AgentHost> {
     let workspaces = CliWorkspaceSet::resolve(options.cwd.as_deref(), &options.add_dirs)?;
     let config_path = prepare_runtime_config_path(
@@ -234,22 +273,19 @@ async fn build_agent_host_with_journals(
     )?;
     let config = load_config(&config_path)
         .with_context(|| format!("load Generic Agent config '{}'", config_path.display()))?;
-    let (backend, profile, model, temperature) = resolve_model(&config)?;
-    let max_output_tokens = profile
-        .as_ref()
-        .and_then(|profile| profile.max_tokens)
-        .unwrap_or(8_192) as u64;
+    let (backend, profile, model, temperature) = resolve_model(&config).await?;
     let (model_backend, token_meter) = build_model_backend(
         &backend,
         &model,
         temperature,
-        max_output_tokens,
+        profile.as_ref(),
         config.agent.stream_buffer,
         options.credential_file.as_deref(),
     )?;
 
     let mut agent_config = GenericAgentConfig::new("orchestral/internal", "generic-agent");
-    agent_config.input_requests_enabled = config.agent.input_requests_enabled;
+    agent_config.input_requests_enabled =
+        config.agent.input_requests_enabled && local_input_available.unwrap_or(true);
     agent_config.model_retry = config.agent.model_retry.clone();
     {
         use orchestral_core::project_instructions::ProjectInstructionSource;
@@ -288,6 +324,7 @@ async fn build_agent_host_with_journals(
     let workspace_context = serde_json::json!({
         "primary": workspaces.primary,
         "additional": workspaces.additional,
+        "os": std::env::consts::OS,
     });
     agent_config.system_prompt.push_str(&format!(
         "\n\n<environment_context>\n  <cwd>{}</cwd>\n  <workspace_roots>{}</workspace_roots>\n</environment_context>",
@@ -496,11 +533,21 @@ async fn build_agent_host_with_journals(
         controller,
         resources,
         mcp_registry,
+        local_input_available,
     })
 }
 
 pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
-    let mut host = Arc::new(build_agent_host(&options).await?);
+    let stdin_is_terminal = io::stdin().is_terminal();
+    let entry_mode = select_entry_mode(
+        options.input.clone(),
+        stdin_is_terminal,
+        io::stdout().is_terminal(),
+    )?;
+    let local_input_available = options.input_mode.resolve(&entry_mode, stdin_is_terminal)?;
+    let mut host = Arc::new(
+        build_agent_host_with_journals(&options, None, Some(local_input_available)).await?,
+    );
     let tui_options = options.clone();
     let session_id = AgentSessionId::new(
         options
@@ -510,11 +557,6 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
     );
     let client = host.client(session_id.clone());
 
-    let entry_mode = select_entry_mode(
-        options.input,
-        io::stdin().is_terminal(),
-        io::stdout().is_terminal(),
-    )?;
     let result = async {
         let history = host.session_history.read(&session_id).await?;
         if let Some(history) = &history {
@@ -528,10 +570,7 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
         let history = host.session_history.read(&session_id).await?;
         match entry_mode {
             EntryMode::HeadlessPrompt(input) => {
-                eprintln!(
-                    "Generic Agent: backend={} model={}",
-                    host.backend_name, host.model
-                );
+                eprintln!("Model: {} (provider: {})", host.model, host.backend_name);
                 let mut lines = BufReader::new(tokio::io::stdin()).lines();
                 run_turn(
                     &client,
@@ -545,10 +584,7 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
                 .await
             }
             EntryMode::HeadlessPipe => {
-                eprintln!(
-                    "Generic Agent: backend={} model={}",
-                    host.backend_name, host.model
-                );
+                eprintln!("Model: {} (provider: {})", host.model, host.backend_name);
                 let mut input = String::new();
                 tokio::io::stdin()
                     .read_to_string(&mut input)
@@ -946,6 +982,20 @@ fn build_cli_tool_runtime(
         .context("register guarded file_write Tool")?;
     runtime
         .register(
+            guarded_file_edit_descriptor(ToolRestriction {
+                bounds: workspace_bounds.clone(),
+            }),
+            Arc::new(
+                GuardedFileEditExecutor::new_with_roots(
+                    &workspaces.primary,
+                    &workspaces.additional,
+                )
+                .context("open file_edit workspace capability")?,
+            ),
+        )
+        .context("register guarded file_edit Tool")?;
+    runtime
+        .register(
             guarded_apply_patch_descriptor(ToolRestriction {
                 bounds: workspace_bounds,
             }),
@@ -1009,10 +1059,13 @@ fn build_cli_tool_runtime(
 fn command_runtime_temp_root(workspace_roots: &BTreeSet<String>) -> anyhow::Result<PathBuf> {
     // Leave room for tools that create Unix sockets below TMPDIR. The macOS
     // per-user OS temp prefix alone can consume much of sockaddr_un.sun_path.
-    let mut candidates = Vec::new();
-    #[cfg(unix)]
-    candidates.extend([PathBuf::from("/tmp"), PathBuf::from("/var/tmp")]);
-    candidates.push(std::env::temp_dir());
+    let candidates = vec![
+        #[cfg(unix)]
+        PathBuf::from("/tmp"),
+        #[cfg(unix)]
+        PathBuf::from("/var/tmp"),
+        std::env::temp_dir(),
+    ];
     let parent = candidates
         .into_iter()
         .filter_map(|path| std::fs::canonicalize(path).ok())
@@ -1053,8 +1106,24 @@ fn configured_exec_host(config: &OrchestralConfig) -> anyhow::Result<Option<CliE
     } else if let Some(shell) = std::env::var_os("SHELL").filter(|shell| !shell.is_empty()) {
         PathBuf::from(resolve_host_program(&shell.to_string_lossy())?)
     } else {
-        ["/bin/zsh", "/bin/bash", "/bin/sh"]
-            .into_iter()
+        #[cfg(windows)]
+        let candidates = {
+            let mut paths = vec!["pwsh.exe".to_owned(), "powershell.exe".to_owned()];
+            if let Some(root) = std::env::var_os("SystemRoot") {
+                paths.push(
+                    PathBuf::from(root)
+                        .join("System32/WindowsPowerShell/v1.0/powershell.exe")
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            paths.push("cmd.exe".to_owned());
+            paths
+        };
+        #[cfg(not(windows))]
+        let candidates = ["/bin/zsh", "/bin/bash", "/bin/sh"];
+        candidates
+            .iter()
             .find_map(|candidate| resolve_host_program(candidate).ok())
             .map(PathBuf::from)
             .context("no command shell is available; set tools.exec.shell")?
@@ -1062,6 +1131,14 @@ fn configured_exec_host(config: &OrchestralConfig) -> anyhow::Result<Option<CliE
     let environment_names = [
         "PATH",
         "HOME",
+        "USERPROFILE",
+        "SystemRoot",
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "APPDATA",
+        "LOCALAPPDATA",
         "USER",
         "LANG",
         "LC_ALL",
@@ -1407,7 +1484,7 @@ fn host_executable_file(candidate: &Path) -> bool {
     }
 }
 
-fn resolve_model(
+async fn resolve_model(
     config: &OrchestralConfig,
 ) -> anyhow::Result<(
     orchestral_core::config::BackendSpec,
@@ -1446,8 +1523,11 @@ fn resolve_model(
         .agent
         .model
         .clone()
-        .or_else(|| profile.as_ref().map(|profile| profile.model.clone()))
-        .context("no model configured for the selected backend")?;
+        .or_else(|| profile.as_ref().map(|profile| profile.model.clone()));
+    let model = match model {
+        Some(model) => model,
+        None => crate::openai_connection::discover_single_model(&backend).await?,
+    };
     let candidate = config
         .agent
         .temperature
@@ -1464,10 +1544,13 @@ fn build_model_backend(
     backend: &BackendSpec,
     model: &str,
     temperature: f32,
-    max_output_tokens: u64,
+    profile: Option<&ModelProfile>,
     max_buffered_events: usize,
     credential_file: Option<&std::path::Path>,
 ) -> anyhow::Result<(Arc<dyn ModelBackend>, Arc<dyn ModelTokenMeter>)> {
+    let max_output_tokens = profile
+        .and_then(|profile| profile.max_tokens)
+        .unwrap_or(8_192) as u64;
     let timeout = Duration::from_secs(
         backend
             .get_config("stream_idle_timeout_secs")
@@ -1544,9 +1627,19 @@ fn build_model_backend(
             Ok((backend.clone(), backend))
         }
         "openai" | "openrouter" | "deepseek" | "groq" | "xai" | "mistral" => {
-            let api_key = backend
-                .resolve_api_key()
-                .with_context(|| format!("resolve API key for backend '{}'", backend.name))?;
+            let sampling = profile
+                .and_then(|profile| profile.config.get("sampling"))
+                .map(|value| serde_json::from_value::<OpenAiSamplingConfig>(value.clone()))
+                .transpose()
+                .context("parse model profile config.sampling")?
+                .unwrap_or_default();
+            let tool_result_format = profile
+                .and_then(|profile| profile.config.get("tool_result_format"))
+                .map(|value| serde_json::from_value::<OpenAiToolResultFormat>(value.clone()))
+                .transpose()
+                .context("parse model profile config.tool_result_format")?
+                .unwrap_or_default();
+            let api_key = crate::openai_connection::api_key(backend)?;
             let endpoint = backend.endpoint.clone().or_else(|| match backend.kind.as_str() {
                 "openai" => Some("https://api.openai.com/v1".to_owned()),
                 "deepseek" => Some("https://api.deepseek.com".to_owned()),
@@ -1572,7 +1665,10 @@ fn build_model_backend(
                         .unwrap_or(true),
                     max_buffered_events,
                 })
-                .context("build OpenAI-compatible ModelBackend")?,
+                .context("build OpenAI-compatible ModelBackend")?
+                .with_sampling(sampling)
+                .context("configure OpenAI-compatible sampling")?
+                .with_tool_result_format(tool_result_format),
             );
             Ok((backend.clone(), backend))
         }
@@ -1982,7 +2078,125 @@ fn select_entry_mode(
 mod entry_mode_tests {
     use std::path::PathBuf;
 
-    use super::{select_entry_mode, unique_id, CliWorkspaceSet, EntryMode};
+    use super::{select_entry_mode, unique_id, CliWorkspaceSet, EntryMode, InputMode};
+
+    #[test]
+    fn input_mode_uses_the_reply_channel_not_headless_output() {
+        let prompt = EntryMode::HeadlessPrompt("inspect the project".to_owned());
+        assert!(!InputMode::Auto.resolve(&prompt, false).unwrap());
+        assert!(InputMode::Auto.resolve(&prompt, true).unwrap());
+        assert!(InputMode::Auto.resolve(&EntryMode::Tui, true).unwrap());
+        assert!(InputMode::Interactive.resolve(&prompt, false).unwrap());
+        assert!(!InputMode::None.resolve(&EntryMode::Tui, true).unwrap());
+        assert!(!InputMode::Auto
+            .resolve(&EntryMode::HeadlessPipe, false)
+            .unwrap());
+        assert!(InputMode::Interactive
+            .resolve(&EntryMode::HeadlessPipe, false)
+            .is_err());
+    }
+
+    #[test]
+    fn model_profile_sampling_is_validated_before_connecting() {
+        let backend = serde_json::from_value(serde_json::json!({
+            "name": "local", "kind": "openai", "endpoint": "http://127.0.0.1:1/v1",
+            "config": {"auth": "none"},
+        }))
+        .unwrap();
+        for sampling in [
+            serde_json::json!({"top_k": "20"}),
+            serde_json::json!({"topk": 20}),
+            serde_json::json!({"repetition_penalty": 0}),
+        ] {
+            let profile = serde_json::from_value(serde_json::json!({
+                "name": "local", "backend": "local", "model": "local-model",
+                "config": {"sampling": sampling},
+            }))
+            .unwrap();
+            let error =
+                super::build_model_backend(&backend, "local-model", 0.6, Some(&profile), 8, None)
+                    .err()
+                    .expect("invalid model sampling must fail before HTTP");
+            assert!(format!("{error:#}").contains("sampling"));
+        }
+    }
+
+    #[test]
+    fn model_profile_tool_result_format_defaults_to_yaml_and_is_strict() {
+        let backend = serde_json::from_value(serde_json::json!({
+            "name": "local", "kind": "openai", "endpoint": "http://127.0.0.1:1/v1",
+            "config": {"auth": "none"},
+        }))
+        .unwrap();
+        let profile = |format| {
+            serde_json::from_value(serde_json::json!({
+                "name": "local", "backend": "local", "model": "local-model",
+                "config": {"tool_result_format": format},
+            }))
+            .unwrap()
+        };
+        for format in [
+            serde_json::json!("text"),
+            serde_json::json!(true),
+            serde_json::Value::Null,
+        ] {
+            let error = super::build_model_backend(
+                &backend,
+                "local-model",
+                0.6,
+                Some(&profile(format)),
+                8,
+                None,
+            )
+            .err()
+            .expect("invalid result format must fail before HTTP");
+            assert!(format!("{error:#}").contains("tool_result_format"));
+        }
+        let (_, json_meter) = super::build_model_backend(
+            &backend,
+            "local-model",
+            0.6,
+            Some(&profile(serde_json::json!("json"))),
+            8,
+            None,
+        )
+        .unwrap();
+        let (_, yaml_meter) = super::build_model_backend(
+            &backend,
+            "local-model",
+            0.6,
+            Some(&profile(serde_json::json!("yaml"))),
+            8,
+            None,
+        )
+        .unwrap();
+        assert_ne!(json_meter.meter_descriptor(), yaml_meter.meter_descriptor());
+        let (_, default_meter) =
+            super::build_model_backend(&backend, "local-model", 0.6, None, 8, None).unwrap();
+        assert_eq!(
+            default_meter.meter_descriptor(),
+            yaml_meter.meter_descriptor()
+        );
+        let mut omitted_format = profile(serde_json::json!("json"));
+        omitted_format
+            .config
+            .as_object_mut()
+            .unwrap()
+            .remove("tool_result_format");
+        let (_, omitted_meter) = super::build_model_backend(
+            &backend,
+            "local-model",
+            0.6,
+            Some(&omitted_format),
+            8,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            omitted_meter.meter_descriptor(),
+            yaml_meter.meter_descriptor()
+        );
+    }
 
     #[cfg(unix)]
     #[test]

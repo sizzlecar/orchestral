@@ -11,39 +11,61 @@ use crate::runtime::ModelOverrides;
 #[derive(Debug, Parser)]
 #[command(
     name = "orchestral",
-    about = "Provider-neutral Orchestral Agent CLI",
+    about = "A coding agent for your terminal and workspace",
     version
 )]
 pub struct Cli {
     #[command(subcommand)]
     command: Option<CliCommand>,
+    /// Read configuration from this YAML file.
     #[arg(long, global = true)]
     config: Option<PathBuf>,
+    /// Load environment variables from a file before reading configuration.
     #[arg(long, global = true)]
     env_file: Option<PathBuf>,
     /// Provider credential document. For Google, this accepts a service-account JSON key.
     #[arg(long, value_name = "PATH", global = true)]
     credential_file: Option<PathBuf>,
+    /// Select a model provider defined in your configuration.
     #[arg(long, global = true)]
     backend: Option<String>,
+    /// Select a named model profile from your configuration.
     #[arg(long, global = true)]
     model_profile: Option<String>,
+    /// Use this model ID (or choose from the server's model list).
     #[arg(long, global = true)]
     model: Option<String>,
+    /// OpenAI-compatible URL. Also accepts OPENAI_BASE_URL; custom URLs default to no auth.
+    #[arg(long, value_name = "URL", global = true)]
+    base_url: Option<String>,
+    /// Explicit credential environment variable for an OpenAI-compatible server.
+    #[arg(long, value_name = "NAME", global = true, conflicts_with = "no_auth")]
+    api_key_env: Option<String>,
+    /// Omit authentication for the selected OpenAI-compatible server.
+    #[arg(long, global = true)]
+    no_auth: bool,
+    /// Override the model's sampling temperature.
     #[arg(long, global = true)]
     temperature: Option<f32>,
-    /// Reuse this Agent Session identity for all turns in this process
+    /// Continue the conversation with this session ID
     #[arg(long, global = true)]
     session_id: Option<String>,
+    /// Add instructions to the agent for this session.
     #[arg(long, global = true)]
     system_prompt: Option<String>,
+    /// Follow-up input for local runs. Serve uses its remote input channel.
+    #[arg(long, value_enum, default_value = "auto", global = true)]
+    input_mode: crate::agent::InputMode,
+    /// Start without MCP servers.
     #[arg(long, global = true)]
     no_mcp: bool,
     /// Explicit local MCP manifest (`.mcp.json`). May be repeated.
     #[arg(long, value_name = "PATH", global = true)]
     mcp_config: Vec<PathBuf>,
+    /// Start without loading skills.
     #[arg(long, global = true)]
     no_skills: bool,
+    /// Show additional diagnostic logging on stderr.
     #[arg(long, global = true)]
     verbose: bool,
     /// Use DIR as the primary Agent workspace instead of the process directory.
@@ -59,6 +81,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum CliCommand {
+    /// Check installation and model configuration without starting a task.
+    Doctor(crate::doctor::DoctorCommand),
     /// Manage MCP servers registered for this user.
     Mcp(crate::mcp_command::McpCommand),
     /// List, enable, or disable Skills for the current workspace.
@@ -67,17 +91,36 @@ enum CliCommand {
     Sessions(crate::session_command::SessionsCommand),
     /// Reopen a built-in Agent conversation, optionally with a follow-up prompt.
     Resume(crate::local_sessions::ResumeCommand),
-    /// Run the local Host gateway and mobile PWA control surface.
+    /// Start the web interface for browser and phone access.
     Serve(crate::remote::ServeCommand),
 }
 
 impl Cli {
     fn model_overrides(&self) -> ModelOverrides {
+        let base_url = self.base_url.clone().or_else(|| {
+            (self.backend.is_none() && self.model_profile.is_none())
+                .then(|| {
+                    env::var("OPENAI_BASE_URL")
+                        .ok()
+                        .filter(|value| !value.trim().is_empty())
+                })
+                .flatten()
+        });
+        let model = self.model.clone().or_else(|| {
+            base_url.as_ref().and_then(|_| {
+                env::var("OPENAI_MODEL")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            })
+        });
         ModelOverrides {
             backend: self.backend.clone(),
             model_profile: self.model_profile.clone(),
-            model: self.model.clone(),
+            model,
             temperature: self.temperature,
+            base_url,
+            api_key_env: self.api_key_env.clone(),
+            no_auth: self.no_auth,
         }
     }
 
@@ -95,6 +138,7 @@ impl Cli {
             session_id: self.session_id,
             system_prompt: self.system_prompt,
             input: (!self.input.is_empty()).then(|| self.input.join(" ")),
+            input_mode: self.input_mode,
             no_mcp: self.no_mcp,
             mcp_config: self.mcp_config,
             no_skills: self.no_skills,
@@ -102,6 +146,7 @@ impl Cli {
             add_dirs: self.add_dirs,
         };
         match self.command {
+            Some(CliCommand::Doctor(command)) => command.run(options).await,
             Some(CliCommand::Mcp(command)) => command.run().await,
             Some(CliCommand::Skills(command)) => command.run(options.config, options.cwd),
             Some(CliCommand::Sessions(command)) => command.run(options.config, options.cwd).await,
@@ -143,6 +188,29 @@ mod tests {
     use super::Cli;
 
     #[test]
+    fn input_mode_is_typed_and_defaults_to_auto() {
+        assert_eq!(
+            Cli::try_parse_from(["orchestral", "inspect"])
+                .unwrap()
+                .input_mode,
+            crate::agent::InputMode::Auto
+        );
+        assert_eq!(
+            Cli::try_parse_from(["orchestral", "--input-mode", "interactive", "inspect"])
+                .unwrap()
+                .input_mode,
+            crate::agent::InputMode::Interactive
+        );
+        assert_eq!(
+            Cli::try_parse_from(["orchestral", "--input-mode", "none", "inspect"])
+                .unwrap()
+                .input_mode,
+            crate::agent::InputMode::None
+        );
+        assert!(Cli::try_parse_from(["orchestral", "--input-mode", "maybe"]).is_err());
+    }
+
+    #[test]
     fn root_command_is_the_agent_entrypoint() {
         let parsed = Cli::try_parse_from(["orchestral", "inspect this repository"])
             .expect("a positional prompt must start the Agent directly");
@@ -153,7 +221,7 @@ mod tests {
                 .get_subcommands()
                 .map(clap::Command::get_name)
                 .collect::<Vec<_>>(),
-            ["mcp", "skills", "sessions", "resume", "serve"]
+            ["doctor", "mcp", "skills", "sessions", "resume", "serve"]
         );
     }
 

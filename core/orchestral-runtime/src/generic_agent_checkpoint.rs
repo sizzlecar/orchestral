@@ -14,7 +14,7 @@ use orchestral_core::agent_protocol::wire::{
 };
 use orchestral_core::agent_session::SessionSourceRange;
 use orchestral_core::model_protocol::{
-    ModelFinishReason, ModelRequestId, ModelToolCallId, ModelUsage,
+    ModelContent, ModelFinishReason, ModelRequestId, ModelToolCallId, ModelUsage,
 };
 use orchestral_core::tool_protocol::ApprovalCapability;
 use serde::{Deserialize, Serialize};
@@ -86,6 +86,9 @@ pub struct GenericModelObservation {
     pub finish_reason: ModelFinishReason,
     #[serde(default)]
     pub response: String,
+    /// Provider-owned message state, separate from visible text and Tool data.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub continuation: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub usage: Option<ModelUsage>,
     #[serde(default)]
@@ -104,15 +107,31 @@ pub struct GenericModelContextTrace {
     pub config_digest: Digest,
     pub history_limit: usize,
     pub used_input_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_estimate: Option<orchestral_core::model_protocol::ModelContextEstimate>,
     pub input_budget_tokens: u64,
 }
 
 impl GenericModelContextTrace {
     fn validate(&self) -> Result<(), GenericCheckpointError> {
+        if let Some(estimate) = &self.context_estimate {
+            if estimate.accounting
+                != orchestral_core::model_protocol::ModelTokenAccounting::Estimated
+                || estimate.tokens > self.used_input_tokens
+            {
+                return Err(GenericCheckpointError::InvalidData(
+                    "model Context planning estimate must be marked estimated and within its input bound".to_owned(),
+                ));
+            }
+        }
         if !self.config_digest.is_sha256()
             || self.history_limit == 0
             || self.input_budget_tokens == 0
-            || self.used_input_tokens > self.input_budget_tokens
+            || self
+                .context_estimate
+                .as_ref()
+                .map_or(self.used_input_tokens, |estimate| estimate.tokens)
+                > self.input_budget_tokens
         {
             return Err(GenericCheckpointError::InvalidData(
                 "model Context trace requires a config digest and valid Host limits".to_owned(),
@@ -146,7 +165,26 @@ impl GenericModelContextTrace {
 }
 
 impl GenericModelObservation {
+    pub(crate) fn assistant_content(&self) -> Vec<ModelContent> {
+        let mut content = Vec::new();
+        if !self.response.is_empty() {
+            content.push(ModelContent::Text {
+                text: self.response.clone(),
+            });
+        }
+        content.extend(self.continuation.iter().map(|(namespace, value)| {
+            ModelContent::Continuation {
+                namespace: namespace.clone(),
+                value: value.clone(),
+            }
+        }));
+        content
+    }
+
     fn validate(&self) -> Result<(), GenericCheckpointError> {
+        for content in self.assistant_content() {
+            content.validate().map_err(invalid_data)?;
+        }
         let mut call_ids = BTreeSet::new();
         if self.tool_calls.iter().any(|call| {
             call.call_id.is_empty()
@@ -1079,6 +1117,7 @@ mod tests {
             config_digest: Digest::sha256("config-v1"),
             history_limit: 128,
             used_input_tokens: 10,
+            context_estimate: None,
             input_budget_tokens: 100,
         }
     }
@@ -1091,6 +1130,39 @@ mod tests {
 
         let mut trace = context_trace();
         trace.used_input_tokens = trace.input_budget_tokens + 1;
+        assert!(trace.validate().is_err());
+    }
+
+    #[test]
+    fn model_context_trace_keeps_legacy_bounds_and_explicit_estimates_distinct() {
+        use orchestral_core::model_protocol::{ModelContextEstimate, ModelTokenAccounting};
+        let legacy = context_trace();
+        let serialized = serde_json::to_value(&legacy).unwrap();
+        assert!(serialized.get("context_estimate").is_none());
+        let restored: GenericModelContextTrace = serde_json::from_value(serialized).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(restored, legacy);
+
+        let mut trace = legacy;
+        trace.used_input_tokens = 900;
+        trace.context_estimate = Some(ModelContextEstimate {
+            tokens: 80,
+            accounting: ModelTokenAccounting::Estimated,
+        });
+        trace.validate().unwrap();
+        let restored: GenericModelContextTrace =
+            serde_json::from_slice(&serde_json::to_vec(&trace).unwrap()).unwrap();
+        assert_eq!(restored, trace);
+        for (tokens, accounting) in [
+            (101, ModelTokenAccounting::Estimated),
+            (901, ModelTokenAccounting::Estimated),
+            (80, ModelTokenAccounting::Exact),
+            (80, ModelTokenAccounting::ConservativeUpperBound),
+        ] {
+            trace.context_estimate = Some(ModelContextEstimate { tokens, accounting });
+            assert!(trace.validate().is_err());
+        }
+        trace.context_estimate = None;
         assert!(trace.validate().is_err());
     }
 
@@ -1177,6 +1249,7 @@ mod tests {
                         observation: GenericModelObservation {
                             finish_reason: ModelFinishReason::Stop,
                             response: "done".to_owned(),
+                            continuation: BTreeMap::new(),
                             usage: None,
                             tool_calls: vec![],
                         },
@@ -1233,6 +1306,10 @@ mod tests {
                         observation: GenericModelObservation {
                             finish_reason: ModelFinishReason::ToolCalls,
                             response: "calling a Tool".to_owned(),
+                            continuation: BTreeMap::from([(
+                                "fixture/native".to_owned(),
+                                serde_json::json!({"opaque": "Ω\n"}),
+                            )]),
                             usage: Some(ModelUsage {
                                 input_tokens: Some(10),
                                 output_tokens: Some(5),
@@ -1250,6 +1327,20 @@ mod tests {
             )
             .unwrap();
         let observed = store.load_run(&run_id).unwrap().unwrap();
+        let persisted = serde_json::to_vec(&observed).unwrap();
+        let restored: StoredGenericAgentRun = serde_json::from_slice(&persisted).unwrap();
+        let GenericCheckpointPhase::ModelAttemptObserved { observation, .. } =
+            restored.validate().unwrap().phase
+        else {
+            panic!("restored terminal model observation");
+        };
+        assert_eq!(
+            observation.continuation["fixture/native"],
+            serde_json::json!({"opaque": "Ω\n"})
+        );
+        assert!(
+            matches!(&observation.assistant_content()[1], ModelContent::Continuation { namespace, .. } if namespace == "fixture/native")
+        );
         assert!(matches!(
             observed.validate().unwrap().phase,
             GenericCheckpointPhase::ModelAttemptObserved {

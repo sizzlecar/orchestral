@@ -2,7 +2,7 @@
 source: apps/orchestral-cli/src/tui/render.rs
 expression: "render_to_string(&state, 120, 40)"
 ---
-  Orchestral  workspace / 会话-恢复                                                                          ○ replied
+  _>. ORCHESTRAL  // workspace / 会话-恢复                                                                   ○ replied
   › 按照发布检查 Skill 验证 checkout 服务；如果远程查询失败，就用本地测试恢复。
 
     ✓ Loaded 1 skill
@@ -38,7 +38,7 @@ expression: "render_to_string(&state, 120, 40)"
 
 
 
-────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   › Ask Orchestral to do anything…
 
-  gemini-3.1-pro · context: —    enter send · / commands · f1 help
+  gemini-3.1-pro · context: —                                                        enter send · / commands · f1 help

@@ -225,6 +225,7 @@ impl FileAgentJournalStore {
             file.write_all(&bytes)?;
             file.sync_all()?;
             fs::rename(&temporary, &destination)?;
+            #[cfg(unix)]
             File::open(self.root.as_path())?.sync_all()?;
             Ok::<(), std::io::Error>(())
         })();
@@ -276,6 +277,7 @@ impl FileAgentJournalStore {
             file.write_all(&bytes)?;
             file.sync_all()?;
             fs::rename(&temporary, &destination)?;
+            #[cfg(unix)]
             File::open(self.root.as_path())?.sync_all()?;
             Ok::<(), std::io::Error>(())
         })();
@@ -327,6 +329,7 @@ impl FileAgentJournalStore {
             file.write_all(&bytes)?;
             file.sync_all()?;
             fs::rename(&temporary, &destination)?;
+            #[cfg(unix)]
             File::open(self.root.as_path())?.sync_all()?;
             Ok::<(), std::io::Error>(())
         })();
@@ -388,6 +391,7 @@ impl FileAgentJournalStore {
             file.write_all(&bytes)?;
             file.sync_all()?;
             fs::rename(&temporary, &destination)?;
+            #[cfg(unix)]
             File::open(self.root.as_path())?.sync_all()?;
             Ok::<(), std::io::Error>(())
         })();

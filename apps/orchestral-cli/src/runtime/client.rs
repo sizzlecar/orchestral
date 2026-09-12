@@ -2,6 +2,7 @@
 
 mod config;
 
+pub(crate) use config::inspect_runtime_config;
 pub(crate) use config::prepare_runtime_config_path;
 pub(crate) use config::resolve_runtime_config_path;
 
@@ -15,6 +16,9 @@ pub struct ModelOverrides {
     pub model_profile: Option<String>,
     pub model: Option<String>,
     pub temperature: Option<f32>,
+    pub base_url: Option<String>,
+    pub api_key_env: Option<String>,
+    pub no_auth: bool,
 }
 
 impl ModelOverrides {
@@ -23,5 +27,8 @@ impl ModelOverrides {
             && self.model_profile.is_none()
             && self.model.is_none()
             && self.temperature.is_none()
+            && self.base_url.is_none()
+            && self.api_key_env.is_none()
+            && !self.no_auth
     }
 }

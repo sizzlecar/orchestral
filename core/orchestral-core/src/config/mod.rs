@@ -245,7 +245,7 @@ pub struct ExecToolConfig {
     /// isolation may disable this path and offer only explicitly requested,
     /// approved Host execution. This does not grant approval by itself and
     /// requires `allow_host_execution` when command execution is enabled.
-    #[serde(default = "default_true")]
+    #[serde(default = "default_sandboxed_execution")]
     pub sandboxed_execution_enabled: bool,
     /// Exact `host:port` destinations available inside the default sandbox.
     /// Empty denies sandboxed network access. Approved Host execution, when
@@ -260,10 +260,16 @@ impl Default for ExecToolConfig {
             enabled: false,
             shell: None,
             allow_host_execution: false,
-            sandboxed_execution_enabled: true,
+            sandboxed_execution_enabled: default_sandboxed_execution(),
             network_targets: Vec::new(),
         }
     }
+}
+
+fn default_sandboxed_execution() -> bool {
+    // Windows currently offers only explicitly approved Host execution.
+    // This does not enable the separate allow_host_execution ceiling.
+    !cfg!(windows)
 }
 
 #[derive(Debug, Clone, Deserialize)]

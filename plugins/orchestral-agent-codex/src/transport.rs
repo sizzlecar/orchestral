@@ -18,7 +18,9 @@ use tokio::io::{
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, oneshot, Mutex};
-use tokio::time::{sleep, timeout, Instant};
+use tokio::time::timeout;
+#[cfg(unix)]
+use tokio::time::{sleep, Instant};
 #[cfg(unix)]
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 #[cfg(unix)]
@@ -227,6 +229,7 @@ impl Drop for PendingRequest {
 trait RpcWriter: Send {
     async fn send_json(&mut self, message: &Value) -> Result<(), CodexTransportError>;
 
+    #[cfg(unix)]
     async fn send_pong(&mut self, _payload: Vec<u8>) -> Result<(), CodexTransportError> {
         Ok(())
     }
@@ -589,11 +592,11 @@ impl CodexRpcClient {
     #[cfg(not(unix))]
     async fn connect_shared(
         _config: &CodexAppServerConfig,
-        socket_path: &PathBuf,
+        socket_path: &std::path::Path,
         _auto_start: bool,
     ) -> Result<Arc<Self>, CodexTransportError> {
         Err(CodexTransportError::SharedDaemonConnect {
-            socket: socket_path.clone(),
+            socket: socket_path.to_path_buf(),
             message: "Unix control sockets are unavailable on this platform; configure PrivateStdio explicitly"
                 .to_owned(),
         })

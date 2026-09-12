@@ -89,13 +89,43 @@ pub(super) async fn prepare_recovered_approval(
                     )
                 })?;
             let binding = capability.claims.binding.clone();
-            let args_digest = invocation.args_digest().map_err(|error| {
-                AgentProtocolError::new(AgentProtocolErrorCode::InvalidDigest, error.to_string())
-            })?;
-            if binding.run_id != invocation.run_id
+            let prepared = tools
+                .runtime
+                .inspect_effect(&orchestral_core::tool_effect::ToolEffectKey::new(
+                    invocation.run_id.clone(),
+                    invocation.call_id.clone(),
+                ))
+                .await
+                .map_err(|error| {
+                    AgentProtocolError::new(
+                        AgentProtocolErrorCode::InvalidDigest,
+                        error.to_string(),
+                    )
+                })?
+                .ok_or_else(|| {
+                    AgentProtocolError::new(
+                        AgentProtocolErrorCode::InvalidDigest,
+                        "replayed approval outcome has no prepared Tool identity",
+                    )
+                })?
+                .prepared;
+            let args_digest = prepared
+                .execution_invocation()
+                .args_digest()
+                .map_err(|error| {
+                    AgentProtocolError::new(
+                        AgentProtocolErrorCode::InvalidDigest,
+                        error.to_string(),
+                    )
+                })?;
+            if prepared.invocation != invocation
+                || binding.run_id != invocation.run_id
                 || binding.call_id != invocation.call_id
                 || binding.tool_id != invocation.tool_id
                 || binding.args_digest != args_digest
+                || binding.operation_digest != prepared.operation_digest
+                || binding.permission_digest != prepared.permission_digest
+                || binding.policy_digest != prepared.policy_digest
             {
                 return Err(AgentProtocolError::new(
                     AgentProtocolErrorCode::InvalidDigest,

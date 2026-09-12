@@ -2,7 +2,7 @@
 source: apps/orchestral-cli/src/tui/render.rs
 expression: "render_to_string(&state, 80, 24)"
 ---
-  Orchestral  workspace / session-stream                               ? input
+  _>. ORCHESTRAL  // workspace / session-stream                        ? input
   › Review the workspace and explain the longest risk without losing 中文 or
   emoji 🚀.
 
@@ -21,8 +21,8 @@ expression: "render_to_string(&state, 80, 24)"
   ? Input requested
   Which package should receive the compatibility fix?
   Reply below, then press Enter
-────────────────────────────────────────────────────────────────────────────────
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   › orchestral-runtime
     保留协议兼容性
 
-  gpt-5.6 · context: —    enter answer · ctrl+c stop
+  gpt-5.6 · context: —                              enter answer · ctrl+c stop

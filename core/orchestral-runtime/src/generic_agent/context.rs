@@ -84,7 +84,18 @@ pub(super) async fn project_model_context(
 
     let mut previous_overflow = None;
     loop {
-        match inner.context_engine.project(make_request()).await {
+        let policy = if request.run.spec.limits.max_input_tokens.is_some()
+            || request.run.spec.limits.max_cost.is_some()
+        {
+            crate::session_context::ContextTokenPolicy::UpperBound
+        } else {
+            crate::session_context::ContextTokenPolicy::Planning
+        };
+        match inner
+            .context_engine
+            .project_with_policy(make_request(), policy)
+            .await
+        {
             Ok(projection) => return Ok(projection),
             Err(SessionContextError::ContextOverflow { used, budget })
                 if through_session_seq.is_none() && inner.session_compactor.is_some() =>

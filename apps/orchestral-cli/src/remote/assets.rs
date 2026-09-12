@@ -5,7 +5,7 @@ use axum::routing::get;
 use axum::Router;
 use include_dir::{include_dir, Dir, File};
 
-static PWA: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../web/orchestral-web/dist");
+static PWA: Dir<'_> = include_dir!("$ORCHESTRAL_WEB_DIST");
 
 pub fn router() -> Router {
     router_with_artifact_origin(None)

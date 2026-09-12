@@ -3,6 +3,12 @@
 //! An executor must opt in to the Host-owned effective policy
 //! and cancellation contract by implementing [`GuardedToolExecutor`].
 
+mod read_precondition;
+use read_precondition::execution_invocation;
+pub use read_precondition::{
+    CompleteFileRead, FrozenToolObservations, ModelToolObservations, ObservedFileRead,
+};
+
 use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
@@ -18,7 +24,7 @@ use orchestral_core::agent_protocol::wire::{
 use orchestral_core::io::{BlobId, BlobIoError, BlobStore, BlobWriteRequest};
 use orchestral_core::spi::{HookRegistry, RuntimeHookContext, RuntimeHookEventEnvelope, SpiMeta};
 use orchestral_core::tool_effect::{
-    replay_tool_effect, InMemoryToolEffectJournalStore, PreparedToolEffect,
+    replay_tool_effect, InMemoryToolEffectJournalStore, PreparedToolEffect, ToolArgumentResolution,
     ToolAuthorizationEvidence, ToolEffectAttemptId, ToolEffectError, ToolEffectEvent,
     ToolEffectEventDraft, ToolEffectEventId, ToolEffectJournalStore, ToolEffectKey,
     ToolEffectPhase, ToolEffectProjection,
@@ -145,6 +151,30 @@ pub struct GuardedToolExecution {
 /// Explicit opt-in SPI for implementations that enforce Host Tool policy.
 #[async_trait]
 pub trait GuardedToolExecutor: Send + Sync {
+    /// Declares a complete read from this executor's own validated result
+    /// contract. Other executors' JSON fields are never guessed as evidence.
+    fn complete_file_read(
+        &self,
+        _invocation: &ToolInvocation,
+        _output: &serde_json::Value,
+    ) -> Option<CompleteFileRead> {
+        None
+    }
+
+    fn requires_observed_arguments(&self, _invocation: &ToolInvocation) -> bool {
+        false
+    }
+
+    /// Resolve omitted arguments from committed observations already shown to
+    /// the model. The runtime journals this result before issuing authority.
+    fn resolve_arguments(
+        &self,
+        _invocation: &ToolInvocation,
+        _reads: &[ObservedFileRead],
+    ) -> Result<Option<ToolArgumentResolution>, ToolOutcome> {
+        Ok(None)
+    }
+
     /// Stable identity of the pre-execution planner implemented by this Tool.
     /// It becomes part of the runtime execution contract used by recovery.
     fn planning_contract(&self) -> serde_json::Value {
@@ -410,6 +440,15 @@ pub fn tool_permission_decision_digest(
 /// reference-monitor state stay behind this Host-owned boundary.
 #[async_trait]
 pub trait AgentToolRuntime: Send + Sync {
+    async fn freeze_model_observations(
+        &self,
+        _run_id: &RunId,
+        _observations: &ModelToolObservations,
+        _pending_calls: &[ToolCallId],
+    ) -> Result<FrozenToolObservations, ToolOutcome> {
+        Ok(FrozenToolObservations::default())
+    }
+
     /// Stable identity of the Host-side execution contract used to decide
     /// whether a private Agent checkpoint may continue after restart.
     ///
@@ -467,6 +506,27 @@ pub trait AgentToolRuntime: Send + Sync {
     ) -> GuardedToolResult {
         self.invoke(invocation, run_grant, approval, run_cancellation)
             .await
+    }
+
+    /// Uses only observations from the Host's already-dispatched model request.
+    /// Runtimes without observation resolution preserve their existing path.
+    async fn invoke_with_observations(
+        &self,
+        invocation: ToolInvocation,
+        run_grant: RunToolGrant,
+        approval: Option<ApprovalCapability>,
+        run_cancellation: CancellationToken,
+        yield_requested: CancellationToken,
+        _observations: &FrozenToolObservations,
+    ) -> GuardedToolResult {
+        self.invoke_with_yield(
+            invocation,
+            run_grant,
+            approval,
+            run_cancellation,
+            yield_requested,
+        )
+        .await
     }
 }
 
@@ -816,6 +876,7 @@ struct InvocationIdentity {
     permission_digest: Digest,
     policy_digest: Digest,
     descriptor_digest: Digest,
+    argument_resolution_digest: Option<Digest>,
 }
 
 struct InvocationEntry {
@@ -841,6 +902,7 @@ struct PlannedInvocation {
     permission: ToolPermissionDecision,
     permission_digest: Digest,
     approval_binding: ApprovalBinding,
+    argument_resolution: Option<ToolArgumentResolution>,
 }
 
 type InvocationKey = (RunId, ToolCallId);
@@ -1089,15 +1151,46 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
                 error.message,
             ));
         }
+        // Recovery never creates a missing preparation. In particular an
+        // omitted precondition needs no new read when no durable effect exists.
+        let recovery_key =
+            ToolEffectKey::new(invocation.run_id.clone(), invocation.call_id.clone());
+        if self
+            .effect_journal
+            .load_effect(&recovery_key)
+            .await
+            .map_err(effect_journal_recovery_error)?
+            .is_empty()
+        {
+            return Ok(None);
+        }
         let effective_policy = EffectiveToolPolicy::resolve(
             &self.host_ceiling,
             &run_grant,
             &registered.descriptor.restriction,
         )
         .map_err(|error| tool_outcome_recovery_error("invalid_effective_policy", error.message))?;
+        let argument_resolution = self
+            .resolve_invocation_arguments(
+                &invocation,
+                &registered,
+                &FrozenToolObservations::default(),
+            )
+            .await
+            .map_err(|outcome| {
+                tool_outcome_recovery_error(
+                    "operation_planning_failed",
+                    format!("Tool argument resolution failed: {outcome:?}"),
+                )
+            })?;
+        let resolved_invocation = execution_invocation(&invocation, argument_resolution.as_ref());
         let operation = registered
             .executor
-            .plan_operation(&invocation, &registered.descriptor, &effective_policy)
+            .plan_operation(
+                &resolved_invocation,
+                &registered.descriptor,
+                &effective_policy,
+            )
             .map_err(|outcome| {
                 tool_outcome_recovery_error(
                     "operation_planning_failed",
@@ -1127,6 +1220,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
             )?;
         let prepared = PreparedToolEffect {
             invocation: invocation.clone(),
+            argument_resolution: argument_resolution.map(Box::new),
             args_digest: invocation.args_digest().map_err(|error| {
                 tool_outcome_recovery_error("invalid_invocation", error.message)
             })?,
@@ -1248,6 +1342,26 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
         run_cancellation: CancellationToken,
         yield_requested: CancellationToken,
     ) -> GuardedToolResult {
+        self.invoke_with_observations(
+            invocation,
+            run_grant,
+            approval,
+            run_cancellation,
+            yield_requested,
+            &FrozenToolObservations::default(),
+        )
+        .await
+    }
+
+    pub async fn invoke_with_observations(
+        &self,
+        invocation: ToolInvocation,
+        run_grant: RunToolGrant,
+        approval: Option<ApprovalCapability>,
+        run_cancellation: CancellationToken,
+        yield_requested: CancellationToken,
+        observations: &FrozenToolObservations,
+    ) -> GuardedToolResult {
         if let Err(error) = invocation.validate() {
             return rejected("invalid_invocation", error.message);
         }
@@ -1277,8 +1391,21 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
             Ok(policy) => policy,
             Err(error) => return rejected("invalid_effective_policy", error.message),
         };
+        let argument_resolution = match self
+            .resolve_invocation_arguments(&invocation, &registered, observations)
+            .await
+        {
+            Ok(resolution) => resolution,
+            Err(outcome) => {
+                return GuardedToolResult::Outcome {
+                    outcome,
+                    cached: false,
+                }
+            }
+        };
+        let resolved_invocation = execution_invocation(&invocation, argument_resolution.as_ref());
         let operation = match registered.executor.plan_operation(
-            &invocation,
+            &resolved_invocation,
             &registered.descriptor,
             &effective_policy,
         ) {
@@ -1314,7 +1441,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
                 Err(error) => return rejected("invalid_permission_decision", error.message),
             };
         let approval_binding = match ApprovalBinding::for_operation(
-            &invocation,
+            &resolved_invocation,
             &operation,
             &effective_policy,
             permission_digest.clone(),
@@ -1328,6 +1455,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
             &effective_policy,
             &permission_digest,
             &registered.descriptor,
+            argument_resolution.as_ref(),
         ) {
             Ok(identity) => identity,
             Err(error) => return rejected("invalid_invocation", error.message),
@@ -1338,6 +1466,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
             permission,
             permission_digest,
             approval_binding,
+            argument_resolution,
         };
         let effect_key = ToolEffectKey::new(invocation.run_id.clone(), invocation.call_id.clone());
         let entry = match self.invocation_entry(&invocation, identity) {
@@ -1410,7 +1539,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
                 self.execute(
                     registered,
                     GuardedToolExecution {
-                        invocation,
+                        invocation: resolved_invocation,
                         operation,
                         effective_policy,
                         lease,
@@ -1466,9 +1595,11 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
             permission,
             permission_digest,
             approval_binding,
+            argument_resolution,
         } = planned;
         let prepared = PreparedToolEffect {
             invocation: invocation.clone(),
+            argument_resolution: argument_resolution.clone().map(Box::new),
             args_digest: invocation
                 .args_digest()
                 .map_err(|error| rejected("invalid_invocation", error.message))?,
@@ -1980,6 +2111,16 @@ impl<S> AgentToolRuntime for GuardedToolRuntime<S>
 where
     S: ApprovalCapabilityStore + 'static,
 {
+    async fn freeze_model_observations(
+        &self,
+        run_id: &RunId,
+        observations: &ModelToolObservations,
+        pending_calls: &[ToolCallId],
+    ) -> Result<FrozenToolObservations, ToolOutcome> {
+        GuardedToolRuntime::freeze_model_observations(self, run_id, observations, pending_calls)
+            .await
+    }
+
     fn execution_contract_digest(&self) -> Result<Digest, ToolRuntimeError> {
         GuardedToolRuntime::execution_contract_digest(self)
     }
@@ -2043,6 +2184,27 @@ where
         )
         .await
     }
+
+    async fn invoke_with_observations(
+        &self,
+        invocation: ToolInvocation,
+        run_grant: RunToolGrant,
+        approval: Option<ApprovalCapability>,
+        run_cancellation: CancellationToken,
+        yield_requested: CancellationToken,
+        observations: &FrozenToolObservations,
+    ) -> GuardedToolResult {
+        GuardedToolRuntime::invoke_with_observations(
+            self,
+            invocation,
+            run_grant,
+            approval,
+            run_cancellation,
+            yield_requested,
+            observations,
+        )
+        .await
+    }
 }
 
 fn invocation_identity(
@@ -2051,6 +2213,7 @@ fn invocation_identity(
     effective_policy: &EffectiveToolPolicy,
     permission_digest: &Digest,
     descriptor: &ToolDescriptor,
+    argument_resolution: Option<&ToolArgumentResolution>,
 ) -> Result<InvocationIdentity, ToolProtocolError> {
     Ok(InvocationIdentity {
         tool_id: invocation.tool_id.clone(),
@@ -2059,6 +2222,18 @@ fn invocation_identity(
         permission_digest: permission_digest.clone(),
         policy_digest: effective_policy.digest()?,
         descriptor_digest: descriptor.digest()?,
+        argument_resolution_digest: argument_resolution
+            .map(|resolution| {
+                serde_jcs::to_vec(resolution)
+                    .map(Digest::sha256)
+                    .map_err(|error| {
+                        ToolProtocolError::new(
+                            ToolProtocolErrorCode::InvalidInvocation,
+                            error.to_string(),
+                        )
+                    })
+            })
+            .transpose()?,
     })
 }
 

@@ -208,6 +208,7 @@ pub(crate) enum UiMsg {
     FollowOutput,
     Submit,
     SelectApproval(ApprovalChoice),
+    ScrollApproval(usize),
     Approval(ApprovalChoice),
     Cancel,
     Quit,
@@ -302,6 +303,7 @@ pub(crate) struct UiState {
     pub composer_cursor: usize,
     pub pending: Option<PendingOverlay>,
     pub approval_choice: ApprovalChoice,
+    pub approval_scroll: usize,
     pub viewport: Viewport,
     pub tools_expanded: bool,
     pub ui_notice: Option<String>,
@@ -352,6 +354,7 @@ impl UiState {
             composer_cursor: 0,
             pending: None,
             approval_choice: ApprovalChoice::Allow,
+            approval_scroll: 0,
             viewport: Viewport::default(),
             tools_expanded: false,
             ui_notice: None,
@@ -364,7 +367,7 @@ impl UiState {
             references: Vec::new(),
             completion_selected: 0,
             completion_dismissed: false,
-            theme: "terminal".to_owned(),
+            theme: "dark".to_owned(),
             color_enabled: true,
             host_busy: false,
             suspended_draft: None,
@@ -718,6 +721,10 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             state.approval_selected = true;
         }
         UiMsg::SelectApproval(_) => {}
+        UiMsg::ScrollApproval(offset) if state.phase == UiPhase::WaitingApproval => {
+            state.approval_scroll = offset;
+        }
+        UiMsg::ScrollApproval(_) => {}
         UiMsg::Approval(choice) => return resolve_approval(state, choice),
         UiMsg::Cancel if state.phase.accepts_new_run() => {
             if state.composer.is_empty() {
@@ -867,6 +874,9 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             {
                 state.approval_choice = ApprovalChoice::Allow;
                 state.approval_selected = false;
+            }
+            if !same_request {
+                state.approval_scroll = 0;
             }
             state.run_id = Some(run_id);
             state.phase = UiPhase::WaitingApproval;
@@ -1393,6 +1403,7 @@ mod tests {
 
         update(&mut state, UiMsg::SelectApproval(ApprovalChoice::Deny));
         assert_eq!(state.approval_choice, ApprovalChoice::Deny);
+        update(&mut state, UiMsg::ScrollApproval(5));
 
         update(
             &mut state,
@@ -1408,6 +1419,7 @@ mod tests {
             ApprovalChoice::Deny,
             "reconciling the same request must not reset keyboard selection"
         );
+        assert_eq!(state.approval_scroll, 5);
 
         assert_eq!(
             update(&mut state, UiMsg::Approval(ApprovalChoice::AllowSession)),
@@ -1428,6 +1440,7 @@ mod tests {
             },
         );
         assert_eq!(state.approval_choice, ApprovalChoice::Allow);
+        assert_eq!(state.approval_scroll, 0);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -31,12 +31,18 @@ static LOCAL_E2E_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[path = "agent_live_e2e/context_reliability.rs"]
 mod context_reliability;
+#[path = "agent_live_e2e/failure_diagnostics.rs"]
+mod failure_diagnostics;
+#[path = "agent_live_e2e/input_mode.rs"]
+mod input_mode;
 #[path = "agent_live_e2e/model_retry.rs"]
 mod model_retry;
 #[path = "agent_live_e2e/project_instructions.rs"]
 mod project_instructions;
 #[path = "agent_live_e2e/session_history.rs"]
 mod session_history;
+#[path = "agent_live_e2e/tool_content.rs"]
+mod tool_content;
 #[path = "agent_live_e2e/tui_experience.rs"]
 mod tui_experience;
 
@@ -57,6 +63,17 @@ impl TestWorkspace {
         fs::create_dir_all(&root).expect("create isolated E2E workspace");
         let config = fs::read_to_string(repository_root().join("configs/orchestral.cli.yaml"))
             .expect("read canonical CLI config");
+        #[cfg(windows)]
+        let config = {
+            // Run platform fixtures under PowerShell even when the test
+            // launcher (for example OpenSSH) sets SHELL to cmd.exe.
+            let mut parsed: serde_yaml::Value = serde_yaml::from_str(&config).unwrap();
+            let shell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+                .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+            parsed["tools"]["exec"]["shell"] =
+                serde_yaml::Value::String(shell.to_string_lossy().into_owned());
+            serde_yaml::to_string(&parsed).unwrap()
+        };
         fs::write(root.join("orchestral.yaml"), config).expect("write isolated CLI config");
         Self { root }
     }
@@ -119,6 +136,7 @@ impl TestWorkspace {
         });
     }
 
+    #[cfg(unix)]
     fn configure_host_execution(&self, enabled: bool) {
         self.rewrite_config(|config| {
             let exec = config
@@ -269,14 +287,15 @@ fn missing_google_credential_is_non_zero_and_actionable() {
 #[test]
 fn terminal_model_failure_is_non_zero_and_preserves_the_reason() {
     let workspace = TestWorkspace::new("terminal-failure");
-    let config_path = workspace.path("orchestral.yaml");
-    let config = fs::read_to_string(&config_path)
-        .expect("read config")
-        .replace(
-            "kind: gemini\n      api_key_env: GOOGLE_API_KEY",
-            "kind: gemini\n      endpoint: http://127.0.0.1:1\n      api_key_env: GOOGLE_API_KEY",
-        );
-    fs::write(&config_path, config).expect("write unreachable model endpoint");
+    workspace.rewrite_config(|config| {
+        let google = config["providers"]["backends"]
+            .as_sequence_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|backend| backend["name"].as_str() == Some("google"))
+            .unwrap();
+        google["endpoint"] = serde_yaml::Value::String("http://127.0.0.1:1".into());
+    });
 
     let mut command = base_command(&workspace);
     command
@@ -331,11 +350,20 @@ fn tui_pty_resolves_input_and_approval_then_cancels_another_run() {
             openai_tool_response(
                 "approval-write",
                 "exec_command",
-                json!({ "cmd": "rm tui-approved.marker" }),
+                if cfg!(windows) {
+                    // Exercise the approved destructive effect without relying
+                    // on PowerShell's cmdlet module discovery. Resolve against
+                    // the shell location, not .NET's separate current directory.
+                    json!({ "cmd": "[System.IO.File]::Delete([System.IO.Path]::Combine($PWD.Path, 'tui-approved.marker'))", "sandbox_permissions": "require_escalated", "justification": "Delete the requested marker", "yield_time_ms": 1, "wait_mode": "completion" })
+                } else {
+                    json!({ "cmd": "rm tui-approved.marker", "yield_time_ms": 1, "wait_mode": "completion" })
+                },
             )
         }),
         Box::new(|request| {
-            assert!(model_request_text(&request.body).contains("\"exit_code\":0"));
+            if let Some(response) = continue_exec_until_exit(request) {
+                return response;
+            }
             openai_text_response("APPROVAL_RESOLVED_OK")
         }),
         Box::new(|_| {
@@ -375,6 +403,10 @@ fn tui_pty_resolves_input_and_approval_then_cancels_another_run() {
     // the final Up+Enter into an accidental denial.
     tui.send(b"\x1b[B");
     thread::sleep(Duration::from_millis(1_100));
+    assert!(
+        workspace.path("tui-approved.marker").exists(),
+        "the destructive effect must wait for approval"
+    );
     tui.send(b"\x1b[A\r");
     tui.wait_for_text("APPROVAL_RESOLVED_OK", LOCAL_PROCESS_TIMEOUT);
     tui.wait_for_text_count("○ replied", 2, LOCAL_PROCESS_TIMEOUT);
@@ -385,7 +417,7 @@ fn tui_pty_resolves_input_and_approval_then_cancels_another_run() {
     tui.send(&[0x03]);
     tui.wait_for_text("cancelled", LOCAL_PROCESS_TIMEOUT);
     tui.send(&[0x04]);
-    tui.wait_for_text("\u{1b}[?1049l", LOCAL_PROCESS_TIMEOUT);
+    tui.wait_for_terminal_restore(LOCAL_PROCESS_TIMEOUT);
 
     let output = tui.finish(LOCAL_PROCESS_TIMEOUT);
     assert!(output.status.success(), "{}", output.text());
@@ -404,7 +436,9 @@ fn tui_pty_resolves_input_and_approval_then_cancels_another_run() {
     assert!(!workspace.path("tui-approved.marker").exists());
     output.assert_terminal_restored();
     let requests = model_server.join().expect("join TUI model server");
-    assert_eq!(requests.len(), 5);
+    let records = session_records(&workspace);
+    let polls = assert_successful_exec_observations(&records);
+    assert_eq!(requests.len(), 5 + polls);
     assert_eq!(run_payload_count(&workspace, "request_opened"), 3);
     assert_eq!(run_payload_count(&workspace, "request_resolved"), 2);
     assert_eq!(run_payload_count(&workspace, "run_cancelled"), 1);
@@ -428,7 +462,7 @@ fn tui_pty_restores_terminal_after_agent_failure() {
     tui.send_paste("trigger the fixture failure");
     tui.wait_for_text("tool_not_found", LOCAL_PROCESS_TIMEOUT);
     tui.send(&[0x04]);
-    tui.wait_for_text("\u{1b}[?1049l", LOCAL_PROCESS_TIMEOUT);
+    tui.wait_for_terminal_restore(LOCAL_PROCESS_TIMEOUT);
 
     let output = tui.finish(LOCAL_PROCESS_TIMEOUT);
     assert!(output.status.success(), "{}", output.text());
@@ -449,6 +483,10 @@ fn piped_prompt_is_headless_and_stdout_contains_only_final_delivery() {
     let workspace = TestWorkspace::new("headless-pipe");
     let (model_endpoint, model_server) = spawn_fixture_http_server(vec![Box::new(|request| {
         assert!(model_request_text(&request.body).contains(PIPE_PROMPT));
+        assert!(!model_request_has_tool(
+            &request.body,
+            "orchestral_request_input"
+        ));
         openai_text_response("PIPE_FINAL_ONLY")
     })]);
     workspace.configure_local_openai(&model_endpoint);
@@ -486,7 +524,9 @@ fn local_cli_creates_and_verifies_a_file_with_exec_disabled() {
     let workspace = TestWorkspace::new("write-without-shell");
     fs::write(
         workspace.path("request.txt"),
-        format!("{CONTEXT_MARKER}\nCreate generated.txt from this request.\n"),
+        format!(
+            "{CONTEXT_MARKER}\nCreate generated.txt from this request.\nlet literal = '\\n';\n"
+        ),
     )
     .expect("write patch request fixture");
     workspace.disable_exec();
@@ -498,10 +538,10 @@ fn local_cli_creates_and_verifies_a_file_with_exec_disabled() {
                 vec![
                     "apply_patch",
                     "artifact_read",
+                    "file_edit",
                     "file_read",
                     "file_search",
                     "file_write",
-                    "orchestral_request_input",
                     "session_read",
                     "text_search"
                 ]
@@ -510,6 +550,23 @@ fn local_cli_creates_and_verifies_a_file_with_exec_disabled() {
         }),
         Box::new(|request| {
             assert!(model_request_text(&request.body).contains(CONTEXT_MARKER));
+            let text = request.body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|message| message["role"] == "tool")
+                .unwrap()["content"]
+                .as_str()
+                .unwrap();
+            // This CLI has no format override: inspect its actual model wire,
+            // including literal source backslashes and complete metadata.
+            assert!(serde_json::from_str::<Value>(text).is_err());
+            let envelope: Value = serde_yaml::from_str(text).unwrap();
+            assert_eq!(envelope["is_error"], false);
+            assert_eq!(envelope["result"]["eof"], true);
+            assert_eq!(envelope["result"]["truncated"], false);
+            assert!(text.contains("let literal = '\\n';"), "{text}");
+            assert!(!text.contains("let literal = '\\\\n';"), "{text}");
             openai_tool_response(
                 "create-generated",
                 "file_write",
@@ -522,7 +579,10 @@ fn local_cli_creates_and_verifies_a_file_with_exec_disabled() {
         }),
         Box::new(|request| {
             let context = model_request_text(&request.body);
-            assert!(context.contains("\"operation\":\"add\""), "{context}");
+            assert!(
+                model_tool_results_json(&request.body).contains("\"operation\":\"add\""),
+                "{context}"
+            );
             openai_tool_response(
                 "verify-generated",
                 "file_read",
@@ -571,6 +631,130 @@ fn local_cli_creates_and_verifies_a_file_with_exec_disabled() {
         .all(|exchange| tool_result_is_error(exchange) == Some(false)));
 }
 
+#[tokio::test]
+async fn explicit_json_run_recovery_rejects_default_yaml_and_replays_with_json() {
+    use futures_util::StreamExt;
+    use orchestral_core::agent_protocol::{
+        spi::{AgentProvider, AgentRecoveryRequest},
+        wire::{
+            AgentEvent, AgentProtocolErrorCode, AgentProviderStreamItem, AgentRunEnvelope,
+            AgentSessionId, AgentStartRequest, Content, ProviderBindingRef, RunId,
+        },
+        AGENT_PROTOCOL_V1,
+    };
+    use orchestral_core::agent_session::InMemoryAgentSessionJournalStore;
+    use orchestral_model_openai::{
+        OpenAiCompatibleBackend, OpenAiCompatibleConfig, OpenAiToolResultFormat,
+    };
+    use orchestral_runtime::{
+        GenericAgentConfig, InMemoryGenericAgentCheckpointStore, InternalGenericAgentProvider,
+    };
+    use std::sync::Arc;
+
+    let (endpoint, server) = spawn_fixture_http_server(vec![Box::new(|_| {
+        openai_text_response("The original Run completed.")
+    })]);
+    let checkpoint = Arc::new(InMemoryGenericAgentCheckpointStore::default());
+    let session = Arc::new(InMemoryAgentSessionJournalStore::default());
+    let provider = |format: Option<OpenAiToolResultFormat>| {
+        let backend = OpenAiCompatibleBackend::new(OpenAiCompatibleConfig {
+            backend_id: "format-recovery".to_owned(),
+            endpoint: endpoint.clone(),
+            api_key: String::new(),
+            model: "fixture-model".to_owned(),
+            temperature: 0.0,
+            default_max_output_tokens: 128,
+            max_context_tokens: Some(8192),
+            timeout: LOCAL_PROCESS_TIMEOUT,
+            structured_output: false,
+            max_buffered_events: 32,
+        })
+        .unwrap();
+        let backend = Arc::new(match format {
+            Some(format) => backend.with_tool_result_format(format),
+            None => backend,
+        });
+        InternalGenericAgentProvider::new_with_session_journal(
+            backend.clone(),
+            GenericAgentConfig::new("format-provider", "generic-agent"),
+            session.clone(),
+            backend,
+        )
+        .unwrap()
+        .with_checkpoint_store(checkpoint.clone())
+        .unwrap()
+    };
+    let original = provider(Some(OpenAiToolResultFormat::Json));
+    let descriptor = original.describe();
+    let request = AgentStartRequest::new(
+        AgentRunEnvelope::new(
+            AGENT_PROTOCOL_V1,
+            AgentSessionId::new("format-session"),
+            RunId::new("format-run"),
+            vec![Content::text("Complete this Run before restart.")],
+        )
+        .unwrap(),
+        ProviderBindingRef::new("format-binding"),
+        &descriptor,
+    )
+    .unwrap();
+    let started = original.start(request.clone()).await.unwrap();
+    let execution = started.execution.clone();
+    let mut stream = started.stream;
+    let mut original_events = Vec::new();
+    tokio::time::timeout(LOCAL_PROCESS_TIMEOUT, async {
+        loop {
+            let item = stream.next().await.expect("Run reaches delivery").unwrap();
+            if let AgentProviderStreamItem::Event(draft) = item {
+                let delivered = matches!(&draft.payload, AgentEvent::DeliveryCommitted { .. });
+                original_events.push(*draft);
+                if delivered {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("original Run terminates within the fixture deadline");
+    drop(stream);
+    drop(original);
+    // The real adapter has made its one request; the fixture closes here.
+    // Recovery must replay the saved Run, not issue another model request.
+    assert_eq!(server.join().unwrap().len(), 1);
+
+    let default_yaml = provider(None);
+    let error = match default_yaml
+        .recover(
+            AgentRecoveryRequest::new(request.clone(), execution.clone(), &descriptor).unwrap(),
+        )
+        .await
+    {
+        Ok(_) => panic!("a different tool-result encoding must not recover the JSON Run"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, AgentProtocolErrorCode::RunIdConflict);
+
+    let explicit_json = provider(Some(OpenAiToolResultFormat::Json));
+    let recovery = explicit_json
+        .recover(AgentRecoveryRequest::new(request, execution, &descriptor).unwrap())
+        .await
+        .expect("explicit JSON retains the original Run identity");
+    let (mut replay, confirmation) = recovery.into_parts();
+    let recovered_events = tokio::time::timeout(LOCAL_PROCESS_TIMEOUT, async {
+        let mut events = Vec::new();
+        while let Some(item) = replay.next().await {
+            if let AgentProviderStreamItem::Event(draft) = item.unwrap() {
+                events.push(*draft);
+            }
+        }
+        confirmation.await.unwrap();
+        events
+    })
+    .await
+    .expect("same-format recovery replays without new model work");
+    assert_eq!(recovered_events, original_events);
+}
+
 #[test]
 fn local_cli_discovers_searches_reads_patches_and_rechecks_source() {
     let _guard = local_e2e_guard();
@@ -612,7 +796,7 @@ fn local_cli_discovers_searches_reads_patches_and_rechecks_source() {
             assert!(context.contains("src/service.rs"), "{context}");
             assert!(!context.contains("ignored/decoy.rs"), "{context}");
             assert!(
-                context.contains("\"completeness\":\"complete\""),
+                model_tool_results_json(&request.body).contains("\"completeness\":\"complete\""),
                 "{context}"
             );
             openai_tool_response(
@@ -628,7 +812,10 @@ fn local_cli_discovers_searches_reads_patches_and_rechecks_source() {
         Box::new(|request| {
             let context = model_request_text(&request.body);
             assert!(context.contains("TODO_TARGET"), "{context}");
-            assert!(context.contains("\"line_number\":1"), "{context}");
+            assert!(
+                model_tool_results_json(&request.body).contains("\"line_number\":1"),
+                "{context}"
+            );
             openai_tool_response(
                 "read-target-file",
                 "file_read",
@@ -638,7 +825,10 @@ fn local_cli_discovers_searches_reads_patches_and_rechecks_source() {
         Box::new(|request| {
             let context = model_request_text(&request.body);
             assert!(context.contains("answer() -> u32 { 41 }"), "{context}");
-            assert!(context.contains("\"eof\":true"), "{context}");
+            assert!(
+                model_tool_results_json(&request.body).contains("\"eof\":true"),
+                "{context}"
+            );
             openai_tool_response(
                 "patch-target-file",
                 "apply_patch",
@@ -655,7 +845,7 @@ fn local_cli_discovers_searches_reads_patches_and_rechecks_source() {
             )
         }),
         Box::new(|request| {
-            assert!(model_request_text(&request.body).contains("\"operation\":\"update\""));
+            assert!(model_tool_results_json(&request.body).contains("\"operation\":\"update\""));
             openai_tool_response(
                 "recheck-target-file",
                 "file_read",
@@ -735,7 +925,10 @@ fn local_cli_uses_structured_tools_across_an_added_workspace() {
     let (model_endpoint, model_server) = spawn_fixture_http_server(vec![
         Box::new(move |request| {
             let context = model_request_text(&request.body);
-            assert!(context.contains(&selector_for_context), "{context}");
+            assert!(
+                context.contains(&serde_json::to_string(&selector_for_context).unwrap()),
+                "{context}"
+            );
             for tool in ["file_search", "text_search", "file_read", "apply_patch"] {
                 assert!(
                     model_request_has_tool(&request.body, tool),
@@ -795,7 +988,7 @@ fn local_cli_uses_structured_tools_across_an_added_workspace() {
             )
         }),
         Box::new(move |request| {
-            assert!(model_request_text(&request.body).contains("\"operation\":\"update\""));
+            assert!(model_tool_results_json(&request.body).contains("\"operation\":\"update\""));
             openai_tool_response(
                 "added-workspace-verify",
                 "file_read",
@@ -855,6 +1048,7 @@ fn local_cli_uses_structured_tools_across_an_added_workspace() {
 }
 
 #[test]
+#[cfg(unix)] // Verifies unattended execution in a Unix workspace sandbox.
 fn local_cli_reads_patches_and_runs_a_guarded_verification() {
     let _guard = local_e2e_guard();
     let workspace = TestWorkspace::new("patch-and-verify");
@@ -926,7 +1120,10 @@ fn local_cli_reads_patches_and_runs_a_guarded_verification() {
         }),
         Box::new(|request| {
             let context = model_request_text(&request.body);
-            assert!(context.contains("\"operation\":\"update\""), "{context}");
+            assert!(
+                model_tool_results_json(&request.body).contains("\"operation\":\"update\""),
+                "{context}"
+            );
             openai_tool_response(
                 "verify-fixed-source",
                 "exec_command",
@@ -943,7 +1140,10 @@ fn local_cli_reads_patches_and_runs_a_guarded_verification() {
         }),
         Box::new(|request| {
             let context = model_request_text(&request.body);
-            assert!(context.contains("\"exit_code\":0"), "{context}");
+            assert!(
+                model_tool_results_json(&request.body).contains("\"exit_code\":0"),
+                "{context}"
+            );
             openai_text_response("PATCH_AND_VERIFY_OK")
         }),
     ]);
@@ -981,6 +1181,7 @@ fn local_cli_reads_patches_and_runs_a_guarded_verification() {
 }
 
 #[test]
+#[cfg(unix)] // Uses Unix sandbox execution for Git and the verification command.
 fn local_cli_establishes_a_requested_branch_before_editing_and_verifying() {
     let _guard = local_e2e_guard();
     const BRANCH: &str = "agent/e2e-fix";
@@ -1024,7 +1225,10 @@ fn local_cli_establishes_a_requested_branch_before_editing_and_verifying() {
         }),
         Box::new(|request| {
             let context = model_request_text(&request.body);
-            assert!(context.contains("\"exit_code\":0"), "{context}");
+            assert!(
+                model_tool_results_json(&request.body).contains("\"exit_code\":0"),
+                "{context}"
+            );
             openai_tool_response(
                 "read-branch-source",
                 "file_read",
@@ -1050,7 +1254,10 @@ fn local_cli_establishes_a_requested_branch_before_editing_and_verifying() {
         }),
         Box::new(|request| {
             let context = model_request_text(&request.body);
-            assert!(context.contains("\"operation\":\"update\""), "{context}");
+            assert!(
+                model_tool_results_json(&request.body).contains("\"operation\":\"update\""),
+                "{context}"
+            );
             openai_tool_response(
                 "verify-branch-change",
                 "exec_command",
@@ -1059,7 +1266,10 @@ fn local_cli_establishes_a_requested_branch_before_editing_and_verifying() {
         }),
         Box::new(|request| {
             let context = model_request_text(&request.body);
-            assert!(context.contains("\"exit_code\":0"), "{context}");
+            assert!(
+                model_tool_results_json(&request.body).contains("\"exit_code\":0"),
+                "{context}"
+            );
             openai_text_response("BRANCH_EDIT_VERIFY_OK")
         }),
     ]);
@@ -1164,9 +1374,15 @@ fn local_exec_runs_toolchains_and_a_child_script_without_program_enumeration() {
             let context = model_request_text(&request.body);
             assert!(context.contains("cargo 1."), "{context}");
             assert!(context.contains("Python 3."), "{context}");
-            assert!(context.contains("\"alive\":false"), "{context}");
+            assert!(
+                model_tool_results_json(&request.body).contains("\"alive\":false"),
+                "{context}"
+            );
             assert!(context.contains("CHILD_SCRIPT_OK"), "{context}");
-            assert!(context.contains("\"exit_code\":0"), "{context}");
+            assert!(
+                model_tool_results_json(&request.body).contains("\"exit_code\":0"),
+                "{context}"
+            );
             openai_text_response("UNIFIED_EXEC_TOOLCHAINS_OK")
         }),
     ]);
@@ -1198,6 +1414,7 @@ fn local_exec_runs_toolchains_and_a_child_script_without_program_enumeration() {
 }
 
 #[test]
+#[cfg(unix)] // The skill intentionally runs a POSIX shell script.
 fn local_cli_skill_read_injects_instructions_and_journals_load() {
     let _guard = local_e2e_guard();
     const DESCRIPTOR_MARKER: &str = "E2E skill descriptor marker";
@@ -1246,7 +1463,7 @@ fn local_cli_skill_read_injects_instructions_and_journals_load() {
         Box::new(move |request| {
             let context = model_request_text(&request.body);
             assert!(context.contains(INSTRUCTION_MARKER));
-            assert!(context.contains("\"status\":\"loaded\""));
+            assert!(model_tool_results_json(&request.body).contains("\"status\":\"loaded\""));
             assert!(context.contains(&skill_resource_base));
             assert!(context.contains("Relative paths in this Skill's instructions"));
             openai_tool_response(
@@ -1289,7 +1506,7 @@ fn local_cli_skill_read_injects_instructions_and_journals_load() {
     assert!(!first_context.contains(INSTRUCTION_MARKER));
     let second_context = model_request_text(&requests[1].body);
     assert!(second_context.contains(INSTRUCTION_MARKER));
-    assert!(second_context.contains("\"status\":\"loaded\""));
+    assert!(model_tool_results_json(&requests[1].body).contains("\"status\":\"loaded\""));
 
     let records = session_records(&workspace);
     assert_eq!(payload_count(&records, "skill_loaded"), 1);
@@ -1551,6 +1768,9 @@ fn local_cli_routes_structured_host_execution_through_the_approval_prompt() {
     let _guard = local_e2e_guard();
     const EXTERNAL_MARKER: &str = "HOST_EXECUTION_APPROVED_雪豹_7319";
     const FINAL_MARKER: &str = "HOST_APPROVAL_E2E_OK";
+    let timing = Arc::new(ApprovalTiming::new());
+    let first_request_timing = timing.clone();
+    let tool_exit_timing = timing.clone();
 
     let workspace = TestWorkspace::new("host-approval");
     let external = TestWorkspace::new("host-approval-external");
@@ -1565,6 +1785,7 @@ fn local_cli_routes_structured_host_execution_through_the_approval_prompt() {
 
     let (model_endpoint, model_server) = spawn_fixture_http_server(vec![
         Box::new(move |request| {
+            first_request_timing.mark("first_model_request");
             assert!(model_request_has_tool(&request.body, "exec_command"));
             let request_json = request.body.to_string();
             assert!(
@@ -1581,19 +1802,31 @@ fn local_cli_routes_structured_host_execution_through_the_approval_prompt() {
                 "approved-host-read",
                 "exec_command",
                 json!({
-                    "cmd": "cat evidence.txt",
+                    "cmd": if cfg!(windows) {
+                        // This contract verifies approved execution and UTF-8
+                        // file output, independently of profile module discovery.
+                        "[Console]::Out.WriteLine([System.IO.File]::ReadAllText('evidence.txt', [System.Text.Encoding]::UTF8))"
+                    } else {
+                        "cat evidence.txt"
+                    },
                     "workdir": external_root,
                     "sandbox_permissions": "require_escalated",
                     "justification": "Read the external fixture explicitly requested by the user",
-                    "yield_time_ms": 1_000
+                    "yield_time_ms": 1,
+                    "wait_mode": "completion"
                 }),
             )
         }),
-        Box::new(|request| {
+        Box::new(move |request| {
+            if let Some(response) = continue_exec_until_exit(request) {
+                return response;
+            }
+            tool_exit_timing.mark("tool_exit_observed");
             let context = model_request_text(&request.body);
             assert!(context.contains(EXTERNAL_MARKER), "{context}");
             assert!(
-                context.contains("\"sandbox_backend\":\"host-approved\""),
+                model_tool_results_json(&request.body)
+                    .contains("\"sandbox_backend\":\"host-approved\""),
                 "{context}"
             );
             openai_text_response(FINAL_MARKER)
@@ -1601,7 +1834,7 @@ fn local_cli_routes_structured_host_execution_through_the_approval_prompt() {
     ]);
     workspace.configure_local_openai(&model_endpoint);
 
-    let output = run_with_approval(
+    let output = run_with_approval_observed(
         local_default_agent_command(
             &workspace,
             "host-approval-session",
@@ -1611,6 +1844,7 @@ fn local_cli_routes_structured_host_execution_through_the_approval_prompt() {
         ),
         true,
         LOCAL_PROCESS_TIMEOUT,
+        Some(&timing),
     );
     assert!(output.status.success(), "{}", output.stderr_text());
     assert_eq!(output.stdout_text().trim(), FINAL_MARKER);
@@ -1618,18 +1852,21 @@ fn local_cli_routes_structured_host_execution_through_the_approval_prompt() {
     assert!(stderr.contains(APPROVAL_PROMPT), "{stderr}");
     assert!(stderr.contains("outside the workspace sandbox"), "{stderr}");
     assert!(stderr.contains("host_execution"), "{stderr}");
+    assert_eq!(stderr.matches(APPROVAL_PROMPT).count(), 1, "{stderr}");
     output.assert_no_ansi();
 
+    let records = session_records(&workspace);
+    let polls = assert_successful_exec_observations(&records);
+    assert_eq!(run_payload_count(&workspace, "delivery_committed"), 1);
     assert_eq!(
         model_server
             .join()
             .expect("join Host approval model server")
             .len(),
-        2
+        2 + polls
     );
-    let records = session_records(&workspace);
     let exchanges = tool_exchanges(&records);
-    assert_eq!(exchanges.len(), 1);
+    assert_eq!(exchanges.len(), 1 + polls);
     assert_eq!(tool_name(exchanges[0]), Some("exec_command"));
     assert_eq!(tool_result_is_error(exchanges[0]), Some(false));
 }
@@ -1647,10 +1884,11 @@ fn local_cli_preserves_command_proxies_without_inheriting_unlisted_secrets() {
                 "inspect-command-environment",
                 "exec_command",
                 json!({
-                    "cmd": "env",
+                    "cmd": if cfg!(windows) { "cmd.exe /d /c set" } else { "env" },
                     "sandbox_permissions": "require_escalated",
                     "justification": "Inspect the requested command environment",
-                    "yield_time_ms": 1000
+                    "yield_time_ms": 10_000,
+                    "wait_mode": "completion"
                 }),
             )
         }),
@@ -1664,10 +1902,20 @@ fn local_cli_preserves_command_proxies_without_inheriting_unlisted_secrets() {
                 "https_proxy",
                 "all_proxy",
             ] {
-                assert!(context.contains(&format!("{name}={PROXY}")), "{context}");
+                assert!(
+                    context
+                        .to_ascii_lowercase()
+                        .contains(&format!("{name}={PROXY}").to_ascii_lowercase()),
+                    "{context}"
+                );
             }
             for name in ["NO_PROXY", "no_proxy"] {
-                assert!(context.contains(&format!("{name}={BYPASS}")), "{context}");
+                assert!(
+                    context
+                        .to_ascii_lowercase()
+                        .contains(&format!("{name}={BYPASS}").to_ascii_lowercase()),
+                    "{context}"
+                );
             }
             assert!(
                 !context.contains(SECRET),
@@ -1705,6 +1953,7 @@ fn local_cli_preserves_command_proxies_without_inheriting_unlisted_secrets() {
 }
 
 #[test]
+#[cfg(unix)] // The Host retains a default sandbox while denying escalation.
 fn local_cli_host_execution_ceiling_denies_without_prompt_or_spawn() {
     let _guard = local_e2e_guard();
     const FINAL_MARKER: &str = "HOST_EXECUTION_CEILING_OK";
@@ -1777,7 +2026,11 @@ fn mcp_user_registry_add_list_get_remove_round_trip() {
         .arg("--env")
         .arg("FIXTURE_MODE=e2e")
         .arg("--")
-        .arg("/bin/echo")
+        .arg(if cfg!(windows) {
+            env!("CARGO_BIN_EXE_orchestral")
+        } else {
+            "/bin/echo"
+        })
         .arg("--stdio");
     let added = run_to_completion(add, LOCAL_PROCESS_TIMEOUT);
     assert!(added.status.success(), "{}", added.stderr_text());
@@ -1791,7 +2044,12 @@ fn mcp_user_registry_add_list_get_remove_round_trip() {
     assert!(listed.status.success(), "{}", listed.stderr_text());
     let registry: serde_json::Value =
         serde_json::from_str(&listed.stdout_text()).expect("list emits registry JSON");
-    let executable = fs::canonicalize("/bin/echo").expect("resolve registered executable");
+    let executable = fs::canonicalize(if cfg!(windows) {
+        env!("CARGO_BIN_EXE_orchestral")
+    } else {
+        "/bin/echo"
+    })
+    .expect("resolve registered executable");
     assert_eq!(
         registry["mcpServers"]["fixture"]["command"],
         executable.to_string_lossy().as_ref()
@@ -1846,6 +2104,7 @@ fn user_registered_stdio_mcp_is_automatically_loaded_and_called() {
             status: "200 OK",
             content_type: "text/plain",
             body: MCP_RESULT_MARKER.as_bytes().to_vec(),
+            repeat_handler: false,
         }
     })]);
     let script = format!(
@@ -1980,7 +2239,7 @@ fn live_vertex_stream_obeys_the_terminal_contract() {
     assert!(output.status.success(), "{}", output.stderr_text());
     assert_eq!(output.stdout_text().trim(), "你好，Orchestral 👋");
     let stderr = output.stderr_text();
-    assert!(stderr.contains("Generic Agent: backend=google model="));
+    assert!(stderr.contains("Model: ") && stderr.contains("(provider: google)"));
     assert!(!stderr.contains("你好，Orchestral"));
     output.assert_no_ansi();
 
@@ -2539,6 +2798,91 @@ struct PtyOutput {
     bytes: Vec<u8>,
 }
 
+fn physical_screen_contents(screen: &vt100::Screen) -> String {
+    // ConPTY may redraw adjacent rows using automatic wrapping. contents()
+    // joins those rows into one logical line, which cannot index cell(row, col).
+    screen
+        .rows(0, screen.size().1)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn pty_screen_snapshots_preserve_wrapped_physical_rows() {
+    let mut parser = vt100::Parser::new(2, 4, 0);
+    parser.process(b"HEAD\x1b[38;2;163;168;181mBODY");
+    assert_eq!(parser.screen().contents(), "HEADBODY");
+    let contents = physical_screen_contents(parser.screen());
+    assert_eq!(contents, "HEAD\nBODY");
+    let row = contents.lines().position(|line| line == "BODY").unwrap();
+    assert_eq!(
+        parser.screen().cell(row as u16, 0).unwrap().fgcolor(),
+        vt100::Color::Rgb(163, 168, 181)
+    );
+}
+
+#[test]
+fn pty_waits_inspect_the_last_chunk_after_the_child_has_exited() {
+    let _guard = local_e2e_guard();
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_orchestral"));
+    command.arg("--version");
+    let mut tui = PtyHarness::spawn(command);
+    let deadline = Instant::now() + LOCAL_PROCESS_TIMEOUT;
+    let mut output = Vec::new();
+    // Keep the real reader's output outside the consumer until the real child
+    // has exited. No scheduler timing or sleep decides whether the final read
+    // and process completion are observed together by the wait helpers.
+    loop {
+        if let Some(status) = tui.child.try_wait().expect("poll version child") {
+            assert!(status.success(), "{status:?}");
+            if String::from_utf8_lossy(&output).contains("orchestral") {
+                break;
+            }
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            let _ = tui.child.kill();
+            let _ = tui.child.wait();
+            panic!("version child did not exit with its output before the deadline");
+        };
+        match tui
+            .updates
+            .recv_timeout(remaining.min(Duration::from_millis(50)))
+        {
+            Ok(bytes) => output = bytes,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => thread::yield_now(),
+        }
+    }
+    for mode in ["count", "after", "screen"] {
+        tui.latest.clear();
+        tui.screen_frames.clear();
+        tui.screen = vt100::Parser::new(24, 80, 0);
+        let (sender, receiver) = mpsc::channel();
+        sender.send(output.clone()).unwrap();
+        drop(sender);
+        tui.updates = receiver;
+        assert!(tui.child.try_wait().unwrap().unwrap().success());
+        match mode {
+            "count" => tui.wait_for_text_count("orchestral", 1, LOCAL_PROCESS_TIMEOUT),
+            "after" => tui.wait_for_text_after("orchestral", 0, LOCAL_PROCESS_TIMEOUT),
+            "screen" => {
+                tui.wait_for_screen(
+                    |screen| screen.contains("orchestral"),
+                    LOCAL_PROCESS_TIMEOUT,
+                );
+            }
+            _ => unreachable!(),
+        }
+        // Already observed output remains valid at the deadline; a closed
+        // reader without the required evidence still fails immediately.
+        assert!(tui.wait_for_output(Duration::ZERO, |tui| {
+            String::from_utf8_lossy(&tui.latest).contains("orchestral")
+        }));
+        assert!(!tui.wait_for_output(LOCAL_PROCESS_TIMEOUT, |_| false));
+    }
+    assert!(tui.finish(LOCAL_PROCESS_TIMEOUT).status.success());
+}
+
 impl PtyOutput {
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.bytes).into_owned()
@@ -2546,8 +2890,6 @@ impl PtyOutput {
 
     fn assert_terminal_restored(&self) {
         for sequence in [
-            b"\x1b[?1049h".as_slice(),
-            b"\x1b[?1049l".as_slice(),
             b"\x1b[?2004h".as_slice(),
             b"\x1b[?2004l".as_slice(),
             b"\x1b[?25l".as_slice(),
@@ -2562,22 +2904,55 @@ impl PtyOutput {
                 self.text()
             );
         }
-        let leave = self
-            .bytes
-            .windows(b"\x1b[?1049l".len())
-            .rposition(|part| part == b"\x1b[?1049l")
-            .expect("alternate-screen leave sequence");
-        let enter = self
-            .bytes
-            .windows(b"\x1b[?1049h".len())
-            .rposition(|part| part == b"\x1b[?1049h")
-            .expect("alternate-screen enter sequence");
-        assert!(leave > enter, "alternate screen was not left after entry");
+        let assert_restored = |enabled: &[u8], disabled: &[u8]| {
+            let enter = self
+                .bytes
+                .windows(enabled.len())
+                .rposition(|part| part == enabled)
+                .expect("terminal mode enabled");
+            let leave = self
+                .bytes
+                .windows(disabled.len())
+                .rposition(|part| part == disabled)
+                .expect("terminal mode restored");
+            assert!(leave > enter, "terminal mode was not restored after entry");
+        };
+        assert_restored(b"\x1b[?2004h", b"\x1b[?2004l");
+        assert_restored(b"\x1b[?25l", b"\x1b[?25h");
+        // Windows Server's ConPTY consumes 1049 rather than forwarding it.
+        // The terminal module's native-console test checks the real raw mode
+        // and original buffer restoration for explicit, Drop and unwind paths.
+        #[cfg(unix)]
+        assert_restored(b"\x1b[?1049h", b"\x1b[?1049l");
     }
 }
 
 impl PtyHarness {
-    fn spawn(command: CommandBuilder) -> Self {
+    fn spawn(#[allow(unused_mut)] mut command: CommandBuilder) -> Self {
+        #[cfg(windows)]
+        {
+            // portable-pty refreshes base variables from the registry. Tests
+            // must inherit this process's environment, just like headless
+            // Command children, including its process-local Cargo PATH.
+            // Preserve explicit overrides and removals made by each caller.
+            let present = command
+                .iter_full_env_as_str()
+                .map(|(key, _)| key.to_ascii_lowercase())
+                .collect::<std::collections::BTreeSet<_>>();
+            let extra = command
+                .iter_extra_env_as_str()
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .collect::<Vec<_>>();
+            command.env_clear();
+            for (key, value) in std::env::vars_os() {
+                if present.contains(&key.to_string_lossy().to_ascii_lowercase()) {
+                    command.env(key, value);
+                }
+            }
+            for (key, value) in extra {
+                command.env(key, value);
+            }
+        }
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 24,
@@ -2590,7 +2965,15 @@ impl PtyHarness {
             .master
             .try_clone_reader()
             .expect("clone TUI PTY reader");
-        let writer = pair.master.take_writer().expect("take TUI PTY writer");
+        #[allow(unused_mut)]
+        let mut writer = pair.master.take_writer().expect("take TUI PTY writer");
+        #[cfg(windows)]
+        {
+            writer
+                .write_all(b"\x1b[1;1R")
+                .expect("answer ConPTY cursor inheritance query");
+            writer.flush().expect("flush cursor report");
+        }
         let child = pair
             .slave
             .spawn_command(command)
@@ -2635,7 +3018,7 @@ impl PtyHarness {
     fn receive(&mut self, bytes: Vec<u8>) {
         self.screen.process(&bytes[self.latest.len()..]);
         self.latest = bytes;
-        let contents = self.screen.screen().contents();
+        let contents = physical_screen_contents(self.screen.screen());
         if self.screen_frames.last() != Some(&contents) {
             self.screen_frames.push(contents);
             if let Some(recording) = &mut self.recording {
@@ -2652,21 +3035,14 @@ impl PtyHarness {
 
     #[track_caller]
     fn wait_for_screen(&mut self, predicate: impl Fn(&str) -> bool, timeout: Duration) -> String {
-        let started = Instant::now();
-        while started.elapsed() < timeout {
-            let contents = self.screen.screen().contents();
-            if predicate(&contents) {
-                return contents;
-            }
-            match self.updates.recv_timeout(Duration::from_millis(50)) {
-                Ok(bytes) => self.receive(bytes),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
+        if self.wait_for_output(timeout, |tui| {
+            predicate(&physical_screen_contents(tui.screen.screen()))
+        }) {
+            return physical_screen_contents(self.screen.screen());
         }
         panic!(
             "TUI screen condition failed:\n{}",
-            self.screen.screen().contents()
+            physical_screen_contents(self.screen.screen())
         );
     }
 
@@ -2678,26 +3054,19 @@ impl PtyHarness {
         self.wait_for_text_count(marker, 1, timeout);
     }
 
+    fn wait_for_terminal_restore(&mut self, timeout: Duration) {
+        // Unlike alternate-buffer switches, bracketed-paste mode changes are
+        // observable in both native Unix PTYs and Windows ConPTY output.
+        self.wait_for_text("\u{1b}[?2004l", timeout);
+    }
+
     fn wait_for_text_after(&mut self, marker: &str, offset: usize, timeout: Duration) {
-        let started = Instant::now();
-        while started.elapsed() < timeout {
-            if String::from_utf8_lossy(&self.latest[offset.min(self.latest.len())..])
-                .contains(marker)
-                || (self.latest.len() > offset && self.screen.screen().contents().contains(marker))
-            {
-                return;
-            }
-            match self.updates.recv_timeout(Duration::from_millis(100)) {
-                Ok(bytes) => self.receive(bytes),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-            if let Some(status) = self.child.try_wait().expect("poll TUI child") {
-                panic!(
-                    "TUI exited before fresh marker {marker:?} with {status:?}:\n{}",
-                    String::from_utf8_lossy(&self.latest)
-                );
-            }
+        if self.wait_for_output(timeout, |tui| {
+            String::from_utf8_lossy(&tui.latest[offset.min(tui.latest.len())..]).contains(marker)
+                || (tui.latest.len() > offset
+                    && physical_screen_contents(tui.screen.screen()).contains(marker))
+        }) {
+            return;
         }
         panic!(
             "TUI did not render fresh marker {marker:?} within {timeout:?}:\n{}",
@@ -2706,10 +3075,9 @@ impl PtyHarness {
     }
 
     fn wait_for_text_count(&mut self, marker: &str, count: usize, timeout: Duration) {
-        let started = Instant::now();
-        while started.elapsed() < timeout {
+        if self.wait_for_output(timeout, |tui| {
             let mut previous = 0usize;
-            let appearances = self
+            let appearances = tui
                 .screen_frames
                 .iter()
                 .map(|frame| {
@@ -2719,25 +3087,10 @@ impl PtyHarness {
                     added
                 })
                 .sum::<usize>();
-            if String::from_utf8_lossy(&self.latest)
-                .matches(marker)
-                .count()
-                >= count
+            String::from_utf8_lossy(&tui.latest).matches(marker).count() >= count
                 || appearances >= count
-            {
-                return;
-            }
-            match self.updates.recv_timeout(Duration::from_millis(100)) {
-                Ok(bytes) => self.receive(bytes),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-            if let Some(status) = self.child.try_wait().expect("poll TUI child") {
-                panic!(
-                    "TUI exited before marker {marker:?} with {status:?}:\n{}",
-                    String::from_utf8_lossy(&self.latest)
-                );
-            }
+        }) {
+            return;
         }
         panic!(
             "TUI did not render marker {marker:?} {count} time(s) within {timeout:?}:\n{}",
@@ -2745,7 +3098,31 @@ impl PtyHarness {
         );
     }
 
+    fn wait_for_output(&mut self, timeout: Duration, predicate: impl Fn(&Self) -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            // A process may exit before its last read is consumed. Only the
+            // reader's channel certifies drained output, and every accepted
+            // chunk must be examined before either EOF or the deadline wins.
+            if predicate(self) {
+                return true;
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            match self.updates.recv_timeout(remaining) {
+                Ok(bytes) => self.receive(bytes),
+                Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
+                    return false;
+                }
+            }
+        }
+    }
+
     fn finish(mut self, timeout: Duration) -> PtyOutput {
+        // Closing ConPTY input terminates its console, even while the child
+        // is still restoring terminal state after the requested exit.
+        #[cfg(unix)]
         self.writer.take();
         let started = Instant::now();
         let status = loop {
@@ -2763,6 +3140,8 @@ impl PtyHarness {
                 self.receive(bytes);
             }
         };
+        #[cfg(windows)]
+        self.writer.take();
         if let (Some(directory), Some(recording)) = (
             std::env::var_os("ORCHESTRAL_TUI_ARTIFACT_DIR"),
             &self.recording,
@@ -2977,9 +3356,9 @@ fn standard_adc_is_available() -> bool {
 fn well_known_adc_path() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        return std::env::var_os("APPDATA")
+        std::env::var_os("APPDATA")
             .map(PathBuf::from)
-            .map(|root| root.join("gcloud/application_default_credentials.json"));
+            .map(|root| root.join("gcloud/application_default_credentials.json"))
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -3025,20 +3404,64 @@ fn run_with_piped_input(mut command: Command, input: &[u8], timeout: Duration) -
     }
 }
 
-fn run_with_approval(mut command: Command, allow: bool, timeout: Duration) -> ProcessOutput {
+// Fixed call sites record only their first monotonic observation. No command,
+// environment, output content or unbounded per-poll history enters this map.
+struct ApprovalTiming {
+    started: Instant,
+    elapsed_ms: Mutex<std::collections::BTreeMap<&'static str, u128>>,
+}
+
+impl ApprovalTiming {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            elapsed_ms: Mutex::new(Default::default()),
+        }
+    }
+
+    fn mark(&self, phase: &'static str) {
+        let elapsed = self.started.elapsed().as_millis();
+        self.elapsed_ms
+            .lock()
+            .unwrap()
+            .entry(phase)
+            .or_insert(elapsed);
+    }
+}
+
+fn run_with_approval(command: Command, allow: bool, timeout: Duration) -> ProcessOutput {
+    run_with_approval_observed(command, allow, timeout, None)
+}
+
+fn run_with_approval_observed(
+    mut command: Command,
+    allow: bool,
+    timeout: Duration,
+    timing: Option<&Arc<ApprovalTiming>>,
+) -> ProcessOutput {
+    let mark = |phase| {
+        if let Some(timing) = timing {
+            timing.mark(phase);
+        }
+    };
+    let workspace = command.get_current_dir().map(Path::to_path_buf);
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    mark("spawn_started");
     let mut child = command.spawn().expect("spawn approval E2E");
+    mark("spawn_returned");
     let mut stdin = child.stdin.take().expect("capture stdin");
     let stdout = child.stdout.take().expect("capture stdout");
     let stderr = child.stderr.take().expect("capture stderr");
-    let stdout_reader = thread::spawn(move || read_all(stdout));
+    let stdout_timing = timing.cloned();
+    let stdout_reader = thread::spawn(move || read_all_observed(stdout, stdout_timing));
     let (stderr_updates, receiver) = mpsc::channel();
     let stderr_reader = thread::spawn(move || read_with_updates(stderr, stderr_updates));
 
     let started = Instant::now();
+    mark("deadline_started");
     let mut approvals_sent = 0_usize;
     let mut exited = None;
     while started.elapsed() < timeout {
@@ -3046,29 +3469,54 @@ fn run_with_approval(mut command: Command, allow: bool, timeout: Duration) -> Pr
             let text = String::from_utf8_lossy(&bytes);
             let observed_prompts = text.matches(APPROVAL_PROMPT).count();
             while approvals_sent < observed_prompts {
+                mark("approval_prompt_observed");
                 stdin
                     .write_all(if allow { b"y\n" } else { b"n\n" })
                     .expect("answer approval prompt");
                 stdin.flush().expect("flush approval answer");
+                mark("approval_answer_flushed");
                 approvals_sent += 1;
             }
         }
         if let Some(status) = child.try_wait().expect("poll approval child") {
+            mark("child_exit_observed");
             exited = Some(status);
             break;
         }
     }
     let timed_out = exited.is_none() && started.elapsed() >= timeout;
     if timed_out {
+        mark("deadline_exceeded");
         let _ = child.kill();
+        mark("kill_returned");
     }
     drop(stdin);
     let status = exited.unwrap_or_else(|| child.wait().expect("wait for approval child"));
+    mark("child_status_collected");
     let output = ProcessOutput {
         status,
         stdout: stdout_reader.join().expect("join stdout reader"),
         stderr: stderr_reader.join().expect("join stderr reader"),
     };
+    mark("output_drained");
+    if timed_out || !output.status.success() {
+        if let Some(timing) = timing {
+            eprintln!(
+                "approval monotonic observations (ms): {}",
+                serde_json::to_string(&*timing.elapsed_ms.lock().unwrap()).unwrap()
+            );
+        }
+    }
+    if timed_out {
+        // The child is already reaped. Keep the original failure below, and
+        // inspect only this fixture's public committed journal metadata.
+        if let Some(workspace) = &workspace {
+            eprintln!(
+                "approval timeout journal metadata: {}",
+                failure_diagnostics::read(workspace)
+            );
+        }
+    }
     assert!(
         approvals_sent > 0,
         "CLI never opened an approval request (status={}):\nstdout:\n{}\nstderr:\n{}",
@@ -3104,6 +3552,23 @@ fn read_all(mut stream: impl Read) -> Vec<u8> {
     let mut bytes = Vec::new();
     stream.read_to_end(&mut bytes).expect("read process stream");
     bytes
+}
+
+fn read_all_observed(mut stream: impl Read, timing: Option<Arc<ApprovalTiming>>) -> Vec<u8> {
+    let Some(timing) = timing else {
+        return read_all(stream);
+    };
+    let mut first = [0_u8; 1];
+    match stream.read_exact(&mut first) {
+        Ok(()) => {
+            timing.mark("first_stdout_observed");
+            let mut bytes = first.to_vec();
+            stream.read_to_end(&mut bytes).expect("read process stream");
+            bytes
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Vec::new(),
+        Err(error) => panic!("read process stream: {error}"),
+    }
 }
 
 fn read_with_updates(mut stream: impl Read, updates: mpsc::Sender<Vec<u8>>) -> Vec<u8> {
@@ -3185,6 +3650,91 @@ fn tool_result_value(exchange: &Value) -> &Value {
         .expect("Tool exchange contains one Tool result")
 }
 
+// Semantic assertions use the complete decoded envelope; raw request text
+// remains untouched for tests that verify the selected presentation itself.
+fn model_tool_results_json(body: &Value) -> String {
+    let results = body["messages"]
+        .as_array()
+        .expect("model messages")
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .map(|message| {
+            serde_yaml::from_str::<Value>(message["content"].as_str().expect("tool result text"))
+                .expect("complete JSON or YAML tool envelope")
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&results).unwrap()
+}
+
+// The exec contract may return a live session at its observation deadline.
+// Continue that exact session through the real tool, within the unchanged
+// fixture deadline; never equate a successful launch with a completed command.
+fn continue_exec_until_exit(request: &CapturedHttpRequest) -> Option<FixtureHttpResponse> {
+    let messages = request.body["messages"].as_array().expect("model messages");
+    let message = messages
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "tool")
+        .expect("exec observation in model history");
+    let payload: Value =
+        serde_yaml::from_str(message["content"].as_str().expect("tool result text"))
+            .expect("structured exec result");
+    assert_eq!(payload["is_error"], false, "{payload}");
+    let result = &payload["result"];
+    if result["alive"] == true {
+        let session = result["session_id"]
+            .as_u64()
+            .expect("live exec session identity");
+        assert!(
+            result["exit_code"].is_null(),
+            "live session cannot have exited: {result}"
+        );
+        assert!(model_request_has_tool(&request.body, "write_stdin"));
+        let mut response = openai_tool_response(
+            &format!("observe-exec-{}", messages.len()),
+            "write_stdin",
+            json!({"session_id":session,"chars":"","yield_time_ms":1000,"wait_mode":"completion"}),
+        );
+        response.repeat_handler = true;
+        Some(response)
+    } else {
+        assert_eq!(result["alive"], false, "{result}");
+        assert_eq!(result["exit_code"], 0, "{result}");
+        None
+    }
+}
+
+fn assert_successful_exec_observations(records: &[Value]) -> usize {
+    let exchanges = tool_exchanges(records);
+    let executions = exchanges
+        .iter()
+        .copied()
+        .filter(|exchange| matches!(tool_name(exchange), Some("exec_command" | "write_stdin")))
+        .collect::<Vec<_>>();
+    assert!(!executions.is_empty(), "missing execution evidence");
+    assert_eq!(tool_name(executions[0]), Some("exec_command"));
+    let session = tool_result_value(executions[0])["session_id"].clone();
+    for (index, exchange) in executions.iter().enumerate() {
+        assert_eq!(tool_result_is_error(exchange), Some(false));
+        if index > 0 {
+            assert_eq!(
+                tool_name(exchange),
+                Some("write_stdin"),
+                "command must execute once"
+            );
+            assert_eq!(tool_arguments(exchange)["session_id"], session);
+            assert_eq!(tool_arguments(exchange)["chars"], "");
+        }
+        if index + 1 < executions.len() {
+            assert_eq!(tool_result_value(exchange)["alive"], true);
+        }
+    }
+    let final_result = tool_result_value(executions.last().unwrap());
+    assert_eq!(final_result["alive"], false);
+    assert_eq!(final_result["exit_code"], 0);
+    executions.len() - 1
+}
+
 fn checkpoint_event_count(workspace: &TestWorkspace, kind: &str) -> usize {
     journal_files(workspace, "generic-checkpoint-")
         .into_iter()
@@ -3239,6 +3789,7 @@ struct FixtureHttpResponse {
     status: &'static str,
     content_type: &'static str,
     body: Vec<u8>,
+    repeat_handler: bool,
 }
 
 type FixtureHttpHandler = Box<dyn Fn(&CapturedHttpRequest) -> FixtureHttpResponse + Send + 'static>;
@@ -3255,32 +3806,42 @@ fn spawn_fixture_http_server(
         let started = Instant::now();
         let mut captured = Vec::with_capacity(handlers.len());
         for handler in handlers {
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(
-                            started.elapsed() < Duration::from_secs(35),
-                            "local HTTP fixture did not receive every expected request"
-                        );
-                        thread::sleep(Duration::from_millis(10));
+            loop {
+                assert!(
+                    started.elapsed() < Duration::from_secs(35),
+                    "local HTTP fixture exceeded its original request deadline"
+                );
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                started.elapsed() < Duration::from_secs(35),
+                                "local HTTP fixture did not receive every expected request"
+                            );
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("accept local HTTP fixture request: {error}"),
                     }
-                    Err(error) => panic!("accept local HTTP fixture request: {error}"),
+                };
+                stream
+                    .set_nonblocking(false)
+                    .expect("use blocking fixture connection");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(20)))
+                    .expect("bound fixture read timeout");
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .expect("bound fixture write timeout");
+                let request = read_http_fixture_request(&mut stream);
+                let response = handler(&request);
+                let repeat = response.repeat_handler;
+                write_http_fixture_response(&mut stream, response);
+                captured.push(request);
+                if !repeat {
+                    break;
                 }
-            };
-            stream
-                .set_nonblocking(false)
-                .expect("use blocking fixture connection");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(20)))
-                .expect("bound fixture read timeout");
-            stream
-                .set_write_timeout(Some(Duration::from_secs(5)))
-                .expect("bound fixture write timeout");
-            let request = read_http_fixture_request(&mut stream);
-            let response = handler(&request);
-            write_http_fixture_response(&mut stream, response);
-            captured.push(request);
+            }
         }
         captured
     });
@@ -3410,6 +3971,7 @@ fn json_response(body: Value) -> FixtureHttpResponse {
         status: "200 OK",
         content_type: "application/json",
         body: serde_json::to_vec(&body).expect("serialize HTTP fixture JSON"),
+        repeat_handler: false,
     }
 }
 
@@ -3418,6 +3980,7 @@ fn sse_response(body: String) -> FixtureHttpResponse {
         status: "200 OK",
         content_type: "text/event-stream",
         body: body.into_bytes(),
+        repeat_handler: false,
     }
 }
 

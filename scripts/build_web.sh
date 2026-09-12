@@ -30,7 +30,8 @@ if [[ -z "${BUNDLE_ID}" ]]; then
   echo "Unable to find the fingerprinted web bundle in generated index.html" >&2
   exit 1
 fi
-sed -i '' "s/__ORCHESTRAL_BUILD_ID__/${BUNDLE_ID}/g" "${DX_OUTPUT}/sw.js"
+sed "s/__ORCHESTRAL_BUILD_ID__/${BUNDLE_ID}/g" "${DX_OUTPUT}/sw.js" > "${DX_OUTPUT}/sw.js.tmp"
+mv "${DX_OUTPUT}/sw.js.tmp" "${DX_OUTPUT}/sw.js"
 
 mkdir -p "${DIST}"
 rsync --archive --delete "${DX_OUTPUT}/" "${DIST}/"

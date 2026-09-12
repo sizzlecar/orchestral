@@ -125,8 +125,14 @@ type SharedOutput = Arc<(Mutex<PtyOutputBuffer>, Condvar)>;
 
 struct PtyProcess {
     writer: Option<Box<dyn Write + Send>>,
+    // Reader/writer clones own pipes on Windows, not the ConPTY itself.
+    #[cfg(windows)]
+    master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
+    #[cfg(unix)]
     process_group_id: Option<u32>,
+    #[cfg(windows)]
+    job: crate::windows_process_job::ProcessJob,
     output: SharedOutput,
     last_activity: Instant,
     reader_thread: Option<std::thread::JoinHandle<()>>,
@@ -159,15 +165,43 @@ impl PtyProcess {
         for (key, value) in &spec.environment {
             command.env(key, value);
         }
-        let child = pty_pair
+        #[allow(unused_mut)]
+        let mut child = pty_pair
             .slave
             .spawn_command(command)
             .map_err(|error| PtyProcessError::Io(error.to_string()))?;
+        #[cfg(unix)]
         let process_group_id = child.process_id();
-        let writer = pty_pair
+        #[cfg(windows)]
+        let job = match child
+            .as_raw_handle()
+            .ok_or_else(|| std::io::Error::other("PTY process handle unavailable"))
+            .and_then(crate::windows_process_job::ProcessJob::attach)
+        {
+            Ok(job) => job,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(PtyProcessError::Io(format!(
+                    "could not supervise Windows PTY process tree: {error}"
+                )));
+            }
+        };
+        #[allow(unused_mut)]
+        let mut writer = pty_pair
             .master
             .take_writer()
             .map_err(|error| PtyProcessError::Io(error.to_string()))?;
+        // portable-pty creates ConPTY with INHERIT_CURSOR. This new virtual
+        // terminal starts at row/column one; answer its startup cursor query
+        // before polling output, otherwise the child waits indefinitely.
+        #[cfg(windows)]
+        {
+            writer
+                .write_all(b"\x1b[1;1R")
+                .and_then(|()| writer.flush())
+                .map_err(|error| PtyProcessError::Io(error.to_string()))?;
+        }
         let mut reader = pty_pair
             .master
             .try_clone_reader()
@@ -200,8 +234,13 @@ impl PtyProcess {
         });
         Ok(Self {
             writer: Some(writer),
+            #[cfg(windows)]
+            master: Some(pty_pair.master),
             child,
+            #[cfg(unix)]
             process_group_id,
+            #[cfg(windows)]
+            job,
             output,
             last_activity: Instant::now(),
             reader_thread: Some(reader_thread),
@@ -245,6 +284,8 @@ impl PtyProcess {
 
     fn terminate(&mut self) {
         self.writer.take();
+        #[cfg(windows)]
+        self.job.terminate();
         #[cfg(unix)]
         if let Some(process_group_id) = self
             .process_group_id
@@ -258,6 +299,8 @@ impl PtyProcess {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+        #[cfg(windows)]
+        self.master.take();
         if let Some(reader_thread) = self.reader_thread.take() {
             let _ = reader_thread.join();
         }
@@ -394,9 +437,23 @@ impl PtyProcessManager {
                 observed_generation = buffer.generation;
                 last_change = Instant::now();
             }
+            if buffer.closed {
+                // PTY EOF can precede an observable child exit. Do not hold the
+                // output lock while inspecting the process: termination takes
+                // the process lock before closing its output buffer.
+                drop(buffer);
+                let exited = process
+                    .lock()
+                    .map_err(|_| PtyProcessError::Unavailable)?
+                    .status()?
+                    .is_some();
+                buffer = output.0.lock().map_err(|_| PtyProcessError::Unavailable)?;
+                if exited {
+                    break;
+                }
+            }
             if (!buffer.bytes.is_empty() && last_change.elapsed() >= settle)
                 || yield_requested.is_cancelled()
-                || buffer.closed
                 || started.elapsed() >= timeout
             {
                 break;
@@ -535,6 +592,67 @@ mod tests {
             manager.send(&RunId::new("another-run"), &process_id, "hello"),
             Err(PtyProcessError::NotFound(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closed_output_keeps_waiting_for_the_child_until_the_observation_deadline() {
+        let manager = PtyProcessManager::new(1024, Duration::from_secs(60)).unwrap();
+        let run_id = RunId::new("closed-output-run");
+        let process_id = PtyProcessId::new("closed-output-process").unwrap();
+        manager
+            .create(PtySpawnSpec {
+                run_id: run_id.clone(),
+                process_id: process_id.clone(),
+                program: std::fs::canonicalize("/bin/sh")
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                args: vec!["-c".to_owned(), "read reply; exit 7".to_owned()],
+                cwd: std::fs::canonicalize(".").unwrap(),
+                environment: BTreeMap::from([("PATH".to_owned(), "/usr/bin:/bin".to_owned())]),
+                rows: 24,
+                cols: 80,
+            })
+            .unwrap();
+        let process = manager.process(&run_id, &process_id).unwrap();
+        let output = process.lock().unwrap().output.clone();
+        // Drive the reader's EOF state independently of the real child. This
+        // isolates the interval before exit status is visible, without relying
+        // on the OS to schedule EOF and child reaping in a particular order.
+        output.0.lock().unwrap().closed = true;
+        assert_eq!(manager.status(&run_id, &process_id).unwrap(), None);
+
+        let deadline = Duration::from_millis(200);
+        let started = Instant::now();
+        let pending = manager
+            .read(
+                &run_id,
+                &process_id,
+                deadline,
+                deadline,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert!(started.elapsed() >= deadline, "EOF ended the wait early");
+        assert!(pending.alive);
+        assert_eq!(pending.exit_code, None);
+        assert!(pending.output.is_empty());
+        assert_eq!(manager.list(&run_id).unwrap(), vec![process_id.clone()]);
+
+        manager.send(&run_id, &process_id, "finish\n").unwrap();
+        let completed = manager
+            .read(
+                &run_id,
+                &process_id,
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert!(!completed.alive);
+        assert_eq!(completed.exit_code, Some(7));
+        manager.close(&run_id, &process_id).unwrap();
     }
 
     #[cfg(unix)]

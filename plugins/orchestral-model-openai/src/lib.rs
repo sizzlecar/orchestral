@@ -1,5 +1,13 @@
 //! OpenAI-compatible HTTP adapter for the canonical Orchestral Model Protocol.
 
+mod continuation;
+mod endpoint;
+pub use endpoint::{discover_models, OpenAiEndpoint};
+mod sampling;
+pub use sampling::OpenAiSamplingConfig;
+mod tool_result;
+pub use tool_result::OpenAiToolResultFormat;
+
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
@@ -9,10 +17,10 @@ use futures_util::stream::BoxStream;
 use futures_util::{stream, StreamExt};
 use orchestral_core::agent_protocol::wire::Digest;
 use orchestral_core::model_protocol::{
-    ModelBackend, ModelCapabilities, ModelContent, ModelDescriptor, ModelError, ModelErrorCode,
-    ModelEvent, ModelEventId, ModelFinishReason, ModelMessage, ModelRequest, ModelRequestId,
-    ModelRole, ModelStream, ModelStreamEvent, ModelTokenAccounting, ModelTokenMeter,
-    ModelTokenMeterDescriptor, ModelToolCallId, ModelToolDefinition, ModelUsage,
+    ModelBackend, ModelCapabilities, ModelContent, ModelContextEstimate, ModelDescriptor,
+    ModelError, ModelErrorCode, ModelEvent, ModelEventId, ModelFinishReason, ModelMessage,
+    ModelRequest, ModelRequestId, ModelRole, ModelStream, ModelStreamEvent, ModelTokenAccounting,
+    ModelTokenMeter, ModelTokenMeterDescriptor, ModelToolCallId, ModelToolDefinition, ModelUsage,
 };
 use reqwest::{Client, StatusCode};
 use serde_json::{json, Map, Value};
@@ -22,6 +30,7 @@ use tokio_util::sync::CancellationToken;
 pub struct OpenAiCompatibleConfig {
     pub backend_id: String,
     pub endpoint: String,
+    /// Bearer credential. An empty string explicitly selects unauthenticated HTTP.
     pub api_key: String,
     pub model: String,
     pub temperature: f32,
@@ -38,7 +47,6 @@ impl OpenAiCompatibleConfig {
     pub fn validate(&self) -> Result<(), ModelError> {
         if self.backend_id.trim().is_empty()
             || self.endpoint.trim().is_empty()
-            || self.api_key.trim().is_empty()
             || self.model.trim().is_empty()
             || !(0.0..=2.0).contains(&self.temperature)
             || self.default_max_output_tokens == 0
@@ -49,25 +57,27 @@ impl OpenAiCompatibleConfig {
                 "invalid OpenAI-compatible ModelBackend configuration",
             ));
         }
+        OpenAiEndpoint::parse(&self.endpoint)?;
         Ok(())
     }
 
     fn completions_url(&self) -> String {
-        let endpoint = self.endpoint.trim_end_matches('/');
-        if endpoint.ends_with("/chat/completions") {
-            endpoint.to_owned()
-        } else {
-            format!("{endpoint}/chat/completions")
-        }
+        OpenAiEndpoint::parse(&self.endpoint)
+            .expect("configuration was validated")
+            .completions_url()
     }
 }
 
 pub struct OpenAiCompatibleBackend {
     client: Client,
     config: OpenAiCompatibleConfig,
+    sampling: OpenAiSamplingConfig,
+    tool_result_format: OpenAiToolResultFormat,
 }
 
 impl OpenAiCompatibleBackend {
+    /// Build an adapter with YAML tool-result text. Select `Json` explicitly
+    /// when retaining the encoding identity of an earlier JSON-configured Run.
     pub fn new(config: OpenAiCompatibleConfig) -> Result<Self, ModelError> {
         config.validate()?;
         let client = Client::builder()
@@ -75,7 +85,27 @@ impl OpenAiCompatibleBackend {
             .read_timeout(config.timeout)
             .build()
             .map_err(|error| ModelError::new(ModelErrorCode::Internal, error.to_string()))?;
-        Ok(Self { client, config })
+        Ok(Self {
+            client,
+            config,
+            sampling: OpenAiSamplingConfig::default(),
+            tool_result_format: OpenAiToolResultFormat::default(),
+        })
+    }
+
+    /// Select explicit sampling parameters without changing omitted defaults.
+    pub fn with_sampling(mut self, sampling: OpenAiSamplingConfig) -> Result<Self, ModelError> {
+        sampling.validate()?;
+        self.sampling = sampling;
+        Ok(self)
+    }
+
+    /// Select the text encoding of complete ToolResult envelopes. Canonical
+    /// messages stay unchanged; this also applies to earlier session history.
+    /// Run recovery remains bound to the original encoding identity.
+    pub fn with_tool_result_format(mut self, format: OpenAiToolResultFormat) -> Self {
+        self.tool_result_format = format;
+        self
     }
 
     fn build_request_body(&self, request: &ModelRequest) -> Result<Value, ModelError> {
@@ -83,11 +113,16 @@ impl OpenAiCompatibleBackend {
         body.insert("model".to_owned(), Value::String(self.config.model.clone()));
         body.insert(
             "messages".to_owned(),
-            Value::Array(encode_messages(&request.messages)?),
+            Value::Array(encode_messages(&request.messages, self.tool_result_format)?),
         );
         body.insert("stream".to_owned(), Value::Bool(true));
         body.insert("stream_options".to_owned(), json!({"include_usage": true}));
         body.insert("temperature".to_owned(), json!(self.config.temperature));
+        let sampling = serde_json::to_value(&self.sampling)
+            .map_err(|error| ModelError::invalid_request(error.to_string()))?;
+        if let Value::Object(sampling) = sampling {
+            body.extend(sampling);
+        }
         body.insert(
             "max_tokens".to_owned(),
             json!(request
@@ -137,30 +172,12 @@ impl OpenAiCompatibleBackend {
         }
         Ok(Value::Object(body))
     }
-}
 
-impl ModelTokenMeter for OpenAiCompatibleBackend {
-    fn meter_descriptor(&self) -> ModelTokenMeterDescriptor {
-        let config = serde_json::to_vec(&(
-            &self.config.model,
-            self.config.temperature.to_bits(),
-            self.config.default_max_output_tokens,
-            self.config.structured_output,
-        ))
-        .expect("OpenAI token meter scalar configuration is serializable");
-        ModelTokenMeterDescriptor {
-            strategy: "openai-compatible/wire-json-upper-bound".to_owned(),
-            version: "1".to_owned(),
-            accounting: ModelTokenAccounting::ConservativeUpperBound,
-            config_digest: Digest::sha256(config),
-        }
-    }
-
-    fn count_request_input(
+    fn input_wire_size(
         &self,
         messages: &[ModelMessage],
         tools: &[ModelToolDefinition],
-    ) -> Result<u64, ModelError> {
+    ) -> Result<(u64, u64), ModelError> {
         let request = ModelRequest {
             request_id: ModelRequestId::new("token-meter"),
             messages: messages.to_vec(),
@@ -173,19 +190,104 @@ impl ModelTokenMeter for OpenAiCompatibleBackend {
         let wire_bytes = serde_json::to_vec(&body)
             .map_err(|error| ModelError::invalid_request(error.to_string()))?
             .len() as u64;
+        let framing = 64_u64
+            .saturating_add((messages.len() as u64).saturating_mul(16))
+            .saturating_add((tools.len() as u64).saturating_mul(32));
+        Ok((wire_bytes, framing))
+    }
+}
+
+// A planning heuristic for mixed prose, code, and tool JSON. This is not a
+// tokenizer and cannot certify a context-window or resource limit.
+const CONTEXT_ESTIMATE_BYTES_PER_TOKEN: u64 = 3;
+
+impl ModelTokenMeter for OpenAiCompatibleBackend {
+    fn meter_descriptor(&self) -> ModelTokenMeterDescriptor {
+        let config = (
+            &self.config.model,
+            self.config.temperature.to_bits(),
+            self.config.default_max_output_tokens,
+            self.config.structured_output,
+            &self.sampling,
+            CONTEXT_ESTIMATE_BYTES_PER_TOKEN,
+        );
+        // Keep the explicit JSON identity byte-for-byte compatible with v2.
+        // Other formats change the actual prompt, so recovery binds the encoding.
+        let (strategy, version, config) = match self.tool_result_format {
+            OpenAiToolResultFormat::Json => (
+                "openai-compatible/wire-json-upper-bound",
+                "2",
+                serde_json::to_vec(&config),
+            ),
+            OpenAiToolResultFormat::Yaml => (
+                "openai-compatible/wire-json-yaml-tool-upper-bound",
+                "1",
+                serde_json::to_vec(&(config, tool_result::YAML_ENCODING_IDENTITY)),
+            ),
+            OpenAiToolResultFormat::TextParts => (
+                "openai-compatible/wire-json-text-parts-tool-upper-bound",
+                "1",
+                serde_json::to_vec(&(config, tool_result::TEXT_PARTS_ENCODING_IDENTITY)),
+            ),
+        };
+        let config = config.expect("OpenAI token meter scalar configuration is serializable");
+        ModelTokenMeterDescriptor {
+            strategy: strategy.to_owned(),
+            version: version.to_owned(),
+            accounting: ModelTokenAccounting::ConservativeUpperBound,
+            config_digest: Digest::sha256(config),
+        }
+    }
+
+    fn count_request_input(
+        &self,
+        messages: &[ModelMessage],
+        tools: &[ModelToolDefinition],
+    ) -> Result<u64, ModelError> {
+        let (wire_bytes, framing) = self.input_wire_size(messages, tools)?;
         // A UTF-8 token consumes at least one byte. The explicit per-request,
         // per-message, and per-tool allowance also covers provider framing
         // that is not present in the HTTP JSON body.
-        Ok(wire_bytes
-            .saturating_add(64)
-            .saturating_add((messages.len() as u64).saturating_mul(16))
-            .saturating_add((tools.len() as u64).saturating_mul(32)))
+        Ok(wire_bytes.saturating_add(framing))
+    }
+
+    fn estimate_context_input(
+        &self,
+        messages: &[ModelMessage],
+        tools: &[ModelToolDefinition],
+    ) -> Result<ModelContextEstimate, ModelError> {
+        let (wire_bytes, framing) = self.input_wire_size(messages, tools)?;
+        Ok(ModelContextEstimate {
+            tokens: wire_bytes
+                .div_ceil(CONTEXT_ESTIMATE_BYTES_PER_TOKEN)
+                .saturating_add(framing),
+            accounting: ModelTokenAccounting::Estimated,
+        })
     }
 }
 
 #[async_trait]
 impl ModelBackend for OpenAiCompatibleBackend {
     fn descriptor(&self) -> ModelDescriptor {
+        let mut extensions = BTreeMap::from([(
+            "openai-compatible/model".to_owned(),
+            Value::String(self.config.model.clone()),
+        )]);
+        extensions.insert(
+            "openai-compatible/continuation".to_owned(),
+            Value::String(continuation::NAMESPACE.to_owned()),
+        );
+        let encoding_identity = match self.tool_result_format {
+            OpenAiToolResultFormat::Json => None,
+            OpenAiToolResultFormat::Yaml => Some(tool_result::YAML_ENCODING_IDENTITY),
+            OpenAiToolResultFormat::TextParts => Some(tool_result::TEXT_PARTS_ENCODING_IDENTITY),
+        };
+        if let Some(encoding_identity) = encoding_identity {
+            extensions.insert(
+                "openai-compatible/tool-result-encoding".to_owned(),
+                Value::String(encoding_identity.to_owned()),
+            );
+        }
         ModelDescriptor {
             backend_id: self.config.backend_id.clone(),
             capabilities: ModelCapabilities {
@@ -195,10 +297,7 @@ impl ModelBackend for OpenAiCompatibleBackend {
                 structured_output: self.config.structured_output,
                 max_context_tokens: self.config.max_context_tokens,
             },
-            extensions: BTreeMap::from([(
-                "openai-compatible/model".to_owned(),
-                Value::String(self.config.model.clone()),
-            )]),
+            extensions,
         }
     }
 
@@ -210,14 +309,14 @@ impl ModelBackend for OpenAiCompatibleBackend {
         request.validate()?;
         self.descriptor().validate()?;
         let body = self.build_request_body(&request)?;
+        let mut http_request = self.client.post(self.config.completions_url()).json(&body);
+        if !self.config.api_key.is_empty() {
+            http_request = http_request.bearer_auth(&self.config.api_key);
+        }
         let response = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(cancelled_error()),
-            response = self.client
-                .post(self.config.completions_url())
-                .bearer_auth(&self.config.api_key)
-                .json(&body)
-                .send() => response,
+            response = http_request.send() => response,
         }
         .map_err(map_transport_error)?;
         let status = response.status();
@@ -229,6 +328,29 @@ impl ModelBackend for OpenAiCompatibleBackend {
             }
             .map_err(map_transport_error)?;
             return Err(map_http_error(status, &bytes));
+        }
+        // Some compatible endpoints return a complete JSON response even to
+        // a streaming request. It follows the same canonical terminal rules.
+        if response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .is_some_and(|mime| mime.trim() == "application/json")
+            })
+        {
+            let bytes = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(cancelled_error()),
+                bytes = response.bytes() => bytes,
+            }
+            .map_err(map_transport_error)?;
+            let value = serde_json::from_slice(&bytes)
+                .map_err(|error| ModelError::protocol(format!("invalid OpenAI JSON: {error}")))?;
+            return Ok(stream::iter(parse_response(&request, &value)?.into_iter().map(Ok)).boxed());
         }
         Ok(openai_event_stream(
             request,
@@ -323,6 +445,7 @@ impl SseDecoder {
 #[derive(Default)]
 struct OpenAiToolCallState {
     call_id: Option<ModelToolCallId>,
+    native_call_id: Option<String>,
     name: String,
     started: bool,
     ended: bool,
@@ -336,6 +459,7 @@ struct OpenAiStreamState {
     pending: VecDeque<Result<ModelStreamEvent, ModelError>>,
     sequence: u64,
     calls: BTreeMap<u64, OpenAiToolCallState>,
+    reasoning: continuation::Reasoning,
     finish_reason: Option<ModelFinishReason>,
     emitted_content: bool,
     terminated: bool,
@@ -390,6 +514,14 @@ impl OpenAiStreamState {
             .and_then(|choices| choices.first())
         {
             if let Some(delta) = choice.get("delta") {
+                if self.finish_reason.is_some()
+                    && delta.as_object().is_none_or(|delta| !delta.is_empty())
+                {
+                    return Err(ModelError::protocol(
+                        "OpenAI content arrived after finish_reason",
+                    ));
+                }
+                self.reasoning.append(delta)?;
                 if let Some(text) = delta
                     .get("content")
                     .and_then(Value::as_str)
@@ -440,7 +572,7 @@ impl OpenAiStreamState {
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
         {
-            let incoming = ModelToolCallId::new(id);
+            let incoming = scoped_tool_call_id(&self.request_id, id);
             if state
                 .call_id
                 .as_ref()
@@ -451,6 +583,7 @@ impl OpenAiStreamState {
                 ));
             }
             state.call_id = Some(incoming);
+            state.native_call_id = Some(id.to_owned());
         }
         if let Some(name) = fragment.pointer("/function/name").and_then(Value::as_str) {
             state.name.push_str(name);
@@ -472,12 +605,15 @@ impl OpenAiStreamState {
             None
         };
         let call_id = state.call_id.clone();
+        let native_call_id = state.native_call_id.clone();
         if let Some((call_id, name)) = start {
             self.emitted_content = true;
             self.emit(ModelEvent::ToolCallStart {
                 call_id,
                 name,
-                extensions: BTreeMap::new(),
+                extensions: native_tool_call_extensions(
+                    native_call_id.expect("started call has native identity"),
+                ),
             })?;
         }
         if let Some(delta) = arguments {
@@ -514,21 +650,22 @@ impl OpenAiStreamState {
         if self.terminated {
             return Ok(());
         }
+        let mut reason = self
+            .finish_reason
+            .clone()
+            .ok_or_else(|| ModelError::protocol("OpenAI stream ended without finish_reason"))?;
         self.close_tool_calls()?;
-        if !self.emitted_content {
+        let continuation = std::mem::take(&mut self.reasoning).into_event();
+        if !self.emitted_content && continuation.is_none() {
             return Err(ModelError::protocol(
                 "OpenAI stream contained neither text nor Tool calls",
             ));
         }
-        let mut reason = self.finish_reason.clone().unwrap_or({
-            if self.calls.is_empty() {
-                ModelFinishReason::Stop
-            } else {
-                ModelFinishReason::ToolCalls
-            }
-        });
         if !self.calls.is_empty() && reason == ModelFinishReason::Stop {
             reason = ModelFinishReason::ToolCalls;
+        }
+        if let Some(continuation) = continuation {
+            self.emit(continuation)?;
         }
         self.emit(ModelEvent::Finish { reason })?;
         self.terminated = true;
@@ -550,6 +687,7 @@ fn openai_event_stream(
         pending: VecDeque::new(),
         sequence: 0,
         calls: BTreeMap::new(),
+        reasoning: continuation::Reasoning::default(),
         finish_reason: None,
         emitted_content: false,
         terminated: false,
@@ -609,7 +747,56 @@ fn map_finish_reason(reason: &str) -> ModelFinishReason {
     }
 }
 
-fn encode_messages(messages: &[ModelMessage]) -> Result<Vec<Value>, ModelError> {
+const OPENAI_TOOL_CALL_ID_EXTENSION: &str = "openai/tool_call_id";
+
+// Some compatible servers reuse native call IDs across completions. Scope the
+// canonical identity to the logical request so distinct model steps cannot
+// collide in the Run's effect journal. Retries of that request stay identical.
+fn scoped_tool_call_id(request_id: &ModelRequestId, native_call_id: &str) -> ModelToolCallId {
+    let identity = serde_json::to_vec(&(request_id.as_str(), native_call_id))
+        .expect("tool identity strings serialize");
+    ModelToolCallId::new(format!("openai-{}", Digest::sha256(identity).as_str()))
+}
+
+fn native_tool_call_extensions(native_call_id: String) -> BTreeMap<String, Value> {
+    BTreeMap::from([(
+        OPENAI_TOOL_CALL_ID_EXTENSION.to_owned(),
+        Value::String(native_call_id),
+    )])
+}
+
+fn encode_messages(
+    messages: &[ModelMessage],
+    tool_result_format: OpenAiToolResultFormat,
+) -> Result<Vec<Value>, ModelError> {
+    // Native continuation IDs survive journaling in provider-owned metadata.
+    // Older history without this metadata already contains native IDs.
+    let mut native_ids = BTreeMap::new();
+    for message in messages {
+        for content in &message.content {
+            if let ModelContent::ToolCall {
+                call_id,
+                extensions,
+                ..
+            } = content
+            {
+                if let Some(native_id) = extensions
+                    .get(OPENAI_TOOL_CALL_ID_EXTENSION)
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                {
+                    native_ids.insert(call_id.as_str(), native_id);
+                }
+            }
+        }
+    }
+    let wire_call_id = |call_id: &ModelToolCallId| {
+        native_ids
+            .get(call_id.as_str())
+            .copied()
+            .unwrap_or(call_id.as_str())
+            .to_owned()
+    };
     let mut encoded = Vec::new();
     for message in messages {
         match message.role {
@@ -622,11 +809,15 @@ fn encode_messages(messages: &[ModelMessage]) -> Result<Vec<Value>, ModelError> 
             ModelRole::Assistant => {
                 let mut text = Vec::new();
                 let mut calls = Vec::new();
+                let mut value = Map::new();
                 for content in &message.content {
                     match content {
                         ModelContent::Text { text: value } => text.push(value.clone()),
                         ModelContent::Json { value } | ModelContent::Data { value, .. } => {
                             text.push(value.to_string())
+                        }
+                        ModelContent::Continuation { namespace, value: state } => {
+                            continuation::insert(&mut value, namespace, state)?;
                         }
                         ModelContent::ToolCall {
                             call_id,
@@ -634,7 +825,7 @@ fn encode_messages(messages: &[ModelMessage]) -> Result<Vec<Value>, ModelError> 
                             arguments,
                             ..
                         } => calls.push(json!({
-                            "id": call_id.as_str(),
+                            "id": wire_call_id(call_id),
                             "type": "function",
                             "function": {
                                 "name": name,
@@ -656,7 +847,6 @@ fn encode_messages(messages: &[ModelMessage]) -> Result<Vec<Value>, ModelError> 
                         }
                     }
                 }
-                let mut value = Map::new();
                 value.insert("role".to_owned(), Value::String("assistant".to_owned()));
                 value.insert(
                     "content".to_owned(),
@@ -685,8 +875,8 @@ fn encode_messages(messages: &[ModelMessage]) -> Result<Vec<Value>, ModelError> 
                     };
                     encoded.push(json!({
                         "role": "tool",
-                        "tool_call_id": call_id.as_str(),
-                        "content": json!({"result": result, "is_error": is_error}).to_string(),
+                        "tool_call_id": wire_call_id(call_id),
+                        "content": tool_result_format.encode(result, *is_error)?,
                     }));
                 }
             }
@@ -717,7 +907,6 @@ fn flatten_text(content: &[ModelContent]) -> Result<String, ModelError> {
         .map(|parts| parts.join("\n"))
 }
 
-#[cfg(test)]
 fn parse_response(
     request: &ModelRequest,
     response: &Value,
@@ -732,6 +921,11 @@ fn parse_response(
         .and_then(Value::as_object)
         .ok_or_else(|| ModelError::protocol("OpenAI choice contains no message"))?;
     let mut payloads = Vec::new();
+    let mut reasoning = continuation::Reasoning::default();
+    reasoning.append(&Value::Object(message.clone()))?;
+    if let Some(continuation) = reasoning.into_event() {
+        payloads.push(continuation);
+    }
     if let Some(text) = message
         .get("content")
         .and_then(Value::as_str)
@@ -767,12 +961,12 @@ fn parse_response(
             .and_then(Value::as_str)
             .filter(|arguments| !arguments.is_empty())
             .unwrap_or("{}");
-        let call_id = ModelToolCallId::new(id);
+        let call_id = scoped_tool_call_id(&request.request_id, id);
         payloads.extend([
             ModelEvent::ToolCallStart {
                 call_id: call_id.clone(),
                 name: name.to_owned(),
-                extensions: BTreeMap::new(),
+                extensions: native_tool_call_extensions(id.to_owned()),
             },
             ModelEvent::ToolCallArgumentsDelta {
                 call_id: call_id.clone(),
@@ -795,22 +989,20 @@ fn parse_response(
             "OpenAI response contains neither content nor Tool calls",
         ));
     }
-    let finish = if tool_count > 0 {
-        ModelFinishReason::ToolCalls
-    } else {
-        match choice.get("finish_reason").and_then(Value::as_str) {
-            Some("stop") | None => ModelFinishReason::Stop,
-            Some("length") => ModelFinishReason::Length,
-            Some("content_filter") => ModelFinishReason::ContentFilter,
-            Some("tool_calls") | Some("function_call") => ModelFinishReason::ToolCalls,
-            Some(_) => ModelFinishReason::Other,
-        }
-    };
+    let mut finish = map_finish_reason(
+        choice
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .filter(|reason| !reason.is_empty())
+            .ok_or_else(|| ModelError::protocol("OpenAI response omitted finish_reason"))?,
+    );
+    if tool_count > 0 && finish == ModelFinishReason::Stop {
+        finish = ModelFinishReason::ToolCalls;
+    }
     payloads.push(ModelEvent::Finish { reason: finish });
     Ok(sequence_events(request, payloads))
 }
 
-#[cfg(test)]
 fn sequence_events(request: &ModelRequest, payloads: Vec<ModelEvent>) -> Vec<ModelStreamEvent> {
     payloads
         .into_iter()
@@ -919,7 +1111,7 @@ mod tests {
         }
     }
 
-    fn request() -> ModelRequest {
+    pub(super) fn request() -> ModelRequest {
         ModelRequest {
             request_id: ModelRequestId::new("request-1"),
             messages: vec![ModelMessage::text(ModelRole::User, "use echo")],
@@ -932,6 +1124,108 @@ mod tests {
             max_output_tokens: Some(128),
             extensions: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn explicit_sampling_reaches_chat_body_without_overriding_the_request_contract() {
+        let backend = OpenAiCompatibleBackend::new(OpenAiCompatibleConfig {
+            backend_id: "sampling-wire".to_owned(),
+            endpoint: "http://127.0.0.1/v1".to_owned(),
+            api_key: String::new(),
+            model: "local-model".to_owned(),
+            temperature: 0.6,
+            default_max_output_tokens: 8_192,
+            max_context_tokens: Some(32_768),
+            timeout: Duration::from_secs(1),
+            structured_output: true,
+            max_buffered_events: 8,
+        })
+        .unwrap();
+        let request = request();
+        let default_body = backend.build_request_body(&request).unwrap();
+        let default_digest = backend.meter_descriptor().config_digest;
+        assert!(default_body.get("repetition_penalty").is_none());
+        assert!(default_body.get("top_k").is_none());
+        let sampling = json!({
+            "top_p": 0.95, "top_k": 20, "min_p": 0.0,
+            "repetition_penalty": 1.0, "presence_penalty": 0.0,
+            "frequency_penalty": 0.0, "seed": 20260912,
+        });
+        let backend = backend
+            .with_sampling(serde_json::from_value(sampling).unwrap())
+            .unwrap();
+        let body = backend.build_request_body(&request).unwrap();
+        assert_eq!(body["top_k"], 20);
+        assert!((body["top_p"].as_f64().unwrap() - 0.95).abs() < 1e-6);
+        assert_eq!(body["repetition_penalty"], 1.0);
+        assert_eq!(body["presence_penalty"], 0.0);
+        assert_eq!(body["frequency_penalty"], 0.0);
+        assert_eq!(body["min_p"], 0.0);
+        assert_eq!(body["seed"], 20260912);
+        for field in [
+            "model",
+            "messages",
+            "tools",
+            "tool_choice",
+            "temperature",
+            "max_tokens",
+            "stream",
+            "stream_options",
+        ] {
+            assert_eq!(body[field], default_body[field], "sampling changed {field}");
+        }
+        assert_ne!(backend.meter_descriptor().config_digest, default_digest);
+        let measured = backend
+            .count_request_input(&request.messages, &request.tools)
+            .unwrap();
+        assert!(measured >= serde_json::to_vec(&body).unwrap().len() as u64);
+    }
+
+    #[test]
+    fn code_context_estimate_does_not_replace_the_wire_reservation() {
+        let backend = OpenAiCompatibleBackend::new(OpenAiCompatibleConfig {
+            backend_id: "context-planning".to_owned(),
+            endpoint: "http://127.0.0.1/v1".to_owned(),
+            api_key: String::new(),
+            model: "local-model".to_owned(),
+            temperature: 0.6,
+            default_max_output_tokens: 2_048,
+            max_context_tokens: Some(32_768),
+            timeout: Duration::from_secs(1),
+            structured_output: false,
+            max_buffered_events: 8,
+        })
+        .unwrap();
+        let mut request = request();
+        request.max_output_tokens = None;
+        request.messages.push(ModelMessage::text(
+            ModelRole::User,
+            "fn keep_newline(text: &str) -> bool { text.ends_with('\\n') }\n".repeat(600),
+        ));
+        let body = backend.build_request_body(&request).unwrap();
+        let wire_bytes = serde_json::to_vec(&body).unwrap().len() as u64;
+        let upper_bound = backend
+            .count_request_input(&request.messages, &request.tools)
+            .unwrap();
+        let estimate = backend
+            .estimate_context_input(&request.messages, &request.tools)
+            .unwrap();
+        assert!(upper_bound >= wire_bytes);
+        assert!(upper_bound > 32_768 - 2_048);
+        assert!(estimate.tokens < 32_768 - 2_048);
+        assert_eq!(estimate.accounting, ModelTokenAccounting::Estimated);
+        // Planning must leave the actual model request and hard meter intact.
+        assert_eq!(backend.build_request_body(&request).unwrap(), body);
+        assert_eq!(
+            backend
+                .count_request_input(&request.messages, &request.tools)
+                .unwrap(),
+            upper_bound
+        );
+        let mut descriptor = backend.meter_descriptor();
+        descriptor.validate().unwrap();
+        descriptor.accounting = ModelTokenAccounting::Estimated;
+        assert!(descriptor.validate().is_err());
     }
 
     #[test]
@@ -1176,9 +1470,83 @@ mod tests {
                 }],
             },
         ];
-        let encoded = encode_messages(&messages).unwrap();
+        let encoded = encode_messages(&messages, OpenAiToolResultFormat::Json).unwrap();
         assert_eq!(encoded[0]["tool_calls"][0]["id"], "call-1");
         assert_eq!(encoded[1]["tool_call_id"], "call-1");
+    }
+
+    #[tokio::test]
+    async fn reused_native_tool_ids_are_scoped_and_round_trip_through_history() {
+        let mut calls = Vec::new();
+        for request_id in ["step-1", "step-2", "step-1"] {
+            let mut request = request();
+            request.request_id = ModelRequestId::new(request_id);
+            let payload = json!({"choices": [{
+                "delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "reused-native-id",
+                    "function": {"name": "echo", "arguments": "{\"value\":1}"}
+                }]},
+                "finish_reason": "tool_calls"
+            }]});
+            let wire = format!("data: {payload}\n\ndata: [DONE]\n\n");
+            let events = openai_event_stream(
+                request,
+                stream::iter([Ok(Bytes::from(wire))]).boxed(),
+                CancellationToken::new(),
+                128,
+            )
+            .collect::<Vec<_>>()
+            .await;
+            assert!(events.iter().all(Result::is_ok));
+            let (call_id, extensions) = events
+                .into_iter()
+                .find_map(|event| match event.unwrap().payload {
+                    ModelEvent::ToolCallStart {
+                        call_id,
+                        extensions,
+                        ..
+                    } => Some((call_id, extensions)),
+                    _ => None,
+                })
+                .expect("tool call start");
+            calls.push((call_id, extensions));
+        }
+        assert_ne!(
+            calls[0].0, calls[1].0,
+            "different requests must not collide"
+        );
+        assert_eq!(calls[0], calls[2], "replaying a request keeps its identity");
+
+        let mut history = Vec::new();
+        for (call_id, extensions) in calls.into_iter().take(2) {
+            history.push(ModelMessage {
+                role: ModelRole::Assistant,
+                content: vec![ModelContent::ToolCall {
+                    call_id: call_id.clone(),
+                    name: "echo".to_owned(),
+                    arguments: json!({"value": 1}),
+                    extensions,
+                }],
+            });
+            history.push(ModelMessage {
+                role: ModelRole::Tool,
+                content: vec![ModelContent::ToolResult {
+                    call_id,
+                    result: json!({"value": 1}),
+                    is_error: false,
+                }],
+            });
+        }
+        // Continuation metadata must survive a process restart, not depend on
+        // an adapter-instance lookup table.
+        let saved = serde_json::to_vec(&history).unwrap();
+        let restored = serde_json::from_slice::<Vec<ModelMessage>>(&saved).unwrap();
+        let wire = encode_messages(&restored, OpenAiToolResultFormat::Json).unwrap();
+        for pair in wire.chunks_exact(2) {
+            assert_eq!(pair[0]["tool_calls"][0]["id"], "reused-native-id");
+            assert_eq!(pair[1]["tool_call_id"], "reused-native-id");
+        }
     }
 
     #[tokio::test]
@@ -1224,7 +1592,14 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(starts, vec!["call-a", "call-b"]);
+        let expected = ["call-a", "call-b"].map(|id| scoped_tool_call_id(&request.request_id, id));
+        assert_eq!(
+            starts,
+            expected
+                .iter()
+                .map(ModelToolCallId::as_str)
+                .collect::<Vec<_>>()
+        );
         assert!(matches!(
             events.last().map(|event| &event.payload),
             Some(ModelEvent::Finish {

@@ -1,0 +1,205 @@
+name: Release distribution
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing public release tag to publish or retry
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-distribution
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+      - name: Verify the public release and exact checkout
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          gh release view "$RELEASE_TAG" --json isDraft,isPrerelease,tagName > release-status.json
+          jq -e --arg tag "$RELEASE_TAG" '.tagName == $tag and .isDraft == false and .isPrerelease == false' release-status.json
+          version=$(cargo run --locked --quiet -p orchestral-release -- prepare --tag "$RELEASE_TAG" --output target/release-plan)
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  crates:
+    needs: release
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cargo-publication
+      - name: Restore the reviewed crate artifacts and tested PWA
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          mkdir reviewed
+          gh release download "$RELEASE_TAG" --dir reviewed --pattern '*.crate' --pattern release.json \
+            --pattern "orchestral-web-v$RELEASE_VERSION.tar.gz" --pattern "orchestral-web-v$RELEASE_VERSION.tar.gz.sha256"
+          (cd reviewed && sha256sum -c "orchestral-web-v$RELEASE_VERSION.tar.gz.sha256")
+          rm -rf web/orchestral-web/dist
+          mkdir -p web/orchestral-web/dist
+          tar -xzf "reviewed/orchestral-web-v$RELEASE_VERSION.tar.gz" -C web/orchestral-web/dist
+          cargo run --locked -p orchestral-release -- stage-web
+      - name: Publish missing, byte-identical reviewed packages
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo 'CARGO_TOKEN is required for crates.io publication.' >&2
+            exit 1
+          fi
+          cargo run --locked -p orchestral-release -- publish-crates --artifacts reviewed
+
+  homebrew:
+    needs: release
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check publication credentials
+        env:
+          TAP_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo 'RELEASE_GITHUB_TOKEN needs write access to sizzlecar/homebrew-orchestral.' >&2
+            exit 1
+          fi
+      - name: Check that this release is still the latest stable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          latest=$(gh release view --json tagName --jq .tagName)
+          test "$latest" = "$RELEASE_TAG"
+          mkdir reviewed
+          gh release download "$RELEASE_TAG" --pattern orchestral.rb --dir reviewed
+      - uses: actions/checkout@v4
+        with:
+          repository: sizzlecar/homebrew-orchestral
+          token: ${{ secrets.RELEASE_GITHUB_TOKEN }}
+          path: tap
+      - name: Update the formula from the reviewed release
+        env:
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          mkdir -p tap/Formula
+          cp reviewed/orchestral.rb tap/Formula/orchestral.rb
+          cd tap
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add Formula/orchestral.rb
+          if ! git diff --cached --quiet; then
+            git commit -m "orchestral $RELEASE_TAG"
+            git push
+          fi
+
+  cargo-install:
+    needs: [release, crates]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cargo-installed-release
+      - name: Install the public CLI package independently of workspace paths
+        env:
+          RELEASE_VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          cargo install orchestral-cli --version "=$RELEASE_VERSION" --locked --root "$RUNNER_TEMP/installed"
+          cargo run --locked -p orchestral-release -- installed --binary "$RUNNER_TEMP/installed/bin/orchestral"
+
+  brew-install:
+    needs: [release, homebrew]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: Homebrew/actions/setup-homebrew@49d03f1bf5d455a413dfbdf99e6718054a4cd975
+      - name: Install and test the public tap formula
+        env:
+          RELEASE_VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          brew install sizzlecar/orchestral/orchestral
+          brew test sizzlecar/orchestral/orchestral
+          test "$(orchestral --version)" = "orchestral $RELEASE_VERSION"
+
+  installer-install:
+    needs: release
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14, macos-15-intel, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+      - name: Install the published Unix archive
+        if: runner.os != 'Windows'
+        env:
+          RELEASE_VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          sh scripts/install.sh --version "$RELEASE_VERSION" --dir "$RUNNER_TEMP/installed" --no-modify-path
+          test "$("$RUNNER_TEMP/installed/orchestral" --version)" = "orchestral $RELEASE_VERSION"
+          "$RUNNER_TEMP/installed/orchestral" serve --help
+      - name: Install the published Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          ./scripts/install.ps1 -Version $env:RELEASE_VERSION -InstallDir "$env:RUNNER_TEMP/installed" -NoModifyPath
+          $binary = "$env:RUNNER_TEMP/installed/orchestral.exe"
+          $version = & $binary --version
+          if ($LASTEXITCODE -ne 0 -or $version -ne "orchestral $env:RELEASE_VERSION") { throw 'Installed version mismatch' }
+          & $binary serve --help
+          if ($LASTEXITCODE -ne 0) { throw 'Installed help failed' }
+
+  distribution-result:
+    if: always()
+    needs: [release, crates, homebrew, cargo-install, brew-install, installer-install]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Require publication and actual channel installation checks
+        env:
+          JOB_RESULTS: ${{ toJson(needs) }}
+        run: jq -e 'all(.[]; .result == "success")' <<< "$JOB_RESULTS"

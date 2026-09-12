@@ -59,6 +59,9 @@ use serde_json::json;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
+#[path = "generic_agent/observed_write_recovery.rs"]
+mod observed_write_recovery;
+
 struct ScriptedModel;
 
 struct BlockingModel;
@@ -177,7 +180,7 @@ enum CheckpointCrashCut {
     InputRequestResolve,
     InputToolExchangeBoundary,
     ApprovalRequestResolve,
-    ApprovalToolExchangeBoundary,
+    ApprovalToolExchangeBoundary(u64),
     DirectToolExchangeBoundary,
 }
 
@@ -262,6 +265,7 @@ struct AckLostAfterModelObservationCheckpointStore {
     inner: InMemoryGenericAgentCheckpointStore,
     acknowledgement_lost: AtomicBool,
     unavailable: AtomicBool,
+    target_round: Option<u64>,
 }
 
 #[derive(Default)]
@@ -596,7 +600,8 @@ impl GenericAgentCheckpointStore for AckLostAfterModelObservationCheckpointStore
         }
         let loses_acknowledgement = matches!(
             &draft.payload,
-            GenericCheckpointEvent::ModelAttemptObserved { .. }
+            GenericCheckpointEvent::ModelAttemptObserved { round, .. }
+                if self.target_round.is_none_or(|target| target == *round)
         );
         let outcome = self.inner.append(run_id, expected_previous, draft)?;
         if loses_acknowledgement && !self.acknowledgement_lost.swap(true, Ordering::SeqCst) {
@@ -777,12 +782,11 @@ impl GenericAgentCheckpointStore for PausingCheckpointStore {
                     },
                 ) => true,
                 (
-                    CheckpointCrashCut::ApprovalToolExchangeBoundary,
+                    CheckpointCrashCut::ApprovalToolExchangeBoundary(expected_round),
                     GenericCheckpointEvent::LoopBoundaryCommitted {
-                        next_model_round: 2,
-                        ..
+                        next_model_round, ..
                     },
-                ) => true,
+                ) => next_model_round == expected_round,
                 (
                     CheckpointCrashCut::DirectToolExchangeBoundary,
                     GenericCheckpointEvent::LoopBoundaryCommitted {
@@ -884,6 +888,7 @@ struct BudgetGuardToolLoopModel {
     rounds: AtomicUsize,
     oversized_dispatches: AtomicUsize,
     input_budget: u64,
+    input_counts: Mutex<Vec<u64>>,
 }
 
 struct PressureCompactionModel {
@@ -1709,9 +1714,10 @@ impl ModelBackend for BudgetGuardToolLoopModel {
         _cancellation: CancellationToken,
     ) -> Result<ModelStream, ModelError> {
         request.validate()?;
-        let input_tokens = serde_jcs::to_vec(&(&request.messages, &request.tools))
-            .expect("test request is serializable")
-            .len() as u64;
+        let input_tokens = JsonSizeTokenMeter::new(1)
+            .unwrap()
+            .count_request_input(&request.messages, &request.tools)?;
+        self.input_counts.lock().unwrap().push(input_tokens);
         if input_tokens > self.input_budget {
             self.oversized_dispatches.fetch_add(1, Ordering::SeqCst);
         }
@@ -1762,7 +1768,7 @@ impl ModelBackend for BudgetGuardToolLoopModel {
                 event_id: ModelEventId::new("budget-answer"),
                 sequence: 1,
                 payload: ModelEvent::TextDelta {
-                    delta: "oversized request reached backend".to_owned(),
+                    delta: "second model round reached backend".to_owned(),
                 },
             }),
             Ok(ModelStreamEvent {
@@ -2333,6 +2339,48 @@ fn recovery_identity_tool_runtime(
     host_bounds: ToolPolicyBounds,
     restriction_bounds: ToolPolicyBounds,
 ) -> Arc<GuardedToolRuntime<InMemoryApprovalCapabilityStore>> {
+    recovery_identity_tool_runtime_with_descriptor(
+        host_bounds,
+        recovery_identity_tool_descriptor(restriction_bounds),
+        Arc::new(EchoTool {
+            calls: AtomicUsize::new(0),
+        }),
+    )
+}
+
+fn recovery_identity_tool_descriptor(restriction_bounds: ToolPolicyBounds) -> ToolDescriptor {
+    ToolDescriptor {
+        tool_id: ToolId::new("test/recovery-echo"),
+        model_schema: ModelToolSchema {
+            name: "recovery_echo".to_owned(),
+            description: "Echo one recovery test value".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["value"],
+                "properties": { "value": { "type": "string" } },
+                "additionalProperties": false
+            }),
+        },
+        output_schema: json!({
+            "type": "object",
+            "required": ["result"],
+            "properties": { "result": { "type": "string" } },
+            "additionalProperties": false
+        }),
+        effect_scopes: BTreeSet::new(),
+        restriction: ToolRestriction {
+            bounds: restriction_bounds,
+        },
+        idempotency: ToolIdempotency::IdempotentWithKey,
+        concurrency: ToolConcurrency::ParallelSafe,
+    }
+}
+
+fn recovery_identity_tool_runtime_with_descriptor(
+    host_bounds: ToolPolicyBounds,
+    descriptor: ToolDescriptor,
+    executor: Arc<EchoTool>,
+) -> Arc<GuardedToolRuntime<InMemoryApprovalCapabilityStore>> {
     let verifier = HostApprovalVerifier::new(
         b"0123456789abcdef0123456789abcdef",
         InMemoryApprovalCapabilityStore::default(),
@@ -2348,36 +2396,7 @@ fn recovery_identity_tool_runtime(
         .expect("valid Host Tool policy"),
     );
     runtime
-        .register(
-            ToolDescriptor {
-                tool_id: ToolId::new("test/recovery-echo"),
-                model_schema: ModelToolSchema {
-                    name: "recovery_echo".to_owned(),
-                    description: "Echo one recovery test value".to_owned(),
-                    input_schema: json!({
-                        "type": "object",
-                        "required": ["value"],
-                        "properties": { "value": { "type": "string" } },
-                        "additionalProperties": false
-                    }),
-                },
-                output_schema: json!({
-                    "type": "object",
-                    "required": ["result"],
-                    "properties": { "result": { "type": "string" } },
-                    "additionalProperties": false
-                }),
-                effect_scopes: BTreeSet::new(),
-                restriction: ToolRestriction {
-                    bounds: restriction_bounds,
-                },
-                idempotency: ToolIdempotency::IdempotentWithKey,
-                concurrency: ToolConcurrency::ParallelSafe,
-            },
-            Arc::new(EchoTool {
-                calls: AtomicUsize::new(0),
-            }),
-        )
+        .register(descriptor, executor)
         .expect("recovery identity Tool registers");
     runtime
 }
@@ -4737,7 +4756,7 @@ async fn run_committed_approval_exchange_recovery(allow: bool) {
     let session_id = AgentSessionId::new(format!("committed-approval-{suffix}-exchange-session"));
     let command_id = CommandId::new(format!("committed-approval-{suffix}-exchange-resolution"));
     let checkpoint_store = Arc::new(PausingCheckpointStore::at(
-        CheckpointCrashCut::ApprovalToolExchangeBoundary,
+        CheckpointCrashCut::ApprovalToolExchangeBoundary(2),
     ));
     let effect_journal = Arc::new(InMemoryToolEffectJournalStore::default());
     let session_journal = Arc::new(InMemoryAgentSessionJournalStore::default());
@@ -6739,6 +6758,76 @@ async fn private_wal_recovery_is_bound_to_model_and_tool_authority() {
     };
     assert_eq!(error.code, AgentProtocolErrorCode::RunIdConflict);
 
+    // Output contracts and durable Tool identity are Host-only: the model
+    // sees the same schema, but neither change may reinterpret the old WAL.
+    let base_tool = recovery_identity_tool_descriptor(base_bounds.clone());
+    let mut changed_tool_id = base_tool.clone();
+    changed_tool_id.tool_id = ToolId::new("test/recovery-echo/v2");
+    let mut changed_output_schema = base_tool;
+    changed_output_schema.output_schema["properties"]["result"] =
+        json!({ "type": "string", "minLength": 1 });
+    for (contract, tool_descriptor) in [
+        ("ToolId", changed_tool_id),
+        ("output_schema", changed_output_schema),
+    ] {
+        let tool = Arc::new(EchoTool {
+            calls: AtomicUsize::new(0),
+        });
+        let runtime = recovery_identity_tool_runtime_with_descriptor(
+            base_bounds.clone(),
+            tool_descriptor,
+            tool.clone(),
+        );
+        assert_eq!(
+            runtime
+                .model_tool_schemas()
+                .expect("replacement model schema"),
+            base_runtime
+                .model_tool_schemas()
+                .expect("original model schema"),
+            "{contract} must not change model-facing definitions"
+        );
+        assert_ne!(
+            runtime
+                .execution_contract_digest()
+                .expect("replacement contract"),
+            base_runtime
+                .execution_contract_digest()
+                .expect("original contract")
+        );
+        let replacement = InternalGenericAgentProvider::new_with_tools_and_session_journal(
+            Arc::new(RecoveryIdentityModel {
+                revision: "v1",
+                starts: starts.clone(),
+            }),
+            config.clone(),
+            runtime,
+            base_grant.clone(),
+            session_journal.clone(),
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+        .expect("replacement Tool contract is internally valid")
+        .with_checkpoint_store(checkpoint_store.clone())
+        .expect("replacement Tool contract sees the same private WAL");
+        let error = match replacement
+            .recover(
+                AgentRecoveryRequest::new(request.clone(), execution.clone(), &descriptor)
+                    .expect("unchanged recovery request identity"),
+            )
+            .await
+        {
+            Ok(_) => panic!("changed {contract} must not resume the Run"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.code,
+            AgentProtocolErrorCode::RunIdConflict,
+            "{contract}"
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 0, "{contract}");
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 0, "{contract}");
+    }
+
     let mut narrower_grant_bounds = base_bounds.clone();
     narrower_grant_bounds.max_timeout_ms = Some(500);
     let changed_grant = InternalGenericAgentProvider::new_with_tools_and_session_journal(
@@ -8315,9 +8404,7 @@ async fn run_non_fatal_tool_case(
 
 #[tokio::test]
 async fn every_model_round_reprojects_context_before_backend_dispatch() {
-    const MAX_CONTEXT_TOKENS: u64 = 3_000;
     const RESERVED_OUTPUT_TOKENS: u64 = 500;
-    const INPUT_BUDGET_TOKENS: u64 = MAX_CONTEXT_TOKENS - RESERVED_OUTPUT_TOKENS;
 
     let bounds = ToolPolicyBounds {
         approval: ApprovalPolicy::NotRequired,
@@ -8339,6 +8426,7 @@ async fn every_model_round_reprojects_context_before_backend_dispatch() {
         )
         .unwrap(),
     );
+    let large_result = "large-inline-result/".repeat(300);
     runtime
         .register(
             ToolDescriptor {
@@ -8367,65 +8455,107 @@ async fn every_model_round_reprojects_context_before_backend_dispatch() {
                 concurrency: ToolConcurrency::ParallelSafe,
             },
             Arc::new(LargeResultTool {
-                value: "large-inline-result/".repeat(300),
+                value: large_result.clone(),
             }),
         )
         .unwrap();
-    let model = Arc::new(BudgetGuardToolLoopModel {
-        rounds: AtomicUsize::new(0),
-        oversized_dispatches: AtomicUsize::new(0),
-        input_budget: INPUT_BUDGET_TOKENS,
-    });
     let mut config = GenericAgentConfig::new("internal-provider", "generic-agent");
-    config.max_context_tokens = MAX_CONTEXT_TOKENS;
     config.reserved_output_tokens = RESERVED_OUTPUT_TOKENS;
-    let provider = Arc::new(
-        InternalGenericAgentProvider::new_with_tools_and_session_journal(
-            model.clone(),
-            config,
-            runtime,
-            RunToolGrant { bounds },
-            Arc::new(InMemoryAgentSessionJournalStore::default()),
-            Arc::new(JsonSizeTokenMeter::new(1).unwrap()),
-        )
-        .unwrap(),
-    );
-    let controller = Arc::new(
-        AgentController::new(provider, ProviderBindingRef::new("generic-binding")).unwrap(),
-    );
-    let run_id = RunId::new("context-budget-run");
-    let execution = controller
-        .start(
-            AgentRunEnvelope::new(
-                AGENT_PROTOCOL_V1,
-                AgentSessionId::new("context-budget-session"),
-                run_id.clone(),
-                vec![Content::text("call the large echo tool")],
+    let mut input_budget = config.max_context_tokens - RESERVED_OUTPUT_TOKENS;
+
+    // Measure the actual provider-built typed requests with the same meter as
+    // admission. This includes current system instructions and tool schemas;
+    // their growth must not turn a second-round overflow test into a first-round
+    // rejection. The second run admits exactly the measured first request.
+    for phase in ["measure", "bounded"] {
+        let model = Arc::new(BudgetGuardToolLoopModel {
+            rounds: AtomicUsize::new(0),
+            oversized_dispatches: AtomicUsize::new(0),
+            input_budget,
+            input_counts: Mutex::new(Vec::new()),
+        });
+        config.max_context_tokens = input_budget + RESERVED_OUTPUT_TOKENS;
+        let journal = Arc::new(InMemoryAgentSessionJournalStore::default());
+        let provider = Arc::new(
+            InternalGenericAgentProvider::new_with_tools_and_session_journal(
+                model.clone(),
+                config.clone(),
+                runtime.clone(),
+                RunToolGrant {
+                    bounds: bounds.clone(),
+                },
+                journal.clone(),
+                Arc::new(JsonSizeTokenMeter::new(1).unwrap()),
             )
             .unwrap(),
+        );
+        let controller = Arc::new(
+            AgentController::new(provider, ProviderBindingRef::new("generic-binding")).unwrap(),
+        );
+        let run_id = RunId::new(format!("context-budget-{phase}-run"));
+        let session_id = AgentSessionId::new(format!("context-budget-{phase}-session"));
+        let execution = controller
+            .start(
+                AgentRunEnvelope::new(
+                    AGENT_PROTOCOL_V1,
+                    session_id.clone(),
+                    run_id.clone(),
+                    vec![Content::text("call the large echo tool")],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let view = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            controller.wait_for_terminal(&execution.run_id),
         )
         .await
+        .expect("context check reaches a terminal boundary")
         .unwrap();
-    let view = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        controller.wait_for_terminal(&execution.run_id),
-    )
-    .await
-    .expect("context overflow reaches a terminal boundary")
-    .unwrap();
 
-    assert_eq!(view.state.status(), AgentRunStatus::Failed);
-    assert_eq!(model.rounds.load(Ordering::SeqCst), 1);
-    assert_eq!(model.oversized_dispatches.load(Ordering::SeqCst), 0);
-    assert!(controller
-        .events(&run_id, 0)
-        .await
-        .unwrap()
-        .iter()
-        .any(|record| matches!(
-            &record.event.payload,
-            AgentEvent::RunFailed { failure } if failure.code == "context_overflow"
-        )));
+        assert_eq!(model.oversized_dispatches.load(Ordering::SeqCst), 0);
+        assert!(
+            journal
+                .load_session(&session_id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|record| match &record.payload {
+                    AgentSessionEvent::ToolExchangeCommitted { tool, .. } => {
+                        tool.content.iter().any(|content| {
+                            matches!(content,
+                            ModelContent::ToolResult { result, is_error: false, .. }
+                            if result == &json!({"result": large_result}))
+                        })
+                    }
+                    _ => false,
+                }),
+            "the real large Tool result must be committed before the overflow check"
+        );
+        let counts = model.input_counts.lock().unwrap().clone();
+        if phase == "measure" {
+            assert_eq!(view.state.status(), AgentRunStatus::Delivered);
+            assert_eq!(model.rounds.load(Ordering::SeqCst), 2);
+            assert_eq!(counts.len(), 2);
+            assert!(counts[0] > 0 && counts[1] > counts[0], "{counts:?}");
+            input_budget = counts[0];
+            continue;
+        }
+
+        assert_eq!(view.state.status(), AgentRunStatus::Failed);
+        assert_eq!(model.rounds.load(Ordering::SeqCst), 1);
+        assert_eq!(counts, vec![input_budget]);
+        assert!(controller
+            .events(&run_id, 0)
+            .await
+            .unwrap()
+            .iter()
+            .any(|record| matches!(
+                &record.event.payload,
+                AgentEvent::RunFailed { failure } if failure.code == "context_overflow"
+            )));
+    }
 }
 
 #[tokio::test]

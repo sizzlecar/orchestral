@@ -16,8 +16,14 @@ pub(crate) fn prepare_runtime_config_path(
     model_overrides: &ModelOverrides,
     credential_file: Option<&Path>,
 ) -> anyhow::Result<PathBuf> {
+    let explicit_config = explicit.is_some();
     let base_path = resolve_runtime_config_path(explicit)?;
-    let automatic = if model_overrides.backend.is_some() || model_overrides.model_profile.is_some()
+    let automatic = if explicit_config
+        || model_overrides.backend.is_some()
+        || model_overrides.model_profile.is_some()
+        || model_overrides.base_url.is_some()
+        || model_overrides.no_auth
+        || model_overrides.api_key_env.is_some()
     {
         ModelOverrides::default()
     } else {
@@ -28,6 +34,43 @@ pub(crate) fn prepare_runtime_config_path(
         return Ok(base_path);
     }
     write_overridden_runtime_config(&base_path, &effective)
+}
+
+/// Read the same effective configuration for diagnostics without creating files.
+pub(crate) fn inspect_runtime_config(
+    explicit: Option<PathBuf>,
+    overrides: &ModelOverrides,
+    credential_file: Option<&Path>,
+) -> anyhow::Result<(OrchestralConfig, Option<PathBuf>)> {
+    let explicit_config = explicit.is_some();
+    let path = explicit.or_else(discover_config_path);
+    let raw = match &path {
+        Some(path) => {
+            fs::read_to_string(path).with_context(|| format!("read config '{}'", path.display()))?
+        }
+        None => embedded_default_config(),
+    };
+    let config: OrchestralConfig = serde_yaml::from_str(&raw).context("parse configuration")?;
+    let automatic = if !explicit_config
+        && overrides.backend.is_none()
+        && overrides.model_profile.is_none()
+        && overrides.base_url.is_none()
+        && !overrides.no_auth
+        && overrides.api_key_env.is_none()
+    {
+        path.as_ref()
+            .and_then(|path| auto_override_model_if_needed(path, credential_file))
+            .unwrap_or_default()
+    } else {
+        ModelOverrides::default()
+    };
+    let mut yaml = serde_yaml::from_str(&raw)?;
+    apply_model_overrides_to_yaml(
+        &mut yaml,
+        &config,
+        &merge_model_overrides(overrides, &automatic),
+    )?;
+    Ok((serde_yaml::from_value(yaml)?, path))
 }
 
 fn auto_override_model_if_needed(
@@ -45,7 +88,10 @@ fn auto_override_model_if_needed(
         backend.kind.trim().to_ascii_lowercase().as_str(),
         "google" | "gemini"
     );
-    if backend.resolve_api_key().is_ok() || (is_google && has_google_credentials(credential_file)) {
+    if backend.get_config::<String>("auth").as_deref() == Some("none")
+        || backend.resolve_api_key().is_ok()
+        || (is_google && has_google_credentials(credential_file))
+    {
         return None;
     }
     let (detected_backend, detected_profile) = detect_default_model_profile(credential_file);
@@ -54,6 +100,7 @@ fn auto_override_model_if_needed(
         model_profile: Some(detected_profile.to_owned()),
         model: None,
         temperature: None,
+        ..ModelOverrides::default()
     })
 }
 
@@ -69,6 +116,9 @@ fn merge_model_overrides(requested: &ModelOverrides, automatic: &ModelOverrides)
             .or_else(|| automatic.model_profile.clone()),
         model: requested.model.clone().or_else(|| automatic.model.clone()),
         temperature: requested.temperature.or(automatic.temperature),
+        base_url: requested.base_url.clone(),
+        api_key_env: requested.api_key_env.clone(),
+        no_auth: requested.no_auth,
     }
 }
 
@@ -178,6 +228,129 @@ fn apply_model_overrides_to_yaml(
             "temperature",
             serde_yaml::to_value(temperature).context("serialize temperature")?,
         );
+    }
+    if overrides.base_url.is_some() || overrides.api_key_env.is_some() || overrides.no_auth {
+        apply_connection_overrides(root, config, overrides)?;
+    }
+    Ok(())
+}
+
+fn apply_connection_overrides(
+    root: &mut Mapping,
+    config: &OrchestralConfig,
+    overrides: &ModelOverrides,
+) -> anyhow::Result<()> {
+    let selected = overrides
+        .backend
+        .as_deref()
+        .or_else(|| {
+            overrides.model_profile.as_deref().and_then(|name| {
+                config
+                    .providers
+                    .models
+                    .iter()
+                    .find(|p| p.name == name)
+                    .map(|p| p.backend.as_str())
+            })
+        })
+        .or_else(|| {
+            overrides
+                .base_url
+                .is_none()
+                .then_some(
+                    config
+                        .agent
+                        .backend
+                        .as_deref()
+                        .or(config.providers.default_backend.as_deref()),
+                )
+                .flatten()
+        });
+    let kind = selected
+        .and_then(|name| {
+            config
+                .providers
+                .backends
+                .iter()
+                .find(|backend| backend.name == name)
+        })
+        .map(|backend| backend.kind.as_str())
+        .unwrap_or("openai");
+    if !matches!(
+        kind.to_ascii_lowercase().as_str(),
+        "openai" | "openrouter" | "deepseek" | "groq" | "xai" | "mistral"
+    ) {
+        bail!("--base-url, --api-key-env and --no-auth require an OpenAI-compatible backend");
+    }
+    let backend_name = if overrides.base_url.is_some() {
+        "cli-openai"
+    } else {
+        selected.context("no model backend selected")?
+    };
+    let endpoint = overrides
+        .base_url
+        .as_deref()
+        .map(orchestral_model_openai::OpenAiEndpoint::parse)
+        .transpose()?;
+    let providers = ensure_mapping_entry(root, "providers");
+    let backends = providers
+        .get_mut(YamlValue::String("backends".to_owned()))
+        .and_then(YamlValue::as_sequence_mut)
+        .context("providers.backends must be a sequence")?;
+    let mut connection = if endpoint.is_some() {
+        let mut mapping = Mapping::new();
+        set_yaml_key(
+            &mut mapping,
+            "name",
+            YamlValue::String(backend_name.to_owned()),
+        );
+        set_yaml_key(&mut mapping, "kind", YamlValue::String("openai".to_owned()));
+        mapping
+    } else {
+        backends
+            .iter()
+            .find(|backend| backend["name"].as_str() == Some(backend_name))
+            .and_then(YamlValue::as_mapping)
+            .cloned()
+            .context("model backend not found")?
+    };
+    if let Some(endpoint) = endpoint {
+        set_yaml_key(
+            &mut connection,
+            "endpoint",
+            YamlValue::String(endpoint.base_url().to_owned()),
+        );
+    }
+    let auth =
+        if overrides.no_auth || (overrides.base_url.is_some() && overrides.api_key_env.is_none()) {
+            "none"
+        } else {
+            "api_key"
+        };
+    set_yaml_key(
+        ensure_mapping_entry(&mut connection, "config"),
+        "auth",
+        YamlValue::String(auth.to_owned()),
+    );
+    if let Some(name) = &overrides.api_key_env {
+        if name.trim().is_empty() {
+            bail!("--api-key-env requires a nonempty environment variable name");
+        }
+        set_yaml_key(
+            &mut connection,
+            "api_key_env",
+            YamlValue::String(name.clone()),
+        );
+    }
+    backends.retain(|backend| backend["name"].as_str() != Some(backend_name));
+    backends.push(YamlValue::Mapping(connection));
+    let agent = ensure_mapping_entry(root, "agent");
+    set_yaml_key(agent, "backend", YamlValue::String(backend_name.to_owned()));
+    if overrides.base_url.is_some() && overrides.model_profile.is_none() {
+        set_yaml_key(agent, "model_profile", YamlValue::Null);
+        if overrides.model.is_none() {
+            set_yaml_key(agent, "model", YamlValue::Null);
+        }
     }
     Ok(())
 }
@@ -337,8 +510,14 @@ mod tests {
         let raw = embedded_default_config();
         let parsed: OrchestralConfig = serde_yaml::from_str(&raw).expect("strict config");
         assert!(parsed.tools.exec.enabled);
-        assert!(parsed.tools.exec.sandboxed_execution_enabled);
-        assert!(orchestral_core::config::ExecToolConfig::default().sandboxed_execution_enabled);
+        assert_eq!(
+            parsed.tools.exec.sandboxed_execution_enabled,
+            !cfg!(windows)
+        );
+        assert_eq!(
+            orchestral_core::config::ExecToolConfig::default().sandboxed_execution_enabled,
+            !cfg!(windows)
+        );
         assert!(!raw.contains("planner:"));
         assert!(!raw.contains("actions:"));
         assert!(!raw.contains("task:"));
@@ -357,6 +536,7 @@ mod tests {
                 model_profile: Some("gemini-2.5-flash".to_owned()),
                 model: None,
                 temperature: Some(0.1),
+                ..ModelOverrides::default()
             },
         )
         .expect("override");

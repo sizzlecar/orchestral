@@ -268,12 +268,7 @@ pub(super) fn observed_tool_exchange_messages(
     result: &serde_json::Value,
     is_error: bool,
 ) -> (ModelMessage, ModelMessage) {
-    let mut assistant_content = Vec::new();
-    if !observation.response.is_empty() {
-        assistant_content.push(ModelContent::Text {
-            text: observation.response.clone(),
-        });
-    }
+    let mut assistant_content = observation.assistant_content();
     assistant_content.push(ModelContent::ToolCall {
         call_id: call.call_id.clone(),
         name: call.name.clone(),

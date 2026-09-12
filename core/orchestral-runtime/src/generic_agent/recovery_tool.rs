@@ -94,6 +94,7 @@ pub(super) async fn resume_observed_tool(
         &run_id,
         &call,
         &arguments,
+        &model_messages,
         cancellation.clone(),
     )
     .await

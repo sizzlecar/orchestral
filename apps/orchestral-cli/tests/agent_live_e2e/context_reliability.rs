@@ -1,4 +1,9 @@
 use super::*;
+use orchestral_core::model_protocol::ModelTokenAccounting;
+use orchestral_runtime::GenericCheckpointEvent;
+
+const PRESSURE_CONTEXT_TOKENS: u64 = 12_000;
+const PRESSURE_OUTPUT_TOKENS: u64 = 1024;
 
 fn last_result(request: &CapturedHttpRequest) -> Value {
     let message = request.body["messages"]
@@ -8,7 +13,7 @@ fn last_result(request: &CapturedHttpRequest) -> Value {
         .rev()
         .find(|message| message["role"] == "tool")
         .expect("model receives the committed Tool result");
-    let envelope: Value = serde_json::from_str(message["content"].as_str().unwrap()).unwrap();
+    let envelope: Value = serde_yaml::from_str(message["content"].as_str().unwrap()).unwrap();
     assert_eq!(envelope["is_error"], false, "{envelope}");
     envelope["result"].clone()
 }
@@ -17,8 +22,12 @@ fn configure_pressure(workspace: &TestWorkspace) {
     workspace.disable_exec();
     workspace.configure_compaction(2, 1);
     workspace.rewrite_config(|config| {
-        config["agent"]["max_context_tokens"] = serde_yaml::to_value(32_000).unwrap();
-        config["agent"]["reserved_output_tokens"] = serde_yaml::to_value(1024).unwrap();
+        // One dataset result fits the native planning estimate, while accumulated
+        // results require compaction. This is a token budget, not a JSON byte cap.
+        config["agent"]["max_context_tokens"] =
+            serde_yaml::to_value(PRESSURE_CONTEXT_TOKENS).unwrap();
+        config["agent"]["reserved_output_tokens"] =
+            serde_yaml::to_value(PRESSURE_OUTPUT_TOKENS).unwrap();
         config["agent"]["compaction"]["summary_max_chars"] = serde_yaml::to_value(1024).unwrap();
     });
     fs::write(
@@ -26,6 +35,36 @@ fn configure_pressure(workspace: &TestWorkspace) {
         "record=unrelated_observation;".repeat(520),
     )
     .unwrap();
+}
+
+fn assert_planning_boundaries(workspace: &TestWorkspace) {
+    let mut saw_attempt = false;
+    let mut planning_differs_from_hard_reservation = false;
+    for path in journal_files(workspace, "generic-checkpoint-") {
+        let journal: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        for record in journal["records"].as_array().unwrap() {
+            let event: GenericCheckpointEvent =
+                serde_json::from_value(record["payload"].clone()).unwrap();
+            if let GenericCheckpointEvent::ModelAttemptStarted { context, .. } = event {
+                saw_attempt = true;
+                let estimate = context.context_estimate.expect("native planning trace");
+                assert_eq!(estimate.accounting, ModelTokenAccounting::Estimated);
+                assert_eq!(
+                    context.input_budget_tokens,
+                    PRESSURE_CONTEXT_TOKENS - PRESSURE_OUTPUT_TOKENS
+                );
+                assert!(estimate.tokens <= context.input_budget_tokens);
+                assert!(context.used_input_tokens >= estimate.tokens);
+                planning_differs_from_hard_reservation |=
+                    context.used_input_tokens > context.input_budget_tokens;
+            }
+        }
+    }
+    assert!(saw_attempt, "read actual model planning boundaries");
+    assert!(
+        planning_differs_from_hard_reservation,
+        "a conservative wire reservation must not become the planning estimate"
+    );
 }
 
 #[test]
@@ -59,7 +98,6 @@ fn repeated_pressure_compaction_and_process_restart_recall_original_outcomes_wit
     for i in 0..8 {
         handlers.push(Box::new(move |request| {
             assert!(model_request_text(&request.body).contains("Preserve stable_api"));
-            assert!(serde_json::to_vec(&request.body).unwrap().len() < 32_000);
             openai_tool_response(
                 &format!("inspect-{i}"),
                 "file_read",
@@ -114,12 +152,14 @@ fn repeated_pressure_compaction_and_process_restart_recall_original_outcomes_wit
         LOCAL_PROCESS_TIMEOUT,
     );
     assert!(first.status.success(), "{}", first.stderr_text());
+    assert_planning_boundaries(&workspace);
     let before = session_records(&workspace);
     assert!(payload_count(&before, "active_run_compaction_committed") >= 2);
     let mut resume = base_command(&workspace);
     resume.env("OPENAI_API_KEY", "fixture-key").args(["--backend", "openai", "--model", "fixture-model", "--temperature", "0", "resume", "context-session", "Continue and preserve the output encoding. Check the original operation outcomes before any further work."]);
     let second = run_to_completion(resume, LOCAL_PROCESS_TIMEOUT);
     assert!(second.status.success(), "{}", second.stderr_text());
+    assert_planning_boundaries(&workspace);
     assert!(second.stdout_text().contains("ORIGINAL_OUTCOMES_RECALLED"));
     assert_eq!(server.join().unwrap().len(), 16);
     let after = session_records(&workspace);
@@ -203,6 +243,7 @@ fn killed_tui_recovers_compacted_run_and_applies_new_input_without_repeating_eff
         tui.wait_for_text("Input requested", LOCAL_PROCESS_TIMEOUT);
         let before = session_records(&workspace);
         assert!(payload_count(&before, "active_run_compaction_committed") >= 2);
+        assert_planning_boundaries(&workspace);
         tui.child.kill().unwrap();
         tui.finish(Duration::from_secs(5));
         let mut command = base_command(&workspace);
@@ -215,12 +256,15 @@ fn killed_tui_recovers_compacted_run_and_applies_new_input_without_repeating_eff
             "0",
             "--system-prompt",
             system,
+            "--input-mode",
+            "interactive",
             "resume",
             "pressure-recovery",
             "Keep output UTF-8 and inspect prior progress.",
         ]);
         let resumed = run_to_completion(command, LOCAL_PROCESS_TIMEOUT);
         assert!(resumed.status.success(), "{}", resumed.stderr_text());
+        assert_planning_boundaries(&workspace);
         assert!(
             !resumed.stderr_text().contains("Input required:"),
             "an already accepted resume answer must not prompt again"

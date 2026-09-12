@@ -15,6 +15,7 @@ fn http_error(status: &'static str) -> FixtureHttpResponse {
     FixtureHttpResponse {
         status,
         content_type: "application/json",
+        repeat_handler: false,
         body: serde_json::to_vec(&json!({"error": {"message": "temporary model failure"}}))
             .unwrap(),
     }
@@ -78,11 +79,11 @@ fn cli_retry_after_a_tool_result_does_not_repeat_the_file_effect() {
             )
         }),
         Box::new(|request| {
-            assert!(model_request_text(&request.body).contains("\"operation\":\"add\""));
+            assert!(model_tool_results_json(&request.body).contains("\"operation\":\"add\""));
             http_error("503 Service Unavailable")
         }),
         Box::new(|request| {
-            assert!(model_request_text(&request.body).contains("\"operation\":\"add\""));
+            assert!(model_tool_results_json(&request.body).contains("\"operation\":\"add\""));
             openai_tool_response("read-document", "file_read", json!({"path": "result.txt"}))
         }),
         Box::new(|request| {
@@ -227,7 +228,7 @@ fn tui_can_cancel_during_model_retry_backoff() {
     tui.send(&[0x03]);
     tui.wait_for_text("cancelled", Duration::from_secs(5));
     tui.send(&[0x04]);
-    tui.wait_for_text("\u{1b}[?1049l", Duration::from_secs(5));
+    tui.wait_for_terminal_restore(Duration::from_secs(5));
     let output = tui.finish(Duration::from_secs(5));
     assert!(output.status.success(), "{}", output.text());
     output.assert_terminal_restored();
@@ -264,7 +265,7 @@ fn tui_steer_interrupts_retry_backoff_and_rebuilds_the_model_context() {
     tui.wait_for_text("STEER_AFTER_RETRY_OK", Duration::from_secs(5));
     tui.wait_for_text("○ replied", Duration::from_secs(5));
     tui.send(&[0x04]);
-    tui.wait_for_text("\u{1b}[?1049l", Duration::from_secs(5));
+    tui.wait_for_terminal_restore(Duration::from_secs(5));
     let output = tui.finish(Duration::from_secs(5));
     assert!(output.status.success(), "{}", output.text());
     assert_eq!(server.join().unwrap().len(), 2);
