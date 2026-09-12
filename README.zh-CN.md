@@ -280,7 +280,7 @@ mcp:
 公共 SDK 就是 Agent 控制面：`AgentClient` 启动 Run，`AgentRunHandle` 提供事件订阅、
 Inspect、Command、输入恢复、Steer、Cancel 和终态等待，不再暴露旧 Planner Loop。
 
-运行完整的 AI 中立示例：
+运行完整示例：
 
 ```bash
 cargo run -p orchestral-examples --example agent_session

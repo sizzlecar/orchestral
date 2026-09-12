@@ -362,7 +362,7 @@ The public SDK is the Agent control plane: `AgentClient` starts Runs and `AgentR
 provides events, inspection, commands, input resolution, steering, cancellation, and terminal
 waiting. It does not expose the retired Planner loop.
 
-Run the complete provider-neutral example:
+Run the complete example:
 
 ```bash
 cargo run -p orchestral-examples --example agent_session
