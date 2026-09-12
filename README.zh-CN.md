@@ -1,6 +1,8 @@
 # Orchestral
 
-一个 AI 中立、可安全执行、可持久恢复、可交互的单 Agent 运行时。
+**A runtime for reliable, interactive AI agents.**
+
+Agents are the new processes. Orchestral is the runtime.
 
 [English Version](./README.md)
 
@@ -11,7 +13,7 @@
 
 - **Agent Protocol v1**：版本化 Run/Session 合同、Command、持久事件、Inspect、Cancel、
   Recovery，以及唯一终态投影。
-- **Generic Agent**：CLI、SDK、API 共用同一套 AI 中立的
+- **Generic Agent**：CLI、SDK、API 共用同一套
   `Model → Tool/Workflow → Model` 循环。
 - **模型适配器**：OpenAI-compatible 与 Gemini Native 统一实现
   [`ModelBackend` 合同](testing/orchestral-model-protocol-testkit/README.md)并通过同一
@@ -278,7 +280,7 @@ mcp:
 公共 SDK 就是 Agent 控制面：`AgentClient` 启动 Run，`AgentRunHandle` 提供事件订阅、
 Inspect、Command、输入恢复、Steer、Cancel 和终态等待，不再暴露旧 Planner Loop。
 
-运行完整的 AI 中立示例：
+运行完整示例：
 
 ```bash
 cargo run -p orchestral-examples --example agent_session
