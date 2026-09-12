@@ -658,7 +658,10 @@ fn tui_pty_skill_catalog_keeps_details_and_preferences_out_of_the_conversation()
         openai_text_response("CATALOG_BROWSING_COMPLETE")
     })]);
     workspace.configure_local_openai(&endpoint);
-    let mut tui = PtyHarness::spawn(skill_tui_command(&workspace, "skill-catalog-session"));
+    // This test inspects the dark palette; do not inherit a CI user's opt-out.
+    let mut command = skill_tui_command(&workspace, "skill-catalog-session");
+    command.env_remove("NO_COLOR");
+    let mut tui = PtyHarness::spawn(command);
     tui.wait_for_screen(|s| s.contains("Ask Orchestral"), LOCAL_PROCESS_TIMEOUT);
     tui.send_paste("/skills");
     let list = tui.wait_for_screen(
@@ -678,7 +681,7 @@ fn tui_pty_skill_catalog_keeps_details_and_preferences_out_of_the_conversation()
             .cell(description_row as u16, 4)
             .unwrap()
             .fgcolor(),
-        vt100::Color::Default
+        vt100::Color::Rgb(163, 168, 181)
     );
     tui.send(b"report");
     tui.wait_for_screen(

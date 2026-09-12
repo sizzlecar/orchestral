@@ -364,7 +364,7 @@ impl UiState {
             references: Vec::new(),
             completion_selected: 0,
             completion_dismissed: false,
-            theme: "terminal".to_owned(),
+            theme: "dark".to_owned(),
             color_enabled: true,
             host_busy: false,
             suspended_draft: None,

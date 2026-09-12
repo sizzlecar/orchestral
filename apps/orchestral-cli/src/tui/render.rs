@@ -1,7 +1,7 @@
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
@@ -18,6 +18,14 @@ const USER: Style = Style::new().fg(Color::LightCyan);
 const ASSISTANT: Style = Style::new();
 const ERROR: Style = Style::new().fg(Color::LightRed);
 const SUCCESS: Style = Style::new().fg(Color::Green);
+const BORDER: Style = Style::new().fg(Color::Gray);
+const DARK_BACKGROUND: Color = Color::Rgb(29, 32, 39);
+const DARK_PANEL: Color = Color::Rgb(39, 43, 53);
+const DARK_TEXT: Color = Color::Rgb(245, 240, 207);
+const DARK_MUTED: Color = Color::Rgb(163, 168, 181);
+const DARK_ACCENT: Color = Color::Rgb(131, 255, 107);
+const DARK_CYAN: Color = Color::Rgb(99, 219, 234);
+const DARK_BORDER: Color = Color::Rgb(85, 91, 107);
 const CONTENT_PADDING: u16 = 2;
 const WORKING_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -43,29 +51,39 @@ pub(crate) fn render_cached(
     let area = frame.area();
     if area.width < 20 || area.height < 6 {
         frame.render_widget(
-            Paragraph::new("Orchestral needs at least 20×6").style(ERROR),
+            Paragraph::new("_>. Orchestral\nResize to at least 20×6")
+                .style(ERROR)
+                .wrap(Wrap { trim: false }),
             area,
         );
+        apply_theme(frame, state);
         return state.viewport.anchor.clone();
     }
 
-    let status_height = u16::from(shows_working_status(state.phase));
     let completion = super::interaction::completion(state);
     let menu = state.menu.as_ref().or(completion.as_ref());
+    // The header still shows the run phase when a tiny screen needs these rows
+    // for a selector's title, filter and first actionable choice.
+    let status_height =
+        u16::from(shows_working_status(state.phase) && (menu.is_none() || area.height > 2 + 4));
+    let body_height = area.height.saturating_sub(2 + status_height);
+    // A question must retain an editable row. Approval and selectors instead
+    // reserve their actions first; transcript history can temporarily be hidden.
+    let input_minimum =
+        u16::from(menu.is_none() && matches!(state.pending, Some(PendingOverlay::Input { .. })))
+            * 2;
     let pending_height = if menu.is_some() {
-        (area.height / 2).clamp(3, 10)
+        (area.height / 2).clamp(4, 10)
     } else {
         pending_height(state, area.width)
-    };
-    let reserved = 2_u16
-        .saturating_add(status_height)
-        .saturating_add(pending_height);
+    }
+    .min(body_height.saturating_sub(input_minimum));
     let composer_height = composer_height(state, area.width)
         .min((area.height / if state.input_expanded { 2 } else { 3 }).max(2))
-        .min(area.height.saturating_sub(reserved).saturating_sub(1));
+        .min(body_height.saturating_sub(pending_height));
     let rows = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Min(1),
+        Constraint::Min(0),
         Constraint::Length(status_height),
         Constraint::Length(pending_height),
         Constraint::Length(composer_height),
@@ -96,9 +114,19 @@ fn apply_theme(frame: &mut Frame<'_>, state: &UiState) {
         if !state.color_enabled {
             cell.set_style(Style::reset());
         } else if state.theme == "light" {
-            cell.bg = Color::White;
+            cell.bg = match cell.bg {
+                Color::Green => Color::Rgb(36, 124, 72),
+                Color::DarkGray => Color::Rgb(233, 237, 231),
+                _ => Color::White,
+            };
+            if cell.bg == Color::Rgb(36, 124, 72) {
+                cell.fg = Color::White;
+            }
             if cell.fg == Color::DarkGray {
                 cell.fg = Color::Rgb(75, 85, 99);
+            }
+            if cell.fg == Color::Gray {
+                cell.fg = Color::Rgb(145, 151, 146);
             }
             if cell.fg == Color::Reset {
                 cell.fg = Color::Black;
@@ -113,25 +141,45 @@ fn apply_theme(frame: &mut Frame<'_>, state: &UiState) {
                 cell.fg = Color::Red;
             }
         } else if state.theme == "dark" {
-            cell.bg = Color::Black;
-            if cell.fg == Color::DarkGray {
-                cell.fg = Color::Rgb(166, 173, 186);
+            cell.bg = match cell.bg {
+                Color::Green => DARK_ACCENT,
+                Color::DarkGray => DARK_PANEL,
+                Color::Reset | Color::Black => DARK_BACKGROUND,
+                other => other,
+            };
+            cell.fg = match cell.fg {
+                Color::Reset | Color::White => DARK_TEXT,
+                Color::DarkGray => DARK_MUTED,
+                Color::Gray => DARK_BORDER,
+                Color::Cyan | Color::Green => DARK_ACCENT,
+                Color::LightCyan => DARK_CYAN,
+                Color::LightRed => Color::Rgb(255, 120, 120),
+                Color::Yellow => Color::Rgb(255, 230, 128),
+                Color::Black => Color::Rgb(21, 23, 29),
+                other => other,
+            };
+        } else {
+            // Terminal mode must not leave our dark panel behind the user's
+            // foreground. Keep the explicit contrast pair only on lime badges.
+            if cell.bg == Color::DarkGray {
+                cell.bg = Color::Reset;
             }
-            if cell.fg == Color::Reset {
-                cell.fg = Color::White;
+            if matches!(cell.fg, Color::DarkGray | Color::Gray) {
+                cell.fg = Color::Reset;
             }
-        } else if cell.fg == Color::DarkGray {
-            // The terminal owns the foreground/background pair. ANSI bright-black
-            // is often almost indistinguishable from a user's background.
-            cell.fg = Color::Reset;
         }
     }
 }
 
 fn render_menu(frame: &mut Frame<'_>, area: Rect, menu: &super::menu::Menu) {
+    frame.render_widget(
+        Block::default().style(Style::new().bg(Color::DarkGray)),
+        area,
+    );
     let block = Block::default()
         .borders(Borders::TOP)
-        .border_style(MUTED)
+        .border_type(BorderType::Thick)
+        .border_style(BORDER)
         .padding(Padding::horizontal(CONTENT_PADDING));
     let inner = block.inner(area);
     let mut lines = vec![Line::styled(
@@ -156,7 +204,9 @@ fn render_menu(frame: &mut Frame<'_>, area: Rect, menu: &super::menu::Menu) {
             MUTED,
         ));
         let choices = menu.filtered();
-        let count = (inner.height.saturating_sub(2) as usize / 2).max(1);
+        let show_descriptions = inner.height >= 4;
+        let choice_height = if show_descriptions { 2 } else { 1 };
+        let count = (inner.height.saturating_sub(2) as usize / choice_height).max(1);
         let start = menu.selected.saturating_sub(count - 1);
         if choices.is_empty() {
             lines.push(Line::styled("No matches", MUTED));
@@ -170,57 +220,62 @@ fn render_menu(frame: &mut Frame<'_>, area: Rect, menu: &super::menu::Menu) {
                     compact_label(&choice.label, inner.width.saturating_sub(2) as usize)
                 ),
                 if selected {
-                    ACCENT.add_modifier(Modifier::BOLD)
+                    Style::new()
+                        .fg(Color::Black)
+                        .bg(Color::Green)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     ASSISTANT
                 },
             ));
-            lines.push(Line::styled(
-                format!(
-                    "  {}",
-                    compact_label(&choice.description, inner.width.saturating_sub(2) as usize)
-                ),
-                MUTED,
-            ));
+            if show_descriptions {
+                lines.push(Line::styled(
+                    format!(
+                        "  {}",
+                        compact_label(&choice.description, inner.width.saturating_sub(2) as usize)
+                    ),
+                    MUTED,
+                ));
+            }
         }
     }
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
+    frame.render_widget(
+        Block::default().style(Style::new().bg(Color::DarkGray)),
+        area,
+    );
+    let brand = Style::new()
+        .fg(Color::Black)
+        .bg(Color::Green)
+        .add_modifier(Modifier::BOLD);
     let (phase_icon, phase_label) = phase_badge(state.phase);
-    if area.width < 54 {
-        let columns = Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)])
-            .split(area);
-        frame.render_widget(
-            Paragraph::new("  Orchestral").style(ACCENT.add_modifier(Modifier::BOLD)),
-            columns[0],
+    let phase = format!("{phase_icon} {phase_label}  ");
+    let columns = Layout::horizontal([
+        Constraint::Min(0),
+        Constraint::Length(u16::try_from(phase.width()).unwrap_or(14)),
+    ])
+    .split(area);
+    let mark = if area.width < 36 {
+        " _>. "
+    } else {
+        " _>. ORCHESTRAL "
+    };
+    let mut spans = vec![Span::raw(" "), Span::styled(mark, brand)];
+    if area.width >= 54 {
+        let label_width = usize::from(columns[0].width).saturating_sub(mark.width() + 8);
+        let project = compact_label(&state.project, label_width / 3);
+        let title = compact_label(
+            &state.session_title,
+            label_width.saturating_sub(project.width()),
         );
-        frame.render_widget(
-            Paragraph::new(format!("{phase_icon} {phase_label}  "))
-                .style(phase_style(state.phase))
-                .alignment(Alignment::Right),
-            columns[1],
-        );
-        return;
+        spans.push(Span::styled(format!(" // {project} / {title}"), MUTED));
     }
-    let columns =
-        Layout::horizontal([Constraint::Percentage(72), Constraint::Percentage(28)]).split(area);
-    let label_width = columns[0].width.saturating_sub(17) as usize;
-    let project = compact_label(&state.project, label_width / 3);
-    let title = compact_label(
-        &state.session_title,
-        label_width.saturating_sub(project.width()),
-    );
+    frame.render_widget(Paragraph::new(Line::from(spans)), columns[0]);
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("  Orchestral", ACCENT.add_modifier(Modifier::BOLD)),
-            Span::styled(format!("  {project} / {title}"), MUTED),
-        ])),
-        columns[0],
-    );
-    frame.render_widget(
-        Paragraph::new(format!("{phase_icon} {phase_label}  "))
+        Paragraph::new(phase)
             .style(phase_style(state.phase))
             .alignment(Alignment::Right),
         columns[1],
@@ -300,10 +355,15 @@ fn render_transcript(
         } else if cache.rows.is_empty() {
             cache.rows.extend(viewport::wrap(
                 "welcome",
-                vec![Line::styled(
-                    "Describe your task. F1 for help · /skills for project skills.",
-                    MUTED,
-                )],
+                vec![
+                    Line::styled("A runtime for reliable, interactive AI agents.", ASSISTANT),
+                    Line::default(),
+                    Line::styled(
+                        "Describe a task, paste context, or use @ to attach a file.",
+                        MUTED,
+                    ),
+                    Line::styled("/ commands · /skills project skills · F1 help", MUTED),
+                ],
                 width as usize,
             ));
         }
@@ -797,7 +857,9 @@ fn render_working_status(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         _ => return,
     };
     let frame_index = usize::try_from(state.animation_frame).unwrap_or(0) % WORKING_FRAMES.len();
-    let timer = if state.phase == UiPhase::Running {
+    let timer = if area.width < 54 {
+        format!(" {}", fmt_elapsed_compact(state.working_elapsed.as_secs()))
+    } else if state.phase == UiPhase::Running {
         format!(
             " ({} · ctrl+c to interrupt)",
             fmt_elapsed_compact(state.working_elapsed.as_secs())
@@ -837,6 +899,10 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     if area.height == 0 {
         return;
     }
+    frame.render_widget(
+        Block::default().style(Style::new().bg(Color::DarkGray)),
+        area,
+    );
     let line_count = state.composer.lines().count();
     let title = if line_count > 20 {
         format!(
@@ -853,7 +919,12 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     let block = Block::default()
         .title(title)
         .borders(Borders::TOP)
-        .border_style(MUTED)
+        .border_type(BorderType::Thick)
+        .border_style(if state.phase == UiPhase::WaitingInput {
+            USER
+        } else {
+            BORDER
+        })
         .padding(Padding::new(CONTENT_PADDING, CONTENT_PADDING, 0, 0));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -886,7 +957,7 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
                 } else {
                     composer_placeholder(state.phase)
                 },
-                MUTED.add_modifier(Modifier::ITALIC),
+                MUTED,
             )))),
             content_area,
         );
@@ -1037,51 +1108,74 @@ fn composer_placeholder(phase: UiPhase) -> &'static str {
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
-    let hint = if state
+    frame.render_widget(
+        Block::default().style(Style::new().bg(Color::DarkGray)),
+        area,
+    );
+    let (hint, compact_hint) = if state
         .menu
         .as_ref()
         .is_some_and(|menu| menu.toggle.is_some())
     {
-        "space toggle · ↑↓ read · esc back"
+        ("space toggle · ↑↓ read · esc back", "space · ↑↓ · esc")
     } else if state
         .menu
         .as_ref()
         .is_some_and(|menu| menu.detail.is_some())
     {
-        "↑↓ read · esc back"
+        ("↑↓ read · esc back", "↑↓ read · esc")
     } else if state.menu.is_some() {
-        "↑↓ select · enter open · esc return"
+        ("↑↓ select · enter open · esc return", "↑↓ enter · esc")
     } else if state.request_submission_pending() {
-        "response submitted · ctrl+c stop"
+        ("response submitted · ctrl+c stop", "sent · ^C stop")
     } else if state.viewport.anchor.is_some() {
         if state.viewport.unread {
-            "new output · end to follow"
+            ("new output · end to follow", "new · end follow")
         } else {
-            "history · end to follow"
+            ("history · end to follow", "end to follow")
         }
     } else {
         match state.phase {
-            UiPhase::WaitingApproval => "↑↓ select · a/d · enter confirm",
-            UiPhase::WaitingInput => "enter answer · ctrl+c stop",
-            UiPhase::Running => "enter steer · ctrl+c stop",
-            UiPhase::Cancelling => "stopping…",
-            _ => "enter send · / commands · f1 help",
+            UiPhase::WaitingApproval => ("↑↓ select · a/d · enter confirm", "↑↓ a/d · enter"),
+            UiPhase::WaitingInput => ("enter answer · ctrl+c stop", "enter · ^C stop"),
+            UiPhase::Running => ("enter steer · ctrl+c stop", "enter · ^C stop"),
+            UiPhase::Cancelling => ("stopping…", "stopping…"),
+            _ => ("enter send · / commands · f1 help", "enter · / · F1"),
         }
     };
-    let text = if let Some(notice) = &state.ui_notice {
-        format!("  {notice}")
-    } else if area.width < 64 {
-        format!("  {hint}")
+    let block = Block::default().padding(Padding::horizontal(CONTENT_PADDING));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if let Some(notice) = &state.ui_notice {
+        frame.render_widget(
+            Paragraph::new(compact_label(notice, inner.width as usize)).style(MUTED),
+            inner,
+        );
+        return;
+    }
+    let hint = if hint.width() <= usize::from(inner.width) {
+        hint
     } else {
-        let context = state
-            .context_budget
-            .map_or_else(|| "—".to_owned(), |budget| format!("—/{budget}"));
-        format!(
-            "  {} · context: {context}    {hint}",
-            super::text::plain(&state.model)
-        )
+        compact_hint
     };
-    frame.render_widget(Paragraph::new(text).style(MUTED), area);
+    if area.width < 64 {
+        frame.render_widget(Paragraph::new(hint).style(MUTED), inner);
+        return;
+    }
+    let columns = Layout::horizontal([
+        Constraint::Min(0),
+        Constraint::Length(u16::try_from(hint.width()).unwrap_or(inner.width)),
+    ])
+    .split(inner);
+    let context = state
+        .context_budget
+        .map_or_else(|| "—".to_owned(), |budget| format!("—/{budget}"));
+    let metadata = compact_label(
+        &format!("{} · context: {context}", state.model),
+        columns[0].width.saturating_sub(2) as usize,
+    );
+    frame.render_widget(Paragraph::new(metadata).style(MUTED), columns[0]);
+    frame.render_widget(Paragraph::new(hint).style(MUTED), columns[1]);
 }
 
 fn render_pending(
@@ -1093,23 +1187,33 @@ fn render_pending(
     if area.is_empty() {
         return;
     }
+    frame.render_widget(
+        Block::default().style(Style::new().bg(Color::DarkGray)),
+        area,
+    );
     match pending {
         PendingOverlay::Input { prompt, .. } => {
-            let mut lines = Vec::new();
-            lines.push(Line::from(Span::styled(
-                "? Input requested",
-                ACCENT.add_modifier(Modifier::BOLD),
-            )));
-            lines.extend(prompt.lines().map(|line| Line::from(line.to_owned())));
-            lines.push(Line::from(Span::styled(
-                "Reply below, then press Enter",
-                MUTED,
-            )));
+            let block = Block::default().padding(Padding::horizontal(CONTENT_PADDING));
+            let inner = block.inner(area);
+            let rows = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(u16::from(inner.height >= 3)),
+            ])
+            .split(inner);
+            frame.render_widget(block, area);
             frame.render_widget(
-                Paragraph::new(lines)
-                    .wrap(Wrap { trim: false })
-                    .block(Block::default().padding(Padding::horizontal(CONTENT_PADDING))),
-                area,
+                Paragraph::new(compact_label("? Input requested", inner.width as usize))
+                    .style(USER.add_modifier(Modifier::BOLD)),
+                rows[0],
+            );
+            frame.render_widget(
+                Paragraph::new(prompt.as_str()).wrap(Wrap { trim: false }),
+                rows[1],
+            );
+            frame.render_widget(
+                Paragraph::new("Reply below, then press Enter").style(MUTED),
+                rows[2],
             );
         }
         PendingOverlay::Approval {
@@ -1119,6 +1223,7 @@ fn render_pending(
         } => {
             let block = Block::default().padding(Padding::horizontal(CONTENT_PADDING));
             let inner = block.inner(area);
+            let compact = inner.width < 22;
             let mut actions = vec![approval_option_line(
                 'a',
                 "Allow once",
@@ -1128,7 +1233,11 @@ fn render_pending(
             if *session_approval_available {
                 actions.push(approval_option_line(
                     's',
-                    "Allow for session",
+                    if compact {
+                        "Session"
+                    } else {
+                        "Allow for session"
+                    },
                     ApprovalChoice::AllowSession,
                     approval_choice,
                 ));
@@ -1139,8 +1248,11 @@ fn render_pending(
                 ApprovalChoice::Deny,
                 approval_choice,
             ));
+            // On a minimum-height screen the header already names the phase.
+            // Preserve the operation summary before the redundant panel title.
+            let title_height = u16::from(inner.height as usize > actions.len() + 1);
             let rows = Layout::vertical([
-                Constraint::Length(1),
+                Constraint::Length(title_height),
                 Constraint::Min(0),
                 Constraint::Length(u16::try_from(actions.len()).unwrap_or(3)),
             ])
@@ -1238,7 +1350,9 @@ fn composer_height(state: &UiState, width: u16) -> u16 {
 fn phase_style(phase: UiPhase) -> Style {
     match phase {
         UiPhase::Idle | UiPhase::Completed => Style::new().fg(Color::Green),
-        UiPhase::Running | UiPhase::WaitingInput | UiPhase::WaitingApproval => ACCENT,
+        UiPhase::Running => ACCENT,
+        UiPhase::WaitingInput => USER,
+        UiPhase::WaitingApproval => Style::new().fg(Color::Yellow),
         UiPhase::Cancelling | UiPhase::Cancelled | UiPhase::Incomplete => {
             Style::new().fg(Color::Yellow)
         }
@@ -1259,6 +1373,10 @@ fn phase_badge(phase: UiPhase) -> (&'static str, &'static str) {
         UiPhase::Cancelled => ("■", "cancelled"),
     }
 }
+
+#[cfg(test)]
+#[path = "render/brand_tests.rs"]
+mod brand_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1361,8 +1479,16 @@ mod tests {
         for (width, height) in [(20, 6), (50, 6), (50, 10)] {
             let rendered = render_to_string(&state, width, height);
             assert!(rendered.contains("› a  Allow once"), "{rendered}");
-            assert!(rendered.contains("s  Allow for"), "{rendered}");
+            assert!(
+                rendered.contains(if width < 26 {
+                    "s  Session"
+                } else {
+                    "s  Allow for"
+                }),
+                "{rendered}"
+            );
             assert!(rendered.contains("d  Deny"), "{rendered}");
+            assert!(rendered.contains("A long approval"), "{rendered}");
             if width >= 50 {
                 assert!(rendered.contains("enter confirm"), "{rendered}");
             }
@@ -1659,7 +1785,7 @@ mod tests {
         assert_eq!(super::fmt_elapsed_compact(3_661), "1h 01m 01s");
     }
 
-    fn render_to_string(state: &UiState, width: u16, height: u16) -> String {
+    pub(super) fn render_to_string(state: &UiState, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("create TestBackend terminal");
         terminal
