@@ -644,7 +644,6 @@ async fn explicit_json_run_recovery_rejects_default_yaml_and_replays_with_json()
     };
     use std::sync::Arc;
 
-    let _guard = local_e2e_guard();
     let (endpoint, server) = spawn_fixture_http_server(vec![Box::new(|_| {
         openai_text_response("The original Run completed.")
     })]);
