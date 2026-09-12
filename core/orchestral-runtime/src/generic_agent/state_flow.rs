@@ -420,6 +420,7 @@ pub(super) fn model_context_trace(
         config_digest: projection.config_digest.clone(),
         history_limit,
         used_input_tokens: projection.used_input_tokens,
+        context_estimate: projection.context_estimate.clone(),
         input_budget_tokens: projection.input_budget_tokens,
     }
 }

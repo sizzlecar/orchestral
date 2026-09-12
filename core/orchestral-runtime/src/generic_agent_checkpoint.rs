@@ -104,15 +104,31 @@ pub struct GenericModelContextTrace {
     pub config_digest: Digest,
     pub history_limit: usize,
     pub used_input_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_estimate: Option<orchestral_core::model_protocol::ModelContextEstimate>,
     pub input_budget_tokens: u64,
 }
 
 impl GenericModelContextTrace {
     fn validate(&self) -> Result<(), GenericCheckpointError> {
+        if let Some(estimate) = &self.context_estimate {
+            if estimate.accounting
+                != orchestral_core::model_protocol::ModelTokenAccounting::Estimated
+                || estimate.tokens > self.used_input_tokens
+            {
+                return Err(GenericCheckpointError::InvalidData(
+                    "model Context planning estimate must be marked estimated and within its input bound".to_owned(),
+                ));
+            }
+        }
         if !self.config_digest.is_sha256()
             || self.history_limit == 0
             || self.input_budget_tokens == 0
-            || self.used_input_tokens > self.input_budget_tokens
+            || self
+                .context_estimate
+                .as_ref()
+                .map_or(self.used_input_tokens, |estimate| estimate.tokens)
+                > self.input_budget_tokens
         {
             return Err(GenericCheckpointError::InvalidData(
                 "model Context trace requires a config digest and valid Host limits".to_owned(),
@@ -1079,6 +1095,7 @@ mod tests {
             config_digest: Digest::sha256("config-v1"),
             history_limit: 128,
             used_input_tokens: 10,
+            context_estimate: None,
             input_budget_tokens: 100,
         }
     }
@@ -1091,6 +1108,39 @@ mod tests {
 
         let mut trace = context_trace();
         trace.used_input_tokens = trace.input_budget_tokens + 1;
+        assert!(trace.validate().is_err());
+    }
+
+    #[test]
+    fn model_context_trace_keeps_legacy_bounds_and_explicit_estimates_distinct() {
+        use orchestral_core::model_protocol::{ModelContextEstimate, ModelTokenAccounting};
+        let legacy = context_trace();
+        let serialized = serde_json::to_value(&legacy).unwrap();
+        assert!(serialized.get("context_estimate").is_none());
+        let restored: GenericModelContextTrace = serde_json::from_value(serialized).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(restored, legacy);
+
+        let mut trace = legacy;
+        trace.used_input_tokens = 900;
+        trace.context_estimate = Some(ModelContextEstimate {
+            tokens: 80,
+            accounting: ModelTokenAccounting::Estimated,
+        });
+        trace.validate().unwrap();
+        let restored: GenericModelContextTrace =
+            serde_json::from_slice(&serde_json::to_vec(&trace).unwrap()).unwrap();
+        assert_eq!(restored, trace);
+        for (tokens, accounting) in [
+            (101, ModelTokenAccounting::Estimated),
+            (901, ModelTokenAccounting::Estimated),
+            (80, ModelTokenAccounting::Exact),
+            (80, ModelTokenAccounting::ConservativeUpperBound),
+        ] {
+            trace.context_estimate = Some(ModelContextEstimate { tokens, accounting });
+            assert!(trace.validate().is_err());
+        }
+        trace.context_estimate = None;
         assert!(trace.validate().is_err());
     }
 

@@ -11,8 +11,8 @@ use orchestral_core::agent_session::{
     SessionSourceRange,
 };
 use orchestral_core::model_protocol::{
-    ModelContent, ModelError, ModelMessage, ModelRole, ModelTokenAccounting, ModelTokenMeter,
-    ModelTokenMeterDescriptor, ModelToolDefinition,
+    ModelContent, ModelContextEstimate, ModelError, ModelMessage, ModelRole, ModelTokenAccounting,
+    ModelTokenMeter, ModelTokenMeterDescriptor, ModelToolDefinition,
 };
 use orchestral_core::skill_protocol::SkillId;
 use serde::{Deserialize, Serialize};
@@ -106,9 +106,19 @@ pub struct SessionContextProjection {
     pub included_ranges: Vec<SessionSourceRange>,
     pub deferred_ranges: Vec<SessionSourceRange>,
     pub used_input_tokens: u64,
+    /// Optional soft planning count. `used_input_tokens` remains the hard
+    /// input bound used for dispatch reservations and observed-usage checks.
+    pub context_estimate: Option<ModelContextEstimate>,
     pub input_budget_tokens: u64,
     pub through_session_seq: u64,
     pub config_digest: Digest,
+}
+
+/// Select context with either a certified bound or an explicitly soft estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextTokenPolicy {
+    UpperBound,
+    Planning,
 }
 
 pub struct AgentSessionContextEngine {
@@ -130,6 +140,15 @@ impl AgentSessionContextEngine {
     pub async fn project(
         &self,
         request: SessionContextRequest,
+    ) -> Result<SessionContextProjection, SessionContextError> {
+        self.project_with_policy(request, ContextTokenPolicy::UpperBound)
+            .await
+    }
+
+    pub async fn project_with_policy(
+        &self,
+        request: SessionContextRequest,
+        policy: ContextTokenPolicy,
     ) -> Result<SessionContextProjection, SessionContextError> {
         validate_context_request(&request)?;
         let records = self.journal.load_session(&request.session_id).await?;
@@ -158,7 +177,7 @@ impl AgentSessionContextEngine {
             .map(|group| group.key)
             .collect::<BTreeSet<_>>();
         let pinned_messages = assemble_messages(&request.system_message, &groups, &selected);
-        let pinned_tokens = self.count_request_input(&pinned_messages, &request.tools)?;
+        let pinned_tokens = self.context_input_tokens(&pinned_messages, &request.tools, policy)?;
         if pinned_tokens > input_budget {
             return Err(SessionContextError::ContextOverflow {
                 used: pinned_tokens,
@@ -197,9 +216,10 @@ impl AgentSessionContextEngine {
                     });
                 let mut candidate = selected.clone();
                 candidate.insert(record.session_seq);
-                if self.count_request_input(
+                if self.context_input_tokens(
                     &assemble_messages(&request.system_message, &candidate_groups, &candidate),
                     &request.tools,
+                    policy,
                 )? <= input_budget
                 {
                     groups = candidate_groups;
@@ -222,12 +242,33 @@ impl AgentSessionContextEngine {
             let mut candidate = selected.clone();
             candidate.insert(group.key);
             let messages = assemble_messages(&request.system_message, &groups, &candidate);
-            if self.count_request_input(&messages, &request.tools)? <= input_budget {
+            if self.context_input_tokens(&messages, &request.tools, policy)? <= input_budget {
                 selected = candidate;
             }
         }
         let messages = assemble_messages(&request.system_message, &groups, &selected);
         let used_input_tokens = self.count_request_input(&messages, &request.tools)?;
+        let context_estimate = if policy == ContextTokenPolicy::Planning {
+            let estimate = self
+                .token_meter
+                .estimate_context_input(&messages, &request.tools)
+                .map_err(|error| SessionContextError::InvalidRequest(error.to_string()))?;
+            if estimate.tokens > input_budget
+                || estimate.tokens > used_input_tokens
+                || (estimate.accounting != ModelTokenAccounting::Estimated
+                    && estimate.tokens != used_input_tokens)
+            {
+                return Err(SessionContextError::InvalidRequest(
+                    "context estimate is inconsistent with the input bound or selected budget"
+                        .to_owned(),
+                ));
+            }
+            // Preserve the durable trace of adapters that retain certified
+            // accounting, including checkpoints written before estimates existed.
+            (estimate.accounting == ModelTokenAccounting::Estimated).then_some(estimate)
+        } else {
+            None
+        };
         let mut included_ranges = Vec::new();
         let mut deferred_ranges = Vec::new();
         for group in groups.values() {
@@ -263,10 +304,26 @@ impl AgentSessionContextEngine {
             included_ranges,
             deferred_ranges,
             used_input_tokens,
+            context_estimate,
             input_budget_tokens: input_budget,
             through_session_seq: records.last().map(|record| record.session_seq).unwrap_or(0),
             config_digest: request.config_digest,
         })
+    }
+
+    fn context_input_tokens(
+        &self,
+        messages: &[ModelMessage],
+        tools: &[ModelToolDefinition],
+        policy: ContextTokenPolicy,
+    ) -> Result<u64, SessionContextError> {
+        if policy == ContextTokenPolicy::UpperBound {
+            return self.count_request_input(messages, tools);
+        }
+        self.token_meter
+            .estimate_context_input(messages, tools)
+            .map(|estimate| estimate.tokens)
+            .map_err(|error| SessionContextError::InvalidRequest(error.to_string()))
     }
 
     fn count_request_input(
@@ -1858,26 +1915,32 @@ mod tests {
         }
         let engine =
             AgentSessionContextEngine::new(store, Arc::new(JsonSizeTokenMeter::new(1).unwrap()));
-        let projection = engine
-            .project(SessionContextRequest {
-                session_id: AgentSessionId::new("session-1"),
-                current_run_id: RunId::new("current"),
-                through_session_seq: None,
-                system_message: Some(ModelMessage::text(ModelRole::System, "system")),
-                tools: Vec::new(),
-                history_limit: 100,
-                max_context_tokens: 600,
-                reserved_output_tokens: 100,
-                config_digest: Digest::sha256("config"),
-                allowed_skill_digests: BTreeMap::new(),
-            })
-            .await
-            .unwrap();
+        let request = || SessionContextRequest {
+            session_id: AgentSessionId::new("session-1"),
+            current_run_id: RunId::new("current"),
+            through_session_seq: None,
+            system_message: Some(ModelMessage::text(ModelRole::System, "system")),
+            tools: Vec::new(),
+            history_limit: 100,
+            max_context_tokens: 600,
+            reserved_output_tokens: 100,
+            config_digest: Digest::sha256("config"),
+            allowed_skill_digests: BTreeMap::new(),
+        };
+        let projection = engine.project(request()).await.unwrap();
         let rendered = serde_json::to_string(&projection.messages).unwrap();
         assert!(rendered.contains("message-12"));
         assert!(rendered.contains("message-11"));
         assert!(!rendered.contains("message-1-"));
         assert!(projection.used_input_tokens <= projection.input_budget_tokens);
+        let planning = engine
+            .project_with_policy(request(), ContextTokenPolicy::Planning)
+            .await
+            .unwrap();
+        assert_eq!(planning.messages, projection.messages);
+        assert_eq!(planning.used_input_tokens, projection.used_input_tokens);
+        assert_eq!(planning.included_ranges, projection.included_ranges);
+        assert!(planning.context_estimate.is_none());
     }
 
     #[tokio::test]

@@ -44,7 +44,9 @@ use orchestral_mcp_streamable_http::{
 use orchestral_model_gemini::{
     GeminiAuthentication, GeminiModelBackend, GeminiModelConfig, GoogleCloudAccessTokenProvider,
 };
-use orchestral_model_openai::{OpenAiCompatibleBackend, OpenAiCompatibleConfig};
+use orchestral_model_openai::{
+    OpenAiCompatibleBackend, OpenAiCompatibleConfig, OpenAiSamplingConfig,
+};
 use orchestral_runtime::api::AgentApi;
 use orchestral_runtime::session_history::JournalSessionHistory;
 use orchestral_runtime::tools::{
@@ -235,15 +237,11 @@ async fn build_agent_host_with_journals(
     let config = load_config(&config_path)
         .with_context(|| format!("load Generic Agent config '{}'", config_path.display()))?;
     let (backend, profile, model, temperature) = resolve_model(&config).await?;
-    let max_output_tokens = profile
-        .as_ref()
-        .and_then(|profile| profile.max_tokens)
-        .unwrap_or(8_192) as u64;
     let (model_backend, token_meter) = build_model_backend(
         &backend,
         &model,
         temperature,
-        max_output_tokens,
+        profile.as_ref(),
         config.agent.stream_buffer,
         options.credential_file.as_deref(),
     )?;
@@ -1489,10 +1487,13 @@ fn build_model_backend(
     backend: &BackendSpec,
     model: &str,
     temperature: f32,
-    max_output_tokens: u64,
+    profile: Option<&ModelProfile>,
     max_buffered_events: usize,
     credential_file: Option<&std::path::Path>,
 ) -> anyhow::Result<(Arc<dyn ModelBackend>, Arc<dyn ModelTokenMeter>)> {
+    let max_output_tokens = profile
+        .and_then(|profile| profile.max_tokens)
+        .unwrap_or(8_192) as u64;
     let timeout = Duration::from_secs(
         backend
             .get_config("stream_idle_timeout_secs")
@@ -1569,6 +1570,12 @@ fn build_model_backend(
             Ok((backend.clone(), backend))
         }
         "openai" | "openrouter" | "deepseek" | "groq" | "xai" | "mistral" => {
+            let sampling = profile
+                .and_then(|profile| profile.config.get("sampling"))
+                .map(|value| serde_json::from_value::<OpenAiSamplingConfig>(value.clone()))
+                .transpose()
+                .context("parse model profile config.sampling")?
+                .unwrap_or_default();
             let api_key = crate::openai_connection::api_key(backend)?;
             let endpoint = backend.endpoint.clone().or_else(|| match backend.kind.as_str() {
                 "openai" => Some("https://api.openai.com/v1".to_owned()),
@@ -1595,7 +1602,9 @@ fn build_model_backend(
                         .unwrap_or(true),
                     max_buffered_events,
                 })
-                .context("build OpenAI-compatible ModelBackend")?,
+                .context("build OpenAI-compatible ModelBackend")?
+                .with_sampling(sampling)
+                .context("configure OpenAI-compatible sampling")?,
             );
             Ok((backend.clone(), backend))
         }
@@ -2006,6 +2015,31 @@ mod entry_mode_tests {
     use std::path::PathBuf;
 
     use super::{select_entry_mode, unique_id, CliWorkspaceSet, EntryMode};
+
+    #[test]
+    fn model_profile_sampling_is_validated_before_connecting() {
+        let backend = serde_json::from_value(serde_json::json!({
+            "name": "local", "kind": "openai", "endpoint": "http://127.0.0.1:1/v1",
+            "config": {"auth": "none"},
+        }))
+        .unwrap();
+        for sampling in [
+            serde_json::json!({"top_k": "20"}),
+            serde_json::json!({"topk": 20}),
+            serde_json::json!({"repetition_penalty": 0}),
+        ] {
+            let profile = serde_json::from_value(serde_json::json!({
+                "name": "local", "backend": "local", "model": "local-model",
+                "config": {"sampling": sampling},
+            }))
+            .unwrap();
+            let error =
+                super::build_model_backend(&backend, "local-model", 0.6, Some(&profile), 8, None)
+                    .err()
+                    .expect("invalid model sampling must fail before HTTP");
+            assert!(format!("{error:#}").contains("sampling"));
+        }
+    }
 
     #[cfg(unix)]
     #[test]

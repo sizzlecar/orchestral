@@ -2,6 +2,8 @@
 
 mod endpoint;
 pub use endpoint::{discover_models, OpenAiEndpoint};
+mod sampling;
+pub use sampling::OpenAiSamplingConfig;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
@@ -12,10 +14,10 @@ use futures_util::stream::BoxStream;
 use futures_util::{stream, StreamExt};
 use orchestral_core::agent_protocol::wire::Digest;
 use orchestral_core::model_protocol::{
-    ModelBackend, ModelCapabilities, ModelContent, ModelDescriptor, ModelError, ModelErrorCode,
-    ModelEvent, ModelEventId, ModelFinishReason, ModelMessage, ModelRequest, ModelRequestId,
-    ModelRole, ModelStream, ModelStreamEvent, ModelTokenAccounting, ModelTokenMeter,
-    ModelTokenMeterDescriptor, ModelToolCallId, ModelToolDefinition, ModelUsage,
+    ModelBackend, ModelCapabilities, ModelContent, ModelContextEstimate, ModelDescriptor,
+    ModelError, ModelErrorCode, ModelEvent, ModelEventId, ModelFinishReason, ModelMessage,
+    ModelRequest, ModelRequestId, ModelRole, ModelStream, ModelStreamEvent, ModelTokenAccounting,
+    ModelTokenMeter, ModelTokenMeterDescriptor, ModelToolCallId, ModelToolDefinition, ModelUsage,
 };
 use reqwest::{Client, StatusCode};
 use serde_json::{json, Map, Value};
@@ -66,6 +68,7 @@ impl OpenAiCompatibleConfig {
 pub struct OpenAiCompatibleBackend {
     client: Client,
     config: OpenAiCompatibleConfig,
+    sampling: OpenAiSamplingConfig,
 }
 
 impl OpenAiCompatibleBackend {
@@ -76,7 +79,18 @@ impl OpenAiCompatibleBackend {
             .read_timeout(config.timeout)
             .build()
             .map_err(|error| ModelError::new(ModelErrorCode::Internal, error.to_string()))?;
-        Ok(Self { client, config })
+        Ok(Self {
+            client,
+            config,
+            sampling: OpenAiSamplingConfig::default(),
+        })
+    }
+
+    /// Select explicit sampling parameters without changing omitted defaults.
+    pub fn with_sampling(mut self, sampling: OpenAiSamplingConfig) -> Result<Self, ModelError> {
+        sampling.validate()?;
+        self.sampling = sampling;
+        Ok(self)
     }
 
     fn build_request_body(&self, request: &ModelRequest) -> Result<Value, ModelError> {
@@ -89,6 +103,11 @@ impl OpenAiCompatibleBackend {
         body.insert("stream".to_owned(), Value::Bool(true));
         body.insert("stream_options".to_owned(), json!({"include_usage": true}));
         body.insert("temperature".to_owned(), json!(self.config.temperature));
+        let sampling = serde_json::to_value(&self.sampling)
+            .map_err(|error| ModelError::invalid_request(error.to_string()))?;
+        if let Value::Object(sampling) = sampling {
+            body.extend(sampling);
+        }
         body.insert(
             "max_tokens".to_owned(),
             json!(request
@@ -138,30 +157,12 @@ impl OpenAiCompatibleBackend {
         }
         Ok(Value::Object(body))
     }
-}
 
-impl ModelTokenMeter for OpenAiCompatibleBackend {
-    fn meter_descriptor(&self) -> ModelTokenMeterDescriptor {
-        let config = serde_json::to_vec(&(
-            &self.config.model,
-            self.config.temperature.to_bits(),
-            self.config.default_max_output_tokens,
-            self.config.structured_output,
-        ))
-        .expect("OpenAI token meter scalar configuration is serializable");
-        ModelTokenMeterDescriptor {
-            strategy: "openai-compatible/wire-json-upper-bound".to_owned(),
-            version: "1".to_owned(),
-            accounting: ModelTokenAccounting::ConservativeUpperBound,
-            config_digest: Digest::sha256(config),
-        }
-    }
-
-    fn count_request_input(
+    fn input_wire_size(
         &self,
         messages: &[ModelMessage],
         tools: &[ModelToolDefinition],
-    ) -> Result<u64, ModelError> {
+    ) -> Result<(u64, u64), ModelError> {
         let request = ModelRequest {
             request_id: ModelRequestId::new("token-meter"),
             messages: messages.to_vec(),
@@ -174,13 +175,60 @@ impl ModelTokenMeter for OpenAiCompatibleBackend {
         let wire_bytes = serde_json::to_vec(&body)
             .map_err(|error| ModelError::invalid_request(error.to_string()))?
             .len() as u64;
+        let framing = 64_u64
+            .saturating_add((messages.len() as u64).saturating_mul(16))
+            .saturating_add((tools.len() as u64).saturating_mul(32));
+        Ok((wire_bytes, framing))
+    }
+}
+
+// A planning heuristic for mixed prose, code, and tool JSON. This is not a
+// tokenizer and cannot certify a context-window or resource limit.
+const CONTEXT_ESTIMATE_BYTES_PER_TOKEN: u64 = 3;
+
+impl ModelTokenMeter for OpenAiCompatibleBackend {
+    fn meter_descriptor(&self) -> ModelTokenMeterDescriptor {
+        let config = serde_json::to_vec(&(
+            &self.config.model,
+            self.config.temperature.to_bits(),
+            self.config.default_max_output_tokens,
+            self.config.structured_output,
+            &self.sampling,
+            CONTEXT_ESTIMATE_BYTES_PER_TOKEN,
+        ))
+        .expect("OpenAI token meter scalar configuration is serializable");
+        ModelTokenMeterDescriptor {
+            strategy: "openai-compatible/wire-json-upper-bound".to_owned(),
+            version: "2".to_owned(),
+            accounting: ModelTokenAccounting::ConservativeUpperBound,
+            config_digest: Digest::sha256(config),
+        }
+    }
+
+    fn count_request_input(
+        &self,
+        messages: &[ModelMessage],
+        tools: &[ModelToolDefinition],
+    ) -> Result<u64, ModelError> {
+        let (wire_bytes, framing) = self.input_wire_size(messages, tools)?;
         // A UTF-8 token consumes at least one byte. The explicit per-request,
         // per-message, and per-tool allowance also covers provider framing
         // that is not present in the HTTP JSON body.
-        Ok(wire_bytes
-            .saturating_add(64)
-            .saturating_add((messages.len() as u64).saturating_mul(16))
-            .saturating_add((tools.len() as u64).saturating_mul(32)))
+        Ok(wire_bytes.saturating_add(framing))
+    }
+
+    fn estimate_context_input(
+        &self,
+        messages: &[ModelMessage],
+        tools: &[ModelToolDefinition],
+    ) -> Result<ModelContextEstimate, ModelError> {
+        let (wire_bytes, framing) = self.input_wire_size(messages, tools)?;
+        Ok(ModelContextEstimate {
+            tokens: wire_bytes
+                .div_ceil(CONTEXT_ESTIMATE_BYTES_PER_TOKEN)
+                .saturating_add(framing),
+            accounting: ModelTokenAccounting::Estimated,
+        })
     }
 }
 
@@ -984,6 +1032,108 @@ mod tests {
             max_output_tokens: Some(128),
             extensions: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn explicit_sampling_reaches_chat_body_without_overriding_the_request_contract() {
+        let backend = OpenAiCompatibleBackend::new(OpenAiCompatibleConfig {
+            backend_id: "sampling-wire".to_owned(),
+            endpoint: "http://127.0.0.1/v1".to_owned(),
+            api_key: String::new(),
+            model: "local-model".to_owned(),
+            temperature: 0.6,
+            default_max_output_tokens: 8_192,
+            max_context_tokens: Some(32_768),
+            timeout: Duration::from_secs(1),
+            structured_output: true,
+            max_buffered_events: 8,
+        })
+        .unwrap();
+        let request = request();
+        let default_body = backend.build_request_body(&request).unwrap();
+        let default_digest = backend.meter_descriptor().config_digest;
+        assert!(default_body.get("repetition_penalty").is_none());
+        assert!(default_body.get("top_k").is_none());
+        let sampling = json!({
+            "top_p": 0.95, "top_k": 20, "min_p": 0.0,
+            "repetition_penalty": 1.0, "presence_penalty": 0.0,
+            "frequency_penalty": 0.0, "seed": 20260912,
+        });
+        let backend = backend
+            .with_sampling(serde_json::from_value(sampling).unwrap())
+            .unwrap();
+        let body = backend.build_request_body(&request).unwrap();
+        assert_eq!(body["top_k"], 20);
+        assert!((body["top_p"].as_f64().unwrap() - 0.95).abs() < 1e-6);
+        assert_eq!(body["repetition_penalty"], 1.0);
+        assert_eq!(body["presence_penalty"], 0.0);
+        assert_eq!(body["frequency_penalty"], 0.0);
+        assert_eq!(body["min_p"], 0.0);
+        assert_eq!(body["seed"], 20260912);
+        for field in [
+            "model",
+            "messages",
+            "tools",
+            "tool_choice",
+            "temperature",
+            "max_tokens",
+            "stream",
+            "stream_options",
+        ] {
+            assert_eq!(body[field], default_body[field], "sampling changed {field}");
+        }
+        assert_ne!(backend.meter_descriptor().config_digest, default_digest);
+        let measured = backend
+            .count_request_input(&request.messages, &request.tools)
+            .unwrap();
+        assert!(measured >= serde_json::to_vec(&body).unwrap().len() as u64);
+    }
+
+    #[test]
+    fn code_context_estimate_does_not_replace_the_wire_reservation() {
+        let backend = OpenAiCompatibleBackend::new(OpenAiCompatibleConfig {
+            backend_id: "context-planning".to_owned(),
+            endpoint: "http://127.0.0.1/v1".to_owned(),
+            api_key: String::new(),
+            model: "local-model".to_owned(),
+            temperature: 0.6,
+            default_max_output_tokens: 2_048,
+            max_context_tokens: Some(32_768),
+            timeout: Duration::from_secs(1),
+            structured_output: false,
+            max_buffered_events: 8,
+        })
+        .unwrap();
+        let mut request = request();
+        request.max_output_tokens = None;
+        request.messages.push(ModelMessage::text(
+            ModelRole::User,
+            "fn keep_newline(text: &str) -> bool { text.ends_with('\\n') }\n".repeat(600),
+        ));
+        let body = backend.build_request_body(&request).unwrap();
+        let wire_bytes = serde_json::to_vec(&body).unwrap().len() as u64;
+        let upper_bound = backend
+            .count_request_input(&request.messages, &request.tools)
+            .unwrap();
+        let estimate = backend
+            .estimate_context_input(&request.messages, &request.tools)
+            .unwrap();
+        assert!(upper_bound >= wire_bytes);
+        assert!(upper_bound > 32_768 - 2_048);
+        assert!(estimate.tokens < 32_768 - 2_048);
+        assert_eq!(estimate.accounting, ModelTokenAccounting::Estimated);
+        // Planning must leave the actual model request and hard meter intact.
+        assert_eq!(backend.build_request_body(&request).unwrap(), body);
+        assert_eq!(
+            backend
+                .count_request_input(&request.messages, &request.tools)
+                .unwrap(),
+            upper_bound
+        );
+        let mut descriptor = backend.meter_descriptor();
+        descriptor.validate().unwrap();
+        descriptor.accounting = ModelTokenAccounting::Estimated;
+        assert!(descriptor.validate().is_err());
     }
 
     #[test]

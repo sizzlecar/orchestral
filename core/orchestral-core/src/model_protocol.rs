@@ -79,6 +79,16 @@ pub enum ModelTokenAccounting {
     Exact,
     /// The adapter deliberately over-counts the provider wire representation.
     ConservativeUpperBound,
+    /// A context-planning estimate, never a hard token or cost reservation.
+    Estimated,
+}
+
+/// Planning information kept separate from the meter's hard input bound.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelContextEstimate {
+    pub tokens: u64,
+    pub accounting: ModelTokenAccounting,
 }
 
 /// Immutable identity of the token accounting strategy used to build model
@@ -98,6 +108,7 @@ impl ModelTokenMeterDescriptor {
         if self.strategy.trim().is_empty()
             || self.version.trim().is_empty()
             || !self.config_digest.is_sha256()
+            || self.accounting == ModelTokenAccounting::Estimated
         {
             return Err(ModelError::invalid_request(
                 "invalid model token meter descriptor",
@@ -118,6 +129,22 @@ pub trait ModelTokenMeter: Send + Sync {
         messages: &[ModelMessage],
         tools: &[ModelToolDefinition],
     ) -> Result<u64, ModelError>;
+
+    /// Estimate space for context selection when no hard input/cost ceiling
+    /// applies. The default retains the existing certified count. Adapters
+    /// overriding this method must bind its algorithm into their descriptor's
+    /// immutable identity. Estimates must not replace `count_request_input`
+    /// for resource reservations or validation of observed usage.
+    fn estimate_context_input(
+        &self,
+        messages: &[ModelMessage],
+        tools: &[ModelToolDefinition],
+    ) -> Result<ModelContextEstimate, ModelError> {
+        Ok(ModelContextEstimate {
+            tokens: self.count_request_input(messages, tools)?,
+            accounting: self.meter_descriptor().accounting,
+        })
+    }
 }
 
 impl ModelDescriptor {
