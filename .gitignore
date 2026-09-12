@@ -50,4 +50,5 @@ configs/*.agent.override.yaml
 /deploy/cloudflare/orchestral-site/public/install.sh
 /deploy/cloudflare/orchestral-site/public/install.ps1
 /deploy/cloudflare/orchestral-site/public/releases/
+/deploy/cloudflare/orchestral-site/public/brand/
 /deploy/cloudflare/orchestral-site/.wrangler/

@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="80" height="80" viewBox="0 0 80 80" role="img" aria-labelledby="title">
+  <title id="title">Orchestral</title>
+  <path fill="#090b0e" d="M10 10h66v66H10z"/>
+  <path fill="#83ff6b" stroke="#090b0e" stroke-width="3" d="M4 4h64v64H4z"/>
+  <g transform="translate(4 4) scale(.6666667)" fill="#15171d">
+    <path d="M10 64h21v8H10z"/>
+    <path d="m43 24-6 6 22 18-22 18 6 6 29-24z"/>
+    <circle cx="83" cy="68" r="4"/>
+  </g>
+</svg>

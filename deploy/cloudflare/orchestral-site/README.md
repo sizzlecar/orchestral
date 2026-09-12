@@ -11,8 +11,11 @@ node scripts/build_site.cjs
 npx wrangler@4.130.0 dev --config deploy/cloudflare/orchestral-site/wrangler.jsonc
 ```
 
-The build copies `scripts/install.sh` and `scripts/install.ps1` into `public/`. Those generated
-copies are ignored; change the source scripts instead. Browser regression checks use the
+The build copies `assets/brand/` SVG/PNG files and the `scripts/install.sh` and
+`scripts/install.ps1` installers into `public/`. Those generated copies are ignored;
+change the source assets instead. After changing `assets/brand/social-card.svg`, run
+`node scripts/export_brand.cjs` before building to refresh the social preview PNG.
+Browser regression checks use the
 pinned Playwright dependency in `scripts/package-lock.json`:
 
 ```sh

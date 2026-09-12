@@ -19,10 +19,10 @@ try {
     if ($architecture -ne 'AMD64') {
         throw 'This installer supports Windows x64. See https://orch.pandaailabs.com for supported platforms.'
     }
-    $releaseOrigin = 'https://orch.pandaailabs.com'
+    $releaseOrigin = 'https://github.com/sizzlecar/orchestral/releases'
     if (-not $Version) {
         try {
-            $Version = (Invoke-RestMethod "$releaseOrigin/releases/latest/x86_64-pc-windows-msvc.txt" -TimeoutSec 30).Trim()
+            $Version = (Invoke-RestMethod "$releaseOrigin/latest/download/version.txt" -TimeoutSec 30).Trim()
         } catch {
             throw 'Could not find the Windows release. Check your connection and retry, or download the Windows package at https://orch.pandaailabs.com/#install.'
         }
@@ -31,7 +31,7 @@ try {
     if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw 'Version must be MAJOR.MINOR.PATCH, for example 0.3.0.' }
     $archive = "orchestral-v$Version-x86_64-pc-windows-msvc"
     $asset = "$archive.zip"
-    if (-not $ReleaseBaseUrl) { $ReleaseBaseUrl = "$releaseOrigin/releases/v$Version" }
+    if (-not $ReleaseBaseUrl) { $ReleaseBaseUrl = "$releaseOrigin/download/v$Version" }
     $uri = [Uri]$ReleaseBaseUrl
     if ($uri.Scheme -ne 'https' -and -not ($uri.Scheme -eq 'http' -and $uri.IsLoopback)) {
         throw 'Release mirror must use HTTPS (loopback HTTP is allowed for local testing).'

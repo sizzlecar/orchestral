@@ -47,15 +47,15 @@ case "$(uname -s):$(uname -m)" in
     ;;
   *) fail 'No release binary is available for this platform. See https://orch.pandaailabs.com for supported platforms.' ;;
 esac
-release_origin=https://orch.pandaailabs.com
+release_origin=https://github.com/sizzlecar/orchestral/releases
 if [ -z "$version" ]; then
-  version=$(curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 15 --max-time 60 "$release_origin/releases/latest/$target.txt") ||
+  version=$(curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 15 --max-time 60 "$release_origin/latest/download/version.txt") ||
     fail 'Could not find a release for this platform. Check your connection and available platforms at https://orch.pandaailabs.com/#install.'
 fi
 printf '%s\n' "$version" | LC_ALL=C grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || fail 'Version must be MAJOR.MINOR.PATCH, for example 0.3.0.'
 archive="orchestral-v${version}-${target}"
 asset="${archive}.tar.gz"
-base_url="${ORCHESTRAL_RELEASE_BASE_URL:-$release_origin/releases/v$version}"
+base_url="${ORCHESTRAL_RELEASE_BASE_URL:-$release_origin/download/v$version}"
 # Explicit mirrors are useful for offline/internal distribution. HTTP is allowed
 # only for loopback test servers; normal downloads always require HTTPS.
 case "$base_url" in
