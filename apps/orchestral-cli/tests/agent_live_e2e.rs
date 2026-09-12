@@ -351,7 +351,10 @@ fn tui_pty_resolves_input_and_approval_then_cancels_another_run() {
                 "approval-write",
                 "exec_command",
                 if cfg!(windows) {
-                    json!({ "cmd": "Remove-Item -LiteralPath tui-approved.marker", "sandbox_permissions": "require_escalated", "justification": "Delete the requested marker", "yield_time_ms": 1, "wait_mode": "completion" })
+                    // Exercise the approved destructive effect without relying
+                    // on PowerShell's cmdlet module discovery. Resolve against
+                    // the shell location, not .NET's separate current directory.
+                    json!({ "cmd": "[System.IO.File]::Delete([System.IO.Path]::Combine($PWD.Path, 'tui-approved.marker'))", "sandbox_permissions": "require_escalated", "justification": "Delete the requested marker", "yield_time_ms": 1, "wait_mode": "completion" })
                 } else {
                     json!({ "cmd": "rm tui-approved.marker", "yield_time_ms": 1, "wait_mode": "completion" })
                 },
@@ -400,6 +403,10 @@ fn tui_pty_resolves_input_and_approval_then_cancels_another_run() {
     // the final Up+Enter into an accidental denial.
     tui.send(b"\x1b[B");
     thread::sleep(Duration::from_millis(1_100));
+    assert!(
+        workspace.path("tui-approved.marker").exists(),
+        "the destructive effect must wait for approval"
+    );
     tui.send(b"\x1b[A\r");
     tui.wait_for_text("APPROVAL_RESOLVED_OK", LOCAL_PROCESS_TIMEOUT);
     tui.wait_for_text_count("○ replied", 2, LOCAL_PROCESS_TIMEOUT);
