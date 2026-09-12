@@ -22,6 +22,8 @@ use windows_sys::Win32::System::Threading::{
 const POWERSHELL_COMMAND_ENTERED: &str = "ORCHESTRAL-PS-COMMAND-ENTERED";
 const POWERSHELL_ENCODING_CONFIGURED: &str = "ORCHESTRAL-PS-ENCODING-CONFIGURED";
 const POWERSHELL_STDOUT_PROBE: &str = "ORCHESTRAL-PS-DIRECT-STDOUT";
+const POWERSHELL_ASSIGNMENT_STARTED: &str = "ORCHESTRAL-PS-ASSIGNMENT-STARTED";
+const POWERSHELL_ASSIGNMENT_COMPLETED: &str = "ORCHESTRAL-PS-ASSIGNMENT-COMPLETED";
 
 fn windows_environment(root: &Path) -> BTreeMap<String, String> {
     // Keep the original environment unchanged apart from temporary storage.
@@ -80,6 +82,8 @@ struct Stages {
     command_entered_observed_ms: Option<u128>,
     encoding_configured_observed_ms: Option<u128>,
     direct_stdout_observed_ms: Option<u128>,
+    assignment_started_observed_ms: Option<u128>,
+    assignment_completed_observed_ms: Option<u128>,
     exit_observed_ms: Option<u128>,
     close_completed_ms: Option<u128>,
 }
@@ -94,6 +98,8 @@ impl Stages {
             command_entered_observed_ms: None,
             encoding_configured_observed_ms: None,
             direct_stdout_observed_ms: None,
+            assignment_started_observed_ms: None,
+            assignment_completed_observed_ms: None,
             exit_observed_ms: None,
             close_completed_ms: None,
         }
@@ -120,6 +126,14 @@ impl Stages {
                 &mut self.encoding_configured_observed_ms,
             ),
             (POWERSHELL_STDOUT_PROBE, &mut self.direct_stdout_observed_ms),
+            (
+                POWERSHELL_ASSIGNMENT_STARTED,
+                &mut self.assignment_started_observed_ms,
+            ),
+            (
+                POWERSHELL_ASSIGNMENT_COMPLETED,
+                &mut self.assignment_completed_observed_ms,
+            ),
         ] {
             if result.stdout.contains(marker) || result.stderr.contains(marker) {
                 observed.get_or_insert(elapsed);
@@ -146,12 +160,50 @@ impl Drop for Stages {
                 "command_entered_observed_ms":self.command_entered_observed_ms,
                 "encoding_configured_observed_ms":self.encoding_configured_observed_ms,
                 "direct_stdout_observed_ms":self.direct_stdout_observed_ms,
+                "assignment_started_observed_ms":self.assignment_started_observed_ms,
+                "assignment_completed_observed_ms":self.assignment_completed_observed_ms,
                 "exit_observed_ms":self.exit_observed_ms,
                 "close_completed_ms":self.close_completed_ms,
                 "elapsed_ms":self.started.elapsed().as_millis(),
             })
         );
     }
+}
+
+#[tokio::test]
+async fn native_pipe_can_capture_a_cmdlet_value_before_direct_output() {
+    let workspace = tempfile::tempdir().unwrap();
+    let manager = ProcessSupervisor::new(16384).unwrap();
+    // Capture the real cmdlet result instead of sending it to Out-Default.
+    // The original tests still exercise uncaptured PowerShell pipeline output.
+    let command = format!(
+        "[Console]::Error.WriteLine('{POWERSHELL_ASSIGNMENT_STARTED}'); [Console]::Error.Flush(); $value = Write-Output 'fixed'; [Console]::Error.WriteLine('{POWERSHELL_ASSIGNMENT_COMPLETED}'); [Console]::Error.Flush(); [Console]::Out.WriteLine($value); [Console]::Out.Flush()"
+    );
+    let spawn = spec(workspace.path(), &command, false);
+    let run = spawn.run_id.clone();
+    let mut stages = Stages::new("powershell_captured_cmdlet");
+    let id = manager.spawn(spawn).await.unwrap();
+    stages.spawned();
+    let result = manager
+        .write_and_poll(
+            &run,
+            id,
+            None,
+            Duration::from_secs(10),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    stages.observe(&result);
+    // Reap a timed-out child before asserting; retain the original poll result.
+    manager.close_run(&run).await.unwrap();
+    stages.closed();
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    assert_eq!(
+        result.stdout,
+        format!("{POWERSHELL_STDOUT_PROBE}\r\nfixed\r\n"),
+        "the actual Write-Output value must reach direct stdout"
+    );
 }
 
 #[tokio::test]
