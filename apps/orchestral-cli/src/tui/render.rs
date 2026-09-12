@@ -97,7 +97,13 @@ pub(crate) fn render_cached(
     if let Some(menu) = menu {
         render_menu(frame, rows[3], menu);
     } else if let Some(pending) = &state.pending {
-        render_pending(frame, rows[3], pending, state.approval_choice);
+        render_pending(
+            frame,
+            rows[3],
+            pending,
+            state.approval_choice,
+            state.approval_scroll,
+        );
     }
     render_composer(frame, rows[4], state);
     render_footer(frame, rows[5], state);
@@ -1128,6 +1134,13 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         ("↑↓ select · enter open · esc return", "↑↓ enter · esc")
     } else if state.request_submission_pending() {
         ("response submitted · ctrl+c stop", "sent · ^C stop")
+    } else if state.phase == UiPhase::WaitingApproval
+        && approval_scroll_max(state, (frame.area().width, frame.area().height)) > 0
+    {
+        (
+            "pgup/pgdn details · ↑↓ · a/d · enter confirm",
+            "pgup/dn · a/d",
+        )
     } else if state.viewport.anchor.is_some() {
         if state.viewport.unread {
             ("new output · end to follow", "new · end follow")
@@ -1183,6 +1196,7 @@ fn render_pending(
     area: Rect,
     pending: &PendingOverlay,
     approval_choice: ApprovalChoice,
+    approval_scroll: usize,
 ) {
     if area.is_empty() {
         return;
@@ -1266,7 +1280,17 @@ fn render_pending(
                 rows[0],
             );
             frame.render_widget(
-                Paragraph::new(summary.as_str()).wrap(Wrap { trim: false }),
+                Paragraph::new(summary.as_str())
+                    .wrap(Wrap { trim: false })
+                    .scroll((
+                        approval_scroll
+                            .min(
+                                wrapped_rows(summary, inner.width as usize)
+                                    .saturating_sub(rows[1].height as usize),
+                            )
+                            .min(u16::MAX as usize) as u16,
+                        0,
+                    )),
                 rows[1],
             );
             frame.render_widget(Paragraph::new(actions), rows[2]);
@@ -1307,7 +1331,7 @@ fn pending_height(state: &UiState, width: u16) -> u16 {
         }) => {
             let actions = if *session_approval_available { 3 } else { 2 };
             1_u16.saturating_add(actions).saturating_add(
-                u16::try_from(wrapped_rows(summary, inner_width).clamp(1, 3)).unwrap_or(3),
+                u16::try_from(wrapped_rows(summary, inner_width).max(1)).unwrap_or(u16::MAX),
             )
         }
         None => 0,
@@ -1315,9 +1339,32 @@ fn pending_height(state: &UiState, width: u16) -> u16 {
 }
 
 fn wrapped_rows(text: &str, width: usize) -> usize {
-    text.lines()
-        .map(|line| UnicodeWidthStr::width(line).max(1).div_ceil(width))
-        .sum()
+    // Use the same word and grapheme wrapping as the rendered paragraph.
+    // Display-width division undercounts lines when a word moves to the next row.
+    Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .line_count(u16::try_from(width.max(1)).unwrap_or(u16::MAX))
+}
+
+pub(super) fn approval_scroll_max(state: &UiState, size: (u16, u16)) -> usize {
+    let Some(PendingOverlay::Approval {
+        summary,
+        session_approval_available,
+        ..
+    }) = &state.pending
+    else {
+        return 0;
+    };
+    let (width, height) = size;
+    // Approval has no composer or working-status row. As in render_cached,
+    // reserve the global header/footer, then the actions and optional title.
+    let panel_height = pending_height(state, width).min(height.saturating_sub(2));
+    let actions = if *session_approval_available { 3 } else { 2 };
+    let title = u16::from(panel_height > actions + 1);
+    let visible_rows = panel_height.saturating_sub(actions + title);
+    wrapped_rows(summary, width.saturating_sub(2 * CONTENT_PADDING) as usize)
+        .saturating_sub(visible_rows as usize)
+        .min(u16::MAX as usize)
 }
 
 fn fmt_elapsed_compact(elapsed_seconds: u64) -> String {
@@ -1491,6 +1538,76 @@ mod tests {
             assert!(rendered.contains("A long approval"), "{rendered}");
             if width >= 50 {
                 assert!(rendered.contains("enter confirm"), "{rendered}");
+            }
+        }
+    }
+
+    #[test]
+    fn approval_summary_uses_available_height_for_wrapped_effects() {
+        let mut state = UiState::new("session", "model");
+        update(
+            &mut state,
+            UiMsg::WaitingApproval {
+                run_id: "run".into(),
+                request_id: "approval".into(),
+                summary: "Execute outside the workspace sandbox:\n[System.IO.File]::Delete([System.IO.Path]::Combine($PWD.Path, 'requested-marker')); Reason: Delete the requested marker\nEffects: process execution".into(),
+                session_approval_available: true,
+            },
+        );
+        for (width, height) in [(100, 30), (50, 18)] {
+            let rendered = render_to_string(&state, width, height);
+            for visible in [
+                "Effects: process execution",
+                "a  Allow once",
+                "s  Allow for session",
+                "d  Deny",
+            ] {
+                assert!(rendered.contains(visible), "{rendered}");
+            }
+            assert_eq!(super::approval_scroll_max(&state, (width, height)), 0);
+        }
+    }
+
+    #[test]
+    fn approval_details_scroll_to_effects_while_actions_remain_visible() {
+        let mut state = UiState::new("session", "model");
+        update(
+            &mut state,
+            UiMsg::WaitingApproval {
+                run_id: "run".into(),
+                request_id: "approval".into(),
+                summary: format!(
+                    "{}Effects: process execution",
+                    "Operation detail 中文\n".repeat(24)
+                ),
+                session_approval_available: true,
+            },
+        );
+        update(
+            &mut state,
+            UiMsg::SelectApproval(super::ApprovalChoice::Deny),
+        );
+        for (width, height) in [(40, 10), (20, 6)] {
+            update(&mut state, UiMsg::ScrollApproval(0));
+            let first = render_to_string(&state, width, height);
+            assert!(first.contains("Operation detail"), "{first}");
+            assert!(!first.contains("Effects:"), "{first}");
+            let offset = super::approval_scroll_max(&state, (width, height));
+            assert!(offset > 0);
+            update(&mut state, UiMsg::ScrollApproval(offset));
+            let last = render_to_string(&state, width, height);
+            // At minimum height there is one detail row. Read backwards one
+            // row when the final effects text itself wraps over two rows.
+            let effects = if last.contains("Effects:") {
+                last.clone()
+            } else {
+                update(&mut state, UiMsg::ScrollApproval(offset.saturating_sub(1)));
+                render_to_string(&state, width, height)
+            };
+            assert!(effects.contains("Effects:"), "{effects}");
+            for rendered in [&first, &last, &effects] {
+                assert!(rendered.contains("a  Allow once"), "{rendered}");
+                assert!(rendered.contains("› d  Deny"), "{rendered}");
             }
         }
     }
