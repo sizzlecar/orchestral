@@ -51,13 +51,13 @@ use orchestral_runtime::api::AgentApi;
 use orchestral_runtime::session_history::JournalSessionHistory;
 use orchestral_runtime::tools::{
     approved_host_exec_command_descriptor, guarded_apply_patch_descriptor,
-    guarded_artifact_read_descriptor, guarded_file_read_descriptor, guarded_file_search_descriptor,
-    guarded_file_write_descriptor, guarded_session_read_descriptor, guarded_text_search_descriptor,
-    workspace_exec_command_descriptor, workspace_write_stdin_descriptor,
-    CommandEnvironmentSnapshot, GuardedApplyPatchExecutor, GuardedArtifactReadExecutor,
-    GuardedExecCommandExecutor, GuardedFileReadExecutor, GuardedFileSearchExecutor,
-    GuardedFileWriteExecutor, GuardedSessionReadExecutor, GuardedTextSearchExecutor,
-    GuardedWriteStdinExecutor,
+    guarded_artifact_read_descriptor, guarded_file_edit_descriptor, guarded_file_read_descriptor,
+    guarded_file_search_descriptor, guarded_file_write_descriptor, guarded_session_read_descriptor,
+    guarded_text_search_descriptor, workspace_exec_command_descriptor,
+    workspace_write_stdin_descriptor, CommandEnvironmentSnapshot, GuardedApplyPatchExecutor,
+    GuardedArtifactReadExecutor, GuardedExecCommandExecutor, GuardedFileEditExecutor,
+    GuardedFileReadExecutor, GuardedFileSearchExecutor, GuardedFileWriteExecutor,
+    GuardedSessionReadExecutor, GuardedTextSearchExecutor, GuardedWriteStdinExecutor,
 };
 use orchestral_runtime::{
     AgentClient, AgentControlEvent, AgentController, ContinuationPolicy,
@@ -937,6 +937,20 @@ fn build_cli_tool_runtime(
             ),
         )
         .context("register guarded file_write Tool")?;
+    runtime
+        .register(
+            guarded_file_edit_descriptor(ToolRestriction {
+                bounds: workspace_bounds.clone(),
+            }),
+            Arc::new(
+                GuardedFileEditExecutor::new_with_roots(
+                    &workspaces.primary,
+                    &workspaces.additional,
+                )
+                .context("open file_edit workspace capability")?,
+            ),
+        )
+        .context("register guarded file_edit Tool")?;
     runtime
         .register(
             guarded_apply_patch_descriptor(ToolRestriction {

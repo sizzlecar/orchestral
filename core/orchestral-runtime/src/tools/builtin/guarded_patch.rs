@@ -3,6 +3,9 @@
 //! The model supplies patch intent only. Workspace identity, filesystem roots,
 //! approval, effect journaling, and cancellation remain Host-owned.
 
+mod file_edit;
+pub use file_edit::{guarded_file_edit_descriptor, GuardedFileEditExecutor};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};

@@ -38,6 +38,15 @@ fn assert_source_observation(request: &CapturedHttpRequest) {
 
 #[test]
 fn yaml_tool_content_preserves_source_through_patch_and_session_restart() {
+    assert_source_edit_and_session_restart("apply_patch");
+}
+
+#[test]
+fn file_edit_preserves_source_through_cli_and_session_restart() {
+    assert_source_edit_and_session_restart("file_edit");
+}
+
+fn assert_source_edit_and_session_restart(edit_tool: &'static str) {
     let _guard = local_e2e_guard();
     let workspace = TestWorkspace::new("yaml-tool-content");
     fs::create_dir(workspace.path("src")).unwrap();
@@ -60,16 +69,26 @@ fn yaml_tool_content_preserves_source_through_patch_and_session_restart() {
                 json!({"path": "src/newline.rs"}),
             )
         }),
-        Box::new(|request| {
+        Box::new(move |request| {
             assert_source_observation(request);
-            openai_tool_response(
-                "edit-source",
-                "apply_patch",
-                json!({"patch": concat!(
+            assert!(request.body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["function"]["name"] == edit_tool));
+            let arguments = match edit_tool {
+                "file_edit" => json!({
+                    "path": "src/newline.rs",
+                    "old_text": "    text.ends_with('\\n')",
+                    "new_text": "    text.contains('\\n')",
+                }),
+                "apply_patch" => json!({"patch": concat!(
                     "*** Begin Patch\n*** Update File: src/newline.rs\n@@\n",
                     "-    text.ends_with('\\n')\n+    text.contains('\\n')\n*** End Patch",
                 )}),
-            )
+                _ => unreachable!("fixture declares an edit tool"),
+            };
+            openai_tool_response("edit-source", edit_tool, arguments)
         }),
         Box::new(|request| {
             let messages = yaml_tool_messages(request);
@@ -122,7 +141,7 @@ fn yaml_tool_content_preserves_source_through_patch_and_session_restart() {
         "restart must not repeat completed effects"
     );
     assert_eq!(tool_name(exchanges[0]), Some("file_read"));
-    assert_eq!(tool_name(exchanges[1]), Some("apply_patch"));
+    assert_eq!(tool_name(exchanges[1]), Some(edit_tool));
     assert_eq!(
         tool_result_value(exchanges[0]),
         &observed_before[0].1["result"]

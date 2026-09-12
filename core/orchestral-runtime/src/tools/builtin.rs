@@ -20,8 +20,8 @@ pub use self::guarded_exec::{
     GuardedWriteStdinExecutor, GUARDED_EXEC_SANDBOX_PROFILE,
 };
 pub use self::guarded_patch::{
-    guarded_apply_patch_descriptor, guarded_file_write_descriptor, GuardedApplyPatchExecutor,
-    GuardedFileWriteExecutor,
+    guarded_apply_patch_descriptor, guarded_file_edit_descriptor, guarded_file_write_descriptor,
+    GuardedApplyPatchExecutor, GuardedFileEditExecutor, GuardedFileWriteExecutor,
 };
 pub use self::guarded_pty::{
     guarded_pty_close_descriptor, guarded_pty_create_descriptor,
