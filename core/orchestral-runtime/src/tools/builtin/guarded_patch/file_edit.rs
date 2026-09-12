@@ -421,8 +421,9 @@ pub fn guarded_file_edit_descriptor(restriction: ToolRestriction) -> ToolDescrip
             name: "file_edit".to_owned(),
             description: concat!(
                 "Replace exactly one occurrence of old_text in an existing UTF-8 file. ",
-                "Copy old_text exactly, including indentation and line endings; include enough ",
-                "unchanged context to make it unique. No patch markers. Empty new_text deletes ",
+                "Use the smallest unique text region needed for the edit; add unchanged context ",
+                "only to disambiguate. Copy old_text exactly, including indentation and line endings. ",
+                "No patch markers. Empty new_text deletes ",
                 "the matched text. Paths are normalized and relative to the selected Host workspace."
             ).to_owned(),
             input_schema: json!({
