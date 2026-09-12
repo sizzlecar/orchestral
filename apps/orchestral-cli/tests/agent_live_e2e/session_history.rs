@@ -191,7 +191,7 @@ fn resume_tui(workspace: &TestWorkspace, session: &str, system: Option<&str>) ->
 
 fn exit_tui(mut tui: PtyHarness) {
     tui.send(&[0x04]);
-    tui.wait_for_text("\u{1b}[?1049l", Duration::from_secs(5));
+    tui.wait_for_terminal_restore(Duration::from_secs(5));
     let output = tui.finish(Duration::from_secs(5));
     assert!(output.status.success(), "{}", output.text());
     output.assert_terminal_restored();
@@ -421,6 +421,7 @@ fn interrupted_session_reconciles_open_model_attempt_and_continues_without_repea
         }),
         Box::new(|_| FixtureHttpResponse {
             status: "429 Too Many Requests",
+            repeat_handler: false,
             content_type: "application/json",
             body: br#"{"error":{"message":"temporary rate limit"}}"#.to_vec(),
         }),

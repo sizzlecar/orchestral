@@ -345,14 +345,16 @@ fn tui_pty_resolves_input_and_approval_then_cancels_another_run() {
                 "approval-write",
                 "exec_command",
                 if cfg!(windows) {
-                    json!({ "cmd": "Remove-Item -LiteralPath tui-approved.marker", "sandbox_permissions": "require_escalated", "justification": "Delete the requested marker" })
+                    json!({ "cmd": "Remove-Item -LiteralPath tui-approved.marker", "sandbox_permissions": "require_escalated", "justification": "Delete the requested marker", "yield_time_ms": 1, "wait_mode": "completion" })
                 } else {
-                    json!({ "cmd": "rm tui-approved.marker" })
+                    json!({ "cmd": "rm tui-approved.marker", "yield_time_ms": 1, "wait_mode": "completion" })
                 },
             )
         }),
         Box::new(|request| {
-            assert!(model_request_text(&request.body).contains("\"exit_code\":0"));
+            if let Some(response) = continue_exec_until_exit(request) {
+                return response;
+            }
             openai_text_response("APPROVAL_RESOLVED_OK")
         }),
         Box::new(|_| {
@@ -402,7 +404,7 @@ fn tui_pty_resolves_input_and_approval_then_cancels_another_run() {
     tui.send(&[0x03]);
     tui.wait_for_text("cancelled", LOCAL_PROCESS_TIMEOUT);
     tui.send(&[0x04]);
-    tui.wait_for_text("\u{1b}[?1049l", LOCAL_PROCESS_TIMEOUT);
+    tui.wait_for_terminal_restore(LOCAL_PROCESS_TIMEOUT);
 
     let output = tui.finish(LOCAL_PROCESS_TIMEOUT);
     assert!(output.status.success(), "{}", output.text());
@@ -421,7 +423,9 @@ fn tui_pty_resolves_input_and_approval_then_cancels_another_run() {
     assert!(!workspace.path("tui-approved.marker").exists());
     output.assert_terminal_restored();
     let requests = model_server.join().expect("join TUI model server");
-    assert_eq!(requests.len(), 5);
+    let records = session_records(&workspace);
+    let polls = assert_successful_exec_observations(&records);
+    assert_eq!(requests.len(), 5 + polls);
     assert_eq!(run_payload_count(&workspace, "request_opened"), 3);
     assert_eq!(run_payload_count(&workspace, "request_resolved"), 2);
     assert_eq!(run_payload_count(&workspace, "run_cancelled"), 1);
@@ -445,7 +449,7 @@ fn tui_pty_restores_terminal_after_agent_failure() {
     tui.send_paste("trigger the fixture failure");
     tui.wait_for_text("tool_not_found", LOCAL_PROCESS_TIMEOUT);
     tui.send(&[0x04]);
-    tui.wait_for_text("\u{1b}[?1049l", LOCAL_PROCESS_TIMEOUT);
+    tui.wait_for_terminal_restore(LOCAL_PROCESS_TIMEOUT);
 
     let output = tui.finish(LOCAL_PROCESS_TIMEOUT);
     assert!(output.status.success(), "{}", output.text());
@@ -1608,12 +1612,15 @@ fn local_cli_routes_structured_host_execution_through_the_approval_prompt() {
                     "workdir": external_root,
                     "sandbox_permissions": "require_escalated",
                     "justification": "Read the external fixture explicitly requested by the user",
-                    "yield_time_ms": 10_000,
+                    "yield_time_ms": 1,
                     "wait_mode": "completion"
                 }),
             )
         }),
         Box::new(|request| {
+            if let Some(response) = continue_exec_until_exit(request) {
+                return response;
+            }
             let context = model_request_text(&request.body);
             assert!(context.contains(EXTERNAL_MARKER), "{context}");
             assert!(
@@ -1642,18 +1649,20 @@ fn local_cli_routes_structured_host_execution_through_the_approval_prompt() {
     assert!(stderr.contains(APPROVAL_PROMPT), "{stderr}");
     assert!(stderr.contains("outside the workspace sandbox"), "{stderr}");
     assert!(stderr.contains("host_execution"), "{stderr}");
+    assert_eq!(stderr.matches(APPROVAL_PROMPT).count(), 1, "{stderr}");
     output.assert_no_ansi();
 
+    let records = session_records(&workspace);
+    let polls = assert_successful_exec_observations(&records);
     assert_eq!(
         model_server
             .join()
             .expect("join Host approval model server")
             .len(),
-        2
+        2 + polls
     );
-    let records = session_records(&workspace);
     let exchanges = tool_exchanges(&records);
-    assert_eq!(exchanges.len(), 1);
+    assert_eq!(exchanges.len(), 1 + polls);
     assert_eq!(tool_name(exchanges[0]), Some("exec_command"));
     assert_eq!(tool_result_is_error(exchanges[0]), Some(false));
 }
@@ -1891,6 +1900,7 @@ fn user_registered_stdio_mcp_is_automatically_loaded_and_called() {
             status: "200 OK",
             content_type: "text/plain",
             body: MCP_RESULT_MARKER.as_bytes().to_vec(),
+            repeat_handler: false,
         }
     })]);
     let script = format!(
@@ -2584,6 +2594,29 @@ struct PtyOutput {
     bytes: Vec<u8>,
 }
 
+fn physical_screen_contents(screen: &vt100::Screen) -> String {
+    // ConPTY may redraw adjacent rows using automatic wrapping. contents()
+    // joins those rows into one logical line, which cannot index cell(row, col).
+    screen
+        .rows(0, screen.size().1)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn pty_screen_snapshots_preserve_wrapped_physical_rows() {
+    let mut parser = vt100::Parser::new(2, 4, 0);
+    parser.process(b"HEAD\x1b[38;2;163;168;181mBODY");
+    assert_eq!(parser.screen().contents(), "HEADBODY");
+    let contents = physical_screen_contents(parser.screen());
+    assert_eq!(contents, "HEAD\nBODY");
+    let row = contents.lines().position(|line| line == "BODY").unwrap();
+    assert_eq!(
+        parser.screen().cell(row as u16, 0).unwrap().fgcolor(),
+        vt100::Color::Rgb(163, 168, 181)
+    );
+}
+
 impl PtyOutput {
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.bytes).into_owned()
@@ -2591,8 +2624,6 @@ impl PtyOutput {
 
     fn assert_terminal_restored(&self) {
         for sequence in [
-            b"\x1b[?1049h".as_slice(),
-            b"\x1b[?1049l".as_slice(),
             b"\x1b[?2004h".as_slice(),
             b"\x1b[?2004l".as_slice(),
             b"\x1b[?25l".as_slice(),
@@ -2607,17 +2638,26 @@ impl PtyOutput {
                 self.text()
             );
         }
-        let leave = self
-            .bytes
-            .windows(b"\x1b[?1049l".len())
-            .rposition(|part| part == b"\x1b[?1049l")
-            .expect("alternate-screen leave sequence");
-        let enter = self
-            .bytes
-            .windows(b"\x1b[?1049h".len())
-            .rposition(|part| part == b"\x1b[?1049h")
-            .expect("alternate-screen enter sequence");
-        assert!(leave > enter, "alternate screen was not left after entry");
+        let assert_restored = |enabled: &[u8], disabled: &[u8]| {
+            let enter = self
+                .bytes
+                .windows(enabled.len())
+                .rposition(|part| part == enabled)
+                .expect("terminal mode enabled");
+            let leave = self
+                .bytes
+                .windows(disabled.len())
+                .rposition(|part| part == disabled)
+                .expect("terminal mode restored");
+            assert!(leave > enter, "terminal mode was not restored after entry");
+        };
+        assert_restored(b"\x1b[?2004h", b"\x1b[?2004l");
+        assert_restored(b"\x1b[?25l", b"\x1b[?25h");
+        // Windows Server's ConPTY consumes 1049 rather than forwarding it.
+        // The terminal module's native-console test checks the real raw mode
+        // and original buffer restoration for explicit, Drop and unwind paths.
+        #[cfg(unix)]
+        assert_restored(b"\x1b[?1049h", b"\x1b[?1049l");
     }
 }
 
@@ -2712,7 +2752,7 @@ impl PtyHarness {
     fn receive(&mut self, bytes: Vec<u8>) {
         self.screen.process(&bytes[self.latest.len()..]);
         self.latest = bytes;
-        let contents = self.screen.screen().contents();
+        let contents = physical_screen_contents(self.screen.screen());
         if self.screen_frames.last() != Some(&contents) {
             self.screen_frames.push(contents);
             if let Some(recording) = &mut self.recording {
@@ -2731,7 +2771,7 @@ impl PtyHarness {
     fn wait_for_screen(&mut self, predicate: impl Fn(&str) -> bool, timeout: Duration) -> String {
         let started = Instant::now();
         while started.elapsed() < timeout {
-            let contents = self.screen.screen().contents();
+            let contents = physical_screen_contents(self.screen.screen());
             if predicate(&contents) {
                 return contents;
             }
@@ -2743,7 +2783,7 @@ impl PtyHarness {
         }
         panic!(
             "TUI screen condition failed:\n{}",
-            self.screen.screen().contents()
+            physical_screen_contents(self.screen.screen())
         );
     }
 
@@ -2755,12 +2795,19 @@ impl PtyHarness {
         self.wait_for_text_count(marker, 1, timeout);
     }
 
+    fn wait_for_terminal_restore(&mut self, timeout: Duration) {
+        // Unlike alternate-buffer switches, bracketed-paste mode changes are
+        // observable in both native Unix PTYs and Windows ConPTY output.
+        self.wait_for_text("\u{1b}[?2004l", timeout);
+    }
+
     fn wait_for_text_after(&mut self, marker: &str, offset: usize, timeout: Duration) {
         let started = Instant::now();
         while started.elapsed() < timeout {
             if String::from_utf8_lossy(&self.latest[offset.min(self.latest.len())..])
                 .contains(marker)
-                || (self.latest.len() > offset && self.screen.screen().contents().contains(marker))
+                || (self.latest.len() > offset
+                    && physical_screen_contents(self.screen.screen()).contains(marker))
             {
                 return;
             }
@@ -3267,6 +3314,75 @@ fn tool_result_value(exchange: &Value) -> &Value {
         .expect("Tool exchange contains one Tool result")
 }
 
+// The exec contract may return a live session at its observation deadline.
+// Continue that exact session through the real tool, within the unchanged
+// fixture deadline; never equate a successful launch with a completed command.
+fn continue_exec_until_exit(request: &CapturedHttpRequest) -> Option<FixtureHttpResponse> {
+    let messages = request.body["messages"].as_array().expect("model messages");
+    let message = messages
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "tool")
+        .expect("exec observation in model history");
+    let payload: Value =
+        serde_json::from_str(message["content"].as_str().expect("tool result text"))
+            .expect("structured exec result");
+    assert_eq!(payload["is_error"], false, "{payload}");
+    let result = &payload["result"];
+    if result["alive"] == true {
+        let session = result["session_id"]
+            .as_u64()
+            .expect("live exec session identity");
+        assert!(
+            result["exit_code"].is_null(),
+            "live session cannot have exited: {result}"
+        );
+        assert!(model_request_has_tool(&request.body, "write_stdin"));
+        let mut response = openai_tool_response(
+            &format!("observe-exec-{}", messages.len()),
+            "write_stdin",
+            json!({"session_id":session,"chars":"","yield_time_ms":1000,"wait_mode":"completion"}),
+        );
+        response.repeat_handler = true;
+        Some(response)
+    } else {
+        assert_eq!(result["alive"], false, "{result}");
+        assert_eq!(result["exit_code"], 0, "{result}");
+        None
+    }
+}
+
+fn assert_successful_exec_observations(records: &[Value]) -> usize {
+    let exchanges = tool_exchanges(records);
+    let executions = exchanges
+        .iter()
+        .copied()
+        .filter(|exchange| matches!(tool_name(exchange), Some("exec_command" | "write_stdin")))
+        .collect::<Vec<_>>();
+    assert!(!executions.is_empty(), "missing execution evidence");
+    assert_eq!(tool_name(executions[0]), Some("exec_command"));
+    let session = tool_result_value(executions[0])["session_id"].clone();
+    for (index, exchange) in executions.iter().enumerate() {
+        assert_eq!(tool_result_is_error(exchange), Some(false));
+        if index > 0 {
+            assert_eq!(
+                tool_name(exchange),
+                Some("write_stdin"),
+                "command must execute once"
+            );
+            assert_eq!(tool_arguments(exchange)["session_id"], session);
+            assert_eq!(tool_arguments(exchange)["chars"], "");
+        }
+        if index + 1 < executions.len() {
+            assert_eq!(tool_result_value(exchange)["alive"], true);
+        }
+    }
+    let final_result = tool_result_value(executions.last().unwrap());
+    assert_eq!(final_result["alive"], false);
+    assert_eq!(final_result["exit_code"], 0);
+    executions.len() - 1
+}
+
 fn checkpoint_event_count(workspace: &TestWorkspace, kind: &str) -> usize {
     journal_files(workspace, "generic-checkpoint-")
         .into_iter()
@@ -3321,6 +3437,7 @@ struct FixtureHttpResponse {
     status: &'static str,
     content_type: &'static str,
     body: Vec<u8>,
+    repeat_handler: bool,
 }
 
 type FixtureHttpHandler = Box<dyn Fn(&CapturedHttpRequest) -> FixtureHttpResponse + Send + 'static>;
@@ -3337,32 +3454,42 @@ fn spawn_fixture_http_server(
         let started = Instant::now();
         let mut captured = Vec::with_capacity(handlers.len());
         for handler in handlers {
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(
-                            started.elapsed() < Duration::from_secs(35),
-                            "local HTTP fixture did not receive every expected request"
-                        );
-                        thread::sleep(Duration::from_millis(10));
+            loop {
+                assert!(
+                    started.elapsed() < Duration::from_secs(35),
+                    "local HTTP fixture exceeded its original request deadline"
+                );
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                started.elapsed() < Duration::from_secs(35),
+                                "local HTTP fixture did not receive every expected request"
+                            );
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("accept local HTTP fixture request: {error}"),
                     }
-                    Err(error) => panic!("accept local HTTP fixture request: {error}"),
+                };
+                stream
+                    .set_nonblocking(false)
+                    .expect("use blocking fixture connection");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(20)))
+                    .expect("bound fixture read timeout");
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .expect("bound fixture write timeout");
+                let request = read_http_fixture_request(&mut stream);
+                let response = handler(&request);
+                let repeat = response.repeat_handler;
+                write_http_fixture_response(&mut stream, response);
+                captured.push(request);
+                if !repeat {
+                    break;
                 }
-            };
-            stream
-                .set_nonblocking(false)
-                .expect("use blocking fixture connection");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(20)))
-                .expect("bound fixture read timeout");
-            stream
-                .set_write_timeout(Some(Duration::from_secs(5)))
-                .expect("bound fixture write timeout");
-            let request = read_http_fixture_request(&mut stream);
-            let response = handler(&request);
-            write_http_fixture_response(&mut stream, response);
-            captured.push(request);
+            }
         }
         captured
     });
@@ -3492,6 +3619,7 @@ fn json_response(body: Value) -> FixtureHttpResponse {
         status: "200 OK",
         content_type: "application/json",
         body: serde_json::to_vec(&body).expect("serialize HTTP fixture JSON"),
+        repeat_handler: false,
     }
 }
 
@@ -3500,6 +3628,7 @@ fn sse_response(body: String) -> FixtureHttpResponse {
         status: "200 OK",
         content_type: "text/event-stream",
         body: body.into_bytes(),
+        repeat_handler: false,
     }
 }
 
