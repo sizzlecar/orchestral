@@ -1,7 +1,7 @@
 [package]
 name = "orchestral-cli"
 autobins = false
-description = "Provider-neutral conversational Agent command line interface"
+description = "A runtime for reliable, interactive AI agents."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
