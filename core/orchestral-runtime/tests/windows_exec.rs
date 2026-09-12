@@ -45,6 +45,18 @@ fn windows_environment(root: &Path) -> BTreeMap<String, String> {
 fn spec(root: &Path, command: &str, tty: bool) -> ExecSpawnSpec {
     let system = std::env::var("SystemRoot").unwrap();
     let shell = Path::new(&system).join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    // These commands use inbox modules from the selected Windows PowerShell.
+    // Keep discovery independent of modules registered in the runner profile.
+    let modules = shell.parent().unwrap().join("Modules");
+    assert!(
+        modules.is_dir(),
+        "selected PowerShell inbox modules must exist"
+    );
+    let mut environment = windows_environment(root);
+    environment.insert(
+        "PSModulePath".into(),
+        modules.to_string_lossy().into_owned(),
+    );
     ExecSpawnSpec {
         run_id: RunId::new("windows-process-test"),
         program: shell.to_string_lossy().into_owned(),
@@ -58,7 +70,7 @@ fn spec(root: &Path, command: &str, tty: bool) -> ExecSpawnSpec {
             ),
         ],
         cwd: root.to_path_buf(),
-        environment: windows_environment(root),
+        environment,
         tty,
         backend_starts_new_session: false,
         operation: ToolOperationPlan {
