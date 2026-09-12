@@ -1,6 +1,8 @@
 # Orchestral
 
-Provider-neutral runtime for running one Agent safely, durably, and interactively.
+**A runtime for reliable, interactive AI agents.**
+
+Agents are the new processes. Orchestral is the runtime.
 
 [中文版本](./README.zh-CN.md)
 
@@ -12,7 +14,7 @@ Provider-neutral runtime for running one Agent safely, durably, and interactivel
 
 - **Agent Protocol v1** — versioned Run/Session contracts, commands, durable events,
   inspection, cancellation, recovery, and exactly one terminal projection.
-- **Generic Agent** — one provider-neutral `Model → Tool/Workflow → Model` loop shared by
+- **Generic Agent** — one `Model → Tool/Workflow → Model` loop shared by
   CLI, SDK, and API surfaces.
 - **Model adapters** — OpenAI-compatible and Gemini-native protocols behind the same
   [`ModelBackend` contract](testing/orchestral-model-protocol-testkit/README.md) and conformance
