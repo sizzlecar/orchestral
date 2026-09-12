@@ -2619,6 +2619,68 @@ fn pty_screen_snapshots_preserve_wrapped_physical_rows() {
     );
 }
 
+#[test]
+fn pty_waits_inspect_the_last_chunk_after_the_child_has_exited() {
+    let _guard = local_e2e_guard();
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_orchestral"));
+    command.arg("--version");
+    let mut tui = PtyHarness::spawn(command);
+    let deadline = Instant::now() + LOCAL_PROCESS_TIMEOUT;
+    let mut output = Vec::new();
+    // Keep the real reader's output outside the consumer until the real child
+    // has exited. No scheduler timing or sleep decides whether the final read
+    // and process completion are observed together by the wait helpers.
+    loop {
+        if let Some(status) = tui.child.try_wait().expect("poll version child") {
+            assert!(status.success(), "{status:?}");
+            if String::from_utf8_lossy(&output).contains("orchestral") {
+                break;
+            }
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            let _ = tui.child.kill();
+            let _ = tui.child.wait();
+            panic!("version child did not exit with its output before the deadline");
+        };
+        match tui
+            .updates
+            .recv_timeout(remaining.min(Duration::from_millis(50)))
+        {
+            Ok(bytes) => output = bytes,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => thread::yield_now(),
+        }
+    }
+    for mode in ["count", "after", "screen"] {
+        tui.latest.clear();
+        tui.screen_frames.clear();
+        tui.screen = vt100::Parser::new(24, 80, 0);
+        let (sender, receiver) = mpsc::channel();
+        sender.send(output.clone()).unwrap();
+        drop(sender);
+        tui.updates = receiver;
+        assert!(tui.child.try_wait().unwrap().unwrap().success());
+        match mode {
+            "count" => tui.wait_for_text_count("orchestral", 1, LOCAL_PROCESS_TIMEOUT),
+            "after" => tui.wait_for_text_after("orchestral", 0, LOCAL_PROCESS_TIMEOUT),
+            "screen" => {
+                tui.wait_for_screen(
+                    |screen| screen.contains("orchestral"),
+                    LOCAL_PROCESS_TIMEOUT,
+                );
+            }
+            _ => unreachable!(),
+        }
+        // Already observed output remains valid at the deadline; a closed
+        // reader without the required evidence still fails immediately.
+        assert!(tui.wait_for_output(Duration::ZERO, |tui| {
+            String::from_utf8_lossy(&tui.latest).contains("orchestral")
+        }));
+        assert!(!tui.wait_for_output(LOCAL_PROCESS_TIMEOUT, |_| false));
+    }
+    assert!(tui.finish(LOCAL_PROCESS_TIMEOUT).status.success());
+}
+
 impl PtyOutput {
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.bytes).into_owned()
@@ -2771,17 +2833,10 @@ impl PtyHarness {
 
     #[track_caller]
     fn wait_for_screen(&mut self, predicate: impl Fn(&str) -> bool, timeout: Duration) -> String {
-        let started = Instant::now();
-        while started.elapsed() < timeout {
-            let contents = physical_screen_contents(self.screen.screen());
-            if predicate(&contents) {
-                return contents;
-            }
-            match self.updates.recv_timeout(Duration::from_millis(50)) {
-                Ok(bytes) => self.receive(bytes),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
+        if self.wait_for_output(timeout, |tui| {
+            predicate(&physical_screen_contents(tui.screen.screen()))
+        }) {
+            return physical_screen_contents(self.screen.screen());
         }
         panic!(
             "TUI screen condition failed:\n{}",
@@ -2804,26 +2859,12 @@ impl PtyHarness {
     }
 
     fn wait_for_text_after(&mut self, marker: &str, offset: usize, timeout: Duration) {
-        let started = Instant::now();
-        while started.elapsed() < timeout {
-            if String::from_utf8_lossy(&self.latest[offset.min(self.latest.len())..])
-                .contains(marker)
-                || (self.latest.len() > offset
-                    && physical_screen_contents(self.screen.screen()).contains(marker))
-            {
-                return;
-            }
-            match self.updates.recv_timeout(Duration::from_millis(100)) {
-                Ok(bytes) => self.receive(bytes),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-            if let Some(status) = self.child.try_wait().expect("poll TUI child") {
-                panic!(
-                    "TUI exited before fresh marker {marker:?} with {status:?}:\n{}",
-                    String::from_utf8_lossy(&self.latest)
-                );
-            }
+        if self.wait_for_output(timeout, |tui| {
+            String::from_utf8_lossy(&tui.latest[offset.min(tui.latest.len())..]).contains(marker)
+                || (tui.latest.len() > offset
+                    && physical_screen_contents(tui.screen.screen()).contains(marker))
+        }) {
+            return;
         }
         panic!(
             "TUI did not render fresh marker {marker:?} within {timeout:?}:\n{}",
@@ -2832,10 +2873,9 @@ impl PtyHarness {
     }
 
     fn wait_for_text_count(&mut self, marker: &str, count: usize, timeout: Duration) {
-        let started = Instant::now();
-        while started.elapsed() < timeout {
+        if self.wait_for_output(timeout, |tui| {
             let mut previous = 0usize;
-            let appearances = self
+            let appearances = tui
                 .screen_frames
                 .iter()
                 .map(|frame| {
@@ -2845,30 +2885,36 @@ impl PtyHarness {
                     added
                 })
                 .sum::<usize>();
-            if String::from_utf8_lossy(&self.latest)
-                .matches(marker)
-                .count()
-                >= count
+            String::from_utf8_lossy(&tui.latest).matches(marker).count() >= count
                 || appearances >= count
-            {
-                return;
-            }
-            match self.updates.recv_timeout(Duration::from_millis(100)) {
-                Ok(bytes) => self.receive(bytes),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-            if let Some(status) = self.child.try_wait().expect("poll TUI child") {
-                panic!(
-                    "TUI exited before marker {marker:?} with {status:?}:\n{}",
-                    String::from_utf8_lossy(&self.latest)
-                );
-            }
+        }) {
+            return;
         }
         panic!(
             "TUI did not render marker {marker:?} {count} time(s) within {timeout:?}:\n{}",
             String::from_utf8_lossy(&self.latest)
         );
+    }
+
+    fn wait_for_output(&mut self, timeout: Duration, predicate: impl Fn(&Self) -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            // A process may exit before its last read is consumed. Only the
+            // reader's channel certifies drained output, and every accepted
+            // chunk must be examined before either EOF or the deadline wins.
+            if predicate(self) {
+                return true;
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            match self.updates.recv_timeout(remaining) {
+                Ok(bytes) => self.receive(bytes),
+                Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
+                    return false;
+                }
+            }
+        }
     }
 
     fn finish(mut self, timeout: Duration) -> PtyOutput {

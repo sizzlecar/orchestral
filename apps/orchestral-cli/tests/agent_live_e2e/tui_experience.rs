@@ -584,7 +584,7 @@ fn tui_pty_keeps_reading_anchor_when_later_output_commits() {
 // Inspect long read-only panels through the same paging keys used by a person.
 fn read_panel_until(tui: &mut PtyHarness, marker: &str) -> String {
     for _ in 0..100 {
-        let before = tui.screen.screen().contents();
+        let before = physical_screen_contents(tui.screen.screen());
         if before.contains(marker) {
             return before;
         }
