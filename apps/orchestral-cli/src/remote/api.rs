@@ -605,7 +605,11 @@ fn expand_host_home(cwd: Option<String>) -> Result<Option<String>, ApiError> {
         return Ok(None);
     };
     let expanded = if cwd == "~" || cwd.starts_with("~/") {
-        let home = std::env::var_os("HOME")
+        #[cfg(target_os = "windows")]
+        let home_variable = "USERPROFILE";
+        #[cfg(not(target_os = "windows"))]
+        let home_variable = "HOME";
+        let home = std::env::var_os(home_variable)
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .ok_or_else(|| {
@@ -3304,15 +3308,25 @@ mod tests {
 
     #[test]
     fn session_creation_expands_host_home_shortcuts_without_touching_other_paths() {
-        let home = std::env::var("HOME").expect("test Host has a home directory");
+        #[cfg(target_os = "windows")]
+        let home_variable = "USERPROFILE";
+        #[cfg(not(target_os = "windows"))]
+        let home_variable = "HOME";
+        let home = std::env::var_os(home_variable)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .expect("test Host has a home directory");
+        assert_eq!(
+            expand_host_home(Some("~".to_owned())).unwrap(),
+            Some(home.to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            expand_host_home(Some("~/".to_owned())).unwrap(),
+            Some(home.join("").to_string_lossy().into_owned())
+        );
         assert_eq!(
             expand_host_home(Some("~/rust_ws/project".to_owned())).unwrap(),
-            Some(
-                PathBuf::from(home)
-                    .join("rust_ws/project")
-                    .to_string_lossy()
-                    .into_owned()
-            )
+            Some(home.join("rust_ws/project").to_string_lossy().into_owned())
         );
         assert_eq!(
             expand_host_home(Some("/srv/project".to_owned())).unwrap(),

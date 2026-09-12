@@ -799,7 +799,15 @@ fn tui_pty_context_reports_skill_loads_for_one_request_after_switching_and_resum
     );
     tui.send_paste("/context");
     let first = tui.wait_for_screen(
-        |s| s.contains("Latest request:") && s.contains("Skills loaded for this request:"),
+        // PTY reads can end after the panel heading but partway through a
+        // skill name. Wait for the panel's content, not the earlier transcript.
+        |s| {
+            s.split_once("Context ·").is_some_and(|(_, context)| {
+                context.contains("Latest request:")
+                    && context.contains("Skills loaded for this request:")
+                    && context.contains("report-builder")
+            })
+        },
         LOCAL_PROCESS_TIMEOUT,
     );
     assert!(
