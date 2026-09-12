@@ -211,7 +211,7 @@ impl ModelTokenMeter for OpenAiCompatibleBackend {
             CONTEXT_ESTIMATE_BYTES_PER_TOKEN,
         );
         // Keep the explicit JSON identity byte-for-byte compatible with v2.
-        // YAML changes the actual prompt, so recovery must bind its encoding.
+        // Other formats change the actual prompt, so recovery binds the encoding.
         let (strategy, version, config) = match self.tool_result_format {
             OpenAiToolResultFormat::Json => (
                 "openai-compatible/wire-json-upper-bound",
@@ -222,6 +222,11 @@ impl ModelTokenMeter for OpenAiCompatibleBackend {
                 "openai-compatible/wire-json-yaml-tool-upper-bound",
                 "1",
                 serde_json::to_vec(&(config, tool_result::YAML_ENCODING_IDENTITY)),
+            ),
+            OpenAiToolResultFormat::TextParts => (
+                "openai-compatible/wire-json-text-parts-tool-upper-bound",
+                "1",
+                serde_json::to_vec(&(config, tool_result::TEXT_PARTS_ENCODING_IDENTITY)),
             ),
         };
         let config = config.expect("OpenAI token meter scalar configuration is serializable");
@@ -267,10 +272,15 @@ impl ModelBackend for OpenAiCompatibleBackend {
             "openai-compatible/model".to_owned(),
             Value::String(self.config.model.clone()),
         )]);
-        if self.tool_result_format == OpenAiToolResultFormat::Yaml {
+        let encoding_identity = match self.tool_result_format {
+            OpenAiToolResultFormat::Json => None,
+            OpenAiToolResultFormat::Yaml => Some(tool_result::YAML_ENCODING_IDENTITY),
+            OpenAiToolResultFormat::TextParts => Some(tool_result::TEXT_PARTS_ENCODING_IDENTITY),
+        };
+        if let Some(encoding_identity) = encoding_identity {
             extensions.insert(
                 "openai-compatible/tool-result-encoding".to_owned(),
-                Value::String(tool_result::YAML_ENCODING_IDENTITY.to_owned()),
+                Value::String(encoding_identity.to_owned()),
             );
         }
         ModelDescriptor {

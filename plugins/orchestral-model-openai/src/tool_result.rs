@@ -2,9 +2,13 @@ use orchestral_core::model_protocol::ModelError;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+mod text_parts;
+
 // Bump this identity if YAML rendering changes. It is included in both the
 // model descriptor and token-meter configuration bound by Run recovery.
 pub(crate) const YAML_ENCODING_IDENTITY: &str = "serde-yaml-0.9/tool-envelope/v1";
+pub(crate) const TEXT_PARTS_ENCODING_IDENTITY: &str =
+    "openai-compatible/text-parts-tool-envelope/v1";
 
 /// Text encoding of the complete `{result, is_error}` tool response envelope.
 /// Canonical ToolResults and their durable journals retain the original JSON.
@@ -17,16 +21,27 @@ pub enum OpenAiToolResultFormat {
     /// literal blocks; special whitespace may require quoted escapes.
     #[default]
     Yaml,
+    /// Separate top-level string values into verbatim fenced text parts, with
+    /// the remaining typed values in a metadata part. This is opt-in: the
+    /// provider's chat template must support OpenAI text-part arrays.
+    #[serde(rename = "text_parts")]
+    TextParts,
 }
 
 impl OpenAiToolResultFormat {
-    pub(crate) fn encode(self, result: &Value, is_error: bool) -> Result<String, ModelError> {
-        let envelope = json!({"result": result, "is_error": is_error});
+    pub(crate) fn encode(self, result: &Value, is_error: bool) -> Result<Value, ModelError> {
         match self {
-            Self::Json => Ok(envelope.to_string()),
-            Self::Yaml => serde_yaml::to_string(&envelope).map_err(|error| {
-                ModelError::invalid_request(format!("cannot encode ToolResult as YAML: {error}"))
-            }),
+            Self::Json => Ok(Value::String(
+                json!({"result": result, "is_error": is_error}).to_string(),
+            )),
+            Self::Yaml => serde_yaml::to_string(&json!({"result": result, "is_error": is_error}))
+                .map(Value::String)
+                .map_err(|error| {
+                    ModelError::invalid_request(format!(
+                        "cannot encode ToolResult as YAML: {error}"
+                    ))
+                }),
+            Self::TextParts => Ok(text_parts::encode(result, is_error)),
         }
     }
 }
@@ -43,7 +58,7 @@ mod tests {
     use orchestral_core::agent_protocol::wire::Digest;
     use std::{collections::BTreeMap, time::Duration};
 
-    fn backend() -> OpenAiCompatibleBackend {
+    pub(super) fn backend() -> OpenAiCompatibleBackend {
         OpenAiCompatibleBackend::new(OpenAiCompatibleConfig {
             backend_id: "tool-result-wire".to_owned(),
             endpoint: "http://127.0.0.1/v1".to_owned(),
@@ -59,7 +74,7 @@ mod tests {
         .unwrap()
     }
 
-    fn history(result: Value) -> ModelRequest {
+    pub(super) fn history(result: Value) -> ModelRequest {
         ModelRequest {
             request_id: ModelRequestId::new("tool-result-request"),
             messages: vec![
@@ -98,7 +113,8 @@ mod tests {
             "truncated": false, "truncation_reasons": [], "file_size_bytes": source.len(),
         });
         let encoded = OpenAiToolResultFormat::Yaml.encode(&result, false).unwrap();
-        let decoded: Value = serde_yaml::from_str(&encoded).unwrap();
+        let encoded = encoded.as_str().unwrap();
+        let decoded: Value = serde_yaml::from_str(encoded).unwrap();
         assert_eq!(decoded, json!({"result": result, "is_error": false}));
         assert_eq!(
             decoded["result"]["content"].as_str().unwrap().as_bytes(),
@@ -127,7 +143,8 @@ mod tests {
                 let encoded = OpenAiToolResultFormat::Yaml
                     .encode(&result, is_error)
                     .unwrap();
-                let decoded: Value = serde_yaml::from_str(&encoded).unwrap();
+                let encoded = encoded.as_str().unwrap();
+                let decoded: Value = serde_yaml::from_str(encoded).unwrap();
                 assert_eq!(decoded, json!({"result": result, "is_error": is_error}));
             }
         }
