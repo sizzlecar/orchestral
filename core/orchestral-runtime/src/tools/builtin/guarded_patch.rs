@@ -11,13 +11,14 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::tool_runtime::{GuardedToolExecution, GuardedToolExecutor};
+use crate::tool_runtime::{GuardedToolExecution, GuardedToolExecutor, ObservedFileRead};
 use async_trait::async_trait;
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions, Permissions};
 use orchestral_core::agent_protocol::wire::{
     Digest, ToolActivityEvidence, ToolDiffLine, ToolDiffLineKind, ToolFileActivityKind,
 };
+use orchestral_core::tool_effect::ToolArgumentResolution;
 use orchestral_core::tool_protocol::{
     CapabilityRequest, CapabilitySelector, EffectScope, ModelToolSchema, ToolConcurrency,
     ToolDescriptor, ToolId, ToolIdempotency, ToolInvocation, ToolOperationPlan, ToolOperationRisk,
@@ -160,6 +161,13 @@ struct FileWriteRequest<'a> {
 
 impl<'a> FileWriteRequest<'a> {
     fn parse(invocation: &'a ToolInvocation) -> Result<Self, ToolOutcome> {
+        Self::parse_parameters(invocation, true)
+    }
+
+    fn parse_parameters(
+        invocation: &'a ToolInvocation,
+        require_precondition: bool,
+    ) -> Result<Self, ToolOutcome> {
         let arguments = &invocation.arguments;
         let path = arguments
             .get("path")
@@ -204,6 +212,12 @@ impl<'a> FileWriteRequest<'a> {
                 ))
             }
             (FileWriteMode::Replace, Some(digest)) if Digest::new(digest).is_sha256() => {}
+            (FileWriteMode::Replace, None)
+                if !require_precondition
+                    && !arguments
+                        .as_object()
+                        .expect("Tool arguments are an object")
+                        .contains_key("expected_digest") => {}
             (FileWriteMode::Replace, _) => {
                 return Err(rejected(
                     "file_write_precondition_missing",
@@ -231,7 +245,44 @@ impl<'a> FileWriteRequest<'a> {
 #[async_trait]
 impl GuardedToolExecutor for GuardedFileWriteExecutor {
     fn planning_contract(&self) -> Value {
-        json!({ "contract": "orchestral.file-write-planner/v1" })
+        json!({ "contract": "orchestral.file-write-planner/v2", "default_precondition": "observed_complete_read" })
+    }
+
+    fn requires_observed_arguments(&self, invocation: &ToolInvocation) -> bool {
+        invocation.arguments.get("mode").and_then(Value::as_str) == Some("replace")
+            && invocation.arguments.get("expected_digest").is_none()
+    }
+
+    fn resolve_arguments(
+        &self,
+        invocation: &ToolInvocation,
+        reads: &[ObservedFileRead],
+    ) -> Result<Option<ToolArgumentResolution>, ToolOutcome> {
+        if !self.requires_observed_arguments(invocation) {
+            return Ok(None);
+        }
+        let request = FileWriteRequest::parse_parameters(invocation, false)?;
+        let workspace = self.workspaces.select(invocation)?;
+        let read = reads.iter().rev().find(|read| {
+            read.version.workspace == workspace.selector
+                && read.version.path == request.path.display()
+        }).ok_or_else(|| rejected(
+            "file_write_precondition_missing",
+            "replace requires a complete, untruncated file_read visible in this model request, or an explicit expected_digest",
+        ))?;
+        let mut arguments = invocation.arguments.clone();
+        arguments
+            .as_object_mut()
+            .expect("validated Tool arguments")
+            .insert(
+                "expected_digest".to_owned(),
+                Value::String(read.version.content_digest.to_string()),
+            );
+        Ok(Some(ToolArgumentResolution {
+            arguments,
+            source: read.source.clone(),
+            source_event_digest: read.source_event_digest.clone(),
+        }))
     }
 
     fn activity_evidence(
@@ -239,7 +290,7 @@ impl GuardedToolExecutor for GuardedFileWriteExecutor {
         invocation: &ToolInvocation,
         _outcome: Option<&ToolOutcome>,
     ) -> Vec<ToolActivityEvidence> {
-        let Ok(request) = FileWriteRequest::parse(invocation) else {
+        let Ok(request) = FileWriteRequest::parse_parameters(invocation, false) else {
             return Vec::new();
         };
         let Ok(workspace) = self.workspaces.select(invocation) else {
@@ -303,7 +354,7 @@ impl GuardedToolExecutor for GuardedFileWriteExecutor {
     }
 
     fn approval_summary(&self, invocation: &ToolInvocation) -> String {
-        FileWriteRequest::parse(invocation)
+        FileWriteRequest::parse_parameters(invocation, false)
             .and_then(|request| {
                 let workspace = self.workspaces.select(invocation)?;
                 Ok(format!(
@@ -782,8 +833,10 @@ pub fn guarded_file_write_descriptor(restriction: ToolRestriction) -> ToolDescri
                 "Create a new UTF-8 text file or intentionally replace a complete existing file ",
                 "inside a Host-approved workspace. Use mode='create' only when the path must ",
                 "not exist. Use mode='replace' only after reading the complete file from offset 1 ",
-                "through eof, and pass that file_read content_digest as expected_digest. Use ",
-                "apply_patch instead for targeted edits to existing files. Parent directories ",
+                "through eof without truncation. The Host uses the latest complete read shown ",
+                "in this model request as the default version precondition; an explicit ",
+                "expected_digest overrides it and must match. Use file_edit or apply_patch ",
+                "for targeted edits to existing files. Parent directories ",
                 "must already exist. When multiple workspaces are provided, select one with its ",
                 "exact canonical workspace root."
             )
@@ -810,7 +863,7 @@ pub fn guarded_file_write_descriptor(restriction: ToolRestriction) -> ToolDescri
                     },
                     "expected_digest": {
                         "type": "string",
-                        "description": "Required only for replace: complete-file content_digest returned by file_read."
+                        "description": "Optional for replace: exact complete-file digest. If omitted, use the latest complete file_read visible in this model request. Never used for create."
                     }
                 },
                 "additionalProperties": false

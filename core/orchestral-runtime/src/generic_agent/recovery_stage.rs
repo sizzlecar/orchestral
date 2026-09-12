@@ -573,6 +573,7 @@ pub(super) async fn prepare_recovered_tool(
     run_id: &RunId,
     call: &GenericObservedToolCall,
     arguments: &serde_json::Value,
+    model_messages: &[ModelMessage],
     cancellation: CancellationToken,
 ) -> Result<GuardedToolResult, AgentFailure> {
     let tools = inner.tools.as_ref().ok_or_else(|| {
@@ -599,9 +600,27 @@ pub(super) async fn prepare_recovered_tool(
                 false,
             )
         })?;
+    // Activation has already rebuilt and verified the original model request
+    // digest. An unprepared call may use only reads in that exact request;
+    // an existing Prepared effect keeps its persisted resolution instead.
+    let observations = tools
+        .runtime
+        .freeze_model_observations(
+            run_id,
+            &crate::tool_runtime::ModelToolObservations::from_messages(model_messages),
+            &[ToolCallId::new(call.call_id.as_str())],
+        )
+        .await
+        .map_err(|error| {
+            agent_failure(
+                "tool_observation_unavailable",
+                format!("Recovered Tool read evidence could not be verified: {error:?}"),
+                false,
+            )
+        })?;
     Ok(tools
         .runtime
-        .invoke(
+        .invoke_with_observations(
             ToolInvocation {
                 run_id: run_id.clone(),
                 call_id: ToolCallId::new(call.call_id.as_str()),
@@ -611,6 +630,8 @@ pub(super) async fn prepare_recovered_tool(
             tools.run_grant.clone(),
             None,
             cancellation,
+            CancellationToken::new(),
+            &observations,
         )
         .await)
 }

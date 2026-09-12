@@ -20,7 +20,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
 
-use crate::tool_runtime::{GuardedToolExecution, GuardedToolExecutor};
+use crate::tool_runtime::{CompleteFileRead, GuardedToolExecution, GuardedToolExecutor};
 use crate::tools::shell_sandbox::{sandbox_command, SandboxNetworkAccess, ShellSandboxPolicy};
 
 use super::support::{
@@ -185,6 +185,32 @@ impl GuardedFileReadExecutor {
 
 #[async_trait]
 impl GuardedToolExecutor for GuardedFileReadExecutor {
+    fn planning_contract(&self) -> Value {
+        json!({ "contract": "orchestral.file-read-planner/v2", "complete_read_evidence": true })
+    }
+
+    fn complete_file_read(
+        &self,
+        _invocation: &orchestral_core::tool_protocol::ToolInvocation,
+        output: &Value,
+    ) -> Option<CompleteFileRead> {
+        let content = output.get("content")?.as_str()?;
+        let digest = Digest::sha256(content.as_bytes());
+        if output.get("start_line")?.as_u64()? != 1
+            || !output.get("eof")?.as_bool()?
+            || output.get("truncated")?.as_bool()?
+            || output.get("file_size_bytes")?.as_u64()? != content.len() as u64
+            || output.get("content_digest")?.as_str()? != digest.as_str()
+        {
+            return None;
+        }
+        Some(CompleteFileRead {
+            workspace: output.get("workspace")?.as_str()?.to_owned(),
+            path: output.get("path")?.as_str()?.to_owned(),
+            content_digest: digest,
+        })
+    }
+
     fn activity_evidence(
         &self,
         invocation: &orchestral_core::tool_protocol::ToolInvocation,

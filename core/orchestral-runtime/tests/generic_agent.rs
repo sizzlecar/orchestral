@@ -59,6 +59,9 @@ use serde_json::json;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
+#[path = "generic_agent/observed_write_recovery.rs"]
+mod observed_write_recovery;
+
 struct ScriptedModel;
 
 struct BlockingModel;
@@ -177,7 +180,7 @@ enum CheckpointCrashCut {
     InputRequestResolve,
     InputToolExchangeBoundary,
     ApprovalRequestResolve,
-    ApprovalToolExchangeBoundary,
+    ApprovalToolExchangeBoundary(u64),
     DirectToolExchangeBoundary,
 }
 
@@ -262,6 +265,7 @@ struct AckLostAfterModelObservationCheckpointStore {
     inner: InMemoryGenericAgentCheckpointStore,
     acknowledgement_lost: AtomicBool,
     unavailable: AtomicBool,
+    target_round: Option<u64>,
 }
 
 #[derive(Default)]
@@ -596,7 +600,8 @@ impl GenericAgentCheckpointStore for AckLostAfterModelObservationCheckpointStore
         }
         let loses_acknowledgement = matches!(
             &draft.payload,
-            GenericCheckpointEvent::ModelAttemptObserved { .. }
+            GenericCheckpointEvent::ModelAttemptObserved { round, .. }
+                if self.target_round.is_none_or(|target| target == *round)
         );
         let outcome = self.inner.append(run_id, expected_previous, draft)?;
         if loses_acknowledgement && !self.acknowledgement_lost.swap(true, Ordering::SeqCst) {
@@ -777,12 +782,11 @@ impl GenericAgentCheckpointStore for PausingCheckpointStore {
                     },
                 ) => true,
                 (
-                    CheckpointCrashCut::ApprovalToolExchangeBoundary,
+                    CheckpointCrashCut::ApprovalToolExchangeBoundary(expected_round),
                     GenericCheckpointEvent::LoopBoundaryCommitted {
-                        next_model_round: 2,
-                        ..
+                        next_model_round, ..
                     },
-                ) => true,
+                ) => next_model_round == expected_round,
                 (
                     CheckpointCrashCut::DirectToolExchangeBoundary,
                     GenericCheckpointEvent::LoopBoundaryCommitted {
@@ -4739,7 +4743,7 @@ async fn run_committed_approval_exchange_recovery(allow: bool) {
     let session_id = AgentSessionId::new(format!("committed-approval-{suffix}-exchange-session"));
     let command_id = CommandId::new(format!("committed-approval-{suffix}-exchange-resolution"));
     let checkpoint_store = Arc::new(PausingCheckpointStore::at(
-        CheckpointCrashCut::ApprovalToolExchangeBoundary,
+        CheckpointCrashCut::ApprovalToolExchangeBoundary(2),
     ));
     let effect_journal = Arc::new(InMemoryToolEffectJournalStore::default());
     let session_journal = Arc::new(InMemoryAgentSessionJournalStore::default());

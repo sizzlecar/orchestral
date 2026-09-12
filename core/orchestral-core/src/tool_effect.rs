@@ -71,9 +71,24 @@ impl ToolEffectKey {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ToolArgumentResolution {
+    /// Host execution arguments. The model's original arguments remain in
+    /// `PreparedToolEffect::invocation` and retain their own digest.
+    pub arguments: serde_json::Value,
+    /// Committed observation used to resolve the omitted precondition.
+    pub source: ToolEffectKey,
+    pub source_event_digest: Digest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PreparedToolEffect {
     pub invocation: ToolInvocation,
     pub args_digest: Digest,
+    /// Resolved once before preparation, then reused unchanged on recovery.
+    /// Absent for legacy and explicit-argument invocations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argument_resolution: Option<Box<ToolArgumentResolution>>,
     /// Digest of the invocation-specific effect plan authorized for this
     /// attempt. It prevents recovery from silently widening or reclassifying
     /// an operation after a runtime upgrade.
@@ -89,6 +104,16 @@ pub struct PreparedToolEffect {
 }
 
 impl PreparedToolEffect {
+    /// Exact Host execution request bound by this preparation. Public model
+    /// history continues to use `invocation`, including its original arguments.
+    pub fn execution_invocation(&self) -> ToolInvocation {
+        let mut invocation = self.invocation.clone();
+        if let Some(resolution) = &self.argument_resolution {
+            invocation.arguments = resolution.arguments.clone();
+        }
+        invocation
+    }
+
     pub fn key(&self) -> ToolEffectKey {
         ToolEffectKey::new(
             self.invocation.run_id.clone(),
@@ -113,6 +138,18 @@ impl PreparedToolEffect {
             return Err(ToolEffectError::InvalidEvent(
                 "Prepared Tool effect digests do not match its invocation".to_owned(),
             ));
+        }
+        if let Some(resolution) = &self.argument_resolution {
+            resolution.source.validate()?;
+            if !resolution.arguments.is_object()
+                || !resolution.source_event_digest.is_sha256()
+                || resolution.source.run_id != self.invocation.run_id
+                || resolution.source.call_id == self.invocation.call_id
+            {
+                return Err(ToolEffectError::InvalidEvent(
+                    "resolved Tool arguments require a prior same-Run observation".to_owned(),
+                ));
+            }
         }
         Ok(())
     }
@@ -567,6 +604,7 @@ mod tests {
         };
         PreparedToolEffect {
             args_digest: invocation.args_digest().unwrap(),
+            argument_resolution: None,
             invocation,
             operation_digest: Digest::sha256("operation"),
             permission_digest: Digest::sha256("permission"),

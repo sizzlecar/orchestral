@@ -7,6 +7,7 @@ pub(super) struct ToolBatchRequest {
     pub(super) run_skills: Option<Arc<SkillRuntime>>,
     pub(super) round: u64,
     pub(super) model_request_id: ModelRequestId,
+    pub(super) observations: crate::tool_runtime::ModelToolObservations,
     pub(super) parsed_calls: Vec<(PendingModelToolCall, serde_json::Value)>,
     pub(super) cancellation: CancellationToken,
     pub(super) yield_requested: CancellationToken,
@@ -36,6 +37,7 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
         run_skills,
         round,
         model_request_id,
+        observations,
         parsed_calls,
         cancellation,
         yield_requested,
@@ -47,6 +49,34 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
         started_event_id,
     } = request;
     let run_id = request.run.spec.run_id.clone();
+    let pending_calls = parsed_calls
+        .iter()
+        .map(|(call, _)| ToolCallId::new(call.call_id.as_str()))
+        .collect::<Vec<_>>();
+    let observations = if let Some(tools) = inner.tools.as_ref() {
+        match tools
+            .runtime
+            .freeze_model_observations(&run_id, &observations, &pending_calls)
+            .await
+        {
+            Ok(observations) => observations,
+            Err(error) => {
+                emit_failure(
+                    &inner,
+                    &request,
+                    &user_message,
+                    agent_failure(
+                        "tool_observation_unavailable",
+                        format!("Tool read evidence could not be verified: {error:?}"),
+                        false,
+                    ),
+                );
+                return ToolBatchExecution::Terminal;
+            }
+        }
+    } else {
+        crate::tool_runtime::FrozenToolObservations::default()
+    };
     let mut supporting_event_ids = Vec::new();
     let mut tool_results = Vec::with_capacity(parsed_calls.len());
     let mut retained_artifacts = BTreeMap::<String, ArtifactRefWithDigest>::new();
@@ -364,12 +394,13 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
         );
         let result = tools
             .runtime
-            .invoke_with_yield(
+            .invoke_with_observations(
                 invocation.clone(),
                 tools.run_grant.clone(),
                 None,
                 cancellation.clone(),
                 yield_requested.clone(),
+                &observations,
             )
             .await;
         let result = match result {
@@ -391,12 +422,13 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                     ApprovalWaitOutcome::Allowed(capability) => {
                         tools
                             .runtime
-                            .invoke_with_yield(
+                            .invoke_with_observations(
                                 invocation.clone(),
                                 tools.run_grant.clone(),
                                 Some(*capability),
                                 cancellation.clone(),
                                 yield_requested.clone(),
+                                &observations,
                             )
                             .await
                     }

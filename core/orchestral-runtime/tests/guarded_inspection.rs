@@ -20,6 +20,9 @@ use tokio_util::sync::CancellationToken;
 
 const SIGNING_KEY: &[u8] = b"guarded-inspection-test-signing-key";
 
+#[path = "guarded_inspection/file_write_precondition.rs"]
+mod file_write_precondition;
+
 fn temp_workspace(label: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("orchestral-{label}-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&path).unwrap();

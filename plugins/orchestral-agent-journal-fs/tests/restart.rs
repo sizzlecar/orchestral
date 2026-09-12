@@ -426,6 +426,7 @@ async fn invoked_tool_effect_rehydrates_without_losing_its_uncertain_boundary() 
         arguments: serde_json::json!({ "value": "hello" }),
     };
     let prepared = PreparedToolEffect {
+        argument_resolution: None,
         args_digest: invocation.args_digest().unwrap(),
         invocation,
         operation_digest: Digest::sha256("operation"),

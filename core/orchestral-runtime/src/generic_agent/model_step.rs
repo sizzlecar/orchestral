@@ -648,6 +648,9 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                         run_skills: run_skills.clone(),
                         round,
                         model_request_id: model_request.request_id.clone(),
+                        observations: crate::tool_runtime::ModelToolObservations::from_messages(
+                            &model_request.messages,
+                        ),
                         parsed_calls,
                         cancellation: cancellation.clone(),
                         yield_requested: yield_requested.clone(),

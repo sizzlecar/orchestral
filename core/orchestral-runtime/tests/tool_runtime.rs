@@ -512,6 +512,7 @@ async fn seed_effect_trace(
         .plan_operation(&invocation, &descriptor, &effective)
         .unwrap();
     let prepared = PreparedToolEffect {
+        argument_resolution: None,
         args_digest: invocation.args_digest().unwrap(),
         invocation,
         operation_digest: operation.digest().unwrap(),
