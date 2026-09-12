@@ -2339,6 +2339,48 @@ fn recovery_identity_tool_runtime(
     host_bounds: ToolPolicyBounds,
     restriction_bounds: ToolPolicyBounds,
 ) -> Arc<GuardedToolRuntime<InMemoryApprovalCapabilityStore>> {
+    recovery_identity_tool_runtime_with_descriptor(
+        host_bounds,
+        recovery_identity_tool_descriptor(restriction_bounds),
+        Arc::new(EchoTool {
+            calls: AtomicUsize::new(0),
+        }),
+    )
+}
+
+fn recovery_identity_tool_descriptor(restriction_bounds: ToolPolicyBounds) -> ToolDescriptor {
+    ToolDescriptor {
+        tool_id: ToolId::new("test/recovery-echo"),
+        model_schema: ModelToolSchema {
+            name: "recovery_echo".to_owned(),
+            description: "Echo one recovery test value".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["value"],
+                "properties": { "value": { "type": "string" } },
+                "additionalProperties": false
+            }),
+        },
+        output_schema: json!({
+            "type": "object",
+            "required": ["result"],
+            "properties": { "result": { "type": "string" } },
+            "additionalProperties": false
+        }),
+        effect_scopes: BTreeSet::new(),
+        restriction: ToolRestriction {
+            bounds: restriction_bounds,
+        },
+        idempotency: ToolIdempotency::IdempotentWithKey,
+        concurrency: ToolConcurrency::ParallelSafe,
+    }
+}
+
+fn recovery_identity_tool_runtime_with_descriptor(
+    host_bounds: ToolPolicyBounds,
+    descriptor: ToolDescriptor,
+    executor: Arc<EchoTool>,
+) -> Arc<GuardedToolRuntime<InMemoryApprovalCapabilityStore>> {
     let verifier = HostApprovalVerifier::new(
         b"0123456789abcdef0123456789abcdef",
         InMemoryApprovalCapabilityStore::default(),
@@ -2354,36 +2396,7 @@ fn recovery_identity_tool_runtime(
         .expect("valid Host Tool policy"),
     );
     runtime
-        .register(
-            ToolDescriptor {
-                tool_id: ToolId::new("test/recovery-echo"),
-                model_schema: ModelToolSchema {
-                    name: "recovery_echo".to_owned(),
-                    description: "Echo one recovery test value".to_owned(),
-                    input_schema: json!({
-                        "type": "object",
-                        "required": ["value"],
-                        "properties": { "value": { "type": "string" } },
-                        "additionalProperties": false
-                    }),
-                },
-                output_schema: json!({
-                    "type": "object",
-                    "required": ["result"],
-                    "properties": { "result": { "type": "string" } },
-                    "additionalProperties": false
-                }),
-                effect_scopes: BTreeSet::new(),
-                restriction: ToolRestriction {
-                    bounds: restriction_bounds,
-                },
-                idempotency: ToolIdempotency::IdempotentWithKey,
-                concurrency: ToolConcurrency::ParallelSafe,
-            },
-            Arc::new(EchoTool {
-                calls: AtomicUsize::new(0),
-            }),
-        )
+        .register(descriptor, executor)
         .expect("recovery identity Tool registers");
     runtime
 }
@@ -6744,6 +6757,76 @@ async fn private_wal_recovery_is_bound_to_model_and_tool_authority() {
         Err(error) => error,
     };
     assert_eq!(error.code, AgentProtocolErrorCode::RunIdConflict);
+
+    // Output contracts and durable Tool identity are Host-only: the model
+    // sees the same schema, but neither change may reinterpret the old WAL.
+    let base_tool = recovery_identity_tool_descriptor(base_bounds.clone());
+    let mut changed_tool_id = base_tool.clone();
+    changed_tool_id.tool_id = ToolId::new("test/recovery-echo/v2");
+    let mut changed_output_schema = base_tool;
+    changed_output_schema.output_schema["properties"]["result"] =
+        json!({ "type": "string", "minLength": 1 });
+    for (contract, tool_descriptor) in [
+        ("ToolId", changed_tool_id),
+        ("output_schema", changed_output_schema),
+    ] {
+        let tool = Arc::new(EchoTool {
+            calls: AtomicUsize::new(0),
+        });
+        let runtime = recovery_identity_tool_runtime_with_descriptor(
+            base_bounds.clone(),
+            tool_descriptor,
+            tool.clone(),
+        );
+        assert_eq!(
+            runtime
+                .model_tool_schemas()
+                .expect("replacement model schema"),
+            base_runtime
+                .model_tool_schemas()
+                .expect("original model schema"),
+            "{contract} must not change model-facing definitions"
+        );
+        assert_ne!(
+            runtime
+                .execution_contract_digest()
+                .expect("replacement contract"),
+            base_runtime
+                .execution_contract_digest()
+                .expect("original contract")
+        );
+        let replacement = InternalGenericAgentProvider::new_with_tools_and_session_journal(
+            Arc::new(RecoveryIdentityModel {
+                revision: "v1",
+                starts: starts.clone(),
+            }),
+            config.clone(),
+            runtime,
+            base_grant.clone(),
+            session_journal.clone(),
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+        .expect("replacement Tool contract is internally valid")
+        .with_checkpoint_store(checkpoint_store.clone())
+        .expect("replacement Tool contract sees the same private WAL");
+        let error = match replacement
+            .recover(
+                AgentRecoveryRequest::new(request.clone(), execution.clone(), &descriptor)
+                    .expect("unchanged recovery request identity"),
+            )
+            .await
+        {
+            Ok(_) => panic!("changed {contract} must not resume the Run"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.code,
+            AgentProtocolErrorCode::RunIdConflict,
+            "{contract}"
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 0, "{contract}");
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 0, "{contract}");
+    }
 
     let mut narrower_grant_bounds = base_bounds.clone();
     narrower_grant_bounds.max_timeout_ms = Some(500);

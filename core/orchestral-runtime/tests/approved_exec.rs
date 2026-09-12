@@ -110,7 +110,7 @@ async fn approved_only_commands_cannot_silently_escalate_or_bypass_run_grants() 
     let invocation = |call: &str, arguments| ToolInvocation {
         run_id: RunId::new("approved-only"),
         call_id: ToolCallId::new(call),
-        tool_id: ToolId::new("orchestral/exec_command/v1"),
+        tool_id: ToolId::new("orchestral/exec_command/v2"),
         arguments,
     };
     for (call, arguments) in [

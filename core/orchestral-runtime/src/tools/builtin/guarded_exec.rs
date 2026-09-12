@@ -894,7 +894,7 @@ fn build_exec_command_descriptor(
     apply_exec_restriction(&mut restriction);
     let effect_scopes = restricted_exec_effects(&restriction);
     ToolDescriptor {
-        tool_id: ToolId::new("orchestral/exec_command/v1"),
+        tool_id: ToolId::new("orchestral/exec_command/v2"),
         model_schema: ModelToolSchema {
             name: "exec_command".to_owned(),
             description: format!("{} {}", if sandboxed_execution_enabled {
@@ -961,7 +961,7 @@ fn build_write_stdin_descriptor(mut restriction: ToolRestriction) -> ToolDescrip
     apply_exec_restriction(&mut restriction);
     let effect_scopes = restricted_exec_effects(&restriction);
     ToolDescriptor {
-        tool_id: ToolId::new("orchestral/write_stdin/v1"),
+        tool_id: ToolId::new("orchestral/write_stdin/v2"),
         model_schema: ModelToolSchema {
             name: "write_stdin".to_owned(),
             description: concat!(
@@ -1324,9 +1324,8 @@ fn display_payload(payload: &str) -> String {
 fn exec_output_schema() -> Value {
     json!({
         "type": "object",
-        "required": ["output", "stdout", "stderr", "alive", "wall_time_seconds", "truncated", "dropped_bytes", "sandbox_backend"],
+        "required": ["stdout", "stderr", "alive", "wall_time_seconds", "truncated", "dropped_bytes", "sandbox_backend"],
         "properties": {
-            "output": { "type": "string" },
             "stdout": { "type": "string" },
             "stderr": { "type": "string" },
             "alive": { "type": "boolean" },
@@ -1540,15 +1539,7 @@ fn render_result(
         truncate_utf8_lossy(result.stdout.as_bytes(), max_output_bytes);
     let remaining = max_output_bytes.saturating_sub(stdout.len());
     let (stderr, stderr_truncated, _) = truncate_utf8_lossy(result.stderr.as_bytes(), remaining);
-    let output = if stderr.is_empty() {
-        stdout.clone()
-    } else if stdout.is_empty() {
-        stderr.clone()
-    } else {
-        format!("{stdout}\n{stderr}")
-    };
     let mut value = Map::from_iter([
-        ("output".to_owned(), json!(output)),
         ("stdout".to_owned(), json!(stdout)),
         ("stderr".to_owned(), json!(stderr)),
         ("alive".to_owned(), json!(result.alive)),
@@ -1602,10 +1593,95 @@ fn exec_error(error: ExecProcessError) -> ToolOutcome {
 mod tests {
     use super::{
         classify_command, display_payload, guarded_exec_command_descriptor,
-        guarded_write_stdin_descriptor, workspace_exec_command_descriptor,
-        workspace_write_stdin_descriptor,
+        guarded_write_stdin_descriptor, render_result, workspace_exec_command_descriptor,
+        workspace_write_stdin_descriptor, ExecPollResult, ExecSessionId,
     };
     use orchestral_core::tool_protocol::{ApprovalPolicy, ToolPolicyBounds, ToolRestriction};
+    use serde_json::json;
+
+    #[test]
+    fn exec_v2_output_preserves_each_stream_and_terminal_metadata_once() {
+        let restriction = ToolRestriction {
+            bounds: ToolPolicyBounds::default(),
+        };
+        let descriptors = [
+            guarded_exec_command_descriptor(restriction.clone()),
+            guarded_write_stdin_descriptor(restriction),
+        ];
+        for (stdout, stderr) in [
+            ("\tlet text = \"\\n\";\r\n", ""),
+            ("", "error: 読み取り\n"),
+            ("first\nlast", "warning\r\n"),
+        ] {
+            let output = render_result(
+                ExecPollResult {
+                    stdout: stdout.to_owned(),
+                    stderr: stderr.to_owned(),
+                    dropped_bytes: 0,
+                    alive: false,
+                    exit_code: Some(7),
+                    wall_time_seconds: 0.25,
+                },
+                ExecSessionId::new(1).unwrap(),
+                1024,
+                "test-sandbox",
+            );
+            assert_eq!(
+                output,
+                json!({
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "alive": false,
+                    "exit_code": 7,
+                    "wall_time_seconds": 0.25,
+                    "truncated": false,
+                    "dropped_bytes": 0,
+                    "sandbox_backend": "test-sandbox",
+                })
+            );
+            for descriptor in &descriptors {
+                descriptor.validate_output(&output).unwrap();
+                let mut legacy = output.clone();
+                legacy["output"] = json!(format!("{stdout}{stderr}"));
+                assert!(descriptor.validate_output(&legacy).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn exec_v2_output_keeps_poll_identity_and_shared_stream_budget() {
+        let descriptor = guarded_write_stdin_descriptor(ToolRestriction {
+            bounds: ToolPolicyBounds::default(),
+        });
+        for (dropped_bytes, budget, stderr, truncated) in [
+            (0, 4, "cd", true),
+            (9, 64, "cdef", true),
+            (0, 64, "cdef", false),
+        ] {
+            let output = render_result(
+                ExecPollResult {
+                    stdout: "ab".to_owned(),
+                    stderr: "cdef".to_owned(),
+                    dropped_bytes,
+                    alive: true,
+                    exit_code: None,
+                    wall_time_seconds: 0.5,
+                },
+                ExecSessionId::new(42).unwrap(),
+                budget,
+                "existing_session",
+            );
+            descriptor.validate_output(&output).unwrap();
+            assert_eq!(output["stdout"], "ab");
+            assert_eq!(output["stderr"], stderr);
+            assert_eq!(output["session_id"], 42);
+            assert_eq!(output["alive"], true);
+            assert_eq!(output["truncated"], truncated);
+            assert_eq!(output["dropped_bytes"], dropped_bytes);
+            assert!(output.get("exit_code").is_none());
+            assert!(output.get("output").is_none());
+        }
+    }
 
     #[test]
     fn operation_classifier_distinguishes_read_mutating_and_destructive_commands() {

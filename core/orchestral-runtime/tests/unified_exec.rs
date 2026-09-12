@@ -123,7 +123,12 @@ fn inline_output(result: GuardedToolResult) -> Value {
                     output: ToolOutput::Inline(output),
                 },
             ..
-        } => output,
+        } => {
+            assert!(output.get("output").is_none(), "{output:#?}");
+            assert!(output["stdout"].is_string(), "{output:#?}");
+            assert!(output["stderr"].is_string(), "{output:#?}");
+            output
+        }
         other => panic!("expected inline completed output, got {other:?}"),
     }
 }
@@ -357,7 +362,7 @@ async fn guarded_write_stdin_observes_an_exit_race_without_requesting_input_auth
             invocation(
                 "guarded-exit-race",
                 "interrupt-after-exit",
-                "orchestral/write_stdin/v1",
+                "orchestral/write_stdin/v2",
                 json!({ "session_id": session_id.get(), "chars": "\u{3}" }),
             ),
             RunToolGrant { bounds },
@@ -367,7 +372,7 @@ async fn guarded_write_stdin_observes_an_exit_race_without_requesting_input_auth
         .await;
     let output = inline_output(result);
     assert_eq!(output["exit_code"], json!(0));
-    assert_eq!(output["output"], json!("final-output"));
+    assert_eq!(output["stdout"], json!("final-output"));
     assert!(manager.list(&run_id).unwrap().is_empty());
     std::fs::remove_dir_all(parent).unwrap();
 }
@@ -580,8 +585,8 @@ async fn guarded_unified_surface_executes_children_and_continues_one_tty_session
     let short = invocation(
         "unified-run",
         "short",
-        "orchestral/exec_command/v1",
-        json!({ "cmd": "printf short-ok; /bin/echo child-ok", "yield_time_ms": 1000 }),
+        "orchestral/exec_command/v2",
+        json!({ "cmd": "printf short-ok; /bin/echo child-ok; printf warning >&2", "yield_time_ms": 1000 }),
     );
     let GuardedToolResult::ApprovalRequired { binding, .. } = runtime
         .invoke(
@@ -613,14 +618,15 @@ async fn guarded_unified_surface_executes_children_and_continues_one_tty_session
             .await,
     );
     assert_eq!(output["exit_code"], json!(0));
-    assert!(output["output"].as_str().unwrap().contains("short-ok"));
-    assert!(output["output"].as_str().unwrap().contains("child-ok"));
+    assert!(output["stdout"].as_str().unwrap().contains("short-ok"));
+    assert!(output["stdout"].as_str().unwrap().contains("child-ok"));
+    assert_eq!(output["stderr"], "warning");
     assert!(output.get("session_id").is_none());
 
     let environment_probe = invocation(
         "unified-run",
         "environment",
-        "orchestral/exec_command/v1",
+        "orchestral/exec_command/v2",
         json!({
             "cmd": "printf '%s|%s|%s' \"$VISIBLE\" \"${MCP_CREDENTIAL-unset}\" \"${HOME-unset}\"",
             "yield_time_ms": 1000
@@ -663,7 +669,7 @@ async fn guarded_unified_surface_executes_children_and_continues_one_tty_session
     let interactive = invocation(
         "unified-run",
         "interactive",
-        "orchestral/exec_command/v1",
+        "orchestral/exec_command/v2",
         json!({
             "cmd": "read value; printf 'got:%s\\n' \"$value\"",
             "tty": true,
@@ -703,7 +709,7 @@ async fn guarded_unified_surface_executes_children_and_continues_one_tty_session
     let stdin = invocation(
         "unified-run",
         "stdin",
-        "orchestral/write_stdin/v1",
+        "orchestral/write_stdin/v2",
         json!({ "session_id": session_id, "chars": "hello\n", "yield_time_ms": 1000 }),
     );
     let GuardedToolResult::ApprovalRequired { binding, summary } = runtime
@@ -740,7 +746,7 @@ async fn guarded_unified_surface_executes_children_and_continues_one_tty_session
         let poll = invocation(
             "unified-run",
             "poll",
-            "orchestral/write_stdin/v1",
+            "orchestral/write_stdin/v2",
             json!({ "session_id": session_id, "yield_time_ms": 1000 }),
         );
         let GuardedToolResult::ApprovalRequired { binding, .. } = runtime
@@ -772,7 +778,7 @@ async fn guarded_unified_surface_executes_children_and_continues_one_tty_session
         );
     }
     assert_eq!(completed["exit_code"], json!(0), "{completed:#?}");
-    assert!(completed["output"].as_str().unwrap().contains("got:hello"));
+    assert!(completed["stdout"].as_str().unwrap().contains("got:hello"));
     assert!(manager.list(&RunId::new("unified-run")).unwrap().is_empty());
 
     std::fs::remove_dir_all(parent).unwrap();
@@ -817,7 +823,7 @@ async fn completion_observation_respects_the_host_deadline_without_losing_the_se
             invocation(
                 run.as_str(),
                 "poll",
-                "orchestral/write_stdin/v1",
+                "orchestral/write_stdin/v2",
                 json!({"session_id": session.get()}),
             ),
             RunToolGrant { bounds },
@@ -891,7 +897,7 @@ async fn workspace_auto_run_confines_reads_and_mutations_to_the_real_sandbox() {
             invocation(
                 "workspace-auto-run",
                 "read-only",
-                "orchestral/exec_command/v1",
+                "orchestral/exec_command/v2",
                 json!({ "cmd": "ls", "yield_time_ms": 1000 }),
             ),
             RunToolGrant {
@@ -919,7 +925,7 @@ async fn workspace_auto_run_confines_reads_and_mutations_to_the_real_sandbox() {
             invocation(
                 "workspace-auto-run",
                 "mutation",
-                "orchestral/exec_command/v1",
+                "orchestral/exec_command/v2",
                 json!({ "cmd": format!("printf mutation > {}", mutation.display()) }),
             ),
             RunToolGrant { bounds },
@@ -978,7 +984,7 @@ async fn host_execution_requires_an_exact_approval_and_can_use_an_external_workd
     let default_request = invocation(
         "host-execution-run",
         "default-outside-workdir",
-        "orchestral/exec_command/v1",
+        "orchestral/exec_command/v2",
         json!({ "cmd": "cat evidence.txt", "workdir": external }),
     );
     let implicit_escalation = runtime
@@ -1022,7 +1028,7 @@ async fn host_execution_requires_an_exact_approval_and_can_use_an_external_workd
     let missing_justification = invocation(
         "host-execution-run",
         "missing-justification",
-        "orchestral/exec_command/v1",
+        "orchestral/exec_command/v2",
         json!({
             "cmd": "cat evidence.txt",
             "workdir": external,
@@ -1049,7 +1055,7 @@ async fn host_execution_requires_an_exact_approval_and_can_use_an_external_workd
     let unresolved_external = invocation(
         "host-execution-run",
         "unresolved-external-workdir",
-        "orchestral/exec_command/v1",
+        "orchestral/exec_command/v2",
         json!({
             "cmd": "pwd",
             "workdir": parent.join("not-inspected-before-approval"),
@@ -1074,7 +1080,7 @@ async fn host_execution_requires_an_exact_approval_and_can_use_an_external_workd
     let escalated = invocation(
         "host-execution-run",
         "approved-outside-workdir",
-        "orchestral/exec_command/v1",
+        "orchestral/exec_command/v2",
         json!({
             "cmd": "cat evidence.txt",
             "workdir": external,
