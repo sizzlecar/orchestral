@@ -14,7 +14,7 @@ use orchestral_core::agent_protocol::wire::{
 };
 use orchestral_core::agent_session::SessionSourceRange;
 use orchestral_core::model_protocol::{
-    ModelFinishReason, ModelRequestId, ModelToolCallId, ModelUsage,
+    ModelContent, ModelFinishReason, ModelRequestId, ModelToolCallId, ModelUsage,
 };
 use orchestral_core::tool_protocol::ApprovalCapability;
 use serde::{Deserialize, Serialize};
@@ -86,6 +86,9 @@ pub struct GenericModelObservation {
     pub finish_reason: ModelFinishReason,
     #[serde(default)]
     pub response: String,
+    /// Provider-owned message state, separate from visible text and Tool data.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub continuation: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub usage: Option<ModelUsage>,
     #[serde(default)]
@@ -162,7 +165,26 @@ impl GenericModelContextTrace {
 }
 
 impl GenericModelObservation {
+    pub(crate) fn assistant_content(&self) -> Vec<ModelContent> {
+        let mut content = Vec::new();
+        if !self.response.is_empty() {
+            content.push(ModelContent::Text {
+                text: self.response.clone(),
+            });
+        }
+        content.extend(self.continuation.iter().map(|(namespace, value)| {
+            ModelContent::Continuation {
+                namespace: namespace.clone(),
+                value: value.clone(),
+            }
+        }));
+        content
+    }
+
     fn validate(&self) -> Result<(), GenericCheckpointError> {
+        for content in self.assistant_content() {
+            content.validate().map_err(invalid_data)?;
+        }
         let mut call_ids = BTreeSet::new();
         if self.tool_calls.iter().any(|call| {
             call.call_id.is_empty()
@@ -1227,6 +1249,7 @@ mod tests {
                         observation: GenericModelObservation {
                             finish_reason: ModelFinishReason::Stop,
                             response: "done".to_owned(),
+                            continuation: BTreeMap::new(),
                             usage: None,
                             tool_calls: vec![],
                         },
@@ -1283,6 +1306,10 @@ mod tests {
                         observation: GenericModelObservation {
                             finish_reason: ModelFinishReason::ToolCalls,
                             response: "calling a Tool".to_owned(),
+                            continuation: BTreeMap::from([(
+                                "fixture/native".to_owned(),
+                                serde_json::json!({"opaque": "Ω\n"}),
+                            )]),
                             usage: Some(ModelUsage {
                                 input_tokens: Some(10),
                                 output_tokens: Some(5),
@@ -1300,6 +1327,20 @@ mod tests {
             )
             .unwrap();
         let observed = store.load_run(&run_id).unwrap().unwrap();
+        let persisted = serde_json::to_vec(&observed).unwrap();
+        let restored: StoredGenericAgentRun = serde_json::from_slice(&persisted).unwrap();
+        let GenericCheckpointPhase::ModelAttemptObserved { observation, .. } =
+            restored.validate().unwrap().phase
+        else {
+            panic!("restored terminal model observation");
+        };
+        assert_eq!(
+            observation.continuation["fixture/native"],
+            serde_json::json!({"opaque": "Ω\n"})
+        );
+        assert!(
+            matches!(&observation.assistant_content()[1], ModelContent::Continuation { namespace, .. } if namespace == "fixture/native")
+        );
         assert!(matches!(
             observed.validate().unwrap().phase,
             GenericCheckpointPhase::ModelAttemptObserved {

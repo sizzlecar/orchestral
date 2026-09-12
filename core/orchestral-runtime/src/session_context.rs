@@ -1430,7 +1430,15 @@ fn render_compaction_message(message: &ModelMessage) -> Result<String, SessionCo
         }
     };
     let mut rendered = format!("{role}: ");
-    for (index, content) in message.content.iter().enumerate() {
+    // Provider continuation belongs to the original assistant exchange. It is
+    // neither transcript text nor a fact that can be copied into a new System
+    // summary. The source records and uncompressed recent messages keep it.
+    for (index, content) in message
+        .content
+        .iter()
+        .filter(|content| !matches!(content, ModelContent::Continuation { .. }))
+        .enumerate()
+    {
         if index > 0 {
             rendered.push_str(" | ");
         }
@@ -2488,6 +2496,125 @@ mod tests {
         assert!(text.contains("\"exit_code\":2"));
         assert!(text.contains("\"truncated\":true"));
         assert!(text.chars().count() <= 2048);
+    }
+
+    #[tokio::test]
+    async fn compaction_omits_continuation_but_preserves_recent_and_durable_exchanges() {
+        let store = Arc::new(InMemoryAgentSessionJournalStore::default());
+        let session_id = AgentSessionId::new("session-1");
+        let run_id = RunId::new("current");
+        append_input(&store, 1, "current", "Inspect recorded observations".into()).await;
+        for seq in 1..=5 {
+            let call_id = ModelToolCallId::new(format!("inspect-{seq}"));
+            append_session_payload(
+                &store,
+                &session_id,
+                &run_id,
+                format!("exchange-{seq}"),
+                AgentSessionEvent::ToolExchangeCommitted {
+                    request_id: ModelRequestId::new(format!("request-{seq}")),
+                    assistant: ModelMessage {
+                        role: ModelRole::Assistant,
+                        content: vec![
+                            ModelContent::Continuation {
+                                namespace: "fixture/continuation".into(),
+                                value: json!({"opaque": format!("private-step-{seq}")}),
+                            },
+                            ModelContent::Data {
+                                media_type: "application/json".into(),
+                                value: json!({"observation": "public-data"}),
+                            },
+                            ModelContent::ToolCall {
+                                call_id: call_id.clone(),
+                                name: "inspect".into(),
+                                arguments: json!({"entry": seq}),
+                                extensions: Default::default(),
+                            },
+                        ],
+                    },
+                    tool: ModelMessage {
+                        role: ModelRole::Tool,
+                        content: vec![ModelContent::ToolResult {
+                            call_id,
+                            result: json!({"observed": seq}),
+                            is_error: false,
+                        }],
+                    },
+                    retained_artifacts: Vec::new(),
+                    usage: None,
+                },
+            )
+            .await;
+        }
+        let originals = store.load_session(&session_id).await.unwrap();
+        let engine = AgentSessionContextEngine::new(
+            store.clone(),
+            Arc::new(JsonSizeTokenMeter::new(1).unwrap()),
+        );
+        let request = || SessionContextRequest {
+            session_id: session_id.clone(),
+            current_run_id: run_id.clone(),
+            through_session_seq: None,
+            system_message: None,
+            tools: Vec::new(),
+            history_limit: 100,
+            max_context_tokens: 20_000,
+            reserved_output_tokens: 100,
+            config_digest: Digest::sha256("continuation-compaction"),
+            allowed_skill_digests: BTreeMap::new(),
+        };
+        let before = engine.project(request()).await.unwrap();
+        let compactor = AgentSessionCompactor::new(
+            store.clone(),
+            Arc::new(DeterministicExtractiveSessionSummarizer::new(4096).unwrap()),
+            SessionCompactionPolicy {
+                minimum_source_records: 3,
+                keep_recent_records: 2,
+            },
+        )
+        .unwrap();
+        compactor
+            .compact_active_run_for_pressure(&session_id, &run_id)
+            .await
+            .unwrap()
+            .expect("older exchanges compact");
+        let after = engine.project(request()).await.unwrap();
+        let summaries = after
+            .messages
+            .iter()
+            .filter(|message| message.role == ModelRole::System)
+            .collect::<Vec<_>>();
+        assert!(!summaries.is_empty());
+        let summary = serde_json::to_string(&summaries).unwrap();
+        assert!(!summary.contains("private-step-"));
+        assert!(!summary.contains("fixture/continuation"));
+        assert!(
+            summary.contains("public-data"),
+            "ordinary Data remains visible"
+        );
+        let continuations = |messages: &[ModelMessage]| {
+            messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .filter_map(|content| match content {
+                    ModelContent::Continuation { value, .. } => Some(value.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let original_continuations = continuations(&before.messages);
+        assert_eq!(original_continuations.len(), 5);
+        assert_eq!(continuations(&after.messages), original_continuations[3..]);
+        let records = store.load_session(&session_id).await.unwrap();
+        assert_eq!(records[..originals.len()], originals);
+        let replay = engine
+            .project(SessionContextRequest {
+                through_session_seq: Some(originals.len() as u64),
+                ..request()
+            })
+            .await
+            .unwrap();
+        assert_eq!(replay.messages, before.messages);
     }
 
     #[tokio::test]

@@ -242,8 +242,16 @@ impl ModelMessage {
                 "model message content must not be empty",
             ));
         }
+        let mut continuations = BTreeSet::new();
         for content in &self.content {
             content.validate()?;
+            if let ModelContent::Continuation { namespace, .. } = content {
+                if self.role != ModelRole::Assistant || !continuations.insert(namespace) {
+                    return Err(ModelError::invalid_request(
+                        "continuation requires the Assistant role and a unique namespace",
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -261,6 +269,14 @@ pub enum ModelContent {
     },
     Data {
         media_type: String,
+        value: Value,
+    },
+    /// Opaque provider-owned state belonging to this entire Assistant message,
+    /// including all its parallel Tool calls. Retained in canonical history for
+    /// native continuation; never rendered as public text or a summary and never
+    /// passed to a Tool. A provider that cannot consume it must reject it.
+    Continuation {
+        namespace: String,
         value: Value,
     },
     ToolCall {
@@ -287,6 +303,9 @@ impl ModelContent {
             }
             Self::Data { media_type, .. } if media_type.trim().is_empty() => Err(
                 ModelError::invalid_request("model data requires a media type"),
+            ),
+            Self::Continuation { namespace, .. } if namespace.trim().is_empty() => Err(
+                ModelError::invalid_request("model continuation requires a namespace"),
             ),
             Self::ToolCall {
                 call_id,
@@ -367,6 +386,13 @@ pub enum ModelEvent {
     TextDelta {
         delta: String,
     },
+    /// Complete opaque state for the current Assistant message, once per
+    /// namespace. The consumer commits it only with a terminal Finish event.
+    /// This is not an output delta or a Tool argument fragment.
+    Continuation {
+        namespace: String,
+        value: Value,
+    },
     ToolCallStart {
         call_id: ModelToolCallId,
         name: String,
@@ -395,6 +421,9 @@ impl ModelEvent {
             Self::TextDelta { delta } if delta.is_empty() => {
                 Err(ModelError::protocol("text delta must not be empty"))
             }
+            Self::Continuation { namespace, .. } if namespace.trim().is_empty() => Err(
+                ModelError::protocol("model continuation requires a namespace"),
+            ),
             Self::ToolCallStart {
                 call_id,
                 name,
@@ -541,6 +570,32 @@ fn validate_extensions(extensions: &BTreeMap<String, Value>) -> Result<(), Model
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continuation_is_message_owned_and_never_valid_as_user_or_tool_content() {
+        let state = ModelContent::Continuation {
+            namespace: "provider/native/v1".to_owned(),
+            value: serde_json::json!({"opaque": " Ω\n"}),
+        };
+        let mut message = ModelMessage {
+            role: ModelRole::Assistant,
+            content: vec![state.clone()],
+        };
+        message.validate().unwrap();
+        let restored: ModelMessage =
+            serde_json::from_slice(&serde_json::to_vec(&message).unwrap()).unwrap();
+        assert_eq!(restored, message);
+        for role in [ModelRole::System, ModelRole::User, ModelRole::Tool] {
+            message.role = role;
+            assert!(message.validate().is_err());
+        }
+        message.role = ModelRole::Assistant;
+        message.content.push(state);
+        assert!(
+            message.validate().is_err(),
+            "one state per namespace, not one per parallel call"
+        );
+    }
 
     #[test]
     fn request_requires_unique_tools_and_namespaced_extensions() {

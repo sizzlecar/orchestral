@@ -1,5 +1,6 @@
 //! OpenAI-compatible HTTP adapter for the canonical Orchestral Model Protocol.
 
+mod continuation;
 mod endpoint;
 pub use endpoint::{discover_models, OpenAiEndpoint};
 mod sampling;
@@ -272,6 +273,10 @@ impl ModelBackend for OpenAiCompatibleBackend {
             "openai-compatible/model".to_owned(),
             Value::String(self.config.model.clone()),
         )]);
+        extensions.insert(
+            "openai-compatible/continuation".to_owned(),
+            Value::String(continuation::NAMESPACE.to_owned()),
+        );
         let encoding_identity = match self.tool_result_format {
             OpenAiToolResultFormat::Json => None,
             OpenAiToolResultFormat::Yaml => Some(tool_result::YAML_ENCODING_IDENTITY),
@@ -323,6 +328,29 @@ impl ModelBackend for OpenAiCompatibleBackend {
             }
             .map_err(map_transport_error)?;
             return Err(map_http_error(status, &bytes));
+        }
+        // Some compatible endpoints return a complete JSON response even to
+        // a streaming request. It follows the same canonical terminal rules.
+        if response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .is_some_and(|mime| mime.trim() == "application/json")
+            })
+        {
+            let bytes = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(cancelled_error()),
+                bytes = response.bytes() => bytes,
+            }
+            .map_err(map_transport_error)?;
+            let value = serde_json::from_slice(&bytes)
+                .map_err(|error| ModelError::protocol(format!("invalid OpenAI JSON: {error}")))?;
+            return Ok(stream::iter(parse_response(&request, &value)?.into_iter().map(Ok)).boxed());
         }
         Ok(openai_event_stream(
             request,
@@ -431,6 +459,7 @@ struct OpenAiStreamState {
     pending: VecDeque<Result<ModelStreamEvent, ModelError>>,
     sequence: u64,
     calls: BTreeMap<u64, OpenAiToolCallState>,
+    reasoning: continuation::Reasoning,
     finish_reason: Option<ModelFinishReason>,
     emitted_content: bool,
     terminated: bool,
@@ -485,6 +514,14 @@ impl OpenAiStreamState {
             .and_then(|choices| choices.first())
         {
             if let Some(delta) = choice.get("delta") {
+                if self.finish_reason.is_some()
+                    && delta.as_object().is_none_or(|delta| !delta.is_empty())
+                {
+                    return Err(ModelError::protocol(
+                        "OpenAI content arrived after finish_reason",
+                    ));
+                }
+                self.reasoning.append(delta)?;
                 if let Some(text) = delta
                     .get("content")
                     .and_then(Value::as_str)
@@ -613,21 +650,22 @@ impl OpenAiStreamState {
         if self.terminated {
             return Ok(());
         }
+        let mut reason = self
+            .finish_reason
+            .clone()
+            .ok_or_else(|| ModelError::protocol("OpenAI stream ended without finish_reason"))?;
         self.close_tool_calls()?;
-        if !self.emitted_content {
+        let continuation = std::mem::take(&mut self.reasoning).into_event();
+        if !self.emitted_content && continuation.is_none() {
             return Err(ModelError::protocol(
                 "OpenAI stream contained neither text nor Tool calls",
             ));
         }
-        let mut reason = self.finish_reason.clone().unwrap_or({
-            if self.calls.is_empty() {
-                ModelFinishReason::Stop
-            } else {
-                ModelFinishReason::ToolCalls
-            }
-        });
         if !self.calls.is_empty() && reason == ModelFinishReason::Stop {
             reason = ModelFinishReason::ToolCalls;
+        }
+        if let Some(continuation) = continuation {
+            self.emit(continuation)?;
         }
         self.emit(ModelEvent::Finish { reason })?;
         self.terminated = true;
@@ -649,6 +687,7 @@ fn openai_event_stream(
         pending: VecDeque::new(),
         sequence: 0,
         calls: BTreeMap::new(),
+        reasoning: continuation::Reasoning::default(),
         finish_reason: None,
         emitted_content: false,
         terminated: false,
@@ -770,11 +809,15 @@ fn encode_messages(
             ModelRole::Assistant => {
                 let mut text = Vec::new();
                 let mut calls = Vec::new();
+                let mut value = Map::new();
                 for content in &message.content {
                     match content {
                         ModelContent::Text { text: value } => text.push(value.clone()),
                         ModelContent::Json { value } | ModelContent::Data { value, .. } => {
                             text.push(value.to_string())
+                        }
+                        ModelContent::Continuation { namespace, value: state } => {
+                            continuation::insert(&mut value, namespace, state)?;
                         }
                         ModelContent::ToolCall {
                             call_id,
@@ -804,7 +847,6 @@ fn encode_messages(
                         }
                     }
                 }
-                let mut value = Map::new();
                 value.insert("role".to_owned(), Value::String("assistant".to_owned()));
                 value.insert(
                     "content".to_owned(),
@@ -865,7 +907,6 @@ fn flatten_text(content: &[ModelContent]) -> Result<String, ModelError> {
         .map(|parts| parts.join("\n"))
 }
 
-#[cfg(test)]
 fn parse_response(
     request: &ModelRequest,
     response: &Value,
@@ -880,6 +921,11 @@ fn parse_response(
         .and_then(Value::as_object)
         .ok_or_else(|| ModelError::protocol("OpenAI choice contains no message"))?;
     let mut payloads = Vec::new();
+    let mut reasoning = continuation::Reasoning::default();
+    reasoning.append(&Value::Object(message.clone()))?;
+    if let Some(continuation) = reasoning.into_event() {
+        payloads.push(continuation);
+    }
     if let Some(text) = message
         .get("content")
         .and_then(Value::as_str)
@@ -943,22 +989,20 @@ fn parse_response(
             "OpenAI response contains neither content nor Tool calls",
         ));
     }
-    let finish = if tool_count > 0 {
-        ModelFinishReason::ToolCalls
-    } else {
-        match choice.get("finish_reason").and_then(Value::as_str) {
-            Some("stop") | None => ModelFinishReason::Stop,
-            Some("length") => ModelFinishReason::Length,
-            Some("content_filter") => ModelFinishReason::ContentFilter,
-            Some("tool_calls") | Some("function_call") => ModelFinishReason::ToolCalls,
-            Some(_) => ModelFinishReason::Other,
-        }
-    };
+    let mut finish = map_finish_reason(
+        choice
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .filter(|reason| !reason.is_empty())
+            .ok_or_else(|| ModelError::protocol("OpenAI response omitted finish_reason"))?,
+    );
+    if tool_count > 0 && finish == ModelFinishReason::Stop {
+        finish = ModelFinishReason::ToolCalls;
+    }
     payloads.push(ModelEvent::Finish { reason: finish });
     Ok(sequence_events(request, payloads))
 }
 
-#[cfg(test)]
 fn sequence_events(request: &ModelRequest, payloads: Vec<ModelEvent>) -> Vec<ModelStreamEvent> {
     payloads
         .into_iter()
@@ -1067,7 +1111,7 @@ mod tests {
         }
     }
 
-    fn request() -> ModelRequest {
+    pub(super) fn request() -> ModelRequest {
         ModelRequest {
             request_id: ModelRequestId::new("request-1"),
             messages: vec![ModelMessage::text(ModelRole::User, "use echo")],

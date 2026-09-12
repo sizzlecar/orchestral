@@ -181,7 +181,15 @@ mod tests {
         let descriptor = json_backend.descriptor();
         assert_eq!(
             descriptor.extensions,
-            BTreeMap::from([("openai-compatible/model".to_owned(), json!("local-model"))])
+            BTreeMap::from([
+                ("openai-compatible/model".to_owned(), json!("local-model")),
+                // Native message continuation changes the backend recovery
+                // contract, independently of the unchanged JSON tool codec.
+                (
+                    "openai-compatible/continuation".to_owned(),
+                    json!(crate::continuation::NAMESPACE)
+                ),
+            ])
         );
         let resumed = backend().with_tool_result_format(OpenAiToolResultFormat::Json);
         assert_eq!(resumed.build_request_body(&request).unwrap(), body);
