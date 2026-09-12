@@ -31,6 +31,8 @@ static LOCAL_E2E_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[path = "agent_live_e2e/context_reliability.rs"]
 mod context_reliability;
+#[path = "agent_live_e2e/failure_diagnostics.rs"]
+mod failure_diagnostics;
 #[path = "agent_live_e2e/model_retry.rs"]
 mod model_retry;
 #[path = "agent_live_e2e/project_instructions.rs"]
@@ -3203,6 +3205,7 @@ fn run_with_piped_input(mut command: Command, input: &[u8], timeout: Duration) -
 }
 
 fn run_with_approval(mut command: Command, allow: bool, timeout: Duration) -> ProcessOutput {
+    let workspace = command.get_current_dir().map(Path::to_path_buf);
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -3246,6 +3249,16 @@ fn run_with_approval(mut command: Command, allow: bool, timeout: Duration) -> Pr
         stdout: stdout_reader.join().expect("join stdout reader"),
         stderr: stderr_reader.join().expect("join stderr reader"),
     };
+    if timed_out {
+        // The child is already reaped. Keep the original failure below, and
+        // inspect only this fixture's public committed journal metadata.
+        if let Some(workspace) = &workspace {
+            eprintln!(
+                "approval timeout journal metadata: {}",
+                failure_diagnostics::read(workspace)
+            );
+        }
+    }
     assert!(
         approvals_sent > 0,
         "CLI never opened an approval request (status={}):\nstdout:\n{}\nstderr:\n{}",
