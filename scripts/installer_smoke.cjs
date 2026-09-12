@@ -7,6 +7,15 @@ const http = require('node:http');
 const crypto = require('node:crypto');
 const { execFileSync, spawn } = require('node:child_process');
 const windows = process.platform === 'win32';
+function windowsPowerShellEnvironment(extra) {
+  const environment = { ...process.env, ...extra };
+  // pwsh -> Node -> Windows PowerShell does not get pwsh's direct-child
+  // module-path filtering. Let Windows PowerShell construct its own defaults.
+  for (const key of Object.keys(environment)) {
+    if (key.toUpperCase() === 'PSMODULEPATH') delete environment[key];
+  }
+  return environment;
+}
 const binary = path.resolve(process.argv[2] || `target/debug/orchestral${windows ? '.exe' : ''}`);
 const version = execFileSync(binary, ['--version'], { encoding: 'utf8' }).trim().split(' ')[1];
 const target = windows ? 'x86_64-pc-windows-msvc' : process.platform === 'darwin' ? `${process.arch === 'arm64' ? 'aarch64' : 'x86_64'}-apple-darwin` : 'x86_64-unknown-linux-gnu';
@@ -18,7 +27,7 @@ fs.copyFileSync(binary, path.join(root, name, windows ? 'orchestral.exe' : 'orch
 if (windows) {
   // Use an encoded command and positional paths passed via process-only variables.
   const encoded = Buffer.from(`Add-Type -AssemblyName System.IO.Compression.FileSystem; [IO.Compression.ZipFile]::CreateFromDirectory($env:ORCHESTRAL_PACKAGE_INPUT,$env:ORCHESTRAL_PACKAGE_OUTPUT,0,$true)`, 'utf16le').toString('base64');
-  execFileSync('powershell.exe', ['-NoProfile', '-EncodedCommand', encoded], { env: { ...process.env, ORCHESTRAL_PACKAGE_INPUT: path.join(root, name), ORCHESTRAL_PACKAGE_OUTPUT: path.join(root, asset) } });
+  execFileSync('powershell.exe', ['-NoProfile', '-EncodedCommand', encoded], { env: windowsPowerShellEnvironment({ ORCHESTRAL_PACKAGE_INPUT: path.join(root, name), ORCHESTRAL_PACKAGE_OUTPUT: path.join(root, asset) }) });
 } else {
   execFileSync('tar', ['-czf', path.join(root, asset), '-C', root, name]);
 }
@@ -35,7 +44,8 @@ const installed = path.join(installDir, windows ? 'orchestral.exe' : 'orchestral
 function install(base) {
   const args = windows ? ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.resolve('scripts/install.ps1'), '-Version', version, '-InstallDir', installDir, '-NoModifyPath', '-ReleaseBaseUrl', base] : [path.resolve('scripts/install.sh'), '--version', version, '--dir', installDir, '--no-modify-path'];
   return new Promise((resolve, reject) => {
-    const child = spawn(windows ? 'powershell.exe' : 'sh', args, { env: { ...process.env, ORCHESTRAL_RELEASE_BASE_URL: base }, stdio: ['ignore', 'pipe', 'pipe'] });
+    const env = windows ? windowsPowerShellEnvironment({ ORCHESTRAL_RELEASE_BASE_URL: base }) : { ...process.env, ORCHESTRAL_RELEASE_BASE_URL: base };
+    const child = spawn(windows ? 'powershell.exe' : 'sh', args, { env, stdio: ['ignore', 'pipe', 'pipe'] });
     let output = '';
     child.stdout.on('data', chunk => { output += chunk; });
     child.stderr.on('data', chunk => { output += chunk; });
