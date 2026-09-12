@@ -10,6 +10,7 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 readme = "../../README.md"
+include = ["Cargo.toml", "Cargo.lock", "build.rs", "src/**", "web-dist/**"]
 
 [[bin]]
 name = "orchestral"
@@ -19,13 +20,13 @@ path = "src/main.rs"
 orchestral-core = { workspace = true }
 orchestral-runtime = { workspace = true }
 orchestral-agent-codex = { workspace = true }
-orchestral-agent-journal-fs = { path = "../../plugins/orchestral-agent-journal-fs" }
+orchestral-agent-journal-fs = { workspace = true }
 orchestral-artifact-r2 = { workspace = true }
-orchestral-blob-fs = { path = "../../plugins/orchestral-blob-fs" }
+orchestral-blob-fs = { workspace = true }
 orchestral-model-gemini = { workspace = true }
 orchestral-model-openai = { workspace = true }
-orchestral-mcp-streamable-http = { path = "../../plugins/orchestral-mcp-streamable-http" }
-orchestral-project-instructions-fs = { path = "../../plugins/orchestral-project-instructions-fs" }
+orchestral-mcp-streamable-http = { workspace = true }
+orchestral-project-instructions-fs = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

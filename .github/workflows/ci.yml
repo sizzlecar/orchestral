@@ -77,6 +77,9 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
 
+      - name: Check workspace targets
+        run: cargo check --locked --workspace --all-targets
+
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
@@ -152,3 +155,45 @@ jobs:
           path: web/orchestral-web/dist/
           if-no-files-found: error
           retention-days: 7
+
+  package-checks:
+    name: Verify crates.io packages
+    needs: web-checks
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cargo-packages
+      - name: Replace workspace PWA with this run's tested bundle
+        run: rm -rf web/orchestral-web/dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/orchestral-web/dist
+      - name: Prepare self-contained package inputs
+        run: |
+          cargo run --locked -p orchestral-release -- prepare --output target/release-plan
+          cargo run --locked -p orchestral-release -- stage-web
+      - name: Build the actual crates.io packages without publishing
+        run: cargo publish --workspace --locked --allow-dirty --dry-run
+      - name: Retain verified crate bytes and their tested PWA
+        run: |
+          version=$(cat target/release-plan/version.txt)
+          mkdir -p target/cargo-distribution
+          cp target/release-plan/release.json target/cargo-distribution/
+          for name in $(jq -r '.packages[]' target/release-plan/release.json); do
+            cp "target/package/$name-$version.crate" target/cargo-distribution/
+          done
+          archive="orchestral-web-v$version.tar.gz"
+          tar -czf "target/cargo-distribution/$archive" -C web/orchestral-web/dist .
+          cd target/cargo-distribution
+          sha256sum "$archive" > "$archive.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cargo-distribution
+          path: target/cargo-distribution/
+          if-no-files-found: error
+          retention-days: 14

@@ -27,6 +27,7 @@ members = [
     "testing/orchestral-agent-protocol-testkit",
     "testing/orchestral-model-protocol-testkit",
     "testing/orchestral-coding-eval",
+    "tools/orchestral-release",
 ]
 
 [workspace.package]
@@ -34,7 +35,7 @@ version = "0.3.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/sizzlecar/orchestral"
-homepage = "https://github.com/sizzlecar/orchestral"
+homepage = "https://orch.pandaailabs.com"
 keywords = ["orchestration", "agent", "workflow", "llm", "dag"]
 categories = ["asynchronous", "command-line-utilities"]
 
@@ -81,7 +82,7 @@ ignore = "0.4"
 fs2 = "0.4"
 
 # Internal crates - Core
-orchestral = { path = "core/orchestral" }
+orchestral = { path = "core/orchestral", version = "0.3.0" }
 orchestral-core = { path = "core/orchestral-core", version = "0.3.0" }
 orchestral-runtime = { path = "core/orchestral-runtime", version = "0.3.0" }
 orchestral-agent-acp = { path = "plugins/orchestral-agent-acp", version = "0.3.0" }
@@ -89,4 +90,8 @@ orchestral-agent-codex = { path = "plugins/orchestral-agent-codex", version = "0
 orchestral-artifact-r2 = { path = "plugins/orchestral-artifact-r2", version = "0.3.0" }
 orchestral-model-gemini = { path = "plugins/orchestral-model-gemini", version = "0.3.0" }
 orchestral-model-openai = { path = "plugins/orchestral-model-openai", version = "0.3.0" }
+orchestral-agent-journal-fs = { path = "plugins/orchestral-agent-journal-fs", version = "0.3.0" }
+orchestral-blob-fs = { path = "plugins/orchestral-blob-fs", version = "0.3.0" }
+orchestral-mcp-streamable-http = { path = "plugins/orchestral-mcp-streamable-http", version = "0.3.0" }
+orchestral-project-instructions-fs = { path = "plugins/orchestral-project-instructions-fs", version = "0.3.0" }
 orchestral-model-protocol-testkit = { path = "testing/orchestral-model-protocol-testkit" }

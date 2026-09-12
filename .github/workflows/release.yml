@@ -19,36 +19,25 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install repository Rust toolchain
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-tools
       - name: Check release version and notes
         id: version
         env:
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          python3 - <<'PY'
-          import os
-          import re
-          from pathlib import Path
-
-          manifest = Path("Cargo.toml").read_text().split("[workspace.package]", 1)[1]
-          version = re.search(r'^version = "([^"]+)"$', manifest, re.M)[1]
-          if not re.fullmatch(r"\d+\.\d+\.\d+", version):
-              raise SystemExit("Release version must be MAJOR.MINOR.PATCH")
-          if os.environ["REF_TYPE"] == "tag" and os.environ["REF_NAME"] != f"v{version}":
-              raise SystemExit("Tag does not match workspace version")
-          heading = f"## [{version}]"
-          changelog = Path("CHANGELOG.md").read_text()
-          if heading not in changelog:
-              raise SystemExit("Release notes are missing")
-          notes = changelog.split(heading, 1)[1].split("\n## [", 1)[0].lstrip(" -\n")
-          Path("release-notes.md").write_text(notes)
-          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              output.write(f"version={version}\n")
-          PY
+          args=(prepare --output target/release-plan)
+          if [ "$REF_TYPE" = tag ]; then args+=(--tag "$REF_NAME"); fi
+          version=$(cargo run --locked --quiet -p orchestral-release -- "${args[@]}")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
-          name: release-notes
-          path: release-notes.md
+          name: release-plan
+          path: target/release-plan/
           if-no-files-found: error
 
   checks:
@@ -109,11 +98,18 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           pattern: release-*
           path: release
           merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: cargo-distribution
+          path: release
+      - name: Generate Homebrew formula from verified native archives
+        run: cargo run --locked -p orchestral-release -- formula --assets release --output release/orchestral.rb
       - name: Create release draft
         env:
           GH_TOKEN: ${{ github.token }}
@@ -121,5 +117,6 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           gh release create "$RELEASE_TAG" release/*.tar.gz release/*.zip release/*.sha256 \
+            release/*.crate release/orchestral.rb release/version.txt release/release.json \
             --verify-tag --draft --title "Orchestral $RELEASE_TAG" \
             --notes-file release/release-notes.md

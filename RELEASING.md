@@ -24,6 +24,7 @@ pre-1.0. Agent Protocol v1 is a wire contract version, separate from the package
 bash scripts/check_workspace.sh
 bash scripts/check_agent_surface.sh
 cargo fmt --all -- --check
+cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 cargo test --locked --workspace --all-targets
 cargo test --locked --workspace --doc
@@ -43,6 +44,22 @@ When disk space is limited, set `CARGO_INCREMENTAL=0`, `CARGO_PROFILE_DEV_DEBUG=
 Live model, native Codex, and local MCP tests require their documented environment and explicit
 `--ignored` selection. The **Live Model Smoke** workflow is manual and may incur model charges.
 Record which optional checks and manual terminal/device acceptance checks actually ran.
+
+CI also verifies the crates.io packages with Cargo's workspace publication dry run:
+
+```sh
+cargo run --locked -p orchestral-release -- prepare --output target/release-plan
+cargo run --locked -p orchestral-release -- stage-web
+cargo publish --workspace --locked --allow-dirty --dry-run
+```
+
+Run these commands after building and testing the PWA. `stage-web` copies that bundle into
+the ignored `apps/orchestral-cli/web-dist/` packaging input; it is not a second committed
+distribution. The CLI package includes this directory, so `cargo install` does not depend on
+paths outside the crate. Normal workspace builds use the canonical `web/orchestral-web/dist/`.
+Remove the staged directory before returning to PWA development to use fresh workspace assets.
+The dry run compiles the packaged sources and checks the publishable dependency graph without
+uploading anything. Protocol testkits, examples, web source, and the release helper stay unpublished.
 
 ## Build archives
 
@@ -91,6 +108,8 @@ and use the website's `irm ... | iex` command. The installer does not change exe
 
 Default directories are `~/.local/bin` on Unix and `%LOCALAPPDATA%\Orchestral\bin` on Windows.
 Omit the version to use the latest public release; rerun with an earlier version to roll back.
+The scripts resolve `version.txt` and download archives directly from the public GitHub Release;
+the static website does not need an asset proxy.
 Checksums and `--version` are verified before replacing the current executable. A failed
 download or hash check leaves the current binary unchanged. During release preparation,
 no public assets exist and the installer reports that status instead of claiming success.
@@ -129,4 +148,48 @@ For a rehearsal, run **Release** with `workflow_dispatch` on a branch. This runs
 uploads downloadable workflow artifacts without creating a tag or a GitHub Release. A failed
 CI job or missing artifact prevents the draft step from running.
 
-This process does not run `cargo publish`, deploy a Host, or restart an existing service.
+The draft also contains the verified `.crate` files, their tested PWA archive, `release.json`
+(version, source commit, package inventory), `version.txt`, and a Homebrew formula generated from
+the native archive checksums. Keep these artifacts together when reviewing the release.
+
+## Cargo and Homebrew publication
+
+The **Release distribution** workflow starts when a stable GitHub Release is published. It can
+also be dispatched with an existing public tag to retry an interrupted distribution. Its workflow
+must already be on the default branch before publishing the release.
+
+Before the first distribution, initialize the public `sizzlecar/homebrew-orchestral` repository
+with a default branch, and configure these repository secrets through the normal GitHub settings:
+
+- `CARGO_TOKEN`: crates.io publication rights for the workspace packages.
+- `RELEASE_GITHUB_TOKEN`: write access to `sizzlecar/homebrew-orchestral`.
+
+Missing credentials fail the relevant job; they do not silently skip a channel. No credentials are
+stored in release artifacts. Cargo uses its normal registry authentication and dependency ordering.
+The helper checks the public index: already published versions must be unyanked and have exactly
+the reviewed archive checksum. It regenerates only missing packages, compares their bytes to the
+verified draft artifacts, then publishes them. `--no-verify` at this final upload stage reuses the
+earlier full package verification; it does not substitute for that CI check. Source commit, version,
+and package inventory must match the reviewed release.
+
+Crates.io publication is not atomic. If a later package fails after dependencies were uploaded,
+retry the same reviewed release. A mismatching existing version is an error, not something the
+workflow overwrites. The Homebrew job separately requires the tag to remain the latest stable
+release, so replaying an older release cannot downgrade the tap.
+
+After publication, the workflow installs the public crate on Linux, installs and tests the tap on
+Linux and both supported macOS architectures, and runs the public-asset installers on all four
+archive targets. Its final result requires all publication and installation jobs to succeed.
+These are install/version/help checks; they do not claim live model or sandbox capability on every
+host. Website deployment, live agent validation, and Host operations remain separate.
+
+Once those channels are actually published, users can install the release with:
+
+```sh
+cargo install orchestral-cli --version 0.3.0 --locked
+brew install sizzlecar/orchestral/orchestral
+```
+
+Before the first 0.3.0 publication, do not advertise these as available 0.3.0 binaries. The public
+registry already contains the older 0.1.0 and 0.2.0 packages; the absence of a GitHub Release does
+not mean crates.io is empty.
