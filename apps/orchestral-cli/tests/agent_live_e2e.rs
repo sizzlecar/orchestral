@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1758,9 +1758,22 @@ fn local_cli_remembers_a_risky_mcp_approval_for_the_host_session() {
 
 #[test]
 fn local_cli_routes_structured_host_execution_through_the_approval_prompt() {
+    assert_host_execution_approval(false);
+}
+
+#[cfg(windows)]
+#[test]
+fn local_cli_routes_host_approval_with_inbox_powershell_modules() {
+    assert_host_execution_approval(true);
+}
+
+fn assert_host_execution_approval(use_inbox_powershell_modules: bool) {
     let _guard = local_e2e_guard();
     const EXTERNAL_MARKER: &str = "HOST_EXECUTION_APPROVED_雪豹_7319";
     const FINAL_MARKER: &str = "HOST_APPROVAL_E2E_OK";
+    let timing = Arc::new(ApprovalTiming::new());
+    let first_request_timing = timing.clone();
+    let tool_exit_timing = timing.clone();
 
     let workspace = TestWorkspace::new("host-approval");
     let external = TestWorkspace::new("host-approval-external");
@@ -1775,6 +1788,7 @@ fn local_cli_routes_structured_host_execution_through_the_approval_prompt() {
 
     let (model_endpoint, model_server) = spawn_fixture_http_server(vec![
         Box::new(move |request| {
+            first_request_timing.mark("first_model_request");
             assert!(model_request_has_tool(&request.body, "exec_command"));
             let request_json = request.body.to_string();
             assert!(
@@ -1791,7 +1805,15 @@ fn local_cli_routes_structured_host_execution_through_the_approval_prompt() {
                 "approved-host-read",
                 "exec_command",
                 json!({
-                    "cmd": if cfg!(windows) { "Get-Content -LiteralPath evidence.txt -Encoding UTF8" } else { "cat evidence.txt" },
+                    "cmd": if cfg!(windows) {
+                        if use_inbox_powershell_modules {
+                            "$env:PSModulePath = [IO.Path]::Combine($PSHOME, 'Modules'); Get-Content -LiteralPath evidence.txt -Encoding UTF8"
+                        } else {
+                            "Get-Content -LiteralPath evidence.txt -Encoding UTF8"
+                        }
+                    } else {
+                        "cat evidence.txt"
+                    },
                     "workdir": external_root,
                     "sandbox_permissions": "require_escalated",
                     "justification": "Read the external fixture explicitly requested by the user",
@@ -1800,10 +1822,11 @@ fn local_cli_routes_structured_host_execution_through_the_approval_prompt() {
                 }),
             )
         }),
-        Box::new(|request| {
+        Box::new(move |request| {
             if let Some(response) = continue_exec_until_exit(request) {
                 return response;
             }
+            tool_exit_timing.mark("tool_exit_observed");
             let context = model_request_text(&request.body);
             assert!(context.contains(EXTERNAL_MARKER), "{context}");
             assert!(
@@ -1816,7 +1839,7 @@ fn local_cli_routes_structured_host_execution_through_the_approval_prompt() {
     ]);
     workspace.configure_local_openai(&model_endpoint);
 
-    let output = run_with_approval(
+    let output = run_with_approval_observed(
         local_default_agent_command(
             &workspace,
             "host-approval-session",
@@ -1826,6 +1849,7 @@ fn local_cli_routes_structured_host_execution_through_the_approval_prompt() {
         ),
         true,
         LOCAL_PROCESS_TIMEOUT,
+        Some(&timing),
     );
     assert!(output.status.success(), "{}", output.stderr_text());
     assert_eq!(output.stdout_text().trim(), FINAL_MARKER);
@@ -3384,21 +3408,64 @@ fn run_with_piped_input(mut command: Command, input: &[u8], timeout: Duration) -
     }
 }
 
-fn run_with_approval(mut command: Command, allow: bool, timeout: Duration) -> ProcessOutput {
+// Fixed call sites record only their first monotonic observation. No command,
+// environment, output content or unbounded per-poll history enters this map.
+struct ApprovalTiming {
+    started: Instant,
+    elapsed_ms: Mutex<std::collections::BTreeMap<&'static str, u128>>,
+}
+
+impl ApprovalTiming {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            elapsed_ms: Mutex::new(Default::default()),
+        }
+    }
+
+    fn mark(&self, phase: &'static str) {
+        let elapsed = self.started.elapsed().as_millis();
+        self.elapsed_ms
+            .lock()
+            .unwrap()
+            .entry(phase)
+            .or_insert(elapsed);
+    }
+}
+
+fn run_with_approval(command: Command, allow: bool, timeout: Duration) -> ProcessOutput {
+    run_with_approval_observed(command, allow, timeout, None)
+}
+
+fn run_with_approval_observed(
+    mut command: Command,
+    allow: bool,
+    timeout: Duration,
+    timing: Option<&Arc<ApprovalTiming>>,
+) -> ProcessOutput {
+    let mark = |phase| {
+        if let Some(timing) = timing {
+            timing.mark(phase);
+        }
+    };
     let workspace = command.get_current_dir().map(Path::to_path_buf);
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    mark("spawn_started");
     let mut child = command.spawn().expect("spawn approval E2E");
+    mark("spawn_returned");
     let mut stdin = child.stdin.take().expect("capture stdin");
     let stdout = child.stdout.take().expect("capture stdout");
     let stderr = child.stderr.take().expect("capture stderr");
-    let stdout_reader = thread::spawn(move || read_all(stdout));
+    let stdout_timing = timing.cloned();
+    let stdout_reader = thread::spawn(move || read_all_observed(stdout, stdout_timing));
     let (stderr_updates, receiver) = mpsc::channel();
     let stderr_reader = thread::spawn(move || read_with_updates(stderr, stderr_updates));
 
     let started = Instant::now();
+    mark("deadline_started");
     let mut approvals_sent = 0_usize;
     let mut exited = None;
     while started.elapsed() < timeout {
@@ -3406,29 +3473,44 @@ fn run_with_approval(mut command: Command, allow: bool, timeout: Duration) -> Pr
             let text = String::from_utf8_lossy(&bytes);
             let observed_prompts = text.matches(APPROVAL_PROMPT).count();
             while approvals_sent < observed_prompts {
+                mark("approval_prompt_observed");
                 stdin
                     .write_all(if allow { b"y\n" } else { b"n\n" })
                     .expect("answer approval prompt");
                 stdin.flush().expect("flush approval answer");
+                mark("approval_answer_flushed");
                 approvals_sent += 1;
             }
         }
         if let Some(status) = child.try_wait().expect("poll approval child") {
+            mark("child_exit_observed");
             exited = Some(status);
             break;
         }
     }
     let timed_out = exited.is_none() && started.elapsed() >= timeout;
     if timed_out {
+        mark("deadline_exceeded");
         let _ = child.kill();
+        mark("kill_returned");
     }
     drop(stdin);
     let status = exited.unwrap_or_else(|| child.wait().expect("wait for approval child"));
+    mark("child_status_collected");
     let output = ProcessOutput {
         status,
         stdout: stdout_reader.join().expect("join stdout reader"),
         stderr: stderr_reader.join().expect("join stderr reader"),
     };
+    mark("output_drained");
+    if timed_out || !output.status.success() {
+        if let Some(timing) = timing {
+            eprintln!(
+                "approval monotonic observations (ms): {}",
+                serde_json::to_string(&*timing.elapsed_ms.lock().unwrap()).unwrap()
+            );
+        }
+    }
     if timed_out {
         // The child is already reaped. Keep the original failure below, and
         // inspect only this fixture's public committed journal metadata.
@@ -3474,6 +3556,23 @@ fn read_all(mut stream: impl Read) -> Vec<u8> {
     let mut bytes = Vec::new();
     stream.read_to_end(&mut bytes).expect("read process stream");
     bytes
+}
+
+fn read_all_observed(mut stream: impl Read, timing: Option<Arc<ApprovalTiming>>) -> Vec<u8> {
+    let Some(timing) = timing else {
+        return read_all(stream);
+    };
+    let mut first = [0_u8; 1];
+    match stream.read_exact(&mut first) {
+        Ok(()) => {
+            timing.mark("first_stdout_observed");
+            let mut bytes = first.to_vec();
+            stream.read_to_end(&mut bytes).expect("read process stream");
+            bytes
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Vec::new(),
+        Err(error) => panic!("read process stream: {error}"),
+    }
 }
 
 fn read_with_updates(mut stream: impl Read, updates: mpsc::Sender<Vec<u8>>) -> Vec<u8> {
