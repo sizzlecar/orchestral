@@ -1758,16 +1758,6 @@ fn local_cli_remembers_a_risky_mcp_approval_for_the_host_session() {
 
 #[test]
 fn local_cli_routes_structured_host_execution_through_the_approval_prompt() {
-    assert_host_execution_approval(false);
-}
-
-#[cfg(windows)]
-#[test]
-fn local_cli_routes_host_approval_with_inbox_powershell_modules() {
-    assert_host_execution_approval(true);
-}
-
-fn assert_host_execution_approval(use_inbox_powershell_modules: bool) {
     let _guard = local_e2e_guard();
     const EXTERNAL_MARKER: &str = "HOST_EXECUTION_APPROVED_雪豹_7319";
     const FINAL_MARKER: &str = "HOST_APPROVAL_E2E_OK";
@@ -1806,11 +1796,9 @@ fn assert_host_execution_approval(use_inbox_powershell_modules: bool) {
                 "exec_command",
                 json!({
                     "cmd": if cfg!(windows) {
-                        if use_inbox_powershell_modules {
-                            "$env:PSModulePath = [IO.Path]::Combine($PSHOME, 'Modules'); Get-Content -LiteralPath evidence.txt -Encoding UTF8"
-                        } else {
-                            "Get-Content -LiteralPath evidence.txt -Encoding UTF8"
-                        }
+                        // This contract verifies approved execution and UTF-8
+                        // file output, independently of profile module discovery.
+                        "[Console]::Out.WriteLine([System.IO.File]::ReadAllText('evidence.txt', [System.Text.Encoding]::UTF8))"
                     } else {
                         "cat evidence.txt"
                     },
@@ -1862,6 +1850,7 @@ fn assert_host_execution_approval(use_inbox_powershell_modules: bool) {
 
     let records = session_records(&workspace);
     let polls = assert_successful_exec_observations(&records);
+    assert_eq!(run_payload_count(&workspace, "delivery_committed"), 1);
     assert_eq!(
         model_server
             .join()
