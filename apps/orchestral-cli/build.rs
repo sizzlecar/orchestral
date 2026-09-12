@@ -8,13 +8,13 @@ fn main() {
         println!("cargo:rustc-link-arg-bin=orchestral=/STACK:8388608");
     }
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    // Registry packages contain the tested PWA inside the crate. Workspace
-    // builds use the canonical generated distribution without duplicating it.
-    let packaged = manifest.join("web-dist");
-    let assets = if packaged.is_dir() {
-        packaged
+    // Workspace builds require the canonical distribution, even when an older
+    // packaged copy exists. Standalone registry packages carry their own PWA.
+    let web_crate = manifest.join("../../web/orchestral-web");
+    let assets = if web_crate.join("Cargo.toml").is_file() {
+        web_crate.join("dist")
     } else {
-        manifest.join("../../web/orchestral-web/dist")
+        manifest.join("web-dist")
     };
     assert!(
         assets.join("index.html").is_file(),
