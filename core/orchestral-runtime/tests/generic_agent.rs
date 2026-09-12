@@ -884,6 +884,7 @@ struct BudgetGuardToolLoopModel {
     rounds: AtomicUsize,
     oversized_dispatches: AtomicUsize,
     input_budget: u64,
+    input_counts: Mutex<Vec<u64>>,
 }
 
 struct PressureCompactionModel {
@@ -1709,9 +1710,10 @@ impl ModelBackend for BudgetGuardToolLoopModel {
         _cancellation: CancellationToken,
     ) -> Result<ModelStream, ModelError> {
         request.validate()?;
-        let input_tokens = serde_jcs::to_vec(&(&request.messages, &request.tools))
-            .expect("test request is serializable")
-            .len() as u64;
+        let input_tokens = JsonSizeTokenMeter::new(1)
+            .unwrap()
+            .count_request_input(&request.messages, &request.tools)?;
+        self.input_counts.lock().unwrap().push(input_tokens);
         if input_tokens > self.input_budget {
             self.oversized_dispatches.fetch_add(1, Ordering::SeqCst);
         }
@@ -1762,7 +1764,7 @@ impl ModelBackend for BudgetGuardToolLoopModel {
                 event_id: ModelEventId::new("budget-answer"),
                 sequence: 1,
                 payload: ModelEvent::TextDelta {
-                    delta: "oversized request reached backend".to_owned(),
+                    delta: "second model round reached backend".to_owned(),
                 },
             }),
             Ok(ModelStreamEvent {
@@ -8315,9 +8317,7 @@ async fn run_non_fatal_tool_case(
 
 #[tokio::test]
 async fn every_model_round_reprojects_context_before_backend_dispatch() {
-    const MAX_CONTEXT_TOKENS: u64 = 3_000;
     const RESERVED_OUTPUT_TOKENS: u64 = 500;
-    const INPUT_BUDGET_TOKENS: u64 = MAX_CONTEXT_TOKENS - RESERVED_OUTPUT_TOKENS;
 
     let bounds = ToolPolicyBounds {
         approval: ApprovalPolicy::NotRequired,
@@ -8339,6 +8339,7 @@ async fn every_model_round_reprojects_context_before_backend_dispatch() {
         )
         .unwrap(),
     );
+    let large_result = "large-inline-result/".repeat(300);
     runtime
         .register(
             ToolDescriptor {
@@ -8367,65 +8368,107 @@ async fn every_model_round_reprojects_context_before_backend_dispatch() {
                 concurrency: ToolConcurrency::ParallelSafe,
             },
             Arc::new(LargeResultTool {
-                value: "large-inline-result/".repeat(300),
+                value: large_result.clone(),
             }),
         )
         .unwrap();
-    let model = Arc::new(BudgetGuardToolLoopModel {
-        rounds: AtomicUsize::new(0),
-        oversized_dispatches: AtomicUsize::new(0),
-        input_budget: INPUT_BUDGET_TOKENS,
-    });
     let mut config = GenericAgentConfig::new("internal-provider", "generic-agent");
-    config.max_context_tokens = MAX_CONTEXT_TOKENS;
     config.reserved_output_tokens = RESERVED_OUTPUT_TOKENS;
-    let provider = Arc::new(
-        InternalGenericAgentProvider::new_with_tools_and_session_journal(
-            model.clone(),
-            config,
-            runtime,
-            RunToolGrant { bounds },
-            Arc::new(InMemoryAgentSessionJournalStore::default()),
-            Arc::new(JsonSizeTokenMeter::new(1).unwrap()),
-        )
-        .unwrap(),
-    );
-    let controller = Arc::new(
-        AgentController::new(provider, ProviderBindingRef::new("generic-binding")).unwrap(),
-    );
-    let run_id = RunId::new("context-budget-run");
-    let execution = controller
-        .start(
-            AgentRunEnvelope::new(
-                AGENT_PROTOCOL_V1,
-                AgentSessionId::new("context-budget-session"),
-                run_id.clone(),
-                vec![Content::text("call the large echo tool")],
+    let mut input_budget = config.max_context_tokens - RESERVED_OUTPUT_TOKENS;
+
+    // Measure the actual provider-built typed requests with the same meter as
+    // admission. This includes current system instructions and tool schemas;
+    // their growth must not turn a second-round overflow test into a first-round
+    // rejection. The second run admits exactly the measured first request.
+    for phase in ["measure", "bounded"] {
+        let model = Arc::new(BudgetGuardToolLoopModel {
+            rounds: AtomicUsize::new(0),
+            oversized_dispatches: AtomicUsize::new(0),
+            input_budget,
+            input_counts: Mutex::new(Vec::new()),
+        });
+        config.max_context_tokens = input_budget + RESERVED_OUTPUT_TOKENS;
+        let journal = Arc::new(InMemoryAgentSessionJournalStore::default());
+        let provider = Arc::new(
+            InternalGenericAgentProvider::new_with_tools_and_session_journal(
+                model.clone(),
+                config.clone(),
+                runtime.clone(),
+                RunToolGrant {
+                    bounds: bounds.clone(),
+                },
+                journal.clone(),
+                Arc::new(JsonSizeTokenMeter::new(1).unwrap()),
             )
             .unwrap(),
+        );
+        let controller = Arc::new(
+            AgentController::new(provider, ProviderBindingRef::new("generic-binding")).unwrap(),
+        );
+        let run_id = RunId::new(format!("context-budget-{phase}-run"));
+        let session_id = AgentSessionId::new(format!("context-budget-{phase}-session"));
+        let execution = controller
+            .start(
+                AgentRunEnvelope::new(
+                    AGENT_PROTOCOL_V1,
+                    session_id.clone(),
+                    run_id.clone(),
+                    vec![Content::text("call the large echo tool")],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let view = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            controller.wait_for_terminal(&execution.run_id),
         )
         .await
+        .expect("context check reaches a terminal boundary")
         .unwrap();
-    let view = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        controller.wait_for_terminal(&execution.run_id),
-    )
-    .await
-    .expect("context overflow reaches a terminal boundary")
-    .unwrap();
 
-    assert_eq!(view.state.status(), AgentRunStatus::Failed);
-    assert_eq!(model.rounds.load(Ordering::SeqCst), 1);
-    assert_eq!(model.oversized_dispatches.load(Ordering::SeqCst), 0);
-    assert!(controller
-        .events(&run_id, 0)
-        .await
-        .unwrap()
-        .iter()
-        .any(|record| matches!(
-            &record.event.payload,
-            AgentEvent::RunFailed { failure } if failure.code == "context_overflow"
-        )));
+        assert_eq!(model.oversized_dispatches.load(Ordering::SeqCst), 0);
+        assert!(
+            journal
+                .load_session(&session_id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|record| match &record.payload {
+                    AgentSessionEvent::ToolExchangeCommitted { tool, .. } => {
+                        tool.content.iter().any(|content| {
+                            matches!(content,
+                            ModelContent::ToolResult { result, is_error: false, .. }
+                            if result == &json!({"result": large_result}))
+                        })
+                    }
+                    _ => false,
+                }),
+            "the real large Tool result must be committed before the overflow check"
+        );
+        let counts = model.input_counts.lock().unwrap().clone();
+        if phase == "measure" {
+            assert_eq!(view.state.status(), AgentRunStatus::Delivered);
+            assert_eq!(model.rounds.load(Ordering::SeqCst), 2);
+            assert_eq!(counts.len(), 2);
+            assert!(counts[0] > 0 && counts[1] > counts[0], "{counts:?}");
+            input_budget = counts[0];
+            continue;
+        }
+
+        assert_eq!(view.state.status(), AgentRunStatus::Failed);
+        assert_eq!(model.rounds.load(Ordering::SeqCst), 1);
+        assert_eq!(counts, vec![input_budget]);
+        assert!(controller
+            .events(&run_id, 0)
+            .await
+            .unwrap()
+            .iter()
+            .any(|record| matches!(
+                &record.event.payload,
+                AgentEvent::RunFailed { failure } if failure.code == "context_overflow"
+            )));
+    }
 }
 
 #[tokio::test]
