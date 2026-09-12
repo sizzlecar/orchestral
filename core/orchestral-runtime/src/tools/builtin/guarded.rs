@@ -659,14 +659,7 @@ async fn read_one_bounded_line(
                 result = reader.fill_buf() => result.map_err(FilePageError::Io)?,
             };
             if available.is_empty() {
-                if !validator.finish() {
-                    return Err(FilePageError::NotUtf8 { line: 0 });
-                }
-                return if saw_bytes {
-                    Ok(Some(BoundedLine { prefix, truncated }))
-                } else {
-                    Ok(None)
-                };
+                break;
             }
             let consumed = available
                 .iter()
@@ -689,16 +682,25 @@ async fn read_one_bounded_line(
         };
         reader.consume(consumed);
         if ended {
-            if !validator.finish() {
-                return Err(FilePageError::NotUtf8 { line: 0 });
-            }
-            while std::str::from_utf8(&prefix).is_err() {
-                prefix.pop();
-                truncated = true;
-            }
-            return Ok(Some(BoundedLine { prefix, truncated }));
+            break;
         }
     }
+    // Validate the entire line, including discarded bytes, before repairing a
+    // retained prefix cut through a scalar. EOF and LF use the same boundary.
+    if !validator.finish() {
+        return Err(FilePageError::NotUtf8 { line: 0 });
+    }
+    if !saw_bytes {
+        return Ok(None);
+    }
+    if let Err(error) = std::str::from_utf8(&prefix) {
+        if error.error_len().is_some() {
+            return Err(FilePageError::NotUtf8 { line: 0 });
+        }
+        prefix.truncate(error.valid_up_to());
+        truncated = true;
+    }
+    Ok(Some(BoundedLine { prefix, truncated }))
 }
 
 #[derive(Debug, Default)]
