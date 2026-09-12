@@ -79,11 +79,11 @@ fn cli_retry_after_a_tool_result_does_not_repeat_the_file_effect() {
             )
         }),
         Box::new(|request| {
-            assert!(model_request_text(&request.body).contains("\"operation\":\"add\""));
+            assert!(model_tool_results_json(&request.body).contains("\"operation\":\"add\""));
             http_error("503 Service Unavailable")
         }),
         Box::new(|request| {
-            assert!(model_request_text(&request.body).contains("\"operation\":\"add\""));
+            assert!(model_tool_results_json(&request.body).contains("\"operation\":\"add\""));
             openai_tool_response("read-document", "file_read", json!({"path": "result.txt"}))
         }),
         Box::new(|request| {

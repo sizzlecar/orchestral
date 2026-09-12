@@ -11,11 +11,11 @@ pub(crate) const YAML_ENCODING_IDENTITY: &str = "serde-yaml-0.9/tool-envelope/v1
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OpenAiToolResultFormat {
-    /// Preserve the original JSON text encoding and recovery identity.
-    #[default]
+    /// Explicitly retain the original JSON text encoding and recovery identity.
     Json,
     /// Encode the complete envelope as YAML. Ordinary multiline strings use
     /// literal blocks; special whitespace may require quoted escapes.
+    #[default]
     Yaml,
 }
 
@@ -134,20 +134,16 @@ mod tests {
     }
 
     #[test]
-    fn json_tool_result_keeps_legacy_wire_and_meter_identity() {
-        assert_eq!(
-            OpenAiToolResultFormat::default(),
-            OpenAiToolResultFormat::Json
-        );
+    fn explicit_json_tool_result_keeps_legacy_wire_and_meter_identity() {
         assert!(serde_json::from_value::<OpenAiToolResultFormat>(json!("guess")).is_err());
         assert_eq!(
             serde_json::from_value::<OpenAiToolResultFormat>(json!("yaml")).unwrap(),
             OpenAiToolResultFormat::Yaml
         );
-        let backend = backend();
+        let json_backend = backend().with_tool_result_format(OpenAiToolResultFormat::Json);
         let result = json!({"content": "line\n\\quoted\"", "eof": false});
         let request = history(result.clone());
-        let body = backend.build_request_body(&request).unwrap();
+        let body = json_backend.build_request_body(&request).unwrap();
         assert_eq!(
             body["messages"][2]["content"],
             json!({"result": result, "is_error": false}).to_string()
@@ -161,30 +157,34 @@ mod tests {
             CONTEXT_ESTIMATE_BYTES_PER_TOKEN,
         ))
         .unwrap();
-        let meter = backend.meter_descriptor();
+        let meter = json_backend.meter_descriptor();
         assert_eq!(meter.strategy, "openai-compatible/wire-json-upper-bound");
         assert_eq!(meter.version, "2");
         assert_eq!(meter.config_digest, Digest::sha256(legacy_config));
-        let descriptor = backend.descriptor();
+        let descriptor = json_backend.descriptor();
         assert_eq!(
             descriptor.extensions,
             BTreeMap::from([("openai-compatible/model".to_owned(), json!("local-model"))])
         );
-        let explicit = backend.with_tool_result_format(OpenAiToolResultFormat::Json);
-        assert_eq!(explicit.build_request_body(&request).unwrap(), body);
-        assert_eq!(explicit.meter_descriptor(), meter);
-        assert_eq!(explicit.descriptor(), descriptor);
+        let resumed = backend().with_tool_result_format(OpenAiToolResultFormat::Json);
+        assert_eq!(resumed.build_request_body(&request).unwrap(), body);
+        assert_eq!(resumed.meter_descriptor(), meter);
+        assert_eq!(resumed.descriptor(), descriptor);
     }
 
     #[test]
-    fn yaml_tool_result_wire_replays_canonical_history_and_is_metered_with_its_own_identity() {
+    fn default_yaml_tool_result_replays_canonical_history_with_existing_yaml_identity() {
+        assert_eq!(
+            OpenAiToolResultFormat::default(),
+            OpenAiToolResultFormat::Yaml
+        );
         let request =
             history(json!({"source": "let quoted = \"\\\"value\\\"\";\n".repeat(8), "eof": true}));
         let saved = serde_json::to_vec(&request).unwrap();
         let restored: ModelRequest = serde_json::from_slice(&saved).unwrap();
-        let json_backend = backend();
+        let json_backend = backend().with_tool_result_format(OpenAiToolResultFormat::Json);
         let json_body = json_backend.build_request_body(&request).unwrap();
-        let yaml_backend = backend().with_tool_result_format(OpenAiToolResultFormat::Yaml);
+        let yaml_backend = backend();
         let body = yaml_backend.build_request_body(&restored).unwrap();
         assert_eq!(body, yaml_backend.build_request_body(&request).unwrap());
         assert_eq!(serde_json::to_vec(&restored).unwrap(), saved);
@@ -224,9 +224,21 @@ mod tests {
             json_backend.meter_descriptor()
         );
         assert_ne!(yaml_backend.descriptor(), json_backend.descriptor());
+        let explicit_yaml = backend().with_tool_result_format(OpenAiToolResultFormat::Yaml);
+        assert_eq!(explicit_yaml.build_request_body(&restored).unwrap(), body);
+        assert_eq!(
+            explicit_yaml.meter_descriptor(),
+            yaml_backend.meter_descriptor()
+        );
+        assert_eq!(explicit_yaml.descriptor(), yaml_backend.descriptor());
+        assert_eq!(
+            yaml_backend.meter_descriptor().strategy,
+            "openai-compatible/wire-json-yaml-tool-upper-bound"
+        );
+        assert_eq!(yaml_backend.meter_descriptor().version, "1");
         // A fresh adapter with the same declared encoding reproduces the body
         // after restart. The runtime binds these descriptors for Run recovery.
-        let resumed = backend().with_tool_result_format(OpenAiToolResultFormat::Yaml);
+        let resumed = backend();
         assert_eq!(resumed.build_request_body(&restored).unwrap(), body);
         assert_eq!(resumed.meter_descriptor(), yaml_backend.meter_descriptor());
     }

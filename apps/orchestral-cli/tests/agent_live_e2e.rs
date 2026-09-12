@@ -33,6 +33,8 @@ static LOCAL_E2E_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 mod context_reliability;
 #[path = "agent_live_e2e/failure_diagnostics.rs"]
 mod failure_diagnostics;
+#[path = "agent_live_e2e/input_mode.rs"]
+mod input_mode;
 #[path = "agent_live_e2e/model_retry.rs"]
 mod model_retry;
 #[path = "agent_live_e2e/project_instructions.rs"]
@@ -474,6 +476,10 @@ fn piped_prompt_is_headless_and_stdout_contains_only_final_delivery() {
     let workspace = TestWorkspace::new("headless-pipe");
     let (model_endpoint, model_server) = spawn_fixture_http_server(vec![Box::new(|request| {
         assert!(model_request_text(&request.body).contains(PIPE_PROMPT));
+        assert!(!model_request_has_tool(
+            &request.body,
+            "orchestral_request_input"
+        ));
         openai_text_response("PIPE_FINAL_ONLY")
     })]);
     workspace.configure_local_openai(&model_endpoint);
@@ -511,7 +517,9 @@ fn local_cli_creates_and_verifies_a_file_with_exec_disabled() {
     let workspace = TestWorkspace::new("write-without-shell");
     fs::write(
         workspace.path("request.txt"),
-        format!("{CONTEXT_MARKER}\nCreate generated.txt from this request.\n"),
+        format!(
+            "{CONTEXT_MARKER}\nCreate generated.txt from this request.\nlet literal = '\\n';\n"
+        ),
     )
     .expect("write patch request fixture");
     workspace.disable_exec();
@@ -527,7 +535,6 @@ fn local_cli_creates_and_verifies_a_file_with_exec_disabled() {
                     "file_read",
                     "file_search",
                     "file_write",
-                    "orchestral_request_input",
                     "session_read",
                     "text_search"
                 ]
@@ -536,6 +543,23 @@ fn local_cli_creates_and_verifies_a_file_with_exec_disabled() {
         }),
         Box::new(|request| {
             assert!(model_request_text(&request.body).contains(CONTEXT_MARKER));
+            let text = request.body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|message| message["role"] == "tool")
+                .unwrap()["content"]
+                .as_str()
+                .unwrap();
+            // This CLI has no format override: inspect its actual model wire,
+            // including literal source backslashes and complete metadata.
+            assert!(serde_json::from_str::<Value>(text).is_err());
+            let envelope: Value = serde_yaml::from_str(text).unwrap();
+            assert_eq!(envelope["is_error"], false);
+            assert_eq!(envelope["result"]["eof"], true);
+            assert_eq!(envelope["result"]["truncated"], false);
+            assert!(text.contains("let literal = '\\n';"), "{text}");
+            assert!(!text.contains("let literal = '\\\\n';"), "{text}");
             openai_tool_response(
                 "create-generated",
                 "file_write",
@@ -548,7 +572,10 @@ fn local_cli_creates_and_verifies_a_file_with_exec_disabled() {
         }),
         Box::new(|request| {
             let context = model_request_text(&request.body);
-            assert!(context.contains("\"operation\":\"add\""), "{context}");
+            assert!(
+                model_tool_results_json(&request.body).contains("\"operation\":\"add\""),
+                "{context}"
+            );
             openai_tool_response(
                 "verify-generated",
                 "file_read",
@@ -597,6 +624,131 @@ fn local_cli_creates_and_verifies_a_file_with_exec_disabled() {
         .all(|exchange| tool_result_is_error(exchange) == Some(false)));
 }
 
+#[tokio::test]
+async fn explicit_json_run_recovery_rejects_default_yaml_and_replays_with_json() {
+    use futures_util::StreamExt;
+    use orchestral_core::agent_protocol::{
+        spi::{AgentProvider, AgentRecoveryRequest},
+        wire::{
+            AgentEvent, AgentProtocolErrorCode, AgentProviderStreamItem, AgentRunEnvelope,
+            AgentSessionId, AgentStartRequest, Content, ProviderBindingRef, RunId,
+        },
+        AGENT_PROTOCOL_V1,
+    };
+    use orchestral_core::agent_session::InMemoryAgentSessionJournalStore;
+    use orchestral_model_openai::{
+        OpenAiCompatibleBackend, OpenAiCompatibleConfig, OpenAiToolResultFormat,
+    };
+    use orchestral_runtime::{
+        GenericAgentConfig, InMemoryGenericAgentCheckpointStore, InternalGenericAgentProvider,
+    };
+    use std::sync::Arc;
+
+    let _guard = local_e2e_guard();
+    let (endpoint, server) = spawn_fixture_http_server(vec![Box::new(|_| {
+        openai_text_response("The original Run completed.")
+    })]);
+    let checkpoint = Arc::new(InMemoryGenericAgentCheckpointStore::default());
+    let session = Arc::new(InMemoryAgentSessionJournalStore::default());
+    let provider = |format: Option<OpenAiToolResultFormat>| {
+        let backend = OpenAiCompatibleBackend::new(OpenAiCompatibleConfig {
+            backend_id: "format-recovery".to_owned(),
+            endpoint: endpoint.clone(),
+            api_key: String::new(),
+            model: "fixture-model".to_owned(),
+            temperature: 0.0,
+            default_max_output_tokens: 128,
+            max_context_tokens: Some(8192),
+            timeout: LOCAL_PROCESS_TIMEOUT,
+            structured_output: false,
+            max_buffered_events: 32,
+        })
+        .unwrap();
+        let backend = Arc::new(match format {
+            Some(format) => backend.with_tool_result_format(format),
+            None => backend,
+        });
+        InternalGenericAgentProvider::new_with_session_journal(
+            backend.clone(),
+            GenericAgentConfig::new("format-provider", "generic-agent"),
+            session.clone(),
+            backend,
+        )
+        .unwrap()
+        .with_checkpoint_store(checkpoint.clone())
+        .unwrap()
+    };
+    let original = provider(Some(OpenAiToolResultFormat::Json));
+    let descriptor = original.describe();
+    let request = AgentStartRequest::new(
+        AgentRunEnvelope::new(
+            AGENT_PROTOCOL_V1,
+            AgentSessionId::new("format-session"),
+            RunId::new("format-run"),
+            vec![Content::text("Complete this Run before restart.")],
+        )
+        .unwrap(),
+        ProviderBindingRef::new("format-binding"),
+        &descriptor,
+    )
+    .unwrap();
+    let started = original.start(request.clone()).await.unwrap();
+    let execution = started.execution.clone();
+    let mut stream = started.stream;
+    let mut original_events = Vec::new();
+    tokio::time::timeout(LOCAL_PROCESS_TIMEOUT, async {
+        loop {
+            let item = stream.next().await.expect("Run reaches delivery").unwrap();
+            if let AgentProviderStreamItem::Event(draft) = item {
+                let delivered = matches!(&draft.payload, AgentEvent::DeliveryCommitted { .. });
+                original_events.push(*draft);
+                if delivered {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("original Run terminates within the fixture deadline");
+    drop(stream);
+    drop(original);
+    // The real adapter has made its one request; the fixture closes here.
+    // Recovery must replay the saved Run, not issue another model request.
+    assert_eq!(server.join().unwrap().len(), 1);
+
+    let default_yaml = provider(None);
+    let error = match default_yaml
+        .recover(
+            AgentRecoveryRequest::new(request.clone(), execution.clone(), &descriptor).unwrap(),
+        )
+        .await
+    {
+        Ok(_) => panic!("a different tool-result encoding must not recover the JSON Run"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, AgentProtocolErrorCode::RunIdConflict);
+
+    let explicit_json = provider(Some(OpenAiToolResultFormat::Json));
+    let recovery = explicit_json
+        .recover(AgentRecoveryRequest::new(request, execution, &descriptor).unwrap())
+        .await
+        .expect("explicit JSON retains the original Run identity");
+    let (mut replay, confirmation) = recovery.into_parts();
+    let recovered_events = tokio::time::timeout(LOCAL_PROCESS_TIMEOUT, async {
+        let mut events = Vec::new();
+        while let Some(item) = replay.next().await {
+            if let AgentProviderStreamItem::Event(draft) = item.unwrap() {
+                events.push(*draft);
+            }
+        }
+        confirmation.await.unwrap();
+        events
+    })
+    .await
+    .expect("same-format recovery replays without new model work");
+    assert_eq!(recovered_events, original_events);
+}
+
 #[test]
 fn local_cli_discovers_searches_reads_patches_and_rechecks_source() {
     let _guard = local_e2e_guard();
@@ -638,7 +790,7 @@ fn local_cli_discovers_searches_reads_patches_and_rechecks_source() {
             assert!(context.contains("src/service.rs"), "{context}");
             assert!(!context.contains("ignored/decoy.rs"), "{context}");
             assert!(
-                context.contains("\"completeness\":\"complete\""),
+                model_tool_results_json(&request.body).contains("\"completeness\":\"complete\""),
                 "{context}"
             );
             openai_tool_response(
@@ -654,7 +806,10 @@ fn local_cli_discovers_searches_reads_patches_and_rechecks_source() {
         Box::new(|request| {
             let context = model_request_text(&request.body);
             assert!(context.contains("TODO_TARGET"), "{context}");
-            assert!(context.contains("\"line_number\":1"), "{context}");
+            assert!(
+                model_tool_results_json(&request.body).contains("\"line_number\":1"),
+                "{context}"
+            );
             openai_tool_response(
                 "read-target-file",
                 "file_read",
@@ -664,7 +819,10 @@ fn local_cli_discovers_searches_reads_patches_and_rechecks_source() {
         Box::new(|request| {
             let context = model_request_text(&request.body);
             assert!(context.contains("answer() -> u32 { 41 }"), "{context}");
-            assert!(context.contains("\"eof\":true"), "{context}");
+            assert!(
+                model_tool_results_json(&request.body).contains("\"eof\":true"),
+                "{context}"
+            );
             openai_tool_response(
                 "patch-target-file",
                 "apply_patch",
@@ -681,7 +839,7 @@ fn local_cli_discovers_searches_reads_patches_and_rechecks_source() {
             )
         }),
         Box::new(|request| {
-            assert!(model_request_text(&request.body).contains("\"operation\":\"update\""));
+            assert!(model_tool_results_json(&request.body).contains("\"operation\":\"update\""));
             openai_tool_response(
                 "recheck-target-file",
                 "file_read",
@@ -824,7 +982,7 @@ fn local_cli_uses_structured_tools_across_an_added_workspace() {
             )
         }),
         Box::new(move |request| {
-            assert!(model_request_text(&request.body).contains("\"operation\":\"update\""));
+            assert!(model_tool_results_json(&request.body).contains("\"operation\":\"update\""));
             openai_tool_response(
                 "added-workspace-verify",
                 "file_read",
@@ -956,7 +1114,10 @@ fn local_cli_reads_patches_and_runs_a_guarded_verification() {
         }),
         Box::new(|request| {
             let context = model_request_text(&request.body);
-            assert!(context.contains("\"operation\":\"update\""), "{context}");
+            assert!(
+                model_tool_results_json(&request.body).contains("\"operation\":\"update\""),
+                "{context}"
+            );
             openai_tool_response(
                 "verify-fixed-source",
                 "exec_command",
@@ -973,7 +1134,10 @@ fn local_cli_reads_patches_and_runs_a_guarded_verification() {
         }),
         Box::new(|request| {
             let context = model_request_text(&request.body);
-            assert!(context.contains("\"exit_code\":0"), "{context}");
+            assert!(
+                model_tool_results_json(&request.body).contains("\"exit_code\":0"),
+                "{context}"
+            );
             openai_text_response("PATCH_AND_VERIFY_OK")
         }),
     ]);
@@ -1055,7 +1219,10 @@ fn local_cli_establishes_a_requested_branch_before_editing_and_verifying() {
         }),
         Box::new(|request| {
             let context = model_request_text(&request.body);
-            assert!(context.contains("\"exit_code\":0"), "{context}");
+            assert!(
+                model_tool_results_json(&request.body).contains("\"exit_code\":0"),
+                "{context}"
+            );
             openai_tool_response(
                 "read-branch-source",
                 "file_read",
@@ -1081,7 +1248,10 @@ fn local_cli_establishes_a_requested_branch_before_editing_and_verifying() {
         }),
         Box::new(|request| {
             let context = model_request_text(&request.body);
-            assert!(context.contains("\"operation\":\"update\""), "{context}");
+            assert!(
+                model_tool_results_json(&request.body).contains("\"operation\":\"update\""),
+                "{context}"
+            );
             openai_tool_response(
                 "verify-branch-change",
                 "exec_command",
@@ -1090,7 +1260,10 @@ fn local_cli_establishes_a_requested_branch_before_editing_and_verifying() {
         }),
         Box::new(|request| {
             let context = model_request_text(&request.body);
-            assert!(context.contains("\"exit_code\":0"), "{context}");
+            assert!(
+                model_tool_results_json(&request.body).contains("\"exit_code\":0"),
+                "{context}"
+            );
             openai_text_response("BRANCH_EDIT_VERIFY_OK")
         }),
     ]);
@@ -1195,9 +1368,15 @@ fn local_exec_runs_toolchains_and_a_child_script_without_program_enumeration() {
             let context = model_request_text(&request.body);
             assert!(context.contains("cargo 1."), "{context}");
             assert!(context.contains("Python 3."), "{context}");
-            assert!(context.contains("\"alive\":false"), "{context}");
+            assert!(
+                model_tool_results_json(&request.body).contains("\"alive\":false"),
+                "{context}"
+            );
             assert!(context.contains("CHILD_SCRIPT_OK"), "{context}");
-            assert!(context.contains("\"exit_code\":0"), "{context}");
+            assert!(
+                model_tool_results_json(&request.body).contains("\"exit_code\":0"),
+                "{context}"
+            );
             openai_text_response("UNIFIED_EXEC_TOOLCHAINS_OK")
         }),
     ]);
@@ -1278,7 +1457,7 @@ fn local_cli_skill_read_injects_instructions_and_journals_load() {
         Box::new(move |request| {
             let context = model_request_text(&request.body);
             assert!(context.contains(INSTRUCTION_MARKER));
-            assert!(context.contains("\"status\":\"loaded\""));
+            assert!(model_tool_results_json(&request.body).contains("\"status\":\"loaded\""));
             assert!(context.contains(&skill_resource_base));
             assert!(context.contains("Relative paths in this Skill's instructions"));
             openai_tool_response(
@@ -1321,7 +1500,7 @@ fn local_cli_skill_read_injects_instructions_and_journals_load() {
     assert!(!first_context.contains(INSTRUCTION_MARKER));
     let second_context = model_request_text(&requests[1].body);
     assert!(second_context.contains(INSTRUCTION_MARKER));
-    assert!(second_context.contains("\"status\":\"loaded\""));
+    assert!(model_tool_results_json(&requests[1].body).contains("\"status\":\"loaded\""));
 
     let records = session_records(&workspace);
     assert_eq!(payload_count(&records, "skill_loaded"), 1);
@@ -1629,7 +1808,8 @@ fn local_cli_routes_structured_host_execution_through_the_approval_prompt() {
             let context = model_request_text(&request.body);
             assert!(context.contains(EXTERNAL_MARKER), "{context}");
             assert!(
-                context.contains("\"sandbox_backend\":\"host-approved\""),
+                model_tool_results_json(&request.body)
+                    .contains("\"sandbox_backend\":\"host-approved\""),
                 "{context}"
             );
             openai_text_response(FINAL_MARKER)
@@ -3376,6 +3556,22 @@ fn tool_result_value(exchange: &Value) -> &Value {
         .expect("Tool exchange contains one Tool result")
 }
 
+// Semantic assertions use the complete decoded envelope; raw request text
+// remains untouched for tests that verify the selected presentation itself.
+fn model_tool_results_json(body: &Value) -> String {
+    let results = body["messages"]
+        .as_array()
+        .expect("model messages")
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .map(|message| {
+            serde_yaml::from_str::<Value>(message["content"].as_str().expect("tool result text"))
+                .expect("complete JSON or YAML tool envelope")
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&results).unwrap()
+}
+
 // The exec contract may return a live session at its observation deadline.
 // Continue that exact session through the real tool, within the unchanged
 // fixture deadline; never equate a successful launch with a completed command.
@@ -3387,7 +3583,7 @@ fn continue_exec_until_exit(request: &CapturedHttpRequest) -> Option<FixtureHttp
         .find(|message| message["role"] == "tool")
         .expect("exec observation in model history");
     let payload: Value =
-        serde_json::from_str(message["content"].as_str().expect("tool result text"))
+        serde_yaml::from_str(message["content"].as_str().expect("tool result text"))
             .expect("structured exec result");
     assert_eq!(payload["is_error"], false, "{payload}");
     let result = &payload["result"];

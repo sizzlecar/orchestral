@@ -53,6 +53,9 @@ pub struct Cli {
     /// Add instructions to the agent for this session.
     #[arg(long, global = true)]
     system_prompt: Option<String>,
+    /// Follow-up input for local runs. Serve uses its remote input channel.
+    #[arg(long, value_enum, default_value = "auto", global = true)]
+    input_mode: crate::agent::InputMode,
     /// Start without MCP servers.
     #[arg(long, global = true)]
     no_mcp: bool,
@@ -135,6 +138,7 @@ impl Cli {
             session_id: self.session_id,
             system_prompt: self.system_prompt,
             input: (!self.input.is_empty()).then(|| self.input.join(" ")),
+            input_mode: self.input_mode,
             no_mcp: self.no_mcp,
             mcp_config: self.mcp_config,
             no_skills: self.no_skills,
@@ -182,6 +186,29 @@ mod tests {
     use clap::{CommandFactory, Parser};
 
     use super::Cli;
+
+    #[test]
+    fn input_mode_is_typed_and_defaults_to_auto() {
+        assert_eq!(
+            Cli::try_parse_from(["orchestral", "inspect"])
+                .unwrap()
+                .input_mode,
+            crate::agent::InputMode::Auto
+        );
+        assert_eq!(
+            Cli::try_parse_from(["orchestral", "--input-mode", "interactive", "inspect"])
+                .unwrap()
+                .input_mode,
+            crate::agent::InputMode::Interactive
+        );
+        assert_eq!(
+            Cli::try_parse_from(["orchestral", "--input-mode", "none", "inspect"])
+                .unwrap()
+                .input_mode,
+            crate::agent::InputMode::None
+        );
+        assert!(Cli::try_parse_from(["orchestral", "--input-mode", "maybe"]).is_err());
+    }
 
     #[test]
     fn root_command_is_the_agent_entrypoint() {

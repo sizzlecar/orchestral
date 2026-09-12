@@ -85,11 +85,39 @@ pub struct AgentRunOptions {
     pub session_id: Option<String>,
     pub system_prompt: Option<String>,
     pub input: Option<String>,
+    pub input_mode: InputMode,
     pub no_mcp: bool,
     pub mcp_config: Vec<PathBuf>,
     pub no_skills: bool,
     pub cwd: Option<PathBuf>,
     pub add_dirs: Vec<PathBuf>,
+}
+
+/// Availability of follow-up user input for a local CLI run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum InputMode {
+    /// Enable follow-up input only when stdin is a terminal.
+    #[default]
+    Auto,
+    /// Allow replies on stdin; a piped initial prompt cannot share that stream.
+    Interactive,
+    /// Do not offer model-requested user input.
+    None,
+}
+
+impl InputMode {
+    fn resolve(self, entry: &EntryMode, stdin_is_terminal: bool) -> anyhow::Result<bool> {
+        match (self, entry) {
+            (Self::Interactive, EntryMode::HeadlessPipe) => bail!(
+                "--input-mode interactive cannot use stdin for both the initial prompt and replies; \
+                 pass the prompt as an argument to reserve stdin for replies"
+            ),
+            (Self::None, _) => Ok(false),
+            (Self::Interactive, _) | (Self::Auto, EntryMode::Tui) => Ok(true),
+            (Self::Auto, EntryMode::HeadlessPrompt(_)) => Ok(stdin_is_terminal),
+            (Self::Auto, EntryMode::HeadlessPipe) => Ok(false),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -200,6 +228,9 @@ pub struct AgentHost {
     controller: Arc<AgentController>,
     resources: Vec<ResourceBinding>,
     mcp_registry: McpToolsAdapterRegistry,
+    // None denotes a Host with its own input channel (for example HTTP serve).
+    // Local runs retain their resolved capability across TUI reconfiguration.
+    local_input_available: Option<bool>,
 }
 
 impl AgentHost {
@@ -210,7 +241,12 @@ impl AgentHost {
     }
 
     pub(crate) async fn reconfigure(&self, options: &AgentRunOptions) -> anyhow::Result<Self> {
-        let mut next = build_agent_host_with_journals(options, Some(self.journals.clone())).await?;
+        let mut next = build_agent_host_with_journals(
+            options,
+            Some(self.journals.clone()),
+            self.local_input_available,
+        )
+        .await?;
         next.metadata.journal_location = self.metadata.journal_location.clone();
         Ok(next)
     }
@@ -221,12 +257,13 @@ impl AgentHost {
 }
 
 pub async fn build_agent_host(options: &AgentRunOptions) -> anyhow::Result<AgentHost> {
-    build_agent_host_with_journals(options, None).await
+    build_agent_host_with_journals(options, None, None).await
 }
 
 async fn build_agent_host_with_journals(
     options: &AgentRunOptions,
     shared: Option<CliJournalStores>,
+    local_input_available: Option<bool>,
 ) -> anyhow::Result<AgentHost> {
     let workspaces = CliWorkspaceSet::resolve(options.cwd.as_deref(), &options.add_dirs)?;
     let config_path = prepare_runtime_config_path(
@@ -247,7 +284,8 @@ async fn build_agent_host_with_journals(
     )?;
 
     let mut agent_config = GenericAgentConfig::new("orchestral/internal", "generic-agent");
-    agent_config.input_requests_enabled = config.agent.input_requests_enabled;
+    agent_config.input_requests_enabled =
+        config.agent.input_requests_enabled && local_input_available.unwrap_or(true);
     agent_config.model_retry = config.agent.model_retry.clone();
     {
         use orchestral_core::project_instructions::ProjectInstructionSource;
@@ -495,11 +533,21 @@ async fn build_agent_host_with_journals(
         controller,
         resources,
         mcp_registry,
+        local_input_available,
     })
 }
 
 pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
-    let mut host = Arc::new(build_agent_host(&options).await?);
+    let stdin_is_terminal = io::stdin().is_terminal();
+    let entry_mode = select_entry_mode(
+        options.input.clone(),
+        stdin_is_terminal,
+        io::stdout().is_terminal(),
+    )?;
+    let local_input_available = options.input_mode.resolve(&entry_mode, stdin_is_terminal)?;
+    let mut host = Arc::new(
+        build_agent_host_with_journals(&options, None, Some(local_input_available)).await?,
+    );
     let tui_options = options.clone();
     let session_id = AgentSessionId::new(
         options
@@ -509,11 +557,6 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
     );
     let client = host.client(session_id.clone());
 
-    let entry_mode = select_entry_mode(
-        options.input,
-        io::stdin().is_terminal(),
-        io::stdout().is_terminal(),
-    )?;
     let result = async {
         let history = host.session_history.read(&session_id).await?;
         if let Some(history) = &history {
@@ -2035,7 +2078,23 @@ fn select_entry_mode(
 mod entry_mode_tests {
     use std::path::PathBuf;
 
-    use super::{select_entry_mode, unique_id, CliWorkspaceSet, EntryMode};
+    use super::{select_entry_mode, unique_id, CliWorkspaceSet, EntryMode, InputMode};
+
+    #[test]
+    fn input_mode_uses_the_reply_channel_not_headless_output() {
+        let prompt = EntryMode::HeadlessPrompt("inspect the project".to_owned());
+        assert!(!InputMode::Auto.resolve(&prompt, false).unwrap());
+        assert!(InputMode::Auto.resolve(&prompt, true).unwrap());
+        assert!(InputMode::Auto.resolve(&EntryMode::Tui, true).unwrap());
+        assert!(InputMode::Interactive.resolve(&prompt, false).unwrap());
+        assert!(!InputMode::None.resolve(&EntryMode::Tui, true).unwrap());
+        assert!(!InputMode::Auto
+            .resolve(&EntryMode::HeadlessPipe, false)
+            .unwrap());
+        assert!(InputMode::Interactive
+            .resolve(&EntryMode::HeadlessPipe, false)
+            .is_err());
+    }
 
     #[test]
     fn model_profile_sampling_is_validated_before_connecting() {
@@ -2063,7 +2122,7 @@ mod entry_mode_tests {
     }
 
     #[test]
-    fn model_profile_tool_result_format_is_explicit_and_strict() {
+    fn model_profile_tool_result_format_defaults_to_yaml_and_is_strict() {
         let backend = serde_json::from_value(serde_json::json!({
             "name": "local", "kind": "openai", "endpoint": "http://127.0.0.1:1/v1",
             "config": {"auth": "none"},
@@ -2112,6 +2171,31 @@ mod entry_mode_tests {
         )
         .unwrap();
         assert_ne!(json_meter.meter_descriptor(), yaml_meter.meter_descriptor());
+        let (_, default_meter) =
+            super::build_model_backend(&backend, "local-model", 0.6, None, 8, None).unwrap();
+        assert_eq!(
+            default_meter.meter_descriptor(),
+            yaml_meter.meter_descriptor()
+        );
+        let mut omitted_format = profile(serde_json::json!("json"));
+        omitted_format
+            .config
+            .as_object_mut()
+            .unwrap()
+            .remove("tool_result_format");
+        let (_, omitted_meter) = super::build_model_backend(
+            &backend,
+            "local-model",
+            0.6,
+            Some(&omitted_format),
+            8,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            omitted_meter.meter_descriptor(),
+            yaml_meter.meter_descriptor()
+        );
     }
 
     #[cfg(unix)]

@@ -502,7 +502,7 @@ fn resume_answers_a_recovered_input_request_in_the_original_run() {
     tui.child.kill().unwrap();
     tui.finish(Duration::from_secs(5));
     let mut command = resume_command(&workspace, "input-session", "Inspect the parser package");
-    command.args(["--system-prompt", system]);
+    command.args(["--system-prompt", system, "--input-mode", "interactive"]);
     let output = run_to_completion(command, LOCAL_PROCESS_TIMEOUT);
     assert!(output.status.success(), "{}", output.stderr_text());
     assert_eq!(output.stdout_text().trim(), "RECOVERED_INPUT_APPLIED");

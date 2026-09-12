@@ -75,6 +75,8 @@ pub struct OpenAiCompatibleBackend {
 }
 
 impl OpenAiCompatibleBackend {
+    /// Build an adapter with YAML tool-result text. Select `Json` explicitly
+    /// when retaining the encoding identity of an earlier JSON-configured Run.
     pub fn new(config: OpenAiCompatibleConfig) -> Result<Self, ModelError> {
         config.validate()?;
         let client = Client::builder()
@@ -99,6 +101,7 @@ impl OpenAiCompatibleBackend {
 
     /// Select the text encoding of complete ToolResult envelopes. Canonical
     /// messages stay unchanged; this also applies to earlier session history.
+    /// Run recovery remains bound to the original encoding identity.
     pub fn with_tool_result_format(mut self, format: OpenAiToolResultFormat) -> Self {
         self.tool_result_format = format;
         self
@@ -207,7 +210,7 @@ impl ModelTokenMeter for OpenAiCompatibleBackend {
             &self.sampling,
             CONTEXT_ESTIMATE_BYTES_PER_TOKEN,
         );
-        // Keep the default JSON identity byte-for-byte compatible with v2.
+        // Keep the explicit JSON identity byte-for-byte compatible with v2.
         // YAML changes the actual prompt, so recovery must bind its encoding.
         let (strategy, version, config) = match self.tool_result_format {
             OpenAiToolResultFormat::Json => (

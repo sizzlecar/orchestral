@@ -13,7 +13,7 @@ fn last_result(request: &CapturedHttpRequest) -> Value {
         .rev()
         .find(|message| message["role"] == "tool")
         .expect("model receives the committed Tool result");
-    let envelope: Value = serde_json::from_str(message["content"].as_str().unwrap()).unwrap();
+    let envelope: Value = serde_yaml::from_str(message["content"].as_str().unwrap()).unwrap();
     assert_eq!(envelope["is_error"], false, "{envelope}");
     envelope["result"].clone()
 }
@@ -256,6 +256,8 @@ fn killed_tui_recovers_compacted_run_and_applies_new_input_without_repeating_eff
             "0",
             "--system-prompt",
             system,
+            "--input-mode",
+            "interactive",
             "resume",
             "pressure-recovery",
             "Keep output UTF-8 and inspect prior progress.",
