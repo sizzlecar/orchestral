@@ -280,6 +280,7 @@ fn generic_private_wal_rehydrates_from_a_new_store_instance() {
                 config_digest: Digest::sha256("generic-config-v1"),
                 history_limit: 128,
                 used_input_tokens: 10,
+                context_estimate: None,
                 input_budget_tokens: 100,
             },
         },
