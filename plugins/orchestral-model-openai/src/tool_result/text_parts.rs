@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 
-/// A transient view of canonical JSON. Only top-level strings move to text;
-/// nested values retain their JSON types and are not recursively flattened.
+/// A transient view of canonical JSON. Only top-level strings containing LF or
+/// CR move to text; scalar strings and nested values retain their JSON types.
 struct ToolTextView<'a> {
     metadata: Value,
     fields: Vec<(Option<&'a str>, &'a str)>,
@@ -18,15 +18,18 @@ impl<'a> ToolTextView<'a> {
                 let mut entries = object.iter().collect::<Vec<_>>();
                 entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
                 for (key, value) in entries {
-                    if let Value::String(text) = value {
-                        fields.push((Some(key.as_str()), text.as_str()));
-                    } else {
-                        remaining.insert(key.clone(), value.clone());
+                    match value {
+                        Value::String(text) if text.contains(['\n', '\r']) => {
+                            fields.push((Some(key.as_str()), text.as_str()));
+                        }
+                        _ => {
+                            remaining.insert(key.clone(), value.clone());
+                        }
                     }
                 }
                 json!({"result": remaining, "is_error": is_error})
             }
-            Value::String(text) => {
+            Value::String(text) if text.contains(['\n', '\r']) => {
                 fields.push((None, text.as_str()));
                 json!({"is_error": is_error})
             }

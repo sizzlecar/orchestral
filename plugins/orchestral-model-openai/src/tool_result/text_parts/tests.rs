@@ -3,28 +3,86 @@ use crate::tool_result::{
     tests::{assert_observed_prefix_planning_identity, backend, history},
     OpenAiToolResultFormat,
 };
-use crate::{ModelBackend, ModelRequest, ModelTokenMeter, CONTEXT_ESTIMATE_BYTES_PER_TOKEN};
+use crate::{
+    ModelBackend, ModelRequest, ModelTokenMeter, OpenAiSamplingConfig,
+    CONTEXT_ESTIMATE_BYTES_PER_TOKEN,
+};
+use orchestral_core::agent_protocol::wire::Digest;
 
-// Interpret the published framing, including its explicitly excluded separator
-// when the source has no final LF. No text unescaping or indentation removal.
-fn source_span(part: &Value) -> &str {
-    assert_eq!(part["type"], "text");
-    let (header, rest) = part["text"].as_str().unwrap().split_once('\n').unwrap();
-    let (opening, rest) = rest.split_once('\n').unwrap();
-    let fence = opening.strip_suffix("text").unwrap();
-    assert!(fence.len() >= 3 && fence.bytes().all(|byte| byte == b'`'));
-    let source = rest
-        .strip_suffix('\n')
-        .unwrap()
-        .strip_suffix(fence)
+// Interpret the published wire framing after a template has joined and trimmed
+// the parts. Reconstruct the complete JSON envelope, without source unescaping
+// or indentation removal, rather than asserting an implementation part count.
+fn restore_envelope(rendered: &str) -> Value {
+    let rest = rendered
+        .trim()
+        .strip_prefix("Tool result metadata:\n")
         .unwrap();
-    if header.ends_with("(final newline: no)") {
-        source.strip_suffix('\n').unwrap()
-    } else {
-        assert!(header.ends_with("(final newline: yes)"));
-        assert!(source.ends_with('\n'));
-        source
+    let (metadata, mut rest) = rest.split_once('\n').unwrap_or((rest, ""));
+    let mut envelope: Value = serde_json::from_str(metadata).unwrap();
+    while !rest.is_empty() {
+        rest = rest.trim_start_matches('\n');
+        if rest.is_empty() {
+            break;
+        }
+        let (header, body) = rest.split_once('\n').unwrap();
+        let (opening, body) = body.split_once('\n').unwrap();
+        let fence = opening.strip_suffix("text").unwrap();
+        assert!(fence.len() >= 3 && fence.bytes().all(|byte| byte == b'`'));
+        let closing = format!("\n{fence}");
+        let (source, following) = body.split_once(closing.as_str()).unwrap();
+        assert!(following.is_empty() || following.starts_with('\n'));
+        let (label, source) = if let Some(label) = header.strip_suffix(" (final newline: yes)") {
+            (label, format!("{source}\n"))
+        } else {
+            (
+                header.strip_suffix(" (final newline: no)").unwrap(),
+                source.to_owned(),
+            )
+        };
+        if label == "Result text" {
+            assert!(envelope
+                .as_object_mut()
+                .unwrap()
+                .insert("result".to_owned(), json!(source))
+                .is_none());
+        } else {
+            let key: String =
+                serde_json::from_str(label.strip_prefix("Text field ").unwrap()).unwrap();
+            assert!(envelope["result"]
+                .as_object_mut()
+                .unwrap()
+                .insert(key, json!(source))
+                .is_none());
+        }
+        rest = following;
     }
+    envelope
+}
+
+fn joined(parts: &Value, separator: &str) -> String {
+    parts
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|part| {
+            assert_eq!(part["type"], "text");
+            part["text"].as_str().unwrap()
+        })
+        .collect::<Vec<_>>()
+        .join(separator)
+}
+
+fn assert_round_trip(result: &Value, is_error: bool) -> Value {
+    let saved = result.clone();
+    let parts = encode(result, is_error);
+    for separator in ["", "\n"] {
+        assert_eq!(
+            restore_envelope(&joined(&parts, separator)),
+            json!({"result": result, "is_error": is_error})
+        );
+    }
+    assert_eq!(result, &saved);
+    parts
 }
 
 #[test]
@@ -32,36 +90,19 @@ fn text_parts_preserve_raw_source_boundaries_and_embedded_fences() {
     let sources = [
         "    fn main() {\r\n\tprintln!(\"\\nλ\");\r\n    }\r\n",
         "  ```text\n\tquoted ` value\n````\nlast ",
-        "  leading and trailing  ",
         "ends in CR\r",
-        "\0\u{1b}\u{2028}",
+        "\0\u{1b}\u{2028}\n",
         "\n",
-        "",
+        "\r",
     ];
     for source in sources {
         let original = json!({"source": source, "eof": true});
-        let saved = original.clone();
-        let parts = encode(&original, false);
-        let parts = parts.as_array().unwrap();
-        assert_eq!(parts.len(), 2);
+        let parts = assert_round_trip(&original, false);
         assert_eq!(
             parts[0]["text"],
             "Tool result metadata:\n{\"is_error\":false,\"result\":{\"eof\":true}}\n"
         );
-        assert_eq!(source_span(&parts[1]).as_bytes(), source.as_bytes());
-        assert_eq!(original, saved);
-        // Both direct template concatenation and server LF joining keep each
-        // complete field intact, even if the whole message is then trimmed.
-        for separator in ["", "\n"] {
-            let rendered = parts
-                .iter()
-                .map(|part| part["text"].as_str().unwrap())
-                .collect::<Vec<_>>()
-                .join(separator);
-            assert!(rendered
-                .trim()
-                .ends_with(parts[1]["text"].as_str().unwrap().trim_end_matches('\n')));
-        }
+        assert_round_trip(&json!(source), true);
     }
     let fenced = encode(&json!({"source": "```\n````\n"}), false);
     assert_eq!(
@@ -71,15 +112,48 @@ fn text_parts_preserve_raw_source_boundaries_and_embedded_fences() {
 }
 
 #[test]
+fn text_parts_keep_empty_and_single_line_strings_in_json_metadata() {
+    for value in [
+        json!(""),
+        json!("  leading and trailing  "),
+        json!("null"),
+        json!("false"),
+        json!("01"),
+        json!("'\"\\\t\0\u{1b}\u{85}\u{2028}\u{2029}λ"),
+        json!("```text"),
+        Value::Null,
+        json!(false),
+        json!(u64::MAX),
+        json!(0.25),
+        json!([]),
+        json!({}),
+        json!(["nested\ntext", "", null, {"v": "a\rb"}]),
+        json!({"empty": "", "single": "a: b", "null": null, "boolean": false, "nested": {"multiline": "a\r\nb"}}),
+    ] {
+        for is_error in [false, true] {
+            let parts = assert_round_trip(&value, is_error);
+            let metadata: Value = serde_json::from_str(
+                parts[0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .strip_prefix("Tool result metadata:\n")
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(metadata, json!({"result": value, "is_error": is_error}));
+        }
+    }
+}
+
+#[test]
 fn text_parts_keep_typed_metadata_and_sort_keys_independent_of_map_features() {
     let result: Value = serde_json::from_str(
-        r#"{"z":"last","nested":{"z":1,"a":{"y":2,"b":"nested string"}},"array":[{"z":true,"a":null}],"a":"first","n":0,"bool":false}"#,
+        r#"{"z":"last\r","nested":{"z":1,"a":{"y":2,"b":"nested\nstring"}},"array":[{"z":true,"a":null}],"a":"first\n","n":0,"bool":false,"single":"null","empty":""}"#,
     ).unwrap();
-    let parts = encode(&result, true);
-    assert_eq!(parts.as_array().unwrap().len(), 3);
+    let parts = assert_round_trip(&result, true);
     assert_eq!(
         parts[0]["text"],
-        "Tool result metadata:\n{\"is_error\":true,\"result\":{\"array\":[{\"a\":null,\"z\":true}],\"bool\":false,\"n\":0,\"nested\":{\"a\":{\"b\":\"nested string\",\"y\":2},\"z\":1}}}\n"
+        "Tool result metadata:\n{\"is_error\":true,\"result\":{\"array\":[{\"a\":null,\"z\":true}],\"bool\":false,\"empty\":\"\",\"n\":0,\"nested\":{\"a\":{\"b\":\"nested\\nstring\",\"y\":2},\"z\":1},\"single\":\"null\"}}\n"
     );
     assert!(parts[1]["text"]
         .as_str()
@@ -89,29 +163,7 @@ fn text_parts_keep_typed_metadata_and_sort_keys_independent_of_map_features() {
         .as_str()
         .unwrap()
         .starts_with("Text field \"z\" "));
-    assert_eq!(source_span(&parts[1]), "first");
-    assert_eq!(source_span(&parts[2]), "last");
-
-    for value in [
-        Value::Null,
-        json!(false),
-        json!(u64::MAX),
-        json!(["string", null]),
-        json!({}),
-    ] {
-        let parts = encode(&value, false);
-        assert_eq!(parts.as_array().unwrap().len(), 1);
-        let metadata: Value = serde_json::from_str(
-            parts[0]["text"]
-                .as_str()
-                .unwrap()
-                .strip_prefix("Tool result metadata:\n")
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(metadata, json!({"is_error": false, "result": value}));
-    }
-    let scalar = encode(&json!("null\n"), true);
+    let scalar = assert_round_trip(&json!("null\n"), true);
     assert_eq!(
         scalar[0]["text"],
         "Tool result metadata:\n{\"is_error\":true}\n"
@@ -120,49 +172,30 @@ fn text_parts_keep_typed_metadata_and_sort_keys_independent_of_map_features() {
         scalar[1]["text"],
         "Result text (final newline: yes)\n```text\nnull\n```\n"
     );
-    assert_eq!(source_span(&scalar[1]), "null\n");
-
     let key = "line\n\"key\\";
-    let quoted = encode(&json!({key: "actual"}), false);
+    let quoted = assert_round_trip(&json!({key: "actual\r"}), false);
     assert!(quoted[1]["text"]
         .as_str()
         .unwrap()
         .starts_with("Text field \"line\\n\\\"key\\\\\" (final newline: no)\n"));
-    assert_eq!(source_span(&quoted[1]), "actual");
 }
 
 #[test]
 fn text_parts_close_fence_lines_when_templates_concatenate_parts_directly() {
-    let parts = encode(&json!({"a": "first\n", "b": "second"}), false);
-    let texts = parts
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|part| part["text"].as_str().unwrap())
-        .collect::<Vec<_>>();
+    let result = json!({"a": "first\n", "b": "second\r", "label": "single"});
+    let parts = assert_round_trip(&result, false);
     assert_eq!(
-        texts.concat(),
+        joined(&parts, ""),
         concat!(
-            "Tool result metadata:\n{\"is_error\":false,\"result\":{}}\n",
+            "Tool result metadata:\n{\"is_error\":false,\"result\":{\"label\":\"single\"}}\n",
             "Text field \"a\" (final newline: yes)\n```text\nfirst\n```\n",
-            "Text field \"b\" (final newline: no)\n```text\nsecond\n```\n",
+            "Text field \"b\" (final newline: no)\n```text\nsecond\r\n```\n",
         )
     );
-    for separator in ["", "\n"] {
-        let rendered = texts.join(separator);
-        let rendered = rendered.trim();
-        assert_eq!(rendered.lines().filter(|line| *line == "```").count(), 2);
-        assert!(!rendered.contains("```Text field"));
-        assert!(rendered.contains("}}\n"));
-        // Both the source's final LF and the no-LF framing separator remain
-        // distinguishable after either template-level joining convention.
-        assert_eq!(source_span(&parts[1]), "first\n");
-        assert_eq!(source_span(&parts[2]), "second");
-    }
 }
 
 #[test]
-fn text_parts_preserve_wire_and_history_but_version_observed_prefix_planning() {
+fn text_parts_v2_preserves_canonical_history_and_changes_recovery_identity() {
     assert_eq!(
         serde_json::from_value::<OpenAiToolResultFormat>(json!("text_parts")).unwrap(),
         OpenAiToolResultFormat::TextParts
@@ -172,8 +205,9 @@ fn text_parts_preserve_wire_and_history_but_version_observed_prefix_planning() {
         "text_parts"
     );
     let source = "fn escape(value: &str) -> String {\n    value.replace('\\\\', \"\\\\\\\\\").replace('\\\"', \"\\\\\\\"\")\n}\n";
-    let request =
-        history(json!({"content": source, "eof": true, "path": "src/lib.rs", "lines": 3}));
+    let result =
+        json!({"content": source, "eof": true, "path": "src/lib.rs", "lines": 3, "stderr": ""});
+    let request = history(result.clone());
     let saved = serde_json::to_vec(&request).unwrap();
     let restored: ModelRequest = serde_json::from_slice(&saved).unwrap();
     let parts_backend = backend().with_tool_result_format(OpenAiToolResultFormat::TextParts);
@@ -181,7 +215,10 @@ fn text_parts_preserve_wire_and_history_but_version_observed_prefix_planning() {
     let tool = &body["messages"][2];
     assert_eq!(tool["role"], "tool");
     assert_eq!(tool["tool_call_id"], "native-call");
-    assert_eq!(source_span(&tool["content"][1]), source);
+    assert_eq!(
+        restore_envelope(&joined(&tool["content"], "")),
+        json!({"result": result, "is_error": false})
+    );
     assert_eq!(serde_json::to_vec(&restored).unwrap(), saved);
     let meter = parts_backend.meter_descriptor();
     assert_eq!(
@@ -193,6 +230,32 @@ fn text_parts_preserve_wire_and_history_but_version_observed_prefix_planning() {
         parts_backend.descriptor().extensions["openai-compatible/tool-result-encoding"],
         crate::tool_result::TEXT_PARTS_ENCODING_IDENTITY
     );
+    // Hold the observed-prefix planning version and all settings constant:
+    // changing only the wire codec must invalidate the bound recovery identity.
+    let mut legacy_descriptor = parts_backend.descriptor();
+    legacy_descriptor.extensions.insert(
+        "openai-compatible/tool-result-encoding".to_owned(),
+        json!("openai-compatible/text-parts-tool-envelope/v1"),
+    );
+    assert_ne!(legacy_descriptor, parts_backend.descriptor());
+    let legacy_config = (
+        "local-model",
+        0.6_f32.to_bits(),
+        128_u64,
+        false,
+        OpenAiSamplingConfig::default(),
+        CONTEXT_ESTIMATE_BYTES_PER_TOKEN,
+        "observed-prefix-input-delta/v1",
+    );
+    let mut legacy_meter = meter.clone();
+    legacy_meter.config_digest = Digest::sha256(
+        serde_json::to_vec(&(
+            legacy_config,
+            "openai-compatible/text-parts-tool-envelope/v1",
+        ))
+        .unwrap(),
+    );
+    assert_ne!(legacy_meter, meter);
     let resumed = backend().with_tool_result_format(OpenAiToolResultFormat::TextParts);
     assert_eq!(resumed.build_request_body(&restored).unwrap(), body);
     assert_eq!(resumed.descriptor(), parts_backend.descriptor());

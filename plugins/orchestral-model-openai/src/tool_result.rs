@@ -8,7 +8,7 @@ mod text_parts;
 // model descriptor and token-meter configuration bound by Run recovery.
 pub(crate) const YAML_ENCODING_IDENTITY: &str = "serde-yaml-0.9/tool-envelope/v1";
 pub(crate) const TEXT_PARTS_ENCODING_IDENTITY: &str =
-    "openai-compatible/text-parts-tool-envelope/v1";
+    "openai-compatible/text-parts-tool-envelope/v2";
 
 /// Text encoding of the complete `{result, is_error}` tool response envelope.
 /// Canonical ToolResults and their durable journals retain the original JSON.
@@ -21,9 +21,10 @@ pub enum OpenAiToolResultFormat {
     /// literal blocks; special whitespace may require quoted escapes.
     #[default]
     Yaml,
-    /// Separate top-level string values into verbatim fenced text parts, with
-    /// the remaining typed values in a metadata part. This is opt-in: the
-    /// provider's chat template must support OpenAI text-part arrays.
+    /// Separate top-level strings containing LF or CR into verbatim fenced
+    /// text parts. Other strings, including empty strings, and nested values
+    /// remain in typed JSON metadata. This is opt-in: the provider's chat
+    /// template must support OpenAI text-part arrays.
     #[serde(rename = "text_parts")]
     TextParts,
 }
@@ -129,7 +130,11 @@ mod tests {
             OpenAiToolResultFormat::TextParts => (
                 "1",
                 "2",
-                serde_json::to_vec(&(legacy_config, TEXT_PARTS_ENCODING_IDENTITY)).unwrap(),
+                serde_json::to_vec(&(
+                    legacy_config,
+                    "openai-compatible/text-parts-tool-envelope/v1",
+                ))
+                .unwrap(),
             ),
         };
         let meter = adapter.meter_descriptor();
