@@ -249,12 +249,9 @@ impl GenericAgentConfig {
                 "existing content before changing it and run relevant ",
                 "verification. Keep user-facing responses concise unless the user requests a ",
                 "detailed explanation. Avoid repeating explanations or checks that add no new ",
-                "evidence. Permission is owned by the Host, not inferred by you. When an ",
-                "exec_command needed for the user's request cannot run in the default sandbox, ",
-                "request sandbox_permissions='require_escalated' with a concise justification ",
-                "so the Host can apply policy or ask the user; do not offload the command to the ",
-                "user merely because approval is needed. Treat every Tool failure as an observation to ",
-                "correct or safely work around; report completion only from successful evidence."
+                "evidence. Permission is owned by the Host, not inferred by you. Treat every Tool ",
+                "failure as an observation to correct or safely work around; report completion ",
+                "only from successful evidence."
             )
             .to_owned(),
             stream_buffer: 128,

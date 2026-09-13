@@ -175,7 +175,7 @@ pub fn guarded_file_search_descriptor(restriction: ToolRestriction) -> ToolDescr
         tool_id: ToolId::new("orchestral/file_search/v1"),
         model_schema: ModelToolSchema {
             name: "file_search".to_owned(),
-            description: "Find paths inside a Host-approved workspace with a glob. When multiple workspaces are provided, select one with its exact canonical workspace root. Respects .gitignore, includes hidden source files, skips dependency/build noise, never follows symlinks, and reports partial results explicitly."
+            description: "Find paths inside a Host-approved workspace with a glob. Respects .gitignore, includes hidden source files, skips dependency/build noise, never follows symlinks, and reports partial results explicitly."
                 .to_owned(),
             input_schema: json!({
                 "type": "object",
@@ -191,7 +191,7 @@ pub fn guarded_file_search_descriptor(restriction: ToolRestriction) -> ToolDescr
                     },
                     "workspace": {
                         "type": "string",
-                        "description": "Optional exact Host-provided canonical workspace root. Omit to use the primary workspace."
+                        "description": "Exact canonical Host workspace root; omit for primary."
                     },
                     "case_sensitive": {
                         "type": "boolean",
@@ -349,7 +349,7 @@ pub fn guarded_text_search_descriptor(restriction: ToolRestriction) -> ToolDescr
         tool_id: ToolId::new("orchestral/text_search/v1"),
         model_schema: ModelToolSchema {
             name: "text_search".to_owned(),
-            description: "Search UTF-8 files inside a Host-approved workspace with ripgrep's streaming Rust matcher using a regular expression or literal. When multiple workspaces are provided, select one with its exact canonical workspace root. Results are resource-bounded, gitignore-aware, and explicitly complete or partial."
+            description: "Search UTF-8 files inside a Host-approved workspace with ripgrep's streaming Rust matcher using a regular expression or literal. Results are resource-bounded, gitignore-aware, and explicitly complete or partial."
                 .to_owned(),
             input_schema: json!({
                 "type": "object",
@@ -373,7 +373,7 @@ pub fn guarded_text_search_descriptor(restriction: ToolRestriction) -> ToolDescr
                     },
                     "workspace": {
                         "type": "string",
-                        "description": "Optional exact Host-provided canonical workspace root. Omit to use the primary workspace."
+                        "description": "Exact canonical Host workspace root; omit for primary."
                     },
                     "include": {
                         "type": "string",

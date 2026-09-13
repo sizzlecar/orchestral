@@ -434,7 +434,7 @@ pub fn guarded_file_read_descriptor(restriction: ToolRestriction) -> ToolDescrip
         tool_id: ToolId::new("orchestral/file_read/v3"),
         model_schema: ModelToolSchema {
             name: "file_read".to_owned(),
-            description: "Read UTF-8 source text by 1-indexed line range from a Host-approved workspace-relative path. When multiple workspaces are provided, select one with its exact canonical workspace root. Continue with next_offset when eof is false; truncation reasons are always explicit."
+            description: "Read UTF-8 source text by 1-indexed line range from a Host-approved workspace-relative path. Continue with next_offset when eof is false; truncation reasons are always explicit."
                 .to_owned(),
             input_schema: json!({
                 "type": "object",
@@ -446,7 +446,7 @@ pub fn guarded_file_read_descriptor(restriction: ToolRestriction) -> ToolDescrip
                     },
                     "workspace": {
                         "type": "string",
-                        "description": "Optional exact Host-provided canonical workspace root. Omit to use the primary workspace."
+                        "description": "Exact canonical Host workspace root; omit for primary."
                     },
                     "offset": {
                         "type": "integer",

@@ -435,7 +435,7 @@ pub fn guarded_file_edit_descriptor(restriction: ToolRestriction) -> ToolDescrip
                     "new_text": { "type": "string", "maxLength": MAX_RESULTING_FILE_BYTES },
                     "workspace": {
                         "type": "string", "minLength": 1,
-                        "description": "Optional exact Host-provided canonical workspace root. Omit to use the primary workspace."
+                        "description": "Exact canonical Host workspace root; omit for primary."
                     }
                 },
                 "additionalProperties": false

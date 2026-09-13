@@ -1793,10 +1793,16 @@ fn local_cli_routes_structured_host_execution_through_the_approval_prompt() {
                 "{request_json}"
             );
             assert!(request_json.contains("require_escalated"), "{request_json}");
-            let context = model_request_text(&request.body);
+            let exec_description = request.body["tools"]
+                .as_array()
+                .expect("model tools")
+                .iter()
+                .find(|tool| tool["function"]["name"] == "exec_command")
+                .and_then(|tool| tool["function"]["description"].as_str())
+                .expect("exec_command description");
             assert!(
-                context.contains("do not offload the command to the user"),
-                "{context}"
+                exec_description.contains("Never tell the user to run the command manually merely because escalation is required"),
+                "{exec_description}"
             );
             openai_tool_response(
                 "approved-host-read",

@@ -913,9 +913,8 @@ fn build_exec_command_descriptor(
             }, concat!(
                 "Never tell the user to run the command manually merely because escalation is required. Short commands ",
                 "return directly; interactive or still-running commands return a session_id ",
-                "for write_stdin. Non-TTY commands aggregate output until exit or the wait ",
-                "deadline; TTY commands return after an output pause. Set wait_mode to ",
-                "'completion' or 'output' to choose explicitly. A wait deadline does not kill the command. ",
+                "for write_stdin. Default wait_mode: completion for non-TTY, output for TTY. ",
+                "A wait deadline does not kill the command. ",
                 "Long captured output shares a stdout/stderr budget. Each available stream keeps its beginning and end where the budget permits."
             )),
             input_schema: json!({
@@ -968,10 +967,9 @@ fn build_write_stdin_descriptor(mut restriction: ToolRestriction) -> ToolDescrip
             description: concat!(
                 "Send characters to a running exec session, or omit chars to poll for new output. ",
                 "If the process exits before input can be delivered, the call returns its final ",
-                "output and exit status instead of failing. Empty non-TTY polls default to ",
-                "completion mode: aggregate output for up to 30 seconds or until exit. ",
-                "TTY sessions and input writes default to output mode for interactive responses. ",
-                "Set wait_mode explicitly to override; yield_time_ms controls the observation ",
+                "output and exit status instead of failing. Default wait_mode: completion with ",
+                "a 30-second wait for empty non-TTY polls, output for TTY or input writes. ",
+                "yield_time_ms controls the observation ",
                 "window, not the process lifetime. Long captured output shares a stdout/stderr budget and keeps ",
                 "each available stream's beginning and end where it fits. Polling returns new output only."
             )
@@ -1482,7 +1480,7 @@ fn wait_mode_schema() -> Value {
     json!({
         "type": "string",
         "enum": ["output", "completion"],
-        "description": "output returns after a short pause in output; completion aggregates output until exit or the wait deadline. Host input can yield either mode without terminating the process."
+        "description": "output yields after a short output pause; completion aggregates output until exit or the wait deadline. Host input can yield either without terminating the process."
     })
 }
 

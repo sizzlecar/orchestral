@@ -796,8 +796,7 @@ pub fn guarded_apply_patch_descriptor(restriction: ToolRestriction) -> ToolDescr
                 "The patch must use `*** Begin Patch` / `*** End Patch` and one or more ",
                 "exact directives: `*** Add File: path`, `*** Update File: path` with `@@` ",
                 "hunks, or `*** Delete File: path`; each path directive requires the colon. ",
-                "Paths must be normalized paths relative to the selected workspace. When multiple ",
-                "workspaces are provided, select one with its exact canonical workspace root."
+                "Paths must be normalized paths relative to the selected workspace."
             )
             .to_owned(),
             input_schema: json!({
@@ -810,7 +809,7 @@ pub fn guarded_apply_patch_descriptor(restriction: ToolRestriction) -> ToolDescr
                     },
                     "workspace": {
                         "type": "string",
-                        "description": "Optional exact Host-provided canonical workspace root. Omit to use the primary workspace."
+                        "description": "Exact canonical Host workspace root; omit for primary."
                     }
                 },
                 "additionalProperties": false
@@ -836,9 +835,7 @@ pub fn guarded_file_write_descriptor(restriction: ToolRestriction) -> ToolDescri
                 "through eof without truncation. The Host uses the latest complete read shown ",
                 "in this model request as the default version precondition; an explicit ",
                 "expected_digest overrides it and must match. Use file_edit or apply_patch ",
-                "for targeted edits to existing files. Parent directories ",
-                "must already exist. When multiple workspaces are provided, select one with its ",
-                "exact canonical workspace root."
+                "for targeted edits to existing files. Parent directories must already exist."
             )
             .to_owned(),
             input_schema: json!({
@@ -851,7 +848,7 @@ pub fn guarded_file_write_descriptor(restriction: ToolRestriction) -> ToolDescri
                     },
                     "workspace": {
                         "type": "string",
-                        "description": "Optional exact Host-provided canonical workspace root. Omit to use the primary workspace."
+                        "description": "Exact canonical Host workspace root; omit for primary."
                     },
                     "content": {
                         "type": "string",
