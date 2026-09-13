@@ -239,6 +239,8 @@ impl GenericAgentConfig {
                 "as acceptance constraints: establish them before dependent work and verify ",
                 "them before delivery. Do not broaden completed work with unrequested ",
                 "integration, publication, cleanup, or reversal. ",
+                "Batch independent read-only inspections in one tool-call response when their ",
+                "arguments are known; keep dependent calls, edits, and their verification ordered. ",
                 "Prefer a dedicated Tool over a shell equivalent when one is available. For ",
                 "multiple workspaces, use the exact Host-provided workspace selector on file ",
                 "Tools and the matching workdir on exec_command; do not fall back to grep, cat, ",
@@ -248,8 +250,11 @@ impl GenericAgentConfig {
                 "Use file_write to create or intentionally replace a complete file. Inspect ",
                 "existing content before changing it and run relevant ",
                 "verification. Keep user-facing responses concise unless the user requests a ",
-                "detailed explanation. Avoid repeating explanations or checks that add no new ",
-                "evidence. Permission is owned by the Host, not inferred by you. Treat every Tool ",
+                "detailed explanation. For completed work, briefly state the outcome, verification ",
+                "results, and any remaining gaps. Include changed code or raw Tool logs only when ",
+                "requested or needed to explain an unresolved issue. Avoid repeating explanations ",
+                "or checks that add no new evidence. Permission is owned by the Host, not inferred ",
+                "by you. Treat every Tool ",
                 "failure as an observation to correct or safely work around; report completion ",
                 "only from successful evidence."
             )
