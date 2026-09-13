@@ -21,7 +21,7 @@ use crate::exec_process::{
 use crate::tool_runtime::{GuardedToolExecution, GuardedToolExecutor};
 use crate::tools::shell_sandbox::{sandbox_command, SandboxNetworkAccess, ShellSandboxPolicy};
 
-use super::support::{canonical_roots, truncate_utf8_lossy};
+use super::support::canonical_roots;
 
 pub const GUARDED_EXEC_SANDBOX_PROFILE: &str = "orchestral.exec_command.v1";
 const DEFAULT_SANDBOX_PERMISSION: &str = "use_default";
@@ -915,7 +915,8 @@ fn build_exec_command_descriptor(
                 "return directly; interactive or still-running commands return a session_id ",
                 "for write_stdin. Non-TTY commands aggregate output until exit or the wait ",
                 "deadline; TTY commands return after an output pause. Set wait_mode to ",
-                "'completion' or 'output' to choose explicitly. A wait deadline does not kill the command."
+                "'completion' or 'output' to choose explicitly. A wait deadline does not kill the command. ",
+                "Long captured output shares a stdout/stderr budget. Each available stream keeps its beginning and end where the budget permits."
             )),
             input_schema: json!({
                 "type": "object",
@@ -971,7 +972,8 @@ fn build_write_stdin_descriptor(mut restriction: ToolRestriction) -> ToolDescrip
                 "completion mode: aggregate output for up to 30 seconds or until exit. ",
                 "TTY sessions and input writes default to output mode for interactive responses. ",
                 "Set wait_mode explicitly to override; yield_time_ms controls the observation ",
-                "window, not the process lifetime."
+                "window, not the process lifetime. Long captured output shares a stdout/stderr budget and keeps ",
+                "each available stream's beginning and end where it fits. Polling returns new output only."
             )
             .to_owned(),
             input_schema: json!({
@@ -1333,7 +1335,10 @@ fn exec_output_schema() -> Value {
             "session_id": { "type": "integer" },
             "wall_time_seconds": { "type": "number" },
             "truncated": { "type": "boolean" },
-            "dropped_bytes": { "type": "integer" },
+            "dropped_bytes": {
+                "type": "integer",
+                "description": "Bytes omitted by capture limits or by shortening the decoded output."
+            },
             "sandbox_backend": { "type": "string" }
         },
         "additionalProperties": false
@@ -1535,10 +1540,17 @@ fn render_result(
     max_output_bytes: usize,
     sandbox_backend: &str,
 ) -> Value {
-    let (stdout, stdout_truncated, _) =
-        truncate_utf8_lossy(result.stdout.as_bytes(), max_output_bytes);
-    let remaining = max_output_bytes.saturating_sub(stdout.len());
-    let (stderr, stderr_truncated, _) = truncate_utf8_lossy(result.stderr.as_bytes(), remaining);
+    // Reserve space for both streams. A short or absent stream gives its unused
+    // share to the other; verbose stdout must not hide stderr diagnostics.
+    let stdout_budget = result.stdout.len().min(max_output_bytes / 2);
+    let stderr_budget = result.stderr.len().min(max_output_bytes - stdout_budget);
+    let stdout_budget = result.stdout.len().min(max_output_bytes - stderr_budget);
+    let (stdout, stdout_omitted) = shorten_exec_output(&result.stdout, stdout_budget);
+    let (stderr, stderr_omitted) = shorten_exec_output(&result.stderr, stderr_budget);
+    let dropped_bytes = result
+        .dropped_bytes
+        .saturating_add(stdout_omitted)
+        .saturating_add(stderr_omitted);
     let mut value = Map::from_iter([
         ("stdout".to_owned(), json!(stdout)),
         ("stderr".to_owned(), json!(stderr)),
@@ -1547,11 +1559,8 @@ fn render_result(
             "wall_time_seconds".to_owned(),
             json!(result.wall_time_seconds),
         ),
-        (
-            "truncated".to_owned(),
-            json!(stdout_truncated || stderr_truncated || result.dropped_bytes > 0),
-        ),
-        ("dropped_bytes".to_owned(), json!(result.dropped_bytes)),
+        ("truncated".to_owned(), json!(dropped_bytes > 0)),
+        ("dropped_bytes".to_owned(), json!(dropped_bytes)),
         ("sandbox_backend".to_owned(), json!(sandbox_backend)),
     ]);
     if result.alive {
@@ -1561,6 +1570,38 @@ fn render_result(
         value.insert("exit_code".to_owned(), json!(exit_code));
     }
     Value::Object(value)
+}
+
+fn shorten_exec_output(text: &str, max_bytes: usize) -> (String, u64) {
+    if text.len() <= max_bytes {
+        return (text.to_owned(), 0);
+    }
+    const OMITTED: &str = "\n[... omitted ...]\n";
+    // Tiny budgets cannot fit both framing and useful text. Return a suffix;
+    // the enclosing result still carries the truncation flag and omitted count.
+    let (head_budget, tail_budget) = if max_bytes > OMITTED.len() + 1 {
+        let content_budget = max_bytes - OMITTED.len();
+        (content_budget / 2, content_budget - content_budget / 2)
+    } else {
+        (0, max_bytes)
+    };
+    let mut head_end = head_budget;
+    while !text.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = text.len() - tail_budget;
+    while !text.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let head = &text[..head_end];
+    let tail = &text[tail_start..];
+    let omitted = text.len() - head.len() - tail.len();
+    let output = if head_budget > 0 {
+        format!("{head}{OMITTED}{tail}")
+    } else {
+        tail.to_owned()
+    };
+    (output, omitted as u64)
 }
 
 fn rejected(code: impl Into<String>, message: impl Into<String>) -> ToolOutcome {
@@ -1653,16 +1694,14 @@ mod tests {
         let descriptor = guarded_write_stdin_descriptor(ToolRestriction {
             bounds: ToolPolicyBounds::default(),
         });
-        for (dropped_bytes, budget, stderr, truncated) in [
-            (0, 4, "cd", true),
-            (9, 64, "cdef", true),
-            (0, 64, "cdef", false),
-        ] {
+        for (capture_dropped, budget, stderr, total_dropped) in
+            [(0, 4, "ef", 2), (9, 64, "cdef", 9), (0, 64, "cdef", 0)]
+        {
             let output = render_result(
                 ExecPollResult {
                     stdout: "ab".to_owned(),
                     stderr: "cdef".to_owned(),
-                    dropped_bytes,
+                    dropped_bytes: capture_dropped,
                     alive: true,
                     exit_code: None,
                     wall_time_seconds: 0.5,
@@ -1676,11 +1715,186 @@ mod tests {
             assert_eq!(output["stderr"], stderr);
             assert_eq!(output["session_id"], 42);
             assert_eq!(output["alive"], true);
-            assert_eq!(output["truncated"], truncated);
-            assert_eq!(output["dropped_bytes"], dropped_bytes);
+            assert_eq!(output["truncated"], total_dropped > 0);
+            assert_eq!(output["dropped_bytes"], total_dropped);
             assert!(output.get("exit_code").is_none());
             assert!(output.get("output").is_none());
         }
+    }
+
+    #[test]
+    fn bounded_exec_output_keeps_stderr_and_each_streams_terminal_diagnostics() {
+        let stdout = format!("build started\n{}\nbuild failed\n", "progress\n".repeat(32));
+        let stderr = format!(
+            "warning: deprecated\n{}\nerror: unavailable\n",
+            "detail\n".repeat(32)
+        );
+        let output = render_result(
+            ExecPollResult {
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
+                dropped_bytes: 11,
+                alive: false,
+                exit_code: Some(9),
+                wall_time_seconds: 0.1,
+            },
+            ExecSessionId::new(1).unwrap(),
+            256,
+            "test-sandbox",
+        );
+        let visible_stdout = output["stdout"].as_str().unwrap();
+        let visible_stderr = output["stderr"].as_str().unwrap();
+        assert!(visible_stdout.starts_with("build started\n"));
+        assert!(visible_stdout.ends_with("build failed\n"));
+        assert!(visible_stderr.starts_with("warning: deprecated\n"));
+        assert!(visible_stderr.ends_with("error: unavailable\n"));
+        assert!(visible_stdout.len() + visible_stderr.len() <= 256);
+        let marker_bytes = 2 * "\n[... omitted ...]\n".len();
+        assert_eq!(
+            output["dropped_bytes"],
+            11 + stdout.len() + stderr.len() - visible_stdout.len() - visible_stderr.len()
+                + marker_bytes
+        );
+        assert_eq!(output["exit_code"], 9);
+        assert_eq!(output["alive"], false);
+        assert_eq!(output["truncated"], true);
+    }
+
+    #[test]
+    fn bounded_exec_output_respects_utf8_and_tiny_or_exact_capacity() {
+        let text = "初期🙂\n処理中\nошибка\n終端";
+        for budget in 0..=text.len() + 1 {
+            let (visible, omitted) = super::shorten_exec_output(text, budget);
+            assert!(visible.len() <= budget);
+            assert!(!visible.contains('\u{fffd}'));
+            if budget >= text.len() {
+                assert_eq!(visible, text);
+                assert_eq!(omitted, 0);
+            } else {
+                assert!(omitted > 0);
+                let pieces = visible.split("\n[... omitted ...]\n").collect::<Vec<_>>();
+                let retained = pieces.iter().map(|piece| piece.len()).sum::<usize>();
+                assert_eq!(omitted as usize + retained, text.len());
+                assert!(text.ends_with(pieces.last().unwrap()));
+                if pieces.len() == 2 {
+                    assert!(text.starts_with(pieces[0]));
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounded_exec_output_reports_capture_and_render_loss_once_across_polls() {
+        use crate::exec_process::{ExecSpawnSpec, ProcessSupervisor};
+        use orchestral_core::agent_protocol::wire::RunId;
+        use orchestral_core::tool_protocol::{
+            CapabilityRequest, EffectScope, ToolOperationPlan, ToolOperationRisk,
+        };
+        use std::collections::BTreeSet;
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+
+        let capacity = 128;
+        let manager = ProcessSupervisor::new(capacity).unwrap();
+        let run_id = RunId::new("bounded-output");
+        let stdout = format!("start:{}:stdout-end", "x".repeat(4 * capacity));
+        let stderr = format!("start:{}:stderr-end", "y".repeat(4 * capacity));
+        let session = manager
+            .spawn(ExecSpawnSpec {
+                run_id: run_id.clone(),
+                program: "/bin/sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    concat!(
+                        "printf '%s' \"$1\"; printf '%s' \"$2\" >&2; ",
+                        "read value; printf done; printf fatal >&2; exit 7"
+                    )
+                    .to_owned(),
+                    "bounded-output".to_owned(),
+                    stdout.clone(),
+                    stderr.clone(),
+                ],
+                cwd: std::fs::canonicalize(".").unwrap(),
+                environment: Default::default(),
+                tty: false,
+                backend_starts_new_session: false,
+                operation: ToolOperationPlan {
+                    required_capabilities: CapabilityRequest::from_effects(BTreeSet::from([
+                        EffectScope::Process,
+                    ])),
+                    risk: ToolOperationRisk::Routine,
+                    session_approval_scope: None,
+                    summary: "Exercise bounded command output".to_owned(),
+                },
+            })
+            .await
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        let captured = manager
+            .write_and_poll(
+                &run_id,
+                session,
+                None,
+                Duration::from_secs(1),
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        assert!(captured.alive);
+        assert_eq!(captured.stdout.len(), capacity);
+        assert_eq!(captured.stderr.len(), capacity);
+        assert_eq!(
+            captured.dropped_bytes as usize,
+            stdout.len() + stderr.len() - 2 * capacity
+        );
+        let output = render_result(captured, session, capacity, "test");
+        let kept_stdout = output["stdout"].as_str().unwrap();
+        let kept_stderr = output["stderr"].as_str().unwrap();
+        assert!(kept_stdout.ends_with(":stdout-end"));
+        assert!(kept_stderr.ends_with(":stderr-end"));
+        assert!(kept_stdout.len() + kept_stderr.len() <= capacity);
+        let kept_bytes = kept_stdout.len() + kept_stderr.len() - 2 * "\n[... omitted ...]\n".len();
+        assert_eq!(
+            output["dropped_bytes"],
+            stdout.len() + stderr.len() - kept_bytes
+        );
+
+        let empty = manager
+            .write_and_poll(
+                &run_id,
+                session,
+                None,
+                Duration::from_millis(10),
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        let empty = render_result(empty, session, capacity, "test");
+        assert_eq!(empty["alive"], true);
+        assert_eq!(empty["session_id"], session.get());
+        assert_eq!(empty["stdout"], "");
+        assert_eq!(empty["stderr"], "");
+        assert_eq!(empty["dropped_bytes"], 0);
+        assert_eq!(empty["truncated"], false);
+
+        let final_output = manager
+            .write_and_poll(
+                &run_id,
+                session,
+                Some("finish\n"),
+                Duration::from_secs(1),
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        let final_output = render_result(final_output, session, capacity, "test");
+        assert_eq!(final_output["stdout"], "done");
+        assert_eq!(final_output["stderr"], "fatal");
+        assert_eq!(final_output["exit_code"], 7);
+        assert_eq!(final_output["alive"], false);
+        assert_eq!(final_output["dropped_bytes"], 0);
+        assert!(manager.list(&run_id).unwrap().is_empty());
     }
 
     #[test]
