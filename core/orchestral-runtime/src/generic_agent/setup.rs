@@ -248,7 +248,7 @@ pub(super) fn generic_config_digest(
         "agent_id": config.agent_id,
         "system_prompt": config.system_prompt,
         "project_instructions": config.project_instructions,
-        "context_projection_contract": "original-user-anchor/v2",
+        "context_projection_contract": "source-positioned-summary/v3",
         "model_retry": config.model_retry,
         "model_descriptor": model_descriptor,
         "token_meter": token_meter,

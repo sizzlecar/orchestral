@@ -125,7 +125,19 @@ fn default_summary_capacity_adapts_to_context_before_the_next_tool_round() {
     );
     assert!(output.status.success(), "{}", output.stderr_text());
     assert_planning_boundaries(&workspace);
-    assert_eq!(server.join().unwrap().len(), 5);
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 5);
+    let initial = requests[0].body["messages"].as_array().unwrap();
+    let compacted = requests[2].body["messages"].as_array().unwrap();
+    assert_eq!(initial[0]["role"], "system");
+    assert_eq!(initial[1]["role"], "user");
+    assert_eq!(&compacted[..2], &initial[..2]);
+    assert_eq!(compacted[2]["role"], "assistant");
+    assert!(compacted[2]["content"]
+        .as_str()
+        .unwrap()
+        .starts_with("UNTRUSTED earlier transcript"));
+    assert!(compacted[2].get("tool_calls").is_none());
     assert!(
         payload_count(
             &session_records(&workspace),

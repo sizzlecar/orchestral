@@ -242,14 +242,17 @@ impl AgentSessionEvent {
                     ));
                 }
                 validate_message(summary)?;
-                if summary.role != ModelRole::System
+                // Existing journals used System summaries. Keep those records
+                // readable; new history summaries can use Assistant authority
+                // without introducing Tool calls or provider continuation state.
+                if !matches!(summary.role, ModelRole::System | ModelRole::Assistant)
                     || summary
                         .content
                         .iter()
                         .any(|content| !matches!(content, ModelContent::Text { .. }))
                 {
                     return Err(AgentSessionError::InvalidEvent(
-                        "compaction summary must be a System text message".to_owned(),
+                        "compaction summary must be a System or Assistant text message".to_owned(),
                     ));
                 }
             }
@@ -705,5 +708,49 @@ mod tests {
             version: "1".to_owned(),
         };
         assert!(event.validate().is_err());
+    }
+
+    #[test]
+    fn compaction_accepts_legacy_and_history_text_but_not_instructions_or_opaque_state() {
+        let event = |summary| AgentSessionEvent::ActiveRunCompactionCommitted {
+            source: SessionSourceRange {
+                first_session_seq: 2,
+                last_session_seq: 3,
+            },
+            source_digest: Digest::sha256("source"),
+            policy_digest: Digest::sha256("policy"),
+            summary_config_digest: Digest::sha256("summary-config"),
+            summary,
+            strategy: "extractive".to_owned(),
+            model: None,
+            version: "6".to_owned(),
+        };
+        for role in [ModelRole::System, ModelRole::Assistant] {
+            assert!(event(ModelMessage::text(role, "Earlier observations"))
+                .validate()
+                .is_ok());
+        }
+        assert!(
+            event(ModelMessage::text(ModelRole::User, "New instructions"))
+                .validate()
+                .is_err()
+        );
+        for content in [
+            ModelContent::Data {
+                media_type: "application/json".to_owned(),
+                value: serde_json::json!({"observation": 1}),
+            },
+            ModelContent::Continuation {
+                namespace: "fixture/continuation".to_owned(),
+                value: serde_json::json!({"opaque": 1}),
+            },
+        ] {
+            assert!(event(ModelMessage {
+                role: ModelRole::Assistant,
+                content: vec![content],
+            })
+            .validate()
+            .is_err());
+        }
     }
 }

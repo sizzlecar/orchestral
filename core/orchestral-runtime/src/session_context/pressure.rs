@@ -65,6 +65,18 @@ impl AgentSessionCompactor {
                 sources.push(source);
             }
         }
+        // A late summary producer may be adjacent to exchanges on the other
+        // side of a surviving fact. Single groups remain useful safe candidates
+        // when their combined logical extent cannot be replaced in place.
+        for group in groups
+            .values()
+            .filter(|group| is_current_compactable(group, &records, &request.current_run_id))
+        {
+            let source = single_range(group.producer_seq);
+            if !sources.contains(&source) {
+                sources.push(source);
+            }
+        }
         let mut best = None;
         let mut best_tokens = before;
         'sources: for source in sources {
@@ -104,20 +116,17 @@ impl AgentSessionCompactor {
                 if previous_summary.as_ref() == Some(&summary) {
                     break;
                 }
+                if summary.role == ModelRole::Assistant
+                    && !placement::can_replace_source(&groups, &records, &source)
+                {
+                    continue 'sources;
+                }
+                let next_seq = records.len() as u64 + 1;
+                let replacement =
+                    placement::summary_group(&groups, &source, next_seq, &summary, true, true)?;
                 let mut candidate = groups.clone();
                 candidate.retain(|_, group| !source.contains(group.producer_seq));
-                let next_seq = records.len() as u64 + 1;
-                candidate.insert(
-                    next_seq,
-                    MessageGroup {
-                        key: next_seq,
-                        producer_seq: next_seq,
-                        source: source.clone(),
-                        messages: vec![summary.clone()],
-                        pinned: true,
-                        active_compactable: true,
-                    },
-                );
+                candidate.insert(next_seq, replacement);
                 let used = measure(&candidate)?;
                 if used < best_tokens {
                     best_tokens = used;

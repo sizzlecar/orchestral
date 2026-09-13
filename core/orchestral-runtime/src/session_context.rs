@@ -1,5 +1,6 @@
 //! Replay-derived model context for the Generic Agent.
 
+mod placement;
 mod pressure;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -212,6 +213,7 @@ impl AgentSessionContextEngine {
                         key: record.session_seq,
                         producer_seq: record.session_seq,
                         source: single_range(record.session_seq),
+                        logical_source: single_range(record.session_seq),
                         messages: vec![message.clone()],
                         pinned: false,
                         active_compactable: false,
@@ -351,6 +353,10 @@ struct MessageGroup {
     /// by those producers.
     producer_seq: u64,
     source: SessionSourceRange,
+    /// Extent of the original history represented by this group, including
+    /// transitive summary sources. Producer order remains the durable identity
+    /// and history-selection order; this range controls new summary placement.
+    logical_source: SessionSourceRange,
     messages: Vec<ModelMessage>,
     pinned: bool,
     /// The group is a complete Tool exchange (or an existing summary of such
@@ -374,6 +380,7 @@ fn replay_groups(
                         key: record.session_seq,
                         producer_seq: record.session_seq,
                         source: single_range(record.session_seq),
+                        logical_source: single_range(record.session_seq),
                         messages: vec![message.clone()],
                         pinned: record.run_id == *current_run_id,
                         active_compactable: false,
@@ -392,6 +399,7 @@ fn replay_groups(
                         key: record.session_seq,
                         producer_seq: record.session_seq,
                         source: single_range(record.session_seq),
+                        logical_source: single_range(record.session_seq),
                         messages: vec![assistant.clone(), tool.clone()],
                         pinned: record.run_id == *current_run_id || !retained_artifacts.is_empty(),
                         active_compactable: retained_artifacts.is_empty(),
@@ -410,6 +418,7 @@ fn replay_groups(
                         key: record.session_seq,
                         producer_seq: record.session_seq,
                         source: single_range(record.session_seq),
+                        logical_source: single_range(record.session_seq),
                         messages: vec![effect_uncertainty_message(
                             effect_call_id,
                             model_call_id,
@@ -428,6 +437,7 @@ fn replay_groups(
                         key: record.session_seq,
                         producer_seq: record.session_seq,
                         source: single_range(record.session_seq),
+                        logical_source: single_range(record.session_seq),
                         messages: vec![message.clone()],
                         pinned: record.run_id == *current_run_id,
                         active_compactable: false,
@@ -466,6 +476,7 @@ fn replay_groups(
                         key: record.session_seq,
                         producer_seq: record.session_seq,
                         source: single_range(record.session_seq),
+                        logical_source: single_range(record.session_seq),
                         messages: vec![skill_load_message(load)],
                         // Current-Run instructions stay pinned for recovery
                         // and cannot be evicted by ordinary history selection.
@@ -516,18 +527,26 @@ fn replay_groups(
                         "compaction attempted to shadow the current Run".to_owned(),
                     )));
                 }
-                groups.retain(|_, group| !source.contains(group.producer_seq));
-                groups.insert(
+                if summary.role == ModelRole::Assistant
+                    && !placement::can_replace_source(&groups, records, source)
+                {
+                    return Err(SessionContextError::Journal(AgentSessionError::Corrupt(
+                        "summary placement crosses a surviving Context group".to_owned(),
+                    )));
+                }
+                let summary_group = placement::summary_group(
+                    &groups,
+                    source,
                     record.session_seq,
-                    MessageGroup {
-                        key: record.session_seq,
-                        producer_seq: record.session_seq,
-                        source: source.clone(),
-                        messages: vec![summary.clone()],
-                        pinned: false,
-                        active_compactable: false,
-                    },
-                );
+                    summary,
+                    false,
+                    false,
+                )
+                .map_err(|error| {
+                    SessionContextError::Journal(AgentSessionError::Corrupt(error.to_string()))
+                })?;
+                groups.retain(|_, group| !source.contains(group.producer_seq));
+                groups.insert(record.session_seq, summary_group);
             }
             AgentSessionEvent::ActiveRunCompactionCommitted {
                 source,
@@ -563,18 +582,26 @@ fn replay_groups(
                             .to_owned(),
                     )));
                 }
-                groups.retain(|_, group| !source.contains(group.producer_seq));
-                groups.insert(
+                if summary.role == ModelRole::Assistant
+                    && !placement::can_replace_source(&groups, records, source)
+                {
+                    return Err(SessionContextError::Journal(AgentSessionError::Corrupt(
+                        "summary placement crosses a surviving Context group".to_owned(),
+                    )));
+                }
+                let summary_group = placement::summary_group(
+                    &groups,
+                    source,
                     record.session_seq,
-                    MessageGroup {
-                        key: record.session_seq,
-                        producer_seq: record.session_seq,
-                        source: source.clone(),
-                        messages: vec![summary.clone()],
-                        pinned: record.run_id == *current_run_id,
-                        active_compactable: true,
-                    },
-                );
+                    summary,
+                    record.run_id == *current_run_id,
+                    true,
+                )
+                .map_err(|error| {
+                    SessionContextError::Journal(AgentSessionError::Corrupt(error.to_string()))
+                })?;
+                groups.retain(|_, group| !source.contains(group.producer_seq));
+                groups.insert(record.session_seq, summary_group);
             }
             _ => {
                 return Err(SessionContextError::Journal(AgentSessionError::Corrupt(
@@ -660,7 +687,9 @@ fn assemble_messages(
             messages.extend(group.messages.clone());
         }
     }
-    for group in groups.values() {
+    let mut conversation = groups.values().collect::<Vec<_>>();
+    conversation.sort_by_key(|group| (group.logical_source.first_session_seq, group.producer_seq));
+    for group in conversation {
         if selected.contains(&group.key)
             && !group
                 .messages
@@ -1044,7 +1073,7 @@ impl DeterministicExtractiveSessionSummarizer {
             ));
         }
         let config = serde_json::json!({
-            "contract": "deterministic-extractive-session-summary/v5",
+            "contract": "deterministic-extractive-session-summary/v6",
             "max_summary_chars": max_summary_chars,
         });
         let bytes = serde_jcs::to_vec(&config).map_err(|error| {
@@ -1057,7 +1086,7 @@ impl DeterministicExtractiveSessionSummarizer {
             descriptor: SessionSummarizerDescriptor {
                 strategy: "deterministic-extractive".to_owned(),
                 model: None,
-                version: "5".to_owned(),
+                version: "6".to_owned(),
                 config_digest: Digest::sha256(bytes),
             },
         })
@@ -1261,7 +1290,7 @@ impl AgentSessionSummarizer for DeterministicExtractiveSessionSummarizer {
             summary.push_str(&rendered);
         }
         debug_assert!(summary.chars().count() <= self.max_summary_chars);
-        Ok(ModelMessage::text(ModelRole::System, summary))
+        Ok(ModelMessage::text(ModelRole::Assistant, summary))
     }
 }
 
@@ -1737,6 +1766,11 @@ impl AgentSessionCompactor {
         summary.validate().map_err(|error| {
             SessionContextError::Compaction(format!("invalid summary message: {error}"))
         })?;
+        if summary.role == ModelRole::Assistant
+            && !placement::can_replace_source(&groups, &records, &source)
+        {
+            return Ok(None);
+        }
         let event_id = AgentSessionEventId::new(format!(
             "compaction-{}-{}-{}",
             session_id.as_str(),
@@ -1823,6 +1857,12 @@ impl AgentSessionCompactor {
         summary: ModelMessage,
     ) -> Result<Option<AgentSessionRecord>, SessionContextError> {
         let session_id = &records[0].session_id;
+        let groups = replay_groups(records, current_run_id, &BTreeMap::new())?;
+        if summary.role == ModelRole::Assistant
+            && !placement::can_replace_source(&groups, records, &source)
+        {
+            return Ok(None);
+        }
         let source_digest = session_range_digest(records, &source)?;
         let policy_digest = self.policy.digest()?;
         summary.validate().map_err(|error| {
@@ -2448,7 +2488,13 @@ mod tests {
         let summary = projected
             .messages
             .iter()
-            .filter(|message| message.role == ModelRole::System)
+            .filter(|message| {
+                message.role == ModelRole::Assistant
+                    && message
+                        .content
+                        .iter()
+                        .all(|content| matches!(content, ModelContent::Text { .. }))
+            })
             .flat_map(|message| &message.content)
             .find_map(|content| match content {
                 ModelContent::Text { text } => Some(text),
@@ -2618,7 +2664,13 @@ mod tests {
         let summaries = after
             .messages
             .iter()
-            .filter(|message| message.role == ModelRole::System)
+            .filter(|message| {
+                message.role == ModelRole::Assistant
+                    && message
+                        .content
+                        .iter()
+                        .all(|content| matches!(content, ModelContent::Text { .. }))
+            })
             .collect::<Vec<_>>();
         assert!(!summaries.is_empty());
         let summary = serde_json::to_string(&summaries).unwrap();
@@ -2706,7 +2758,7 @@ mod tests {
             let first = summarizer.summarize(summarize()).await.unwrap();
             let second = summarizer.summarize(summarize()).await.unwrap();
             assert_eq!(first, second);
-            assert_eq!(first.role, ModelRole::System);
+            assert_eq!(first.role, ModelRole::Assistant);
             let ModelContent::Text { text } = &first.content[0] else {
                 panic!("extractive summary must be one text block");
             };
