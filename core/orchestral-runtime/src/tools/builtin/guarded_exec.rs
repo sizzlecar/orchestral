@@ -893,11 +893,37 @@ fn build_exec_command_descriptor(
 ) -> ToolDescriptor {
     apply_exec_restriction(&mut restriction);
     let effect_scopes = restricted_exec_effects(&restriction);
+    let host_execution_available = effect_scopes.contains(&EffectScope::HostExecution);
+    let mut input_schema = json!({
+        "type": "object",
+        "required": if sandboxed_execution_enabled { vec!["cmd"] } else { vec!["cmd", "sandbox_permissions", "justification"] },
+        "properties": {
+            "cmd": { "type": "string", "minLength": 1 },
+            "workdir": { "type": "string", "minLength": 1 },
+            "tty": { "type": "boolean" },
+            "wait_mode": wait_mode_schema(),
+            "yield_time_ms": { "type": "integer", "minimum": 1 },
+            "max_output_tokens": { "type": "integer", "minimum": 1 },
+            "sandbox_permissions": {
+                "type": "string",
+                "enum": if sandboxed_execution_enabled { vec!["use_default", "require_escalated"] } else { vec!["require_escalated"] }
+            },
+            "justification": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false
+    });
+    if sandboxed_execution_enabled && !host_execution_available {
+        let properties = input_schema["properties"].as_object_mut().unwrap();
+        properties.remove("sandbox_permissions");
+        properties.remove("justification");
+    }
     ToolDescriptor {
         tool_id: ToolId::new("orchestral/exec_command/v2"),
         model_schema: ModelToolSchema {
             name: "exec_command".to_owned(),
-            description: format!("{} {}", if sandboxed_execution_enabled {
+            description: format!("{}{} {}", if sandboxed_execution_enabled && !host_execution_available {
+                "Run a shell command in the workspace sandbox."
+            } else if sandboxed_execution_enabled {
                 concat!(
                     "Run a shell command. Commands use the workspace sandbox by default. ",
                     "When that sandbox prevents an operation the user requested, retry with ",
@@ -910,31 +936,18 @@ fn build_exec_command_descriptor(
                     "the workspace sandbox. Set sandbox_permissions='require_escalated' and ",
                     "provide a concise justification on every command."
                 )
+            }, if host_execution_available || !sandboxed_execution_enabled {
+                " Never tell the user to run the command manually merely because escalation is required."
+            } else {
+                ""
             }, concat!(
-                "Never tell the user to run the command manually merely because escalation is required. Short commands ",
+                "Short commands ",
                 "return directly; interactive or still-running commands return a session_id ",
                 "for write_stdin. Default wait_mode: completion for non-TTY, output for TTY. ",
                 "A wait deadline does not kill the command. ",
                 "Long captured output shares a stdout/stderr budget. Each available stream keeps its beginning and end where the budget permits."
             )),
-            input_schema: json!({
-                "type": "object",
-                "required": if sandboxed_execution_enabled { vec!["cmd"] } else { vec!["cmd", "sandbox_permissions", "justification"] },
-                "properties": {
-                    "cmd": { "type": "string", "minLength": 1 },
-                    "workdir": { "type": "string", "minLength": 1 },
-                    "tty": { "type": "boolean" },
-                    "wait_mode": wait_mode_schema(),
-                    "yield_time_ms": { "type": "integer", "minimum": 1 },
-                    "max_output_tokens": { "type": "integer", "minimum": 1 },
-                    "sandbox_permissions": {
-                        "type": "string",
-                        "enum": if sandboxed_execution_enabled { vec!["use_default", "require_escalated"] } else { vec!["require_escalated"] }
-                    },
-                    "justification": { "type": "string", "minLength": 1 }
-                },
-                "additionalProperties": false
-            }),
+            input_schema,
         },
         output_schema: exec_output_schema(),
         effect_scopes,
@@ -1631,9 +1644,10 @@ fn exec_error(error: ExecProcessError) -> ToolOutcome {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_command, display_payload, guarded_exec_command_descriptor,
-        guarded_write_stdin_descriptor, render_result, workspace_exec_command_descriptor,
-        workspace_write_stdin_descriptor, ExecPollResult, ExecSessionId,
+        approved_host_exec_command_descriptor, classify_command, display_payload, exec_effects,
+        guarded_exec_command_descriptor, guarded_write_stdin_descriptor, render_result,
+        workspace_exec_command_descriptor, workspace_write_stdin_descriptor, ExecPollResult,
+        ExecSessionId,
     };
     use orchestral_core::tool_protocol::{ApprovalPolicy, ToolPolicyBounds, ToolRestriction};
     use serde_json::json;
@@ -1961,6 +1975,161 @@ mod tests {
                 .approval,
             ApprovalPolicy::NotRequired
         );
+    }
+
+    #[test]
+    fn exec_schema_exposes_only_available_host_escalation() {
+        use orchestral_core::tool_protocol::EffectScope;
+
+        let mut bounds = ToolPolicyBounds {
+            allowed_effects: exec_effects(),
+            approval: ApprovalPolicy::NotRequired,
+            ..Default::default()
+        };
+        bounds.allowed_effects.remove(&EffectScope::HostExecution);
+        let restriction = ToolRestriction { bounds };
+        for descriptor in [
+            workspace_exec_command_descriptor(restriction.clone()),
+            guarded_exec_command_descriptor(restriction.clone()),
+        ] {
+            descriptor
+                .model_schema
+                .validate_arguments(&json!({
+                    "cmd":"echo ready", "workdir":"subdirectory", "tty":true,
+                    "wait_mode":"output", "yield_time_ms":1, "max_output_tokens":16,
+                }))
+                .unwrap();
+            for unavailable in [
+                json!({"cmd":"echo ready", "sandbox_permissions":"require_escalated", "justification":"requested operation"}),
+                json!({"cmd":"echo ready", "justification":"requested operation"}),
+            ] {
+                assert!(descriptor
+                    .model_schema
+                    .validate_arguments(&unavailable)
+                    .is_err());
+            }
+            assert!(!descriptor
+                .model_schema
+                .description
+                .contains("require_escalated"));
+            assert!(!descriptor
+                .model_schema
+                .description
+                .contains("justification"));
+            assert!(!descriptor
+                .effect_scopes
+                .contains(&EffectScope::HostExecution));
+        }
+        let sandbox_only = workspace_exec_command_descriptor(restriction.clone());
+        let mut enabled = restriction;
+        enabled
+            .bounds
+            .allowed_effects
+            .insert(EffectScope::HostExecution);
+        let dual = workspace_exec_command_descriptor(enabled.clone());
+        dual.model_schema
+            .validate_arguments(&json!({"cmd":"echo ready"}))
+            .unwrap();
+        dual.model_schema
+            .validate_arguments(&json!({"cmd":"echo ready", "sandbox_permissions":"use_default"}))
+            .unwrap();
+        dual.model_schema.validate_arguments(&json!({
+            "cmd":"echo ready", "sandbox_permissions":"require_escalated", "justification":"requested operation",
+        })).unwrap();
+        assert!(dual.model_schema.description.contains("require_escalated"));
+        // The existing recovery digest includes the projected schema, even if
+        // a caller were to keep the underlying Host restrictions identical.
+        let mut same_authority = dual.clone();
+        same_authority.model_schema = sandbox_only.model_schema;
+        assert_ne!(same_authority.digest().unwrap(), dual.digest().unwrap());
+        let host_only = approved_host_exec_command_descriptor(enabled);
+        assert_eq!(
+            host_only.restriction.bounds.approval,
+            ApprovalPolicy::Required
+        );
+        assert!(host_only
+            .model_schema
+            .validate_arguments(&json!({"cmd":"echo ready"}))
+            .is_err());
+        assert!(host_only
+            .model_schema
+            .validate_arguments(
+                &json!({"cmd":"echo ready", "sandbox_permissions":"require_escalated"})
+            )
+            .is_err());
+        host_only.model_schema.validate_arguments(&json!({
+            "cmd":"echo ready", "sandbox_permissions":"require_escalated", "justification":"requested operation",
+        })).unwrap();
+    }
+
+    #[tokio::test]
+    async fn exec_planner_rejects_explicit_and_implicit_host_execution_without_authority() {
+        use super::{CommandEnvironmentSnapshot, GuardedExecCommandExecutor, ProcessSupervisor};
+        use crate::tool_runtime::GuardedToolExecutor;
+        use orchestral_core::agent_protocol::wire::RunId;
+        use orchestral_core::tool_protocol::{
+            EffectScope, EffectiveToolPolicy, HostToolPolicy, RunToolGrant, ToolCallId,
+            ToolInvocation, ToolOutcome,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(directory.path()).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let manager = std::sync::Arc::new(ProcessSupervisor::new(1024).unwrap());
+        let executor = GuardedExecCommandExecutor::new(
+            manager,
+            std::env::current_exe().unwrap(),
+            [],
+            [],
+            CommandEnvironmentSnapshot::default(),
+        )
+        .unwrap();
+        let mut bounds = ToolPolicyBounds {
+            allowed_effects: exec_effects(),
+            ..Default::default()
+        };
+        bounds
+            .filesystem
+            .readable_roots
+            .insert(workspace.to_string_lossy().into_owned());
+        bounds.filesystem.writable_roots = bounds.filesystem.readable_roots.clone();
+        let descriptor = workspace_exec_command_descriptor(ToolRestriction {
+            bounds: bounds.clone(),
+        });
+        bounds.allowed_effects.remove(&EffectScope::HostExecution);
+        let policy = EffectiveToolPolicy::resolve(
+            &HostToolPolicy {
+                bounds: bounds.clone(),
+            },
+            &RunToolGrant { bounds },
+            &descriptor.restriction,
+        )
+        .unwrap();
+        for arguments in [
+            json!({"cmd":"echo denied", "sandbox_permissions":"require_escalated", "justification":"requested operation"}),
+            json!({"cmd":"echo denied", "workdir":outside.path()}),
+        ] {
+            // Deliberately use the broader schema and invoke the planner directly:
+            // hiding model fields must not become the authorization boundary.
+            descriptor
+                .model_schema
+                .validate_arguments(&arguments)
+                .unwrap();
+            let result = executor.plan_operation(
+                &ToolInvocation {
+                    run_id: RunId::new("host-ceiling"),
+                    call_id: ToolCallId::new("denied"),
+                    tool_id: descriptor.tool_id.clone(),
+                    arguments,
+                },
+                &descriptor,
+                &policy,
+            );
+            assert!(
+                matches!(result, Err(ToolOutcome::Rejected { ref code, .. }) if code == "exec_host_execution_denied"),
+                "{result:?}"
+            );
+        }
     }
 
     #[test]

@@ -34,7 +34,7 @@ use orchestral_core::tool_effect::{InMemoryToolEffectJournalStore, ToolEffectJou
 use orchestral_core::tool_protocol::{
     ApprovalPolicy, EffectScope, EnvironmentPolicy, FilesystemPolicy, HostApprovalVerifier,
     HostToolPolicy, InMemoryApprovalCapabilityStore, InteractiveCommandPolicy, NetworkPolicy,
-    ProcessPolicy, RunToolGrant, SandboxPolicy, ToolPolicyBounds, ToolRestriction,
+    ProcessPolicy, RunToolGrant, SandboxPolicy, ToolDescriptor, ToolPolicyBounds, ToolRestriction,
     TransportLaunchPolicy,
 };
 use orchestral_mcp_streamable_http::{
@@ -158,6 +158,19 @@ impl CliWorkspaceSet {
         self.roots()
             .map(|root| root.to_string_lossy().into_owned())
             .collect()
+    }
+
+    fn file_tool_descriptor(&self, mut descriptor: ToolDescriptor) -> ToolDescriptor {
+        // Freeze the model schema at registration from the Host workspace set.
+        // The executor already defaults to the primary root when this is omitted.
+        if self.additional.is_empty() {
+            if let Some(properties) =
+                descriptor.model_schema.input_schema["properties"].as_object_mut()
+            {
+                properties.remove("workspace");
+            }
+        }
+        descriptor
     }
 }
 
@@ -926,9 +939,9 @@ fn build_cli_tool_runtime(
         .context("register guarded artifact_read Tool")?;
     runtime
         .register(
-            guarded_file_read_descriptor(ToolRestriction {
+            workspaces.file_tool_descriptor(guarded_file_read_descriptor(ToolRestriction {
                 bounds: workspace_bounds.clone(),
-            }),
+            })),
             Arc::new(
                 GuardedFileReadExecutor::new_with_roots(
                     &workspaces.primary,
@@ -940,9 +953,9 @@ fn build_cli_tool_runtime(
         .context("register guarded file_read Tool")?;
     runtime
         .register(
-            guarded_file_search_descriptor(ToolRestriction {
+            workspaces.file_tool_descriptor(guarded_file_search_descriptor(ToolRestriction {
                 bounds: workspace_bounds.clone(),
-            }),
+            })),
             Arc::new(
                 GuardedFileSearchExecutor::new_with_roots(
                     &workspaces.primary,
@@ -954,9 +967,9 @@ fn build_cli_tool_runtime(
         .context("register guarded file_search Tool")?;
     runtime
         .register(
-            guarded_text_search_descriptor(ToolRestriction {
+            workspaces.file_tool_descriptor(guarded_text_search_descriptor(ToolRestriction {
                 bounds: workspace_bounds.clone(),
-            }),
+            })),
             Arc::new(
                 GuardedTextSearchExecutor::new_with_roots(
                     &workspaces.primary,
@@ -968,9 +981,9 @@ fn build_cli_tool_runtime(
         .context("register guarded text_search Tool")?;
     runtime
         .register(
-            guarded_file_write_descriptor(ToolRestriction {
+            workspaces.file_tool_descriptor(guarded_file_write_descriptor(ToolRestriction {
                 bounds: workspace_bounds.clone(),
-            }),
+            })),
             Arc::new(
                 GuardedFileWriteExecutor::new_with_roots(
                     &workspaces.primary,
@@ -982,9 +995,9 @@ fn build_cli_tool_runtime(
         .context("register guarded file_write Tool")?;
     runtime
         .register(
-            guarded_file_edit_descriptor(ToolRestriction {
+            workspaces.file_tool_descriptor(guarded_file_edit_descriptor(ToolRestriction {
                 bounds: workspace_bounds.clone(),
-            }),
+            })),
             Arc::new(
                 GuardedFileEditExecutor::new_with_roots(
                     &workspaces.primary,
@@ -996,9 +1009,9 @@ fn build_cli_tool_runtime(
         .context("register guarded file_edit Tool")?;
     runtime
         .register(
-            guarded_apply_patch_descriptor(ToolRestriction {
+            workspaces.file_tool_descriptor(guarded_apply_patch_descriptor(ToolRestriction {
                 bounds: workspace_bounds,
-            }),
+            })),
             Arc::new(
                 GuardedApplyPatchExecutor::new_with_roots(
                     &workspaces.primary,
@@ -2073,6 +2086,10 @@ fn select_entry_mode(
         "interactive mode requires a TTY on stdout; pass a prompt or pipe stdin for Headless mode"
     )
 }
+
+#[cfg(test)]
+#[path = "agent/tool_capability_tests.rs"]
+mod tool_capability_tests;
 
 #[cfg(test)]
 mod entry_mode_tests {
