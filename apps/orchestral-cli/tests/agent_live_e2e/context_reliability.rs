@@ -68,6 +68,78 @@ fn assert_planning_boundaries(workspace: &TestWorkspace) {
 }
 
 #[test]
+fn default_summary_capacity_adapts_to_context_before_the_next_tool_round() {
+    let _guard = local_e2e_guard();
+    let workspace = TestWorkspace::new("default-summary-pressure");
+    configure_pressure(&workspace);
+    workspace.rewrite_config(|config| {
+        // Exercise the product default, whose character ceiling is larger
+        // than the remaining input space of this small context window.
+        config["agent"]["compaction"]
+            .as_mapping_mut()
+            .unwrap()
+            .remove(serde_yaml::Value::String("summary_max_chars".to_owned()));
+    });
+    let (endpoint, server) = spawn_fixture_http_server(vec![
+        Box::new(|_| {
+            openai_tool_response("inspect-first", "file_read", json!({"path": "dataset.txt"}))
+        }),
+        Box::new(|_| {
+            openai_tool_response("inspect-again", "file_read", json!({"path": "dataset.txt"}))
+        }),
+        Box::new(|request| {
+            let context = model_request_text(&request.body);
+            assert!(
+                context.contains("UNTRUSTED earlier transcript"),
+                "{context}"
+            );
+            assert!(context.contains("Preserve stable_api"));
+            openai_tool_response(
+                "record-inspection",
+                "file_write",
+                json!({"path": "inspection.txt", "mode": "create", "content": "inspection recorded\n"}),
+            )
+        }),
+        Box::new(|_| {
+            openai_tool_response(
+                "verify-record",
+                "file_read",
+                json!({"path": "inspection.txt"}),
+            )
+        }),
+        Box::new(|request| {
+            assert_eq!(last_result(request)["content"], "inspection recorded\n");
+            openai_text_response("Inspection recorded and read back.")
+        }),
+    ]);
+    workspace.configure_local_openai(&endpoint);
+    let output = run_to_completion(
+        local_default_agent_command(
+            &workspace,
+            "default-summary-session",
+            "Inspect the dataset and record the inspection. Preserve stable_api.",
+            true,
+            true,
+        ),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    assert!(output.status.success(), "{}", output.stderr_text());
+    assert_planning_boundaries(&workspace);
+    assert_eq!(server.join().unwrap().len(), 5);
+    assert!(
+        payload_count(
+            &session_records(&workspace),
+            "active_run_compaction_committed"
+        ) > 0
+    );
+    assert_eq!(run_payload_count(&workspace, "delivery_committed"), 1);
+    assert_eq!(
+        fs::read_to_string(workspace.path("inspection.txt")).unwrap(),
+        "inspection recorded\n"
+    );
+}
+
+#[test]
 fn repeated_pressure_compaction_and_process_restart_recall_original_outcomes_without_repeating_work(
 ) {
     let _guard = local_e2e_guard();

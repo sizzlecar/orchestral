@@ -126,10 +126,7 @@ pub(super) async fn project_model_context(
                     .session_compactor
                     .as_ref()
                     .expect("compactor presence was checked")
-                    .compact_active_run_for_pressure(
-                        &request.run.spec.session_id,
-                        &request.run.spec.run_id,
-                    )
+                    .compact_active_run_for_context(&inner.context_engine, make_request(), policy)
                     .await?;
                 if compacted.is_none() {
                     return Err(SessionContextError::ContextOverflow { used, budget });

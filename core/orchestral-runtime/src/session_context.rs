@@ -1,5 +1,7 @@
 //! Replay-derived model context for the Generic Agent.
 
+mod pressure;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -1042,7 +1044,7 @@ impl DeterministicExtractiveSessionSummarizer {
             ));
         }
         let config = serde_json::json!({
-            "contract": "deterministic-extractive-session-summary/v4",
+            "contract": "deterministic-extractive-session-summary/v5",
             "max_summary_chars": max_summary_chars,
         });
         let bytes = serde_jcs::to_vec(&config).map_err(|error| {
@@ -1055,7 +1057,7 @@ impl DeterministicExtractiveSessionSummarizer {
             descriptor: SessionSummarizerDescriptor {
                 strategy: "deterministic-extractive".to_owned(),
                 model: None,
-                version: "4".to_owned(),
+                version: "5".to_owned(),
                 config_digest: Digest::sha256(bytes),
             },
         })
@@ -1080,6 +1082,16 @@ struct ExtractiveCandidate {
 impl AgentSessionSummarizer for DeterministicExtractiveSessionSummarizer {
     fn descriptor(&self) -> SessionSummarizerDescriptor {
         self.descriptor.clone()
+    }
+
+    async fn summarize_with_char_budget(
+        &self,
+        input: SessionCompactionInput,
+        max_chars: usize,
+    ) -> Result<ModelMessage, SessionContextError> {
+        Self::new(self.max_summary_chars.min(max_chars))?
+            .summarize(input)
+            .await
     }
 
     async fn summarize(
@@ -1597,6 +1609,18 @@ pub trait AgentSessionSummarizer: Send + Sync {
         &self,
         input: SessionCompactionInput,
     ) -> Result<ModelMessage, SessionContextError>;
+
+    /// A size hint for pressure compaction, including the summary's framing
+    /// text. The runtime still meters the complete candidate model input and
+    /// never commits a summary that increases its context use. Implementations
+    /// that do not support adaptive summaries may return their normal result.
+    async fn summarize_with_char_budget(
+        &self,
+        input: SessionCompactionInput,
+        _max_chars: usize,
+    ) -> Result<ModelMessage, SessionContextError> {
+        self.summarize(input).await
+    }
 }
 
 /// Expand only durable backward references; original exchanges stay atomic
@@ -1755,8 +1779,6 @@ impl AgentSessionCompactor {
         else {
             return Ok(None);
         };
-        let source_digest = session_range_digest(&records, &source)?;
-        let policy_digest = self.policy.digest()?;
         let groups = replay_groups(&records, current_run_id, &BTreeMap::new())?;
         let source_groups = groups
             .values()
@@ -1789,6 +1811,20 @@ impl AgentSessionCompactor {
                 focus_messages,
             })
             .await?;
+        self.commit_active_run_summary(&records, current_run_id, source, summary)
+            .await
+    }
+
+    async fn commit_active_run_summary(
+        &self,
+        records: &[AgentSessionRecord],
+        current_run_id: &RunId,
+        source: SessionSourceRange,
+        summary: ModelMessage,
+    ) -> Result<Option<AgentSessionRecord>, SessionContextError> {
+        let session_id = &records[0].session_id;
+        let source_digest = session_range_digest(records, &source)?;
+        let policy_digest = self.policy.digest()?;
         summary.validate().map_err(|error| {
             SessionContextError::Compaction(format!("invalid active-Run summary: {error}"))
         })?;
@@ -1863,7 +1899,7 @@ mod tests {
         }
     }
 
-    async fn append_input(
+    pub(super) async fn append_input(
         store: &Arc<InMemoryAgentSessionJournalStore>,
         sequence: u64,
         run_id: &str,
@@ -1900,7 +1936,7 @@ mod tests {
             .unwrap();
     }
 
-    async fn append_tool_exchange(
+    pub(super) async fn append_tool_exchange(
         store: &Arc<InMemoryAgentSessionJournalStore>,
         sequence: u64,
         run_id: &str,
