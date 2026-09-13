@@ -1,5 +1,8 @@
 use super::*;
-use crate::tool_result::{tests::backend, tests::history, OpenAiToolResultFormat};
+use crate::tool_result::{
+    tests::{assert_observed_prefix_planning_identity, backend, history},
+    OpenAiToolResultFormat,
+};
 use crate::{ModelBackend, ModelRequest, ModelTokenMeter, CONTEXT_ESTIMATE_BYTES_PER_TOKEN};
 
 // Interpret the published framing, including its explicitly excluded separator
@@ -159,7 +162,7 @@ fn text_parts_close_fence_lines_when_templates_concatenate_parts_directly() {
 }
 
 #[test]
-fn text_parts_bind_actual_wire_meter_and_replay_without_changing_canonical_history() {
+fn text_parts_preserve_wire_and_history_but_version_observed_prefix_planning() {
     assert_eq!(
         serde_json::from_value::<OpenAiToolResultFormat>(json!("text_parts")).unwrap(),
         OpenAiToolResultFormat::TextParts
@@ -185,7 +188,7 @@ fn text_parts_bind_actual_wire_meter_and_replay_without_changing_canonical_histo
         meter.strategy,
         "openai-compatible/wire-json-text-parts-tool-upper-bound"
     );
-    assert_eq!(meter.version, "1");
+    assert_observed_prefix_planning_identity(&parts_backend, OpenAiToolResultFormat::TextParts);
     assert_eq!(
         parts_backend.descriptor().extensions["openai-compatible/tool-result-encoding"],
         crate::tool_result::TEXT_PARTS_ENCODING_IDENTITY

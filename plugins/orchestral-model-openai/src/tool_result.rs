@@ -104,6 +104,44 @@ mod tests {
         }
     }
 
+    pub(super) fn assert_observed_prefix_planning_identity(
+        adapter: &OpenAiCompatibleBackend,
+        format: OpenAiToolResultFormat,
+    ) {
+        // These are the pre-observation configurations, including each unchanged
+        // wire codec. Private Run recovery must not mistake them for the new
+        // soft-planning contract even though canonical history still replays.
+        let legacy_config = (
+            "local-model",
+            0.6_f32.to_bits(),
+            128_u64,
+            false,
+            OpenAiSamplingConfig::default(),
+            CONTEXT_ESTIMATE_BYTES_PER_TOKEN,
+        );
+        let (legacy_version, version, legacy_config) = match format {
+            OpenAiToolResultFormat::Json => ("2", "3", serde_json::to_vec(&legacy_config).unwrap()),
+            OpenAiToolResultFormat::Yaml => (
+                "1",
+                "2",
+                serde_json::to_vec(&(legacy_config, YAML_ENCODING_IDENTITY)).unwrap(),
+            ),
+            OpenAiToolResultFormat::TextParts => (
+                "1",
+                "2",
+                serde_json::to_vec(&(legacy_config, TEXT_PARTS_ENCODING_IDENTITY)).unwrap(),
+            ),
+        };
+        let meter = adapter.meter_descriptor();
+        let mut legacy_meter = meter.clone();
+        legacy_meter.version = legacy_version.to_owned();
+        legacy_meter.config_digest = Digest::sha256(legacy_config);
+        assert!(adapter.supports_observed_prefix_estimation());
+        assert_eq!(meter.version, version);
+        assert_ne!(meter.config_digest, legacy_meter.config_digest);
+        assert_ne!(meter, legacy_meter);
+    }
+
     #[test]
     fn yaml_tool_result_preserves_multiline_source_and_complete_metadata() {
         let source = "fn quoted(key: &str) -> String {\n    format!(\"\\\"{key}\\\"\")\n}\n";
@@ -151,7 +189,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_json_tool_result_keeps_legacy_wire_and_meter_identity() {
+    fn explicit_json_preserves_legacy_wire_but_versions_observed_prefix_planning() {
         assert!(serde_json::from_value::<OpenAiToolResultFormat>(json!("guess")).is_err());
         assert_eq!(
             serde_json::from_value::<OpenAiToolResultFormat>(json!("yaml")).unwrap(),
@@ -165,19 +203,9 @@ mod tests {
             body["messages"][2]["content"],
             json!({"result": result, "is_error": false}).to_string()
         );
-        let legacy_config = serde_json::to_vec(&(
-            "local-model",
-            0.6_f32.to_bits(),
-            128_u64,
-            false,
-            OpenAiSamplingConfig::default(),
-            CONTEXT_ESTIMATE_BYTES_PER_TOKEN,
-        ))
-        .unwrap();
         let meter = json_backend.meter_descriptor();
         assert_eq!(meter.strategy, "openai-compatible/wire-json-upper-bound");
-        assert_eq!(meter.version, "2");
-        assert_eq!(meter.config_digest, Digest::sha256(legacy_config));
+        assert_observed_prefix_planning_identity(&json_backend, OpenAiToolResultFormat::Json);
         let descriptor = json_backend.descriptor();
         assert_eq!(
             descriptor.extensions,
@@ -198,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn default_yaml_tool_result_replays_canonical_history_with_existing_yaml_identity() {
+    fn default_yaml_preserves_wire_and_history_but_versions_observed_prefix_planning() {
         assert_eq!(
             OpenAiToolResultFormat::default(),
             OpenAiToolResultFormat::Yaml
@@ -260,7 +288,7 @@ mod tests {
             yaml_backend.meter_descriptor().strategy,
             "openai-compatible/wire-json-yaml-tool-upper-bound"
         );
-        assert_eq!(yaml_backend.meter_descriptor().version, "1");
+        assert_observed_prefix_planning_identity(&yaml_backend, OpenAiToolResultFormat::Yaml);
         // A fresh adapter with the same declared encoding reproduces the body
         // after restart. The runtime binds these descriptors for Run recovery.
         let resumed = backend();
