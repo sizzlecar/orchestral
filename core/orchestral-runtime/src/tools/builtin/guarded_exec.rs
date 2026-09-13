@@ -622,11 +622,7 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
             environment.insert(name.to_owned(), runtime_temp.clone());
         }
         environment.insert("TMPPREFIX".to_owned(), format!("{runtime_temp}/zsh"));
-        let wait = bounded_wait(
-            &execution.invocation.arguments,
-            bounds.max_timeout_ms,
-            10_000,
-        );
+        let wait = command_wait(&execution.invocation.arguments, bounds.max_timeout_ms, mode);
         let max_output_bytes =
             output_byte_limit(&execution.invocation.arguments, bounds.max_output_bytes);
         let session_id = match self
@@ -664,7 +660,7 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
                 session_id,
                 None,
                 ExecWaitOptions {
-                    duration: observation_window(wait, &execution),
+                    duration: observation_window(wait, execution.deadline),
                     mode,
                     yield_requested: execution.yield_requested.clone(),
                 },
@@ -849,7 +845,7 @@ impl GuardedToolExecutor for GuardedWriteStdinExecutor {
                 session_id,
                 input,
                 ExecWaitOptions {
-                    duration: observation_window(wait, &execution),
+                    duration: observation_window(wait, execution.deadline),
                     mode,
                     yield_requested: execution.yield_requested.clone(),
                 },
@@ -943,7 +939,9 @@ fn build_exec_command_descriptor(
             }, concat!(
                 "Short commands ",
                 "return directly; interactive or still-running commands return a session_id ",
-                "for write_stdin. Default wait_mode: completion for non-TTY, output for TTY. ",
+                "for write_stdin. Default wait_mode: completion for non-TTY (up to 60 seconds), ",
+                "output for TTY (up to 10 seconds). yield_time_ms overrides this observation ",
+                "window within Host limits. ",
                 "A wait deadline does not kill the command. ",
                 "Long captured output shares a stdout/stderr budget. Each available stream keeps its beginning and end where the budget permits."
             )),
@@ -1509,6 +1507,17 @@ fn wait_mode(arguments: &Value, tty: bool, has_input: bool) -> Result<ExecWaitMo
     }
 }
 
+fn command_wait(arguments: &Value, maximum_ms: Option<u64>, mode: ExecWaitMode) -> Duration {
+    bounded_wait(
+        arguments,
+        maximum_ms,
+        match mode {
+            ExecWaitMode::Completion => 60_000,
+            ExecWaitMode::Output => 10_000,
+        },
+    )
+}
+
 fn bounded_wait(arguments: &Value, maximum_ms: Option<u64>, default_ms: u64) -> Duration {
     let requested = arguments
         .get("yield_time_ms")
@@ -1518,11 +1527,11 @@ fn bounded_wait(arguments: &Value, maximum_ms: Option<u64>, default_ms: u64) -> 
     Duration::from_millis(requested.min(maximum_ms.unwrap_or(requested)))
 }
 
-fn observation_window(requested: Duration, execution: &GuardedToolExecution) -> Duration {
+fn observation_window(requested: Duration, deadline: Option<tokio::time::Instant>) -> Duration {
     // Reserve a short interval for draining and returning the observation.
     // Otherwise a wait equal to the Host bound races the outer tool timeout
     // and misclassifies a still-running session as an unknown effect.
-    let remaining = execution.deadline.map(|deadline| {
+    let remaining = deadline.map(|deadline| {
         deadline
             .saturating_duration_since(tokio::time::Instant::now())
             .saturating_sub(Duration::from_millis(50))
@@ -1651,6 +1660,117 @@ mod tests {
     };
     use orchestral_core::tool_protocol::{ApprovalPolicy, ToolPolicyBounds, ToolRestriction};
     use serde_json::json;
+
+    #[test]
+    fn command_wait_keeps_explicit_windows_and_interactions_within_host_limits() {
+        use super::{command_wait, wait_mode, ExecWaitMode};
+        use std::time::Duration;
+
+        for (arguments, tty, has_input, expected_seconds) in [
+            (json!({}), false, false, 60),
+            (json!({}), true, false, 10),
+            (json!({}), false, true, 10),
+            (json!({"wait_mode":"output"}), false, false, 10),
+            (json!({"wait_mode":"completion"}), true, false, 60),
+        ] {
+            let mode = wait_mode(&arguments, tty, has_input).unwrap();
+            assert_eq!(
+                command_wait(&arguments, None, mode),
+                Duration::from_secs(expected_seconds)
+            );
+        }
+        for (explicit, host_ms, expected_ms) in [
+            (None, Some(130_000), 60_000),
+            (None, Some(8_000), 8_000),
+            (Some(1_234), Some(130_000), 1_234),
+            (Some(90_000), Some(130_000), 90_000),
+            (Some(90_000), Some(20_000), 20_000),
+        ] {
+            let arguments =
+                explicit.map_or_else(|| json!({}), |value| json!({"yield_time_ms":value}));
+            assert_eq!(
+                command_wait(&arguments, host_ms, ExecWaitMode::Completion),
+                Duration::from_millis(expected_ms)
+            );
+        }
+    }
+
+    #[test]
+    fn command_observation_respects_the_remaining_dispatch_deadline() {
+        use super::observation_window;
+        use std::time::Duration;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+        let remaining = observation_window(Duration::from_secs(60), Some(deadline));
+        assert!(remaining <= Duration::from_millis(11_950));
+        assert!(remaining > Duration::from_secs(10));
+        assert_eq!(
+            observation_window(Duration::from_millis(1_234), Some(deadline)),
+            Duration::from_millis(1_234)
+        );
+        assert_eq!(
+            observation_window(Duration::from_secs(60), None),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_completion_observes_exit_after_the_previous_default_window() {
+        use super::{command_wait, wait_mode, ExecWaitOptions};
+        use crate::exec_process::{ExecSpawnSpec, ProcessSupervisor};
+        use orchestral_core::agent_protocol::wire::RunId;
+        use orchestral_core::tool_protocol::{
+            CapabilityRequest, EffectScope, ToolOperationPlan, ToolOperationRisk,
+        };
+        use std::collections::BTreeSet;
+        use tokio_util::sync::CancellationToken;
+
+        let manager = ProcessSupervisor::new(1024).unwrap();
+        let run_id = RunId::new("completion-window");
+        let session = manager
+            .spawn(ExecSpawnSpec {
+                run_id: run_id.clone(),
+                program: "/bin/sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    "/bin/sleep 12; printf completed; exit 7".to_owned(),
+                ],
+                cwd: std::fs::canonicalize(".").unwrap(),
+                environment: Default::default(),
+                tty: false,
+                backend_starts_new_session: false,
+                operation: ToolOperationPlan {
+                    required_capabilities: CapabilityRequest::from_effects(BTreeSet::from([
+                        EffectScope::Process,
+                    ])),
+                    risk: ToolOperationRisk::Routine,
+                    session_approval_scope: None,
+                    summary: "Observe delayed process completion".to_owned(),
+                },
+            })
+            .await
+            .unwrap();
+        let arguments = json!({});
+        let mode = wait_mode(&arguments, false, false).unwrap();
+        let result = manager
+            .write_and_poll_with_options(
+                &run_id,
+                session,
+                None,
+                ExecWaitOptions {
+                    duration: command_wait(&arguments, Some(20_000), mode),
+                    mode,
+                    yield_requested: CancellationToken::new(),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        manager.close_run(&run_id).await.unwrap();
+        assert!(!result.alive);
+        assert_eq!(result.exit_code, Some(7));
+        assert_eq!(result.stdout, "completed");
+    }
 
     #[test]
     fn exec_v2_output_preserves_each_stream_and_terminal_metadata_once() {
