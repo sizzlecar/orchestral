@@ -1165,32 +1165,97 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    fn probe_loopback_callback(phase: &str) {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpSocket, TcpStream};
+
+        eprintln!(
+            "loopback phase={phase} executable={:?}",
+            std::env::current_exe().expect("resolve probe executable")
+        );
+        let stage = |name: &str| eprintln!("loopback phase={phase} stage={name}");
+        stage("runtime");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("create loopback probe runtime");
+        runtime.block_on(async {
+            let timeout = Duration::from_secs(1);
+            stage("socket");
+            let socket = TcpSocket::new_v4().expect("create IPv4 loopback socket");
+            stage("bind");
+            socket
+                .bind(([127, 0, 0, 1], 0).into())
+                .expect("bind IPv4 loopback socket");
+            stage("getsockname");
+            let address = socket.local_addr().expect("read bound loopback address");
+            eprintln!("loopback phase={phase} bound_address={address}");
+            assert!(address.ip().is_loopback());
+            assert_ne!(address.port(), 0);
+            stage("listen");
+            let listener = socket.listen(1).expect("listen on bound loopback socket");
+            assert_eq!(listener.local_addr().unwrap(), address);
+            stage("connect");
+            let mut client = tokio::time::timeout(timeout, TcpStream::connect(address))
+                .await
+                .expect("loopback connect timed out")
+                .expect("connect to loopback listener");
+            stage("accept");
+            let (mut server, peer) = tokio::time::timeout(timeout, listener.accept())
+                .await
+                .expect("loopback accept timed out")
+                .expect("accept loopback callback");
+            eprintln!("loopback phase={phase} peer_address={peer}");
+            assert!(peer.ip().is_loopback());
+            stage("send");
+            tokio::time::timeout(timeout, client.write_all(b"X"))
+                .await
+                .expect("loopback send timed out")
+                .expect("send callback byte");
+            stage("recv");
+            let mut received = [0_u8; 1];
+            tokio::time::timeout(timeout, server.read_exact(&mut received))
+                .await
+                .expect("loopback recv timed out")
+                .expect("receive callback byte");
+            assert_eq!(received, *b"X");
+            println!("CALLBACK_OK");
+        });
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn approved_unrestricted_network_supports_a_loopback_oauth_callback() {
+        const CHILD_PHASE: &str = "ORCHESTRAL_TEST_LOOPBACK_PHASE";
+        match std::env::var(CHILD_PHASE) {
+            Ok(phase) => {
+                assert!(matches!(phase.as_str(), "control" | "sandbox"));
+                probe_loopback_callback(&phase);
+                return;
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Err(error) => panic!("invalid loopback child phase: {error}"),
+        }
+
         let (parent, workspace, _) = isolated_test_roots("oauth-callback");
-        let python = std::env::var_os("PATH")
-            .into_iter()
-            .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
-            .map(|directory| directory.join("python3"))
-            .find(|candidate| candidate.is_file())
-            .map(|candidate| std::fs::canonicalize(candidate).unwrap())
-            .expect("python3 is installed for the sandbox callback test");
-        let code = concat!(
-            "import socket; ",
-            "listener=socket.socket(); listener.bind(('127.0.0.1', 0)); listener.listen(1); ",
-            "client=socket.create_connection(listener.getsockname(), 1); ",
-            "server,_=listener.accept(); client.sendall(b'X'); ",
-            "assert server.recv(1)==b'X'; print('CALLBACK_OK')",
-        );
+        let executable = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+        let args = vec![
+            "--exact".to_owned(),
+            "tools::shell_sandbox::tests::approved_unrestricted_network_supports_a_loopback_oauth_callback"
+                .to_owned(),
+            "--nocapture".to_owned(),
+            "--test-threads=1".to_owned(),
+        ];
         let mut readable_roots = vec![workspace.clone()];
         for candidate in ["/usr", "/opt/homebrew", "/Library", "/System/Library"] {
             if let Ok(path) = std::fs::canonicalize(candidate) {
                 readable_roots.push(path);
             }
         }
-        let command = sandbox_command(
-            python.to_string_lossy().into_owned(),
-            vec!["-c".to_owned(), code.to_owned()],
+        let mut command = sandbox_command(
+            executable.to_string_lossy().into_owned(),
+            args.clone(),
             &workspace,
             &ShellSandboxPolicy {
                 readable_roots,
@@ -1198,20 +1263,54 @@ mod tests {
                 writable_roots: vec![workspace.clone()],
                 allow_child_processes: true,
                 allow_host_ui: false,
-                launcher_programs: vec![python],
+                launcher_programs: vec![executable.clone()],
                 network: SandboxNetworkAccess::Unrestricted,
                 linux_bwrap_path: None,
             },
         )
         .unwrap();
 
+        // The launcher grants an exact executable read, not its target directory.
+        // Both children run the same Rust probe with the same cleared environment.
+        let profile = command.args[1].clone();
+        command
+            .env
+            .insert(CHILD_PHASE.to_owned(), "sandbox".to_owned());
+        let control = std::process::Command::new(&executable)
+            .args(args)
+            .env_clear()
+            .envs(&command.env)
+            .env(CHILD_PHASE, "control")
+            .current_dir(&workspace)
+            .output()
+            .expect("launch unsandboxed loopback control");
         let output = run_sandboxed(command, &workspace);
+        let diagnostics = format!(
+            "executable={executable:?}\ncontrol status={}\ncontrol stdout={}\ncontrol stderr={}\nsandbox status={}\nsandbox stdout={}\nsandbox stderr={}\nprofile={profile}",
+            control.status,
+            String::from_utf8_lossy(&control.stdout),
+            String::from_utf8_lossy(&control.stderr),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        eprintln!("{diagnostics}");
+        assert!(
+            control.status.success(),
+            "unsandboxed loopback control failed: {diagnostics}"
+        );
         assert!(
             output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
+            "sandboxed loopback callback failed: {diagnostics}"
         );
-        assert!(String::from_utf8_lossy(&output.stdout).contains("CALLBACK_OK"));
+        assert!(
+            String::from_utf8_lossy(&control.stdout).contains("CALLBACK_OK"),
+            "control did not complete the byte exchange: {diagnostics}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("CALLBACK_OK"),
+            "sandbox did not complete the byte exchange: {diagnostics}"
+        );
         std::fs::remove_dir_all(parent).unwrap();
     }
 
