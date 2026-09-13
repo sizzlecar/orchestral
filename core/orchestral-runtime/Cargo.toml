@@ -1,6 +1,6 @@
 [package]
 name = "orchestral-runtime"
-description = "Provider-neutral Agent control plane, Generic Agent, durable context, and guarded Tool runtime"
+description = "A runtime for reliable, interactive AI agents."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
