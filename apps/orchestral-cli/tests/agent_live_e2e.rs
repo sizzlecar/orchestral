@@ -1964,58 +1964,84 @@ fn local_cli_host_execution_ceiling_denies_without_prompt_or_spawn() {
     let _guard = local_e2e_guard();
     const FINAL_MARKER: &str = "HOST_EXECUTION_CEILING_OK";
 
-    let workspace = TestWorkspace::new("host-execution-ceiling");
-    let external = TestWorkspace::new("host-execution-ceiling-external");
-    let escaped = external.path("must-not-exist.txt");
-    let external_root = external
-        .root
-        .canonicalize()
-        .expect("canonicalize external approval fixture")
-        .to_string_lossy()
-        .to_string();
-    let (model_endpoint, model_server) = spawn_fixture_http_server(vec![
-        Box::new(move |_request| {
-            openai_tool_response(
-                "denied-host-write",
-                "exec_command",
-                json!({
-                    "cmd": "printf should-not-run > must-not-exist.txt",
-                    "workdir": external_root,
-                    "sandbox_permissions": "require_escalated",
-                    "justification": "Exercise the disabled Host execution boundary"
-                }),
-            )
-        }),
-        Box::new(|request| {
-            let context = model_request_text(&request.body);
-            assert!(context.contains("exec_host_execution_denied"), "{context}");
-            openai_text_response(FINAL_MARKER)
-        }),
-    ]);
-    workspace.configure_local_openai(&model_endpoint);
-    workspace.configure_host_execution(false);
+    for (request_escalation, expected_code) in [
+        (true, "input_schema_violation"),
+        (false, "exec_host_execution_denied"),
+    ] {
+        let workspace = TestWorkspace::new("host-execution-ceiling");
+        let external = TestWorkspace::new("host-execution-ceiling-external");
+        let escaped = external.path("must-not-exist.txt");
+        let external_root = external
+            .root
+            .canonicalize()
+            .expect("canonicalize external approval fixture")
+            .to_string_lossy()
+            .to_string();
+        let mut arguments = json!({
+            "cmd": "printf should-not-run > must-not-exist.txt",
+            "workdir": external_root,
+        });
+        if request_escalation {
+            arguments["sandbox_permissions"] = json!("require_escalated");
+            arguments["justification"] = json!("Exercise the disabled Host execution boundary");
+        }
+        let model_arguments = arguments.clone();
+        let (model_endpoint, model_server) = spawn_fixture_http_server(vec![
+            Box::new(move |request| {
+                let properties = request.body["tools"]
+                    .as_array()
+                    .expect("model tools")
+                    .iter()
+                    .find(|tool| tool["function"]["name"] == "exec_command")
+                    .and_then(|tool| tool["function"]["parameters"]["properties"].as_object())
+                    .expect("exec_command properties");
+                assert!(!properties.contains_key("sandbox_permissions"));
+                assert!(!properties.contains_key("justification"));
+                // Explicit unavailable arguments fail schema validation. An
+                // external workdir alone reaches the Host authority planner.
+                openai_tool_response("denied-host-write", "exec_command", model_arguments.clone())
+            }),
+            Box::new(move |request| {
+                let context = model_request_text(&request.body);
+                assert!(context.contains(expected_code), "{context}");
+                openai_text_response(FINAL_MARKER)
+            }),
+        ]);
+        workspace.configure_local_openai(&model_endpoint);
+        workspace.configure_host_execution(false);
 
-    let output = run_to_completion(
-        local_default_agent_command(
-            &workspace,
-            "host-execution-ceiling-session",
-            "Try the requested Host execution and report its actual outcome.",
-            true,
-            true,
-        ),
-        LOCAL_PROCESS_TIMEOUT,
-    );
-    assert!(output.status.success(), "{}", output.stderr_text());
-    assert_eq!(output.stdout_text().trim(), FINAL_MARKER);
-    assert!(!output.stderr_text().contains(APPROVAL_PROMPT));
-    assert!(!escaped.exists(), "denied Host execution reached spawn");
-    assert_eq!(
-        model_server
-            .join()
-            .expect("join Host ceiling model server")
-            .len(),
-        2
-    );
+        let output = run_to_completion(
+            local_default_agent_command(
+                &workspace,
+                "host-execution-ceiling-session",
+                "Try the requested Host execution and report its actual outcome.",
+                true,
+                true,
+            ),
+            LOCAL_PROCESS_TIMEOUT,
+        );
+        assert!(output.status.success(), "{}", output.stderr_text());
+        assert_eq!(output.stdout_text().trim(), FINAL_MARKER);
+        assert!(!output.stderr_text().contains(APPROVAL_PROMPT));
+        assert!(!escaped.exists(), "denied Host execution reached spawn");
+        assert!(
+            !workspace.path("must-not-exist.txt").exists(),
+            "denied Host execution ran in the primary workspace"
+        );
+        assert_eq!(
+            model_server
+                .join()
+                .expect("join Host ceiling model server")
+                .len(),
+            2
+        );
+        let records = session_records(&workspace);
+        let exchanges = tool_exchanges(&records);
+        assert_eq!(exchanges.len(), 1);
+        assert_eq!(tool_arguments(exchanges[0]), &arguments);
+        assert_eq!(tool_result_is_error(exchanges[0]), Some(true));
+        assert_eq!(tool_result_value(exchanges[0])["code"], expected_code);
+    }
 }
 
 #[test]
