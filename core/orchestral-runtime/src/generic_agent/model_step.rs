@@ -65,6 +65,13 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
         .config
         .continuation
         .effective_tool_calls(request.run.spec.limits.max_tool_calls);
+    let mut observed_prefix = match observed_prefix_for_run(&inner, &request) {
+        Ok(anchor) => anchor,
+        Err(error) => {
+            emit_failure(&inner, &request, &user_message, session_failure(error));
+            return;
+        }
+    };
     'model_rounds: for round in
         std::iter::successors(Some(next_model_round), |round| round.checked_add(1))
     {
@@ -131,6 +138,7 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
             ModelContextBudget {
                 remaining_input_tokens: remaining_input,
                 reserved_output_tokens: Some(inner.config.reserved_output_tokens),
+                observed_prefix: observed_prefix.as_ref(),
             },
         )
         .await
@@ -425,6 +433,12 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                         role: ModelRole::Assistant,
                         content: observation.assistant_content(),
                     };
+                    let next_observed_prefix = context_trace.observed_prefix(
+                        &run_id,
+                        &model_request.request_id,
+                        &observation,
+                        dispatch_budget.max_output_tokens,
+                    );
                     if let Err(failure) = commit_model_observation(
                         &inner,
                         &run_id,
@@ -449,6 +463,7 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                         merge_usage(&mut total_usage, observed);
                         has_usage = true;
                     }
+                    observed_prefix = next_observed_prefix;
                     match reason {
                         ModelFinishReason::Stop
                             if tool_calls.is_empty() && !response.is_empty() =>

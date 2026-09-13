@@ -441,7 +441,6 @@ pub(super) struct RecoveredSkillPreparation {
     pub(super) observation: SkillCallObservation,
     pub(super) load_committed: bool,
     pub(super) exchange_record: Option<AgentSessionRecord>,
-    pub(super) prior_session_seq: Option<u64>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -569,7 +568,6 @@ pub(super) async fn prepare_recovered_skill(
         observation: evaluation.observation,
         load_committed: load_record.is_some(),
         exchange_record,
-        prior_session_seq: first_outcome_seq.map(|sequence| sequence.saturating_sub(1)),
     })
 }
 

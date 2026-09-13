@@ -202,6 +202,10 @@ impl OpenAiCompatibleBackend {
 const CONTEXT_ESTIMATE_BYTES_PER_TOKEN: u64 = 3;
 
 impl ModelTokenMeter for OpenAiCompatibleBackend {
+    fn supports_observed_prefix_estimation(&self) -> bool {
+        true
+    }
+
     fn meter_descriptor(&self) -> ModelTokenMeterDescriptor {
         let config = (
             &self.config.model,
@@ -210,23 +214,23 @@ impl ModelTokenMeter for OpenAiCompatibleBackend {
             self.config.structured_output,
             &self.sampling,
             CONTEXT_ESTIMATE_BYTES_PER_TOKEN,
+            "observed-prefix-input-delta/v1",
         );
-        // Keep the explicit JSON identity byte-for-byte compatible with v2.
-        // Other formats change the actual prompt, so recovery binds the encoding.
+        // Bind both the encoding and opt-in observed-prefix planning semantics.
         let (strategy, version, config) = match self.tool_result_format {
             OpenAiToolResultFormat::Json => (
                 "openai-compatible/wire-json-upper-bound",
-                "2",
+                "3",
                 serde_json::to_vec(&config),
             ),
             OpenAiToolResultFormat::Yaml => (
                 "openai-compatible/wire-json-yaml-tool-upper-bound",
-                "1",
+                "2",
                 serde_json::to_vec(&(config, tool_result::YAML_ENCODING_IDENTITY)),
             ),
             OpenAiToolResultFormat::TextParts => (
                 "openai-compatible/wire-json-text-parts-tool-upper-bound",
-                "1",
+                "2",
                 serde_json::to_vec(&(config, tool_result::TEXT_PARTS_ENCODING_IDENTITY)),
             ),
         };

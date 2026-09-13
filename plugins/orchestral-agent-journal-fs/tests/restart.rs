@@ -281,6 +281,7 @@ fn generic_private_wal_rehydrates_from_a_new_store_instance() {
                 history_limit: 128,
                 used_input_tokens: 10,
                 context_estimate: None,
+                planning: None,
                 input_budget_tokens: 100,
             },
         },

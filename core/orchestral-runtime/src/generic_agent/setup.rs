@@ -249,6 +249,7 @@ pub(super) fn generic_config_digest(
         "system_prompt": config.system_prompt,
         "project_instructions": config.project_instructions,
         "context_projection_contract": "source-positioned-summary/v3",
+        "observed_prefix_planning_contract": "completed-input-prefix/v1",
         "model_retry": config.model_retry,
         "model_descriptor": model_descriptor,
         "token_meter": token_meter,

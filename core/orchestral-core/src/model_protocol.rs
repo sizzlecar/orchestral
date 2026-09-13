@@ -124,6 +124,15 @@ impl ModelTokenMeterDescriptor {
 pub trait ModelTokenMeter: Send + Sync {
     fn meter_descriptor(&self) -> ModelTokenMeterDescriptor;
 
+    /// Whether differences between this meter's soft estimates may be added
+    /// to observed input usage for an unchanged request prefix. This remains
+    /// estimated accounting, never a hard bound. Opting in must change the
+    /// meter descriptor's immutable identity; unknown meters retain full-input
+    /// estimation. The runtime separately verifies the prefix and Run scope.
+    fn supports_observed_prefix_estimation(&self) -> bool {
+        false
+    }
+
     fn count_request_input(
         &self,
         messages: &[ModelMessage],

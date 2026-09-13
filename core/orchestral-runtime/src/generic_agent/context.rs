@@ -1,9 +1,11 @@
 use super::*;
+use crate::session_context::observed_prefix::ObservedPrefixAnchor;
 
 #[derive(Debug, Clone, Copy, Default)]
-pub(super) struct ModelContextBudget {
+pub(super) struct ModelContextBudget<'a> {
     pub(super) remaining_input_tokens: Option<u64>,
     pub(super) reserved_output_tokens: Option<u64>,
+    pub(super) observed_prefix: Option<&'a ObservedPrefixAnchor>,
 }
 
 pub(super) async fn project_model_context(
@@ -13,7 +15,7 @@ pub(super) async fn project_model_context(
     run_skills: Option<&SkillRuntime>,
     initial_input: Option<ModelMessage>,
     through_session_seq: Option<u64>,
-    budget: ModelContextBudget,
+    budget: ModelContextBudget<'_>,
 ) -> Result<SessionContextProjection, SessionContextError> {
     if let Some(message) = initial_input {
         inner
@@ -81,6 +83,11 @@ pub(super) async fn project_model_context(
         config_digest: inner.config_digest.clone(),
         allowed_skill_digests: allowed_skill_digests.clone(),
     };
+    let context_engine = inner.context_engine.with_observed_prefix(
+        &request.run.spec.run_id,
+        &inner.config_digest,
+        budget.observed_prefix,
+    );
 
     let mut previous_overflow = None;
     loop {
@@ -91,12 +98,20 @@ pub(super) async fn project_model_context(
         } else {
             crate::session_context::ContextTokenPolicy::Planning
         };
-        match inner
-            .context_engine
+        match context_engine
             .project_with_policy(make_request(), policy)
             .await
         {
-            Ok(projection) => return Ok(projection),
+            Ok(mut projection) => {
+                if policy == crate::session_context::ContextTokenPolicy::Planning {
+                    projection.planning = inner.context_engine.planning_trace(
+                        &projection.messages,
+                        model_definitions,
+                        budget.observed_prefix,
+                    )?;
+                }
+                return Ok(projection);
+            }
             Err(SessionContextError::ContextOverflow { used, budget })
                 if through_session_seq.is_none() && inner.session_compactor.is_some() =>
             {
@@ -126,7 +141,7 @@ pub(super) async fn project_model_context(
                     .session_compactor
                     .as_ref()
                     .expect("compactor presence was checked")
-                    .compact_active_run_for_context(&inner.context_engine, make_request(), policy)
+                    .compact_active_run_for_context(&context_engine, make_request(), policy)
                     .await?;
                 if compacted.is_none() {
                     return Err(SessionContextError::ContextOverflow { used, budget });
@@ -166,6 +181,14 @@ pub(super) async fn project_model_messages(
     through_session_seq: Option<u64>,
     remaining_input_tokens: Option<u64>,
 ) -> Result<Vec<ModelMessage>, SessionContextError> {
+    // This wrapper is used by recovery, not the live per-round loop. Resolve
+    // durable evidence once for the current-head projection; historical
+    // attempts use replay_started_context with their original trace instead.
+    let anchor = if through_session_seq.is_none() {
+        observed_prefix_for_run(inner, request)?
+    } else {
+        None
+    };
     project_model_context(
         inner,
         request,
@@ -176,6 +199,7 @@ pub(super) async fn project_model_messages(
         ModelContextBudget {
             remaining_input_tokens,
             reserved_output_tokens: None,
+            observed_prefix: anchor.as_ref(),
         },
     )
     .await

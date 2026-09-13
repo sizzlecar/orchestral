@@ -1,5 +1,6 @@
 //! Replay-derived model context for the Generic Agent.
 
+pub mod observed_prefix;
 mod placement;
 mod pressure;
 
@@ -112,6 +113,8 @@ pub struct SessionContextProjection {
     /// Optional soft planning count. `used_input_tokens` remains the hard
     /// input bound used for dispatch reservations and observed-usage checks.
     pub context_estimate: Option<ModelContextEstimate>,
+    /// Optional provenance for soft planning; absent for certified accounting.
+    pub planning: Option<observed_prefix::ContextPlanningTrace>,
     pub input_budget_tokens: u64,
     pub through_session_seq: u64,
     pub config_digest: Digest,
@@ -309,6 +312,7 @@ impl AgentSessionContextEngine {
             deferred_ranges,
             used_input_tokens,
             context_estimate,
+            planning: None,
             input_budget_tokens: input_budget,
             through_session_seq: records.last().map(|record| record.session_seq).unwrap_or(0),
             config_digest: request.config_digest,

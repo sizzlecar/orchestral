@@ -467,10 +467,12 @@ impl GenericExecutionSeed {
 }
 
 mod command;
+mod context_anchor;
 mod coordinator;
 mod provider;
 mod provider_spi;
 mod recovery_activate;
+use context_anchor::*;
 mod recovery_approval;
 mod recovery_dispatch;
 mod recovery_entry;

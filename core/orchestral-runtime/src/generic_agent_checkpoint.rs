@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::RwLock;
 
+use crate::session_context::observed_prefix::{ContextPlanningTrace, ObservedPrefixAnchor};
 use orchestral_core::agent_protocol::wire::{
     AgentAdmission, AgentCommandEnvelope, AgentEvent, AgentEventDraft, AgentEventId,
     AgentExecutionRef, AgentStartRequest, CommandId, Digest, ProviderCommandOutcome, RunId,
@@ -109,11 +110,26 @@ pub struct GenericModelContextTrace {
     pub used_input_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_estimate: Option<orchestral_core::model_protocol::ModelContextEstimate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planning: Option<ContextPlanningTrace>,
     pub input_budget_tokens: u64,
 }
 
 impl GenericModelContextTrace {
     fn validate(&self) -> Result<(), GenericCheckpointError> {
+        if self.planning.as_ref().is_some_and(|planning| {
+            !planning.input.validate()
+                || planning.input.raw_estimate_tokens > self.used_input_tokens
+                || self.context_estimate.is_none()
+                || planning
+                    .anchor
+                    .as_ref()
+                    .is_some_and(|anchor| !anchor.validate())
+        }) {
+            return Err(GenericCheckpointError::InvalidData(
+                "invalid context planning provenance".to_owned(),
+            ));
+        }
         if let Some(estimate) = &self.context_estimate {
             if estimate.accounting
                 != orchestral_core::model_protocol::ModelTokenAccounting::Estimated
@@ -161,6 +177,43 @@ impl GenericModelContextTrace {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn observed_prefix(
+        &self,
+        run_id: &RunId,
+        request_id: &ModelRequestId,
+        observation: &GenericModelObservation,
+        max_output_tokens: Option<u64>,
+    ) -> Option<ObservedPrefixAnchor> {
+        let planning = self.planning.as_ref()?;
+        let input_tokens = observation.usage.as_ref()?.input_tokens?;
+        if input_tokens == 0
+            || input_tokens > self.used_input_tokens
+            || observation
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.output_tokens)
+                .zip(max_output_tokens)
+                .is_some_and(|(used, cap)| used > cap)
+            || !matches!(
+                observation.finish_reason,
+                ModelFinishReason::Stop | ModelFinishReason::ToolCalls
+            )
+            || (observation.response.is_empty() && observation.tool_calls.is_empty())
+            || observation.tool_calls.iter().any(|call| {
+                !call.ended || serde_json::from_str::<serde_json::Value>(&call.arguments).is_err()
+            })
+        {
+            return None;
+        }
+        Some(ObservedPrefixAnchor {
+            run_id: run_id.clone(),
+            config_digest: self.config_digest.clone(),
+            source_request_id: request_id.clone(),
+            input: planning.input.clone(),
+            observed_input_tokens: input_tokens,
+        })
     }
 }
 
@@ -618,6 +671,8 @@ pub struct GenericAgentCheckpointProjection {
     pub provider_events: Vec<AgentEventDraft>,
     pub commands: BTreeMap<CommandId, CommandCheckpoint>,
     pub last_checkpoint_seq: u64,
+    /// Derived from the last completed request, never cumulative/output usage.
+    pub observed_prefix: Option<ObservedPrefixAnchor>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -638,6 +693,8 @@ pub fn replay_generic_agent_checkpoint(
     let mut commands = BTreeMap::<CommandId, CommandCheckpoint>::new();
     let mut checkpoint_ids = BTreeMap::<GenericCheckpointEventId, Digest>::new();
     let mut last_retry_number = 0_u32;
+    let mut observed_prefix = None;
+    let mut started_context: Option<(GenericModelContextTrace, Option<u64>)> = None;
 
     for (index, record) in run.records.iter().enumerate() {
         record.validate()?;
@@ -727,8 +784,8 @@ pub fn replay_generic_agent_checkpoint(
                 round,
                 request_id,
                 request_digest,
-                max_output_tokens: _,
-                context: _,
+                max_output_tokens,
+                context,
             } => {
                 let GenericCheckpointPhase::Stable(boundary) = &phase else {
                     return Err(GenericCheckpointError::InvalidData(
@@ -740,6 +797,19 @@ pub fn replay_generic_agent_checkpoint(
                         "model attempt round does not match the stable boundary".to_owned(),
                     ));
                 }
+                if context.planning.as_ref().is_some_and(|planning| {
+                    context.config_digest != run.registration.config_digest
+                        || planning
+                            .anchor
+                            .as_ref()
+                            .is_some_and(|anchor| Some(anchor) != observed_prefix.as_ref())
+                }) {
+                    return Err(GenericCheckpointError::InvalidData(
+                        "context anchor does not match an earlier completed request in this Run"
+                            .to_owned(),
+                    ));
+                }
+                started_context = Some((context.clone(), *max_output_tokens));
                 phase = GenericCheckpointPhase::ModelAttemptOpen {
                     boundary: boundary.clone(),
                     round: *round,
@@ -769,6 +839,9 @@ pub fn replay_generic_agent_checkpoint(
                         "model observation identity does not match its open attempt".to_owned(),
                     ));
                 }
+                observed_prefix = started_context.as_ref().and_then(|(context, cap)| {
+                    context.observed_prefix(run_id, request_id, observation, *cap)
+                });
                 phase = GenericCheckpointPhase::ModelAttemptObserved {
                     boundary: boundary.clone(),
                     round: *round,
@@ -878,6 +951,7 @@ pub fn replay_generic_agent_checkpoint(
         provider_events,
         commands,
         last_checkpoint_seq: run.last_checkpoint_seq(),
+        observed_prefix,
     })
 }
 
@@ -1118,6 +1192,7 @@ mod tests {
             history_limit: 128,
             used_input_tokens: 10,
             context_estimate: None,
+            planning: None,
             input_budget_tokens: 100,
         }
     }
@@ -1139,7 +1214,13 @@ mod tests {
         let legacy = context_trace();
         let serialized = serde_json::to_value(&legacy).unwrap();
         assert!(serialized.get("context_estimate").is_none());
-        let restored: GenericModelContextTrace = serde_json::from_value(serialized).unwrap();
+        assert!(serialized.get("planning").is_none());
+        let restored: GenericModelContextTrace =
+            serde_json::from_value(serialized.clone()).unwrap();
+        assert_eq!(
+            serde_jcs::to_vec(&restored).unwrap(),
+            serde_jcs::to_vec(&serialized).unwrap()
+        );
         restored.validate().unwrap();
         assert_eq!(restored, legacy);
 
@@ -1164,6 +1245,75 @@ mod tests {
         }
         trace.context_estimate = None;
         assert!(trace.validate().is_err());
+    }
+
+    #[test]
+    fn observed_prefix_requires_positive_complete_in_bound_input_usage() {
+        use crate::session_context::observed_prefix::ContextInputSignature;
+        use orchestral_core::model_protocol::{ModelContextEstimate, ModelTokenAccounting};
+        let mut trace = context_trace();
+        trace.context_estimate = Some(ModelContextEstimate {
+            tokens: 8,
+            accounting: ModelTokenAccounting::Estimated,
+        });
+        trace.planning = Some(ContextPlanningTrace {
+            input: ContextInputSignature {
+                messages_len: 2,
+                messages_digest: Digest::sha256("messages"),
+                tools_digest: Digest::sha256("tools"),
+                raw_estimate_tokens: 8,
+            },
+            anchor: None,
+        });
+        let observation = GenericModelObservation {
+            finish_reason: ModelFinishReason::Stop,
+            response: "complete".to_owned(),
+            continuation: Default::default(),
+            tool_calls: Vec::new(),
+            usage: Some(ModelUsage {
+                input_tokens: Some(5),
+                output_tokens: Some(2),
+            }),
+        };
+        let derive = |observation: &GenericModelObservation| {
+            trace.observed_prefix(
+                &RunId::new("run"),
+                &ModelRequestId::new("request"),
+                observation,
+                Some(4),
+            )
+        };
+        assert_eq!(derive(&observation).unwrap().observed_input_tokens, 5);
+        for reason in [
+            ModelFinishReason::Length,
+            ModelFinishReason::Cancelled,
+            ModelFinishReason::ContentFilter,
+            ModelFinishReason::Other,
+        ] {
+            let mut rejected = observation.clone();
+            rejected.finish_reason = reason;
+            assert!(derive(&rejected).is_none());
+        }
+        for input in [None, Some(0), Some(11)] {
+            let mut rejected = observation.clone();
+            rejected.usage.as_mut().unwrap().input_tokens = input;
+            assert!(derive(&rejected).is_none());
+        }
+        let mut rejected = observation.clone();
+        rejected.usage = None;
+        assert!(derive(&rejected).is_none());
+        let mut rejected = observation.clone();
+        rejected.usage.as_mut().unwrap().output_tokens = Some(5);
+        assert!(derive(&rejected).is_none());
+        let mut rejected = observation;
+        rejected.tool_calls.push(GenericObservedToolCall {
+            call_id: ModelToolCallId::new("half-call"),
+            name: "inspect".to_owned(),
+            arguments: "{}".to_owned(),
+            extensions: Default::default(),
+            ended: false,
+        });
+        assert!(derive(&rejected).is_none());
     }
 
     #[test]

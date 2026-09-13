@@ -421,6 +421,7 @@ pub(super) fn model_context_trace(
         history_limit,
         used_input_tokens: projection.used_input_tokens,
         context_estimate: projection.context_estimate.clone(),
+        planning: projection.planning.clone(),
         input_budget_tokens: projection.input_budget_tokens,
     }
 }

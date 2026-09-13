@@ -62,6 +62,9 @@ use tokio_util::sync::CancellationToken;
 #[path = "generic_agent/observed_write_recovery.rs"]
 mod observed_write_recovery;
 
+#[path = "generic_agent/observed_prefix_recovery.rs"]
+mod observed_prefix_recovery;
+
 struct ScriptedModel;
 
 struct BlockingModel;
@@ -176,6 +179,8 @@ enum CheckpointCrashCut {
     InitialBoundary,
     ModelAttempt,
     ModelObservation,
+    ModelObservationRound(u64),
+    ToolExchangeRound(u64),
     InputRequestOpen,
     InputRequestResolve,
     InputToolExchangeBoundary,
@@ -794,6 +799,16 @@ impl GenericAgentCheckpointStore for PausingCheckpointStore {
                         ..
                     },
                 ) => true,
+                (
+                    CheckpointCrashCut::ModelObservationRound(expected),
+                    GenericCheckpointEvent::ModelAttemptObserved { round, .. },
+                ) => expected == round,
+                (
+                    CheckpointCrashCut::ToolExchangeRound(expected),
+                    GenericCheckpointEvent::LoopBoundaryCommitted {
+                        next_model_round, ..
+                    },
+                ) => expected == next_model_round,
                 _ => false,
             };
             if !state.paused_once && at_cut {
