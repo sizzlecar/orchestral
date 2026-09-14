@@ -39,6 +39,9 @@ Pre-1.0 Agent Foundation release, replacing the workflow-first architecture in 0
   native unattended CLI runs in Docker task environments.
 - Linux/macOS/Windows CI, WASM and browser checks, and a tag-triggered workflow that prepares
   release archives, SHA-256 files, and a GitHub Release draft.
+- A separate distribution workflow for published stable releases, with verified Cargo packages,
+  Homebrew formula generation, and public installation checks. See `RELEASING.md` for the
+  registry and tap prerequisites; preparing a draft does not publish these channels.
 
 - `--base-url`, `OPENAI_BASE_URL`, explicit keyless local connections, optional model
   discovery, and `doctor` configuration/connection diagnostics without generation calls.
@@ -51,8 +54,19 @@ Pre-1.0 Agent Foundation release, replacing the workflow-first architecture in 0
 
 - Retry transient failures before model content arrives, retaining reported usage from
   usage-only retry attempts while respecting strict cumulative budget constraints.
+- Handle structured model context-capacity rejections before content arrives with bounded
+  retries and a smaller, durable input budget. Recovery reprojects committed context without
+  repeating completed tool effects; `agent.context_recovery.max_retries` controls retries.
 - Preserve recent tool outcomes and process state during compaction, including results
   that would otherwise disappear behind long output or repeated inspection.
+- Merge live summaries across superseded journal records while retaining original-source
+  identity, historical replay, user corrections, and protected effect/artifact boundaries.
+- Separate model-visible tool output allowances from execution capture limits. Large collected
+  results can be read through `artifact_read` using a reference and byte cursor; the Host resolves
+  and verifies their Session-scoped metadata. Complete observed pages preserve file-read version
+  evidence. The explicit-metadata Artifact reader remains available to SDK Hosts.
+- Preserve failing upstream pipeline status by default with Bash/Zsh `pipefail`. Select
+  `tools.exec.pipeline_exit_status: native` when native shell pipeline semantics are intended.
 - Isolate Run temporary storage, aggregate process waits, yield to Steer, and finish process
   cleanup before completion or cancellation. Harbor aborts verification when timeout cleanup
   cannot be confirmed.
@@ -69,10 +83,13 @@ Pre-1.0 Agent Foundation release, replacing the workflow-first architecture in 0
   separate concern. Integration tests and small benchmark subsets are not coding quality scores.
 - Live model/native Agent checks are opt-in. TUI cross-terminal manual acceptance and full
   end-to-end performance characterization are still incomplete.
+- A per-result output allowance does not guarantee that the full model request fits. Recovery
+  can still stop when required context cannot fit; process output discarded beyond capture
+  limits cannot be reconstructed through Artifact reads.
 - Release archives target Linux x86_64 (glibc 2.35+), macOS Apple Silicon/Intel, and Windows x64.
   Native Windows has no filesystem/network sandbox; use WSL for sandboxed commands.
   Native Windows MCP connections use Streamable HTTP; local stdio MCP requires WSL.
-  macOS archives are not Developer ID notarized; Windows binaries are not Authenticode signed. This workflow does not publish to crates.io.
+  macOS archives are not Developer ID notarized; Windows binaries are not Authenticode signed.
 
 ## [0.2.0]
 
