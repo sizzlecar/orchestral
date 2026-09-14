@@ -1154,6 +1154,12 @@ fn local_cli_reads_patches_and_runs_a_guarded_verification() {
                 model_tool_results_json(&request.body).contains("\"exit_code\":0"),
                 "{context}"
             );
+            #[cfg(target_os = "macos")]
+            assert!(
+                !context.contains("couldn't create cache file")
+                    && !context.contains("DVTFilePathFSEvents"),
+                "guarded Cargo verification must retain diagnostics without xcrun cache denials: {context}"
+            );
             openai_text_response("PATCH_AND_VERIFY_OK")
         }),
     ]);

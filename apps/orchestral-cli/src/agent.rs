@@ -1191,7 +1191,9 @@ fn configured_exec_host(config: &OrchestralConfig) -> anyhow::Result<Option<CliE
 }
 
 fn exec_runtime_readable_files() -> Vec<PathBuf> {
-    let mut candidates = BTreeSet::new();
+    let mut candidates = orchestral_runtime::tools::host_toolchain_readable_files()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     let home = std::env::var_os("HOME").map(PathBuf::from);
     if let Some(home) = &home {
         candidates.insert(home.join(".gitconfig"));

@@ -5,6 +5,7 @@
 mod builtin;
 mod mcp;
 pub(crate) mod shell_sandbox;
+mod toolchain;
 #[cfg(any(windows, test))]
 mod windows_sandbox;
 
@@ -14,3 +15,4 @@ pub use mcp::{
     McpToolsAdapterRegistry, StdioMcpSandboxPolicy, StdioMcpTransportFactory,
     MCP_STDIO_SANDBOX_PROFILE,
 };
+pub use toolchain::host_toolchain_readable_files;
