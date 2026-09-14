@@ -708,6 +708,8 @@ pub struct GenericAgentCheckpointProjection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenericContextRecovery {
+    /// Consecutive rejected attempts. Zero means generation succeeded while
+    /// the learned per-request ceiling remains in force for this Run.
     pub retry_number: u32,
     pub input_budget_tokens: u64,
 }
@@ -715,8 +717,12 @@ pub struct GenericContextRecovery {
 impl GenericContextRecovery {
     /// The ceiling is one token below the rejected input; rounding its half
     /// upward recovers half the original rejected input without overflowing.
-    pub(crate) fn compaction_target_tokens(&self) -> u64 {
-        self.input_budget_tokens.div_ceil(2)
+    pub(crate) fn compaction_target_tokens(&self) -> Option<u64> {
+        (self.retry_number > 0).then(|| self.input_budget_tokens.div_ceil(2))
+    }
+
+    pub(crate) fn generation_observed(&mut self) {
+        self.retry_number = 0;
     }
 }
 
@@ -950,7 +956,9 @@ pub fn replay_generic_agent_checkpoint(
                 observed_prefix = started_context.as_ref().and_then(|(context, cap)| {
                     context.observed_prefix(run_id, request_id, observation, *cap)
                 });
-                context_recovery = None;
+                if let Some(recovery) = &mut context_recovery {
+                    recovery.generation_observed();
+                }
                 phase = GenericCheckpointPhase::ModelAttemptObserved {
                     boundary: boundary.clone(),
                     round: *round,

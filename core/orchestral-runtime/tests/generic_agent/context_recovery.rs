@@ -9,6 +9,7 @@ enum Rejection {
     AfterToolStart,
     Always,
     Initial,
+    FollowupTool,
 }
 
 struct CapacityModel {
@@ -91,6 +92,9 @@ impl ModelBackend for CapacityModel {
             .iter()
             .any(|message| message.role == ModelRole::Tool);
         let summarized = text.contains("active pressure summary");
+        let followup = summarized
+            && matches!(self.rejection, Rejection::FollowupTool)
+            && self.requests.lock().unwrap().len() == 3;
         let rejection = ModelError::new(
             ModelErrorCode::ContextLengthExceeded,
             "context rejected before generation",
@@ -98,44 +102,46 @@ impl ModelBackend for CapacityModel {
         if matches!(self.rejection, Rejection::Initial) {
             return Err(rejection);
         }
-        let mut events =
-            if has_result || (summarized && matches!(self.rejection, Rejection::Always)) {
-                let prefix = match self.rejection {
-                    Rejection::BeforeGeneration | Rejection::Always | Rejection::Initial => {
-                        return Err(rejection)
-                    }
-                    Rejection::AfterUsage => ModelEvent::Usage {
-                        usage: ModelUsage {
-                            input_tokens: Some(1),
-                            output_tokens: Some(1),
-                        },
+        let mut events = if has_result
+            || (summarized && matches!(self.rejection, Rejection::Always))
+        {
+            let prefix = match self.rejection {
+                Rejection::BeforeGeneration
+                | Rejection::Always
+                | Rejection::Initial
+                | Rejection::FollowupTool => return Err(rejection),
+                Rejection::AfterUsage => ModelEvent::Usage {
+                    usage: ModelUsage {
+                        input_tokens: Some(1),
+                        output_tokens: Some(1),
                     },
-                    Rejection::AfterText => ModelEvent::TextDelta {
-                        delta: "partial".to_owned(),
-                    },
-                    Rejection::AfterToolStart => ModelEvent::ToolCallStart {
-                        call_id: ModelToolCallId::new("incomplete-call"),
-                        name: "echo".to_owned(),
-                        extensions: Default::default(),
-                    },
-                };
-                return Ok(stream::iter([
-                    Ok(ModelStreamEvent {
-                        request_id: request.request_id.clone(),
-                        event_id: ModelEventId::new("partial"),
-                        sequence: 1,
-                        payload: prefix,
-                    }),
-                    Err(rejection),
-                ])
-                .boxed());
-            } else if summarized {
-                vec![ModelEvent::TextDelta {
-                    delta: "continued after rejection".to_owned(),
-                }]
-            } else {
-                let call_id = ModelToolCallId::new("record-once");
-                vec![
+                },
+                Rejection::AfterText => ModelEvent::TextDelta {
+                    delta: "partial".to_owned(),
+                },
+                Rejection::AfterToolStart => ModelEvent::ToolCallStart {
+                    call_id: ModelToolCallId::new("incomplete-call"),
+                    name: "echo".to_owned(),
+                    extensions: Default::default(),
+                },
+            };
+            return Ok(stream::iter([
+                Ok(ModelStreamEvent {
+                    request_id: request.request_id.clone(),
+                    event_id: ModelEventId::new("partial"),
+                    sequence: 1,
+                    payload: prefix,
+                }),
+                Err(rejection),
+            ])
+            .boxed());
+        } else if summarized && !followup {
+            vec![ModelEvent::TextDelta {
+                delta: "continued after rejection".to_owned(),
+            }]
+        } else {
+            let call_id = ModelToolCallId::new(if followup { "followup" } else { "record-once" });
+            vec![
                     ModelEvent::ToolCallStart {
                         call_id: call_id.clone(),
                         name: "echo".to_owned(),
@@ -143,11 +149,11 @@ impl ModelBackend for CapacityModel {
                     },
                     ModelEvent::ToolCallArgumentsDelta {
                         call_id: call_id.clone(),
-                        delta: json!({"value":"one observation"}).to_string(),
+                        delta: json!({"value": if followup { "next observation" } else { "one observation" }}).to_string(),
                     },
                     ModelEvent::ToolCallEnd { call_id },
                 ]
-            };
+        };
         events.push(ModelEvent::Usage {
             usage: ModelUsage {
                 input_tokens: Some(self.fixed_input_tokens + if summarized { 800 } else { 700 }),
@@ -155,7 +161,7 @@ impl ModelBackend for CapacityModel {
             },
         });
         events.push(ModelEvent::Finish {
-            reason: if summarized {
+            reason: if summarized && !followup {
                 ModelFinishReason::Stop
             } else {
                 ModelFinishReason::ToolCalls
@@ -178,6 +184,7 @@ impl ModelBackend for CapacityModel {
 #[derive(Default)]
 struct RejectionAckLostStore {
     inner: InMemoryGenericAgentCheckpointStore,
+    cut_after_observation: bool,
     cut_once: AtomicBool,
     unavailable: AtomicBool,
 }
@@ -206,15 +213,29 @@ impl GenericAgentCheckpointStore for RejectionAckLostStore {
                 "process lost".to_owned(),
             ));
         }
-        let rejected = matches!(
-            draft.payload,
-            GenericCheckpointEvent::ModelContextRejected { .. }
-        );
+        let cut_boundary = if self.cut_after_observation {
+            matches!(
+                draft.payload,
+                GenericCheckpointEvent::ModelAttemptObserved { .. }
+            ) && self.inner.load_run(run_id)?.is_some_and(|stored| {
+                stored.records.iter().any(|record| {
+                    matches!(
+                        record.payload,
+                        GenericCheckpointEvent::ModelContextRejected { .. }
+                    )
+                })
+            })
+        } else {
+            matches!(
+                draft.payload,
+                GenericCheckpointEvent::ModelContextRejected { .. }
+            )
+        };
         let result = self.inner.append(run_id, previous, draft)?;
-        if rejected && !self.cut_once.swap(true, Ordering::SeqCst) {
+        if cut_boundary && !self.cut_once.swap(true, Ordering::SeqCst) {
             self.unavailable.store(true, Ordering::SeqCst);
             return Err(GenericCheckpointError::Unavailable(
-                "lost ack after rejection commit".to_owned(),
+                "lost ack after capacity boundary commit".to_owned(),
             ));
         }
         Ok(result)
@@ -440,6 +461,77 @@ fn assert_rejection_history_integrity(stored: &StoredGenericAgentRun) {
 }
 
 #[tokio::test]
+async fn learned_capacity_survives_success_and_bounds_the_next_tool_round() {
+    let model = Arc::new(CapacityModel {
+        requests: Mutex::new(Vec::new()),
+        rejection: Rejection::FollowupTool,
+        fixed_input_tokens: 0,
+    });
+    let checkpoints = Arc::new(InMemoryGenericAgentCheckpointStore::default());
+    let tool = Arc::new(EchoTool {
+        calls: AtomicUsize::new(0),
+    });
+    let controller = Arc::new(
+        AgentController::new(
+            provider(
+                model.clone(),
+                config(),
+                Arc::new(InMemoryAgentSessionJournalStore::default()),
+                Arc::new(InMemoryToolEffectJournalStore::default()),
+                checkpoints.clone(),
+                tool.clone(),
+            ),
+            ProviderBindingRef::new("capacity-binding"),
+        )
+        .unwrap(),
+    );
+    let envelope = run();
+    let run_id = envelope.spec.run_id.clone();
+    controller.start(envelope).await.unwrap();
+    let view = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        controller.wait_for_terminal(&run_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(view.state.status(), AgentRunStatus::Delivered);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 2);
+    // The second exchange must be compacted proactively. Forgetting the
+    // learned ceiling sends it to the backend and incurs another rejection.
+    assert_eq!(model.requests.lock().unwrap().len(), 4);
+    let stored = checkpoints.load_run(&run_id).unwrap().unwrap();
+    let mut learned = None;
+    for record in &stored.records {
+        match &record.payload {
+            GenericCheckpointEvent::ModelContextRejected {
+                input_budget_tokens,
+                ..
+            } => {
+                assert!(
+                    learned.is_none(),
+                    "only the first exchange should reach capacity rejection"
+                );
+                learned = Some(*input_budget_tokens);
+            }
+            GenericCheckpointEvent::ModelAttemptStarted { context, .. } => {
+                if let Some(ceiling) = learned {
+                    assert!(context.input_budget_tokens <= ceiling);
+                }
+            }
+            _ => {}
+        }
+    }
+    let retained = stored.validate().unwrap().context_recovery.unwrap();
+    assert_eq!(retained.retry_number, 0);
+    assert_eq!(Some(retained.input_budget_tokens), learned);
+    assert_eq!(
+        view.delivery.unwrap().usage.unwrap().input_tokens,
+        Some(2300)
+    );
+}
+
+#[tokio::test]
 async fn capacity_recovery_cannot_bypass_the_run_model_step_limit() {
     let model = Arc::new(CapacityModel {
         requests: Mutex::new(Vec::new()),
@@ -506,7 +598,19 @@ async fn capacity_recovery_cannot_bypass_the_run_model_step_limit() {
 
 #[tokio::test]
 async fn committed_capacity_rejection_recovers_after_lost_ack_without_repeating_tools() {
-    let checkpoints = Arc::new(RejectionAckLostStore::default());
+    recover_lost_capacity_boundary(false).await;
+}
+
+#[tokio::test]
+async fn learned_capacity_survives_restart_after_success_before_followup_tool_commit() {
+    recover_lost_capacity_boundary(true).await;
+}
+
+async fn recover_lost_capacity_boundary(cut_after_observation: bool) {
+    let checkpoints = Arc::new(RejectionAckLostStore {
+        cut_after_observation,
+        ..Default::default()
+    });
     let sessions = Arc::new(InMemoryAgentSessionJournalStore::default());
     let effects = Arc::new(InMemoryToolEffectJournalStore::default());
     let host = Arc::new(InMemoryAgentJournalStore::default());
@@ -515,7 +619,11 @@ async fn committed_capacity_rejection_recovers_after_lost_ack_without_repeating_
     });
     let first_model = Arc::new(CapacityModel {
         requests: Mutex::new(Vec::new()),
-        rejection: Rejection::BeforeGeneration,
+        rejection: if cut_after_observation {
+            Rejection::FollowupTool
+        } else {
+            Rejection::BeforeGeneration
+        },
         fixed_input_tokens: 1500,
     });
     let first = Arc::new(
@@ -548,10 +656,20 @@ async fn committed_capacity_rejection_recovers_after_lost_ack_without_repeating_
     ));
     let stored = checkpoints.load_run(&run_id).unwrap().unwrap();
     let projection = stored.validate().unwrap();
-    assert!(
-        matches!(projection.phase,GenericCheckpointPhase::Stable(ref boundary) if boundary.next_model_round==3)
+    if cut_after_observation {
+        assert!(matches!(
+            projection.phase,
+            GenericCheckpointPhase::ModelAttemptObserved { round: 3, .. }
+        ));
+    } else {
+        assert!(
+            matches!(projection.phase, GenericCheckpointPhase::Stable(ref boundary) if boundary.next_model_round == 3)
+        );
+    }
+    assert_eq!(
+        projection.context_recovery.unwrap().retry_number,
+        u32::from(!cut_after_observation)
     );
-    assert_eq!(projection.context_recovery.unwrap().retry_number, 1);
     assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
     checkpoints.unavailable.store(false, Ordering::SeqCst);
     let model = Arc::new(CapacityModel {
@@ -583,15 +701,23 @@ async fn committed_capacity_rejection_recovers_after_lost_ack_without_repeating_
     .unwrap()
     .unwrap();
     assert_eq!(result.state.status(), AgentRunStatus::Delivered);
-    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(first_model.requests.lock().unwrap().len(), 2);
+    assert_eq!(
+        tool.calls.load(Ordering::SeqCst),
+        if cut_after_observation { 2 } else { 1 }
+    );
+    assert_eq!(
+        first_model.requests.lock().unwrap().len(),
+        if cut_after_observation { 3 } else { 2 }
+    );
     assert_eq!(model.requests.lock().unwrap().len(), 1);
-    assert!(checkpoints
+    let retained = checkpoints
         .load_run(&run_id)
         .unwrap()
         .unwrap()
         .validate()
         .unwrap()
         .context_recovery
-        .is_none());
+        .unwrap();
+    assert_eq!(retained.retry_number, 0);
+    assert!(retained.input_budget_tokens < 4_000);
 }

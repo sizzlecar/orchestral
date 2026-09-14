@@ -151,7 +151,7 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                     .map(|recovery| recovery.input_budget_tokens),
                 input_compaction_target_tokens: context_recovery
                     .as_ref()
-                    .map(|recovery| recovery.compaction_target_tokens()),
+                    .and_then(|recovery| recovery.compaction_target_tokens()),
                 reserved_output_tokens: Some(
                     if inner.config.minimum_output_reserve_tokens.is_some() {
                         output_reserve
@@ -510,7 +510,9 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                         has_usage = true;
                     }
                     observed_prefix = next_observed_prefix;
-                    context_recovery = None;
+                    if let Some(recovery) = &mut context_recovery {
+                        recovery.generation_observed();
+                    }
                     match reason {
                         ModelFinishReason::Stop
                             if tool_calls.is_empty() && !response.is_empty() =>

@@ -198,6 +198,10 @@ repeated. An irreducible context or a second rejection ends the run explicitly.
 The OpenAI-compatible adapter requires HTTP 400 with `error.code` equal to
 `context_length_exceeded`; ordinary parameter errors and errors after generation
 do not trigger this recovery. The rejection and smaller budget survive restart.
+Successful generation resets the consecutive retry count while the smaller input
+ceiling remains in force for later tool rounds in the same Run. When compacting
+paged tool results, summaries prioritize an intact reference and continuation
+cursor; original content remains available through Session recall.
 
 Configure discovery, compatibility filenames, and retries as follows:
 

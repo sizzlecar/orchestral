@@ -253,7 +253,7 @@ pub(super) fn generic_config_digest(
         "observed_prefix_planning_contract": "completed-input-prefix/v1",
         "model_retry": config.model_retry,
         "context_recovery": config.context_recovery,
-        "context_recovery_contract": "rejected-input-target-and-ceiling/v2",
+        "context_recovery_contract": "persistent-ceiling-consecutive-retries/v3",
         "model_descriptor": model_descriptor,
         "token_meter": token_meter,
         "continuation_policy": {

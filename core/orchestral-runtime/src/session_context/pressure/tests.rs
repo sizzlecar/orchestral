@@ -75,6 +75,61 @@ fn default_summarizer() -> Arc<dyn AgentSessionSummarizer> {
 }
 
 #[tokio::test]
+async fn minimum_summary_keeps_artifact_identity_and_continuation_together() {
+    use orchestral_core::model_protocol::ModelToolCallId;
+    let identity = Digest::sha256("immutable paged tool result").to_string();
+    for max_chars in [256, 512, 2_048] {
+        let call_id = ModelToolCallId::new("page-call");
+        let summary = DeterministicExtractiveSessionSummarizer::new(max_chars)
+            .unwrap()
+            .summarize(SessionCompactionInput {
+                session_id: AgentSessionId::new("paged-summary"),
+                source: single_range(11),
+                focus_messages: Vec::new(),
+                groups: vec![SessionCompactionGroup {
+                    source: single_range(11),
+                    messages: vec![
+                        ModelMessage {
+                            role: ModelRole::Assistant,
+                            content: vec![ModelContent::ToolCall {
+                                call_id: call_id.clone(),
+                                name: "read_part".to_owned(),
+                                arguments: serde_json::json!({"artifact_ref":identity,"digest":identity,"media_type":"application/json","byte_size":4_096,"offset":128}),
+                                extensions: Default::default(),
+                            }],
+                        },
+                        ModelMessage {
+                            role: ModelRole::Tool,
+                            content: vec![ModelContent::ToolResult {
+                                call_id,
+                                result: serde_json::json!({"artifact_ref":identity,"digest":identity,"offset":128,"next_offset":256,"bytes_read":128,"total_bytes":4_096,"complete":false,"content":"x".repeat(128)}),
+                                is_error: false,
+                            }],
+                        },
+                    ],
+                }],
+            })
+            .await
+            .unwrap();
+        let ModelContent::Text { text } = &summary.content[0] else {
+            panic!("text summary");
+        };
+        assert!(
+            text.contains(&identity),
+            "missing Artifact identity at budget {max_chars}"
+        );
+        assert!(
+            text.contains("\"next_offset\":256"),
+            "missing continuation at budget {max_chars}: {text}"
+        );
+        assert!(text.contains("\"complete\":false"));
+        assert!(text.contains("session_seq=11..11"));
+        assert!(text.contains("status=succeeded"));
+        assert!(text.chars().count() <= max_chars);
+    }
+}
+
+#[tokio::test]
 async fn default_extractive_expansion_is_tightened_before_commit() {
     // The unrestricted extractive renderer adds observation and transcript
     // framing to these small completed exchanges. Exercise that real renderer

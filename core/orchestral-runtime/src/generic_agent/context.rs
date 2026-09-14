@@ -295,7 +295,7 @@ pub(super) async fn project_model_messages(
                 .map(|recovery| recovery.input_budget_tokens),
             input_compaction_target_tokens: recovery
                 .as_ref()
-                .map(|recovery| recovery.compaction_target_tokens()),
+                .and_then(|recovery| recovery.compaction_target_tokens()),
             reserved_output_tokens: None,
             observed_prefix: anchor.as_ref(),
         },

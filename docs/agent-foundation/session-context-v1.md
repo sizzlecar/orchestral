@@ -30,6 +30,11 @@ history/token 预算内优先恢复它的原文及 User 角色；不能容纳时
 移除 Artifact 引用所在的完整 exchange。若预算仍不能满足，继续有限压缩或明确失败。
 此行为通过 `context_pressure_contract = full-candidate-planning/v1` 绑定恢复配置。
 
+extractive summarizer v7 在小预算下优先保留符合 Artifact 分页输出合同的完整引用、
+`next_offset` 和 `complete`，与来源序号和工具状态一起组成不可拆分的观察记录。该观察
+不能容纳时，不将它截成残缺游标或引用；原始记录仍可回查。错误交换不会被一个成功分页观察遮蔽。
+摘要是历史数据，不能当作新权限或任务验收结论。
+
 ## 受控历史回查
 
 CLI Host 注册 `orchestral/session_read/v1`，模型可见名称为 `session_read`。SDK Host 可使用
