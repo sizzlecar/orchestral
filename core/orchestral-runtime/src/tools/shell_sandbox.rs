@@ -376,6 +376,12 @@ fn build_macos_profile(
             ));
         }
     }
+    // Darwin user-directory lookup needs local account and directory services,
+    // including for offline toolchains. Filesystem access remains separately
+    // constrained by the declared paths and roots.
+    profile.push_str(
+        "(allow mach-lookup\n  (global-name \"com.apple.bsd.dirhelper\")\n  (global-name \"com.apple.system.opendirectoryd.membership\"))\n",
+    );
     match &policy.network {
         SandboxNetworkAccess::Disabled => {}
         SandboxNetworkAccess::Unrestricted => {
@@ -413,8 +419,6 @@ fn build_macos_profile(
     (socket-domain AF_SYSTEM)
     (socket-protocol 2)))
 (allow mach-lookup
-  (global-name "com.apple.bsd.dirhelper")
-  (global-name "com.apple.system.opendirectoryd.membership")
   (global-name "com.apple.SecurityServer")
   (global-name "com.apple.networkd")
   (global-name "com.apple.ocspd")
@@ -1161,6 +1165,158 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn disabled_network_resolves_user_cache_without_opening_network_or_outside_files() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::time::Duration;
+
+        const CHILD_PHASE: &str = "ORCHESTRAL_TEST_CACHE_PHASE";
+        const OUTSIDE_ROOT: &str = "ORCHESTRAL_TEST_CACHE_OUTSIDE";
+        const LISTENER: &str = "ORCHESTRAL_TEST_CACHE_LISTENER";
+
+        match std::env::var(CHILD_PHASE) {
+            Ok(phase) => {
+                assert!(matches!(phase.as_str(), "control" | "sandbox"));
+                eprintln!("cache phase={phase} stage=confstr");
+                let mut buffer = vec![0_u8; libc::PATH_MAX as usize + 1];
+                // SAFETY: buffer is writable for its entire supplied length.
+                let length = unsafe {
+                    libc::confstr(
+                        libc::_CS_DARWIN_USER_CACHE_DIR,
+                        buffer.as_mut_ptr().cast(),
+                        buffer.len(),
+                    )
+                };
+                assert!(
+                    length > 1 && length <= buffer.len(),
+                    "cache phase={phase} confstr length={length}: {}",
+                    std::io::Error::last_os_error()
+                );
+                let cache = std::ffi::CStr::from_bytes_with_nul(&buffer[..length])
+                    .expect("complete, NUL-terminated cache path");
+                assert!(Path::new(std::ffi::OsStr::from_bytes(cache.to_bytes())).is_absolute());
+                std::fs::write(format!("cache-{phase}.path"), cache.to_bytes())
+                    .expect("write workspace probe result");
+
+                let outside = PathBuf::from(std::env::var_os(OUTSIDE_ROOT).unwrap());
+                eprintln!("cache phase={phase} stage=outside_read");
+                let read = std::fs::read(outside.join("original.txt"));
+                eprintln!("cache phase={phase} stage=outside_write");
+                let write = std::fs::write(outside.join(format!("{phase}.txt")), b"probe");
+                let address = std::env::var(LISTENER).unwrap().parse().unwrap();
+                eprintln!("cache phase={phase} stage=connect");
+                let connect =
+                    std::net::TcpStream::connect_timeout(&address, Duration::from_secs(1));
+                if phase == "control" {
+                    assert_eq!(read.expect("control outside read"), b"outside-original");
+                    write.expect("control outside write");
+                    connect.expect("control connects to the live host listener");
+                } else {
+                    for (stage, error) in [
+                        (
+                            "outside_read",
+                            read.expect_err("outside read must be denied"),
+                        ),
+                        (
+                            "outside_write",
+                            write.expect_err("outside write must be denied"),
+                        ),
+                        (
+                            "connect",
+                            connect.expect_err("offline connection must be denied"),
+                        ),
+                    ] {
+                        assert!(
+                            matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM)),
+                            "cache phase={phase} stage={stage}: {error}"
+                        );
+                    }
+                }
+                return;
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Err(error) => panic!("invalid cache child phase: {error}"),
+        }
+
+        let (parent, workspace, outside) = isolated_test_roots("offline-user-cache");
+        std::fs::write(outside.join("original.txt"), b"outside-original").unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("create live host listener for the network-denial control");
+        let executable = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+        let args = vec![
+            "--exact".to_owned(),
+            "tools::shell_sandbox::tests::disabled_network_resolves_user_cache_without_opening_network_or_outside_files"
+                .to_owned(),
+            "--nocapture".to_owned(),
+            "--test-threads=1".to_owned(),
+        ];
+        let mut command = sandbox_command(
+            executable.to_string_lossy().into_owned(),
+            args.clone(),
+            &workspace,
+            &ShellSandboxPolicy {
+                readable_roots: vec![workspace.clone()],
+                readable_files: Vec::new(),
+                writable_roots: vec![workspace.clone()],
+                allow_child_processes: false,
+                allow_host_ui: false,
+                launcher_programs: vec![executable.clone()],
+                network: SandboxNetworkAccess::Disabled,
+                linux_bwrap_path: None,
+            },
+        )
+        .unwrap();
+        command.env.extend([
+            (CHILD_PHASE.to_owned(), "sandbox".to_owned()),
+            (
+                OUTSIDE_ROOT.to_owned(),
+                outside.to_string_lossy().into_owned(),
+            ),
+            (
+                LISTENER.to_owned(),
+                listener.local_addr().unwrap().to_string(),
+            ),
+        ]);
+        let profile = command.args[1].clone();
+        let control = std::process::Command::new(&executable)
+            .args(args)
+            .env_clear()
+            .envs(&command.env)
+            .env(CHILD_PHASE, "control")
+            .current_dir(&workspace)
+            .output()
+            .expect("launch unsandboxed cache control");
+        let output = run_sandboxed(command, &workspace);
+        let diagnostics = format!(
+            "control status={}\ncontrol stdout={}\ncontrol stderr={}\nsandbox status={}\nsandbox stdout={}\nsandbox stderr={}\nprofile={profile}",
+            control.status,
+            String::from_utf8_lossy(&control.stdout),
+            String::from_utf8_lossy(&control.stderr),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(control.status.success(), "{diagnostics}");
+        assert!(output.status.success(), "{diagnostics}");
+        assert_eq!(
+            std::fs::read(workspace.join("cache-control.path")).unwrap(),
+            std::fs::read(workspace.join("cache-sandbox.path")).unwrap(),
+            "sandbox and control must resolve the same user cache"
+        );
+        assert_eq!(
+            std::fs::read(outside.join("original.txt")).unwrap(),
+            b"outside-original"
+        );
+        assert_eq!(
+            std::fs::read(outside.join("control.txt")).unwrap(),
+            b"probe"
+        );
+        assert!(!outside.join("sandbox.txt").exists());
+        drop(listener);
         std::fs::remove_dir_all(parent).unwrap();
     }
 
