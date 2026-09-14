@@ -5,6 +5,7 @@ mod guarded_patch;
 mod guarded_pty;
 mod guarded_search;
 mod guarded_session;
+mod model_output;
 mod patch_parser;
 mod support;
 pub use self::guarded::{

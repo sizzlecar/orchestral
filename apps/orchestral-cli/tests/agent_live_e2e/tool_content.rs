@@ -1,4 +1,9 @@
 use super::*;
+use orchestral_core::agent_protocol::wire::Digest;
+use orchestral_core::tool_effect::{
+    replay_tool_effect, ToolEffectJournalRecord, ToolEffectPhase, ToolEffectProjection,
+};
+use orchestral_core::tool_protocol::{ToolOutcome, ToolOutput};
 
 const SOURCE: &str = "// Preserve Unicode Ω and literal backslashes.\npub fn has_newline(text: &str) -> bool {\n    text.ends_with('\\n')\n}\n";
 const UPDATED: &str = "// Preserve Unicode Ω and literal backslashes.\npub fn has_newline(text: &str) -> bool {\n    text.contains('\\n')\n}\n";
@@ -61,9 +66,13 @@ fn assert_source_observation(request: &CapturedHttpRequest) {
     let messages = yaml_tool_messages(request);
     let (text, envelope) = &messages[0];
     assert_eq!(envelope["is_error"], false);
-    assert_eq!(envelope["result"]["content"], SOURCE);
-    assert_eq!(envelope["result"]["eof"], true);
-    assert_eq!(envelope["result"]["truncated"], false);
+    assert_eq!(envelope["result"]["path"], "src/newline.rs");
+    assert_eq!(
+        envelope["result"]["content"].as_str().unwrap().as_bytes(),
+        SOURCE.as_bytes()
+    );
+    assert!(envelope["result"].get("revision").is_none());
+    assert!(envelope["result"].get("content_digest").is_none());
     // Inspect the actual model-facing text, not only a parsed round trip:
     // normal source lines must retain their original backslashes and quotes.
     for line in SOURCE.lines() {
@@ -84,6 +93,11 @@ fn yaml_tool_content_preserves_source_through_patch_and_session_restart() {
 #[test]
 fn file_edit_preserves_source_through_cli_and_session_restart() {
     assert_source_edit_and_session_restart("file_edit", false);
+}
+
+#[test]
+fn file_replace_uses_observed_read_through_cli_and_session_restart() {
+    assert_source_edit_and_session_restart("file_write", true);
 }
 
 #[test]
@@ -169,6 +183,9 @@ fn assert_source_edit_and_session_restart(edit_tool: &'static str, streaming: bo
                     "*** Begin Patch\n*** Update File: src/newline.rs\n@@\n",
                     "-    text.ends_with('\\n')\n+    text.contains('\\n')\n*** End Patch",
                 )}),
+                "file_write" => json!({
+                    "path": "src/newline.rs", "mode": "replace", "content": UPDATED,
+                }),
                 _ => unreachable!("fixture declares an edit tool"),
             };
             reasoning_tool_response("edit-source", edit_tool, arguments, streaming)
@@ -191,8 +208,8 @@ fn assert_source_edit_and_session_restart(edit_tool: &'static str, streaming: bo
             }
         }),
         Box::new(|request| {
-            // A fresh process must project the original canonical observation
-            // using the same explicit format, without repeating either tool.
+            // A fresh process must preserve the recorded model observation
+            // in the same explicit format, without repeating either tool.
             assert_source_observation(request);
             assert_native_continuations(request, 2);
             let delivered = request.body["messages"]
@@ -214,10 +231,14 @@ fn assert_source_edit_and_session_restart(edit_tool: &'static str, streaming: bo
         }),
     ]);
     workspace.configure_local_openai(&endpoint);
-    for prompt in [
+    let mut effects_before_restart = None;
+    for (index, prompt) in [
         "Find newlines anywhere in the input.",
         "Recall the recorded change.",
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let mut command = root_command(&workspace);
         command.env("OPENAI_API_KEY", "fixture-key").args([
             "--model-profile",
@@ -235,6 +256,9 @@ fn assert_source_edit_and_session_restart(edit_tool: &'static str, streaming: bo
             fs::read_to_string(workspace.path("src/newline.rs")).unwrap(),
             UPDATED
         );
+        if index == 0 {
+            effects_before_restart = Some(effect_journals(&workspace));
+        }
     }
     let requests = server.join().unwrap();
     assert_eq!(requests.len(), 4);
@@ -258,4 +282,111 @@ fn assert_source_edit_and_session_restart(edit_tool: &'static str, streaming: bo
         tool_result_value(exchanges[1]),
         &observed_after[1].1["result"]
     );
+    // Model history is compact; the immutable Effect Journal still contains
+    // the complete canonical read and mutation outcomes after restart.
+    let effects = effect_journals(&workspace);
+    assert_eq!(
+        effects,
+        effects_before_restart.unwrap(),
+        "restart must not execute or rewrite completed effects"
+    );
+    let projections = effects
+        .iter()
+        .map(|records| {
+            let key = &records.first().expect("nonempty effect journal").key;
+            replay_tool_effect(key, records)
+                .expect("valid effect journal digest chain")
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(projections.len(), 2);
+    let read_effect = effect_for_exchange(&projections, exchanges[0]);
+    let canonical_read = committed_output(read_effect);
+    assert_eq!(
+        canonical_read["content"].as_str().unwrap().as_bytes(),
+        SOURCE.as_bytes()
+    );
+    assert_eq!(canonical_read["path"], "src/newline.rs");
+    assert_eq!(canonical_read["start_line"], 1);
+    assert_eq!(canonical_read["eof"], true);
+    assert_eq!(canonical_read["truncated"], false);
+    assert_eq!(canonical_read["file_size_bytes"], SOURCE.len());
+    assert_eq!(
+        canonical_read["content_digest"],
+        json!(Digest::sha256(SOURCE.as_bytes()))
+    );
+    let mutation = effect_for_exchange(&projections, exchanges[1]);
+    let changes = committed_output(mutation)["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0]["path"], "src/newline.rs");
+    assert_eq!(
+        changes[0]["before_digest"],
+        json!(Digest::sha256(SOURCE.as_bytes()))
+    );
+    assert_eq!(
+        changes[0]["after_digest"],
+        json!(Digest::sha256(UPDATED.as_bytes()))
+    );
+    if edit_tool == "file_write" {
+        assert!(tool_arguments(exchanges[1])
+            .get("expected_digest")
+            .is_none());
+        assert!(mutation
+            .prepared
+            .invocation
+            .arguments
+            .get("expected_digest")
+            .is_none());
+        let resolution = mutation
+            .prepared
+            .argument_resolution
+            .as_ref()
+            .expect("runtime binds the observed complete read");
+        assert_eq!(resolution.source, read_effect.key);
+        assert_eq!(
+            resolution.arguments["expected_digest"],
+            canonical_read["content_digest"]
+        );
+    }
+}
+
+fn effect_journals(workspace: &TestWorkspace) -> Vec<Vec<ToolEffectJournalRecord>> {
+    journal_files(workspace, "effect-")
+        .into_iter()
+        .map(|path| {
+            serde_json::from_slice(&fs::read(path).expect("read Effect Journal"))
+                .expect("decode canonical Effect Journal")
+        })
+        .collect()
+}
+
+fn effect_for_exchange<'a>(
+    effects: &'a [ToolEffectProjection],
+    exchange: &Value,
+) -> &'a ToolEffectProjection {
+    let call_id = exchange["tool"]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|content| content["type"] == "tool_result")
+        .unwrap()["call_id"]
+        .as_str()
+        .unwrap();
+    effects
+        .iter()
+        .find(|effect| effect.key.call_id.as_str() == call_id)
+        .expect("model observation has its original committed effect")
+}
+
+fn committed_output(effect: &ToolEffectProjection) -> &Value {
+    match &effect.phase {
+        ToolEffectPhase::Committed {
+            outcome:
+                ToolOutcome::Completed {
+                    output: ToolOutput::Inline(output),
+                },
+            ..
+        } => output,
+        _ => panic!("expected a committed inline effect: {effect:?}"),
+    }
 }

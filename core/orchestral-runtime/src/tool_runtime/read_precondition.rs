@@ -153,9 +153,6 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
             else {
                 continue;
             };
-            if output != visible {
-                continue;
-            }
             let Some(producer) = self
                 .registered_tool(&prior.prepared.invocation.tool_id)
                 .map_err(|error| ToolOutcome::Rejected {
@@ -173,6 +170,17 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
                     message: error.message,
                 })?
                 != prior.prepared.descriptor_digest
+            {
+                continue;
+            }
+            // Old sessions may contain the complete canonical output. New
+            // sessions contain exactly the registered producer's model view;
+            // summaries or edited values are never read evidence.
+            if output != visible
+                && producer
+                    .executor
+                    .project_model_output(&prior.prepared.invocation, output)
+                    != *visible
             {
                 continue;
             }

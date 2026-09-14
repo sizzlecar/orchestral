@@ -185,6 +185,18 @@ impl GuardedFileReadExecutor {
 
 #[async_trait]
 impl GuardedToolExecutor for GuardedFileReadExecutor {
+    fn model_output_contract(&self) -> Value {
+        super::model_output::contract("file-read")
+    }
+
+    fn project_model_output(
+        &self,
+        invocation: &orchestral_core::tool_protocol::ToolInvocation,
+        output: &Value,
+    ) -> Value {
+        super::model_output::file_read(invocation, output)
+    }
+
     fn planning_contract(&self) -> Value {
         json!({ "contract": "orchestral.file-read-planner/v2", "complete_read_evidence": true })
     }

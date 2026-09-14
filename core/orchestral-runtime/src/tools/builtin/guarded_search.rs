@@ -77,6 +77,18 @@ impl GuardedFileSearchExecutor {
 
 #[async_trait]
 impl GuardedToolExecutor for GuardedFileSearchExecutor {
+    fn model_output_contract(&self) -> Value {
+        super::model_output::contract("file-search")
+    }
+
+    fn project_model_output(
+        &self,
+        invocation: &orchestral_core::tool_protocol::ToolInvocation,
+        output: &Value,
+    ) -> Value {
+        super::model_output::search(invocation, output, false)
+    }
+
     async fn execute(&self, execution: GuardedToolExecution) -> ToolOutcome {
         if execution.cancellation.is_cancelled() {
             return ToolOutcome::Cancelled;
@@ -245,6 +257,18 @@ impl GuardedTextSearchExecutor {
 
 #[async_trait]
 impl GuardedToolExecutor for GuardedTextSearchExecutor {
+    fn model_output_contract(&self) -> Value {
+        super::model_output::contract("text-search")
+    }
+
+    fn project_model_output(
+        &self,
+        invocation: &orchestral_core::tool_protocol::ToolInvocation,
+        output: &Value,
+    ) -> Value {
+        super::model_output::search(invocation, output, true)
+    }
+
     async fn execute(&self, execution: GuardedToolExecution) -> ToolOutcome {
         if execution.cancellation.is_cancelled() {
             return ToolOutcome::Cancelled;

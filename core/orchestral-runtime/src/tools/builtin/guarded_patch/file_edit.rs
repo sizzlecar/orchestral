@@ -86,6 +86,14 @@ impl<'a> FileEditRequest<'a> {
 
 #[async_trait]
 impl GuardedToolExecutor for GuardedFileEditExecutor {
+    fn model_output_contract(&self) -> Value {
+        super::super::model_output::contract("mutation")
+    }
+
+    fn project_model_output(&self, invocation: &ToolInvocation, output: &Value) -> Value {
+        super::super::model_output::mutation(invocation, output)
+    }
+
     fn planning_contract(&self) -> Value {
         json!({ "contract": "orchestral.file-edit-planner/v1" })
     }

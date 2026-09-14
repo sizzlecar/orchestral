@@ -244,6 +244,14 @@ impl<'a> FileWriteRequest<'a> {
 
 #[async_trait]
 impl GuardedToolExecutor for GuardedFileWriteExecutor {
+    fn model_output_contract(&self) -> Value {
+        super::model_output::contract("mutation")
+    }
+
+    fn project_model_output(&self, invocation: &ToolInvocation, output: &Value) -> Value {
+        super::model_output::mutation(invocation, output)
+    }
+
     fn planning_contract(&self) -> Value {
         json!({ "contract": "orchestral.file-write-planner/v2", "default_precondition": "observed_complete_read" })
     }
@@ -477,6 +485,14 @@ impl GuardedApplyPatchExecutor {
 
 #[async_trait]
 impl GuardedToolExecutor for GuardedApplyPatchExecutor {
+    fn model_output_contract(&self) -> Value {
+        super::model_output::contract("mutation")
+    }
+
+    fn project_model_output(&self, invocation: &ToolInvocation, output: &Value) -> Value {
+        super::model_output::mutation(invocation, output)
+    }
+
     fn planning_contract(&self) -> Value {
         json!({ "contract": "orchestral.apply-patch-planner/v2" })
     }

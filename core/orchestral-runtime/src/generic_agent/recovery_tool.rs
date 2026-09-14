@@ -267,7 +267,23 @@ pub(super) async fn continue_observed_tool(
         }
         GuardedToolResult::Outcome { outcome, .. } => {
             let retained_artifacts = retained_artifacts_for_outcome(&outcome);
-            let (result, is_error) = model_tool_result(outcome);
+            let (result, is_error) =
+                match recovered_model_tool_result(&inner, &run_id, &call, &arguments, outcome) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        emit_failure(
+                            &inner,
+                            &request,
+                            &user_message,
+                            agent_failure(
+                                "tool_result_projection_failed",
+                                error.to_string(),
+                                false,
+                            ),
+                        );
+                        return;
+                    }
+                };
             (result, is_error, retained_artifacts)
         }
     };

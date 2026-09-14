@@ -330,7 +330,9 @@ impl ModelBackend for ReadThenApprovedWriteModel {
                         |block| matches!(
                             block, ModelContent::ToolResult {call_id, result, is_error:false}
                                 if call_id.as_str() == "read" && result["content"] == SOURCE
-                                    && result["eof"] == true && result["truncated"] == false
+                                    && result["path"] == "source.rs"
+                                    && result.get("revision").is_none()
+                                    && result.get("content_digest").is_none()
                         )
                     ));
                     call_events("write", "file_write", write_arguments())

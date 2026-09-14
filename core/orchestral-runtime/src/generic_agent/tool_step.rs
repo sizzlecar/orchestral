@@ -573,7 +573,23 @@ pub(super) async fn execute_tool_batch(request: ToolBatchRequest) -> ToolBatchEx
                 for artifact in retained_artifacts_for_outcome(&outcome) {
                     retained_artifacts.insert(artifact.artifact_ref.as_str().to_owned(), artifact);
                 }
-                let (result, is_error) = model_tool_result(outcome);
+                let (result, is_error) =
+                    match model_tool_result(tools.runtime.as_ref(), &invocation, outcome) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            emit_failure(
+                                &inner,
+                                &request,
+                                &user_message,
+                                agent_failure(
+                                    "tool_result_projection_failed",
+                                    error.to_string(),
+                                    false,
+                                ),
+                            );
+                            return ToolBatchExecution::Terminal;
+                        }
+                    };
                 publish_tool_activity(
                     &inner,
                     &run_id,

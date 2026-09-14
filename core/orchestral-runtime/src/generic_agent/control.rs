@@ -292,6 +292,8 @@ pub(super) fn observed_tool_exchange_messages(
 }
 
 pub(super) fn recovered_approval_exchange_messages(
+    inner: &GenericInner,
+    run_id: &RunId,
     observation: &GenericModelObservation,
     call: &GenericObservedToolCall,
     arguments: &serde_json::Value,
@@ -331,7 +333,7 @@ pub(super) fn recovered_approval_exchange_messages(
     if matches!(outcome, ToolOutcome::UnknownEffect { .. }) {
         return Ok(None);
     }
-    let (result, is_error) = model_tool_result(outcome);
+    let (result, is_error) = recovered_model_tool_result(inner, run_id, call, arguments, outcome)?;
     Ok(Some(observed_tool_exchange_messages(
         observation,
         call,

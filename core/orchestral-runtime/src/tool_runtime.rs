@@ -151,6 +151,22 @@ pub struct GuardedToolExecution {
 /// Explicit opt-in SPI for implementations that enforce Host Tool policy.
 #[async_trait]
 pub trait GuardedToolExecutor: Send + Sync {
+    /// Deterministic model view of this producer's own successful output.
+    /// The canonical output remains in the Effect Journal. A complete file
+    /// read must retain its original content bytes in this view.
+    fn project_model_output(
+        &self,
+        _invocation: &ToolInvocation,
+        output: &serde_json::Value,
+    ) -> serde_json::Value {
+        output.clone()
+    }
+
+    /// Version the model view separately from execution and output schemas.
+    fn model_output_contract(&self) -> serde_json::Value {
+        serde_json::json!({ "contract": "orchestral.model-output/identity/v1" })
+    }
+
     /// Declares a complete read from this executor's own validated result
     /// contract. Other executors' JSON fields are never guessed as evidence.
     fn complete_file_read(
@@ -440,6 +456,14 @@ pub fn tool_permission_decision_digest(
 /// reference-monitor state stay behind this Host-owned boundary.
 #[async_trait]
 pub trait AgentToolRuntime: Send + Sync {
+    fn project_model_output(
+        &self,
+        _invocation: &ToolInvocation,
+        output: &serde_json::Value,
+    ) -> Result<serde_json::Value, ToolRuntimeError> {
+        Ok(output.clone())
+    }
+
     async fn freeze_model_observations(
         &self,
         _run_id: &RunId,
@@ -566,6 +590,8 @@ pub enum ToolRuntimeError {
     DuplicateToolId(ToolId),
     #[error("model tool name is already registered: {0}")]
     DuplicateModelName(String),
+    #[error("Tool is not registered: {0}")]
+    UnknownTool(ToolId),
     #[error("Tool Runtime execution contract cannot be encoded: {0}")]
     InvalidExecutionContract(String),
     #[error("Tool activity evidence is invalid: {0}")]
@@ -1037,6 +1063,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
                 serde_json::json!({
                     "descriptor": &registered.descriptor,
                     "planning_contract": registered.executor.planning_contract(),
+                    "model_output_contract": registered.executor.model_output_contract(),
                 })
             })
             .collect::<Vec<_>>();
@@ -1057,6 +1084,17 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
         let bytes = serde_jcs::to_vec(&contract)
             .map_err(|error| ToolRuntimeError::InvalidExecutionContract(error.to_string()))?;
         Ok(Digest::sha256(bytes))
+    }
+
+    pub fn project_model_output(
+        &self,
+        invocation: &ToolInvocation,
+        output: &serde_json::Value,
+    ) -> Result<serde_json::Value, ToolRuntimeError> {
+        let producer = self
+            .registered_tool(&invocation.tool_id)?
+            .ok_or_else(|| ToolRuntimeError::UnknownTool(invocation.tool_id.clone()))?;
+        Ok(producer.executor.project_model_output(invocation, output))
     }
 
     /// Projects only the model-facing schema. Host policy, effect declarations,
@@ -2111,6 +2149,14 @@ impl<S> AgentToolRuntime for GuardedToolRuntime<S>
 where
     S: ApprovalCapabilityStore + 'static,
 {
+    fn project_model_output(
+        &self,
+        invocation: &ToolInvocation,
+        output: &serde_json::Value,
+    ) -> Result<serde_json::Value, ToolRuntimeError> {
+        GuardedToolRuntime::project_model_output(self, invocation, output)
+    }
+
     async fn freeze_model_observations(
         &self,
         run_id: &RunId,

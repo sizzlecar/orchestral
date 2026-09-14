@@ -116,6 +116,65 @@ mod context_planning_tests {
         (provider, journal, backend)
     }
 
+    #[test]
+    fn recovery_formats_non_inline_outcomes_without_a_tool_runtime() {
+        let (provider, _, model) = fixture();
+        assert!(provider.inner.tools.is_none());
+        let call = GenericObservedToolCall {
+            call_id: ModelToolCallId::new("missing-call"),
+            name: "unregistered_tool".to_owned(),
+            arguments: "{}".to_owned(),
+            extensions: Default::default(),
+            ended: true,
+        };
+        let artifact = orchestral_core::tool_protocol::ToolArtifact {
+            artifact: ArtifactRefWithDigest {
+                artifact_ref: orchestral_core::agent_protocol::wire::ArtifactRef::new(
+                    "blob:result",
+                ),
+                digest: Digest::sha256(b"full result"),
+            },
+            media_type: "text/plain".to_owned(),
+            byte_size: 11,
+            summary: "Result in artifact".to_owned(),
+        };
+        for outcome in [
+            ToolOutcome::Rejected {
+                code: "unknown_tool".to_owned(),
+                message: "not registered".to_owned(),
+            },
+            ToolOutcome::Cancelled,
+            ToolOutcome::Completed {
+                output: ToolOutput::Artifact(artifact.clone()),
+            },
+        ] {
+            let (result, is_error) = recovered_model_tool_result(
+                &provider.inner,
+                &RunId::new("result-recovery"),
+                &call,
+                &serde_json::json!({}),
+                outcome.clone(),
+            )
+            .unwrap();
+            match outcome {
+                ToolOutcome::Completed { .. } => {
+                    assert!(!is_error);
+                    assert_eq!(result["kind"], "artifact");
+                    assert_eq!(
+                        result["artifact"],
+                        serde_json::to_value(&artifact.artifact).unwrap()
+                    );
+                    assert_eq!(result["summary"], artifact.summary);
+                }
+                other => {
+                    assert!(is_error);
+                    assert_eq!(result, serde_json::to_value(other).unwrap());
+                }
+            }
+        }
+        assert_eq!(model.starts.load(Ordering::SeqCst), 0);
+    }
+
     fn request(provider: &InternalGenericAgentProvider, limits: RunLimits) -> AgentStartRequest {
         let mut spec = AgentRunEnvelope::new(
             AGENT_PROTOCOL_V1,

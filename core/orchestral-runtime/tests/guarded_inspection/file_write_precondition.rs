@@ -13,6 +13,9 @@ use orchestral_runtime::{GuardedToolExecution, GuardedToolExecutor, WorkspacePer
 #[path = "file_write_precondition/generic_flow.rs"]
 mod generic_flow;
 
+#[path = "file_write_precondition/model_output_projection.rs"]
+mod model_output_projection;
+
 type Runtime = GuardedToolRuntime<InMemoryApprovalCapabilityStore>;
 
 struct ReadShapedOutput(Value);
@@ -329,6 +332,32 @@ async fn unread_partial_truncated_and_untrusted_results_never_authorize_replace(
             )
             .await,
     );
+    assert_eq!(
+        runtime
+            .project_model_output(
+                &call(
+                    "run",
+                    "shaped",
+                    "test/read-shaped-output",
+                    json!({"path":"source.rs"})
+                ),
+                &shaped,
+            )
+            .unwrap(),
+        shaped,
+        "an opaque producer retains its complete output"
+    );
+    let projected_partial = runtime
+        .project_model_output(
+            &call(
+                "run",
+                "partial",
+                "orchestral/file_read/v3",
+                json!({"path":"source.rs","limit":1}),
+            ),
+            &partial,
+        )
+        .unwrap();
     let mut forged = complete.clone();
     forged["content"] = json!("forged");
     let mut error = tool_message("full", complete.clone());
@@ -340,6 +369,7 @@ async fn unread_partial_truncated_and_untrusted_results_never_authorize_replace(
     for (index, messages) in [
         vec![],
         vec![tool_message("partial", partial)],
+        vec![tool_message("partial", projected_partial)],
         vec![tool_message("missing", complete.clone())],
         vec![tool_message("full", forged)],
         vec![system],
@@ -398,13 +428,31 @@ async fn unread_partial_truncated_and_untrusted_results_never_authorize_replace(
         .read(&runtime, "run", "truncated", json!({"path":"source.rs"}))
         .await;
     assert_eq!(value["truncated"], true);
-    let observations = freeze(&runtime, "run", &[tool_message("truncated", value)], &[]).await;
-    rejected_with(
-        truncated
-            .write(&runtime, replace("run", "write", "wrong"), &observations)
-            .await,
-        "file_write_precondition_missing",
-    );
+    let projected = runtime
+        .project_model_output(
+            &call(
+                "run",
+                "truncated",
+                "orchestral/file_read/v3",
+                json!({"path":"source.rs"}),
+            ),
+            &value,
+        )
+        .unwrap();
+    for (index, visible) in [value, projected].into_iter().enumerate() {
+        let observations =
+            freeze(&runtime, "run", &[tool_message("truncated", visible)], &[]).await;
+        rejected_with(
+            truncated
+                .write(
+                    &runtime,
+                    replace("run", &format!("write-{index}"), "wrong"),
+                    &observations,
+                )
+                .await,
+            "file_write_precondition_missing",
+        );
+    }
 }
 
 #[tokio::test]

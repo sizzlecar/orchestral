@@ -35,6 +35,9 @@ impl<'a> ToolTextView<'a> {
             }
             _ => json!({"result": result, "is_error": is_error}),
         };
+        if !is_error {
+            metadata.as_object_mut().unwrap().remove("is_error");
+        }
         metadata.sort_all_objects();
         Self { metadata, fields }
     }
@@ -45,11 +48,11 @@ pub(super) fn encode(result: &Value, is_error: bool) -> Value {
     let mut parts = Vec::with_capacity(view.fields.len() + 1);
     parts.push(json!({
         "type": "text",
-        "text": format!("Tool result metadata:\n{}\n", view.metadata),
+        "text": format!("{}\n", view.metadata),
     }));
     for (key, text) in view.fields {
         let label = match key {
-            Some(key) => format!("Text field {}", json!(key)),
+            Some(key) => json!(key).to_string(),
             None => "Result text".to_owned(),
         };
         parts.push(json!({"type": "text", "text": fenced_text(&label, text)}));

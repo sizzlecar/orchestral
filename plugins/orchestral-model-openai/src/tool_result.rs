@@ -8,7 +8,7 @@ mod text_parts;
 // model descriptor and token-meter configuration bound by Run recovery.
 pub(crate) const YAML_ENCODING_IDENTITY: &str = "serde-yaml-0.9/tool-envelope/v1";
 pub(crate) const TEXT_PARTS_ENCODING_IDENTITY: &str =
-    "openai-compatible/text-parts-tool-envelope/v2";
+    "openai-compatible/text-parts-tool-envelope/v3";
 
 /// Text encoding of the complete `{result, is_error}` tool response envelope.
 /// Canonical ToolResults and their durable journals retain the original JSON.

@@ -559,12 +559,15 @@ fn local_cli_creates_and_verifies_a_file_with_exec_disabled() {
                 .as_str()
                 .unwrap();
             // This CLI has no format override: inspect its actual model wire,
-            // including literal source backslashes and complete metadata.
+            // including the complete source and its literal backslashes.
             assert!(serde_json::from_str::<Value>(text).is_err());
             let envelope: Value = serde_yaml::from_str(text).unwrap();
             assert_eq!(envelope["is_error"], false);
-            assert_eq!(envelope["result"]["eof"], true);
-            assert_eq!(envelope["result"]["truncated"], false);
+            assert_eq!(envelope["result"]["path"], "request.txt");
+            assert_eq!(
+                envelope["result"]["content"].as_str().unwrap().as_bytes(),
+                format!("{CONTEXT_MARKER}\nCreate generated.txt from this request.\nlet literal = '\\n';\n").as_bytes()
+            );
             assert!(text.contains("let literal = '\\n';"), "{text}");
             assert!(!text.contains("let literal = '\\\\n';"), "{text}");
             openai_tool_response(
@@ -825,9 +828,16 @@ fn local_cli_discovers_searches_reads_patches_and_rechecks_source() {
         Box::new(|request| {
             let context = model_request_text(&request.body);
             assert!(context.contains("answer() -> u32 { 41 }"), "{context}");
-            assert!(
-                model_tool_results_json(&request.body).contains("\"eof\":true"),
-                "{context}"
+            let envelopes = model_tool_result_envelopes(&request.body);
+            let result = &envelopes.last().unwrap()["result"];
+            assert_eq!(result["path"], "src/service.rs");
+            assert_eq!(
+                result["content"].as_str().unwrap().as_bytes(),
+                concat!(
+                    "// TODO_TARGET: return the verified answer\n",
+                    "pub fn answer() -> u32 { 41 }\n",
+                )
+                .as_bytes()
             );
             openai_tool_response(
                 "patch-target-file",
@@ -1374,15 +1384,9 @@ fn local_exec_runs_toolchains_and_a_child_script_without_program_enumeration() {
             let context = model_request_text(&request.body);
             assert!(context.contains("cargo 1."), "{context}");
             assert!(context.contains("Python 3."), "{context}");
-            assert!(
-                model_tool_results_json(&request.body).contains("\"alive\":false"),
-                "{context}"
-            );
+            let envelopes = model_tool_result_envelopes(&request.body);
+            assert_completed_exec_result(&envelopes.last().unwrap()["result"]);
             assert!(context.contains("CHILD_SCRIPT_OK"), "{context}");
-            assert!(
-                model_tool_results_json(&request.body).contains("\"exit_code\":0"),
-                "{context}"
-            );
             openai_text_response("UNIFIED_EXEC_TOOLCHAINS_OK")
         }),
     ]);
@@ -3685,7 +3689,11 @@ fn tool_result_value(exchange: &Value) -> &Value {
 // Semantic assertions use the complete decoded envelope; raw request text
 // remains untouched for tests that verify the selected presentation itself.
 fn model_tool_results_json(body: &Value) -> String {
-    let results = body["messages"]
+    serde_json::to_string(&model_tool_result_envelopes(body)).unwrap()
+}
+
+fn model_tool_result_envelopes(body: &Value) -> Vec<Value> {
+    body["messages"]
         .as_array()
         .expect("model messages")
         .iter()
@@ -3694,8 +3702,19 @@ fn model_tool_results_json(body: &Value) -> String {
             serde_yaml::from_str::<Value>(message["content"].as_str().expect("tool result text"))
                 .expect("complete JSON or YAML tool envelope")
         })
-        .collect::<Vec<_>>();
-    serde_json::to_string(&results).unwrap()
+        .collect()
+}
+
+fn assert_completed_exec_result(result: &Value) {
+    assert_eq!(result["exit_code"], 0, "{result}");
+    assert!(
+        matches!(result.get("alive"), None | Some(Value::Bool(false))),
+        "completed command cannot remain alive: {result}"
+    );
+    assert!(
+        result.get("session_id").is_none(),
+        "completed command retains a live session: {result}"
+    );
 }
 
 // The exec contract may return a live session at its observation deadline.
@@ -3730,8 +3749,7 @@ fn continue_exec_until_exit(request: &CapturedHttpRequest) -> Option<FixtureHttp
         response.repeat_handler = true;
         Some(response)
     } else {
-        assert_eq!(result["alive"], false, "{result}");
-        assert_eq!(result["exit_code"], 0, "{result}");
+        assert_completed_exec_result(result);
         None
     }
 }
@@ -3758,12 +3776,15 @@ fn assert_successful_exec_observations(records: &[Value]) -> usize {
             assert_eq!(tool_arguments(exchange)["chars"], "");
         }
         if index + 1 < executions.len() {
-            assert_eq!(tool_result_value(exchange)["alive"], true);
+            let result = tool_result_value(exchange);
+            assert_eq!(result["alive"], true);
+            assert!(result["session_id"].is_u64());
+            assert_eq!(result["session_id"], session);
+            assert!(result["exit_code"].is_null());
         }
     }
     let final_result = tool_result_value(executions.last().unwrap());
-    assert_eq!(final_result["alive"], false);
-    assert_eq!(final_result["exit_code"], 0);
+    assert_completed_exec_result(final_result);
     executions.len() - 1
 }
 

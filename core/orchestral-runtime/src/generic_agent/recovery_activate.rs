@@ -152,6 +152,8 @@ pub(super) async fn activate_recovery(
         .await?;
         let expected_exchange = match resolved_response.as_ref() {
             Some(resolution) => recovered_approval_exchange_messages(
+                &inner,
+                &run_id,
                 observation,
                 call,
                 arguments,
@@ -480,7 +482,8 @@ pub(super) async fn activate_recovery(
                 ));
             }
             let retained_artifacts = retained_artifacts_for_outcome(&outcome);
-            let (result, is_error) = model_tool_result(outcome);
+            let (result, is_error) =
+                recovered_model_tool_result(&inner, &run_id, call, arguments, outcome)?;
             let (assistant, tool) =
                 observed_tool_exchange_messages(observation, call, arguments, &result, is_error);
             let expected_payload = AgentSessionEvent::ToolExchangeCommitted {

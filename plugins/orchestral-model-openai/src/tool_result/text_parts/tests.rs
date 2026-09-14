@@ -13,12 +13,14 @@ use orchestral_core::agent_protocol::wire::Digest;
 // the parts. Reconstruct the complete JSON envelope, without source unescaping
 // or indentation removal, rather than asserting an implementation part count.
 fn restore_envelope(rendered: &str) -> Value {
-    let rest = rendered
-        .trim()
-        .strip_prefix("Tool result metadata:\n")
-        .unwrap();
+    let rest = rendered.trim();
     let (metadata, mut rest) = rest.split_once('\n').unwrap_or((rest, ""));
     let mut envelope: Value = serde_json::from_str(metadata).unwrap();
+    envelope
+        .as_object_mut()
+        .unwrap()
+        .entry("is_error")
+        .or_insert(json!(false));
     while !rest.is_empty() {
         rest = rest.trim_start_matches('\n');
         if rest.is_empty() {
@@ -46,8 +48,7 @@ fn restore_envelope(rendered: &str) -> Value {
                 .insert("result".to_owned(), json!(source))
                 .is_none());
         } else {
-            let key: String =
-                serde_json::from_str(label.strip_prefix("Text field ").unwrap()).unwrap();
+            let key: String = serde_json::from_str(label).unwrap();
             assert!(envelope["result"]
                 .as_object_mut()
                 .unwrap()
@@ -98,16 +99,13 @@ fn text_parts_preserve_raw_source_boundaries_and_embedded_fences() {
     for source in sources {
         let original = json!({"source": source, "eof": true});
         let parts = assert_round_trip(&original, false);
-        assert_eq!(
-            parts[0]["text"],
-            "Tool result metadata:\n{\"is_error\":false,\"result\":{\"eof\":true}}\n"
-        );
+        assert_eq!(parts[0]["text"], "{\"result\":{\"eof\":true}}\n");
         assert_round_trip(&json!(source), true);
     }
     let fenced = encode(&json!({"source": "```\n````\n"}), false);
     assert_eq!(
         fenced[1]["text"],
-        "Text field \"source\" (final newline: yes)\n`````text\n```\n````\n`````\n"
+        "\"source\" (final newline: yes)\n`````text\n```\n````\n`````\n"
     );
 }
 
@@ -132,15 +130,13 @@ fn text_parts_keep_empty_and_single_line_strings_in_json_metadata() {
     ] {
         for is_error in [false, true] {
             let parts = assert_round_trip(&value, is_error);
-            let metadata: Value = serde_json::from_str(
-                parts[0]["text"]
-                    .as_str()
-                    .unwrap()
-                    .strip_prefix("Tool result metadata:\n")
-                    .unwrap(),
-            )
-            .unwrap();
-            assert_eq!(metadata, json!({"result": value, "is_error": is_error}));
+            let metadata: Value = serde_json::from_str(parts[0]["text"].as_str().unwrap()).unwrap();
+            let expected = if is_error {
+                json!({"result": value, "is_error": true})
+            } else {
+                json!({"result": value})
+            };
+            assert_eq!(metadata, expected);
         }
     }
 }
@@ -153,21 +149,12 @@ fn text_parts_keep_typed_metadata_and_sort_keys_independent_of_map_features() {
     let parts = assert_round_trip(&result, true);
     assert_eq!(
         parts[0]["text"],
-        "Tool result metadata:\n{\"is_error\":true,\"result\":{\"array\":[{\"a\":null,\"z\":true}],\"bool\":false,\"empty\":\"\",\"n\":0,\"nested\":{\"a\":{\"b\":\"nested\\nstring\",\"y\":2},\"z\":1},\"single\":\"null\"}}\n"
+        "{\"is_error\":true,\"result\":{\"array\":[{\"a\":null,\"z\":true}],\"bool\":false,\"empty\":\"\",\"n\":0,\"nested\":{\"a\":{\"b\":\"nested\\nstring\",\"y\":2},\"z\":1},\"single\":\"null\"}}\n"
     );
-    assert!(parts[1]["text"]
-        .as_str()
-        .unwrap()
-        .starts_with("Text field \"a\" "));
-    assert!(parts[2]["text"]
-        .as_str()
-        .unwrap()
-        .starts_with("Text field \"z\" "));
+    assert!(parts[1]["text"].as_str().unwrap().starts_with("\"a\" "));
+    assert!(parts[2]["text"].as_str().unwrap().starts_with("\"z\" "));
     let scalar = assert_round_trip(&json!("null\n"), true);
-    assert_eq!(
-        scalar[0]["text"],
-        "Tool result metadata:\n{\"is_error\":true}\n"
-    );
+    assert_eq!(scalar[0]["text"], "{\"is_error\":true}\n");
     assert_eq!(
         scalar[1]["text"],
         "Result text (final newline: yes)\n```text\nnull\n```\n"
@@ -177,7 +164,7 @@ fn text_parts_keep_typed_metadata_and_sort_keys_independent_of_map_features() {
     assert!(quoted[1]["text"]
         .as_str()
         .unwrap()
-        .starts_with("Text field \"line\\n\\\"key\\\\\" (final newline: no)\n"));
+        .starts_with("\"line\\n\\\"key\\\\\" (final newline: no)\n"));
 }
 
 #[test]
@@ -187,15 +174,15 @@ fn text_parts_close_fence_lines_when_templates_concatenate_parts_directly() {
     assert_eq!(
         joined(&parts, ""),
         concat!(
-            "Tool result metadata:\n{\"is_error\":false,\"result\":{\"label\":\"single\"}}\n",
-            "Text field \"a\" (final newline: yes)\n```text\nfirst\n```\n",
-            "Text field \"b\" (final newline: no)\n```text\nsecond\r\n```\n",
+            "{\"result\":{\"label\":\"single\"}}\n",
+            "\"a\" (final newline: yes)\n```text\nfirst\n```\n",
+            "\"b\" (final newline: no)\n```text\nsecond\r\n```\n",
         )
     );
 }
 
 #[test]
-fn text_parts_v2_preserves_canonical_history_and_changes_recovery_identity() {
+fn text_parts_v3_preserves_canonical_history_and_changes_recovery_identity() {
     assert_eq!(
         serde_json::from_value::<OpenAiToolResultFormat>(json!("text_parts")).unwrap(),
         OpenAiToolResultFormat::TextParts
@@ -235,7 +222,7 @@ fn text_parts_v2_preserves_canonical_history_and_changes_recovery_identity() {
     let mut legacy_descriptor = parts_backend.descriptor();
     legacy_descriptor.extensions.insert(
         "openai-compatible/tool-result-encoding".to_owned(),
-        json!("openai-compatible/text-parts-tool-envelope/v1"),
+        json!("openai-compatible/text-parts-tool-envelope/v2"),
     );
     assert_ne!(legacy_descriptor, parts_backend.descriptor());
     let legacy_config = (
@@ -251,7 +238,7 @@ fn text_parts_v2_preserves_canonical_history_and_changes_recovery_identity() {
     legacy_meter.config_digest = Digest::sha256(
         serde_json::to_vec(&(
             legacy_config,
-            "openai-compatible/text-parts-tool-envelope/v1",
+            "openai-compatible/text-parts-tool-envelope/v2",
         ))
         .unwrap(),
     );

@@ -161,6 +161,14 @@ impl GuardedWriteStdinExecutor {
 
 #[async_trait]
 impl GuardedToolExecutor for GuardedExecCommandExecutor {
+    fn model_output_contract(&self) -> Value {
+        super::model_output::contract("exec")
+    }
+
+    fn project_model_output(&self, _invocation: &ToolInvocation, output: &Value) -> Value {
+        super::model_output::exec(output)
+    }
+
     fn planning_contract(&self) -> Value {
         json!({
             "contract": "orchestral.exec-command-operation-planner/v6",
@@ -686,6 +694,14 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
 
 #[async_trait]
 impl GuardedToolExecutor for GuardedWriteStdinExecutor {
+    fn model_output_contract(&self) -> Value {
+        super::model_output::contract("exec")
+    }
+
+    fn project_model_output(&self, _invocation: &ToolInvocation, output: &Value) -> Value {
+        super::model_output::exec(output)
+    }
+
     fn planning_contract(&self) -> Value {
         json!({
             "contract": "orchestral.write-stdin-operation-planner/v2"
