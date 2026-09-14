@@ -15,8 +15,6 @@ fn read_page(artifact: &Value, offset: usize, ordinal: usize) -> FixtureHttpResp
         "artifact_read",
         json!({
             "artifact_ref":artifact["artifact"]["artifact_ref"],
-            "digest":artifact["artifact"]["digest"],
-            "media_type":artifact["media_type"], "byte_size":artifact["byte_size"],
             "offset":offset, "max_bytes":64 * 1024,
         }),
     );
@@ -41,7 +39,19 @@ fn cli_large_exec_output_preserves_nonzero_status_and_reads_without_reexecution(
     let observation = Arc::new(Mutex::new(OutputObservation::default()));
     let handler_observation = observation.clone();
     let (endpoint, server) = spawn_fixture_http_server(vec![
-        Box::new(|_| {
+        Box::new(|request| {
+            let schema = request.body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["function"]["name"] == "artifact_read")
+                .unwrap();
+            let parameters = &schema["function"]["parameters"];
+            assert_eq!(parameters["required"], json!(["artifact_ref"]));
+            assert_eq!(parameters["additionalProperties"], false);
+            for field in ["digest", "media_type", "byte_size"] {
+                assert!(parameters["properties"].get(field).is_none());
+            }
             openai_tool_response(
                 "execute-once",
                 "exec_command",

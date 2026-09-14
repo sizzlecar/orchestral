@@ -13,7 +13,10 @@ pub use self::guarded::{
     guarded_shell_descriptor_with_program_aliases, GuardedFileReadExecutor, GuardedProgramAliases,
     GuardedShellExecutor, GUARDED_SHELL_SANDBOX_PROFILE,
 };
-pub use self::guarded_artifact::{guarded_artifact_read_descriptor, GuardedArtifactReadExecutor};
+pub use self::guarded_artifact::{
+    guarded_artifact_read_descriptor, guarded_artifact_read_v2_descriptor,
+    GuardedArtifactReadExecutor,
+};
 pub use self::guarded_exec::{
     approved_host_exec_command_descriptor, guarded_exec_command_descriptor,
     guarded_write_stdin_descriptor, workspace_exec_command_descriptor,

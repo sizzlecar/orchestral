@@ -3,6 +3,38 @@ use orchestral_core::tool_protocol::ToolArtifact;
 use orchestral_runtime::{InMemoryBlobStore, ToolArtifactStore};
 use std::num::NonZeroU64;
 
+#[path = "artifact_pages/session_scope.rs"]
+mod session_scope;
+use session_scope::TestSessionScope;
+
+fn page_runtime(
+    fixture: &Fixture,
+    artifacts: ToolArtifactStore,
+    scope: Option<&TestSessionScope>,
+) -> Runtime {
+    let runtime = fixture.runtime_with_artifacts(Some(artifacts.clone()));
+    let restriction = ToolRestriction {
+        bounds: fixture.policy.clone(),
+    };
+    let (descriptor, reader) = match scope {
+        Some(scope) => (
+            orchestral_runtime::tools::guarded_artifact_read_v2_descriptor(restriction),
+            orchestral_runtime::tools::GuardedArtifactReadExecutor::new_session_scoped(
+                artifacts,
+                scope.runs.clone(),
+                scope.sessions.clone(),
+                fixture.journal.clone(),
+            ),
+        ),
+        None => (
+            orchestral_runtime::tools::guarded_artifact_read_descriptor(restriction),
+            orchestral_runtime::tools::GuardedArtifactReadExecutor::new(artifacts),
+        ),
+    };
+    runtime.register(descriptor, Arc::new(reader)).unwrap();
+    runtime
+}
+
 fn artifact_value(artifact: &ToolArtifact) -> Value {
     json!({
         "kind": "artifact", "artifact": artifact.artifact,
@@ -48,6 +80,15 @@ async fn model_budget_uses_visible_source_without_spilling_hidden_journal_metada
 
 #[tokio::test]
 async fn complete_artifact_pages_preserve_observed_write_evidence_across_restart() {
+    complete_pages(None).await;
+}
+
+#[tokio::test]
+async fn session_scoped_artifact_pages_preserve_observed_write_evidence_across_restart() {
+    complete_pages(Some(TestSessionScope::new().await)).await;
+}
+
+async fn complete_pages(scope: Option<TestSessionScope>) {
     let mut fixture = Fixture::new(ApprovalPolicy::NotRequired, 64 * 1024);
     fixture
         .policy
@@ -56,7 +97,7 @@ async fn complete_artifact_pages_preserve_observed_write_evidence_across_restart
     let artifacts = ToolArtifactStore::new(Arc::new(InMemoryBlobStore::default()), 128 * 1024, 80)
         .unwrap()
         .with_inline_output_limit(NonZeroU64::new(1024).unwrap());
-    let runtime = fixture.runtime_with_artifacts(Some(artifacts.clone()));
+    let runtime = page_runtime(&fixture, artifacts.clone(), scope.as_ref());
     let source = "// quoted=\"\\n\" 🦀 你好\r\n".repeat(120);
     fs::write(fixture.file(), &source).unwrap();
     let invocation = call(
@@ -78,23 +119,34 @@ async fn complete_artifact_pages_preserve_observed_write_evidence_across_restart
     else {
         panic!("expected stored read: {result:?}")
     };
+    if let Some(scope) = &scope {
+        scope.commit("session", "run", "read", &artifact).await;
+    }
     let mut messages = vec![tool_message("read", artifact_value(&artifact))];
     let mut offset = 0;
     loop {
         let id = format!("page-{offset}");
+        let mut arguments = json!({
+            "artifact_ref": artifact.artifact.artifact_ref,
+            "offset": offset, "max_bytes":2048,
+        });
+        if scope.is_none() {
+            arguments["digest"] = json!(artifact.artifact.digest);
+            arguments["media_type"] = json!(artifact.media_type);
+            arguments["byte_size"] = json!(artifact.byte_size);
+        }
         let page = completed(
             runtime
                 .invoke(
                     call(
                         "run",
                         &id,
-                        "orchestral/artifact_read/v1",
-                        json!({
-                            "artifact_ref":artifact.artifact.artifact_ref,
-                            "digest":artifact.artifact.digest,
-                            "media_type":artifact.media_type, "byte_size":artifact.byte_size,
-                            "offset":offset, "max_bytes":2048,
-                        }),
+                        if scope.is_some() {
+                            "orchestral/artifact_read/v2"
+                        } else {
+                            "orchestral/artifact_read/v1"
+                        },
+                        arguments,
                     ),
                     fixture.grant(),
                     None,
@@ -171,7 +223,7 @@ async fn complete_artifact_pages_preserve_observed_write_evidence_across_restart
     // Recreate the runtime from its durable services, without executing the
     // read or any page again. Page order and duplicate observations are benign.
     drop(runtime);
-    let runtime = fixture.runtime_with_artifacts(Some(artifacts));
+    let runtime = page_runtime(&fixture, artifacts, scope.as_ref());
     let mut visible = messages.clone();
     visible[1..].reverse();
     visible.push(messages[2].clone());

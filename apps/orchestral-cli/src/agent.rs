@@ -51,13 +51,14 @@ use orchestral_runtime::api::AgentApi;
 use orchestral_runtime::session_history::JournalSessionHistory;
 use orchestral_runtime::tools::{
     approved_host_exec_command_descriptor, guarded_apply_patch_descriptor,
-    guarded_artifact_read_descriptor, guarded_file_edit_descriptor, guarded_file_read_descriptor,
-    guarded_file_search_descriptor, guarded_file_write_descriptor, guarded_session_read_descriptor,
-    guarded_text_search_descriptor, workspace_exec_command_descriptor,
-    workspace_write_stdin_descriptor, CommandEnvironmentSnapshot, GuardedApplyPatchExecutor,
-    GuardedArtifactReadExecutor, GuardedExecCommandExecutor, GuardedFileEditExecutor,
-    GuardedFileReadExecutor, GuardedFileSearchExecutor, GuardedFileWriteExecutor,
-    GuardedSessionReadExecutor, GuardedTextSearchExecutor, GuardedWriteStdinExecutor,
+    guarded_artifact_read_v2_descriptor, guarded_file_edit_descriptor,
+    guarded_file_read_descriptor, guarded_file_search_descriptor, guarded_file_write_descriptor,
+    guarded_session_read_descriptor, guarded_text_search_descriptor,
+    workspace_exec_command_descriptor, workspace_write_stdin_descriptor,
+    CommandEnvironmentSnapshot, GuardedApplyPatchExecutor, GuardedArtifactReadExecutor,
+    GuardedExecCommandExecutor, GuardedFileEditExecutor, GuardedFileReadExecutor,
+    GuardedFileSearchExecutor, GuardedFileWriteExecutor, GuardedSessionReadExecutor,
+    GuardedTextSearchExecutor, GuardedWriteStdinExecutor,
 };
 use orchestral_runtime::{
     AgentClient, AgentControlEvent, AgentController, ContinuationPolicy,
@@ -408,6 +409,12 @@ async fn build_agent_host_with_journals(
         &config,
         model_backend.descriptor().capabilities.max_context_tokens,
     ));
+    let artifact_reader = GuardedArtifactReadExecutor::new_session_scoped(
+        artifact_store.clone(),
+        run_journal.clone(),
+        session_journal.clone(),
+        effect_journal.clone(),
+    );
     let CliToolComposition {
         runtime: tool_runtime,
         run_grant,
@@ -420,6 +427,7 @@ async fn build_agent_host_with_journals(
         effect_journal,
         artifact_store,
         &workspaces,
+        artifact_reader,
     )?;
     // Session identity is resolved from the registered invoking Run, never
     // from model arguments or a filesystem path supplied by the model.
@@ -691,6 +699,7 @@ fn build_cli_tool_runtime(
     effect_journal: Arc<dyn ToolEffectJournalStore>,
     artifact_store: ToolArtifactStore,
     workspaces: &CliWorkspaceSet,
+    artifact_reader: GuardedArtifactReadExecutor,
 ) -> anyhow::Result<CliToolComposition> {
     let workspace_roots = workspaces.root_strings();
     let exec_host = configured_exec_host(config)?;
@@ -956,10 +965,10 @@ fn build_cli_tool_runtime(
     );
     runtime
         .register(
-            guarded_artifact_read_descriptor(ToolRestriction {
+            guarded_artifact_read_v2_descriptor(ToolRestriction {
                 bounds: workspace_bounds.clone(),
             }),
-            Arc::new(GuardedArtifactReadExecutor::new(artifact_store)),
+            Arc::new(artifact_reader),
         )
         .context("register guarded artifact_read Tool")?;
     runtime

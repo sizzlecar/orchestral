@@ -1,9 +1,13 @@
 //! Guarded model access to Host-persisted Tool result Artifacts.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use async_trait::async_trait;
+use orchestral_core::agent_protocol::spi::AgentJournalStore;
 use orchestral_core::agent_protocol::wire::{ArtifactRef, ArtifactRefWithDigest, Digest};
+use orchestral_core::agent_session::AgentSessionJournalStore;
+use orchestral_core::tool_effect::ToolEffectJournalStore;
 use orchestral_core::tool_protocol::{
     EffectScope, ModelToolSchema, ToolArtifact, ToolConcurrency, ToolDescriptor, ToolId,
     ToolIdempotency, ToolInvocation, ToolOutcome, ToolRestriction,
@@ -14,27 +18,61 @@ use crate::tool_runtime::{
     ArtifactReadObservation, GuardedToolExecution, GuardedToolExecutor, ToolArtifactStore,
 };
 
+mod session_scope;
+use session_scope::SessionArtifactResolver;
+
 const DEFAULT_READ_BYTES: u64 = 32 * 1024;
 const HARD_MAX_READ_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone)]
 pub struct GuardedArtifactReadExecutor {
     artifacts: ToolArtifactStore,
+    session_scope: Option<SessionArtifactResolver>,
 }
 
 impl GuardedArtifactReadExecutor {
     pub fn new(artifacts: ToolArtifactStore) -> Self {
-        Self { artifacts }
+        Self {
+            artifacts,
+            session_scope: None,
+        }
+    }
+
+    /// Pair with `guarded_artifact_read_v2_descriptor`. Resolve trusted metadata
+    /// from committed Tool outcomes in the invoking Run's registered Session,
+    /// including previous Runs. Blob metadata and model arguments are not authority.
+    pub fn new_session_scoped(
+        artifacts: ToolArtifactStore,
+        runs: Arc<dyn AgentJournalStore>,
+        sessions: Arc<dyn AgentSessionJournalStore>,
+        effects: Arc<dyn ToolEffectJournalStore>,
+    ) -> Self {
+        Self {
+            artifacts,
+            session_scope: Some(SessionArtifactResolver {
+                runs,
+                sessions,
+                effects,
+            }),
+        }
     }
 }
 
 #[async_trait]
 impl GuardedToolExecutor for GuardedArtifactReadExecutor {
     fn planning_contract(&self) -> Value {
+        if self.session_scope.is_none() {
+            return json!({
+                "contract": "orchestral.artifact-read/page-envelope/v2",
+                "inline_output_limit": self.artifacts.inline_output_limit(),
+                "read_observation": "complete-json-pages/v1",
+            });
+        }
         json!({
             "contract": "orchestral.artifact-read/page-envelope/v2",
             "inline_output_limit": self.artifacts.inline_output_limit(),
-            "read_observation": "complete-json-pages/v1",
+            "read_observation": "complete-json-pages/v2",
+            "metadata_source": "registered-session-committed-effects/v1",
         })
     }
 
@@ -46,11 +84,20 @@ impl GuardedToolExecutor for GuardedArtifactReadExecutor {
         let arguments = &invocation.arguments;
         let offset = output.get("offset")?.as_u64()?;
         let content = output.get("content")?.as_str()?;
-        let byte_size = arguments.get("byte_size")?.as_u64()?;
+        let byte_size = output.get("total_bytes")?.as_u64()?;
+        let digest = output.get("digest")?;
+        let media_type = if self.session_scope.is_some() {
+            "application/json"
+        } else {
+            if arguments.get("byte_size")?.as_u64()? != byte_size
+                || arguments.get("digest")? != digest
+            {
+                return None;
+            }
+            arguments.get("media_type")?.as_str()?
+        };
         let end = offset.checked_add(content.len() as u64)?;
         if output.get("artifact_ref")? != arguments.get("artifact_ref")?
-            || output.get("digest")? != arguments.get("digest")?
-            || output.get("total_bytes")?.as_u64()? != byte_size
             || output.get("bytes_read")?.as_u64()? != content.len() as u64
             || output.get("next_offset")?.as_u64()? != end
             || output.get("complete")?.as_bool()? != (end == byte_size)
@@ -62,9 +109,9 @@ impl GuardedToolExecutor for GuardedArtifactReadExecutor {
         Some(ArtifactReadObservation {
             artifact: ArtifactRefWithDigest {
                 artifact_ref: ArtifactRef::new(arguments.get("artifact_ref")?.as_str()?),
-                digest: Digest::new(arguments.get("digest")?.as_str()?),
+                digest: Digest::new(digest.as_str()?),
             },
-            media_type: arguments.get("media_type")?.as_str()?.to_owned(),
+            media_type: media_type.to_owned(),
             byte_size,
             offset,
             content: content.to_owned(),
@@ -79,24 +126,6 @@ impl GuardedToolExecutor for GuardedArtifactReadExecutor {
         let artifact_ref = match required_string(arguments, "artifact_ref") {
             Ok(value) => value,
             Err(outcome) => return outcome,
-        };
-        let digest = match required_string(arguments, "digest") {
-            Ok(value) => Digest::new(value),
-            Err(outcome) => return outcome,
-        };
-        let media_type = match required_string(arguments, "media_type") {
-            Ok(value) => value,
-            Err(outcome) => return outcome,
-        };
-        if media_type != "application/json" {
-            return rejected(
-                "artifact_media_type_unsupported",
-                "artifact_read v1 supports application/json Tool results only",
-            );
-        }
-        let byte_size = match required_u64(arguments, "byte_size") {
-            Ok(value) if value > 0 => value,
-            _ => return rejected("artifact_shape_invalid", "byte_size must be positive"),
         };
         let offset = match arguments.get("offset") {
             None => 0,
@@ -135,15 +164,32 @@ impl GuardedToolExecutor for GuardedArtifactReadExecutor {
         .min(HARD_MAX_READ_BYTES)
         .min(policy_max)
         .max(1);
-        let artifact = ToolArtifact {
-            artifact: ArtifactRefWithDigest {
-                artifact_ref: ArtifactRef::new(artifact_ref),
-                digest,
+        let artifact = match &self.session_scope {
+            Some(scope) => match scope
+                .resolve(
+                    &execution.invocation.run_id,
+                    &ArtifactRef::new(artifact_ref),
+                    &execution.cancellation,
+                )
+                .await
+            {
+                Ok(artifact) => artifact,
+                Err(message) => return rejected("artifact_reference_invalid", message),
             },
-            media_type,
-            byte_size,
-            summary: "Artifact read request".to_owned(),
+            None => match explicit_artifact(arguments, artifact_ref) {
+                Ok(artifact) => artifact,
+                Err(outcome) => return outcome,
+            },
         };
+        if execution.cancellation.is_cancelled() {
+            return ToolOutcome::Cancelled;
+        }
+        if artifact.media_type != "application/json" {
+            return rejected(
+                "artifact_media_type_unsupported",
+                "artifact_read supports application/json Tool results only",
+            );
+        }
         let bytes = match self.artifacts.resolve(&artifact).await {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -295,6 +341,45 @@ pub fn guarded_artifact_read_descriptor(restriction: ToolRestriction) -> ToolDes
         idempotency: ToolIdempotency::Pure,
         concurrency: ToolConcurrency::ParallelSafe,
     }
+}
+
+/// Minimal model interface for Session-scoped, Host-resolved Artifact reads.
+/// Register with `GuardedArtifactReadExecutor::new_session_scoped`.
+pub fn guarded_artifact_read_v2_descriptor(restriction: ToolRestriction) -> ToolDescriptor {
+    let mut descriptor = guarded_artifact_read_descriptor(restriction);
+    descriptor.tool_id = ToolId::new("orchestral/artifact_read/v2");
+    descriptor.model_schema.description = "Read a stored large Tool result from this conversation without rerunning the Tool. Supply artifact_ref; omit offset for the first page, then continue at returned next_offset until complete=true when the full result is needed. Content is canonical JSON text and offsets count UTF-8 bytes. The Host resolves and verifies metadata; pages fit its output budget.".to_owned();
+    descriptor.model_schema.input_schema["required"] = json!(["artifact_ref"]);
+    let properties = descriptor.model_schema.input_schema["properties"]
+        .as_object_mut()
+        .expect("Artifact properties are an object");
+    for key in ["digest", "media_type", "byte_size"] {
+        properties.remove(key);
+    }
+    descriptor
+}
+
+fn explicit_artifact(arguments: &Value, artifact_ref: String) -> Result<ToolArtifact, ToolOutcome> {
+    let digest = Digest::new(required_string(arguments, "digest")?);
+    let media_type = required_string(arguments, "media_type")?;
+    let byte_size = match required_u64(arguments, "byte_size") {
+        Ok(value) if value > 0 => value,
+        _ => {
+            return Err(rejected(
+                "artifact_shape_invalid",
+                "byte_size must be positive",
+            ))
+        }
+    };
+    Ok(ToolArtifact {
+        artifact: ArtifactRefWithDigest {
+            artifact_ref: ArtifactRef::new(artifact_ref),
+            digest,
+        },
+        media_type,
+        byte_size,
+        summary: "Artifact read request".to_owned(),
+    })
 }
 
 fn required_string(arguments: &Value, name: &str) -> Result<String, ToolOutcome> {

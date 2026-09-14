@@ -84,18 +84,6 @@ impl Fixture {
         }
         .unwrap()
         .with_permission_policy(Arc::new(WorkspacePermissionPolicy));
-        if let Some(artifacts) = artifacts {
-            runtime
-                .register(
-                    orchestral_runtime::tools::guarded_artifact_read_descriptor(ToolRestriction {
-                        bounds: self.policy.clone(),
-                    }),
-                    Arc::new(orchestral_runtime::tools::GuardedArtifactReadExecutor::new(
-                        artifacts,
-                    )),
-                )
-                .unwrap();
-        }
         runtime
             .register(
                 guarded_file_read_descriptor(ToolRestriction {

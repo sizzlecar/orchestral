@@ -57,7 +57,9 @@ CLI、TUI 和 `serve` 共用的 Host 根据模型声明及用户配置中较小�
 
 `orchestral-blob-fs` 是 durable、content-addressed 文件插件，Blob ID 等于内容 SHA-256。data 与 metadata 使用同目录临时文件、fsync 和原子 rename 提交；应用的 `artifacts.backend: filesystem` 默认接入该插件。
 
-模型可调用只读 `artifact_read` Tool，携带返回结果中的 `artifact_ref/digest/media_type/byte_size`，按 UTF-8 byte offset 分块读取。每次读取仍经过 Tool policy，并重新验证完整 Artifact。
+CLI、TUI 和 `serve` 共用的 `artifact_read` 使用 `orchestral/artifact_read/v2`：模型只需提供 `artifact_ref`，可选 `offset` 和 `max_bytes`，按 UTF-8 byte offset 分块读取。Host 根据调用 Run 的已注册 Session，从该会话的已提交 Tool Exchange 和对应 Effect Journal 中取得原始 digest、media_type、byte_size，再验证实际存储字节。允许读取同一 Session 中先前 Run 的结果；其他 Session、未注册 Run、只有 JSON 外形或用户文本的引用不能授予读取权限。Blob 自报的摘要不能替代日志中的原始摘要，同一引用的已提交元数据冲突会拒绝读取。
+
+SDK 仍保留 `guarded_artifact_read_descriptor` 和 `GuardedArtifactReadExecutor::new` 的 v1 显式元数据接口。v2 必须将 `guarded_artifact_read_v2_descriptor` 与 `GuardedArtifactReadExecutor::new_session_scoped` 配对注册，并传入与生产者共用的 Run、Session、Effect Journal。元数据来源和读取证据契约纳入规划身份；旧版本未完成 Run 不会跨契约静默恢复。每次新读取仍经过 Tool policy，并重新验证完整 Artifact；已提交的同一调用按 Effect Journal 重放。
 
 `artifact_read` 返回的 `next_offset` 用于下一页，`complete=true` 表示读到末尾；负数 offset 或非正数 max_bytes 被拒绝，不能静默重置到起点。模型不必重跑产生结果的原始工具。
 

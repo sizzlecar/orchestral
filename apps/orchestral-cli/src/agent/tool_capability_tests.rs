@@ -81,12 +81,22 @@ async fn cli_file_schema_projection_preserves_primary_and_additional_root_operat
         std::fs::write(primary.join("same.txt"), "primary\n").unwrap();
         std::fs::write(shared.join("same.txt"), "shared\n").unwrap();
         let workspaces = CliWorkspaceSet::resolve(Some(&primary), &additional).unwrap();
+        let effects = Arc::new(InMemoryToolEffectJournalStore::default());
+        let artifacts =
+            ToolArtifactStore::new(Arc::new(InMemoryBlobStore::default()), 8192, 128).unwrap();
+        let reader = GuardedArtifactReadExecutor::new_session_scoped(
+            artifacts.clone(),
+            Arc::new(InMemoryAgentJournalStore::default()),
+            Arc::new(InMemoryAgentSessionJournalStore::default()),
+            effects.clone(),
+        );
         let composition = build_cli_tool_runtime(
             &OrchestralConfig::default(),
             &[],
-            Arc::new(InMemoryToolEffectJournalStore::default()),
-            ToolArtifactStore::new(Arc::new(InMemoryBlobStore::default()), 8192, 128).unwrap(),
+            effects,
+            artifacts,
             &workspaces,
+            reader,
         )
         .unwrap();
         let schemas = composition.runtime.model_tool_schemas().unwrap();
